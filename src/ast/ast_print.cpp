@@ -662,6 +662,7 @@ namespace das {
             if ( call->rtti_isInvoke() ) {
                 auto * inv = (ExprInvoke *) call;
                 if ( printAliases && inv->doesNotNeedSp ) ss << " /*no_sp*/ ";
+                if ( inv->isInvokeMethod ) ss << "/*method*/";
             }
             ss << "(";
         }

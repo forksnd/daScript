@@ -40,6 +40,11 @@ namespace das {
 
     void das_debug ( Context * context, TypeInfo * typeInfo, const char * FILE, int LINE, vec4f res, const char * message = nullptr );
 
+#if (!defined(DAS_ENABLE_EXCEPTIONS)) || (!DAS_ENABLE_EXCEPTIONS)
+    void das_throw(const char * msg);
+    void das_trycatch(callable<void()> tryBody, callable<void(const char * msg)> catchBody);
+#endif
+
     template <typename TT>
     struct das_auto_cast {
         template <typename QQ>
@@ -2188,6 +2193,92 @@ namespace das {
         template <typename BLK, typename ...ArgType>
         static __forceinline void invoke ( Context *, LineInfo *, const BLK & blk, ArgType ...arg ) {
             return blk(das::forward<ArgType>(arg)...);
+        }
+    };
+
+    template <typename ResType, int methodOffset>
+    struct das_invoke_method {
+        template <typename FirstArgType>
+        static __forceinline ResType invoke ( Context * __context__, LineInfo * __lineinfo__, const FirstArgType & blk ) {
+            char * classPtr = (char *)&blk;
+            SimFunction* simFunc = ((Func *)(classPtr + methodOffset))->PTR;
+            if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
+            if ( simFunc->aotFunction ) {
+                using fnPtrType = ResType (*) ( Context *, const FirstArgType & blk );
+                auto fnPtr = (fnPtrType) simFunc->aotFunction;
+                return (*fnPtr) ( __context__, blk );
+            } else {
+                vec4f arguments [] = { cast<FirstArgType>::from(blk) };
+                vec4f result = __context__->callOrFastcall(simFunc, arguments, __lineinfo__);
+                return cast<ResType>::to(result);
+            }
+        }
+        template <typename FirstArgType, typename ...ArgType>
+        static __forceinline ResType invoke ( Context * __context__, LineInfo * __lineinfo__, const FirstArgType & blk, ArgType ...arg ) {
+            char * classPtr = (char *)&blk;
+            SimFunction* simFunc = ((Func *)(classPtr + methodOffset))->PTR;
+            if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
+            if ( simFunc->aotFunction ) {
+                using fnPtrType = ResType (*) ( Context *, const FirstArgType & blk, ArgType... );
+                auto fnPtr = (fnPtrType) simFunc->aotFunction;
+                return (*fnPtr) ( __context__, blk, das::forward<ArgType>(arg)... );
+            } else {
+                vec4f arguments [] = { cast<FirstArgType>::from(blk), cast<ArgType>::from(arg)... };
+                vec4f result = __context__->callOrFastcall(simFunc, arguments, __lineinfo__);
+                return cast<ResType>::to(result);
+            }
+        }
+        template <typename FirstArgType>
+        static __forceinline ResType invoke_cmres ( Context * __context__, LineInfo * __lineinfo__, const FirstArgType & blk ) {
+            char * classPtr = (char *)&blk;
+            SimFunction* simFunc = ((Func *)(classPtr + methodOffset))->PTR;
+            if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
+            if ( simFunc->aotFunction ) {
+                using fnPtrType = ResType (*) ( Context *, const FirstArgType & blk );
+                auto fnPtr = (fnPtrType) simFunc->aotFunction;
+                return (*fnPtr) ( __context__, blk );
+            } else {
+                typename remove_const<ResType>::type result;
+                vec4f arguments [] = { cast<FirstArgType>::from(blk) };
+                __context__->callWithCopyOnReturn(simFunc, arguments, &result, __lineinfo__);
+                return result;
+            }
+        }
+        template <typename FirstArgType, typename ...ArgType>
+        static __forceinline ResType invoke_cmres ( Context * __context__, LineInfo * __lineinfo__, const FirstArgType & blk, ArgType ...arg ) {
+            char * classPtr = (char *)&blk;
+            SimFunction* simFunc = ((Func *)(classPtr + methodOffset))->PTR;
+            if ( simFunc->aotFunction ) {
+                using fnPtrType = ResType (*) ( Context *, const FirstArgType & blk, ArgType... );
+                auto fnPtr = (fnPtrType) simFunc->aotFunction;
+                return (*fnPtr) ( __context__, blk, das::forward<ArgType>(arg)... );
+            } else {
+                if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
+                typename remove_const<ResType>::type result;
+                vec4f arguments [] = { cast<FirstArgType>::from(blk), cast<ArgType>::from(arg)... };
+                __context__->callWithCopyOnReturn(simFunc, arguments, &result, __lineinfo__);
+                return result;
+            }
+        }
+    };
+
+    template <int methodOffset>
+    struct das_invoke_method<void,methodOffset> {
+        template <typename FirstArgType>
+        static __forceinline void invoke ( Context * __context__, LineInfo * __lineinfo__, const FirstArgType & blk ) {
+            char * classPtr = (char *)&blk;
+            SimFunction* simFunc = ((Func *)(classPtr + methodOffset))->PTR;
+            if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
+            vec4f arguments [] = { cast<FirstArgType>::from(blk) };
+            __context__->callOrFastcall(simFunc, arguments, __lineinfo__);
+        }
+        template <typename FirstArgType, typename ...ArgType>
+        static __forceinline void invoke ( Context * __context__, LineInfo * __lineinfo__, const FirstArgType & blk, ArgType ...arg ) {
+            char * classPtr = (char *)&blk;
+            SimFunction* simFunc = ((Func *)(classPtr + methodOffset))->PTR;
+            if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
+            vec4f arguments [] = { cast<FirstArgType>::from(blk), cast<ArgType>::from(arg)... };
+            __context__->callOrFastcall(simFunc, arguments, __lineinfo__);
         }
     };
 
