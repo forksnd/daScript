@@ -452,6 +452,22 @@ public:
         lock_guard<mutex> guard(lock);
         router.AllowCORS();
     }
+    void SET_DOCUMENT_ROOT ( const char * dir ) {
+        lock_guard<mutex> guard(lock);
+        router.document_root = dir ? dir : ".";
+    }
+    void SET_HOME_PAGE ( const char * filename ) {
+        lock_guard<mutex> guard(lock);
+        router.home_page = filename ? filename : "index.html";
+    }
+    void SET_INDEX_OF ( const char * dir ) {
+        lock_guard<mutex> guard(lock);
+        router.index_of = dir ? dir : "";
+    }
+    void SET_ERROR_PAGE ( const char * filename ) {
+        lock_guard<mutex> guard(lock);
+        router.error_page = filename ? filename : "";
+    }
 protected:
     HttpService router;
     WebSocketService service;
@@ -553,6 +569,26 @@ void das_wss_static ( hv::WebSocketServer * server, const char * path, const cha
 void das_wss_allow_cors ( hv::WebSocketServer * server ) {
     auto adapter = (WebServer_Adapter *) server;
     adapter->ALLOW_CORS();
+}
+
+void das_wss_set_document_root ( hv::WebSocketServer * server, const char * dir ) {
+    auto adapter = (WebServer_Adapter *) server;
+    adapter->SET_DOCUMENT_ROOT(dir);
+}
+
+void das_wss_set_home_page ( hv::WebSocketServer * server, const char * filename ) {
+    auto adapter = (WebServer_Adapter *) server;
+    adapter->SET_HOME_PAGE(filename);
+}
+
+void das_wss_set_index_of ( hv::WebSocketServer * server, const char * dir ) {
+    auto adapter = (WebServer_Adapter *) server;
+    adapter->SET_INDEX_OF(dir);
+}
+
+void das_wss_set_error_page ( hv::WebSocketServer * server, const char * filename ) {
+    auto adapter = (WebServer_Adapter *) server;
+    adapter->SET_ERROR_PAGE(filename);
 }
 
 http_status das_resp_string ( HttpResponse * resp, const char * msg, http_status status ) {
@@ -1080,6 +1116,18 @@ public:
         addExtern<DAS_BIND_FUN(das_wss_allow_cors)> (*this, lib, "allow_cors",
             SideEffects::worstDefault, "das_wss_allow_cors")
                 ->args({"server"});
+        addExtern<DAS_BIND_FUN(das_wss_set_document_root)> (*this, lib, "set_document_root",
+            SideEffects::worstDefault, "das_wss_set_document_root")
+                ->args({"server","dir"});
+        addExtern<DAS_BIND_FUN(das_wss_set_home_page)> (*this, lib, "set_home_page",
+            SideEffects::worstDefault, "das_wss_set_home_page")
+                ->args({"server","filename"});
+        addExtern<DAS_BIND_FUN(das_wss_set_index_of)> (*this, lib, "set_index_of",
+            SideEffects::worstDefault, "das_wss_set_index_of")
+                ->args({"server","dir"});
+        addExtern<DAS_BIND_FUN(das_wss_set_error_page)> (*this, lib, "set_error_page",
+            SideEffects::worstDefault, "das_wss_set_error_page")
+                ->args({"server","filename"});
         // response
         auto http_status_enum = findEnum("http_status");
         addExtern<DAS_BIND_FUN(das_resp_string)> (*this, lib, "TEXT_PLAIN",

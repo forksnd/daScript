@@ -201,3 +201,9 @@ Quick Reference
      - Get URL-encoded form field (server)
 
 Source: ``tutorials/dasHV/05_cookies_and_forms.das``
+
+.. seealso::
+
+   Full source: :download:`tutorials/dasHV/05_cookies_and_forms.das <../../../../tutorials/dasHV/05_cookies_and_forms.das>`
+
+   Next tutorial: :ref:`tutorial_dasHV_websockets`

@@ -61,9 +61,18 @@ Standalone examples that don't fit neatly into other categories.
 | `base64_generators.das` | Base64 encoder built as a chain of composable generators (deliberately slow — demonstrates generator composition, not production encoding) |
 | `shader_like_validation.das` | Shader-like mode demo — shows how `options shader_like` rejects heap-allocating constructs (arrays, lambdas, `new`) at simulation time |
 
-## test/ — Test Harness & Unit Tests
+## hv/ — WebSocket Chat Example
 
-The compiler/runtime test suite (`daScriptTest`). Contains unit tests,
-compilation failure tests, runtime error tests, optimization tests, and
-module-specific test directories. This is a C++ test executable — not
-standalone `.das` scripts. Will be reorganized later.
+A WebSocket chat room powered by the `dashv` module.
+The server serves an HTML page and speaks WebSocket on the same port.
+
+| File | Description |
+|------|-------------|
+| `ws_chat_server.das` | Chat server — serves `chat.html` at `/`, WebSocket at `/chat` |
+| `ws_chat_client.das` | Terminal chat client — type messages in the console |
+| `chat.html`          | Standalone browser chat client |
+
+Start the server, open `http://localhost:9090` in a browser,
+and/or run `ws_chat_client.das` in a terminal — all clients share the
+same chat room. See `examples/hv/README.md` for details.
+

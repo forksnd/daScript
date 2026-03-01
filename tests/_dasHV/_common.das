@@ -25,6 +25,7 @@ let PORT_SERVER_ROUTES  = 19003
 let PORT_SERVER_ADVANCED = 19004
 let PORT_COOKIES        = 19005
 let PORT_FORMS          = 19006
+let PORT_WEBSOCKETS     = 19007
 
 // ──────────────────────────────────────────────────────────────────────────
 // Generic server lifecycle
