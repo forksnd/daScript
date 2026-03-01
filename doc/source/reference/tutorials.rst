@@ -215,3 +215,4 @@ Run any tutorial from the project root::
    tutorials/dasHV_03_http_server.rst
    tutorials/dasHV_04_http_server_advanced.rst
    tutorials/dasHV_05_cookies_and_forms.rst
+   tutorials/dasHV_06_websockets.rst

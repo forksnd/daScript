@@ -36,6 +36,9 @@ class HvWebSocketClient {
     def send(text : string) {
         send(*client, text)
     }
+    def close : int {
+        return close(*client)
+    }
 }
 
 class HvWebServer {
@@ -89,6 +92,18 @@ class HvWebServer {
     }
     def allow_cors() : void {
         allow_cors(server)
+    }
+    def set_document_root(dir : string) : void {
+        set_document_root(server, dir)
+    }
+    def set_home_page(filename : string) : void {
+        set_home_page(server, filename)
+    }
+    def set_index_of(dir : string) : void {
+        set_index_of(server, dir)
+    }
+    def set_error_page(filename : string) : void {
+        set_error_page(server, filename)
     }
 }
 
