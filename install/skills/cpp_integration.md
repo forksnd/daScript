@@ -147,13 +147,27 @@ Available operator names: `+`, `-`, `*`, `/`, `%`, `<<`, `>>`, `<`, `>`, `<=`, `
 
 **Equality**: `addEquNeq<T>(*this, lib)` binds both `==` and `!=` (requires `operator==` and `operator!=` on T).
 
-**Properties**: method calls disguised as field access in `ManagedStructureAnnotation`:
+**Properties**: field-like access that calls C++ code under the hood.
+
+*Member function property* — inside `ManagedStructureAnnotation`:
 
 ```cpp
 addProperty<DAS_BIND_MANAGED_PROP(length)>("length", "length");
 ```
 
-In daslang, `v.length` calls `Vec3::length()` — looks like a field, calls a method.
+`DAS_BIND_MANAGED_PROP` only works with member functions (methods) of the managed type.
+
+*Free function property* — via `addExtern` with `.\`` name prefix (in the module constructor):
+
+```cpp
+int get_content_length(const HttpResponse & resp) { return int(resp.content_length); }
+
+// In module constructor, AFTER addAnnotation for the type:
+addExtern<DAS_BIND_FUN(get_content_length)>(*this, lib, ".`content_length",
+    SideEffects::none, "get_content_length")->args({"self"});
+```
+
+Naming a function `.\`prop_name` makes it callable with property syntax: `resp.content_length`. This is the preferred way to bind properties when the getter is a free function (not a method), or when the member returns a type that needs conversion (e.g. `size_t` → `int`).
 
 ## Binding C++ enums — `DAS_BASE_BIND_ENUM`
 
