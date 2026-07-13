@@ -23,6 +23,7 @@ struct public LaunchMsg {
 struct public LaunchRail {
     app : string
     args : string
+    affinity : bool = true   // DAS_JOBQUE_AFFINITY for the child
     running : bool
     has_run : bool
     exit_code : int
@@ -86,6 +87,17 @@ def public launch_start(var L : LaunchRail) : bool {
     L.has_run = false
     L.exit_code = -9999
     delete L.tail
+    // the child inherits these: dasLLAMA's env-armed trace rails point at tool-owned
+    // paths (the "jobque trace saved:" output line + auto-open pick the file up), and
+    // the affinity pin follows the checkbox
+    var terr = ""
+    let tdir = "{temp_directory(terr)}/jobque-timeline"
+    if (empty(terr)) {
+        mkdir(tdir)
+        set_env_variable("DASLLAMA_PREFILL_TRACE", "{tdir}/launch_prefill.trace.json")
+        set_env_variable("DASLLAMA_BATCH_TRACE", "{tdir}/launch_batch.trace.json")
+    }
+    set_env_variable("DAS_JOBQUE_AFFINITY", L.affinity ? "1" : "0")
     L.ch = unsafe(channel_create())
     var ch = L.ch
     let app := L.app
@@ -110,7 +122,7 @@ def public launch_start(var L : LaunchRail) : bool {
             }
         }))
         var lines <- split(outp, "\n")
-        let first = max(0, length(lines) - 30)
+        let first = max(0, length(lines) - 60)
         for (i in range(first, length(lines))) {
             ch |> push_clone(LaunchMsg(kind = 0, text = lines[i], rc = 0))
         }
@@ -143,7 +155,7 @@ def public launch_pump(var L : LaunchRail) : bool {
                     line = clone_string(m.text)
                 }
                 L.tail |> push(line)
-                if (length(L.tail) > 30) {
+                if (length(L.tail) > 60) {
                     L.tail |> erase(0)
                 }
             }

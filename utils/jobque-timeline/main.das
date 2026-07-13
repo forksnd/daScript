@@ -28,7 +28,7 @@ var g_render : array<RenderCache>      // per-doc cached draw runs
 var g_view_stats : array<StatsCache>   // per-doc, keyed on the visible range
 var g_sel_stats : array<StatsCache>    // per-doc, keyed on the selection range
 var g_pending : array<string>   // files handed on the command line, loaded in init
-var g_launch : LaunchRail
+var g_launch = LaunchRail()
 var g_watch : array<FileWatch>  // per-doc auto-refresh watchers
 var g_poll_frame = 0
 var g_dlg_purpose = 0           // the singleton file dialog's pending consumer: 1 = launch app, 2 = open traces
@@ -208,6 +208,7 @@ def init() {
     SHARE_ZOOM.value = true    // both sync modes ON by default
     SHARE_TIMER.value = true
     AUTO_REFRESH.value = true
+    AFFINITY_CB.value = true   // bench discipline: launched runs pin by default
     for (path in g_pending) {
         open_file(path)
     }
@@ -222,6 +223,14 @@ def update() {
     harness_new_frame()
     if (launch_pump(g_launch)) {
         to_log(LOG_INFO, "jobque-timeline: launch finished rc={g_launch.exit_code}\n")
+        if (g_launch.exit_code == 0) {
+            for (line in g_launch.tail) {   // auto-open every trace the run reported saving
+                let jp = extract_json_path(line)
+                if (!empty(jp)) {
+                    open_or_reload(jp)
+                }
+            }
+        }
     }
     g_poll_frame++
     if (AUTO_REFRESH.value && g_poll_frame % 30 == 0) {
@@ -278,6 +287,7 @@ def update() {
             }
             same_line()
             text(ARGS_LABEL, (text = empty(g_launch.args) ? "<no args>" : g_launch.args))
+            checkbox(AFFINITY_CB, (text = "affinity"))
             popup_modal(ARGS_MODAL, (text = "Launch arguments", closable = true, flags = ImGuiWindowFlags.None)) {
                 text("whitespace-separated; newlines are fine (one argument per line avoids quoting)")
                 input_text_multiline(ARGS_MULTI, (text = "##args", size = float2(640.0f, 240.0f)))
@@ -294,6 +304,7 @@ def update() {
                 text("running...")
             } else {
                 if (icon_button(LAUNCH_BTN, (glyph = "play", tip = "launch"))) {
+                    g_launch.affinity = AFFINITY_CB.value
                     if (!launch_start(g_launch)) {
                         to_log(LOG_ERROR, "jobque-timeline: launch failed to start\n")
                     }
@@ -533,6 +544,7 @@ def timeline_launch(input : JsonValue?) : JsonValue? {
         g_launch.app = a.app
     }
     g_launch.args = a.args
+    g_launch.affinity = AFFINITY_CB.value
     if (!a.start) {
         return JV((running = false, app = g_launch.app, args = g_launch.args))
     }
