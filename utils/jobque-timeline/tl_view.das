@@ -75,15 +75,18 @@ def private stage_color(base : uint; stage, nstages : int) : uint {
 }
 
 def public fmt_us(v : double) : string {
+    if (v < 0.0lf) return "-" + fmt_us(-v)
     if (v >= 10000.0lf) return "{int(v / 1000.0lf)}ms"
     if (v >= 1000.0lf) return "{float(v) / 1000.0f}ms"
     return "{int(v)}us"
 }
 
 def public clamp_view(var ui : ViewUI; span : double) {
-    var w = ui.t1 - ui.t0
-    w = clamp(w, 8.0lf, max(span, 8.0lf))
-    ui.t0 = clamp(ui.t0, 0.0lf, max(0.0lf, span - w))
+    // perfetto-style: the window may pan up to one full window past either end of the
+    // data — so share-timer keeps absolute alignment across files with unequal spans
+    // (the shorter file's content just runs off-screen) instead of pinning at its edge
+    let w = max(ui.t1 - ui.t0, 8.0lf)
+    ui.t0 = clamp(ui.t0, -w, span)
     ui.t1 = ui.t0 + w
 }
 
@@ -293,7 +296,7 @@ def public draw_timeline(doc : TraceDoc; var ui : ViewUI; var cache : RenderCach
     if (hovered && io.MouseWheel != 0.0f) {
         let factor = exp(-io.MouseWheel * 0.16f)
         var nw = (ui.t1 - ui.t0) * double(factor)
-        nw = clamp(nw, 8.0lf, span)
+        nw = clamp(nw, 8.0lf, span * 2.0lf)
         let frac = clamp(double(mx - plot_x0) / double(plot_w), 0.0lf, 1.0lf)
         ui.t0 = m_t - nw * frac
         ui.t1 = ui.t0 + nw
@@ -406,8 +409,8 @@ def public draw_timeline(doc : TraceDoc; var ui : ViewUI; var cache : RenderCach
                     float2(max(plot_x0 + r.x1 * plot_w, plot_x0 + r.x0 * plot_w + 0.5f), oy0 + ov_row),
                     col32(r.col, 150))
             }
-            let vx0 = plot_x0 + float(ui.t0 / span) * plot_w
-            let vx1 = plot_x0 + float(ui.t1 / span) * plot_w
+            let vx0 = clamp(plot_x0 + float(ui.t0 / span) * plot_w, plot_x0, plot_x0 + plot_w)
+            let vx1 = clamp(plot_x0 + float(ui.t1 / span) * plot_w, plot_x0, plot_x0 + plot_w)
             dl |> add_rect_filled(float2(vx0, ov_y0), float2(max(vx1, vx0 + 2.0f), ov_y1), col32(0xE8EAEDu, 36))
             dl |> add_line(float2(vx0, ov_y0), float2(vx0, ov_y1), col32(0xE8EAEDu, 160), 1.0)
             dl |> add_line(float2(vx1, ov_y0), float2(vx1, ov_y1), col32(0xE8EAEDu, 160), 1.0)

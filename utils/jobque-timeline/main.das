@@ -122,16 +122,17 @@ def sync_views(from_idx : int) {
             ui.t1 = span
             ui.inited = true
         }
-        let nw = SHARE_ZOOM.value ? clamp(w, 8.0lf, span) : (ui.t1 - ui.t0)
+        let nw = SHARE_ZOOM.value ? max(w, 8.0lf) : (ui.t1 - ui.t0)
         var nt0 = ui.t0
         if (SHARE_TIMER.value) {
             nt0 = src.t0
         } elif (SHARE_ZOOM.value) {
             nt0 = (ui.t0 + ui.t1) * 0.5lf - nw * 0.5lf
         }
+        // NO clamp on adoption — shared timer means the same absolute clock even when this
+        // file's data has run out (it draws empty); direct interaction on this view clamps
         ui.t0 = nt0
         ui.t1 = nt0 + nw
-        clamp_view(ui, span)
     }
 }
 
