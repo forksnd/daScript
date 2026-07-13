@@ -246,20 +246,38 @@ def update() {
             }
         }
         dock_window(LAUNCH_WIN, (text = "Launch", closable = false, flags = ImGuiWindowFlags.None)) {
-            if (icon_button(BROWSE_BTN, (glyph = "folder", tip = "select the app to run"))) {
+            if (icon_button(BROWSE_BTN, (glyph = "folder", tip = "select the app to run (.das runs via daslang -jit)"))) {
                 file_dialog_open(FileDialogConfig(title = "Select App", start_dir = "",
-                    filters <- file_filters("Programs (*.exe)|exe|All files|"),
+                    filters <- file_filters("Apps (*.das *.exe)|das;exe|All files|"),
                     mode = FileDialogMode.open, max_selection = 1))
                 g_dlg_purpose = 1
             }
             same_line()
             text(APP_LABEL, (text = empty(g_launch.app) ? "<no app>" : base_name(g_launch.app)))
-            input_text(ARGS_INPUT, (text = "args"))
+            if (icon_button(ARGS_EDIT_BTN, (glyph = "sliders", tip = "edit arguments (multi-line)"))) {
+                ARGS_MULTI.capacity = 4096
+                ARGS_MULTI.pending_value = g_launch.args
+                ARGS_MULTI.has_pending = true
+                ARGS_MODAL.pending_open = true
+            }
+            same_line()
+            text(ARGS_LABEL, (text = empty(g_launch.args) ? "<no args>" : g_launch.args))
+            popup_modal(ARGS_MODAL, (text = "Launch arguments", closable = true, flags = ImGuiWindowFlags.None)) {
+                text("whitespace-separated; newlines are fine (one argument per line avoids quoting)")
+                input_text_multiline(ARGS_MULTI, (text = "##args", size = float2(640.0f, 240.0f)))
+                if (button(ARGS_OK, (text = "OK"))) {
+                    g_launch.args = ARGS_MULTI.value
+                    ARGS_MODAL.pending_close = true
+                }
+                same_line()
+                if (button(ARGS_CANCEL, (text = "Cancel"))) {
+                    ARGS_MODAL.pending_close = true
+                }
+            }
             if (g_launch.running) {
                 text("running...")
             } else {
                 if (icon_button(LAUNCH_BTN, (glyph = "play", tip = "launch"))) {
-                    g_launch.args = ARGS_INPUT.value
                     if (!launch_start(g_launch)) {
                         to_log(LOG_ERROR, "jobque-timeline: launch failed to start\n")
                     }
@@ -472,19 +490,23 @@ def timeline_set_selection(input : JsonValue?) : JsonValue? {
 struct TLLaunchArg {
     app : string
     args : string
+    start : bool = true   // false = just pre-fill the launch panel
 }
 
 struct TLAutoArg {
     on : bool
 }
 
-[live_command(description = "launch a trace-producing app in the background: args \{app,args\}")]
+[live_command(description = "launch a trace-producing app in the background: args \{app,args,start?\} (start=false pre-fills only)")]
 def timeline_launch(input : JsonValue?) : JsonValue? {
     let a = from_JV(input, type<TLLaunchArg>)
     if (!empty(a.app)) {
         g_launch.app = a.app
     }
     g_launch.args = a.args
+    if (!a.start) {
+        return JV((running = false, app = g_launch.app, args = g_launch.args))
+    }
     if (!launch_start(g_launch)) {
         return JV("launch failed (already running, or no app set)")
     }

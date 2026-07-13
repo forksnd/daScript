@@ -1651,6 +1651,16 @@ namespace das {
         return context->allocateString(res, at);
     }
 
+    void set_env_variable ( const char * var, const char * value, Context *, LineInfoArg * ) {
+        // process-wide; children spawned via popen/popen_argv inherit it
+        if ( !var || !*var ) return;
+#ifdef _MSC_VER
+        _putenv_s(var, value ? value : "");
+#else
+        setenv(var, value ? value : "", 1);
+#endif
+    }
+
     enum class RegisterOnError {
         Quiet = 0,      // missing/unloadable .shared_module is silent (deferred for retry); broken artifacts still report
         ErrorMsg,       // error message is displayed

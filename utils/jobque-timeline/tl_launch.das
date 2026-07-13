@@ -5,6 +5,7 @@ module tl_launch
 
 require daslib/jobque_boost
 require daslib/strings_boost
+require daslib/command_line
 require daslib/fio
 require math
 require strings
@@ -39,7 +40,7 @@ def public split_args(s : string) : array<string> {
             let c = data[i]
             if (c == uint8('"')) {
                 in_quote = !in_quote
-            } elif (!in_quote && (c == uint8(' ') || c == uint8('\t'))) {
+            } elif (!in_quote && (c == uint8(' ') || c == uint8('\t') || c == uint8('\n') || c == uint8('\r'))) {
                 if (!empty(cur)) {
                     unsafe {
                         out |> push(string(cur))
@@ -74,11 +75,19 @@ def public launch_start(var L : LaunchRail) : bool {
     var ch = L.ch
     let app := L.app
     let args := L.args
+    let das_exe := get_das_exe()   // .das apps run as `daslang -jit <script> -- <args>`
     new_job <| @ {
         var outp = ""
         var argv <- split_args(args)
         var full : array<string>
-        full |> push(app)
+        if (ends_with(app, ".das")) {
+            full |> push(das_exe)
+            full |> push("-jit")
+            full |> push(app)
+            full |> push("--")
+        } else {
+            full |> push(app)
+        }
         full |> push_from(argv)
         let rc = unsafe(popen_argv(full, 0.0, $(f) {
             if (f != null) {
