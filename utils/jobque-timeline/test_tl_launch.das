@@ -23,6 +23,15 @@ def test_split_args(t : T?) {
 }
 
 [test]
+def test_extract_json_path(t : T?) {
+    t |> run("finds the .json token in an output line") @(t : T?) {
+        t |> equal("C:/tmp/a.trace.json", extract_json_path("jobque trace saved: C:/tmp/a.trace.json"))
+        t |> equal("", extract_json_path("decode: 8 tokens in 118494us"))
+        t |> equal("b.json", extract_json_path("wrote b.json ok"))
+    }
+}
+
+[test]
 def test_file_watch(t : T?) {
     t |> run("watch fires on change only after a stable poll") @(t : T?) {
         var terr = ""

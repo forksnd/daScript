@@ -61,6 +61,21 @@ def public split_args(s : string) : array<string> {
     return <- out
 }
 
+//! First whitespace-separated token ending in ".json" — how output lines like
+//! "jobque trace saved: <path>" surface a clickable trace. "" when none.
+def public extract_json_path(line : string) : string {
+    var found = ""
+    var toks <- split_args(line)
+    for (tk in toks) {
+        if (ends_with(tk, ".json")) {
+            found := tk
+            break
+        }
+    }
+    delete toks
+    return found
+}
+
 //! Start `app args` in a background job. Output (last lines) and the exit code arrive
 //! via launch_pump. False when already running or no app set.
 def public launch_start(var L : LaunchRail) : bool {

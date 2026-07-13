@@ -41,6 +41,10 @@ var private RELOAD_BTN : table<int; ClickState>       // per-file manual refresh
 var private CLOSE_BTN : table<int; ClickState>        // per-file close
 var private FILE_SL_A : table<int; EmptyMarkerState>  // per-file row same_line markers
 var private FILE_SL_B : table<int; EmptyMarkerState>
+var private TAIL_OPEN : table<int; ClickState>        // output lines naming a .json: open it
+var private TAIL_COPY : table<int; ClickState>        // ... or copy its path
+var private TAIL_SL_A : table<int; EmptyMarkerState>
+var private TAIL_SL_B : table<int; EmptyMarkerState>
 var private TAIL_LINE : table<int; NarrativeState>    // launch output tail
 var g_close_req = -1            // deferred close (icon or window X) — applied after the frame's windows
 
@@ -92,6 +96,18 @@ def close_file(i : int) {
     TRACE2.open = true
     TRACE3.open = true
     TL_ROOT.has_initial_layout = false
+}
+
+def open_or_reload(path : string) {
+    for (i in range(length(g_docs))) {
+        if (g_docs[i].path == path) {
+            reload_file(i)
+            return
+        }
+    }
+    if (open_file(path)) {
+        TL_ROOT.has_initial_layout = false
+    }
 }
 
 def reload_file(i : int) {
@@ -289,6 +305,19 @@ def update() {
             }
             separator()
             for (i in range(length(g_launch.tail))) {
+                let jpath = extract_json_path(g_launch.tail[i])
+                if (!empty(jpath)) {
+                    if (icon_button(TAIL_OPEN[i], (glyph = "folder", tip = "open this trace", size = 14.0f))) {
+                        open_or_reload(jpath)
+                    }
+                    same_line(TAIL_SL_A[i])
+                    if (icon_button(TAIL_COPY[i], (glyph = "duplicate", tip = "copy path to clipboard", size = 14.0f))) {
+                        log_to_clipboard()
+                        log_text(jpath)
+                        log_finish()
+                    }
+                    same_line(TAIL_SL_B[i])
+                }
                 text(TAIL_LINE[i], (text = g_launch.tail[i]))
             }
         }
@@ -333,7 +362,7 @@ def update() {
         } elif (g_dlg_purpose == 2) {
             var sel <- file_dialog_selection()
             for (p in sel) {
-                open_file(p)
+                open_or_reload(p)   // re-picking an open file reloads it instead of duplicating
             }
             delete sel
             TL_ROOT.has_initial_layout = false   // reseed the stacked layout with the new windows
