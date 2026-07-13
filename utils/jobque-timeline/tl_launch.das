@@ -24,6 +24,7 @@ struct public LaunchRail {
     app : string
     args : string
     affinity : bool = true   // DAS_JOBQUE_AFFINITY for the child
+    threads : int = 0        // DAS_JOBQUE_THREADS for the child; 0 = inherit
     running : bool
     has_run : bool
     exit_code : int
@@ -98,6 +99,9 @@ def public launch_start(var L : LaunchRail) : bool {
         set_env_variable("DASLLAMA_BATCH_TRACE", "{tdir}/launch_batch.trace.json")
     }
     set_env_variable("DAS_JOBQUE_AFFINITY", L.affinity ? "1" : "0")
+    if (L.threads > 0) {
+        set_env_variable("DAS_JOBQUE_THREADS", "{L.threads}")
+    }
     L.ch = unsafe(channel_create())
     var ch = L.ch
     let app := L.app

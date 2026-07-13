@@ -209,6 +209,9 @@ def init() {
     SHARE_TIMER.value = true
     AUTO_REFRESH.value = true
     AFFINITY_CB.value = true   // bench discipline: launched runs pin by default
+    if (has_env_variable("DAS_JOBQUE_THREADS")) {   // seed from the tool's own env (box config)
+        THREADS_INPUT.value = to_int(get_env_variable("DAS_JOBQUE_THREADS"))
+    }
     for (path in g_pending) {
         open_file(path)
     }
@@ -288,6 +291,7 @@ def update() {
             same_line()
             text(ARGS_LABEL, (text = empty(g_launch.args) ? "<no args>" : g_launch.args))
             checkbox(AFFINITY_CB, (text = "affinity"))
+            input_int(THREADS_INPUT, (text = "threads (0 = inherit)"))
             popup_modal(ARGS_MODAL, (text = "Launch arguments", closable = true, flags = ImGuiWindowFlags.None)) {
                 text("whitespace-separated; newlines are fine (one argument per line avoids quoting)")
                 input_text_multiline(ARGS_MULTI, (text = "##args", size = float2(640.0f, 240.0f)))
@@ -305,6 +309,7 @@ def update() {
             } else {
                 if (icon_button(LAUNCH_BTN, (glyph = "play", tip = "launch"))) {
                     g_launch.affinity = AFFINITY_CB.value
+                    g_launch.threads = THREADS_INPUT.value
                     if (!launch_start(g_launch)) {
                         to_log(LOG_ERROR, "jobque-timeline: launch failed to start\n")
                     }
@@ -545,6 +550,7 @@ def timeline_launch(input : JsonValue?) : JsonValue? {
     }
     g_launch.args = a.args
     g_launch.affinity = AFFINITY_CB.value
+    g_launch.threads = THREADS_INPUT.value
     if (!a.start) {
         return JV((running = false, app = g_launch.app, args = g_launch.args))
     }
