@@ -7,7 +7,7 @@ require daslib/clargs
 require daslib/json_boost
 require strings
 require math
-require stddlg
+require imgui/imgui_file_dialog
 require tl_model
 require tl_loader
 require tl_view
@@ -30,6 +30,7 @@ var g_pending : array<string>   // files handed on the command line, loaded in i
 var g_launch : LaunchRail
 var g_watch : array<FileWatch>  // per-doc auto-refresh watchers
 var g_poll_frame = 0
+var g_dlg_purpose = 0           // the singleton file dialog's pending consumer: 1 = launch app, 2 = open traces
 
 var private DOC_STATS : table<int; NarrativeState>    // per-window header line widgets
 var private DOC_CHIPS : table<int; NarrativeState>    // per-window computed stats (idle/par/cats)
@@ -189,6 +190,12 @@ def update() {
             checkbox(SHARE_ZOOM, (text = "share zoom"))
             checkbox(SHARE_TIMER, (text = "share timer"))
             checkbox(AUTO_REFRESH, (text = "auto refresh"))
+            if (button(OPEN_TRACE_BTN, (text = "open trace..."))) {
+                file_dialog_open(FileDialogConfig(title = "Open Trace", start_dir = "",
+                    filters <- file_filters("Traces (*.json)|json|All files|"),
+                    mode = FileDialogMode.open, max_selection = MAX_DOCS))
+                g_dlg_purpose = 2
+            }
             for (i in range(length(g_docs))) {
                 text(FILE_LABEL[i], (text = g_docs[i].title))
                 if (button(RELOAD_BTN[i], (text = "reload##{i}"))) {
@@ -198,10 +205,10 @@ def update() {
             text("-- launch --")
             text(APP_LABEL, (text = empty(g_launch.app) ? "<no app>" : g_launch.app))
             if (button(BROWSE_BTN, (text = "browse..."))) {
-                let picked = get_dlg_open_file("", "")
-                if (!empty(picked)) {
-                    g_launch.app = picked
-                }
+                file_dialog_open(FileDialogConfig(title = "Select App", start_dir = "",
+                    filters <- file_filters("Programs (*.exe)|exe|All files|"),
+                    mode = FileDialogMode.open, max_selection = 1))
+                g_dlg_purpose = 1
             }
             input_text(ARGS_INPUT, (text = "args"))
             if (g_launch.running) {
@@ -242,6 +249,24 @@ def update() {
                 draw_doc_window(3)
             }
         }
+    }
+    // the file dialog renders at top level (clean FILEDLG/... registry path); one modal
+    // serves both consumers, dispatched by g_dlg_purpose
+    let fd = file_dialog_draw()
+    if (fd == FileDialogResult.confirmed) {
+        if (g_dlg_purpose == 1) {
+            g_launch.app = file_dialog_selected_path()
+        } elif (g_dlg_purpose == 2) {
+            var sel <- file_dialog_selection()
+            for (p in sel) {
+                open_file(p)
+            }
+            delete sel
+            TL_ROOT.has_initial_layout = false   // reseed the stacked layout with the new windows
+        }
+        g_dlg_purpose = 0
+    } elif (fd == FileDialogResult.cancelled) {
+        g_dlg_purpose = 0
     }
     harness_end_frame()
 }
