@@ -4,6 +4,7 @@ options stack = 65536
 require imgui/imgui_harness
 require daslib/jobque_boost
 require daslib/clargs
+require daslib/fio
 require daslib/json_boost
 require strings
 require math
@@ -37,7 +38,11 @@ var private DOC_CHIPS : table<int; NarrativeState>    // per-window computed sta
 var private DOC_SEL : table<int; NarrativeState>      // per-window selection stats
 var private FILE_LABEL : table<int; NarrativeState>   // controls-panel file list
 var private RELOAD_BTN : table<int; ClickState>       // per-file manual refresh
+var private CLOSE_BTN : table<int; ClickState>        // per-file close
+var private FILE_SL_A : table<int; EmptyMarkerState>  // per-file row same_line markers
+var private FILE_SL_B : table<int; EmptyMarkerState>
 var private TAIL_LINE : table<int; NarrativeState>    // launch output tail
+var g_close_req = -1            // deferred close (icon or window X) — applied after the frame's windows
 
 def open_file(path : string) : bool {
     if (length(g_docs) >= MAX_DOCS) {
@@ -63,6 +68,30 @@ def open_file(path : string) : bool {
     watch_prime(fw, path)
     g_watch |> push(fw)
     return true
+}
+
+def trace_window_open(i : int) : bool {
+    if (i == 0) return TRACE0.open
+    if (i == 1) return TRACE1.open
+    if (i == 2) return TRACE2.open
+    return TRACE3.open
+}
+
+def close_file(i : int) {
+    g_docs |> erase(i)
+    g_ui |> erase(i)
+    g_render |> erase(i)
+    g_view_stats |> erase(i)
+    g_sel_stats |> erase(i)
+    g_watch |> erase(i)
+    for (j in range(length(g_docs))) {
+        g_docs[j].title = "{j}: {base_name(g_docs[j].path)}"
+    }
+    TRACE0.open = true   // dock slots are positional — reset and reseed
+    TRACE1.open = true
+    TRACE2.open = true
+    TRACE3.open = true
+    TL_ROOT.has_initial_layout = false
 }
 
 def reload_file(i : int) {
@@ -115,7 +144,11 @@ def setup_layout(dock_id : uint) {
     var left_id : uint = 0u
     var main_id : uint = 0u
     DockBuilderSplitNode(dock_id, ImGuiDir.Left, 0.16f, left_id, main_id)
-    DockBuilderDockWindow("Controls", left_id)
+    var launch_id : uint = 0u
+    var ctrl_id : uint = 0u
+    DockBuilderSplitNode(left_id, ImGuiDir.Down, 0.34f, launch_id, ctrl_id)
+    DockBuilderDockWindow("Controls", ctrl_id)
+    DockBuilderDockWindow("Launch", launch_id)
     let n = length(g_docs)
     var cur = main_id
     for (i in range(n)) {
@@ -190,66 +223,88 @@ def update() {
             checkbox(SHARE_ZOOM, (text = "share zoom"))
             checkbox(SHARE_TIMER, (text = "share timer"))
             checkbox(AUTO_REFRESH, (text = "auto refresh"))
-            if (button(OPEN_TRACE_BTN, (text = "open trace..."))) {
+            separator()
+            if (icon_button(OPEN_TRACE_BTN, (glyph = "folder", tip = "open trace file(s) — multi-select with ctrl/shift"))) {
                 file_dialog_open(FileDialogConfig(title = "Open Trace", start_dir = "",
                     filters <- file_filters("Traces (*.json)|json|All files|"),
                     mode = FileDialogMode.open, max_selection = MAX_DOCS))
                 g_dlg_purpose = 2
             }
+            same_line()
+            text("open trace...")
             for (i in range(length(g_docs))) {
-                text(FILE_LABEL[i], (text = g_docs[i].title))
-                if (button(RELOAD_BTN[i], (text = "reload##{i}"))) {
+                if (icon_button(RELOAD_BTN[i], (glyph = "refresh", tip = "reload from disk"))) {
                     reload_file(i)
                 }
+                same_line(FILE_SL_A[i])
+                if (icon_button(CLOSE_BTN[i], (glyph = "close", tip = "close"))) {
+                    g_close_req = i
+                }
+                same_line(FILE_SL_B[i])
+                text(FILE_LABEL[i], (text = g_docs[i].title))
             }
-            text("-- launch --")
-            text(APP_LABEL, (text = empty(g_launch.app) ? "<no app>" : g_launch.app))
-            if (button(BROWSE_BTN, (text = "browse..."))) {
+        }
+        dock_window(LAUNCH_WIN, (text = "Launch", closable = false, flags = ImGuiWindowFlags.None)) {
+            if (icon_button(BROWSE_BTN, (glyph = "folder", tip = "select the app to run"))) {
                 file_dialog_open(FileDialogConfig(title = "Select App", start_dir = "",
                     filters <- file_filters("Programs (*.exe)|exe|All files|"),
                     mode = FileDialogMode.open, max_selection = 1))
                 g_dlg_purpose = 1
             }
+            same_line()
+            text(APP_LABEL, (text = empty(g_launch.app) ? "<no app>" : base_name(g_launch.app)))
             input_text(ARGS_INPUT, (text = "args"))
             if (g_launch.running) {
                 text("running...")
             } else {
-                if (button(LAUNCH_BTN, (text = "launch"))) {
+                if (icon_button(LAUNCH_BTN, (glyph = "play", tip = "launch"))) {
                     g_launch.args = ARGS_INPUT.value
                     if (!launch_start(g_launch)) {
                         to_log(LOG_ERROR, "jobque-timeline: launch failed to start\n")
                     }
                 }
                 if (g_launch.has_run) {
+                    same_line()
                     text(RC_LABEL, (text = "exit code {g_launch.exit_code}"))
                 }
             }
+            separator()
             for (i in range(length(g_launch.tail))) {
                 text(TAIL_LINE[i], (text = g_launch.tail[i]))
             }
         }
         let flags = ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse
         if (!empty(g_docs)) {
-            dock_window(TRACE0, (text = g_docs[0].title, closable = false, flags = flags)) {
+            dock_window(TRACE0, (text = g_docs[0].title, closable = true, flags = flags)) {
                 draw_doc_window(0)
             }
         }
         if (length(g_docs) > 1) {
-            dock_window(TRACE1, (text = g_docs[1].title, closable = false, flags = flags)) {
+            dock_window(TRACE1, (text = g_docs[1].title, closable = true, flags = flags)) {
                 draw_doc_window(1)
             }
         }
         if (length(g_docs) > 2) {
-            dock_window(TRACE2, (text = g_docs[2].title, closable = false, flags = flags)) {
+            dock_window(TRACE2, (text = g_docs[2].title, closable = true, flags = flags)) {
                 draw_doc_window(2)
             }
         }
         if (length(g_docs) > 3) {
-            dock_window(TRACE3, (text = g_docs[3].title, closable = false, flags = flags)) {
+            dock_window(TRACE3, (text = g_docs[3].title, closable = true, flags = flags)) {
                 draw_doc_window(3)
             }
         }
     }
+    // apply deferred closes (close icon or a trace window's X)
+    for (i in range(length(g_docs))) {
+        if (!trace_window_open(i)) {
+            g_close_req = i
+        }
+    }
+    if (g_close_req >= 0 && g_close_req < length(g_docs)) {
+        close_file(g_close_req)
+    }
+    g_close_req = -1
     // the file dialog renders at top level (clean FILEDLG/... registry path); one modal
     // serves both consumers, dispatched by g_dlg_purpose
     let fd = file_dialog_draw()
