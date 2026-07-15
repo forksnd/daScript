@@ -5,6 +5,7 @@ require dastest/testing_boost
 require metal/msl_shader
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — GPU driver half, Apple builds only
 require dasllama/dasllama_metal_decode  // nolint:STYLE030 — the production batch attention MSL (zero copy drift)
+require dasllama/dasllama_math   // the q8_0 KV codec (quantize_q8kv_row / cvt_q8kv_to_f32) — the store oracle
 require daslib/fio
 require math
 require strings
@@ -99,6 +100,117 @@ class MetalSqAttnLab {
         j = 0u
         while (j < cnt) {
             acc += scores[j] * float(vc[j * kv_dim + khoff + lid])
+            j++
+        }
+        yo[qoff + lid] = acc / l
+    }
+}
+
+// q8_0-cache twin of MetalSqAttnLab (format-matrix W3): K/V arrive as ggml block_q8_0 rows
+// (34B per 32 elements — {f16 d; int8 qs[32]}), read through the MetalQ8MulMm dual-view trick
+// (one blob buffer bound twice: half view for scales at 17*b, byte view for quants at 34*b+2)
+// and dequantized in-registers while streaming. Same grid contract as the f16 form: one
+// threadgroup per (stream, head), 128 threads, hs == 128. Score pass: simdgroup sg owns row j,
+// lane sl covers 4 elements — all inside ONE block (sl/8), so the block scale factors out of
+// the lane dot. V pass: lane owns column lid — element (khoff + lid) sits in block lid/32 of
+// the row at in-block offset lid%32. The BW bar vs f16: 34B vs 64B per 32 elements = 0.53x
+// cache traffic where the K walk is coalesced.
+class MetalSqAttnLabQ8 {
+    @ssbo @binding = 0 ksh : array<float16> // K blob, HALF-SCALE view: scale of block b at 17*b
+    @ssbo @binding = 1 kqb : array<int8>    // the SAME K blob, BYTE view: quants of block b at 34*b + 2
+    @ssbo @binding = 2 vsh : array<float16>
+    @ssbo @binding = 3 vqb : array<int8>
+    @ssbo @binding = 4 q : array<float>     // [B x qd] roped queries
+    @ssbo @binding = 5 yo : array<float>    // [B x qd] attention out
+    @uniform @binding = 6 cnt : uint        // context depth (pos + 1)
+    @uniform @binding = 7 nblk : uint       // blocks per row = kv_dim / 32
+    @uniform @binding = 8 nheads : uint
+    @uniform @binding = 9 kv_mul : uint
+    @uniform @binding = 10 scale : float
+    @workgroup scores : float[2048]
+    @workgroup red : float[4]
+
+    [metal_kernel(name="lab_sq_attn_q8_msl")]
+    def lab_sq_attn_q8 {
+        let head_size = 128u                // == threads per group; lane owns one V column
+        let wg = gl_WorkGroupID.x
+        let h = wg % nheads
+        let bb = wg / nheads
+        let lid = gl_LocalInvocationID.x
+        let khblk = (h / kv_mul) * (head_size / 32u)   // kv head offset in BLOCKS
+        let qoff = bb * (nheads * head_size) + h * head_size
+        // pass 1: simdgroup-cooperative score fill — sg owns row j; lane sl's 4 elements share
+        // block sl/8, so d multiplies the lane dot once
+        let sg = gl_SubgroupID
+        let sl = gl_SubgroupInvocationID
+        let qb = qoff + sl * 4u
+        let q0 = q[qb]
+        let q1 = q[qb + 1u]
+        let q2 = q[qb + 2u]
+        let q3 = q[qb + 3u]
+        let inblk = (sl % 8u) * 4u          // this lane's byte offset inside its block's quants
+        var j = sg
+        while (j < cnt) {
+            let blk = j * nblk + khblk + sl / 8u
+            let d = float(ksh[blk * 17u])
+            let kb = blk * 34u + 2u + inblk
+            var s = q0 * float(kqb[kb])
+            s += q1 * float(kqb[kb + 1u])
+            s += q2 * float(kqb[kb + 2u])
+            s += q3 * float(kqb[kb + 3u])
+            s = simd_sum(s * d)
+            if (sl == 0u) {
+                scores[j] = s * scale
+            }
+            j += gl_NumSubgroups
+        }
+        barrier()
+        // pass 2a: max — strided local, simd butterfly, cross-simdgroup partials
+        var m = -3.0e38
+        j = lid
+        while (j < cnt) {
+            m = max(m, scores[j])
+            j += 128u
+        }
+        m = max(m, simd_shuffle_xor(m, 16u))
+        m = max(m, simd_shuffle_xor(m, 8u))
+        m = max(m, simd_shuffle_xor(m, 4u))
+        m = max(m, simd_shuffle_xor(m, 2u))
+        m = max(m, simd_shuffle_xor(m, 1u))
+        if (gl_SubgroupInvocationID == 0u) {
+            red[gl_SubgroupID] = m
+        }
+        barrier()
+        m = max(max(red[0], red[1]), max(red[2], red[3]))
+        barrier()                           // red[] reused for the sum below
+        // pass 2b: exp in place + sum
+        var l = 0.0
+        j = lid
+        while (j < cnt) {
+            let w = exp(scores[j] - m)
+            scores[j] = w
+            l += w
+            j += 128u
+        }
+        l += simd_shuffle_xor(l, 16u)
+        l += simd_shuffle_xor(l, 8u)
+        l += simd_shuffle_xor(l, 4u)
+        l += simd_shuffle_xor(l, 2u)
+        l += simd_shuffle_xor(l, 1u)
+        if (gl_SubgroupInvocationID == 0u) {
+            red[gl_SubgroupID] = l
+        }
+        barrier()
+        l = red[0] + red[1] + red[2] + red[3]
+        // pass 3: lane owns V column lid — dequant rides the weighted sum (scale + quant land
+        // on the same cacheline, so the column walk still touches ~one line per row)
+        let vblk0 = khblk + lid / 32u
+        let vin = lid % 32u
+        var acc = 0.0
+        j = 0u
+        while (j < cnt) {
+            let blk = j * nblk + vblk0
+            acc += scores[j] * float(vqb[blk * 34u + 2u + vin]) * float(vsh[blk * 17u])
             j++
         }
         yo[qoff + lid] = acc / l
@@ -702,7 +814,11 @@ class MetalSqAttnCombLabP {
 }
 
 // CPU twin — same math, f32 throughout, natural order
-def private cpu_sq_attn(kc, vc : array<float16>; q : array<float>; nb, cnt, nheads, head_size, kv_dim, kv_mul : int64;
+def private at_f(a : array<float16>; i : int64) : float => float(a[i])
+def private at_f(a : array<float>; i : int64) : float => a[i]
+
+// generic over the K/V element type (f16 mirror or a dequantized-f32 codec oracle)
+def private cpu_sq_attn(kc, vc; q : array<float>; nb, cnt, nheads, head_size, kv_dim, kv_mul : int64;
                         scale : float) : array<float> {
     var yo : array<float>
     yo |> resize(int(nb * nheads * head_size))
@@ -716,7 +832,7 @@ def private cpu_sq_attn(kc, vc : array<float16>; q : array<float>; nb, cnt, nhea
             for (j in range64(cnt)) {
                 var s = 0.0
                 for (e in range64(head_size)) {
-                    s += q[qoff + e] * float(kc[j * kv_dim + khoff + e])
+                    s += q[qoff + e] * at_f(kc, j * kv_dim + khoff + e)
                 }
                 sc[j] = s * scale
                 m = max(m, sc[j])
@@ -729,7 +845,7 @@ def private cpu_sq_attn(kc, vc : array<float16>; q : array<float>; nb, cnt, nhea
             for (e in range64(head_size)) {
                 var acc = 0.0
                 for (j in range64(cnt)) {
-                    acc += sc[j] * float(vc[j * kv_dim + khoff + e])
+                    acc += sc[j] * at_f(vc, j * kv_dim + khoff + e)
                 }
                 yo[qoff + e] = acc / l
             }
@@ -746,7 +862,7 @@ def private env_or(name : string; dflt : int) : int {
 def private upload_array(dev; arr; bytes : int64) {
     var buf = metal_new_buffer(dev, uint64(bytes))
     unsafe {
-        memcpy(metal_buffer_contents(buf), addr < void? >(arr[0]), int(bytes))
+        memcpy(metal_buffer_contents(buf), addr < void ? > (arr[0]), int(bytes))
     }
     return buf
 }
@@ -953,7 +1069,7 @@ def private run_attn_b2_sidebyside(b) {
             est[arm] = ms0
             ygot |> resize(int(nb * qd))
             unsafe {
-                memcpy(addr < void? >(ygot[0]), metal_buffer_contents(ybuf), int(nb * qd * 4l))
+                memcpy(addr < void ? > (ygot[0]), metal_buffer_contents(ybuf), int(nb * qd * 4l))
             }
             var maxd = 0.0
             for (i in range64(nb * qd)) {
@@ -1063,28 +1179,57 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
     var err : string
     var pso = pipeline_from_source(dev, metal_sq_attn_msl, metal_sq_attn_msl_entry, true, err)
     b |> success(pso != null, "sq attention kernel compiles")
-    if (pso == null) {
+    var pso8 = pipeline_from_source(dev, lab_sq_attn_q8_msl, lab_sq_attn_q8_msl_entry, true, err)
+    b |> success(pso8 != null, "q8_0-cache sq attention kernel compiles")
+    if (pso == null || pso8 == null) {
         to_log(LOG_ERROR, "compile failed: {err}\n")
         metal_release(queue)
         metal_release(dev)
         return
     }
     // exact-in-f16 fills: small ints for K/V, small ints for q
+    var kf : array<float>
+    var vf : array<float>
+    kf |> resize(int(maxrows * kv_dim))
+    vf |> resize(int(maxrows * kv_dim))
     var kc : array<float16>
     var vc : array<float16>
     kc |> resize(int(maxrows * kv_dim))
     vc |> resize(int(maxrows * kv_dim))
     for (i in range64(maxrows * kv_dim)) {
-        kc[i] = float16(float(int((i * 7l + i / 129l) % 9l) - 4))
-        vc[i] = float16(float(int((i * 11l + i / 257l) % 9l) - 4))
+        kf[i] = float(int((i * 7l + i / 129l) % 9l) - 4)
+        vf[i] = float(int((i * 11l + i / 257l) % 9l) - 4)
+        kc[i] = float16(kf[i])
+        vc[i] = float16(vf[i])
     }
     var q : array<float>
     q |> resize(int(16l * qd))
     for (i in range64(16l * qd)) {
         q[i] = float(int((i * 13l + i / 61l) % 9l) - 4)
     }
+    // the q8_0 arm's cache: encode the SAME rows through the CPU codec (the store-side oracle),
+    // and give the correctness gate a dequantized-f32 oracle so codec error stays out of it
+    let nblk_row = kv_dim / 32l
+    let rowb = nblk_row * 34l
+    var k8 : array<uint8>
+    var v8 : array<uint8>
+    k8 |> resize(int(maxrows * rowb))
+    v8 |> resize(int(maxrows * rowb))
+    var kdq : array<float>
+    var vdq : array<float>
+    kdq |> resize(int(maxrows * kv_dim))
+    vdq |> resize(int(maxrows * kv_dim))
+    unsafe {
+        quantize_q8kv_row(addr(k8[0]), addr(kf[0]), maxrows * kv_dim)
+        quantize_q8kv_row(addr(v8[0]), addr(vf[0]), maxrows * kv_dim)
+        cvt_q8kv_to_f32(addr(kdq[0]), addr(k8[0]), maxrows * kv_dim)
+        cvt_q8kv_to_f32(addr(vdq[0]), addr(v8[0]), maxrows * kv_dim)
+    }
     var kbuf = upload_array(dev, kc, maxrows * kv_dim * 2l)
     var vbuf = upload_array(dev, vc, maxrows * kv_dim * 2l)
+    var k8buf = upload_array(dev, k8, maxrows * rowb)
+    var v8buf = upload_array(dev, v8, maxrows * rowb)
+    var nblkbuf = upload_u32(dev, uint(nblk_row))
     var qbuf = upload_array(dev, q, 16l * qd * 4l)
     var ybuf = metal_new_buffer(dev, uint64(16l * qd * 4l))
     var kvdimbuf = upload_u32(dev, uint(kv_dim))
@@ -1095,6 +1240,7 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
     for (depth in [512l, 2048l]) {
         var cntbuf = upload_u32(dev, uint(depth))
         var yref <- cpu_sq_attn(kc, vc, q, 8l, depth, nheads, head_size, kv_dim, kv_mul, scale)
+        var yref8 <- cpu_sq_attn(kdq, vdq, q, 8l, depth, nheads, head_size, kv_dim, kv_mul, scale)
         for (nb in [1, 8]) {
             var bufs <- [kbuf, vbuf, qbuf, ybuf, cntbuf, kvdimbuf, nheadsbuf, kvmulbuf, scalebuf]
             let groups = uint3(uint(nb * int(nheads)), 1u, 1u)
@@ -1109,7 +1255,7 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
             }
             ygot |> resize(int(16l * qd))
             unsafe {
-                memcpy(addr < void? >(ygot[0]), metal_buffer_contents(ybuf), int(int64(nb) * qd * 4l))
+                memcpy(addr < void ? > (ygot[0]), metal_buffer_contents(ybuf), int(int64(nb) * qd * 4l))
             }
             var maxd = 0.0
             for (i in range64(int64(nb) * qd)) {
@@ -1132,12 +1278,52 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
             unsafe {
                 delete bufs
             }
+
+            // the q8_0-cache arm: same q/y, dual-view K/V blobs (each blob bound twice)
+            var bufs8 <- [k8buf, k8buf, v8buf, v8buf, qbuf, ybuf, cntbuf, nblkbuf, nheadsbuf, kvmulbuf, scalebuf]
+            let ms08 = time_reps(queue, pso8, bufs8, groups, 1, lab_sq_attn_q8_msl_tgmem)
+            if (ms08 < 0.0lf) {
+                b |> success(false, "sq_attn_q8 d{depth} B{nb}: dispatch")
+                bufs8 |> clear()
+                unsafe {
+                    delete bufs8
+                }
+                continue
+            }
+            unsafe {
+                memcpy(addr < void ? > (ygot[0]), metal_buffer_contents(ybuf), int(int64(nb) * qd * 4l))
+            }
+            var maxd8 = 0.0
+            for (i in range64(int64(nb) * qd)) {
+                maxd8 = max(maxd8, abs(ygot[i] - yref8[i]))
+            }
+            b |> success(maxd8 < 5.0e-3, "sq_attn_q8 d{depth} B{nb}: matches dequantized CPU twin (maxd {maxd8})")
+            var best8 = 1.0e30lf
+            for (_round in range(rounds)) {
+                let reps = clamp(int(5.0lf / max(ms08, 0.005lf)) + 1, 1, 256)
+                let ms = time_reps(queue, pso8, bufs8, groups, reps, lab_sq_attn_q8_msl_tgmem)
+                if (ms > 0.0lf && ms < best8) {
+                    best8 = ms
+                }
+            }
+            // physical traffic: 34B per 32 elements, K+V (the BW bar vs f16 is 0.53x bytes)
+            let kvbytes8 = double(int64(nb) * nheads * depth * (head_size / 32l * 34l) * 2l)
+            let gbs8 = kvbytes8 / (best8 * 1.0e6lf)
+            to_log(LOG_INFO, "sq_attn_q8 d{depth} B{nb}  {best8} ms  {gbs8} KV GB/s (physical)  f16/q8 speedup {best / best8}x\n")
+            bufs8 |> clear()
+            unsafe {
+                delete bufs8
+            }
         }
         metal_release(cntbuf)
         delete yref
+        delete yref8
     }
     metal_release(kbuf)
     metal_release(vbuf)
+    metal_release(k8buf)
+    metal_release(v8buf)
+    metal_release(nblkbuf)
     metal_release(qbuf)
     metal_release(ybuf)
     metal_release(kvdimbuf)
@@ -1145,10 +1331,17 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
     metal_release(kvmulbuf)
     metal_release(scalebuf)
     metal_release(pso)
+    metal_release(pso8)
     metal_release(queue)
     metal_release(dev)
+    delete kf
+    delete vf
     delete kc
     delete vc
+    delete k8
+    delete v8
+    delete kdq
+    delete vdq
     delete q
     delete ygot
     assert_no_metal_leaks()
