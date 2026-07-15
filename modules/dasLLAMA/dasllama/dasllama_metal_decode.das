@@ -3413,7 +3413,10 @@ def private uniform_f32(v : float) : MetalBuffer? {
 // only the llama-family std shape is wired — the same decline set as prefill_supported minus the
 // npos window (the model/config half, shared by the single-stream and batched drivers)
 def private decode_shape_supported(t : Model) : bool {
-    if ((t.quant != QuantMode.q8 || t.arch != "llama") ||
+    // kquant_native: the per-tensor K-quant planes are NOT readable as qblob offsets — without
+    // this decline a Q4_K_M file passes the q8-mode check and blob_of reads the wrong plane
+    // (silent garbage). Real K-quant kernels are the format-matrix arc's W4.
+    if ((t.quant != QuantMode.q8 || t.kquant_native || t.arch != "llama") ||
             (kernel_backend_needs_repack(active_kernel_backend()) || !get_rope_table_mode())) {
         return false
     }

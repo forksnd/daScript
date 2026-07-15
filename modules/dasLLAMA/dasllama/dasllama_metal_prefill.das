@@ -1250,8 +1250,9 @@ def private prefill_supported(t : Model; s : Session; npos, start_pos : int64) :
     // the GEMM kernel reads ROW-MAJOR Q8 weights — a repack backend's interleaved layout is
     // unreadable here (the same donor contract as the Phase-5c batch offload: load under
     // DASLLAMA_PIN_BACKEND=arm64-sdot or another row-major backend)
+    // kquant_native declines like the decode driver: K-quant plane offsets are not qblob offsets
     if ((start_pos != 0l || npos < g_min_npos || npos > g_max_npos) ||
-            (t.quant != QuantMode.q8 || t.wscale_f16 || t.arch != "llama") ||
+            (t.quant != QuantMode.q8 || t.kquant_native || t.wscale_f16 || t.arch != "llama") ||
             kernel_backend_needs_repack(active_kernel_backend())) {
         return false
     }
