@@ -90,7 +90,7 @@ def private continuation(tr : Model; prompt : array<int64>; n_gen : int; kdt : K
     return <- got
 }
 
-// max |Δ| between two cache slabs' row `pos`, decoded per the (f16/f32/q8_0) codec
+// max |Δ| between two cache slabs' row `pos`, decoded per the (f16/f32/q8_0/tq4) codec
 def private kv_row_max_diff_one(cache_a, cache_b : array<uint8>; base_a, base_b : int64;
                                 dt : KVDtype; kv_dim, pos : int64) : float {
     var maxd = 0.0
@@ -104,13 +104,19 @@ def private kv_row_max_diff_one(cache_a, cache_b : array<uint8>; base_a, base_b 
             for (e in range64(kv_dim)) {
                 maxd = max(maxd, abs(f16_to_f32(uint(ha[e])) - f16_to_f32(uint(hb[e]))))
             }
-        } elif (dt == KVDtype.q8_0) {
+        } elif (dt == KVDtype.q8_0 || dt == KVDtype.tq4) {
+            // block codecs compare dequantized (tq4: in the rotated basis both rows share)
             var da : array<float>
             var db : array<float>
             da |> resize(int(kv_dim))
             db |> resize(int(kv_dim))
-            cvt_q8kv_to_f32(addr(da[0]), pa, kv_dim)
-            cvt_q8kv_to_f32(addr(db[0]), pb, kv_dim)
+            if (dt == KVDtype.q8_0) {
+                cvt_q8kv_to_f32(addr(da[0]), pa, kv_dim)
+                cvt_q8kv_to_f32(addr(db[0]), pb, kv_dim)
+            } else {
+                cvt_tq4kv_to_f32(addr(da[0]), pa, kv_dim)
+                cvt_tq4kv_to_f32(addr(db[0]), pb, kv_dim)
+            }
             for (e in range64(kv_dim)) {
                 maxd = max(maxd, abs(da[e] - db[e]))
             }
@@ -526,6 +532,8 @@ def test_metal_batch_decode_parity(t : T?) {
             batch_step_gate(t, tr, 6, KVDtype.f32, 0.5, 0.25, "B=6 f32")
             batch_step_gate(t, tr, 3, KVDtype.q8_0, 0.5, 0.25, "B=3 q8_0")
             batch_step_gate(t, tr, 6, KVDtype.q8_0, 0.5, 0.25, "B=6 q8_0")
+            batch_step_gate(t, tr, 3, KVDtype.tq4, 1.0, 2.0, "B=3 tq4")   // quant-step-scale envelopes
+            batch_step_gate(t, tr, 6, KVDtype.tq4, 1.0, 2.0, "B=6 tq4")   // (see the single tq4 arm)
 
             // arm B4b: q8_0 greedy streams — the block-codec batch kernels end to end (format-
             // matrix W3): B=3 covers the GEMV path + the chunked partB attention as depth crosses
@@ -538,6 +546,13 @@ def test_metal_batch_decode_parity(t : T?) {
             let cpu8b6 <- batch_greedy(tr, prompts6, 12, KVDtype.q8_0, false, -1, 0)
             let gpu8b6 <- batch_greedy(tr, prompts6, 12, KVDtype.q8_0, true, -1, 0)
             t |> success(streams_match(cpu8b6, gpu8b6), "B=6 q8_0 batched greedy streams match the CPU control (GEMM path)")
+
+            // arm B4c: tq4 greedy streams — FWHT store + nibble attention + unsign, batch shape
+            let cpu4b <- batch_greedy(tr, prompts3, 24, KVDtype.tq4, false, -1, 0)
+            before = metal_batch_decode_stats().steps
+            let gpu4b <- batch_greedy(tr, prompts3, 24, KVDtype.tq4, true, -1, 0)
+            t |> success(metal_batch_decode_stats().steps - before > 0l, "B=3 tq4 arm served on the GPU")
+            t |> success(streams_match(cpu4b, gpu4b), "B=3 tq4 batched greedy streams match the CPU control")
 
             // arm B5: paged sessions — interleaved page tables force multi-run mirror gathers
             let paged_cpu <- paged_batch_greedy(tr, prompts3, 64l, 8, false)
@@ -588,6 +603,7 @@ def test_metal_batch_decode_parity(t : T?) {
                 batch_step_gate(t, tr3, 3, KVDtype.f16, 0.5, 0.25, "B=3 hs128 f16")
                 batch_step_gate(t, tr3, 3, KVDtype.f32, 0.5, 0.25, "B=3 hs128 f32")
                 batch_step_gate(t, tr3, 3, KVDtype.q8_0, 0.5, 0.25, "B=3 hs128 q8_0")   // the partD q8 twin
+                batch_step_gate(t, tr3, 3, KVDtype.tq4, 1.0, 2.0, "B=3 hs128 tq4")      // ... and the partD tq4 twin
                 delete promptsd
                 delete tr3
             } else {
@@ -722,6 +738,20 @@ def test_metal_decode_parity(t : T?) {
             t |> success(metal_decode_stats().decodes - before > 0l, "q8_0 arm served on the GPU")
             t |> success(same(cpu8, gpu8), "40-token q8_0-cache continuation matches the CPU control")
             single_step_gate(t, tr, prompt, KVDtype.q8_0, 0.5, 0.25, "q8_0")
+
+            // arm 7b: tq4 KV mirror — the rotated 4-bit codec (W3): threadgroup-per-head FWHT
+            // store, nibble attention, fwht-unsign epilogue; the CPU tq4 path is the oracle.
+            // Envelopes are quant-step scale (d = amax/8 ⇒ one flipped cell moves a stored row
+            // ~1.3 and logits ~0.65 — measured on the 1B; tokens stay exact on the fixture), so
+            // both tolerances sit at ~2x the q8_0 arm's.
+            let cpu4 <- continuation(tr, prompt, 40, KVDtype.tq4)
+            select_decode_override("metal")
+            before = metal_decode_stats().decodes
+            let gpu4 <- continuation(tr, prompt, 40, KVDtype.tq4)
+            select_decode_override("")
+            t |> success(metal_decode_stats().decodes - before > 0l, "tq4 arm served on the GPU")
+            t |> success(same(cpu4, gpu4), "40-token tq4-cache continuation matches the CPU control")
+            single_step_gate(t, tr, prompt, KVDtype.tq4, 1.0, 2.0, "tq4")
 
             // arm 8: wscale_f16 model — the f16-scale GEMV twin reads the qscales16 halfword
             // plane (llama.cpp q8_0 byte parity); a fresh load owns fresh weight regions

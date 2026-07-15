@@ -27,7 +27,7 @@ require _model_tier
 //   q8        f32     f16    ENGAGE               ENGAGE               ENGAGE
 //   q8        f32     f32    ENGAGE               ENGAGE               ENGAGE
 //   q8        f32     q8_0   ENGAGE               ENGAGE (W3)          ENGAGE (W3)
-//   q8        f32     tq4    ENGAGE               decline kv_dtype     decline kv_dtype
+//   q8        f32     tq4    ENGAGE               ENGAGE (W3)          ENGAGE (W3)
 //   q8        f16     f16    decline wscale_f16   ENGAGE               ENGAGE
 //   Q4_K_M    f32     f16    decline kquant_native x3 (the silent-misread guard — W4 lifts it)
 // plus the prefill-only window clauses: npos < min_npos declines npos_window, a continuation
@@ -174,7 +174,7 @@ def test_metal_support_matrix(t : T?) {
             matrix_cell(t, tr, KVDtype.f16, "q8/s32/f16", "", "", "")
             matrix_cell(t, tr, KVDtype.f32, "q8/s32/f32", "", "", "")
             matrix_cell(t, tr, KVDtype.q8_0, "q8/s32/q8_0", "", "", "")
-            matrix_cell(t, tr, KVDtype.tq4, "q8/s32/tq4", "", "kv_dtype", "kv_dtype")
+            matrix_cell(t, tr, KVDtype.tq4, "q8/s32/tq4", "", "", "")
 
             // the prefill window clauses ride the same model: npos below the default min_npos
             // declines npos_window; a continuation chunk (start_pos > 0) declines start_pos
