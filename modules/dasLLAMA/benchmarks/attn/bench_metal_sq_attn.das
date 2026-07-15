@@ -217,6 +217,116 @@ class MetalSqAttnLabQ8 {
     }
 }
 
+// tq4-cache twin (format-matrix W3): K/V arrive as TurboQuant rotated 4-bit blocks (18B per 32
+// elements — {f16 d; uint8 qs[16]}, element 2i in the low nibble of byte i, d = signed-max/-8).
+// The rows AND the query are already FWHT-rotated (⟨Hx, Hy⟩ = ⟨x, y⟩, so the whole attention
+// runs in the rotated basis; the yo it produces is rotated too — the driver un-rotates once
+// per head downstream). Same dual-view read: scale at halfword 9*b, nibbles at byte 18*b + 2.
+class MetalSqAttnLabTq4 {
+    @ssbo @binding = 0 ksh : array<float16> // K blob, HALF-SCALE view: scale of block b at 9*b
+    @ssbo @binding = 1 kqb : array<uint8>   // the SAME K blob, BYTE view: nibbles at 18*b + 2
+    @ssbo @binding = 2 vsh : array<float16>
+    @ssbo @binding = 3 vqb : array<uint8>
+    @ssbo @binding = 4 q : array<float>     // [B x qd] roped + ROTATED queries
+    @ssbo @binding = 5 yo : array<float>    // [B x qd] attention out (rotated basis)
+    @uniform @binding = 6 cnt : uint
+    @uniform @binding = 7 nblk : uint       // blocks per row = kv_dim / 32
+    @uniform @binding = 8 nheads : uint
+    @uniform @binding = 9 kv_mul : uint
+    @uniform @binding = 10 scale : float
+    @workgroup scores : float[2048]
+    @workgroup red : float[4]
+
+    [metal_kernel(name="lab_sq_attn_tq4_msl")]
+    def lab_sq_attn_tq4 {
+        let head_size = 128u                // == threads per group; lane owns one V column
+        let wg = gl_WorkGroupID.x
+        let h = wg % nheads
+        let bb = wg / nheads
+        let lid = gl_LocalInvocationID.x
+        let khblk = (h / kv_mul) * (head_size / 32u)
+        let qoff = bb * (nheads * head_size) + h * head_size
+        // pass 1: sg owns row j; lane sl's 4 elements = 2 nibble bytes of block sl/8
+        let sg = gl_SubgroupID
+        let sl = gl_SubgroupInvocationID
+        let qb = qoff + sl * 4u
+        let q0 = q[qb]
+        let q1 = q[qb + 1u]
+        let q2 = q[qb + 2u]
+        let q3 = q[qb + 3u]
+        let inb = (sl % 8u) * 2u            // this lane's byte offset inside its block's nibbles
+        var j = sg
+        while (j < cnt) {
+            let blk = j * nblk + khblk + sl / 8u
+            let d = float(ksh[blk * 9u])
+            let kb = blk * 18u + 2u + inb
+            let by0 = uint(kqb[kb])
+            let by1 = uint(kqb[kb + 1u])
+            var s = q0 * float(int(by0 & 15u) - 8)
+            s += q1 * float(int(by0 >> 4u) - 8)
+            s += q2 * float(int(by1 & 15u) - 8)
+            s += q3 * float(int(by1 >> 4u) - 8)
+            s = simd_sum(s * d)
+            if (sl == 0u) {
+                scores[j] = s * scale
+            }
+            j += gl_NumSubgroups
+        }
+        barrier()
+        // pass 2a: max
+        var m = -3.0e38
+        j = lid
+        while (j < cnt) {
+            m = max(m, scores[j])
+            j += 128u
+        }
+        m = max(m, simd_shuffle_xor(m, 16u))
+        m = max(m, simd_shuffle_xor(m, 8u))
+        m = max(m, simd_shuffle_xor(m, 4u))
+        m = max(m, simd_shuffle_xor(m, 2u))
+        m = max(m, simd_shuffle_xor(m, 1u))
+        if (gl_SubgroupInvocationID == 0u) {
+            red[gl_SubgroupID] = m
+        }
+        barrier()
+        m = max(max(red[0], red[1]), max(red[2], red[3]))
+        barrier()                           // red[] reused for the sum below
+        // pass 2b: exp in place + sum
+        var l = 0.0
+        j = lid
+        while (j < cnt) {
+            let w = exp(scores[j] - m)
+            scores[j] = w
+            l += w
+            j += 128u
+        }
+        l += simd_shuffle_xor(l, 16u)
+        l += simd_shuffle_xor(l, 8u)
+        l += simd_shuffle_xor(l, 4u)
+        l += simd_shuffle_xor(l, 2u)
+        l += simd_shuffle_xor(l, 1u)
+        if (gl_SubgroupInvocationID == 0u) {
+            red[gl_SubgroupID] = l
+        }
+        barrier()
+        l = red[0] + red[1] + red[2] + red[3]
+        // pass 3: lane owns V column lid — nibble parity picks the half-byte
+        let vblk0 = khblk + lid / 32u
+        let vbyte = (lid % 32u) / 2u
+        let hi = (lid % 2u) == 1u
+        var acc = 0.0
+        j = 0u
+        while (j < cnt) {
+            let blk = j * nblk + vblk0
+            let by = uint(vqb[blk * 18u + 2u + vbyte])
+            let nib = hi ? (by >> 4u) : (by & 15u)
+            acc += scores[j] * float(int(nib) - 8) * float(vsh[blk * 9u])
+            j++
+        }
+        yo[qoff + lid] = acc / l
+    }
+}
+
 // Pointer-stream rework candidate for the production part kernel (hs == 128 specialization,
 // epl == 4): K reads ONE half4 per lane per position through a walked device pointer (the
 // production form issues 4 scalar half loads + the epl guard chain), q hoists as ONE float4,
@@ -1181,7 +1291,9 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
     b |> success(pso != null, "sq attention kernel compiles")
     var pso8 = pipeline_from_source(dev, lab_sq_attn_q8_msl, lab_sq_attn_q8_msl_entry, true, err)
     b |> success(pso8 != null, "q8_0-cache sq attention kernel compiles")
-    if (pso == null || pso8 == null) {
+    var pso4 = pipeline_from_source(dev, lab_sq_attn_tq4_msl, lab_sq_attn_tq4_msl_entry, true, err)
+    b |> success(pso4 != null, "tq4-cache sq attention kernel compiles")
+    if (pso == null || pso8 == null || pso4 == null) {
         to_log(LOG_ERROR, "compile failed: {err}\n")
         metal_release(queue)
         metal_release(dev)
@@ -1225,10 +1337,49 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
         cvt_q8kv_to_f32(addr(kdq[0]), addr(k8[0]), maxrows * kv_dim)
         cvt_q8kv_to_f32(addr(vdq[0]), addr(v8[0]), maxrows * kv_dim)
     }
+    // the tq4 arm's cache: rotate every K/V/q head (the store-seam basis change), encode through
+    // the CPU codec, dequantized-f32 (still-rotated) oracle — the whole arm runs in the rotated
+    // basis, exactly as production attention does
+    let rowb4 = nblk_row * 18l
+    var signs : array<float>
+    tq4_fill_signs(signs, head_size)
+    var kr := kf
+    var vr := vf
+    var qr := q
+    unsafe {
+        for (r in range64(maxrows)) {
+            for (hh in range64(kv_dim / head_size)) {
+                fwht_signs_row(addr(kr[r * kv_dim + hh * head_size]), addr(signs[0]), head_size)
+                fwht_signs_row(addr(vr[r * kv_dim + hh * head_size]), addr(signs[0]), head_size)
+            }
+        }
+        for (r in range64(16l)) {
+            for (hh in range64(nheads)) {
+                fwht_signs_row(addr(qr[r * qd + hh * head_size]), addr(signs[0]), head_size)
+            }
+        }
+    }
+    var k4 : array<uint8>
+    var v4 : array<uint8>
+    k4 |> resize(int(maxrows * rowb4))
+    v4 |> resize(int(maxrows * rowb4))
+    var kdq4 : array<float>
+    var vdq4 : array<float>
+    kdq4 |> resize(int(maxrows * kv_dim))
+    vdq4 |> resize(int(maxrows * kv_dim))
+    unsafe {
+        quantize_tq4kv_row(addr(k4[0]), addr(kr[0]), maxrows * kv_dim)
+        quantize_tq4kv_row(addr(v4[0]), addr(vr[0]), maxrows * kv_dim)
+        cvt_tq4kv_to_f32(addr(kdq4[0]), addr(k4[0]), maxrows * kv_dim)
+        cvt_tq4kv_to_f32(addr(vdq4[0]), addr(v4[0]), maxrows * kv_dim)
+    }
     var kbuf = upload_array(dev, kc, maxrows * kv_dim * 2l)
     var vbuf = upload_array(dev, vc, maxrows * kv_dim * 2l)
     var k8buf = upload_array(dev, k8, maxrows * rowb)
     var v8buf = upload_array(dev, v8, maxrows * rowb)
+    var k4buf = upload_array(dev, k4, maxrows * rowb4)
+    var v4buf = upload_array(dev, v4, maxrows * rowb4)
+    var qrbuf = upload_array(dev, qr, 16l * qd * 4l)
     var nblkbuf = upload_u32(dev, uint(nblk_row))
     var qbuf = upload_array(dev, q, 16l * qd * 4l)
     var ybuf = metal_new_buffer(dev, uint64(16l * qd * 4l))
@@ -1241,6 +1392,7 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
         var cntbuf = upload_u32(dev, uint(depth))
         var yref <- cpu_sq_attn(kc, vc, q, 8l, depth, nheads, head_size, kv_dim, kv_mul, scale)
         var yref8 <- cpu_sq_attn(kdq, vdq, q, 8l, depth, nheads, head_size, kv_dim, kv_mul, scale)
+        var yref4 <- cpu_sq_attn(kdq4, vdq4, qr, 8l, depth, nheads, head_size, kv_dim, kv_mul, scale)
         for (nb in [1, 8]) {
             var bufs <- [kbuf, vbuf, qbuf, ybuf, cntbuf, kvdimbuf, nheadsbuf, kvmulbuf, scalebuf]
             let groups = uint3(uint(nb * int(nheads)), 1u, 1u)
@@ -1314,15 +1466,55 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
             unsafe {
                 delete bufs8
             }
+
+            // the tq4-cache arm: rotated q, rotated-basis oracle, dual-view nibble blobs
+            var bufs4 <- [k4buf, k4buf, v4buf, v4buf, qrbuf, ybuf, cntbuf, nblkbuf, nheadsbuf, kvmulbuf, scalebuf]
+            let ms04 = time_reps(queue, pso4, bufs4, groups, 1, lab_sq_attn_tq4_msl_tgmem)
+            if (ms04 < 0.0lf) {
+                b |> success(false, "sq_attn_tq4 d{depth} B{nb}: dispatch")
+                bufs4 |> clear()
+                unsafe {
+                    delete bufs4
+                }
+                continue
+            }
+            unsafe {
+                memcpy(addr < void ? > (ygot[0]), metal_buffer_contents(ybuf), int(int64(nb) * qd * 4l))
+            }
+            var maxd4 = 0.0
+            for (i in range64(int64(nb) * qd)) {
+                maxd4 = max(maxd4, abs(ygot[i] - yref4[i]))
+            }
+            b |> success(maxd4 < 5.0e-3, "sq_attn_tq4 d{depth} B{nb}: matches dequantized rotated CPU twin (maxd {maxd4})")
+            var best4 = 1.0e30lf
+            for (_round in range(rounds)) {
+                let reps = clamp(int(5.0lf / max(ms04, 0.005lf)) + 1, 1, 256)
+                let ms = time_reps(queue, pso4, bufs4, groups, reps, lab_sq_attn_tq4_msl_tgmem)
+                if (ms > 0.0lf && ms < best4) {
+                    best4 = ms
+                }
+            }
+            // physical traffic: 18B per 32 elements, K+V (0.28x the f16 bytes)
+            let kvbytes4 = double(int64(nb) * nheads * depth * (head_size / 32l * 18l) * 2l)
+            let gbs4 = kvbytes4 / (best4 * 1.0e6lf)
+            to_log(LOG_INFO, "sq_attn_tq4 d{depth} B{nb}  {best4} ms  {gbs4} KV GB/s (physical)  f16/tq4 speedup {best / best4}x\n")
+            bufs4 |> clear()
+            unsafe {
+                delete bufs4
+            }
         }
         metal_release(cntbuf)
         delete yref
         delete yref8
+        delete yref4
     }
     metal_release(kbuf)
     metal_release(vbuf)
     metal_release(k8buf)
     metal_release(v8buf)
+    metal_release(k4buf)
+    metal_release(v4buf)
+    metal_release(qrbuf)
     metal_release(nblkbuf)
     metal_release(qbuf)
     metal_release(ybuf)
@@ -1332,6 +1524,7 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
     metal_release(scalebuf)
     metal_release(pso)
     metal_release(pso8)
+    metal_release(pso4)
     metal_release(queue)
     metal_release(dev)
     delete kf
@@ -1342,6 +1535,14 @@ def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds n
     delete v8
     delete kdq
     delete vdq
+    delete signs
+    delete kr
+    delete vr
+    delete qr
+    delete k4
+    delete v4
+    delete kdq4
+    delete vdq4
     delete q
     delete ygot
     assert_no_metal_leaks()
