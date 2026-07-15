@@ -2811,6 +2811,29 @@ var private g_attn_single_max = 64l
 // the fused add+rms kernel's threadgroup row slab — wider models take the unfused pair
 let ADD_RMS_MAX_DIM = 4096l
 
+// why a step declined to the CPU path — every gate reports its FIRST failing clause, and the
+// declines-by-reason tables make silent coverage regressions observable (the support-matrix test
+// asserts these names as strings; renaming a value is a test-visible change)
+enum MetalDecodeDecline {
+    none                // supported — the step runs on the GPU
+    quant_mode          // weights not loaded under QuantMode.q8
+    kquant_native       // per-tensor K-quant planes: not readable as qblob offsets (kernels = W4)
+    arch                // not the llama family graph
+    backend_repack      // repack backend: interleaved weight layout unreadable by the GPU kernels
+    rope_mode           // rope tables off
+    config              // feature-flag config the kernels don't implement (neox/bias/qk-norm/softcap/...)
+    shape               // head/dim alignment outside the kernel grids
+    layers              // per-layer non-uniformity (kv_dim/head_size/hidden/sliding/missing wv)
+    kv_dtype            // session KV codec not uniform f16/f32 (the mirror moves raw row bytes)
+    depth               // context deeper than MAX_ATTN_ROWS
+    no_uid              // session without a real uid (mirror keying)
+    rope_rows           // the position's rope row not built
+    batch_dim_cap       // batch: dim exceeds the add+rms/GEMM row slabs for this B
+    device              // metal_decode_init failed (no device / PSO build failure)
+    mirror              // the mirror arena cannot hold the KV slice
+    gpu_error           // dispatch failed at execution time
+}
+
 var private g_dev : MetalDevice?
 var private g_queue : MetalCommandQueue?
 var private g_failed = false
@@ -2819,6 +2842,7 @@ var private g_pool : MetalBufferPool
 var private g_upool : MetalBufferPool                // UNTRACKED pool: uniforms + rope rows (GPU-read-only)
 var private g_decodes = 0l
 var private g_declines = 0l
+var private g_declines_by_reason : table<string; int64>
 var private g_logits_cpu = false
 var private g_skip = ""                              // DASLLAMA_METAL_DECODE_SKIP=gemv|attn|ew knockout rail
 var private g_pso_gemv : MetalComputePipeline?
@@ -2875,6 +2899,7 @@ var private g_gpu_ms = 0.0lf
 var private g_batch_steps = 0l
 var private g_batch_rows = 0l
 var private g_batch_declines = 0l
+var private g_batch_declines_by_reason : table<string; int64>
 var private g_us_bsetup = 0l
 var private g_us_bencode = 0l
 var private g_us_bwait = 0l
@@ -2964,14 +2989,35 @@ def public set_metal_decode_logits_cpu(v : bool) {
     g_logits_cpu = v
 }
 
+def private decline(why : MetalDecodeDecline) {
+    g_declines++
+    g_declines_by_reason["{why}"]++
+}
+
+def private batch_decline(why : MetalDecodeDecline) {
+    g_batch_declines++
+    g_batch_declines_by_reason["{why}"]++
+}
+
 //! (gpu decode steps served, declines to the CPU path) since load — diagnostics / tests.
 def public metal_decode_stats() : tuple<decodes : int64; declines : int64> {
     return (decodes = g_decodes, declines = g_declines)
 }
 
+//! Single-stream declines-by-reason since load — reason name -> count (the first failing gate
+//! clause per declined step). The support-matrix test asserts WHY a config declined.
+def public metal_decode_declines() : table<string; int64> {
+    return clone_to_move(g_declines_by_reason)
+}
+
 //! (batched eval_batch steps served, total rows across them, batch declines) since load.
 def public metal_batch_decode_stats() : tuple<steps : int64; rows : int64; declines : int64> {
     return (steps = g_batch_steps, rows = g_batch_rows, declines = g_batch_declines)
+}
+
+//! Batched-step declines-by-reason since load — reason name -> count.
+def public metal_batch_decode_declines() : table<string; int64> {
+    return clone_to_move(g_batch_declines_by_reason)
 }
 
 // speculative-chain state: the pre-encoded next step may open with GPU argmax + embed gather off
@@ -3058,12 +3104,24 @@ def public metal_decode_mirror_stats() : tuple<mirrors : int64; bytes : uint64> 
     return (mirrors = int64(length(g_mirrors)), bytes = g_mirror_bytes)
 }
 
+// " reason=count reason=count" — the declines-by-reason tail of a report line
+def private declines_line(tab : table<string; int64>) : string {
+    return build_string() $(var w) {
+        for (k, v in keys(tab), values(tab)) {
+            w |> write(" ")
+            w |> write(k)
+            w |> write("=")
+            w |> write(v)
+        }
+    }
+}
+
 //! One cumulative per-stage timing line for the steps served since load (decode is per-token, so
-//! the driver never logs per step).
+//! the driver never logs per step) + declines-by-reason for all three GPU paths — the decline
+//! tables surface HERE even when zero steps served (the silent-decline case this report exists for).
 def public metal_decode_stage_report {
     if (g_decodes == 0l && g_batch_steps == 0l) {
         to_log(LOG_INFO, "dasLLAMA metal decode: no steps served\n")
-        return
     }
     if (g_decodes > 0l) {
         let n = float(g_decodes)
@@ -3072,6 +3130,18 @@ def public metal_decode_stage_report {
     if (g_batch_steps > 0l) {
         let n = float(g_batch_steps)
         to_log(LOG_INFO, "dasLLAMA metal batch decode: {g_batch_steps} steps ({g_batch_rows} rows)  per-step setup={float(g_us_bsetup) / n}us encode={float(g_us_bencode) / n}us wait={float(g_us_bwait) / n}us (sched {g_sched_b_ms * 1000.0lf / double(g_batch_steps)}us handoff {g_handoff_b_ms * 1000.0lf / double(g_batch_steps)}us gpu {g_gpu_b_ms * 1000.0lf / double(g_batch_steps)}us) readback+writeback={float(g_us_breadback) / n}us\n")
+    }
+    if (g_declines > 0l) {
+        to_log(LOG_INFO, "dasLLAMA metal decode declines: {g_declines} —{declines_line(g_declines_by_reason)}\n")
+    }
+    if (g_batch_declines > 0l) {
+        to_log(LOG_INFO, "dasLLAMA metal batch decode declines: {g_batch_declines} —{declines_line(g_batch_declines_by_reason)}\n")
+    }
+    let pf = metal_prefill_stats()
+    if (pf.declines > 0l) {
+        var pfd <- metal_prefill_declines()
+        to_log(LOG_INFO, "dasLLAMA metal prefill declines: {pf.declines} —{declines_line(pfd)}\n")
+        delete pfd
     }
 }
 
@@ -3366,17 +3436,17 @@ def private upload_scales(t : Model; off, rows, n : int64) : MetalBuffer? {
     let cnt = rows * (n / 32l)
     unsafe {
         if (t.wscale_f16) {
-            return upload_region(addr < void? >(t.qscales16[off / 32l]), uint64(cnt * 2l))
+            return upload_region(addr < void ? > (t.qscales16[off / 32l]), uint64(cnt * 2l))
         }
-        return upload_region(addr < void? >(t.qscales[off / 32l]), uint64(cnt * 4l))
+        return upload_region(addr < void ? > (t.qscales[off / 32l]), uint64(cnt * 4l))
     }
 }
 
 // one tensor's resident 34B q8-block blob (the prefill module's cache — shared, repacked once)
 def private blob_of(t : Model; off, rows, n : int64) : MetalBuffer? {
     unsafe {
-        let q = addr < void? >(t.qblob[off])
-        let s = t.wscale_f16 ? addr < void? >(t.qscales16[off / 32l]) : addr < void? >(t.qscales[off / 32l])
+        let q = addr < void ? > (t.qblob[off])
+        let s = t.wscale_f16 ? addr < void ? > (t.qscales16[off / 32l]) : addr < void ? > (t.qscales[off / 32l])
         return metal_blob_region(g_dev, q, s, rows, n, t.wscale_f16)
     }
 }
@@ -3386,11 +3456,11 @@ def private upload_scales_cat3(t : Model; off0, rows0, off1, rows1, off2, rows2,
     let ssz = t.wscale_f16 ? 2l : 4l
     let nb = n / 32l
     unsafe {
-        let p0 = t.wscale_f16 ? addr < void? >(t.qscales16[off0 / 32l]) : addr < void? >(t.qscales[off0 / 32l])
-        let p1 = t.wscale_f16 ? addr < void? >(t.qscales16[off1 / 32l]) : addr < void? >(t.qscales[off1 / 32l])
+        let p0 = t.wscale_f16 ? addr < void ? > (t.qscales16[off0 / 32l]) : addr < void ? > (t.qscales[off0 / 32l])
+        let p1 = t.wscale_f16 ? addr < void ? > (t.qscales16[off1 / 32l]) : addr < void ? > (t.qscales[off1 / 32l])
         var p2 : void?
         if (rows2 > 0l) {
-            p2 = t.wscale_f16 ? addr < void? >(t.qscales16[off2 / 32l]) : addr < void? >(t.qscales[off2 / 32l])
+            p2 = t.wscale_f16 ? addr < void ? > (t.qscales16[off2 / 32l]) : addr < void ? > (t.qscales[off2 / 32l])
         }
         return upload_region_cat3(p0, uint64(rows0 * nb * ssz), p1, uint64(rows1 * nb * ssz), p2, uint64(rows2 * nb * ssz))
     }
@@ -3410,21 +3480,33 @@ def private uniform_f32(v : float) : MetalBuffer? {
     return buf
 }
 
-// only the llama-family std shape is wired — the same decline set as prefill_supported minus the
-// npos window (the model/config half, shared by the single-stream and batched drivers)
-def private decode_shape_supported(t : Model) : bool {
+// only the llama-family std shape is wired — the same decline set as prefill_decline minus the
+// npos window (the model/config half, shared by the single-stream and batched drivers). Returns
+// the FIRST failing clause; .none = supported.
+def private decode_shape_decline(t : Model) : MetalDecodeDecline {
+    if (t.quant != QuantMode.q8) {
+        return MetalDecodeDecline.quant_mode
+    }
     // kquant_native: the per-tensor K-quant planes are NOT readable as qblob offsets — without
     // this decline a Q4_K_M file passes the q8-mode check and blob_of reads the wrong plane
     // (silent garbage). Real K-quant kernels are the format-matrix arc's W4.
-    if ((t.quant != QuantMode.q8 || t.kquant_native || t.arch != "llama") ||
-            (kernel_backend_needs_repack(active_kernel_backend()) || !get_rope_table_mode())) {
-        return false
+    if (t.kquant_native) {
+        return MetalDecodeDecline.kquant_native
+    }
+    if (t.arch != "llama") {
+        return MetalDecodeDecline.arch
+    }
+    if (kernel_backend_needs_repack(active_kernel_backend())) {
+        return MetalDecodeDecline.backend_repack
+    }
+    if (!get_rope_table_mode()) {
+        return MetalDecodeDecline.rope_mode
     }
     let c = t.config
     if ((c.rope_neox || c.attn_qkv_bias || c.qk_norm || c.v_norm || c.pre_post_norm) ||
             (c.layer_out_scale || c.attn_sinks || c.attn_logit_softcap > 0.0 || c.sliding_window > 0l) ||
             (c.ffn_act != FfnAct.silu || c.attn_scale > 0.0)) {
-        return false
+        return MetalDecodeDecline.config
     }
     let head_size = c.head_size
     let qd = c.n_heads * head_size
@@ -3433,28 +3515,40 @@ def private decode_shape_supported(t : Model) : bool {
     // head_size == the attention threadgroup width: whole simdgroups only, red[] holds <= 4
     if ((qd != c.dim || (head_size % 32l) != 0l || head_size > 128l) ||
             ((c.dim % 32l) != 0l || (kv_dim % 32l) != 0l || (hidden % 32l) != 0l)) {
-        return false
+        return MetalDecodeDecline.shape
     }
     for (l in range64(c.n_layers)) {
         if ((t.kv_src[l] != l || layer_kv_dim(c, l) != kv_dim || layer_head_size(c, l) != head_size) ||
                 (layer_hidden(t, l) != hidden || layer_is_sliding(c, l) || t.wv_offs[l] < 0l)) {
-            return false
+            return MetalDecodeDecline.layers
         }
     }
-    return true
+    return MetalDecodeDecline.none
 }
 
 // ... plus the decode-specific gates (uniform f16/f32 KV, attention depth, a real session uid)
-def private decode_supported(t : Model; s : Session; pos : int64) : bool {
+def private decode_decline(t : Model; s : Session; pos : int64) : MetalDecodeDecline {
     // the mirror + writeback move raw row bytes, so the session codec must equal the mirror
     // dtype; the attention kernel's threadgroup score slab caps the depth — deeper steps run on
     // the CPU and the watermark contract mirrors them back in if the driver is ever re-entered
-    if ((s.kv_dtype_k != s.kv_dtype_v || (s.kv_dtype_k != KVDtype.f16 && s.kv_dtype_k != KVDtype.f32)) ||
-            (pos + 1l > MAX_ATTN_ROWS || s.uid == 0ul) || !decode_shape_supported(t)) {
-        return false
+    if (s.kv_dtype_k != s.kv_dtype_v || (s.kv_dtype_k != KVDtype.f16 && s.kv_dtype_k != KVDtype.f32)) {
+        return MetalDecodeDecline.kv_dtype
+    }
+    if (pos + 1l > MAX_ATTN_ROWS) {
+        return MetalDecodeDecline.depth
+    }
+    if (s.uid == 0ul) {
+        return MetalDecodeDecline.no_uid
+    }
+    let shape = decode_shape_decline(t)
+    if (shape != MetalDecodeDecline.none) {
+        return shape
     }
     // forward() built this position's rope row right before the hook
-    return int64(length(s.rope_cos)) >= t.config.head_size / 2l
+    if (int64(length(s.rope_cos)) < t.config.head_size / 2l) {
+        return MetalDecodeDecline.rope_rows
+    }
+    return MetalDecodeDecline.none
 }
 
 // Evict least-recently-used mirrors (never `keep`, never a pinned batch row) until the resident
@@ -4178,9 +4272,9 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
 // the token-dependent input bytes — the ONLY step state not known at encode time
 def private poke_step(s : Session; r : StepRes) {
     unsafe {
-        memcpy(metal_buffer_contents(r.bx), addr < void? >(s.x[0]), int(r.bytes_x))
-        memcpy(metal_buffer_contents(r.bcos), addr < void? >(s.rope_cos[0]), int(r.bytes_tab))
-        memcpy(metal_buffer_contents(r.bsin), addr < void? >(s.rope_sin[0]), int(r.bytes_tab))
+        memcpy(metal_buffer_contents(r.bx), addr < void ? > (s.x[0]), int(r.bytes_x))
+        memcpy(metal_buffer_contents(r.bcos), addr < void ? > (s.rope_cos[0]), int(r.bytes_tab))
+        memcpy(metal_buffer_contents(r.bsin), addr < void ? > (s.rope_sin[0]), int(r.bytes_tab))
     }
 }
 
@@ -4213,7 +4307,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
         // the speculative head: greedy-pick the previous step's logits, gather the winner's
         // embedding row into r.bx (the cls_q8 linear plane — gated in pre_encode_next)
         unsafe {
-            var bembq = upload_region(addr < void? >(t.qblob[t.emb_q8_off]), uint64(c.vocab_size * dim))
+            var bembq = upload_region(addr < void ? > (t.qblob[t.emb_q8_off]), uint64(c.vocab_size * dim))
             var bembs = upload_scales(t, t.emb_q8_off, c.vocab_size, dim)
             enc_argmax(enc, prev_blog, r.btok, r.u_vocab)
             enc_embed(enc, r.s16, bembq, bembs, r.btok, r.bx, r.u_dim, dim)
@@ -4222,7 +4316,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     // layer-0 attention norm — the per-layer trailing add+rms is fused and feeds the NEXT layer
     if (g_skip != "ew") {
         unsafe {
-            var bw_att0 = upload_region(addr < void? >(t.fblob[t.rms_att_off]), uint64(dim * 4l))
+            var bw_att0 = upload_region(addr < void ? > (t.fblob[t.rms_att_off]), uint64(dim * 4l))
             enc_rms(enc, r.bx, bw_att0, r.bxb, r.u_dim, r.u_eps)
         }
     }
@@ -4233,9 +4327,9 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             // fused residual add + ffn norm
             if (g_skip != "gemv") {
                 var bwqkv = upload_region_cat3(
-                    addr < void? >(t.qblob[t.wq_offs[l]]), uint64(qd * dim),
-                    addr < void? >(t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
-                    addr < void? >(t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
+                    addr < void ? > (t.qblob[t.wq_offs[l]]), uint64(qd * dim),
+                    addr < void ? > (t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
+                    addr < void ? > (t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
                 var bwqkv_s = upload_scales_cat3(t, t.wq_offs[l], qd, t.wk_offs[l], kv_dim, t.wv_offs[l], kv_dim, dim)
                 if (r.s16) {
                     enc_gemv_qkv_rs(enc, r.f16, bwqkv, bwqkv_s, r.bxb, r.bqkv, g_arena, g_arena,
@@ -4261,20 +4355,20 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 }
             }
             if (g_skip != "gemv") {
-                var bwo = upload_region(addr < void? >(t.qblob[t.wo_offs[l]]), uint64(dim * qd))
+                var bwo = upload_region(addr < void ? > (t.qblob[t.wo_offs[l]]), uint64(dim * qd))
                 var bwo_s = upload_scales(t, t.wo_offs[l], dim, qd)
                 enc_gemv(enc, r.s16, bwo, bwo_s, r.bxb, r.bxb2, r.u_qd, r.u_dim, dim)
             }
             // ffn: fused add+norm -> fused W1|W3 GEMV -> swiglu -> W2 GEMV -> fused add + the
             // NEXT layer's attention norm (plain add on the last layer — the final norm follows)
             if (g_skip != "ew") {
-                var bw_ffn = upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
+                var bw_ffn = upload_region(addr < void ? > (t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
                 enc_add_rms_site(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, dim)
             }
             if (g_skip != "gemv") {
                 var bw13 = upload_region_cat3(
-                    addr < void? >(t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
-                    addr < void? >(t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
+                    addr < void ? > (t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
+                    addr < void ? > (t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
                 var bw13_s = upload_scales_cat3(t, t.w1_offs[l], hidden, t.w3_offs[l], hidden, 0l, 0l, dim)
                 if (r.s16) {   // fused gate+up dot with the swiglu epilogue — one dispatch
                     enc_gemv_w13sw(enc, bw13, bw13_s, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
@@ -4286,13 +4380,13 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(hidden * 4l), r.u_hidden, hidden)
             }
             if (g_skip != "gemv") {
-                var bw2 = upload_region(addr < void? >(t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
+                var bw2 = upload_region(addr < void ? > (t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
                 var bw2_s = upload_scales(t, t.w2_offs[l], dim, hidden)
                 enc_gemv(enc, r.s16, bw2, bw2_s, r.bh12, r.bxb, r.u_hidden, r.u_dim, dim)
             }
             if (g_skip != "ew") {
                 if (l + 1l < c.n_layers) {
-                    var bw_attn = upload_region(addr < void? >(t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
+                    var bw_attn = upload_region(addr < void ? > (t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
                     enc_add_rms_site(enc, r.bx, r.bxb, bw_attn, r.bxb, r.u_dim, r.u_eps, dim)
                 } else {
                     enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb, 0ul, r.u_dim, dim)
@@ -4303,8 +4397,8 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     if (r.gpu_logits) {
         // final rmsnorm (one row) + classifier GEMV — the caller samples straight from s.logits
         unsafe {
-            var bwfin = upload_region(addr < void? >(t.fblob[t.rms_final_off]), uint64(dim * 4l))
-            var bwc = upload_region(addr < void? >(t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
+            var bwfin = upload_region(addr < void ? > (t.fblob[t.rms_final_off]), uint64(dim * 4l))
+            var bwc = upload_region(addr < void ? > (t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
             var bwc_s = upload_scales(t, t.wcls_off, c.vocab_size, dim)
             enc_rms(enc, r.bx, bwfin, r.bxf, r.u_dim, r.u_eps)
             enc_gemv(enc, r.s16, bwc, bwc_s, r.bxf, r.blog, r.u_dim, r.u_vocab, c.vocab_size)
@@ -4336,7 +4430,7 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
         let pos = r.pos
         let cap = r.cap
         unsafe {
-            memcpy(addr < void? >(s.x[0]), metal_buffer_contents(r.bx), int(r.bytes_x))
+            memcpy(addr < void ? > (s.x[0]), metal_buffer_contents(r.bx), int(r.bytes_x))
             var kmp = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + r.koff
             var vmp = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + r.voff
             let prow = kv_phys_row(s, pos)
@@ -4347,7 +4441,7 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
                     reinterpret<void?>(vmp + (l * cap + pos) * rowb), int(rowb))
             }
             if (r.gpu_logits) {
-                memcpy(addr < void? >(s.logits[0]), metal_buffer_contents(r.blog), int(r.bytes_log))
+                memcpy(addr < void ? > (s.logits[0]), metal_buffer_contents(r.blog), int(r.bytes_log))
             }
         }
         if (r.gpu_logits) {
@@ -4358,7 +4452,7 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
         g_decodes++
     } else {
         to_log(LOG_ERROR, "dasLLAMA metal decode: dispatch failed ({err}) — falling back to the CPU layer loop\n")
-        g_declines++
+        decline(MetalDecodeDecline.gpu_error)
     }
     return ok
 }
@@ -4432,7 +4526,8 @@ def private discard_pre {
 // stays uncommitted and the next call pokes + commits. Declines quietly when the next step's
 // gates fail or the mirror would need a rebuild — the slow path serves those.
 def private pre_encode_next(t : Model; s : Session; npos : int64; var prev_blog : MetalBuffer?) {
-    if (!decode_supported(t, s, npos) || !key_exists(g_mirrors, s.uid)) {
+    // quiet non-decline: skipping the pre-encode just means the slow path serves the next step
+    if (decode_decline(t, s, npos) != MetalDecodeDecline.none || !key_exists(g_mirrors, s.uid)) {
         return
     }
     let mr = g_mirrors[s.uid]   // cheap copy, capacity check ONLY — row npos-1 is in flight on the GPU
@@ -4449,8 +4544,8 @@ def private pre_encode_next(t : Model; s : Session; npos : int64; var prev_blog 
         r.btok = pool_acquire(g_pool, g_dev, 64ul)
         build_decode_rope_row(t, npos, g_rope_cos_next, g_rope_sin_next)
         unsafe {
-            memcpy(metal_buffer_contents(r.bcos), addr < void? >(g_rope_cos_next[0]), int(r.bytes_tab))
-            memcpy(metal_buffer_contents(r.bsin), addr < void? >(g_rope_sin_next[0]), int(r.bytes_tab))
+            memcpy(metal_buffer_contents(r.bcos), addr < void ? > (g_rope_cos_next[0]), int(r.bytes_tab))
+            memcpy(metal_buffer_contents(r.bsin), addr < void ? > (g_rope_sin_next[0]), int(r.bytes_tab))
         }
         encode_step(t, r, true, prev_blog)
     } else {
@@ -4466,7 +4561,7 @@ def private metal_decode_slow(t : Model; var s : Session; pos : int64) : bool {
     let ts_all = ref_time_ticks()
     let mir = mirror_prepare(t, s, pos)
     if (!mir.ok) {
-        g_declines++
+        decline(MetalDecodeDecline.mirror)
         return false
     }
     var r = acquire_step(t, s, pos, mir.koff, mir.voff, mir.cap)
@@ -4489,9 +4584,13 @@ def metal_decode_forward(t : Model; var s : Session; token, pos : int64) : bool 
     // and logits — land it before reading anything session-side (no-op when nothing pends)
     finish_pending_step()
     g_lp_err = false
-    if (!decode_supported(t, s, pos) || !metal_decode_init()) {
+    var why = decode_decline(t, s, pos)
+    if (why == MetalDecodeDecline.none && !metal_decode_init()) {
+        why = MetalDecodeDecline.device
+    }
+    if (why != MetalDecodeDecline.none) {
         discard_pre()   // the sequence diverged from the prediction
-        g_declines++
+        decline(why)
         return false
     }
     if (!(g_pre.valid && g_pre.uid == s.uid && g_pre.pos == pos &&
@@ -4595,26 +4694,35 @@ var private g_b_voffs : array<uint64>
 var private g_b_caps : array<int64>
 var private g_b_ulays : array<MetalBuffer?>   // per-layer uniforms, pooled per step
 
-// the model half is decode_shape_supported; per batch: uniform f16/f32 KV (eval_batch snapshots
+// the model half is decode_shape_decline; per batch: uniform f16/f32 KV (eval_batch snapshots
 // the dtypes onto ws.scr), every row within the attention depth cap with a real uid, per-row
 // rope rows built, and dim within the add+rms row slabs (the GEMM path caps at 3072, the
 // fixed-B GEMV path at ADD_RMS_MAX_DIM — B >= 5 on a wider model declines)
-def private batch_decode_supported(t : Model; ws : BatchWorkspace; sessions : array<Session?>; nrows : int64) : bool {
-    if (!decode_shape_supported(t)) {
-        return false
+def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : array<Session?>; nrows : int64) : MetalDecodeDecline {
+    let shape = decode_shape_decline(t)
+    if (shape != MetalDecodeDecline.none) {
+        return shape
     }
     let c = t.config
     let kdt = ws.scr.kv_dtype_k
-    if ((ws.scr.kv_dtype_v != kdt || (kdt != KVDtype.f16 && kdt != KVDtype.f32)) ||
-            c.dim > (nrows <= 4l ? ADD_RMS_MAX_DIM : 3072l)) {
-        return false
+    if (ws.scr.kv_dtype_v != kdt || (kdt != KVDtype.f16 && kdt != KVDtype.f32)) {
+        return MetalDecodeDecline.kv_dtype
+    }
+    if (c.dim > (nrows <= 4l ? ADD_RMS_MAX_DIM : 3072l)) {
+        return MetalDecodeDecline.batch_dim_cap
     }
     for (i in range64(nrows)) {
-        if (sessions[i].uid == 0ul || ws.positions[i] + 1l > MAX_ATTN_ROWS) {
-            return false
+        if (sessions[i].uid == 0ul) {
+            return MetalDecodeDecline.no_uid
+        }
+        if (ws.positions[i] + 1l > MAX_ATTN_ROWS) {
+            return MetalDecodeDecline.depth
         }
     }
-    return int64(length(ws.scr.rope_cos)) >= nrows * (c.head_size / 2l)
+    if (int64(length(ws.scr.rope_cos)) < nrows * (c.head_size / 2l)) {
+        return MetalDecodeDecline.rope_rows
+    }
+    return MetalDecodeDecline.none
 }
 
 //! The BatchDecodeOverrideFn (P4): one eval_batch step's whole layer stack GPU-resident — B rows
@@ -4624,10 +4732,14 @@ def private batch_decode_supported(t : Model; ws : BatchWorkspace; sessions : ar
 //! residuals; the CPU tail (final rms, classifier, scatter, n_past++) stays with the caller.
 //! false = declined — the CPU layer loop recomputes from clean state (x_b written only on ok).
 def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; nrows : int64) : bool {
-    if (!batch_decode_supported(t, ws, sessions, nrows) || !metal_decode_init()) {
+    var why = batch_decode_decline(t, ws, sessions, nrows)
+    if (why == MetalDecodeDecline.none && !metal_decode_init()) {
+        why = MetalDecodeDecline.device
+    }
+    if (why != MetalDecodeDecline.none) {
         finish_pending_step()   // the CPU fallback needs the in-flight step's KV/logits landed first
         g_lp_err = false
-        g_batch_declines++
+        batch_decline(why)
         return false
     }
     // a parked single-stream pre-step may reference a batch row's mirror slice — retire it first
@@ -4700,7 +4812,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     if (!rows_ok) {
         finish_pending_step()   // fall back synchronously — the CPU loop needs completed KV state
         g_lp_err = false
-        g_batch_declines++
+        batch_decline(MetalDecodeDecline.mirror)
         return false
     }
     if (g_bgemm_min < 0l) {
@@ -4824,10 +4936,10 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         g_b_ulays[l] = uniform_u32(uint(l))
     }
     unsafe {
-        memcpy(metal_buffer_contents(bx), addr < void? >(ws.scr.x_b[0]), int(nrows * dim * 4l))
-        memcpy(metal_buffer_contents(bcos), addr < void? >(ws.scr.rope_cos[0]), int(bytes_tab))
-        memcpy(metal_buffer_contents(bsin), addr < void? >(ws.scr.rope_sin[0]), int(bytes_tab))
-        memcpy(metal_buffer_contents(brt), addr < void? >(g_b_rte[0]), int(bytes_rt))
+        memcpy(metal_buffer_contents(bx), addr < void ? > (ws.scr.x_b[0]), int(nrows * dim * 4l))
+        memcpy(metal_buffer_contents(bcos), addr < void ? > (ws.scr.rope_cos[0]), int(bytes_tab))
+        memcpy(metal_buffer_contents(bsin), addr < void ? > (ws.scr.rope_sin[0]), int(bytes_tab))
+        memcpy(metal_buffer_contents(brt), addr < void ? > (g_b_rte[0]), int(bytes_rt))
     }
     g_us_bsetup += int64(get_time_usec(ts_all))
     let ts_enc = ref_time_ticks()
@@ -4845,7 +4957,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     // layer-0 attention norm (the per-layer trailing add+rms feeds the NEXT layer's)
     if (g_skip != "ew") {
         unsafe {
-            var bw_att0 = upload_region(addr < void? >(t.fblob[t.rms_att_off]), uint64(dim * 4l))
+            var bw_att0 = upload_region(addr < void ? > (t.fblob[t.rms_att_off]), uint64(dim * 4l))
             bar_dep(enc, haz, HZ_BX, HZ_BXB)
             enc_rms_b(enc, bx, bw_att0, bxb, u_dim, u_eps, nrows)
         }
@@ -4871,9 +4983,9 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                         nrows, uint64(dim * 4l), u_nrows_mv, u_nrows_mv2)
                 } else {
                     var bwqkv = upload_region_cat3(
-                        addr < void? >(t.qblob[t.wq_offs[l]]), uint64(qd * dim),
-                        addr < void? >(t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
-                        addr < void? >(t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
+                        addr < void ? > (t.qblob[t.wq_offs[l]]), uint64(qd * dim),
+                        addr < void ? > (t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
+                        addr < void ? > (t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
                     var bwqkv_s = upload_scales_cat3(t, t.wq_offs[l], qd, t.wk_offs[l], kv_dim, t.wv_offs[l], kv_dim, dim)
                     if (qkv_sk > 0l) {
                         bar_dep(enc, haz, HZ_BXB, HZ_BPSK)
@@ -4923,7 +5035,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     enc_mv_site(enc, blob_of(t, t.wo_offs[l], dim, qd), bxb, bxb2,
                         u_qd, u_dim, u_xs4_qd, dim, nrows, uint64(qd * 4l), u_nrows_mv, u_nrows_mv2)
                 } else {
-                    var bwo = upload_region(addr < void? >(t.qblob[t.wo_offs[l]]), uint64(dim * qd))
+                    var bwo = upload_region(addr < void ? > (t.qblob[t.wo_offs[l]]), uint64(dim * qd))
                     var bwo_s = upload_scales(t, t.wo_offs[l], dim, qd)
                     if (wo_sk > 0l) {
                         bar_dep(enc, haz, HZ_BXB, HZ_BPSK)
@@ -4942,7 +5054,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
             // ffn: fused add+norm -> W1 / W3 (the cat region at byte offsets) -> swiglu
             // -> W2 -> fused add + the NEXT layer's attention norm (plain add on the last)
             if (g_skip != "ew") {
-                var bw_ffn = upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
+                var bw_ffn = upload_region(addr < void ? > (t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
                 // add_rms updates the residual bx in place AND writes the norm-out bxb
                 bar_dep(enc, haz, HZ_BX | HZ_BXB2, HZ_BX | HZ_BXB)
                 enc_add_rms_b(enc, bx, bxb2, bw_ffn, bxb, u_dim, u_eps, nrows)
@@ -4962,8 +5074,8 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                         u_dim, u_hidden, u_xs4_dim, hidden, nrows, uint64(dim * 4l), u_nrows_mv, u_nrows_mv2)
                 } else {
                     var bw13 = upload_region_cat3(
-                        addr < void? >(t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
-                        addr < void? >(t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
+                        addr < void ? > (t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
+                        addr < void ? > (t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
                     var bw13_s = upload_scales_cat3(t, t.w1_offs[l], hidden, t.w3_offs[l], hidden, 0l, 0l, dim)
                     if (fuse13) {
                         // one fused dispatch: gate+up dot + swiglu straight into bhb (w2's input)
@@ -4999,7 +5111,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     enc_mv_site(enc, blob_of(t, t.w2_offs[l], dim, hidden), bhb, bxb,
                         u_hidden, u_dim, u_xs4_hid, dim, nrows, uint64(hidden * 4l), u_nrows_mv, u_nrows_mv2)
                 } else {
-                    var bw2 = upload_region(addr < void? >(t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
+                    var bw2 = upload_region(addr < void ? > (t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
                     var bw2_s = upload_scales(t, t.w2_offs[l], dim, hidden)
                     if (w2_sk > 0l) {
                         bar_dep(enc, haz, HZ_BHB, HZ_BPSK)
@@ -5017,7 +5129,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
             }
             if (g_skip != "ew") {
                 if (l + 1l < c.n_layers) {
-                    var bw_attn = upload_region(addr < void? >(t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
+                    var bw_attn = upload_region(addr < void ? > (t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
                     bar_dep(enc, haz, HZ_BX | HZ_BXB, HZ_BX | HZ_BXB)
                     enc_add_rms_b(enc, bx, bxb, bw_attn, bxb, u_dim, u_eps, nrows)
                 } else {
@@ -5044,7 +5156,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     if (gpu_logits) {
         // batched final rmsnorm + classifier — the caller's CPU classifier step is skipped
         unsafe {
-            var bwfin = upload_region(addr < void? >(t.fblob[t.rms_final_off]), uint64(dim * 4l))
+            var bwfin = upload_region(addr < void ? > (t.fblob[t.rms_final_off]), uint64(dim * 4l))
             bar_dep(enc, haz, HZ_BX, HZ_BXF)
             enc_rms_b(enc, bx, bwfin, bxf, u_dim, u_eps, nrows)
             bar_dep(enc, haz, HZ_BXF, HZ_BLOG)
@@ -5054,7 +5166,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 enc_mv_site(enc, blob_of(t, t.wcls_off, c.vocab_size, dim), bxf, blog,
                     u_dim, u_vocab, u_xs4_dim, c.vocab_size, nrows, uint64(dim * 4l), u_nrows_mv, u_nrows_mv2)
             } else {
-                var bwc = upload_region(addr < void? >(t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
+                var bwc = upload_region(addr < void ? > (t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
                 var bwc_s = upload_scales(t, t.wcls_off, c.vocab_size, dim)
                 if (cls64) {
                     enc_gemm64_b(enc, bwc, 0ul, bwc_s, 0ul, bxf, blog, u_dim, u_vocab, u_s16, mp, c.vocab_size)
@@ -5161,7 +5273,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     if (!gpu_logits) {
         g_lp_xb = bx   // the CPU-classifier tail reads x_b — sync-only writeback
         unsafe {
-            g_lp_xb_dst = addr < void? >(ws.scr.x_b[0])
+            g_lp_xb_dst = addr < void ? > (ws.scr.x_b[0])
         }
         g_lp_xb_bytes = nrows * dim * 4l
     }
@@ -5208,9 +5320,9 @@ var private g_cat_blobs : table<uint64; MetalBuffer?>
 def private repack_blocks(base : int8?; blk0 : int64; t : Model; off, rows, n : int64) {
     let nblocks = rows * (n / 32l)
     unsafe {
-        var qp = addr < int8? >(t.qblob[off])
+        var qp = addr < int8 ? > (t.qblob[off])
         if (t.wscale_f16) {
-            var sp16 = addr < uint16? >(t.qscales16[off / 32l])
+            var sp16 = addr < uint16 ? > (t.qscales16[off / 32l])
             for (b in range64(nblocks)) {
                 let o = (blk0 + b) * 34l
                 var pb = reinterpret<uint16?>(base + o)
@@ -5218,7 +5330,7 @@ def private repack_blocks(base : int8?; blk0 : int64; t : Model; off, rows, n : 
                 memcpy(reinterpret<void?>(base + o + 2l), reinterpret<void?>(qp + b * 32l), 32)
             }
         } else {
-            var sp = addr < float? >(t.qscales[off / 32l])
+            var sp = addr < float ? > (t.qscales[off / 32l])
             for (b in range64(nblocks)) {
                 let o = (blk0 + b) * 34l
                 var ph = reinterpret<float16?>(base + o)
@@ -5326,7 +5438,7 @@ def private finish_pending_step {
                         reinterpret<void?>(ab + (g_lp_voffs[i] + uint64((l * cap + pos) * g_lp_rowb))), int(g_lp_rowb))
                 }
                 if (lgp != null) {
-                    memcpy(addr < void? >(sp.logits[0]),
+                    memcpy(addr < void ? > (sp.logits[0]),
                         reinterpret<void?>(lgp + i * g_lp_vocab * 4l), int(g_lp_vocab * 4l))
                 }
                 if (key_exists(g_mirrors, sp.uid)) {   // never regress the optimistic commit-time mark
@@ -5349,7 +5461,7 @@ def private finish_pending_step {
             }
         }
         g_lp_err = true
-        g_batch_declines++
+        batch_decline(MetalDecodeDecline.gpu_error)
     }
     for (pb in g_lp_pooled) {
         var b = pb.buf
