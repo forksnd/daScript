@@ -519,11 +519,25 @@ def test_metal_batch_decode_parity(t : T?) {
             let gpum <- batch_greedy(tr, prompts3, 18, KVDtype.f16, true, -1, 3)
             t |> success(streams_match(cpum, gpum), "mixed batch/single schedule matches the CPU control")
 
-            // arm B4: one-step logits + stored-KV-row tolerance, both paths x both mirror dtypes
+            // arm B4: one-step logits + stored-KV-row tolerance, both paths x all mirror dtypes
             batch_step_gate(t, tr, 3, KVDtype.f16, 0.5, 0.25, "B=3 f16")
             batch_step_gate(t, tr, 6, KVDtype.f16, 0.5, 0.25, "B=6 f16")
             batch_step_gate(t, tr, 3, KVDtype.f32, 0.5, 0.25, "B=3 f32")
             batch_step_gate(t, tr, 6, KVDtype.f32, 0.5, 0.25, "B=6 f32")
+            batch_step_gate(t, tr, 3, KVDtype.q8_0, 0.5, 0.25, "B=3 q8_0")
+            batch_step_gate(t, tr, 6, KVDtype.q8_0, 0.5, 0.25, "B=6 q8_0")
+
+            // arm B4b: q8_0 greedy streams — the block-codec batch kernels end to end (format-
+            // matrix W3): B=3 covers the GEMV path + the chunked partB attention as depth crosses
+            // the single-tg ceiling, B=6 the GEMM path; the CPU q8_0 batch path is the oracle
+            let cpu8b <- batch_greedy(tr, prompts3, 24, KVDtype.q8_0, false, -1, 0)
+            before = metal_batch_decode_stats().steps
+            let gpu8b <- batch_greedy(tr, prompts3, 24, KVDtype.q8_0, true, -1, 0)
+            t |> success(metal_batch_decode_stats().steps - before > 0l, "B=3 q8_0 arm served on the GPU")
+            t |> success(streams_match(cpu8b, gpu8b), "B=3 q8_0 batched greedy streams match the CPU control")
+            let cpu8b6 <- batch_greedy(tr, prompts6, 12, KVDtype.q8_0, false, -1, 0)
+            let gpu8b6 <- batch_greedy(tr, prompts6, 12, KVDtype.q8_0, true, -1, 0)
+            t |> success(streams_match(cpu8b6, gpu8b6), "B=6 q8_0 batched greedy streams match the CPU control (GEMM path)")
 
             // arm B5: paged sessions — interleaved page tables force multi-run mirror gathers
             let paged_cpu <- paged_batch_greedy(tr, prompts3, 64l, 8, false)
@@ -573,6 +587,7 @@ def test_metal_batch_decode_parity(t : T?) {
                 t |> success(streams_match(cpud, gpud), "B=3 hs=128 batched greedy streams match the CPU control (partD attention)")
                 batch_step_gate(t, tr3, 3, KVDtype.f16, 0.5, 0.25, "B=3 hs128 f16")
                 batch_step_gate(t, tr3, 3, KVDtype.f32, 0.5, 0.25, "B=3 hs128 f32")
+                batch_step_gate(t, tr3, 3, KVDtype.q8_0, 0.5, 0.25, "B=3 hs128 q8_0")   // the partD q8 twin
                 delete promptsd
                 delete tr3
             } else {
