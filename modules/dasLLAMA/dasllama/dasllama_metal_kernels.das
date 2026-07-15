@@ -1112,59 +1112,6 @@ class MetalSqAttnComb {
     }
 }
 
-// The seed GEMV's f16-SCALE twin (wscale_f16 models — the qscales16 halfword plane, llama.cpp
-// q8_0 byte parity): one simdgroup per output row, lanes stride byte4s, 4 blocks in flight.
-// 1.0625 vs 1.125 bytes/weight — ~5.6% less stream on a bandwidth-bound decode. (A uint4
-// wide-load + shift-unpack variant measured 0.5ms/token SLOWER — the char4 convert path wins
-// on M1; don't re-try without new silicon.)
-class MetalQ8GemvS16 {
-    @ssbo @binding = 0 wq : array<byte4>    // [d x n] Q8 rows, byte4 view
-    @ssbo @binding = 1 ws : array<float16>  // [d x n/32] scales, raw binary16
-    @ssbo @binding = 2 x : array<float4>    // [n] f32 vector, float4 view
-    @ssbo @binding = 3 y : array<float>     // [d]
-    @uniform @binding = 4 ndim : uint       // n (reduction dim, % 32)
-    @uniform @binding = 5 ddim : uint       // d (output rows)
-
-    [metal_kernel(name="metal_q8_gemv_s16_msl")]
-    def metal_q8_gemv_s16 {
-        let row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
-        if (row >= ddim) {
-            return
-        }
-        let lane = gl_SubgroupInvocationID
-        let nb4 = ndim / 4u
-        let wbase = row * nb4
-        let sbase = row * (ndim / 32u)
-        var acc = 0.0
-        var k = lane
-        while (k + 96u < nb4) {
-            let wa = float4(int4(wq[wbase + k]))
-            let xa = x[k]
-            let wb = float4(int4(wq[wbase + (k + 32u)]))
-            let xb = x[k + 32u]
-            let wc = float4(int4(wq[wbase + (k + 64u)]))
-            let xc = x[k + 64u]
-            let wd = float4(int4(wq[wbase + (k + 96u)]))
-            let xd = x[k + 96u]
-            acc += (wa.x * xa.x + wa.y * xa.y + wa.z * xa.z + wa.w * xa.w) * float(ws[sbase + k / 8u])
-            acc += (wb.x * xb.x + wb.y * xb.y + wb.z * xb.z + wb.w * xb.w) * float(ws[sbase + (k + 32u) / 8u])
-            acc += (wc.x * xc.x + wc.y * xc.y + wc.z * xc.z + wc.w * xc.w) * float(ws[sbase + (k + 64u) / 8u])
-            acc += (wd.x * xd.x + wd.y * xd.y + wd.z * xd.z + wd.w * xd.w) * float(ws[sbase + (k + 96u) / 8u])
-            k += 128u
-        }
-        while (k < nb4) {
-            let w4 = float4(int4(wq[wbase + k]))
-            let x4 = x[k]
-            acc += (w4.x * x4.x + w4.y * x4.y + w4.z * x4.z + w4.w * x4.w) * float(ws[sbase + k / 8u])
-            k += gl_SubgroupSize
-        }
-        acc = simd_sum(acc)
-        if (lane == 0u) {
-            y[row] = acc
-        }
-    }
-}
-
 // The 2-rows-per-simdgroup fused QKV GEMV + rope + KV-row store (the s16 perf path): element
 // pairs (2r, 2r+1) of the q/k vectors ARE weight rows 2r, 2r+1 of the fused QKV region, so one
 // simdgroup holds a whole rope pair in registers after its two row dots — q pairs rope into the

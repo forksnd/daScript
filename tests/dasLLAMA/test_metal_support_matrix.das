@@ -28,7 +28,7 @@ require _model_tier
 //   q8        f32     f32    ENGAGE               ENGAGE               ENGAGE
 //   q8        f32     q8_0   ENGAGE               ENGAGE (W3)          ENGAGE (W3)
 //   q8        f32     tq4    ENGAGE               ENGAGE (W3)          ENGAGE (W3)
-//   q8        f16     f16    decline wscale_f16   ENGAGE               ENGAGE
+//   q8        f16     f16    ENGAGE (W2)          ENGAGE               ENGAGE
 //   Q4_K_M    f32     f16    decline kquant_native x3 (the silent-misread guard — W4 lifts it)
 // plus the prefill-only window clauses: npos < min_npos declines npos_window, a continuation
 // chunk (start_pos > 0) declines start_pos.
@@ -206,7 +206,7 @@ def test_metal_support_matrix(t : T?) {
             set_wscale_f16(true)
             var tr16 <- load_model(path, QuantMode.q8)
             tr16.config.seq_len = min(tr16.config.seq_len, 512l)
-            matrix_cell(t, tr16, KVDtype.f16, "q8/s16/f16", "wscale_f16", "", "")
+            matrix_cell(t, tr16, KVDtype.f16, "q8/s16/f16", "", "", "")
             set_wscale_f16(false)
             delete tr16
 

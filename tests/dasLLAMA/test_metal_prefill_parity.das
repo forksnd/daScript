@@ -100,6 +100,30 @@ def test_metal_prefill_parity(t : T?) {
             }
             t |> success(same(cpu, gpu_legacy), "40-token continuation matches the CPU control (legacy quantized GEMM)")
             t |> success(same(cpu, gpu), "40-token continuation matches the CPU control (lcpp mul_mm, f32 activations)")
+
+            // s16 arm (W2): the DEFAULT-load scale plane — blobs read raw f16 scales, the
+            // classifier GEMV takes its halfword twin; a fresh load owns fresh weight regions.
+            // The restores above un-pinned the backend — re-pin row-major (the donor contract)
+            set_wscale_f16(true)
+            pin_kernel_backend("portable")
+            var tr16 <- load_model(path, QuantMode.q8)
+            if (tr16.config.seq_len > 2048l) {
+                tr16.config.seq_len = 2048l
+            }
+            let cpu16 <- continuation(tr16, prompt, 40)
+            t |> success(select_prefill_override("metal"), "override registered (s16)")
+            set_metal_prefill_min_npos(1l)
+            let before16 = metal_prefill_stats().prefills
+            let gpu16 <- continuation(tr16, prompt, 40)
+            t |> success(metal_prefill_stats().prefills - before16 > 0l, "wscale16 prefill served on the GPU")
+            select_prefill_override("")
+            set_metal_prefill_min_npos(64l)
+            clear_kernel_backend_pin()
+            select_kernel_backend(prior_backend)
+            set_wscale_f16(prior_wscale)
+            t |> success(same(cpu16, gpu16), "40-token wscale16 continuation matches the CPU control (s16 mul_mm + s16 classifier)")
+            delete tr16
+
             metal_prefill_shutdown()
             t |> equal(metal_live_object_count(), 0l)
             delete tr
