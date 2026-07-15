@@ -5,7 +5,7 @@ options stack = 131072   // several by-value Sessions per cell (test_batch_decod
 require dastest/testing_boost public
 require dasllama/dasllama   // the public facade — engine + arch registrations + (on Apple) the metal overrides
 require dasllama/dasllama_math   // set_wscale_f16 — the wscale matrix axis
-require ?das_metal dasllama/dasllama_metal_decode  // nolint:STYLE030 — stats/declines/shutdown rails
+require ?das_metal dasllama/dasllama_metal_llama  // nolint:STYLE030 — stats/declines/shutdown rails
 require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — prefill stats/declines rails
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — device probe + metal_live_object_count
 require daslib/jobque_boost

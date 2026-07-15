@@ -147,8 +147,10 @@ IF(APPLE)
     # tests reach them behind `require ?das_metal`, so off-Apple no stubs are needed
     LIST(APPEND AOT_DASLLAMA_MODULE_FILES
         modules/dasLLAMA/dasllama/dasllama_math_metal.das
+        modules/dasLLAMA/dasllama/dasllama_metal_common.das
+        modules/dasLLAMA/dasllama/dasllama_metal_kernels.das
         modules/dasLLAMA/dasllama/dasllama_metal_prefill.das
-        modules/dasLLAMA/dasllama/dasllama_metal_decode.das)
+        modules/dasLLAMA/dasllama/dasllama_metal_llama.das)
 ENDIF()
 
 # AOT for decs test files

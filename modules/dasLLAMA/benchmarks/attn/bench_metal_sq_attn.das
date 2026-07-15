@@ -4,7 +4,7 @@ options persistent_heap
 require dastest/testing_boost
 require metal/msl_shader
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — GPU driver half, Apple builds only
-require dasllama/dasllama_metal_decode  // nolint:STYLE030 — the production batch attention MSL (zero copy drift)
+require dasllama/dasllama_metal_llama  // nolint:STYLE030 — the production batch attention MSL (zero copy drift)
 require dasllama/dasllama_math   // the q8_0 KV codec (quantize_q8kv_row / cvt_q8kv_to_f32) — the store oracle
 require daslib/fio
 require math

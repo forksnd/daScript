@@ -4,7 +4,7 @@ options _jit_fast_math = true   // ggml-parity FP laxity — same rail as decode
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + pin_kernel_backend (engine-level, not re-exported)
-require ?das_metal dasllama/dasllama_metal_decode  // nolint:STYLE030 — per-stage report on the GPU rail (Apple builds only)
+require ?das_metal dasllama/dasllama_metal_llama  // nolint:STYLE030 — per-stage report on the GPU rail (Apple builds only)
 require daslib/jobque_boost
 require daslib/clargs
 require daslib/fio
