@@ -90,20 +90,32 @@ def private continuation(tr : Model; prompt : array<int64>; n_gen : int; kdt : K
     return <- got
 }
 
-// max |Δ| between two cache slabs' row `pos`, decoded per the (f16/f32) codec
+// max |Δ| between two cache slabs' row `pos`, decoded per the (f16/f32/q8_0) codec
 def private kv_row_max_diff_one(cache_a, cache_b : array<uint8>; base_a, base_b : int64;
                                 dt : KVDtype; kv_dim, pos : int64) : float {
     var maxd = 0.0
     let rowb = kv_row_bytes(dt, kv_dim)
     unsafe {
-        let pa = addr < uint8 const? >(cache_a[0]) + (base_a + pos * rowb)
-        let pb = addr < uint8 const? >(cache_b[0]) + (base_b + pos * rowb)
+        let pa = addr < uint8 const ? > (cache_a[0]) + (base_a + pos * rowb)
+        let pb = addr < uint8 const ? > (cache_b[0]) + (base_b + pos * rowb)
         if (dt == KVDtype.f16) {
             var ha = reinterpret<uint16 const?>(pa)
             var hb = reinterpret<uint16 const?>(pb)
             for (e in range64(kv_dim)) {
                 maxd = max(maxd, abs(f16_to_f32(uint(ha[e])) - f16_to_f32(uint(hb[e]))))
             }
+        } elif (dt == KVDtype.q8_0) {
+            var da : array<float>
+            var db : array<float>
+            da |> resize(int(kv_dim))
+            db |> resize(int(kv_dim))
+            cvt_q8kv_to_f32(addr(da[0]), pa, kv_dim)
+            cvt_q8kv_to_f32(addr(db[0]), pb, kv_dim)
+            for (e in range64(kv_dim)) {
+                maxd = max(maxd, abs(da[e] - db[e]))
+            }
+            delete da
+            delete db
         } else {
             var fa = reinterpret<float const?>(pa)
             var fb = reinterpret<float const?>(pb)
@@ -684,7 +696,19 @@ def test_metal_decode_parity(t : T?) {
             t |> equal(metal_decode_mirror_stats().mirrors, 1l)
             set_metal_decode_mirror_cap_mb(-1)
 
-            // arm 7: wscale_f16 model — the f16-scale GEMV twin reads the qscales16 halfword
+            // arm 7: q8_0 KV mirror — the block-codec decode path (format-matrix W3): GPU
+            // rope+quantize store + dual-view block-dequant attention; the CPU q8_0 decode
+            // path is the oracle (both arms consume the same codec)
+            let cpu8 <- continuation(tr, prompt, 40, KVDtype.q8_0)
+            select_decode_override("metal")
+            before = metal_decode_stats().decodes
+            let gpu8 <- continuation(tr, prompt, 40, KVDtype.q8_0)
+            select_decode_override("")
+            t |> success(metal_decode_stats().decodes - before > 0l, "q8_0 arm served on the GPU")
+            t |> success(same(cpu8, gpu8), "40-token q8_0-cache continuation matches the CPU control")
+            single_step_gate(t, tr, prompt, KVDtype.q8_0, 0.5, 0.25, "q8_0")
+
+            // arm 8: wscale_f16 model — the f16-scale GEMV twin reads the qscales16 halfword
             // plane (llama.cpp q8_0 byte parity); a fresh load owns fresh weight regions
             set_wscale_f16(true)
             var tr16 <- load_model(path, QuantMode.q8)
