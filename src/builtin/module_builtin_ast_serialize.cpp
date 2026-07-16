@@ -1437,7 +1437,17 @@ namespace das {
 
     void Function::AliasInfo::serialize ( AstSerializer & ser ) {
         ser.tag(HASH_TAG("AliasInfo"));
-        ser << var;
+        // var is often a global owned by ANOTHER module (deriveAliasing pulls
+        // useGlobalVariables transitively across modules). The owning module's content is
+        // NOT in this stream, so the inline operator<<(VariablePtr&) would serialize a
+        // foreign or half-constructed var->type and read garbage (0xCD-filled type pointer
+        // -> AV at TypeDecl::serialize). Cross-module vars resolve by module+name, exactly
+        // like serializeUseVariables and Structure::serialize (parent); same-module or
+        // module-less vars stay inline (smart-map).
+        bool crossModule = ser.writing && var && var->module && var->module != ser.thisModule;
+        ser << crossModule;
+        if ( crossModule ) ser.serializePointer(var);
+        else               ser << var;
         ser.serializePointer(func);
         ser << viaPointer;
     }
