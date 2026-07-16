@@ -1,0 +1,1 @@
+Memory-maps the file at ``path`` read-only and returns the mapping's base pointer, writing the mapped byte count through ``size``. Unlike ``fmap`` the mapping is not scope-bound: it stays valid until passed to ``fmap_close``, so long-lived borrowed views (e.g. dasLLAMA's prepared-model images) can be built over it. Returns null when the file cannot be opened or mapped.

@@ -162,7 +162,12 @@ def test_image_mechanics(t : T?) {
         t |> equal(stat(path).size % uint64(IMAGE_PAGE), 0ul, "file is a page multiple")
 
         var m = ImgProbe()
+        let epoch0 = weights_epoch()
         t |> success(load_image(path, m, "img-probe"), "load")
+        // the Metal drivers' weight caches key by HOST ADDRESS and flush on the weights epoch;
+        // an image load that lands planes at a deleted model's recycled addresses without
+        // moving the epoch makes them serve the dead model's buffers (arm10-kq, 2026-07-16)
+        t |> success(weights_epoch() > epoch0, "an image load moves the weights epoch")
         t |> success(m.image_map != null, "image-backed")
         t |> equal(m.tagv, p.tagv)
         t |> equal(m.n, p.n)

@@ -523,6 +523,10 @@ def load_image(path : string; var t; tag : string = "") : bool {
     }
     t.image_map = base
     t.image_bytes = msize
+    // address-keyed weight caches (the Metal drivers' resident regions) flush on the weights
+    // epoch; this mapping may sit at a deleted model's recycled addresses, so it counts as a
+    // load exactly like load_gguf's own bump does
+    bump_weights_epoch()
     return true
 }
 

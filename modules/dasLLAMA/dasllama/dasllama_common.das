@@ -1807,6 +1807,13 @@ def public weights_epoch() : int64 {
     return g_weights_epoch
 }
 
+//! The image loader's half of the same contract: mapping a prepared image lands planes at
+//! fresh (possibly recycled) addresses exactly like a gguf load does, so it must move the
+//! epoch too — dasllama_image calls this on every successful load_image.
+def public bump_weights_epoch() {
+    g_weights_epoch++
+}
+
 def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     //! The conversion passes (transcode/repack/wscale) thread across the jobque; spin a scoped one
     //! for the load when the caller hasn't (the server/tools start theirs after the model loads).
