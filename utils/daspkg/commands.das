@@ -65,6 +65,10 @@ struct DaspkgArgs {
     @clarg_doc = "Output directory for `release` (default: current directory)"
     out : string = "."
 
+    @clarg_name = "tune-fast"
+    @clarg_doc = "Use the tuner's quick progressive 4/8-round screen / 20-round cap during `release`"
+    tune_fast : bool
+
     @clarg_name = "wasm"
     @clarg_doc = "Target wasm64 (memory64): `build --wasm` builds the wasm64 runtime + module archives; `release wasm` ships compiled .wasm artifacts"
     wasm : bool
@@ -1393,6 +1397,7 @@ struct private TuneScopeDep {
     manifest : string               //!< the app tune sidecar the winners live in
     tuner : string                  //!< tuner harness path ("" = none declared)
     complete : bool                 //!< every [tune] kernel of this scope has a fresh sidecar entry
+    fallbacks : string              //!< fallback stamps selected by this same compile/host
 }
 
 struct private ReleaseDeps {
@@ -1421,12 +1426,17 @@ def private read_release_deps(path : string; var deps : ReleaseDeps) : bool {
 
 // the exact env+cmd shape llvm_tune's policy rail uses for scope tuners (the env prefix
 // leads so the line never starts with a quote — cmd.exe strips a LEADING one)
-def private release_tuner_cmd(daslang : string; ts : TuneScopeDep) : string {
+def private release_tuner_cmd(daslang : string; ts : TuneScopeDep; tune_fast : bool) : string {
     let win = get_platform_name() == "windows"
     let envs = (win ?
-        "set \"DAS_TUNE_MODE=tune\"&& set \"DAS_TUNE_MANIFEST={ts.manifest}\"&& " :
-        "DAS_TUNE_MODE=tune DAS_TUNE_MANIFEST=\"{ts.manifest}\" ")
-    return "{envs}\"{daslang}\" -jit \"{ts.tuner}\" -dasroot \"{get_das_root()}\""
+        "set \"DAS_TUNE_MODE=tune\"&& set \"DAS_TUNE_MANIFEST={ts.manifest}\"&& set \"DAS_TUNE_COMPILE_FALLBACKS={ts.fallbacks}\"&& " :
+        "DAS_TUNE_MODE=tune DAS_TUNE_MANIFEST=\"{ts.manifest}\" DAS_TUNE_COMPILE_FALLBACKS=\"{ts.fallbacks}\" ")
+    let tune_args = tune_fast ? " -- --tune-fast" : ""
+    return "{envs}\"{daslang}\" -jit \"{ts.tuner}\" -dasroot \"{get_das_root()}\"{tune_args}"
+}
+
+def private release_elapsed(t0 : int64) : string {
+    return fmt(":.1f", float(double(get_time_usec(t0)) / 1000000.0lf))
 }
 
 // Bundle path for the standalone exe (daslang -exe appends `.exe` itself).
@@ -1513,7 +1523,8 @@ def private ship_dep_assets(pkg_dir, bundle_modules_dir : string; var shipped : 
     if (!fexist(dep_pkg_file)) return 0
     var dep_spec : PackageReleaseInfo
     if (!run_das_package_release(dep_pkg_file, dep_spec) ||
-        (empty(dep_spec.include_globs) && empty(dep_spec.native_dlls))) return 0
+        (empty(dep_spec.include_globs) && empty(dep_spec.include_if_missing_globs) &&
+            empty(dep_spec.native_dlls))) return 0
     let dep_name = base_name(pkg_dir)
     let dep_dst_dir = "{bundle_modules_dir}/{dep_name}"
     var dep_files : array<string>
@@ -1536,6 +1547,28 @@ def private ship_dep_assets(pkg_dir, bundle_modules_dir : string; var shipped : 
     }
     if (!empty(dep_files)) {
         log("  ship dep `{dep_name}`: {length(dep_files)} file(s)\n")
+    }
+    var dep_starter_files : array<string>
+    glob_filtered(pkg_dir, dep_spec.include_if_missing_globs, dep_spec.exclude_globs) $(rel_path, is_dir) {
+        if (!is_dir) {
+            dep_starter_files |> push_clone(rel_path)
+        }
+    }
+    var dep_starter_copies = 0
+    for (rel in dep_starter_files) {
+        let src = path_join(pkg_dir, rel)
+        let dst = path_join(dep_dst_dir, rel)
+        if (fexist(dst)) continue
+        mkdir_rec(dir_name(dst))
+        var err : string
+        if (!copy_file(src, dst, false, err)) {
+            to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
+            return 1
+        }
+        dep_starter_copies++
+    }
+    if (dep_starter_copies > 0) {
+        log("  initialize dep `{dep_name}`: {dep_starter_copies} user-owned file(s)\n")
     }
     if (!empty(dep_spec.native_dlls)) {
         let rc = ship_native_dlls(dep_name, dep_dst_dir, dep_spec.native_dlls, shipped, "modules/{dep_name}/")
@@ -1908,7 +1941,15 @@ def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<str
 // <name>.toml config, logs — that the old whole-dir wipe destroyed on every re-release.
 let RELEASE_MANIFEST = ".daspkg_release.manifest"
 
-def private clean_previous_release(bundle_dir : string) {
+def private release_path_is_preserved(rel : string; preserve_paths : array<string>) : bool {
+    let generic_rel = to_generic_path(rel)
+    for (p in preserve_paths) {
+        if (to_generic_path(p) == generic_rel) return true
+    }
+    return false
+}
+
+def private clean_previous_release(bundle_dir : string; preserve_paths : array<string>) {
     let mpath = path_join(bundle_dir, RELEASE_MANIFEST)
     if (!fexist(mpath)) {
         return   // first release into this dir (or a pre-manifest bundle): nothing to clean
@@ -1920,9 +1961,12 @@ def private clean_previous_release(bundle_dir : string) {
     }
     for (line in split(body, "\n")) {
         let rel = strip(line)
+        // A file may have been release-owned by an older package manifest and become
+        // release_include_if_missing now. Preserve that deployed copy during migration.
         // skip blanks; stay inside the bundle even on a corrupt or hostile manifest —
         // reject `..`, drive colons, and both absolute spellings (`/x`, `\x` = drive root)
-        if (empty(rel) || find(rel, "..") >= 0 || starts_with(rel, "/") || starts_with(rel, "\\") || find(rel, ":") >= 0) {
+        if (empty(rel) || find(rel, "..") >= 0 || starts_with(rel, "/") || starts_with(rel, "\\")
+                || find(rel, ":") >= 0 || release_path_is_preserved(rel, preserve_paths)) {
             continue
         }
         let p = path_join(bundle_dir, rel)
@@ -1951,7 +1995,8 @@ def private get_daslang_path() : string {
     return get_platform_name() == "windows" ? replace(joined, "/", "\\") : joined
 }
 
-def cmd_release(root : string; out_dir : string) : int {
+def cmd_release(root : string; out_dir : string; tune_fast = false) : int {
+    let release_t0 = ref_time_ticks()
     // Reset the patchelf availability cache so a daspkg process that releases
     // multiple bundles can pick up a patchelf install between calls.
     patchelf_state = -1
@@ -1998,6 +2043,12 @@ def cmd_release(root : string; out_dir : string) : int {
     let is_mac_app = get_platform_name() == "darwin"
     let app_root = is_mac_app ? path_join(out_dir, "{bundle_name}.app") : ""
     let bundle_dir = is_mac_app ? path_join(app_root, "Contents/MacOS") : path_join(out_dir, bundle_name)
+    var preserve_project_files : array<string>
+    glob_filtered(root, spec.include_if_missing_globs, spec.exclude_globs) $(rel_path, is_dir) {
+        if (!is_dir) {
+            preserve_project_files |> push_clone(rel_path)
+        }
+    }
     // The macOS .app is wholly daspkg-owned: full wipe. A flat bundle dir is NOT — it
     // accumulates user files next to daspkg's output — so it cleans via the previous
     // release's manifest instead (empty dirs from removed deps may linger; harmless).
@@ -2006,7 +2057,7 @@ def cmd_release(root : string; out_dir : string) : int {
             force_rmdir(app_root)
         }
     } elif (fexist(bundle_dir)) {
-        clean_previous_release(bundle_dir)
+        clean_previous_release(bundle_dir, preserve_project_files)
     }
     mkdir_rec(bundle_dir)
     var shipped : array<string>   // bundle-relative paths -> RELEASE_MANIFEST at the end
@@ -2031,6 +2082,7 @@ def cmd_release(root : string; out_dir : string) : int {
         }
     }
     let cmd = "\"{daslang}\" -exe -output \"{exe_path}\" --list-shared-modules \"{deps_file}\"{force_args} \"{main_path}\""
+    let build_t0 = ref_time_ticks()
     let rc = run_cmd(cmd, output)
     if (rc != 0) {
         to_log(LOG_ERROR, "release: daslang -exe failed (rc={rc}):\n{output}\n")
@@ -2039,6 +2091,7 @@ def cmd_release(root : string; out_dir : string) : int {
         }
         return 1
     }
+    log("  build: standalone exe in {release_elapsed(build_t0)}s\n")
     // 1.5 Build-time tuning: the deps JSON reports each [tune_scope] with per-key
     //     completeness against the app sidecar. Run the tuners of incomplete scopes and
     //     REBUILD, so the shipped exe bakes measured winners instead of the generic
@@ -2055,16 +2108,20 @@ def cmd_release(root : string; out_dir : string) : int {
                     continue
                 }
                 log("  tune: scope `{ts.name}` -> {ts.manifest}\n")
+                let tune_t0 = ref_time_ticks()
                 var tout : string
-                let trc = run_cmd(release_tuner_cmd(daslang, ts), tout)
+                let trc = run_cmd(release_tuner_cmd(daslang, ts, tune_fast), tout)
+                let tune_seconds = release_elapsed(tune_t0)
                 if (trc != 0) {
-                    to_log(LOG_WARNING, "release: tuner for scope `{ts.name}` failed (rc={trc}) — shipping fallback stamps\n{tout}\n")
+                    to_log(LOG_WARNING, "release: tuner for scope `{ts.name}` failed after {tune_seconds}s (rc={trc}) — shipping fallback stamps\n{tout}\n")
                 } else {
+                    log("  tune: scope `{ts.name}` finished in {tune_seconds}s\n")
                     tuned_any = true
                 }
             }
             if (tuned_any) {
                 log("  rebuild: baking the fresh tune winners into the exe\n")
+                let rebuild_t0 = ref_time_ticks()
                 var out2 : string
                 let rc2 = run_cmd(cmd, out2)
                 if (rc2 != 0) {
@@ -2074,6 +2131,7 @@ def cmd_release(root : string; out_dir : string) : int {
                     }
                     return 1
                 }
+                log("  rebuild: standalone exe in {release_elapsed(rebuild_t0)}s\n")
             }
         }
     }
@@ -2235,6 +2293,31 @@ def cmd_release(root : string; out_dir : string) : int {
     if (!empty(asset_files)) {
         log("  shipped {length(asset_files)} project asset file(s)\n")
     }
+    // Mutable starter files are copied only for a new deployment. They are
+    // intentionally not added to `shipped`, so the next manifest cleanup
+    // treats the deployed copy as user-owned and leaves it alone.
+    var starter_files : array<string>
+    glob_filtered(root, spec.include_if_missing_globs, spec.exclude_globs) $(rel_path, is_dir) {
+        if (!is_dir) {
+            starter_files |> push_clone(rel_path)
+        }
+    }
+    var starter_copies = 0
+    for (rel_path in starter_files) {
+        let src = path_join(root, rel_path)
+        let dst = path_join(bundle_dir, rel_path)
+        if (fexist(dst)) continue
+        mkdir_rec(dir_name(dst))
+        var err : string
+        if (!copy_file(src, dst, false, err)) {
+            to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
+            return 1
+        }
+        starter_copies++
+    }
+    if (starter_copies > 0) {
+        log("  initialized {starter_copies} user-owned project file(s)\n")
+    }
     // Project-declared native deps land next to the exe (the project has no
     // .shared_module to colocate with — its deps are loaded directly by the exe).
     if (!empty(spec.native_dlls)) {
@@ -2259,7 +2342,7 @@ def cmd_release(root : string; out_dir : string) : int {
             return 1
         }
         log("  wrote: Contents/Info.plist (CFBundleIdentifier={bundle_id})\n")
-        log("Released to: {app_root}\n")
+        log("Released to: {app_root} ({release_elapsed(release_t0)}s)\n")
     } else {
         let mbody = build_string() $(var writer) {
             for (s in shipped) {
@@ -2271,7 +2354,7 @@ def cmd_release(root : string; out_dir : string) : int {
             to_log(LOG_ERROR, "release: cannot write {RELEASE_MANIFEST}\n")
             return 1
         }
-        log("Released to: {bundle_dir}\n")
+        log("Released to: {bundle_dir} ({release_elapsed(release_t0)}s)\n")
     }
     return 0
 }

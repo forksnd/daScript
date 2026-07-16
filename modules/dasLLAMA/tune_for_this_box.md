@@ -110,13 +110,25 @@ stale — every reader treats it as absent, and the next tuner write resets it.
 
 ```
 bin/daslang -jit modules/dasLLAMA/harness/tune_kernels.das
+
+# quick mode: progressive 4/8-round screening, finalists stop at 20
+bin/daslang -jit modules/dasLLAMA/harness/tune_kernels.das -- --tune-fast
+
+# full generator + kernel scope (also available as `daspkg release --tune-fast`)
+bin/daslang -jit modules/dasLLAMA/harness/dasllama_tuner.das -- --tune-fast
 ```
 
 Sweeps every `[tuned]` kernel (15: the float elementwise set, softmax, rmsnorm, the quantized
 dots, the activation requant, the NEOX rope-table leaf, the fp32 GEMM tile, and — arm64+JIT
 only, clean skip elsewhere — the laneq4x4 tile) across the 20-permutation grid
-(`{plain, u2, u4, u8} ∪ {vec4,vec8,vec16,vec32} × {-, u2, u4, u8}`), interleaved best-of-N
-(80 rounds × 2000 reps at N=4096), correctness gate per variant (f64 reference; EXACT
+(`{plain, u2, u4, u8} ∪ {vec4,vec8,vec16,vec32} × {-, u2, u4, u8}`), interleaved best-of-N.
+The default screens the full valid grid for 20 rounds, retains the four fastest rows plus
+anything within 5% of the leader, and continues those finalists to at most 80 rounds.
+`--tune-fast` narrows progressively after rounds 4 and 8 and stops at 20. Every mode runs
+one unscored warm-up pass and rotates row order each round; the measured minimum remains the
+score. The measurement thread is hard-pinned by its child-process JobQue and is automatically
+unpinned when that tuner child exits. Each round runs 2000 reps at N=4096. The correctness
+gate per variant (f64 reference; EXACT
 quant/scale equality for the requant), reports each variant as %Δ vs that kernel's SHIPPED
 fallback perm (`vec8_u2` for most; dot_q8q8 ships `vec16`, dot_q4 `vec4_u4`, the tile k-loops
 `u2`, rmsnorm/requant `plain`), and UPSERTS the winners into the app sidecar's `"kernels"`

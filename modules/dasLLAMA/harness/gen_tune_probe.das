@@ -1095,9 +1095,24 @@ def private parse_confirm_pp(outp : string) : double {
     return 0.0lf
 }
 
-// What a manifest-less normal run would stamp on this box: a compile-only child prints the
-// `llvm_tune: q8q8_tile_gen <- <suffix> (fallback)` line during its [tune] macro pass.
+def private compile_fallback(fname : string) : string {
+    for (entry in split(get_env_variable("DAS_TUNE_COMPILE_FALLBACKS"), ";")) {
+        let eq = find(entry, "=")
+        if (eq > 0 && slice(entry, 0, eq) == fname) {
+            return slice(entry, eq + 1)
+        }
+    }
+    return ""
+}
+
+// A release compile reports the fallback it just selected on this same host. Direct/manual
+// tuner runs have no such handoff, so retain the compile-only child as their safe fallback.
 def private discover_fallback_stamp() : string {
+    let inherited = compile_fallback("q8q8_tile_gen")
+    if (!empty(inherited)) {
+        print("confirm: using q8q8 fallback '{inherited}' from the release compile on this host\n")
+        return inherited
+    }
     var envs <- [("DAS_TUNE_MODE" => "normal"), ("DAS_TUNE_MANIFEST" => ""), ("GEN_TUNE_COMPILE_ONLY" => "1")]
     let cmd = env_cmd(envs, "\"{get_das_exe()}\" -jit \"{harness_dir()}/gen_tune_probe.das\"")
     delete envs
@@ -1169,6 +1184,7 @@ def private confirm_and_write(winner : string) : bool {
 }
 
 def tune_mode_run : bool {
+    let tune_total_t0 = ref_time_ticks()
     var fx <- build_fixture(2048l, 512l, 64l)      // batch shape (the kv projection)
     var gfx <- build_fixture(2048l, 8192l, 1l)     // streamed decode shape (DRAM-bound ffn GEMV)
     var hfx <- build_fixture(2048l, 512l, 1l)      // hot decode shape (cache-resident — the
@@ -1345,9 +1361,12 @@ def tune_mode_run : bool {
     // child-process confirm gate here: the kq stamp only moves the kq planes' interleave,
     // and the e2e exposure (a tile-optimal mr shaving decode kernel rate) is bounded by the
     // decode path staying DRAM-bound — validated end-to-end when the entries first landed.
+    print("TUNE_GEN_TIME q8q8_family {get_time_usec(tune_total_t0) / 1000} ms\n")
     var kok = true
     for (fmt in fixed_array(4l, 5l, 6l, 40l)) {
+        let kq_t0 = ref_time_ticks()
         let w = kq_tune_family(fmt)
+        print("TUNE_GEN_TIME k{fmt}_family {get_time_usec(kq_t0) / 1000} ms\n")
         let entry = fmt == 40l ? "q40q8_tile_gen" : "k{fmt}q8_tile_gen"
         if (empty(w)) {
             kok = false
@@ -1357,7 +1376,10 @@ def tune_mode_run : bool {
             kok = kok && wok
         }
     }
+    let confirm_t0 = ref_time_ticks()
     let ok = confirm_and_write(vs[merged]._0) && kok
+    print("TUNE_GEN_TIME confirm {get_time_usec(confirm_t0) / 1000} ms\n")
+    print("TUNE_GEN_TIME total {get_time_usec(tune_total_t0) / 1000} ms\n")
     delete y
     delete yg
     delete yh

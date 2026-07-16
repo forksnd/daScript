@@ -35,6 +35,7 @@ struct PackageReleaseInfo {
     main_script : string
     wasm_main_script : string
     include_globs : array<string>
+    include_if_missing_globs : array<string>
     exclude_globs : array<string>
     forced_modules : array<string>
     native_dlls : array<string>
@@ -121,6 +122,9 @@ def run_das_package_release(das_package_path : string; var info : PackageRelease
             info.wasm_main_script = clone_string(src.wasm_main_script)
             for (g in src.include_globs) {
                 info.include_globs |> push_clone(clone_string(g))
+            }
+            for (g in src.include_if_missing_globs) {
+                info.include_if_missing_globs |> push_clone(clone_string(g))
             }
             for (g in src.exclude_globs) {
                 info.exclude_globs |> push_clone(clone_string(g))

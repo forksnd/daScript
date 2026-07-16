@@ -390,6 +390,7 @@ struct TuneScopeStatus {
     manifest : string   //!< the app sidecar the winners live in
     tuner : string      //!< tuner harness path ("" = none declared)
     complete : bool     //!< every [tune] kernel of this scope has a fresh sidecar entry
+    fallbacks : string  //!< ';'-joined fname=suffix stamps selected by this compile/host
 }
 
 //! Every declared scope in `prog` with its per-key completeness against the app sidecar,
@@ -426,6 +427,7 @@ def tune_scopes_status(prog : Program?) : array<TuneScopeStatus> {
     var rows : array<TuneScopeStatus>
     rows |> reserve(length(found))
     let mpath = tune_manifest_path()
+    var compileStatus <- collect_status(prog)
     for (sc in found) {
         var wanted : table<string>
         wanted |> insert(sc.modName)
@@ -440,12 +442,24 @@ def tune_scopes_status(prog : Program?) : array<TuneScopeStatus> {
                 module_kernel_fnames(mod, fnames)
             }
         }
+        var fallbacks : array<string>
+        for (fname in fnames) {
+            for (st in compileStatus) {
+                if (st.fname == fname && st.source != "manifest") {
+                    fallbacks |> push("{fname}={st.suffix}")
+                    break
+                }
+            }
+        }
         rows |> push(TuneScopeStatus(name = sc.scopeName, manifest = mpath,
             tuner = sc.tunerPath,
-            complete = tune_sidecar_entries_complete(mpath, join(fnames, ";"))))
+            complete = tune_sidecar_entries_complete(mpath, join(fnames, ";")),
+            fallbacks = join(fallbacks, ";")))
         delete wanted
         delete fnames
+        delete fallbacks
     }
+    delete compileStatus
     delete found
     delete seen
     return <- rows
@@ -1099,10 +1113,10 @@ def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : s
 // final stamped truth per [tune] function, read off the AST (the tune_suffix/tune_from args
 // stamp_llvm_code records) — no macro-state bank, so shared-context reuse across compiles
 // can't pollute it
-def private collect_status() : array<TuneStatus> {
+def private collect_status(prog : Program?) : array<TuneStatus> {
     var rows : array<TuneStatus>
     let sidecar = tune_manifest_path()
-    program_for_each_module(compiling_program()) $(mod) {
+    prog |> for_each_module() $(mod) {
         let modName = "{mod.name}"
         var scopeName = ""
         if (g_scopes |> key_exists(modName)) {
@@ -1148,7 +1162,7 @@ def private tune_policy_gated() : bool {
 // truth — emitted by policy runs AND by -exe builds (an artifact must be able to report
 // which perms it carries: log_tune_status / tune_status work inside a standalone exe)
 def private emit_status_init(var errors : string&) {
-    var rows <- collect_status()
+    var rows <- collect_status(get_ptr(compiling_program()))
     if (!empty(rows)) {
         var body : array<ExpressionPtr>
         body |> reserve(length(rows))
