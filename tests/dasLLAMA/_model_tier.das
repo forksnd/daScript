@@ -41,7 +41,8 @@ def arm_on(t : T?; name : string) : bool {
         return true
     }
     for (tok in split(filter, ",")) {
-        if (!empty(tok) && find(name, tok) >= 0) {
+        let tk = strip(tok)   // "arm12, batch" — the comma-adjacent space must not defeat the match
+        if (!empty(tk) && find(name, tk) >= 0) {
             return true
         }
     }
