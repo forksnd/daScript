@@ -171,6 +171,8 @@ namespace das {
     void builtin_fclose ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     void builtin_fflush ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     void builtin_map_file(const FILE* f, const TBlock<void, TTemporary<TArray<uint8_t>>>& blk, Context* context, LineInfoArg * at) GENERATE_IO_STUB
+    void * builtin_fmap_open ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    void builtin_fmap_close ( void * data, uint64_t size, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int64_t builtin_ftell ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int64_t builtin_fseek ( const FILE * f, int64_t offset, int32_t mode, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * builtin_fread ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
@@ -369,6 +371,41 @@ namespace das {
         args[0] = cast<Array *>::from(&arr);
         context->invoke(blk, args, nullptr, at);
         munmap(data, size_t(st.st_size));
+    }
+
+    // split fmap (the prepared-model-image loader): the mapping OUTLIVES the call — the caller
+    // owns it and unmaps via fmap_close. Read-only shared pages: clean (droppable under memory
+    // pressure, never swapped) and shared across processes through the OS page cache. The FILE
+    // closes right after mapping — both POSIX and the win32 shim keep the view alive through
+    // the mapping's own file reference.
+    void * builtin_fmap_open ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) {
+        if ( !size ) context->throw_error_at(at, "fmap_open: null size out-param");
+        *size = 0;
+        if ( !name ) context->throw_error_at(at, "fmap_open: null path");
+        FILE * f = fopen(name, "rb");
+        if ( !f ) context->throw_error_at(at, "fmap_open: can't open '%s'", name);
+        das_filestat st;
+        int fd = fileno(f);
+        if ( das_fstat64(fd, st) != 0 ) {
+            fclose(f);
+            context->throw_error_at(at, "fmap_open: can't stat '%s'", name);
+        }
+        if ( st.st_size == 0 ) {
+            fclose(f);
+            context->throw_error_at(at, "fmap_open: '%s' is empty", name);
+        }
+        void * data = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+        fclose(f);
+        if ( data == MAP_FAILED ) {
+            context->throw_error_at(at, "fmap_open: can't map '%s' (%llu bytes)", name, (unsigned long long)st.st_size);
+        }
+        *size = uint64_t(st.st_size);
+        return data;
+    }
+
+    void builtin_fmap_close ( void * data, uint64_t size, Context * context, LineInfoArg * at ) {
+        if ( !data ) context->throw_error_at(at, "fmap_close: null mapping");
+        munmap(data, size_t(size));
     }
 
     int64_t builtin_ftell ( const FILE * f, Context * context, LineInfoArg * at ) {
@@ -1921,6 +1958,12 @@ namespace das {
             addExtern<DAS_BIND_FUN(builtin_map_file)>(*this, lib, "fmap",
                 SideEffects::modifyExternal, "builtin_map_file")
                     ->args({"file","block","context","line"});
+            addExtern<DAS_BIND_FUN(builtin_fmap_open)>(*this, lib, "fmap_open",
+                SideEffects::modifyExternal, "builtin_fmap_open")
+                    ->args({"path","size","context","line"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(builtin_fmap_close)>(*this, lib, "fmap_close",
+                SideEffects::modifyExternal, "builtin_fmap_close")
+                    ->args({"data","size","context","line"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(builtin_fgets)>(*this, lib, "fgets",
                 SideEffects::modifyExternal, "builtin_fgets")
                     ->args({"file","context","line"});
