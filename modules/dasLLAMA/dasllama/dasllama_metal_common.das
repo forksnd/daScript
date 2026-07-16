@@ -430,6 +430,36 @@ def upload_scales_cat3(t : Model; off0, rows0, off1, rows1, off2, rows2, n : int
     }
 }
 
+// the kq formats the Metal kernels implement — anything else (the q4_0 QAT tier, future
+// formats) must DECLINE kquant_native instead of falling into a wrong-layout kernel branch
+// (the dispatchers below treat "not k4/k6" as k5)
+def kq_fmt_gpu_supported(f : KqFmt) : bool {
+    return f == KqFmt.q8 || f == KqFmt.k4 || f == KqFmt.k5 || f == KqFmt.k6
+}
+
+def private kq_fmts_gpu_supported(a : array<KqFmt>) : bool {
+    for (f in a) {
+        if (!kq_fmt_gpu_supported(f)) {
+            return false
+        }
+    }
+    return true
+}
+
+// every tensor fmt a kq load can route to a GPU kernel — the decode/batch/prefill gates all
+// clause on this (the MoE expert planes never reach the llama-family GPU graph, so we1/2/3
+// stay out of scope)
+def kq_load_gpu_supported(t : Model) : bool {
+    if (!t.kquant_native) {
+        return true
+    }
+    return ((kq_fmts_gpu_supported(t.wq_fmt) && kq_fmts_gpu_supported(t.wk_fmt) &&
+             kq_fmts_gpu_supported(t.wv_fmt) && kq_fmts_gpu_supported(t.wo_fmt)) &&
+        (kq_fmts_gpu_supported(t.w1_fmt) && kq_fmts_gpu_supported(t.w2_fmt) &&
+             kq_fmts_gpu_supported(t.w3_fmt)) &&
+        (kq_fmt_gpu_supported(t.wcls_fmt) && kq_fmt_gpu_supported(t.emb_fmt)))
+}
+
 // One kq tensor's quant plane slice, uploaded BYTE-IDENTICAL (disk-order superblock payloads —
 // the backend_repack decline excludes grp-repacked loads, and the non-repack backends leave the
 // planes disk-order). Cached in g_regions by source address like every weight region.

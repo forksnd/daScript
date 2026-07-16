@@ -1846,9 +1846,12 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
     if (t.kquant_native) {
         let ck = t.config
         let qdk = ck.n_heads * ck.head_size
+        // ... and every fmt needs a GPU kernel: kq_load_gpu_supported rejects the q4_0 QAT
+        // tier (and future formats) instead of letting them dispatch a wrong-layout branch
         if (g_mm_legacy || get_env_variable("DASLLAMA_METAL_MULMM") == "0" ||
                 (ck.dim % 64l) != 0l || (qdk % 64l) != 0l ||
-                (layer_kv_dim(ck, 0l) % 64l) != 0l || (layer_hidden(t, 0l) % 64l) != 0l) {
+                (layer_kv_dim(ck, 0l) % 64l) != 0l || (layer_hidden(t, 0l) % 64l) != 0l ||
+                !kq_load_gpu_supported(t)) {
             return MetalPrefillDecline.kquant_native
         }
     }

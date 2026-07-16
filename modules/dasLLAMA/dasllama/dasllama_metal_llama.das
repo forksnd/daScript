@@ -56,6 +56,9 @@ def private decode_shape_decline(t : Model) : MetalDecodeDecline {
     if (t.quant != QuantMode.q8) {
         return MetalDecodeDecline.quant_mode
     }
+    if (!kq_load_gpu_supported(t)) {   // a fmt without a GPU kernel (the q4_0 QAT tier, ...) must not dispatch
+        return MetalDecodeDecline.kquant_native
+    }
     if (t.arch != "llama") {
         return MetalDecodeDecline.arch
     }
