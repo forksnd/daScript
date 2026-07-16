@@ -16,6 +16,8 @@ options gen2
 module dasllama shared public
 
 require dasllama/dasllama_transformer public   // the engine + arch registry; every arch [init] fires
+require dasllama/dasllama_image   // the prepared-image cache: load_model maps it when present
+require daslib/fio   // the DASLLAMA_IMAGE kill switch
 require dasllama/dasllama_prefix public        // page-granular prefix cache over the paged pool
 require dasllama/dasllama_chat public          // layer 2: chat sessions over the same engine
 require dasllama/dasllama_audio public         // audio tower (mel frontend + whisper encoder + projectors)
@@ -41,6 +43,25 @@ def load_model(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     //! Load a model AND its tokenizer from a GGUF file — the one entry point. The architecture and
     //! tokenizer backend are auto-selected from GGUF metadata; ``mode`` picks the weight quantization
     //! (``QuantMode.fp32`` = the token-exact reference, ``QuantMode.q8`` = the fast int8 path).
+    //! Q8 loads keep a PREPARED IMAGE next to the gguf (box + knob specific): the first load
+    //! saves it, later loads map it in milliseconds with zero-copy weight planes.
+    //! ``DASLLAMA_IMAGE=0`` disables the cache.
+    if (mode == QuantMode.q8 && get_env_variable("DASLLAMA_IMAGE") != "0") {
+        apply_box_profile_runtime()   // a backend pin must precede the identity (it names the backend)
+        let img = image_path_for(path)
+        let ts_img = ref_time_ticks()
+        var t = Model()
+        if (load_model_image(img, t)) {
+            to_log(LOG_INFO, "dasLLAMA: prepared image mapped in {get_time_usec(ts_img) / 1000} ms — {img}\n")
+            return <- t
+        }
+        var m <- load_model_(path, mode)
+        let ts_save = ref_time_ticks()
+        if (save_model_image(m, img)) {
+            to_log(LOG_INFO, "dasLLAMA: prepared image saved in {get_time_usec(ts_save) / 1000} ms — {img}\n")
+        }
+        return <- m
+    }
     return <- load_model_(path, mode)
 }
 
