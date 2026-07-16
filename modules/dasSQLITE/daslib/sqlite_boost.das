@@ -1650,8 +1650,9 @@ let private FTS5_REJECTED_ANNOTATIONS = fixed_array(
         why = "FTS5 columns are tokenized text, not JSON. Drop the annotation or use a regular [sql_table]."),
     FtsRejectedAnnotation(name = "sql_blob", is_bool = true,
         why = "FTS5 columns are tokenized text, not BLOB. Drop the annotation or use a regular [sql_table]."))
-// Self-contained mode only: content fields must be string/Option<string>;
-// @sql_fts_rank is read-only and maps to FTS5's hidden `rank` on SELECT.
+// Self-contained mode only: indexed content fields must be string/Option<string>;
+// @sql_fts_unindexed stores typed metadata without tokenizing it; @sql_fts_rank is
+// read-only and maps to FTS5's hidden `rank` on SELECT.
 
 [structure_macro(name=sql_fts5)]
 class private SqlFts5Macro : AstStructureAnnotation {
@@ -1666,6 +1667,7 @@ class private SqlFts5Macro : AstStructureAnnotation {
             let fname = string(field.name)
             let is_optional = is_option_field_type(field._type)
             let is_fts_rank = find_annotation(field.annotation, "sql_fts_rank", false)
+            let is_fts_unindexed = find_annotation(field.annotation, "sql_fts_unindexed", false)
             // Reject every annotation that doesn't apply to a virtual table.
             for (rej in FTS5_REJECTED_ANNOTATIONS) {
                 var present = false
@@ -1701,6 +1703,10 @@ class private SqlFts5Macro : AstStructureAnnotation {
             }
             // @sql_fts_rank: read-only float column, reads FTS5's hidden `rank`. No daslang init allowed.
             if (is_fts_rank) {
+                if (is_fts_unindexed) {
+                    errors := "[sql_fts5]: field '{fname}' cannot be both @sql_fts_rank and @sql_fts_unindexed — rank is FTS5's hidden relevance column, not stored metadata."
+                    return false
+                }
                 col_name = "rank"   // FTS5 hidden column — not a declared content column
                 if (field.init != null) {
                     errors := "[sql_fts5]: field '{fname}' is @sql_fts_rank — read-only column populated from FTS5's hidden `rank` on SELECT. Remove the daslang field initializer."
@@ -1715,6 +1721,9 @@ class private SqlFts5Macro : AstStructureAnnotation {
                     return false
                 }
                 rank_count++
+            } elif (is_fts_unindexed) {
+                // Stored metadata: the ordinary sql_bind/sql_extract adapter rail provides
+                // its typed representation; FTS5's UNINDEXED suffix excludes it from MATCH.
             } else {
                 // Content column: string or Option<string>.
                 let bt = field._type.baseType
@@ -1738,12 +1747,13 @@ class private SqlFts5Macro : AstStructureAnnotation {
                 is_json = false,
                 is_blob = false,
                 is_fts_rank = is_fts_rank,
+                is_fts_unindexed = is_fts_unindexed,
                 computed_sql = "",
                 default_clause = "",
                 references_clause = ""))
         }
         if (content_count == 0) {
-            errors := "[sql_fts5] on struct '{st.name}': must declare at least one content column (`string` or `Option<string>`). A struct with only @sql_fts_rank fields has nothing to index."
+            errors := "[sql_fts5] on struct '{st.name}': must declare at least one indexed content column (`string` or `Option<string>`). A struct with only @sql_fts_unindexed metadata / @sql_fts_rank fields has nothing to index."
             return false
         }
         if (rank_count > 1) {
@@ -1830,6 +1840,9 @@ def private build_fts5_create_table_sql(table_name : string; fields : array<Fiel
             w |> write("\"")
             w |> write(info.col_name)
             w |> write("\"")
+            if (info.is_fts_unindexed) {
+                w |> write(" UNINDEXED")
+            }
             first = false
         }
     }

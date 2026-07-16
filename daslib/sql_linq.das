@@ -3611,9 +3611,15 @@ def private fn_call_to_sql(var call : ExprCall?; var q : SqlQuery&; prog : Progr
             return "{lhs} LIKE ? ESCAPE '\\'"
         }
     }
-    // ---- FTS5 (tut 40): text_match(_.Body, q) on [sql_fts5] → `Body MATCH ?`; non-FTS5 is a compile error.
+    // ---- FTS5 (tut 40): text_match(_.Body, q) on indexed [sql_fts5] content → `Body MATCH ?`.
     if (fname == "text_match" && argc == 2) {
         if (!has_struct_annotation(q.rootType, "sql_fts5")) return pred_fail(q, prog, at, "_sql: text_match() requires an [sql_fts5] struct, got '{describe(q.rootType)}'. Options: use contains(_.Col, q) for LIKE-based substring match, or annotate the struct with [sql_fts5] for indexed full-text search.")
+        var receiver : ExpressionPtr
+        var fieldName : string
+        if (qmatch(call.arguments[0], $e(receiver).$f(fieldName)).matched
+            && has_field_annotation(q.rootType, fieldName, "sql_fts_unindexed")) {
+            return pred_fail(q, prog, at, "_sql: text_match() cannot target @sql_fts_unindexed field '{fieldName}' — UNINDEXED metadata is stored and filterable with ordinary comparisons, but deliberately excluded from FTS5 MATCH. Match an indexed string field instead.")
+        }
         let lhs = pred_to_sql(call.arguments[0], q, prog, at)
         return "" if (q.hadError)
         if (q.inHaving) {

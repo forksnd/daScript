@@ -12,6 +12,14 @@ struct Doc {
     @sql_fts_rank Rank : float
 }
 
+[sql_fts5(name="messages_idx")]
+struct MessageDoc {
+    @sql_fts_unindexed ChatId : int64
+    @sql_fts_unindexed TelegramMessageId : int64
+    Body : string
+    @sql_fts_rank Rank : float
+}
+
 [test]
 def test_fts5_emits_create_virtual_table(t : T?) {
     t |> equal(_::_sql_create_table_sql(type<Doc>),
@@ -96,6 +104,25 @@ def test_fts5_runtime_phrase_match(t : T?) {
         let hits <- _sql(db |> select_from(type<Doc>)
                            |> _where(_.Body |> text_match("\"quick brown\"")))
         t |> equal(length(hits), 1, "phrase match only finds adjacent tokens in order")
+    }
+}
+
+[test]
+def test_fts5_unindexed_metadata_emits_ddl_and_round_trips(t : T?) {
+    t |> equal(_::_sql_create_table_sql(type<MessageDoc>),
+        "CREATE VIRTUAL TABLE IF NOT EXISTS \"messages_idx\" USING fts5(\"ChatId\" UNINDEXED, \"TelegramMessageId\" UNINDEXED, \"Body\", tokenize='unicode61')",
+        "@sql_fts_unindexed stores metadata without adding it to the inverted index")
+    with_sqlite(":memory:") $(db) {
+        db |> create_table(type<MessageDoc>)
+        db |> insert(MessageDoc(ChatId = 42l, TelegramMessageId = 1001l, Body = "first fox note"))
+        db |> insert(MessageDoc(ChatId = 7l, TelegramMessageId = 1002l, Body = "second fox note"))
+
+        let hits <- _sql(db |> select_from(type<MessageDoc>)
+                           |> _where(_.ChatId == 42l && (_.Body |> text_match("fox"))))
+        t |> equal(length(hits), 1)
+        t |> equal(hits[0].ChatId, 42l)
+        t |> equal(hits[0].TelegramMessageId, 1001l)
+        t |> equal(hits[0].Body, "first fox note")
     }
 }
 

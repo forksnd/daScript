@@ -25,6 +25,8 @@ API surface added in this chunk
 
 * ``[sql_fts5(name = "...")]`` --- struct annotation: the type
   is materialized as a SQLite FTS5 virtual table.
+* ``@sql_fts_unindexed`` --- stored typed metadata column that is
+  excluded from the inverted index and cannot be a ``MATCH`` target.
 * ``@sql_fts_rank`` --- read-only ``float`` column annotation:
   maps to FTS5's hidden ``rank`` column on SELECT, skipped on
   INSERT.
@@ -47,6 +49,7 @@ Declaring the virtual table
 
     [sql_fts5(name = "docs_idx")]
     struct Doc {
+        @sql_fts_unindexed Id : int64
         Body : string
         @sql_fts_rank Rank : float
     }
@@ -54,15 +57,32 @@ Declaring the virtual table
     db |> create_table(type<Doc>)
     // emits:
     //   CREATE VIRTUAL TABLE IF NOT EXISTS "docs_idx"
-    //       USING fts5("Body", tokenize='unicode61')
+    //       USING fts5("Id" UNINDEXED, "Body", tokenize='unicode61')
 
 INSERT works like any ``[sql_table]``; the ``Rank`` column is
 skipped automatically (FTS5 has no user-writable rank).
 
 .. code-block:: das
 
-    db |> insert(Doc(Body = "The quick brown fox jumps over the lazy dog"))
-    db |> insert(Doc(Body = "A swift red fox escaped at dawn"))
+    db |> insert(Doc(Id = 1l, Body = "The quick brown fox jumps over the lazy dog"))
+    db |> insert(Doc(Id = 2l, Body = "A swift red fox escaped at dawn"))
+
+Typed metadata with ``@sql_fts_unindexed``
+===============================================
+
+Use unindexed columns for row IDs, tenant/chat IDs, kinds, timestamps,
+or other metadata that must travel with each search hit without being
+tokenized:
+
+.. code-block:: das
+
+    let hits <- _sql(db |> select_from(type<Doc>)
+                        |> _where(_.Id == 1l
+                            && (_.Body |> text_match("fox"))))
+
+``Id`` remains an ``int64`` through INSERT and SELECT and supports
+ordinary typed comparisons. ``text_match(_.Id, ...)`` is rejected:
+UNINDEXED metadata is deliberately not part of the FTS5 index.
 
 Querying
 ========

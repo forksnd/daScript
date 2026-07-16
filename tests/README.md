@@ -260,13 +260,14 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_91_sql_vacuum_into_macro.das | `_sql_vacuum_into(path)` macro form (vacuum into file path, runtime string path, verification across reopen) | |
 | test_92_order_by_runtime.das | Runtime `_order_by(string)` column-name binding (const string folds to compile-time, runtime path uses sql_quote_id) | |
 | test_93_attach.das | `with_attached(path, alias)` attach secondary database file (query across attached, temp-file cleanup) | |
-| test_94_fts5.das | `[sql_fts5]` full-text search (CREATE VIRTUAL TABLE fts5, `@sql_fts_rank` hidden rank column, INSERT skips rank, typed predicate DELETE) | |
+| test_94_fts5.das | `[sql_fts5]` full-text search (`@sql_fts_unindexed` typed metadata, `@sql_fts_rank`, MATCH, INSERT, typed predicate DELETE) | |
 | failed_create_view.das | `_create_view` macro validation failures (column count/type mismatches, non-annotated struct, bound parameters) | **expect** `40104:7` |
 | failed_each_sql_terminals.das | `_each_sql` rejects materializing terminals (`_to_array`, `_first`, `_first_opt`, aggregates) | **expect** `40104:4` |
 | failed_pred_json_path_typo.das | Predicate-side JSON-path validation (typo detection in `_.Field.nested` chains) | **expect** `40104:3, 30503:3` |
 | failed_register_function.das | `register_function` compile-time type validation (struct args, struct returns, pointers, non-function references) | **expect** `40104:5` |
 | failed_sql_column.das | `@sql_column` annotation validation (empty value, embedded quotes/backslashes, cross-field collisions) | **expect** `30111:5` |
-| failed_sql_fts5.das | `[sql_fts5]` field-annotation rejections (`@sql_column` on `@sql_fts_rank`) | **expect** `30111:1` |
+| failed_sql_fts5.das | `[sql_fts5]` field-annotation rejections (`@sql_column` / `@sql_fts_unindexed` on rank) | **expect** `20800:2` |
+| failed_sql_fts5_unindexed_match.das | `_sql` rejects `text_match` on `@sql_fts_unindexed` metadata | **expect** `50503:1` |
 | failed_sql_index.das | `[sql_index]` validation (missing fields, nonexistent columns, ordering with `[sql_table]`) | **expect** `30111:4` |
 | failed_sql_json_blob_kind_collision.das | Payload type kind collision rejection (same type in `@sql_json` vs `@sql_blob`) | **expect** `30111:3` |
 | failed_sql_macro.das | `_sql` / `_sql_text` analyzer failures (22 malformed chains: invalid roots, duplicate modifiers, unsupported expressions) | **expect** `40104:22, 30304:2, 30503:2` |

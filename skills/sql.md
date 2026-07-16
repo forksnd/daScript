@@ -482,20 +482,23 @@ For window functions, recursive CTEs, custom helpers the chain doesn't translate
 ```das
 [sql_fts5(name = "docs_idx")]
 struct Doc {
+    @sql_fts_unindexed Id : int64  // stored/filterable metadata, excluded from MATCH
     Body : string
     @sql_fts_rank Rank : float       // FTS5 fills on SELECT (BM25); INSERT skips
 }
 
 db |> create_table(type<Doc>)                    // CREATE VIRTUAL TABLE … USING fts5(...)
-db |> insert(Doc(Body = "The quick brown fox jumps"))
+db |> insert(Doc(Id = 42l, Body = "The quick brown fox jumps"))
 
 let foxes <- _sql(db |> select_from(type<Doc>)
-                     |> _where(_.Body |> text_match("quick fox"))
+                     |> _where(_.Id == 42l && (_.Body |> text_match("quick fox")))
                      |> _order_by(_.Rank))
-// SELECT "Body", rank FROM "docs_idx" WHERE "Body" MATCH ? ORDER BY rank
+// SELECT "Id", "Body", rank FROM "docs_idx" WHERE "Id" = ? AND "Body" MATCH ? ORDER BY rank
 
 let removed = db |> _sql_delete(type<Doc>, _.Body |> text_match("obsolete"))
 ```
+
+`@sql_fts_unindexed` emits FTS5's `UNINDEXED` column suffix. Use it for typed IDs, timestamps, kinds, or tenant/chat metadata that must round-trip with hits and participate in ordinary comparisons without being tokenized. The normal `sql_bind` / `sql_extract` adapter rail supplies its storage type. `text_match` on an unindexed field is a compile error.
 
 `text_match(col, query)` lowers to `col MATCH ?`. The same predicate is also a `daslib/strings_boost` (via `daslib/fts5_query`) in-memory matcher — one call site for both SQL and in-memory filtering. `text_match` on a non-`[sql_fts5]` column is a compile error pointing at `contains` (LIKE-based) or adding `[sql_fts5]`.
 

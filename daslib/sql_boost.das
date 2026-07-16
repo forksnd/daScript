@@ -382,6 +382,7 @@ struct FieldInfo {
     is_json : bool
     is_blob : bool
     is_fts_rank : bool   // [sql_fts5] only — read-only, emits `rank`, skipped on INSERT
+    is_fts_unindexed : bool   // [sql_fts5] only — stored metadata excluded from the inverted index
     computed_sql : string
     default_clause : string
     references_clause : string
