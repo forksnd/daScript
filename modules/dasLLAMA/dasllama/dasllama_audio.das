@@ -662,8 +662,9 @@ def finalize(var t : AudioTower) {
 // are deliberate skips. A new non-array AudioTower field trips this until BOTH agree.
 let private TOWER_META_FIELDS = 28 + 2
 
-// every non-array AudioTower field, explicitly, both directions (see dasllama_image)
-def private serialize_image_meta(var arch : Archive; var t : AudioTower) {
+// every non-array AudioTower field, explicitly, both directions (see dasllama_image).
+// Public: WhisperModel's serialize_image_meta reuses it for its nested `enc` tower.
+def serialize_image_meta(var arch : Archive; var t : AudioTower) {
     verify(count_meta_fields(t) == TOWER_META_FIELDS)   // grew AudioTower? extend this list
     arch |> serialize_raw(t.n_mel)
     arch |> serialize_raw(t.d_model)

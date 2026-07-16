@@ -19,6 +19,9 @@ require dasllama/dasllama_math   // active_kernel_backend — half the image ide
 // Images are BOX + KNOB specific (identity below) and versioned — a mismatch regenerates,
 // never migrates. The load path touches only the header + meta blob: bigger-than-RAM images
 // stay lazy (full verification belongs to the offline tool, not load).
+// Nested weight-carriers (a struct field that itself declares image_map, e.g.
+// WhisperModel.enc) contribute their planes under dotted names ("enc.fblob"); string-array
+// fields ride the meta blob via serialize_strings — raw string pointers can't be planes.
 
 // bump on ANY layout/serialization change — a mismatched image regenerates from the gguf
 let IMAGE_VERSION = 2
@@ -115,8 +118,10 @@ def private serialize_pod_array(var arch : Archive; var a : array<auto(TT)>) {
     }
 }
 
-// string arrays as [lengths][one blob] — two bulk payloads instead of per-string dispatch
-def private serialize_strings(var arch : Archive; var a : array<string>) {
+//! String arrays as [lengths][one blob] — two bulk payloads instead of per-string dispatch.
+//! Public because string-array fields cannot be raw planes (they hold pointers) — a type's
+//! serialize_image_meta must route them through this instead.
+def serialize_strings(var arch : Archive; var a : array<string>) {
     var lens : array<int>
     var blob : array<uint8>
     if (!arch.reading) {
@@ -276,12 +281,15 @@ def private serialize_image_meta(var arch : Archive; var t : Model) {
 // image_bytes are deliberate skips. A new non-array Model field trips this until BOTH agree.
 let IMAGE_META_FIELDS = 63 + 3
 
-//! Count of non-array fields of any struct — pair with a per-type field-count constant to
+//! Count of meta-carried fields of any struct: non-arrays plus string arrays (those cannot
+//! be raw planes — see serialize_strings). Pair with a per-type field-count constant to
 //! tripwire an explicit serialize_image_meta list against struct growth.
 def count_meta_fields(var t) : int {
     var n = 0
     apply(t) $ [unused_argument(name, field)] (name : string; var field) {
         static_if (!typeinfo is_array(field)) {
+            n++
+        } static_elif (typeinfo is_string(field[0])) {
             n++
         }
     }
@@ -294,6 +302,27 @@ def private image_post_load(var t : Model) {
 }
 
 // ===== save =====
+
+// one plane: pad to a page, bulk-write, account. long_ forms: a plane past 2 GiB
+// (voxtral-mini qblob = 3.6 G elements) does not fit the int32 length/byte-count rail
+def private write_plane(f : file; var sections : array<ImgSection>; var cur : uint64&;
+                        var ok : bool&; name : string; var field : array<auto(TT)>) {
+    if (empty(field)) {
+        return
+    }
+    let nbytes = uint64(long_length(field)) * uint64(typeinfo sizeof(field[0]))
+    let at = pad_to_page(cur)
+    write_zeros(f, at - cur)
+    f |> long_fwrite(field)
+    sections |> push(ImgSection(name = name, off = at, bytes = nbytes))
+    cur = at + nbytes
+    // fwrite and the section table must agree byte-for-byte, or the mapped planes land at
+    // the wrong offsets — fail the save loudly, not the load
+    if (uint64(ftell(f)) != cur) {
+        to_log(LOG_ERROR, "dasLLAMA image: plane '{name}' wrote {ftell(f)} != accounted {cur} (nbytes {nbytes}) — image save aborted\n")
+        ok = false
+    }
+}
 
 //! Serialize a loaded weight-carrying struct as a prepared image: array planes page-aligned
 //! raw (borrowed back at load), everything else archived. Atomic (tmp + rename). Returns
@@ -322,20 +351,18 @@ def save_image(var t; path : string; tag : string = "") : bool {
         let ts_planes = ref_time_ticks()
         apply(t) $(name : string; var field) {
             static_if (typeinfo is_array(field)) {
-                if (!empty(field)) {
-                    // long_ forms: a plane past 2 GiB (voxtral-mini qblob = 3.6 G elements)
-                    // does not fit the int32 length/byte-count rail
-                    let nbytes = uint64(long_length(field)) * uint64(typeinfo sizeof(field[0]))
-                    let at = pad_to_page(cur)
-                    write_zeros(f, at - cur)
-                    f |> long_fwrite(field)
-                    sections |> push(ImgSection(name = name, off = at, bytes = nbytes))
-                    cur = at + nbytes
-                    // fwrite and the section table must agree byte-for-byte, or the mapped
-                    // planes land at the wrong offsets — fail the save loudly, not the load
-                    if (uint64(ftell(f)) != cur) {
-                        to_log(LOG_ERROR, "dasLLAMA image: plane '{name}' wrote {ftell(f)} != accounted {cur} (nbytes {nbytes}) — image save aborted\n")
-                        ok = false
+                static_if (!typeinfo is_string(field[0])) {   // string arrays ride the meta blob
+                    write_plane(f, sections, cur, ok, name, field)
+                }
+            } static_elif (typeinfo safe_has_field < image_map > (field)) {
+                // a nested weight-carrier on the image rail (marker: it declares image_map) —
+                // its planes join this image under dotted names; scalars ride the meta blob
+                // via the outer type's serialize_image_meta (e.g. WhisperModel.enc)
+                apply(field) $(iname : string; var ifield) {
+                    static_if (typeinfo is_array(ifield)) {
+                        static_if (!typeinfo is_string(ifield[0])) {
+                            write_plane(f, sections, cur, ok, "{name}.{iname}", ifield)
+                        }
                     }
                 }
             }
@@ -398,6 +425,25 @@ def save_model_image(var t : Model; path : string) : bool {
 
 // ===== load =====
 
+// one plane: validate the section against the mapping, then borrow it in place
+def private borrow_plane(bp : uint8 const?; msize : uint64; path : string;
+                         by_name : table<string; ImgSection>; var ok : bool&;
+                         name : string; var field : array<auto(TT)>) {
+    if (!key_exists(by_name, name)) {
+        return
+    }
+    let sec = by_name?[name] ?? ImgSection()
+    let esz = uint64(typeinfo sizeof(field[0]))
+    if (sec.off % uint64(IMAGE_PAGE) != 0ul || sec.off + sec.bytes > msize || sec.bytes % esz != 0ul) {
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — section '{name}' at {sec.off}+{sec.bytes} (esz {esz}) is malformed\n")
+        ok = false
+    } else {
+        unsafe {
+            _builtin_make_temp_array_i64(field, reinterpret<void?>(bp + int64(sec.off)), int64(sec.bytes / esz))
+        }
+    }
+}
+
 //! Map a prepared image and rebuild the struct with zero O(model) work: array plane fields
 //! borrow the mapping (the finalizer forgets + unmaps), the archive blob restores everything
 //! else. false = absent / wrong identity / wrong version — the caller regenerates from gguf.
@@ -449,15 +495,16 @@ def load_image(path : string; var t; tag : string = "") : bool {
     var ok = true
     apply(t) $(name : string; var field) {
         static_if (typeinfo is_array(field)) {
-            if (key_exists(by_name, name)) {
-                let sec = by_name?[name] ?? ImgSection()
-                let esz = uint64(typeinfo sizeof(field[0]))
-                if (sec.off % uint64(IMAGE_PAGE) != 0ul || sec.off + sec.bytes > msize || sec.bytes % esz != 0ul) {
-                    to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — section '{name}' at {sec.off}+{sec.bytes} (esz {esz}) is malformed\n")
-                    ok = false
-                } else {
-                    unsafe {
-                        _builtin_make_temp_array_i64(field, reinterpret<void?>(bp + int64(sec.off)), int64(sec.bytes / esz))
+            static_if (!typeinfo is_string(field[0])) {   // string arrays ride the meta blob
+                borrow_plane(bp, msize, path, by_name, ok, name, field)
+            }
+        } static_elif (typeinfo safe_has_field < image_map > (field)) {
+            // nested weight-carrier: borrow its planes back from the dotted sections (the
+            // nested image_map stays null — the OUTER struct owns this mapping)
+            apply(field) $(iname : string; var ifield) {
+                static_if (typeinfo is_array(ifield)) {
+                    static_if (!typeinfo is_string(ifield[0])) {
+                        borrow_plane(bp, msize, path, by_name, ok, "{name}.{iname}", ifield)
                     }
                 }
             }

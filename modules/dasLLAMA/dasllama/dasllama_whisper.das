@@ -5,12 +5,16 @@ module dasllama_whisper shared public
 require math
 require daslib/fio
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs
+require daslib/apply
+require daslib/archive
 require strings
 require dasllama/dasllama_math
 require dasllama/dasllama_par
 require dasllama/dasllama_gguf
 require dasllama/dasllama_quant
 require dasllama/dasllama_audio
+require dasllama/dasllama_common   // apply_box_profile_runtime for the whisper-image identity
+require dasllama/dasllama_image
 
 // Whisper-proper ASR: reads ggerganov/whisper.cpp ggml-*.bin models directly (drop-in HF
 // models, no converter), reuses the validated encoder tower from dasllama_audio, adds the
@@ -55,6 +59,72 @@ struct WhisperModel {
     d_ln_b_off : int64
     dlayers_off : int64
     dlayer_stride : int64
+    image_map : void?         // non-null when the planes borrow a mapped .dlim (dasllama_image)
+    image_bytes : uint64
+}
+
+def finalize(var t : WhisperModel) {
+    apply(t) $ [unused_argument(name)] (name : string; var field) {
+        static_if (typeinfo is_array(field)) {
+            if (lock_count(field) != 0) {
+                unsafe {
+                    _builtin_forget_temp_array(field)
+                }
+            } else {
+                delete field
+            }
+        } static_elif (typeinfo is_struct(field)) {
+            delete field   // enc's own finalizer forgets ITS borrowed planes
+        }
+    }
+    if (t.image_map != null) {
+        unsafe {
+            fmap_close(t.image_map, t.image_bytes)
+        }
+        t.image_map = null
+        t.image_bytes = 0ul
+    }
+}
+
+// the tripwire: serialize_image_meta(WhisperModel) covers 27 fields (vocab rides the meta
+// blob — string arrays can't be raw planes; enc reuses AudioTower's list); mel (rebuilt at
+// load) + image_map + image_bytes are deliberate skips.
+let private WHISPER_META_FIELDS = 27 + 3
+
+// every meta-carried WhisperModel field, explicitly, both directions (see dasllama_image)
+def private serialize_image_meta(var arch : Archive; var t : WhisperModel) {
+    verify(count_meta_fields(t) == WHISPER_META_FIELDS)   // grew WhisperModel? extend this list
+    arch |> serialize_raw(t.n_vocab)
+    arch |> serialize_raw(t.n_text_ctx)
+    arch |> serialize_raw(t.n_text_state)
+    arch |> serialize_raw(t.n_text_head)
+    arch |> serialize_raw(t.n_text_layer)
+    arch |> serialize_raw(t.eps)
+    arch |> serialize_raw(t.multilingual)
+    arch |> serialize_raw(t.n_lang)
+    arch |> serialize_raw(t.tok_eot)
+    arch |> serialize_raw(t.tok_sot)
+    arch |> serialize_raw(t.tok_translate)
+    arch |> serialize_raw(t.tok_transcribe)
+    arch |> serialize_raw(t.tok_solm)
+    arch |> serialize_raw(t.tok_prev)
+    arch |> serialize_raw(t.tok_nosp)
+    arch |> serialize_raw(t.tok_not)
+    arch |> serialize_raw(t.tok_beg)
+    arch |> serialize_raw(t.tok_space)
+    serialize_strings(arch, t.vocab)
+    serialize_image_meta(arch, t.enc)
+    arch |> serialize_raw(t.dq8)
+    arch |> serialize_raw(t.d_pe_off)
+    arch |> serialize_raw(t.d_te_off)
+    arch |> serialize_raw(t.d_ln_w_off)
+    arch |> serialize_raw(t.d_ln_b_off)
+    arch |> serialize_raw(t.dlayers_off)
+    arch |> serialize_raw(t.dlayer_stride)
+}
+
+def private image_post_load(var t : WhisperModel) {
+    t.mel <- build_whisper_mel_plan(AUDIO_N_FFT)   // derived tables — the parse-at-load carve-out
 }
 
 // Per-layer decoder tensor offsets inside dblob, in layout order (24 tensors: self-attn
@@ -252,7 +322,43 @@ def private wt_read_conv_permuted(recs : table<string; WTensorRec>; b : array<ui
 
 //! Load a whisper.cpp ggml-*.bin model (f32/f16 tensor types; quantized whisper bins are not
 //! supported). Verified against whisper.cpp's whisper_model_load, byte for byte.
+//! Like ``load_model``, keeps a PREPARED IMAGE next to the bin (box + knob specific): the
+//! first load saves it, later loads map it in milliseconds with zero-copy weight planes.
+//! ``DASLLAMA_IMAGE=0`` disables the cache; a ``.dlim`` path loads that image directly.
 def load_whisper_model(path : string; q8 : bool = false) : WhisperModel {
+    let tag = q8 ? "whisper-q8" : "whisper-f32"
+    if (path |> ends_with(".dlim")) {
+        // named directly — no source bin to regenerate from, so a wrong identity panics
+        apply_box_profile_runtime()
+        let ts_img = ref_time_ticks()
+        var t = WhisperModel()
+        if (!load_image(path, t, tag)) {
+            panic("dasLLAMA: '{path}' is not a prepared whisper image for this box/knobs (identity {image_identity(tag)}) — regenerate it from the source model")
+        }
+        to_log(LOG_INFO, "dasLLAMA: prepared whisper image mapped in {get_time_usec(ts_img) / 1000} ms — {path}\n")
+        return <- t
+    }
+    if (get_env_variable("DASLLAMA_IMAGE") != "0") {
+        apply_box_profile_runtime()   // a backend pin must precede the identity (it names the backend)
+        let img = image_path_for(path, tag)
+        let ts_img = ref_time_ticks()
+        var t = WhisperModel()
+        if (load_image(img, t, tag)) {
+            to_log(LOG_INFO, "dasLLAMA: prepared whisper image mapped in {get_time_usec(ts_img) / 1000} ms — {img}\n")
+            return <- t
+        }
+        var m <- load_whisper_model_(path, q8)
+        let ts_save = ref_time_ticks()
+        if (save_image(m, img, tag)) {
+            to_log(LOG_INFO, "dasLLAMA: prepared whisper image saved in {get_time_usec(ts_save) / 1000} ms — {img}\n")
+        }
+        return <- m
+    }
+    return <- load_whisper_model_(path, q8)
+}
+
+// the ggml-bin reader proper (see load_whisper_model's doc for the container contract)
+def private load_whisper_model_(path : string; q8 : bool = false) : WhisperModel {
     var w = WhisperModel()
     // the record walk runs until EOF, so it needs the true byte count — length(bytes) is
     // int32 and wraps negative on >2 GB bins (large-v3); stat's st_size is 64-bit
