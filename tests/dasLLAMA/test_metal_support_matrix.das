@@ -33,6 +33,9 @@ require _model_tier
 //   Q4_K_M    f32     q8_0   decline kquant_native ENGAGE (W4)          decline kquant_native
 // (W4: single-stream decode serves K-quant weights via the per-site kq plane GEMVs; the batched
 // mv/GEMM forms and prefill mul_mm keep the kquant_native guard until their kq twins land.)
+// The MetalMode knob (M1) rides the same matrix: off = overrides deselected, when_available =
+// engage/fallback per the cells above, required = a CAPABILITY decline panics (policy declines
+// — the prefill npos window — stay quiet CPU fallbacks).
 // plus the prefill-only window clauses: npos < min_npos declines npos_window, a continuation
 // chunk (start_pos > 0) declines start_pos.
 
@@ -213,6 +216,60 @@ def test_metal_support_matrix(t : T?) {
             set_wscale_f16(false)
             delete tr16
 
+            // ===== the MetalMode knob (M1) on a fully-servable q8 config =====
+            {
+                let de_off = metal_decode_stats().decodes
+                set_metal_mode(MetalMode.off)
+                t |> success(active_decode_override() == "", "mode off: overrides deselected")
+                with_job_que() {
+                    setup_dasllama_jobque()
+                    var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                    let pr <- encode(tr, counting_prompt(1, 12), true, false)
+                    eval_(tr, s, pr)
+                    var one <- [greedy_top(s.logits, tr.config.vocab_size)]
+                    eval_(tr, s, one)
+                    delete one
+                    delete s
+                }
+                t |> success(metal_decode_stats().decodes == de_off, "mode off: nothing served on the GPU")
+                set_metal_mode(MetalMode.when_available)
+                t |> success(active_decode_override() == "metal", "mode when_available: metal overrides selected")
+                let de_avail = metal_decode_stats().decodes
+                with_job_que() {
+                    setup_dasllama_jobque()
+                    var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                    let pr <- encode(tr, counting_prompt(1, 12), true, false)
+                    eval_(tr, s, pr)
+                    var one <- [greedy_top(s.logits, tr.config.vocab_size)]
+                    eval_(tr, s, one)
+                    delete one
+                    delete s
+                }
+                t |> success(metal_decode_stats().decodes > de_avail, "mode when_available: decode serves on the GPU")
+                // required on a servable config: decode serves, and the SHORT prompt's
+                // npos_window POLICY decline stays a quiet CPU prefill — no panic
+                set_metal_mode(MetalMode.required)
+                let de_req = metal_decode_stats().decodes
+                var pfd_r0 <- metal_prefill_declines()
+                with_job_que() {
+                    setup_dasllama_jobque()
+                    var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                    let pr <- encode(tr, counting_prompt(1, 12), true, false)
+                    eval_(tr, s, pr)
+                    var one <- [greedy_top(s.logits, tr.config.vocab_size)]
+                    eval_(tr, s, one)
+                    delete one
+                    delete s
+                }
+                var pfd_r1 <- metal_prefill_declines()
+                t |> success(metal_decode_stats().decodes > de_req, "mode required: decode serves on the GPU")
+                t |> success((pfd_r1?["npos_window"] ?? 0l) > (pfd_r0?["npos_window"] ?? 0l),
+                    "mode required: the npos_window POLICY decline stays a quiet CPU fallback")
+                set_metal_mode(MetalMode.off)
+                delete pfd_r0
+                delete pfd_r1
+            }
+
             // ===== native K-quant weights (Q4_K_M) =====
             // W4: single-stream decode ENGAGES (per-site kq plane GEMVs — Q4_K_M mixes k4 and k6
             // per tensor, incl. the tied Q6_K classifier on the GPU-logits path); prefill and the
@@ -248,6 +305,56 @@ def test_metal_support_matrix(t : T?) {
                     "K-quant continuation with metal overrides ON matches the CPU truth (guard verified)")
                 delete cpu_ids
                 delete gpu_ids
+
+                // ===== MetalMode.required on the kq model: capability declines PANIC =====
+                // single-stream decode (servable) runs; the >= min_npos prefill and the batched
+                // step (kq kernels pending on those paths) fail hard instead of falling back
+                with_job_que() {
+                    setup_dasllama_jobque()
+                    var sa = make_run_state(trk.config, KVDtype.f16, KVDtype.f16)
+                    var sb = make_run_state(trk.config, KVDtype.f16, KVDtype.f16)
+                    eval_(trk, sa, kprompt)   // mode still off — clean CPU prefills
+                    eval_(trk, sb, kprompt)
+                    set_metal_mode(MetalMode.required)
+                    let de0 = metal_decode_stats().decodes
+                    var one <- [greedy_top(sa.logits, trk.config.vocab_size)]
+                    eval_(trk, sa, one)
+                    t |> success(metal_decode_stats().decodes - de0 > 0l,
+                        "required: kq single-stream decode serves on the GPU")
+                    var pf_panicked = false
+                    var sc = make_run_state(trk.config, KVDtype.f16, KVDtype.f16)
+                    try {
+                        eval_(trk, sc, kprompt)   // >= min_npos, start_pos 0 -> kquant capability
+                    } recover {
+                        pf_panicked = true
+                    }
+                    t |> success(pf_panicked, "required: kq prefill (>= min_npos) panics instead of CPU fallback")
+                    var ba_panicked = false
+                    var ws <- create_batch_workspace_(trk)
+                    var sess : array<Session?>
+                    unsafe {
+                        sess |> push(addr(sa))
+                        sess |> push(addr(sb))
+                    }
+                    var cur <- [greedy_top(sa.logits, trk.config.vocab_size), greedy_top(sb.logits, trk.config.vocab_size)]
+                    try {
+                        eval_batch_(trk, ws, sess, cur)
+                    } recover {
+                        ba_panicked = true
+                    }
+                    t |> success(ba_panicked, "required: kq batched step panics instead of CPU fallback")
+                    set_metal_mode(MetalMode.off)
+                    sess |> clear()   // borrowed handles — delete of array<T?> cascades to the pointees
+                    unsafe {
+                        delete ws
+                        delete sess
+                    }
+                    delete cur
+                    delete one
+                    delete sa
+                    delete sb
+                    delete sc
+                }
                 delete trk
             } else {
                 feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); K-quant cells skipped\n")

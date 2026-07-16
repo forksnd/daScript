@@ -56,10 +56,13 @@ def private vecs_equal(a, b : array<float>) : bool {
 }
 
 // Start the server on a dedicated thread (model loaded in-thread), wait until it answers /v1/models,
-// run the block, then POST /shutdown (flips the server context's stop flag) and join.
-def private with_llama_server(model_path : string; port : int; blk : block<(base_url : string) : void>) {
+// run the block, then POST /shutdown (flips the server context's stop flag) and join. `mode`
+// arms the Metal pipeline in the server thread's context BEFORE the load (the --metal flag's
+// engine effect — the != off backend pin must precede load_model).
+def private with_llama_server(model_path : string; port : int; mode : MetalMode = MetalMode.off; blk : block<(base_url : string) : void>) {
     with_job_status(1) $(finished) {
         new_thread() @() {
+            set_metal_mode(mode)
             var m <- load_model(model_path, QuantMode.q8)
             set_model(m, "test-llm")
             set_default_max_tokens(4l)   // per-context global — exercised by the default-budget completion test
@@ -245,6 +248,38 @@ def test_asr_worker_panic_boundary(t : T?) {
 }
 
 // ===== parse_tool_calls (model-free) =====
+
+[test]
+def test_openai_server_metal_mode(t : T?) {
+    t |> run("OpenAI server: metal mode when_available serves (the --metal flag's engine effect)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA server test is JIT-only)")
+            return
+        }
+        if (!stat(MODEL_PATH).is_valid) {
+            t |> success(true, "skipped: {base_name(MODEL_PATH)} not present (set DASLLAMA_MODELS_DIR)")
+            return
+        }
+        // when_available: engages the GPU where the gates pass (Apple), quietly stays CPU
+        // elsewhere — serving must work identically either way
+        with_llama_server(MODEL_PATH, TEST_PORT + 2, MetalMode.when_available) $(base_url) {
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"messages\":[\{\"role\":\"user\",\"content\":\"Say hi\"}],\"max_tokens\":8}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "chat JSON parses under metal mode")
+                if (js != null) {
+                    t |> success(!empty(string(js?["choices"]?[0]?["message"]?["content"] ?? "")),
+                        "chat completion returns content under metal mode")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+        }
+    }
+}
 
 [test]
 def test_parse_tool_calls(t : T?) {

@@ -321,6 +321,62 @@ def active_decode_override : string {
     return g_decode_override_name
 }
 
+//! Is a whole-prefill/decode override registered under `name`? (Apple builds register "metal"
+//! at [init]; other platforms have none.)
+def has_prefill_override(name : string) : bool {
+    return key_exists(g_prefill_overrides, name)
+}
+
+def has_decode_override(name : string) : bool {
+    return key_exists(g_decode_overrides, name)
+}
+
+//! How the Metal pipeline engages — ONE knob for all three GPU paths (prefill, single-stream
+//! decode, batched decode).
+enum MetalMode {
+    off             //!< CPU loops only (deselects the "metal" overrides)
+    when_available  //!< GPU when a path's gates pass, silent CPU fallback otherwise
+    required        //!< GPU or fail: a capability decline (the GPU cannot serve) panics
+}
+
+var private g_metal_mode = MetalMode.off
+
+//! Select how the Metal pipeline engages (see ``MetalMode``). Any mode but ``off`` pins the
+//! row-major "portable" kernel backend (the GPU kernels read row-major planes — call this
+//! BEFORE ``load_model``, or the ARM repack backend interleaves the weights at load and every
+//! Metal gate declines ``backend_repack``) and activates the "metal" prefill + decode + batch
+//! overrides. Under ``required`` a capability decline at run time (a call the GPU cannot
+//! serve — unsupported arch/shape/config, a path whose kernels are missing, depth past the
+//! attention cap, a GPU dispatch failure) panics with the decline reason instead of falling
+//! back; POLICY declines (the prefill npos window — the GPU could serve but chooses not to)
+//! still run the CPU path. ``required`` with no "metal" override registered (a non-Apple
+//! build) panics right here. ``off`` deselects the overrides; the backend pin is left as-is.
+def set_metal_mode(mode : MetalMode) {
+    if (mode == MetalMode.off) {
+        select_prefill_override("")
+        select_decode_override("")
+        g_metal_mode = mode
+        return
+    }
+    if (!has_prefill_override("metal") || !has_decode_override("metal")) {
+        if (mode == MetalMode.required) {
+            panic("dasLLAMA: metal mode `required`, but the metal overrides are not registered (non-Apple build or dasMetal missing)")
+        }
+        to_log(LOG_WARNING, "dasLLAMA: metal mode requested, but the metal overrides are not registered — staying on the CPU paths
+")
+        g_metal_mode = MetalMode.off
+        return
+    }
+    pin_kernel_backend("portable")
+    select_prefill_override("metal")
+    select_decode_override("metal")
+    g_metal_mode = mode
+}
+
+def get_metal_mode : MetalMode {
+    return g_metal_mode
+}
+
 // set by an override that ALSO produced this position's logits; reset before every invocation
 var private g_decode_logits_done = false
 

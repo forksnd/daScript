@@ -174,14 +174,25 @@ def public set_metal_decode_logits_cpu(v : bool) {
 }
 
 
+// required-mode enforcement: a capability decline under MetalMode.required is a hard failure —
+// the caller would silently fall back to the CPU path otherwise. Policy declines (the GPU
+// could serve but chooses not to — prefill's npos_window) stay fallback-eligible in every mode.
+def require_or_panic(kind : string; why : string) {
+    if (get_metal_mode() == MetalMode.required) {
+        panic("dasLLAMA: metal mode `required`, but {kind} declined: {why} (the GPU cannot serve this call)")
+    }
+}
+
 def decline(why : MetalDecodeDecline) {
     g_declines++
     g_declines_by_reason["{why}"]++
+    require_or_panic("decode", "{why}")
 }
 
 def batch_decline(why : MetalDecodeDecline) {
     g_batch_declines++
     g_batch_declines_by_reason["{why}"]++
+    require_or_panic("batch decode", "{why}")
 }
 
 //! (gpu decode steps served, declines to the CPU path) since load — diagnostics / tests.
@@ -971,6 +982,9 @@ var g_prefill_declines_by_reason : table<string; int64>
 def decline(why : MetalPrefillDecline) {
     g_prefill_declines++
     g_prefill_declines_by_reason["{why}"]++
+    if (why != MetalPrefillDecline.npos_window) {   // the one POLICY decline — see require_or_panic
+        require_or_panic("prefill", "{why}")
+    }
 }
 
 //! Declines-by-reason since load — reason name -> count (the first failing gate clause per

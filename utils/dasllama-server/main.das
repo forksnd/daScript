@@ -53,6 +53,9 @@ struct ServerArgs {
     @clarg_doc = "KV cache codec: f32 | f16 | q8_0 | tq4 (default f16)"
     kv_dtype : string
 
+    @clarg_doc = "Metal (GPU) serving mode: off | auto | required (default off). auto = GPU when a path's gates pass, CPU fallback otherwise; required = a call the GPU cannot serve is a hard failure"
+    metal : string
+
     @clarg_short = "a"
     @clarg_doc = "Path to an ASR model — enables /v1/audio/transcriptions"
     asr : string
@@ -132,6 +135,18 @@ def pick_kv_dtype(s : string) : KVDtype {
     return KVDtype.f16
 }
 
+def pick_metal_mode(s : string) : MetalMode {
+    let l = to_lower(s)
+    if (l == "required") {
+        return MetalMode.required
+    } elif (l == "auto" || l == "when_available") {
+        return MetalMode.when_available
+    } elif (!empty(l) && l != "off") {
+        to_log(LOG_WARNING, "dasllama-server: unknown --metal '{s}', using off (valid: off | auto | required)\n")
+    }
+    return MetalMode.off
+}
+
 def private cli_has_flag(flag : string) : bool {
     var args <- get_user_args()
     let eqform = "{flag}="
@@ -170,6 +185,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     }
     if (empty(cfg.kv_dtype)) {
         cfg.kv_dtype = root?["kv_dtype"] ?? ""
+    }
+    if (empty(cfg.metal)) {
+        cfg.metal = root?["metal"] ?? ""
     }
     if (empty(cfg.asr)) {
         cfg.asr = root?["asr"] ?? ""
@@ -398,6 +416,10 @@ def init() {
     to_log(LOG_INFO, "dasllama-server: logging to {get_das_root()}/logs/dasllama-server.log\n")
 
     log_tune_status("dasllama-server")
+    // metal mode lands BEFORE the load: != off pins the row-major backend the GPU kernels read
+    let metal_mode = pick_metal_mode(g_cfg.metal)
+    set_metal_mode(metal_mode)
+    to_log(LOG_INFO, "dasllama-server: metal mode {get_metal_mode()}\n")
     print("loading {g_cfg.model} ...\n")
     var m <- load_model(g_cfg.model, pick_quant(g_cfg.quant))
     if (ctx > 0l) {
