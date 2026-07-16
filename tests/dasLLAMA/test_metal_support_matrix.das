@@ -3,14 +3,14 @@ options persistent_heap   // + explicit deletes: the models free before the proc
 options stack = 131072   // several by-value Sessions per cell (test_batch_decode sizing)
 
 require dastest/testing_boost public
-require dasllama/dasllama   // the public facade — engine + arch registrations + (on Apple) the metal overrides
+require dasllama/dasllama   // nolint:STYLE029 — the public facade (engine + arch registrations + the metal overrides); off-Apple the static_if halves compile out and only its dasllama_common re-export stays referenced
 require dasllama/dasllama_math   // set_wscale_f16 — the wscale matrix axis
 require ?das_metal dasllama/dasllama_metal_llama  // nolint:STYLE030 — stats/declines/shutdown rails
 require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — prefill stats/declines rails
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — device probe + metal_live_object_count
 require daslib/jobque_boost
 require daslib/fio  // nolint:STYLE030 — used only inside the Apple static_if half
-require math
+require math  // nolint:STYLE030 — used only inside the Apple static_if half
 require strings
 require _model_tier
 
