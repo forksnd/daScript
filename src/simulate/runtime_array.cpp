@@ -24,6 +24,19 @@ namespace das
         arr.magic = DAS_ARRAY_MAGIC;
     }
 
+    // the inverse of array_mark_locked for views that outlive a temp scope: reset the view
+    // WITHOUT freeing the storage (it belongs to a file mapping / another allocator). false =
+    // not a mark_locked view (untouched) — callers turn that into a runtime error.
+    bool array_forget_locked ( Array & arr ) {
+        if ( arr.lock != 1 || arr.magic != DAS_ARRAY_MAGIC ) return false;
+        arr.data = nullptr;
+        arr.size = 0;
+        arr.capacity = 0;
+        arr.lock = 0;
+        arr.magic = 0;
+        return true;
+    }
+
     void array_lock ( Context & context, Array & arr, LineInfo * at ) {
         if ( arr.shared || arr.hopeless ) return;
         if ( arr.lock==0 ) {

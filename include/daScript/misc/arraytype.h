@@ -183,6 +183,7 @@ namespace das {
         friend DAS_API int builtin_array_lock_count ( const Array & arr );
         friend DAS_API void array_mark_locked(Array &arr, void *data, uint64_t capacity);
         friend DAS_API void array_mark_locked(Array &arr, void *data, uint64_t size, uint64_t capacity);
+        friend DAS_API bool array_forget_locked(Array &arr);
         friend DAS_API void array_lock(Context &context, Array &arr, LineInfo *at);
         friend DAS_API void array_unlock(Context &context, Array &arr, LineInfo *at);
         friend DAS_API void table_lock(Context &context, Table &arr, LineInfo *at);

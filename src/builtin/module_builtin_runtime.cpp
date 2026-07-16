@@ -1688,6 +1688,16 @@ namespace das
         array_mark_locked(arr, (char *)data, size < 0 ? uint64_t(0) : uint64_t(size));
     }
 
+    // release a borrowed (mark_locked) array view WITHOUT freeing the storage — the bytes
+    // belong to someone else (a file mapping, another allocator). The inverse of
+    // builtin_make_temp_array for views that outlive a temp scope (the model-image loader
+    // resets its borrowed plane views through this before unmapping).
+    void builtin_forget_temp_array ( Array & arr, Context * context, LineInfoArg * at ) {
+        if ( !array_forget_locked(arr) ) {
+            context->throw_error_at(at, "forget_temp_array: not a borrowed (locked) array view");
+        }
+    }
+
     void toLog ( int level, const char * text, Context * context, LineInfoArg * at ) {
         context->to_out(at, level, text);
     }
@@ -2520,6 +2530,10 @@ namespace das
             SideEffects::modifyArgument, "builtin_make_temp_array_i64")
                 ->args({"array","data","size"});
         bmta64->unsafeOperation = true;
+        auto bfta = addExtern<DAS_BIND_FUN(builtin_forget_temp_array)>(*this, lib, "_builtin_forget_temp_array",
+            SideEffects::modifyArgument, "builtin_forget_temp_array")
+                ->args({"array","context","line"});
+        bfta->unsafeOperation = true;
         // migrate data
         addExtern<DAS_BIND_FUN(das_is_dll_build)>(*this, lib, "das_is_dll_build",
             SideEffects::worstDefault, "das_is_dll_build");
