@@ -26,7 +26,8 @@ let IMAGE_PAGE = 16384l          // Apple-Silicon page: the bytesNoCopy alignmen
 let IMAGE_HEADER_BYTES = 64l     // magic..identity, inside the first page
 let IMAGE_MAGIC = 0x314D4C44u    // 'DLM1'
 
-struct private ImgSection {
+// public only for the save_image/load_image generics — they instantiate from caller modules
+struct ImgSection {
     name : string
     off : uint64      // absolute byte offset, page-aligned
     bytes : uint64
@@ -35,16 +36,18 @@ struct private ImgSection {
 // the box + knob identity an image is valid for; folded into the file name AND the header.
 // It names the exact plane layout, so it must be computed AFTER the same backend select the
 // gguf loader runs at repack time — the entry-time auto default is a different backend.
-def image_identity : string {
+// `tag` distinguishes image kinds sharing one source path (e.g. "tower-f32" vs "tower-q8").
+def image_identity(tag : string = "") : string {
     select_matmul_backend_for_load()
     return ("v{IMAGE_VERSION}|{active_kernel_backend()}|{get_wscale_f16() ? "s16" : "s32"}"
         + "|q8 mr{active_q8_layout_mr()} b{active_q8_wbias()} g{active_q8_kgroup()}"
-        + "|kq {active_kq_layout_mr(4)}/{active_kq_layout_mr(5)}/{active_kq_layout_mr(6)}/{active_kq_layout_mr(40)}")
+        + "|kq {active_kq_layout_mr(4)}/{active_kq_layout_mr(5)}/{active_kq_layout_mr(6)}/{active_kq_layout_mr(40)}"
+        + (tag != "" ? "|{tag}" : ""))
 }
 
 // the image path for (gguf, current identity) — knob combos coexist as separate files
-def image_path_for(gguf_path : string) : string {
-    return "{gguf_path}.{hash(image_identity()) & 0xFFFFFFFFul}.dlim"
+def image_path_for(gguf_path : string; tag : string = "") : string {
+    return "{gguf_path}.{hash(image_identity(tag)) & 0xFFFFFFFFul}.dlim"
 }
 
 def private pad_to_page(cur : uint64) : uint64 {
@@ -64,14 +67,14 @@ def private write_zeros(f : file; n : uint64) {
 
 def private store_u32(var b : array<uint8>; at : int; v : uint) {
     unsafe {
-        var p = unsafe(addr < uint ? > (b[at]))
+        var p = unsafe(addr < uint? >(b[at]))
         p[0] = v
     }
 }
 
 def private store_u64(var b : array<uint8>; at : int; v : uint64) {
     unsafe {
-        var p = unsafe(addr < uint64 ? > (b[at]))
+        var p = unsafe(addr < uint64? >(b[at]))
         p[0] = v
     }
 }
@@ -147,7 +150,7 @@ def private serialize_strings(var arch : Archive; var a : array<string>) {
             let n = lens[i]
             if (n > 0) {
                 unsafe {
-                    a[i] = string(temp_array(addr < uint8 ? > (blob[at]), n, type<uint8>))
+                    a[i] = string(temp_array(addr < uint8? >(blob[at]), n, type<uint8>))
                 }
             } else {
                 a[i] = ""
@@ -200,9 +203,10 @@ def private serialize_tokenizer(var arch : Archive; var tk : Tokenizer) {
 }
 
 // every non-array Model field, explicitly, both directions (the archive is bidirectional).
-// blocks is NOT serialized — resolve_arch re-binds it from the registry after the read.
-// The count tripwire below forces this list to grow with the struct.
-def private serialize_model_meta(var arch : Archive; var t : Model) {
+// blocks is NOT serialized — image_post_load re-binds it from the registry after the read.
+// The count tripwire forces this list to grow with the struct.
+def private serialize_image_meta(var arch : Archive; var t : Model) {
+    verify(count_meta_fields(t) == IMAGE_META_FIELDS)   // grew Model? extend this list
     arch |> serialize(t.config)
     arch |> serialize(t.arch)
     arch |> serialize(t.chat_template_str)
@@ -268,11 +272,13 @@ def private serialize_model_meta(var arch : Archive; var t : Model) {
     arch |> serialize_raw(t.mtp_headnorm_off)
 }
 
-// the tripwire: serialize_model_meta covers 63 fields; blocks + image_map + image_bytes are
-// deliberate skips. A new non-array Model field trips this until BOTH lists agree.
+// the tripwire: serialize_image_meta(Model) covers 63 fields; blocks + image_map +
+// image_bytes are deliberate skips. A new non-array Model field trips this until BOTH agree.
 let IMAGE_META_FIELDS = 63 + 3
 
-def private count_meta_fields(var t : Model) : int {
+//! Count of non-array fields of any struct — pair with a per-type field-count constant to
+//! tripwire an explicit serialize_image_meta list against struct growth.
+def count_meta_fields(var t) : int {
     var n = 0
     apply(t) $ [unused_argument(name, field)] (name : string; var field) {
         static_if (!typeinfo is_array(field)) {
@@ -282,12 +288,22 @@ def private count_meta_fields(var t : Model) : int {
     return n
 }
 
+// Model's post-read fix-up: blocks re-bind from the registry (+ the arch's idempotent configure)
+def private image_post_load(var t : Model) {
+    resolve_arch(t, t.arch)
+}
+
 // ===== save =====
 
-//! Serialize a loaded Model as a prepared image: planes page-aligned raw (borrowed back at
-//! load), everything else archived. Atomic (tmp + rename). Returns false on any IO failure.
-def save_model_image(var t : Model; path : string) : bool {
-    let tmp_path = "{path}.tmp"
+//! Serialize a loaded weight-carrying struct as a prepared image: array planes page-aligned
+//! raw (borrowed back at load), everything else archived. Atomic (tmp + rename). Returns
+//! false on any IO failure. The caller's module must provide `serialize_image_meta(Archive,
+//! T)` for every non-array field and `image_post_load(T)` for post-read fix-ups (`_::`
+//! dispatch — Model's live here, AudioTower's in dasllama_audio).
+def save_image(var t; path : string; tag : string = "") : bool {
+    // per-writer tmp name: concurrent savers (parallel test workers on one cache miss) must
+    // not clobber each other's half-written file; last atomic rename wins with same content
+    let tmp_path = "{path}.{ref_time_ticks()}.tmp"
     var ok = true
     var meta <- new MemSerializer()
     var warch = Archive(reading = false, stream = meta)
@@ -300,9 +316,8 @@ def save_model_image(var t : Model; path : string) : bool {
         // page 0: header placeholder — patched after the walk (fseek back)
         write_zeros(f, uint64(IMAGE_PAGE))
         var cur = uint64(IMAGE_PAGE)
-        verify(count_meta_fields(t) == IMAGE_META_FIELDS)   // grew Model? extend serialize_model_meta
         let ts_meta = ref_time_ticks()
-        serialize_model_meta(warch, t)
+        _::serialize_image_meta(warch, t)
         to_log(LOG_INFO, "dasLLAMA image: meta serialize {get_time_usec(ts_meta) / 1000}ms\n")
         let ts_planes = ref_time_ticks()
         apply(t) $(name : string; var field) {
@@ -350,7 +365,7 @@ def save_model_image(var t : Model; path : string) : bool {
         store_u64(hdr, 16, meta_off)
         store_u64(hdr, 24, meta_bytes)
         store_u64(hdr, 32, fend)
-        store_u64(hdr, 40, hash(image_identity()))
+        store_u64(hdr, 40, hash(image_identity(tag)))
         fseek(f, 0l, seek_set)
         f |> fwrite(hdr)
         delete hdr
@@ -376,12 +391,18 @@ def save_model_image(var t : Model; path : string) : bool {
     return true
 }
 
+//! Model entry point (the AudioTower one is load_audio_tower's cache in dasllama_audio).
+def save_model_image(var t : Model; path : string) : bool {
+    return save_image(t, path)
+}
+
 // ===== load =====
 
-//! Map a prepared image and rebuild the Model with zero O(model) work: plane fields borrow
-//! the mapping (the Model finalizer forgets + unmaps), the archive blob restores everything
+//! Map a prepared image and rebuild the struct with zero O(model) work: array plane fields
+//! borrow the mapping (the finalizer forgets + unmaps), the archive blob restores everything
 //! else. false = absent / wrong identity / wrong version — the caller regenerates from gguf.
-def load_model_image(path : string; var t : Model) : bool {
+//! Same `_::` contract as save_image.
+def load_image(path : string; var t; tag : string = "") : bool {
     if (!stat(path).is_valid) {
         return false
     }
@@ -393,19 +414,14 @@ def load_model_image(path : string; var t : Model) : bool {
     unsafe {
         base = fmap_open(path, addr(msize))
     }
-    var bp : uint8 const?
-    unsafe {
-        bp = reinterpret<uint8 const?>(base)
-    }
+    var bp = unsafe(reinterpret<uint8 const?>(base))
     if (int64(msize) < IMAGE_HEADER_BYTES ||
             (read_u32(bp, 0l) != IMAGE_MAGIC || read_u32(bp, 4l) != uint(IMAGE_VERSION)) ||
-            (read_u32(bp, 8l) != uint(IMAGE_PAGE) || read_u64(bp, 40l) != hash(image_identity()))) {
+            (read_u32(bp, 8l) != uint(IMAGE_PAGE) || read_u64(bp, 40l) != hash(image_identity(tag)))) {
         // every decline is loud (short of the file simply not existing) — a silently
         // regenerating cache is undebuggable
-        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — size {msize} magic {read_u32(bp, 0l)} version {read_u32(bp, 4l)} (want {IMAGE_VERSION}) page {read_u32(bp, 8l)} identity {read_u64(bp, 40l)} (want {hash(image_identity())} = '{image_identity()}')\n")
-        unsafe {
-            fmap_close(base, msize)
-        }
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — size {msize} magic {read_u32(bp, 0l)} version {read_u32(bp, 4l)} (want {IMAGE_VERSION}) page {read_u32(bp, 8l)} identity {read_u64(bp, 40l)} (want {hash(image_identity(tag))} = '{image_identity(tag)}')\n")
+        unsafe(fmap_close(base, msize))
         return false
     }
     let nsections = int(read_u32(bp, 12l))
@@ -414,9 +430,7 @@ def load_model_image(path : string; var t : Model) : bool {
     let file_bytes = read_u64(bp, 32l)
     if (file_bytes != msize || meta_off + meta_bytes > msize) {
         to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — header says {file_bytes} bytes / meta {meta_off}+{meta_bytes}, mapped {msize}\n")
-        unsafe {
-            fmap_close(base, msize)
-        }
+        unsafe(fmap_close(base, msize))
         return false
     }
     // the meta blob is the ONE copied+parsed piece (small); planes stay lazy in the mapping
@@ -430,8 +444,8 @@ def load_model_image(path : string; var t : Model) : bool {
     var sections : array<ImgSection>
     rarch |> serialize(sections)
     var by_name <- {for (sec in sections); sec.name => sec}
-    serialize_model_meta(rarch, t)
-    resolve_arch(t, t.arch)   // blocks re-bind + the arch's (idempotent) configure
+    _::serialize_image_meta(rarch, t)
+    _::image_post_load(t)
     var ok = true
     apply(t) $(name : string; var field) {
         static_if (typeinfo is_array(field)) {
@@ -463,4 +477,9 @@ def load_model_image(path : string; var t : Model) : bool {
     t.image_map = base
     t.image_bytes = msize
     return true
+}
+
+//! Model entry point — see load_image.
+def load_model_image(path : string; var t : Model) : bool {
+    return load_image(path, t)
 }
