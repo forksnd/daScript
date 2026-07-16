@@ -459,6 +459,38 @@
         "das_tok_s": 5.947793981799007,
         "llama_cpp_tok_s": 4.983295
       }
+    },
+    {
+      "model": "Voxtral-Small-24B-q4k",
+      "arch": "llama",
+      "quant": "q4_k_m",
+      "active_b": 23.5724032,
+      "prefill": {
+        "context": 512,
+        "das_tok_s": 73.23,
+        "llama_cpp_tok_s": 32.55
+      },
+      "emission": {
+        "context": 128,
+        "das_tok_s": 4.01,
+        "llama_cpp_tok_s": 3.86
+      }
+    },
+    {
+      "model": "GLM-4.5-Air-q4k",
+      "arch": "glm4moe",
+      "quant": "q4_k_m",
+      "active_b": 12.0,
+      "prefill": {
+        "context": 512,
+        "das_tok_s": 59.12,
+        "llama_cpp_tok_s": 35.75
+      },
+      "emission": {
+        "context": 128,
+        "das_tok_s": 5.54,
+        "llama_cpp_tok_s": 5.76
+      }
     }
   ]
 }
