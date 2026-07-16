@@ -64,8 +64,10 @@ The database is created automatically. Migration 1 creates message/state storage
 the FTS5 index, migration 3 records outgoing transcript-delivery IDs, migration 4 adds resumable
 Telegram-export media checkpoints, and migration 5 records the database sources behind Cadmus
 answers. Migration 6 adds the durable live-audio queue, and migration 7 checkpoints successful live
-ASR results so cleanup retries do not retranscribe the same audio. Telegram update offsets are persisted, and
-`(chat_id, message_id)` makes replayed updates and edits idempotent. History is retained indefinitely.
+ASR results so cleanup retries do not retranscribe the same audio. Migration 8 rebuilds the FTS5
+index with typed, unindexed chat/message keys so only message text is tokenized. Telegram update
+offsets are persisted, and `(chat_id, message_id)` makes replayed updates and edits idempotent.
+History is retained indefinitely.
 
 Before sending an answer, Cadmus validates every model-written HTTP(S) link against exact URLs
 returned by Brave Search or chat-history tools in the current turn. An unverified link triggers up to
