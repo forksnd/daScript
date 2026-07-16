@@ -37,7 +37,8 @@ require _model_tier
 // twins, same %64 shape gates as the s16 path.)
 // The MetalMode knob (M1) rides the same matrix: off = overrides deselected, when_available =
 // engage/fallback per the cells above, required = a CAPABILITY decline panics (policy declines
-// — the prefill npos window — stay quiet CPU fallbacks).
+// — the prefill npos window — stay quiet CPU fallbacks). Batch kq: B <= 8 = per-stream GEMVs,
+// B >= 9 = the kq mul_mm twins (%64 shapes gated).
 // plus the prefill-only window clauses: npos < min_npos declines npos_window, a continuation
 // chunk (start_pos > 0) declines start_pos.
 
@@ -339,40 +340,30 @@ def test_metal_support_matrix(t : T?) {
                     eval_batch_(trk, ws, sess, cur)
                     t |> success(metal_batch_decode_stats().steps - ba0 > 0l,
                         "required: kq batched step serves on the GPU (M2.1 per-stream form)")
-                    // the B=9 capability gap: nine sessions -> the batch gate's kquant decline -> panic
-                    var s9 : array<Session>
-                    var sess9 : array<Session?>
-                    var cur9 : array<int64>
-                    let p9 <- encode(trk, counting_prompt(1, 8), true, false)
-                    for (i in range(9)) {
-                        s9 |> emplace <| make_run_state(trk.config, KVDtype.f16, KVDtype.f16)
-                        eval_(trk, s9[i], p9)   // short prompt: the npos POLICY window keeps CPU prefill quiet
-                        unsafe {
-                            sess9 |> push(addr(s9[i]))
-                        }
-                        cur9 |> push(greedy_top(s9[i].logits, trk.config.vocab_size))
-                    }
-                    var ba_panicked = false
+                    // a CAPABILITY decline under required must still panic — a continuation
+                    // prefill (start_pos > 0) has no GPU form yet (M2.5)
+                    var sc = make_run_state(trk.config, KVDtype.f16, KVDtype.f16)
+                    set_metal_prefill_min_npos(1l)
+                    eval_(trk, sc, kprompt)      // chunk 1: fresh-start, GPU-serves
+                    var pf2_panicked = false
                     try {
-                        eval_batch_(trk, ws, sess9, cur9)
+                        eval_(trk, sc, kprompt)  // chunk 2: start_pos = n_past > 0
                     } recover {
-                        ba_panicked = true
+                        pf2_panicked = true
                     }
-                    t |> success(ba_panicked, "required: B=9 kq batched step panics (kq GEMM pending) instead of CPU fallback")
+                    set_metal_prefill_min_npos(64l)
+                    t |> success(pf2_panicked, "required: continuation prefill (start_pos > 0) panics instead of CPU fallback")
                     set_metal_mode(MetalMode.off)
                     sess |> clear()   // borrowed handles — delete of array<T?> cascades to the pointees
-                    sess9 |> clear()
                     unsafe {
                         delete ws
                         delete sess
-                        delete sess9
                     }
                     delete cur
-                    delete cur9
                     delete one
                     delete sa
                     delete sb
-                    delete s9
+                    delete sc
                 }
                 delete trk
             } else {

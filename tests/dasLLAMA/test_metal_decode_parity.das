@@ -629,6 +629,17 @@ def test_metal_batch_decode_parity(t : T?) {
                 let cpuk2 <- batch_greedy(trkb, promptsk2, 14, KVDtype.q8_0, false, -1, 0)
                 let gpuk2 <- batch_greedy(trkb, promptsk2, 14, KVDtype.q8_0, true, -1, 0)
                 t |> success(streams_match(cpuk2, gpuk2), "B=2 kq q8_0-KV batched greedy streams match the CPU control")
+                // B=12: the kq mul_mm batch form (B >= 9 leaves the per-stream GEMVs)
+                var promptsk12 : array<array<int64>>
+                for (i in range(12)) {
+                    promptsk12 |> emplace <| encode(trkb, counting_prompt(1 + i, 34 + 2 * i), true, false)
+                }
+                let cpuk12 <- batch_greedy(trkb, promptsk12, 10, KVDtype.f16, false, -1, 0)
+                before = metal_batch_decode_stats().steps
+                let gpuk12 <- batch_greedy(trkb, promptsk12, 10, KVDtype.f16, true, -1, 0)
+                t |> success(metal_batch_decode_stats().steps - before > 0l, "B=12 kq arm served on the GPU")
+                t |> success(streams_match(cpuk12, gpuk12), "B=12 kq batched greedy streams match the CPU control (kq mul_mm)")
+                delete promptsk12
                 delete promptsk
                 delete promptsk2
                 delete trkb
