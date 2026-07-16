@@ -56,7 +56,11 @@ def main {
     // needs the f32 scale plane like the batch donor (DASLLAMA_WSCALE_F16=0)
     if (has_env_variable("DASLLAMA_PIN_PREFILL")) {
         let pf = get_env_variable("DASLLAMA_PIN_PREFILL")
-        if (!select_prefill_override(pf)) {
+        if (pf == "metal") {
+            // measurement runs are MetalMode.required — a CPU fallback fails the run
+            set_metal_mode(MetalMode.required)
+            print("prefill override: metal, MetalMode.required — CPU fallback fails the run\n")
+        } elif (!select_prefill_override(pf)) {
             print("prefill override `{pf}` not registered on this build\n")
         } else {
             print("prefill override: {pf}\n")

@@ -315,7 +315,11 @@ def main() {
     // per token; needs the f32 scale plane + a row-major backend (like DASLLAMA_PIN_PREFILL)
     if (has_env_variable("DASLLAMA_PIN_DECODE")) {
         let dv = get_env_variable("DASLLAMA_PIN_DECODE")
-        if (!select_decode_override(dv)) {
+        if (dv == "metal") {
+            // measurement runs are MetalMode.required — a CPU fallback fails the run
+            set_metal_mode(MetalMode.required)
+            print("decode override: metal, MetalMode.required — CPU fallback fails the run\n")
+        } elif (!select_decode_override(dv)) {
             print("decode override `{dv}` not registered on this build\n")
         } else {
             print("decode override: {dv}\n")

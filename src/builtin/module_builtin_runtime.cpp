@@ -2403,11 +2403,13 @@ namespace das
                 ->args({"name","context"});
         addExtern<DAS_BIND_FUN(gc0_reset)>(*this, lib, "gc0_reset",
             SideEffects::modifyExternal, "gc0_reset");
-        // memops
-        addExtern<DAS_BIND_FUN(das_memcpy)>(*this, lib, "memcpy",
+        // memops — explicit function-pointer types pick the non-const overloads (aot.h grew
+        // const-source twins for the emitted das_cast<void const *> calls; the das-side extern
+        // signatures must stay unchanged so no AOT hash churns)
+        addExtern<void (*)(void *, void *, int), das_memcpy>(*this, lib, "memcpy",
             SideEffects::modifyArgumentAndExternal, "das_memcpy")
                 ->args({"left","right","size"})->unsafeOperation = true;
-        addExtern<DAS_BIND_FUN(das_memcmp)>(*this, lib, "memcmp",
+        addExtern<int (*)(void *, void *, int), das_memcmp>(*this, lib, "memcmp",
             SideEffects::none, "das_memcmp")
                 ->args({"left","right","size"})->unsafeOperation = true;
         addExtern<DAS_BIND_FUN(das_memset8)>(*this, lib, "memset8",

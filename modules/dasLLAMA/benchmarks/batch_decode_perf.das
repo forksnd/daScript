@@ -4,7 +4,7 @@ options _jit_fast_math = true   // ggml-parity FP laxity — same rail as decode
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + pin_kernel_backend (engine-level, not re-exported)
-require ?das_metal dasllama/dasllama_metal_decode  // nolint:STYLE030 — per-stage report on the GPU rail (Apple builds only)
+require ?das_metal dasllama/dasllama_metal_llama  // nolint:STYLE030 — per-stage report on the GPU rail (Apple builds only)
 require daslib/jobque_boost
 require daslib/clargs
 require daslib/fio
@@ -171,13 +171,26 @@ def main() {
     if (g_fixed_tok >= 0l) {
         print("fixed-token protocol: {g_fixed_tok} (no per-step sampling)\n")
     }
-    if (has_env_variable("DASLLAMA_PIN_DECODE")) {
+    if (has_env_variable("DASLLAMA_METAL_MODE")) {
+        // the M3 mode rail: off | auto | required (auto = when_available). != off pins the
+        // portable backend itself; off leaves the default (repack) backend — the real CPU config
+        let mv = get_env_variable("DASLLAMA_METAL_MODE")
+        set_metal_mode(mv == "required" ? MetalMode.required : (mv == "auto" ? MetalMode.when_available : MetalMode.off))
+        print("metal mode: {mv}\n")
+    } elif (has_env_variable("DASLLAMA_PIN_DECODE")) {
         let dv = get_env_variable("DASLLAMA_PIN_DECODE")
-        if (!select_decode_override(dv)) {
+        if (dv == "metal") {
+            // measurement runs are MetalMode.required: a CPU fallback anywhere in the run
+            // (prefill, decode, batch) PANICS with the decline reason instead of silently
+            // polluting the numbers with CPU or mixed steps
+            set_metal_mode(MetalMode.required)
+            print("decode override: metal (single-stream + batch + prefill), MetalMode.required — CPU fallback fails the run\n")
+        } elif (!select_decode_override(dv)) {
             print("unknown decode override `{dv}`\n")
             return
+        } else {
+            print("decode override: {dv} (single-stream + batch)\n")
         }
-        print("decode override: {dv} (single-stream + batch)\n")
     }
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)

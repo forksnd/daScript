@@ -6,6 +6,7 @@ require metal/msl_shader
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — GPU driver half, Apple builds only
 require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — the production 32x32 GEMM MSL (the batch-crossover row)
 require dasllama/dasllama_metal_prefill  // nolint:STYLE030 — the production GEMV MSL (v0 baseline)
+require llvm/daslib/f16_cvt  // f16 bit converts for the K-quant superblock fills
 require daslib/fio
 require math  // nolint:STYLE030 — used only inside the Apple static_if half
 require strings
@@ -53,6 +54,24 @@ require strings
 // load per chunk) are 30-45% WORSE everywhere: inter-lane coalescing beats per-lane locality
 // on AGX (lcpp's mul_mv_ext chunks are strided per-thread too — its prefetch win is the load
 // BATCHING, which [unroll_count=4] already banks). Kept as negative controls.
+//
+// K-quant round verdicts (M1 Max, 2026-07-15): k4_b1c (16B compact scale blocks, whole block in
+// ONE uint4 load) beats the lcpp mul_mv_q4_K wall at every shape — parity on the SLC-resident
+// small shapes (q3b/kv3b), -16..-25% on qkv/w13/w2/cls (cls3b 0.677 vs 0.872 ms, 327 wGB/s,
+// 1.87x the q8 GEMV row; the 144/288-byte ceiling is 2.0x). k4_b1 (reading the production 20B
+// scale blocks) is the negative control: the 20B stride's varying mod-16 phase keeps LLVM from
+// merging the scale-triple into a vector load (3 scalar loads/row, +4 issues/iter) — 7-8%
+// behind lcpp everywhere. Production uploads therefore strip the pads GPU-side: quant plane
+// byte-identical (zero-copy-able), scale plane repacked 20B->16B at upload (2.7% of tensor bytes).
+//
+// k5/k6 round (M1 Max, 2026-07-15): k6_b1d beats the lcpp q6_K wall at EVERY shape (-11..-19%,
+// 321-370 wGB/s; the uint4+select sub-scale read of k6_b1c cost 2 resident sgs — lcpp-shape
+// scattered byte loads of the 16B block win). k5 is ALU-bound on the per-element 5th-bit
+// extract (~6 ops/elem vs k4's ~2.5 uint16-mask trick): k5_b2r (int-composed q5, 2 rows/sg)
+// takes 5/6 shapes at -5..-27% vs the wall (243 wGB/s cls3b — well under k4/k6's ~330-370;
+// further forms = ledger: uint16-mask nibble hybrid ~+5%, upload-time qh bit-plane transpose
+// ~+10% but kills k5q zero-copy); the small-d kv3b shape prefers nr0=1 k5_b1c (wall -5% there,
+// b2r +22% — under-occupied at 256 tgs) — production picks per site like the gemm policies.
 
 // ===== kernel variants =====
 // Shared contract (f32-X planar): b0 wq [d x n] Q8 byte4 view, b1 ws [d x n/32] f32 scales,
@@ -1141,6 +1160,1135 @@ class MetalSkReduceLab {
     }
 }
 
+// ===== K-quant (Q4_K) arms — the format-matrix W4 lab gate =====
+// Weight contract: f32-X, in-kernel superblock dequant. Two weight layouts per format:
+// the ggml interleaved block_q4_K stream (144B/sb: d f16, dmin f16, scales[12], qs[128]) for the
+// lcpp wall arm, and the production plane pair (k4q 128B qs + k4s 20B [d][dmin][scales[12]][pad4],
+// gguf_transcode_q4k's exact output) for ours. Geometry both: the lcpp mul_mv shape — 64-thread
+// tg, 2 simdgroups x 2 rows (N_SG_Q4_K=2, N_R0_Q4_K=2), lane owns 32 elems of every 4th
+// superblock (ix = lane/8 block-stream, iq/ir sub-position), y loaded once per superblock and
+// reused across both rows. K-quant traffic/row: 148B (planes) / 144B (ggml) per 256 elems vs
+// q8's 288B — the ~1.95x decode payoff W4 is after.
+
+// the lcpp kernel_mul_mv_q4_K_f32 wall: their lane map, scale-halfword decode (kmask trick) and
+// nibble-mask acc folds (x16/x256 groups folded by pow2 constants), on the ggml interleaved
+// stream. Verbatim math; only the kargs plumbing is baked (dense strides from ndim/ddim).
+class MetalKqLabLcppK4 {
+    @ssbo @binding = 0 gsh : array<float16> // interleaved block_q4_K stream, half view (d at 72*blk)
+    @ssbo @binding = 1 gqu : array<uint>    // the same stream, uint view (scales at 36*blk+1, qs at 36*blk+4)
+    @ssbo @binding = 2 x : array<float>
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 ndim : uint
+    @uniform @binding = 5 ddim : uint
+
+    [metal_kernel(name="lab_k4_lcpp_msl")]
+    def lab_k4_lcpp {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u
+        let it = lane % 8u
+        let iq = it / 4u
+        let ir = it % 4u
+        let nb = ndim / 256u
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var yh : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + ir * 8u
+            var sumy : float[4]
+            for [unroll_full] (i in range(8)) {
+                yl[i] = x[yb + uint(i)]
+                sumy[0] += yl[i]
+                yl[i + 8] = x[yb + 32u + uint(i)]
+                sumy[1] += yl[i + 8]
+                yh[i] = x[yb + 128u + uint(i)]
+                sumy[2] += yh[i]
+                yh[i + 8] = x[yb + 160u + uint(i)]
+                sumy[3] += yh[i + 8]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = (first_row + uint(r)) * nb + ib
+                let so = blk * 36u + 1u
+                let hw0 = (gqu[so] >> (16u * iq)) & 0xFFFF
+                let hw2 = (gqu[so + 1u] >> (16u * iq)) & 0xFFFF
+                let hw4 = (gqu[so + 2u] >> (16u * iq)) & 0xFFFF
+                let sc0 = hw0 & 0x3F3F
+                let sc1 = hw2 & 0x3F3F
+                let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+                let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+                let qb = blk * 36u + 4u + iq * 8u + ir * 2u
+                let q1a = gqu[qb]
+                let q1b = gqu[qb + 1u]
+                let q2a = gqu[qb + 16u]
+                let q2b = gqu[qb + 17u]
+                var acc1 : float[4]
+                var acc2 : float[4]
+                for [unroll_full] (i in range(4)) {
+                    let sh = 16u * (uint(i) & 1u)
+                    let q1 = ((i < 2 ? q1a : q1b) >> sh) & 0xFFFF
+                    let q2 = ((i < 2 ? q2a : q2b) >> sh) & 0xFFFF
+                    acc1[0] += yl[2 * i] * float(q1 & 0x000F)
+                    acc1[1] += yl[2 * i + 1] * float(q1 & 0x0F00)
+                    acc1[2] += yl[2 * i + 8] * float(q1 & 0x00F0)
+                    acc1[3] += yl[2 * i + 9] * float(q1 & 0xF000)
+                    acc2[0] += yh[2 * i] * float(q2 & 0x000F)
+                    acc2[1] += yh[2 * i + 1] * float(q2 & 0x0F00)
+                    acc2[2] += yh[2 * i + 8] * float(q2 & 0x00F0)
+                    acc2[3] += yh[2 * i + 9] * float(q2 & 0xF000)
+                }
+                let dd = float(gsh[blk * 72u])
+                let dm = float(gsh[blk * 72u + 1u])
+                sumf[r] += dd * ((acc1[0] + 0.00390625 * acc1[1]) * float(sc0 & 255u)
+                    + (acc1[2] + 0.00390625 * acc1[3]) * float(sc0 >> 8u) * 0.0625
+                    + (acc2[0] + 0.00390625 * acc2[1]) * float(sc2 & 255u)
+                    + (acc2[2] + 0.00390625 * acc2[3]) * float(sc2 >> 8u) * 0.0625)
+                sumf[r] -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                    + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// ours v1 — NEGATIVE CONTROL: the same lcpp shape reading the production 20B scale blocks
+// (k4s dual f16/uint views). The 20B stride's varying mod-16 phase blocks LLVM's vector-load
+// merge, so the scale triple compiles to 3 scalar loads per row — 7-8% behind the lcpp arm.
+class MetalKqLabK4B1 {
+    @ssbo @binding = 0 ksh : array<float16> // k4s plane, half view (d at 10*blk, dmin at 10*blk+1)
+    @ssbo @binding = 1 ksu : array<uint>    // the same plane, uint view (scales at 5*blk+1)
+    @ssbo @binding = 2 kqu : array<uint>    // k4q plane, uint view (qs of blk at 32*blk)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k4_b1_msl")]
+    def lab_k4_b1 {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u
+        let it = lane % 8u
+        let iq = it / 4u
+        let ir = it % 4u
+        let nb = ndim / 256u
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var yh : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + ir * 8u
+            var sumy : float[4]
+            for [unroll_full] (i in range(8)) {
+                yl[i] = x[yb + uint(i)]
+                sumy[0] += yl[i]
+                yl[i + 8] = x[yb + 32u + uint(i)]
+                sumy[1] += yl[i + 8]
+                yh[i] = x[yb + 128u + uint(i)]
+                sumy[2] += yh[i]
+                yh[i + 8] = x[yb + 160u + uint(i)]
+                sumy[3] += yh[i + 8]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = (first_row + uint(r)) * nb + ib
+                let so = blk * 5u + 1u
+                let hw0 = (ksu[so] >> (16u * iq)) & 0xFFFF
+                let hw2 = (ksu[so + 1u] >> (16u * iq)) & 0xFFFF
+                let hw4 = (ksu[so + 2u] >> (16u * iq)) & 0xFFFF
+                let sc0 = hw0 & 0x3F3F
+                let sc1 = hw2 & 0x3F3F
+                let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+                let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+                let qb = blk * 32u + iq * 8u + ir * 2u
+                let q1a = kqu[qb]
+                let q1b = kqu[qb + 1u]
+                let q2a = kqu[qb + 16u]
+                let q2b = kqu[qb + 17u]
+                var acc1 : float[4]
+                var acc2 : float[4]
+                for [unroll_full] (i in range(4)) {
+                    let sh = 16u * (uint(i) & 1u)
+                    let q1 = ((i < 2 ? q1a : q1b) >> sh) & 0xFFFF
+                    let q2 = ((i < 2 ? q2a : q2b) >> sh) & 0xFFFF
+                    acc1[0] += yl[2 * i] * float(q1 & 0x000F)
+                    acc1[1] += yl[2 * i + 1] * float(q1 & 0x0F00)
+                    acc1[2] += yl[2 * i + 8] * float(q1 & 0x00F0)
+                    acc1[3] += yl[2 * i + 9] * float(q1 & 0xF000)
+                    acc2[0] += yh[2 * i] * float(q2 & 0x000F)
+                    acc2[1] += yh[2 * i + 1] * float(q2 & 0x0F00)
+                    acc2[2] += yh[2 * i + 8] * float(q2 & 0x00F0)
+                    acc2[3] += yh[2 * i + 9] * float(q2 & 0xF000)
+                }
+                let dd = float(ksh[blk * 10u])
+                let dm = float(ksh[blk * 10u + 1u])
+                sumf[r] += dd * ((acc1[0] + 0.00390625 * acc1[1]) * float(sc0 & 255u)
+                    + (acc1[2] + 0.00390625 * acc1[3]) * float(sc0 >> 8u) * 0.0625
+                    + (acc2[0] + 0.00390625 * acc2[1]) * float(sc2 & 255u)
+                    + (acc2[2] + 0.00390625 * acc2[3]) * float(sc2 >> 8u) * 0.0625)
+                sumf[r] -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                    + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// ours v2: 16B scale blocks — the 20B transcode block minus its 4 pad bytes, built at upload.
+// The 20B stride's varying mod-16 phase blocks LLVM's vector-load merge (the v1 scale triple
+// compiles to 3 scalar loads; lcpp's 144B-stride triple gets one xyz), and 16B blocks land the
+// whole [d|dmin][s0][s1][s2] block in ONE uint4 load at phase 0 — fewer issues than lcpp's
+// xyz+halfpair AND 148->144B per 256 elems, byte-parity with ggml. Quant plane unchanged.
+class MetalKqLabK4B1C {
+    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
+    @ssbo @binding = 1 ks4 : array<uint4>   // the same plane, uint4 view (whole block at blk)
+    @ssbo @binding = 2 kqu : array<uint>    // k4q plane, uint view (qs of blk at 32*blk)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k4_b1c_msl")]
+    def lab_k4_b1c {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u
+        let it = lane % 8u
+        let iq = it / 4u
+        let ir = it % 4u
+        let nb = ndim / 256u
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var yh : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + ir * 8u
+            var sumy : float[4]
+            for [unroll_full] (i in range(8)) {
+                yl[i] = x[yb + uint(i)]
+                sumy[0] += yl[i]
+                yl[i + 8] = x[yb + 32u + uint(i)]
+                sumy[1] += yl[i + 8]
+                yh[i] = x[yb + 128u + uint(i)]
+                sumy[2] += yh[i]
+                yh[i + 8] = x[yb + 160u + uint(i)]
+                sumy[3] += yh[i + 8]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = (first_row + uint(r)) * nb + ib
+                let sv = ks4[blk]
+                let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+                let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+                let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+                let sc0 = hw0 & 0x3F3F
+                let sc1 = hw2 & 0x3F3F
+                let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+                let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+                let qb = blk * 32u + iq * 8u + ir * 2u
+                let q1a = kqu[qb]
+                let q1b = kqu[qb + 1u]
+                let q2a = kqu[qb + 16u]
+                let q2b = kqu[qb + 17u]
+                var acc1 : float[4]
+                var acc2 : float[4]
+                for [unroll_full] (i in range(4)) {
+                    let sh = 16u * (uint(i) & 1u)
+                    let q1 = ((i < 2 ? q1a : q1b) >> sh) & 0xFFFF
+                    let q2 = ((i < 2 ? q2a : q2b) >> sh) & 0xFFFF
+                    acc1[0] += yl[2 * i] * float(q1 & 0x000F)
+                    acc1[1] += yl[2 * i + 1] * float(q1 & 0x0F00)
+                    acc1[2] += yl[2 * i + 8] * float(q1 & 0x00F0)
+                    acc1[3] += yl[2 * i + 9] * float(q1 & 0xF000)
+                    acc2[0] += yh[2 * i] * float(q2 & 0x000F)
+                    acc2[1] += yh[2 * i + 1] * float(q2 & 0x0F00)
+                    acc2[2] += yh[2 * i + 8] * float(q2 & 0x00F0)
+                    acc2[3] += yh[2 * i + 9] * float(q2 & 0xF000)
+                }
+                let dd = float(ksh[blk * 8u])
+                let dm = float(ksh[blk * 8u + 1u])
+                sumf[r] += dd * ((acc1[0] + 0.00390625 * acc1[1]) * float(sc0 & 255u)
+                    + (acc1[2] + 0.00390625 * acc1[3]) * float(sc0 >> 8u) * 0.0625
+                    + (acc2[0] + 0.00390625 * acc2[1]) * float(sc2 & 255u)
+                    + (acc2[2] + 0.00390625 * acc2[3]) * float(sc2 >> 8u) * 0.0625)
+                sumf[r] -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                    + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// the lcpp kernel_mul_mv_q5_K_f32 wall (N_R0_Q5_K = 1 — one output row per simdgroup, rtg 2):
+// same kmask scale decode as q4_K; nibble bytes read directly, the 5th bit lands as a +16
+// select off the qh byte (bit s of qh[l] = sub-block s at position l).
+class MetalKqLabLcppK5 {
+    @ssbo @binding = 0 gsh : array<float16> // interleaved block_q5_K stream, half view (d at 88*blk)
+    @ssbo @binding = 1 gsu : array<uint>    // the same stream, uint view (scales at 44*blk+1)
+    @ssbo @binding = 2 gqb : array<uint8>   // the same stream, byte view (qh at 176*blk+16, qs at +48)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k5_lcpp_msl")]
+    def lab_k5_lcpp {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 4u
+        let ix = lane % 4u
+        let iq = tid / 4u
+        let ir = tid % 4u
+        let l0 = ir * 8u
+        let hm1 = 1u << (2u * iq)
+        let hm2 = hm1 << 1u
+        let hm3 = hm1 << 4u
+        let hm4 = hm2 << 4u
+        let nb = ndim / 256u
+        let first_row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var yl : float[16]
+        var yh : float[16]
+        var sumf = 0.0
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + l0
+            var sumy : float[4]
+            for [unroll_full] (l in range(8)) {
+                yl[l] = x[yb + uint(l)]
+                sumy[0] += yl[l]
+                yl[l + 8] = x[yb + 32u + uint(l)]
+                sumy[1] += yl[l + 8]
+                yh[l] = x[yb + 128u + uint(l)]
+                sumy[2] += yh[l]
+                yh[l + 8] = x[yb + 160u + uint(l)]
+                sumy[3] += yh[l + 8]
+            }
+            let blk = first_row * nb + ib
+            let so = blk * 44u + 1u
+            let hw0 = (gsu[so] >> (16u * iq)) & 0xFFFF
+            let hw2 = (gsu[so + 1u] >> (16u * iq)) & 0xFFFF
+            let hw4 = (gsu[so + 2u] >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qs0 = blk * 176u + 48u + iq * 32u + l0
+            let qh0 = blk * 176u + 16u + l0
+            var acc1 : float[4]
+            var acc2 : float[4]
+            for [unroll_full] (l in range(8)) {
+                let q1 = uint(gqb[qs0 + uint(l)])
+                let q2 = uint(gqb[qs0 + 64u + uint(l)])
+                let h = uint(gqb[qh0 + uint(l)])
+                acc1[0] += yl[l] * float(q1 & 0x0F)
+                acc1[1] += yl[l + 8] * float(q1 & 0xF0)
+                acc1[2] += yh[l] * float(q2 & 0x0F)
+                acc1[3] += yh[l + 8] * float(q2 & 0xF0)
+                acc2[0] += (h & hm1) != 0u ? yl[l] : 0.0
+                acc2[1] += (h & hm2) != 0u ? yl[l + 8] : 0.0
+                acc2[2] += (h & hm3) != 0u ? yh[l] : 0.0
+                acc2[3] += (h & hm4) != 0u ? yh[l + 8] : 0.0
+            }
+            let dd = float(gsh[blk * 88u])
+            let dm = float(gsh[blk * 88u + 1u])
+            sumf += dd * (float(sc0 & 255u) * (acc1[0] + 16.0 * acc2[0])
+                + float(sc0 >> 8u) * (acc1[1] * 0.0625 + 16.0 * acc2[1])
+                + float(sc2 & 255u) * (acc1[2] + 16.0 * acc2[2])
+                + float(sc2 >> 8u) * (acc1[3] * 0.0625 + 16.0 * acc2[3]))
+            sumf -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            ib += 4u
+        }
+        let s = simd_sum(sumf)
+        if (lane == 0u && first_row < ddim) {
+            y[first_row] = s
+        }
+    }
+}
+
+// ours v1 — the SMALL-d pick (kv-shape wins, big shapes lose to b2r): k5 plane pair (k5q 160B
+// [qs][qh] + 16B compact scale blocks), lcpp's q5 lane map and select-form math, nr0=1.
+class MetalKqLabK5B1C {
+    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
+    @ssbo @binding = 1 ks4 : array<uint4>   // the same plane, uint4 view (whole block at blk)
+    @ssbo @binding = 2 kqb : array<uint8>   // k5q plane, byte view (qs at 160*blk, qh at 160*blk+128)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k5_b1c_msl")]
+    def lab_k5_b1c {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 4u
+        let ix = lane % 4u
+        let iq = tid / 4u
+        let ir = tid % 4u
+        let l0 = ir * 8u
+        let hm1 = 1u << (2u * iq)
+        let hm2 = hm1 << 1u
+        let hm3 = hm1 << 4u
+        let hm4 = hm2 << 4u
+        let nb = ndim / 256u
+        let first_row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var yl : float[16]
+        var yh : float[16]
+        var sumf = 0.0
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + l0
+            var sumy : float[4]
+            for [unroll_full] (l in range(8)) {
+                yl[l] = x[yb + uint(l)]
+                sumy[0] += yl[l]
+                yl[l + 8] = x[yb + 32u + uint(l)]
+                sumy[1] += yl[l + 8]
+                yh[l] = x[yb + 128u + uint(l)]
+                sumy[2] += yh[l]
+                yh[l + 8] = x[yb + 160u + uint(l)]
+                sumy[3] += yh[l + 8]
+            }
+            let blk = first_row * nb + ib
+            let sv = ks4[blk]
+            let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+            let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+            let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qs0 = blk * 160u + iq * 32u + l0
+            let qh0 = blk * 160u + 128u + l0
+            var acc1 : float[4]
+            var acc2 : float[4]
+            for [unroll_full] (l in range(8)) {
+                let q1 = uint(kqb[qs0 + uint(l)])
+                let q2 = uint(kqb[qs0 + 64u + uint(l)])
+                let h = uint(kqb[qh0 + uint(l)])
+                acc1[0] += yl[l] * float(q1 & 0x0F)
+                acc1[1] += yl[l + 8] * float(q1 & 0xF0)
+                acc1[2] += yh[l] * float(q2 & 0x0F)
+                acc1[3] += yh[l + 8] * float(q2 & 0xF0)
+                acc2[0] += (h & hm1) != 0u ? yl[l] : 0.0
+                acc2[1] += (h & hm2) != 0u ? yl[l + 8] : 0.0
+                acc2[2] += (h & hm3) != 0u ? yh[l] : 0.0
+                acc2[3] += (h & hm4) != 0u ? yh[l + 8] : 0.0
+            }
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            sumf += dd * (float(sc0 & 255u) * (acc1[0] + 16.0 * acc2[0])
+                + float(sc0 >> 8u) * (acc1[1] * 0.0625 + 16.0 * acc2[1])
+                + float(sc2 & 255u) * (acc1[2] + 16.0 * acc2[2])
+                + float(sc2 >> 8u) * (acc1[3] * 0.0625 + 16.0 * acc2[3]))
+            sumf -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            ib += 4u
+        }
+        let s = simd_sum(sumf)
+        if (lane == 0u && first_row < ddim) {
+            y[first_row] = s
+        }
+    }
+}
+
+// ours, take 2 (superseded by b2r — kept as the nr0 isolation control): q5 composed in INT
+// (nibble | qh bit << 4, the k6 discipline) — ONE fma per element instead of lcpp's
+// mask-fma + select-add pair, halving the float-accumulate chains.
+class MetalKqLabK5B1D {
+    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
+    @ssbo @binding = 1 ks4 : array<uint4>   // the same plane, uint4 view (whole block at blk)
+    @ssbo @binding = 2 kqb : array<uint8>   // k5q plane, byte view (qs at 160*blk, qh at 160*blk+128)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k5_b1d_msl")]
+    def lab_k5_b1d {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 4u
+        let ix = lane % 4u
+        let iq = tid / 4u
+        let ir = tid % 4u
+        let l0 = ir * 8u
+        let hb0 = 2u * iq
+        let nb = ndim / 256u
+        let first_row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var yl : float[16]
+        var yh : float[16]
+        var sumf = 0.0
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + l0
+            var sumy : float[4]
+            for [unroll_full] (l in range(8)) {
+                yl[l] = x[yb + uint(l)]
+                sumy[0] += yl[l]
+                yl[l + 8] = x[yb + 32u + uint(l)]
+                sumy[1] += yl[l + 8]
+                yh[l] = x[yb + 128u + uint(l)]
+                sumy[2] += yh[l]
+                yh[l + 8] = x[yb + 160u + uint(l)]
+                sumy[3] += yh[l + 8]
+            }
+            let blk = first_row * nb + ib
+            let sv = ks4[blk]
+            let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+            let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+            let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qs0 = blk * 160u + iq * 32u + l0
+            let qh0 = blk * 160u + 128u + l0
+            var acc : float[4]
+            for [unroll_full] (l in range(8)) {
+                let q1 = uint(kqb[qs0 + uint(l)])
+                let q2 = uint(kqb[qs0 + 64u + uint(l)])
+                let h = uint(kqb[qh0 + uint(l)]) >> hb0
+                acc[0] += yl[l] * float((q1 & 0x0F) | ((h & 1u) << 4u))
+                acc[1] += yl[l + 8] * float((q1 >> 4u) | ((h & 2u) << 3u))
+                acc[2] += yh[l] * float((q2 & 0x0F) | ((h & 16u) << 0u))
+                acc[3] += yh[l + 8] * float((q2 >> 4u) | ((h & 32u) >> 1u))
+            }
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            sumf += dd * (float(sc0 & 255u) * acc[0] + float(sc0 >> 8u) * acc[1]
+                + float(sc2 & 255u) * acc[2] + float(sc2 >> 8u) * acc[3])
+            sumf -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            ib += 4u
+        }
+        let s = simd_sum(sumf)
+        if (lane == 0u && first_row < ddim) {
+            y[first_row] = s
+        }
+    }
+}
+
+// ours, take 3 — THE big-shape k5 winner (5/6 shapes, -5..-27% vs the wall; small-d kv shape
+// prefers b1c): b1d's int-composed q5 x TWO rows per simdgroup (the k4/k6 shape) — the 32
+// y-loads and the sumy build amortize across both rows.
+class MetalKqLabK5B2R {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqb : array<uint8>
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k5_b2r_msl")]
+    def lab_k5_b2r {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 4u
+        let ix = lane % 4u
+        let iq = tid / 4u
+        let ir = tid % 4u
+        let l0 = ir * 8u
+        let hb0 = 2u * iq
+        let nb = ndim / 256u
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var yh : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + l0
+            var sumy : float[4]
+            for [unroll_full] (l in range(8)) {
+                yl[l] = x[yb + uint(l)]
+                sumy[0] += yl[l]
+                yl[l + 8] = x[yb + 32u + uint(l)]
+                sumy[1] += yl[l + 8]
+                yh[l] = x[yb + 128u + uint(l)]
+                sumy[2] += yh[l]
+                yh[l + 8] = x[yb + 160u + uint(l)]
+                sumy[3] += yh[l + 8]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = (first_row + uint(r)) * nb + ib
+                let sv = ks4[blk]
+                let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+                let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+                let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+                let sc0 = hw0 & 0x3F3F
+                let sc1 = hw2 & 0x3F3F
+                let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+                let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+                let qs0 = blk * 160u + iq * 32u + l0
+                let qh0 = blk * 160u + 128u + l0
+                var acc : float[4]
+                for [unroll_full] (l in range(8)) {
+                    let q1 = uint(kqb[qs0 + uint(l)])
+                    let q2 = uint(kqb[qs0 + 64u + uint(l)])
+                    let h = uint(kqb[qh0 + uint(l)]) >> hb0
+                    acc[0] += yl[l] * float((q1 & 0x0F) | ((h & 1u) << 4u))
+                    acc[1] += yl[l + 8] * float((q1 >> 4u) | ((h & 2u) << 3u))
+                    acc[2] += yh[l] * float((q2 & 0x0F) | ((h & 16u) << 0u))
+                    acc[3] += yh[l + 8] * float((q2 >> 4u) | ((h & 32u) >> 1u))
+                }
+                let dd = float(ksh[blk * 8u])
+                let dm = float(ksh[blk * 8u + 1u])
+                sumf[r] += dd * (float(sc0 & 255u) * acc[0] + float(sc0 >> 8u) * acc[1]
+                    + float(sc2 & 255u) * acc[2] + float(sc2 >> 8u) * acc[3])
+                sumf[r] -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                    + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// the lcpp kernel_mul_mv_q6_K_f32 wall (N_R0_Q6_K = 2): 6-bit q = nibble | 2 qh bits, minus 32,
+// per-16-element SIGNED int8 sub-scales, no min side. Lane owns 4x4-elem slices of every 2nd
+// superblock; the 4 scattered sub-scale byte loads are their shape.
+class MetalKqLabLcppK6 {
+    @ssbo @binding = 0 gsh : array<float16> // interleaved block_q6_K stream, half view (d at 105*blk+104)
+    @ssbo @binding = 1 gqb : array<uint8>   // the same stream, byte view (ql at 210*blk, qh at +128, scales at +192)
+    @ssbo @binding = 2 x : array<float>
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 ndim : uint
+    @uniform @binding = 5 ddim : uint
+
+    [metal_kernel(name="lab_k6_lcpp_msl")]
+    def lab_k6_lcpp {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 2u
+        let ix = lane % 2u
+        let ip = tid / 8u
+        let il = tid % 8u
+        let l0 = il * 4u
+        let is0 = ip * 8u + l0 / 16u
+        let nb = ndim / 256u
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + ip * 128u + l0
+            for [unroll_full] (l in range(4)) {
+                yl[4 * l] = x[yb + uint(l)]
+                yl[4 * l + 1] = x[yb + 32u + uint(l)]
+                yl[4 * l + 2] = x[yb + 64u + uint(l)]
+                yl[4 * l + 3] = x[yb + 96u + uint(l)]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = (first_row + uint(r)) * nb + ib
+                let ql0 = blk * 210u + ip * 64u + l0
+                let qh0 = blk * 210u + 128u + ip * 32u + l0
+                let sb = blk * 210u + 192u + is0
+                var sums : float[4]
+                for [unroll_full] (l in range(4)) {
+                    let q1 = uint(gqb[ql0 + uint(l)])
+                    let q2 = uint(gqb[ql0 + 32u + uint(l)])
+                    let h = uint(gqb[qh0 + uint(l)])
+                    sums[0] += yl[4 * l] * (float((q1 & 0x0F) | ((h & 0x03) << 4u)) - 32.0)
+                    sums[1] += yl[4 * l + 1] * (float((q2 & 0x0F) | ((h & 0x0C) << 2u)) - 32.0)
+                    sums[2] += yl[4 * l + 2] * (float((q1 >> 4u) | (h & 0x30)) - 32.0)
+                    sums[3] += yl[4 * l + 3] * (float((q2 >> 4u) | ((h & 0xC0) >> 2u)) - 32.0)
+                }
+                let s0 = float(((int(gqb[sb]) ^ 128) - 128))
+                let s2 = float(((int(gqb[sb + 2u]) ^ 128) - 128))
+                let s4 = float(((int(gqb[sb + 4u]) ^ 128) - 128))
+                let s6 = float(((int(gqb[sb + 6u]) ^ 128) - 128))
+                let dd = float(gsh[blk * 105u + 104u])
+                sumf[r] += dd * (sums[0] * s0 + sums[1] * s2 + sums[2] * s4 + sums[3] * s6)
+            }
+            ib += 2u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// ours v1 — NEGATIVE CONTROL (the uint4 + ip-selects cost 2 resident sgs; b1d wins every
+// shape): k6q plane (192B [ql][qh]) + SPLIT scale planes — the 18B production scale block is
+// not even uint-addressable per block (18B stride), so the GPU side takes 16B sub-scale blocks
+// (whole block in one uint4, lane extracts its 4 signed bytes by shift) + a packed f16 d plane.
+class MetalKqLabK6B1C {
+    @ssbo @binding = 0 kdh : array<float16> // d plane (d of blk at blk)
+    @ssbo @binding = 1 ksc : array<uint4>   // 16B sub-scale blocks (16 int8 at blk)
+    @ssbo @binding = 2 kqb : array<uint8>   // k6q plane, byte view (ql at 192*blk, qh at 192*blk+128)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k6_b1c_msl")]
+    def lab_k6_b1c {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 2u
+        let ix = lane % 2u
+        let ip = tid / 8u
+        let il = tid % 8u
+        let l0 = il * 4u
+        let o = (l0 / 16u) * 8u   // bit offset of sub-scale is0 within its uint (is0 % 4 = l0/16)
+        let nb = ndim / 256u
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + ip * 128u + l0
+            for [unroll_full] (l in range(4)) {
+                yl[4 * l] = x[yb + uint(l)]
+                yl[4 * l + 1] = x[yb + 32u + uint(l)]
+                yl[4 * l + 2] = x[yb + 64u + uint(l)]
+                yl[4 * l + 3] = x[yb + 96u + uint(l)]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = (first_row + uint(r)) * nb + ib
+                let ql0 = blk * 192u + ip * 64u + l0
+                let qh0 = blk * 192u + 128u + ip * 32u + l0
+                var sums : float[4]
+                for [unroll_full] (l in range(4)) {
+                    let q1 = uint(kqb[ql0 + uint(l)])
+                    let q2 = uint(kqb[ql0 + 32u + uint(l)])
+                    let h = uint(kqb[qh0 + uint(l)])
+                    sums[0] += yl[4 * l] * (float((q1 & 0x0F) | ((h & 0x03) << 4u)) - 32.0)
+                    sums[1] += yl[4 * l + 1] * (float((q2 & 0x0F) | ((h & 0x0C) << 2u)) - 32.0)
+                    sums[2] += yl[4 * l + 2] * (float((q1 >> 4u) | (h & 0x30)) - 32.0)
+                    sums[3] += yl[4 * l + 3] * (float((q2 >> 4u) | ((h & 0xC0) >> 2u)) - 32.0)
+                }
+                let sv = ksc[blk]
+                let ulo = ip != 0u ? sv.z : sv.x   // sub-scales is0, is0+2 (block bytes 0..3 / 8..11)
+                let uhi = ip != 0u ? sv.w : sv.y   // sub-scales is0+4, is0+6
+                let s0 = float(((int(ulo >> o) & 255) ^ 128) - 128)
+                let s2 = float(((int(ulo >> (o + 16u)) & 255) ^ 128) - 128)
+                let s4 = float(((int(uhi >> o) & 255) ^ 128) - 128)
+                let s6 = float(((int(uhi >> (o + 16u)) & 255) ^ 128) - 128)
+                let dd = float(kdh[blk])
+                sumf[r] += dd * (sums[0] * s0 + sums[1] * s2 + sums[2] * s4 + sums[3] * s6)
+            }
+            ib += 2u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// k6 take 2 — THE k6 winner (beats the lcpp wall at every shape, -11..-19%, 321-370 wGB/s):
+// the sub-scale block read as 4 scattered byte loads (lcpp's own shape — fewer live registers
+// than b1c's uint4+select form, 28 vs 26 resident sgs; the 16B block still spans one line).
+class MetalKqLabK6B1D {
+    @ssbo @binding = 0 kdh : array<float16> // d plane (d of blk at blk)
+    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view
+    @ssbo @binding = 2 kqb : array<uint8>   // k6q plane, byte view (ql at 192*blk, qh at 192*blk+128)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k6_b1d_msl")]
+    def lab_k6_b1d {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 2u
+        let ix = lane % 2u
+        let ip = tid / 8u
+        let il = tid % 8u
+        let l0 = il * 4u
+        let is0 = ip * 8u + l0 / 16u
+        let nb = ndim / 256u
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + ip * 128u + l0
+            for [unroll_full] (l in range(4)) {
+                yl[4 * l] = x[yb + uint(l)]
+                yl[4 * l + 1] = x[yb + 32u + uint(l)]
+                yl[4 * l + 2] = x[yb + 64u + uint(l)]
+                yl[4 * l + 3] = x[yb + 96u + uint(l)]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = (first_row + uint(r)) * nb + ib
+                let ql0 = blk * 192u + ip * 64u + l0
+                let qh0 = blk * 192u + 128u + ip * 32u + l0
+                let sb = blk * 16u + is0
+                var sums : float[4]
+                for [unroll_full] (l in range(4)) {
+                    let q1 = uint(kqb[ql0 + uint(l)])
+                    let q2 = uint(kqb[ql0 + 32u + uint(l)])
+                    let h = uint(kqb[qh0 + uint(l)])
+                    sums[0] += yl[4 * l] * (float((q1 & 0x0F) | ((h & 0x03) << 4u)) - 32.0)
+                    sums[1] += yl[4 * l + 1] * (float((q2 & 0x0F) | ((h & 0x0C) << 2u)) - 32.0)
+                    sums[2] += yl[4 * l + 2] * (float((q1 >> 4u) | (h & 0x30)) - 32.0)
+                    sums[3] += yl[4 * l + 3] * (float((q2 >> 4u) | ((h & 0xC0) >> 2u)) - 32.0)
+                }
+                let s0 = float((int(kscb[sb]) ^ 128) - 128)
+                let s2 = float((int(kscb[sb + 2u]) ^ 128) - 128)
+                let s4 = float((int(kscb[sb + 4u]) ^ 128) - 128)
+                let s6 = float((int(kscb[sb + 6u]) ^ 128) - 128)
+                let dd = float(kdh[blk])
+                sumf[r] += dd * (sums[0] * s0 + sums[1] * s2 + sums[2] * s4 + sums[3] * s6)
+            }
+            ib += 2u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// ===== K-quant batched mv arms (M2.1) — B x-streams through ONE weight pass =====
+// STATUS (2026-07-15, round 1 verdict): NEGATIVE so far — the weight-amortization thesis is
+// wrong for these shapes. The kq GEMV is ALU/ISSUE-bound, not BW-bound (b1c cls3b executes
+// ~94 G sg-instr/s at ~500 instrs per row-token; DRAM had headroom at 327 of ~400 GB/s), so
+// sharing the weight pass across streams saves bytes that were not the bottleneck while the
+// per-stream accumulator sets + w[32] block cost occupancy (0x200 vs 0x2c0) and drop the
+// execution rate ~1.75x. v4 (float4 x views, registered pre-folded weights, batch-load runs)
+// is ISA-clean — 362 instrs / 17 vector loads / 4 waits vs b1c's 393/17/3 — and still loses:
+// cls3b 2.37 ms vs 2 x b1c = 1.35. The stream-0-only control (k4_mvb2ctl, B=1) pins the split:
+// the 1-row/sg + w-register structure costs 0.976 vs b1c 0.677; the second stream adds 1.39.
+// Iteration levers, in order: (a) hoist the row-invariant min-side sums (sy = per-quarter
+// x-sums — every ROW recomputes identical values; a d-independent prepass kills ~25% of the
+// per-token ALU), (b) inline per-quarter dequant (8 live w regs, not 32) for occupancy,
+// (c) fp16 x panels (2x fma rate) — accuracy call. Production interim: B=2..8 as B separate
+// B1 dispatches per site (= the lcpp wall exactly; honest, GPU-only, no CPU fallback).
+// Address-alignment lesson (cost v1-v3 their 3-7x): a runtime-uniform term (b*ndim) in a
+// scalar-view index defeats LLVM's vector-load merge — it cannot prove 16B alignment. Bind a
+// float4 VIEW and index in float4 units; alignment holds by construction (the production q8
+// mv kernels' xs4 discipline).
+
+class MetalKqLabK4MvB2 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>  // float4 view: stream-strided reads stay provably 16B-aligned
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k4_mvb2_msl")]
+    def lab_k4_mvb2 {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u
+        let it = lane % 8u
+        let iq = it / 4u
+        let ir = it % 4u
+        let nb = ndim / 256u
+        let row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + ir * 8u
+            let blk = row * nb + ib
+            let sv = ks4[blk]
+            let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+            let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+            let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qb = blk * 32u + iq * 8u + ir * 2u
+            let q1a = kqu[qb]
+            let q1b = kqu[qb + 1u]
+            let q2a = kqu[qb + 16u]
+            let q2b = kqu[qb + 17u]
+            // dequant ONCE into quarter-major registers, mask folds pre-applied — the per-elem
+            // converts amortize across the B streams; the x side then reads consecutive runs
+            var w : float[32]
+            for [unroll_full] (i in range(4)) {
+                let sh = 16u * (uint(i) & 1u)
+                let q1 = ((i < 2 ? q1a : q1b) >> sh) & 0xFFFF
+                let q2 = ((i < 2 ? q2a : q2b) >> sh) & 0xFFFF
+                w[2 * i] = float(q1 & 0x000F)
+                w[2 * i + 1] = float(q1 & 0x0F00) * 0.00390625
+                w[8 + 2 * i] = float(q1 & 0x00F0) * 0.0625
+                w[8 + 2 * i + 1] = float(q1 & 0xF000) * 0.000244140625
+                w[16 + 2 * i] = float(q2 & 0x000F)
+                w[16 + 2 * i + 1] = float(q2 & 0x0F00) * 0.00390625
+                w[24 + 2 * i] = float(q2 & 0x00F0) * 0.0625
+                w[24 + 2 * i + 1] = float(q2 & 0xF000) * 0.000244140625
+            }
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            for [unroll_full] (b in range(2)) {
+                let xb4 = uint(b) * (ndim / 4u) + yb / 4u
+                var acc : float[4]
+                var sy : float[4]
+                for [unroll_full] (q4 in range(4)) {
+                    let qo4 = q4 == 0 ? 0u : (q4 == 1 ? 8u : (q4 == 2 ? 32u : 40u))
+                    let va = x[xb4 + qo4]
+                    let vb = x[xb4 + qo4 + 1u]
+                    acc[q4] += va.x * w[q4 * 8] + va.y * w[q4 * 8 + 1] + va.z * w[q4 * 8 + 2] + va.w * w[q4 * 8 + 3]
+                    acc[q4] += vb.x * w[q4 * 8 + 4] + vb.y * w[q4 * 8 + 5] + vb.z * w[q4 * 8 + 6] + vb.w * w[q4 * 8 + 7]
+                    sy[q4] += va.x + va.y + va.z + va.w + vb.x + vb.y + vb.z + vb.w
+                }
+                sumf[b] += dd * (acc[0] * float(sc0 & 255u) + acc[1] * float(sc0 >> 8u)
+                    + acc[2] * float(sc2 & 255u) + acc[3] * float(sc2 >> 8u))
+                sumf[b] -= dm * (sy[0] * float(sc1 & 255u) + sy[1] * float(sc1 >> 8u)
+                    + sy[2] * float(sc3 & 255u) + sy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (b in range(2)) {
+            let sm = simd_sum(sumf[b])
+            if (lane == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
+class MetalKqLabK4MvB2Ctl {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>  // float4 view: stream-strided reads stay provably 16B-aligned
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k4_mvb2ctl_msl")]
+    def lab_k4_mvb2ctl {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u
+        let it = lane % 8u
+        let iq = it / 4u
+        let ir = it % 4u
+        let nb = ndim / 256u
+        let row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + ir * 8u
+            let blk = row * nb + ib
+            let sv = ks4[blk]
+            let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+            let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+            let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qb = blk * 32u + iq * 8u + ir * 2u
+            let q1a = kqu[qb]
+            let q1b = kqu[qb + 1u]
+            let q2a = kqu[qb + 16u]
+            let q2b = kqu[qb + 17u]
+            // dequant ONCE into quarter-major registers, mask folds pre-applied — the per-elem
+            // converts amortize across the B streams; the x side then reads consecutive runs
+            var w : float[32]
+            for [unroll_full] (i in range(4)) {
+                let sh = 16u * (uint(i) & 1u)
+                let q1 = ((i < 2 ? q1a : q1b) >> sh) & 0xFFFF
+                let q2 = ((i < 2 ? q2a : q2b) >> sh) & 0xFFFF
+                w[2 * i] = float(q1 & 0x000F)
+                w[2 * i + 1] = float(q1 & 0x0F00) * 0.00390625
+                w[8 + 2 * i] = float(q1 & 0x00F0) * 0.0625
+                w[8 + 2 * i + 1] = float(q1 & 0xF000) * 0.000244140625
+                w[16 + 2 * i] = float(q2 & 0x000F)
+                w[16 + 2 * i + 1] = float(q2 & 0x0F00) * 0.00390625
+                w[24 + 2 * i] = float(q2 & 0x00F0) * 0.0625
+                w[24 + 2 * i + 1] = float(q2 & 0xF000) * 0.000244140625
+            }
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            for [unroll_full] (b in range(1)) {
+                let xb4 = uint(b) * (ndim / 4u) + yb / 4u
+                var acc : float[4]
+                var sy : float[4]
+                for [unroll_full] (q4 in range(4)) {
+                    let qo4 = q4 == 0 ? 0u : (q4 == 1 ? 8u : (q4 == 2 ? 32u : 40u))
+                    let va = x[xb4 + qo4]
+                    let vb = x[xb4 + qo4 + 1u]
+                    acc[q4] += va.x * w[q4 * 8] + va.y * w[q4 * 8 + 1] + va.z * w[q4 * 8 + 2] + va.w * w[q4 * 8 + 3]
+                    acc[q4] += vb.x * w[q4 * 8 + 4] + vb.y * w[q4 * 8 + 5] + vb.z * w[q4 * 8 + 6] + vb.w * w[q4 * 8 + 7]
+                    sy[q4] += va.x + va.y + va.z + va.w + vb.x + vb.y + vb.z + vb.w
+                }
+                sumf[b] += dd * (acc[0] * float(sc0 & 255u) + acc[1] * float(sc0 >> 8u)
+                    + acc[2] * float(sc2 & 255u) + acc[3] * float(sc2 >> 8u))
+                sumf[b] -= dm * (sy[0] * float(sc1 & 255u) + sy[1] * float(sc1 >> 8u)
+                    + sy[2] * float(sc3 & 255u) + sy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (b in range(2)) {
+            let sm = simd_sum(sumf[b])
+            if (lane == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
+class MetalKqLabK5MvB2 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqb : array<uint8>
+    @ssbo @binding = 3 x : array<float4>  // float4 view: stream-strided reads stay provably 16B-aligned
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k5_mvb2_msl")]
+    def lab_k5_mvb2 {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 4u
+        let ix = lane % 4u
+        let iq = tid / 4u
+        let ir = tid % 4u
+        let l0 = ir * 8u
+        let hb0 = 2u * iq
+        let nb = ndim / 256u
+        let row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + l0
+            let blk = row * nb + ib
+            let sv = ks4[blk]
+            let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+            let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+            let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qs0 = blk * 160u + iq * 32u + l0
+            let qh0 = blk * 160u + 128u + l0
+            var w : float[32]
+            for [unroll_full] (l in range(8)) {
+                let q1 = uint(kqb[qs0 + uint(l)])
+                let q2 = uint(kqb[qs0 + 64u + uint(l)])
+                let h = uint(kqb[qh0 + uint(l)]) >> hb0
+                w[l] = float((q1 & 0x0F) | ((h & 1u) << 4u))
+                w[8 + l] = float((q1 >> 4u) | ((h & 2u) << 3u))
+                w[16 + l] = float((q2 & 0x0F) | ((h & 16u) << 0u))
+                w[24 + l] = float((q2 >> 4u) | ((h & 32u) >> 1u))
+            }
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            for [unroll_full] (b in range(2)) {
+                let xb4 = uint(b) * (ndim / 4u) + yb / 4u
+                var acc : float[4]
+                var sy : float[4]
+                for [unroll_full] (q4 in range(4)) {
+                    let qo4 = q4 == 0 ? 0u : (q4 == 1 ? 8u : (q4 == 2 ? 32u : 40u))
+                    let va = x[xb4 + qo4]
+                    let vb = x[xb4 + qo4 + 1u]
+                    acc[q4] += va.x * w[q4 * 8] + va.y * w[q4 * 8 + 1] + va.z * w[q4 * 8 + 2] + va.w * w[q4 * 8 + 3]
+                    acc[q4] += vb.x * w[q4 * 8 + 4] + vb.y * w[q4 * 8 + 5] + vb.z * w[q4 * 8 + 6] + vb.w * w[q4 * 8 + 7]
+                    sy[q4] += va.x + va.y + va.z + va.w + vb.x + vb.y + vb.z + vb.w
+                }
+                sumf[b] += dd * (float(sc0 & 255u) * acc[0] + float(sc0 >> 8u) * acc[1]
+                    + float(sc2 & 255u) * acc[2] + float(sc2 >> 8u) * acc[3])
+                sumf[b] -= dm * (sy[0] * float(sc1 & 255u) + sy[1] * float(sc1 >> 8u)
+                    + sy[2] * float(sc3 & 255u) + sy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (b in range(2)) {
+            let sm = simd_sum(sumf[b])
+            if (lane == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
+class MetalKqLabK6MvB2 {
+    @ssbo @binding = 0 kdh : array<float16>
+    @ssbo @binding = 1 ksc : array<uint4>
+    @ssbo @binding = 2 kqb : array<uint8>
+    @ssbo @binding = 3 x : array<float4>  // float4 view: stream-strided reads stay provably 16B-aligned
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k6_mvb2_msl")]
+    def lab_k6_mvb2 {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 2u
+        let ix = lane % 2u
+        let ip = tid / 8u
+        let il = tid % 8u
+        let l0 = il * 4u
+        let o = (l0 / 16u) * 8u
+        let nb = ndim / 256u
+        let row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + ip * 128u + l0
+            let blk = row * nb + ib
+            let ql0 = blk * 192u + ip * 64u + l0
+            let qh0 = blk * 192u + 128u + ip * 32u + l0
+            var w : float[16]
+            for [unroll_full] (l in range(4)) {
+                let q1 = uint(kqb[ql0 + uint(l)])
+                let q2 = uint(kqb[ql0 + 32u + uint(l)])
+                let h = uint(kqb[qh0 + uint(l)])
+                w[l] = float((q1 & 0x0F) | ((h & 0x03) << 4u)) - 32.0
+                w[4 + l] = float((q2 & 0x0F) | ((h & 0x0C) << 2u)) - 32.0
+                w[8 + l] = float((q1 >> 4u) | (h & 0x30)) - 32.0
+                w[12 + l] = float((q2 >> 4u) | ((h & 0xC0) >> 2u)) - 32.0
+            }
+            let sv = ksc[blk]
+            let ulo = ip != 0u ? sv.z : sv.x
+            let uhi = ip != 0u ? sv.w : sv.y
+            let s0 = float(((int(ulo >> o) & 255) ^ 128) - 128)
+            let s2 = float(((int(ulo >> (o + 16u)) & 255) ^ 128) - 128)
+            let s4 = float(((int(uhi >> o) & 255) ^ 128) - 128)
+            let s6 = float(((int(uhi >> (o + 16u)) & 255) ^ 128) - 128)
+            let dd = float(kdh[blk])
+            for [unroll_full] (b in range(2)) {
+                let xb4 = uint(b) * (ndim / 4u) + yb / 4u
+                var acc : float[4]
+                for [unroll_full] (q4 in range(4)) {
+                    let v = x[xb4 + uint(q4) * 8u]
+                    acc[q4] += v.x * w[q4 * 4] + v.y * w[q4 * 4 + 1] + v.z * w[q4 * 4 + 2] + v.w * w[q4 * 4 + 3]
+                }
+                sumf[b] += dd * (acc[0] * s0 + acc[1] * s2 + acc[2] * s4 + acc[3] * s6)
+            }
+            ib += 2u
+        }
+        for [unroll_full] (b in range(2)) {
+            let sm = simd_sum(sumf[b])
+            if (lane == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
 // ===== driver (Apple-only; every Metal-typed helper is a generic so non-Apple never compiles it) =====
 
 struct private LabVariant {
@@ -1157,6 +2305,11 @@ struct private LabVariant {
     gemm_sk : bool = false                  // split-K f32-X GEMM (partial planes + reduce pass)
     sk : int = 0                            // slice count for gemm_sk
     tgmem : uint64 = 0ul                    // dynamic [[threadgroup(0)]] bytes (@workgroup kernels)
+    kq : int = 0                            // K-quant plane arm: 4 = k4 (b0/b1 k4s dual view, b2 k4q)
+    kq_ggml : bool = false                  // K-quant lcpp wall arm (b0/b1 = ggml interleaved stream)
+    kq16 : bool = false                     // kq arm reads the 16B compact scale blocks instead
+    tgsz : int = 128                        // threads per threadgroup (kq arms ride lcpp's 64)
+    rtg : int = 4                           // output rows per threadgroup (grid.x = ceil(d/rtg))
 }
 
 // exact-arithmetic Q8 fill: quants in [-8, 7], pow2 scales (same contract as the gemm lab)
@@ -1188,6 +2341,244 @@ def private cpu_ref_sample(wq : array<int8>; ws : array<float>; xq : array<int8>
                     blk += float(wq[j * n + kb * 32l + c]) * float(xq[b * n + kb * 32l + c])
                 }
                 acc += blk * (ws[j * nb + kb] * xs[b * nb + kb])
+            }
+            y[b * refd + j] = acc
+        }
+    }
+    return <- y
+}
+
+// exact-arithmetic Q4_K fill: sub-scales/mins in [0,7], pow2 d/dmin, nibbles 0..15 — every
+// product is an exact int x pow2 (the fill_exact_q8 contract). Emits BOTH weight layouts from
+// one logical stream: the production plane pair (kq 128B qs + ks 20B scale blocks) and the ggml
+// interleaved block_q4_K stream (gg 144B) for the lcpp wall arm.
+def private fill_exact_k4(var kq : array<uint8>; var ks : array<uint8>; var gg : array<uint8>; rows, k : int64; seed : int64) {
+    let nsb = k / 256l
+    let total = rows * nsb
+    kq |> resize(total * 128l)
+    ks |> resize(total * 20l)
+    gg |> resize(total * 144l)
+    let lut = fixed_array(0.25, 0.5, 1.0, 2.0)
+    for (sb in range64(total)) {
+        let db = f32_to_f16(lut[int((sb / 5l) % 4l)])
+        let mb = f32_to_f16(lut[int((sb / 3l + 1l) % 4l)])
+        let ko = sb * 20l
+        let go = sb * 144l
+        ks[ko] = uint8(db & 255u)
+        ks[ko + 1l] = uint8(db >> 8u)
+        ks[ko + 2l] = uint8(mb & 255u)
+        ks[ko + 3l] = uint8(mb >> 8u)
+        gg[go] = ks[ko]
+        gg[go + 1l] = ks[ko + 1l]
+        gg[go + 2l] = ks[ko + 2l]
+        gg[go + 3l] = ks[ko + 3l]
+        for (j in range64(4l)) {   // ggml scales[12]: [0,7] values keep the packed high bits zero
+            let scl = int((sb + j * 5l + seed) % 8l)
+            let mnl = int((sb * 3l + j * 7l + 1l) % 8l)
+            let sch = int((sb + (j + 4l) * 5l + seed) % 8l)
+            let mnh = int((sb * 3l + (j + 4l) * 7l + 1l) % 8l)
+            ks[ko + 4l + j] = uint8(scl)
+            ks[ko + 8l + j] = uint8(mnl)
+            ks[ko + 12l + j] = uint8(sch | (mnh << 4))
+        }
+        for (j in range64(4l)) {
+            gg[go + 4l + j] = ks[ko + 4l + j]
+            gg[go + 8l + j] = ks[ko + 8l + j]
+            gg[go + 12l + j] = ks[ko + 12l + j]
+        }
+        ks[ko + 16l] = uint8(0)   // the transcode zeroes the 4 pad bytes
+        ks[ko + 17l] = uint8(0)
+        ks[ko + 18l] = uint8(0)
+        ks[ko + 19l] = uint8(0)
+        let qo = sb * 128l
+        for (b in range64(128l)) {
+            let lo = int((b * 7l + sb * 13l + seed) % 16l)
+            let hi = int((b * 11l + sb * 5l + 3l) % 16l)
+            kq[qo + b] = uint8(lo | (hi << 4))
+            gg[go + 16l + b] = kq[qo + b]
+        }
+    }
+}
+
+// 6-bit sub-scale/min j of a 12-byte packed Q4_K scale block (ggml get_scale_min_k4, array form)
+def private k4_ref_sc_mn(ks : array<uint8>; base, j : int64) : int2 {
+    if (j < 4l) {
+        return int2(int(ks[base + j]) & 63, int(ks[base + j + 4l]) & 63)
+    }
+    let sc = (int(ks[base + j + 4l]) & 15) | ((int(ks[base + j - 4l]) >> 6) << 4)
+    let mn = (int(ks[base + j + 4l]) >> 4) | ((int(ks[base + j]) >> 6) << 4)
+    return int2(sc, mn)
+}
+
+// CPU reference for the k4 arms, sampled like cpu_ref_sample: per-element w = d*sc*q - dmin*mn
+// against the f32 panel — algebraically the kernels' grouped folds, identical bits since every
+// intermediate is exact under the fill
+def private cpu_ref_k4(kq : array<uint8>; ks : array<uint8>; xf : array<float>; n, nb_streams, refd : int64) : array<float> {
+    var y : array<float>
+    y |> resize(nb_streams * refd)
+    let nsb = n / 256l
+    for (b in range64(nb_streams)) {
+        for (j in range64(refd)) {
+            var acc = 0.0
+            for (sb in range64(nsb)) {
+                let ko = (j * nsb + sb) * 20l
+                let qo = (j * nsb + sb) * 128l
+                let dd = f16_to_f32(uint(ks[ko]) | (uint(ks[ko + 1l]) << 8u))
+                let dm = f16_to_f32(uint(ks[ko + 2l]) | (uint(ks[ko + 3l]) << 8u))
+                for (js in range64(8l)) {
+                    let s = k4_ref_sc_mn(ks, ko + 4l, js)
+                    let ds = dd * float(s.x)
+                    let dmn = dm * float(s.y)
+                    for (l in range64(32l)) {
+                        let qv = int(kq[qo + (js / 2l) * 32l + l])
+                        let q = (js & 1l) == 0l ? (qv & 15) : (qv >> 4)
+                        acc += (ds * float(q) - dmn) * xf[b * n + sb * 256l + js * 32l + l]
+                    }
+                }
+            }
+            y[b * refd + j] = acc
+        }
+    }
+    return <- y
+}
+
+// exact-arithmetic Q5_K fill: the Q4_K scale/min construction + full-random qh bytes (bit s of
+// qh[l] = the +16 bit of sub-block s at position l). Emits the production plane ([qs 128][qh 32])
+// with 16B COMPACT scale blocks (the upload form) and the ggml interleaved block_q5_K stream
+// ([d][dmin][scales 12][qh 32][qs 128], 176B).
+def private fill_exact_k5(var kq : array<uint8>; var kc : array<uint8>; var gg : array<uint8>; rows, k : int64; seed : int64) {
+    let nsb = k / 256l
+    let total = rows * nsb
+    kq |> resize(total * 160l)
+    kc |> resize(total * 16l)
+    gg |> resize(total * 176l)
+    let lut = fixed_array(0.25, 0.5, 1.0, 2.0)
+    for (sb in range64(total)) {
+        let db = f32_to_f16(lut[int((sb / 5l) % 4l)])
+        let mb = f32_to_f16(lut[int((sb / 3l + 1l) % 4l)])
+        let co = sb * 16l
+        let go = sb * 176l
+        kc[co] = uint8(db & 255u)
+        kc[co + 1l] = uint8(db >> 8u)
+        kc[co + 2l] = uint8(mb & 255u)
+        kc[co + 3l] = uint8(mb >> 8u)
+        for (j in range64(4l)) {
+            let scl = int((sb + j * 5l + seed) % 8l)
+            let mnl = int((sb * 3l + j * 7l + 1l) % 8l)
+            let sch = int((sb + (j + 4l) * 5l + seed) % 8l)
+            let mnh = int((sb * 3l + (j + 4l) * 7l + 1l) % 8l)
+            kc[co + 4l + j] = uint8(scl)
+            kc[co + 8l + j] = uint8(mnl)
+            kc[co + 12l + j] = uint8(sch | (mnh << 4))
+        }
+        for (j in range64(16l)) {
+            gg[go + j] = kc[co + j]
+        }
+        let qo = sb * 160l
+        for (b in range64(128l)) {   // qs nibbles
+            let lo = int((b * 7l + sb * 13l + seed) % 16l)
+            let hi = int((b * 11l + sb * 5l + 3l) % 16l)
+            kq[qo + b] = uint8(lo | (hi << 4))
+            gg[go + 48l + b] = kq[qo + b]
+        }
+        for (b in range64(32l)) {   // qh bytes
+            let h = int((b * 29l + sb * 17l + seed) % 256l)
+            kq[qo + 128l + b] = uint8(h)
+            gg[go + 16l + b] = uint8(h)
+        }
+    }
+}
+
+// exact-arithmetic Q6_K fill: signed sub-scales in [-7,7], pow2 d, random ql/qh streams. Emits
+// the production quant plane ([ql 128][qh 64]) with the SPLIT GPU scale planes (16B sub-scale
+// blocks + packed f16 d plane) and the ggml interleaved block_q6_K stream
+// ([ql 128][qh 64][scales 16][d], 210B).
+def private fill_exact_k6(var kq : array<uint8>; var ksc : array<uint8>; var kd : array<uint8>; var gg : array<uint8>; rows, k : int64; seed : int64) {
+    let nsb = k / 256l
+    let total = rows * nsb
+    kq |> resize(total * 192l)
+    ksc |> resize(total * 16l)
+    kd |> resize(total * 2l)
+    gg |> resize(total * 210l)
+    let lut = fixed_array(0.25, 0.5, 1.0, 2.0)
+    for (sb in range64(total)) {
+        let db = f32_to_f16(lut[int((sb / 5l) % 4l)])
+        kd[sb * 2l] = uint8(db & 255u)
+        kd[sb * 2l + 1l] = uint8(db >> 8u)
+        let go = sb * 210l
+        gg[go + 208l] = kd[sb * 2l]
+        gg[go + 209l] = kd[sb * 2l + 1l]
+        for (j in range64(16l)) {
+            let sc = int((sb * 3l + j * 5l + seed) % 15l) - 7   // [-7, 7]
+            ksc[sb * 16l + j] = uint8(sc & 255)
+            gg[go + 192l + j] = ksc[sb * 16l + j]
+        }
+        let qo = sb * 192l
+        for (b in range64(192l)) {   // ql then qh, disk order
+            let v = int((b * 7l + sb * 13l + seed) % 256l)
+            kq[qo + b] = uint8(v)
+            gg[go + b] = uint8(v)
+        }
+    }
+}
+
+// CPU reference for the k5 arms: q = nibble | (qh bit s << 4), w = d*sc*q - dmin*mn
+def private cpu_ref_k5(kq : array<uint8>; kc : array<uint8>; xf : array<float>; n, nb_streams, refd : int64) : array<float> {
+    var y : array<float>
+    y |> resize(nb_streams * refd)
+    let nsb = n / 256l
+    for (b in range64(nb_streams)) {
+        for (j in range64(refd)) {
+            var acc = 0.0
+            for (sb in range64(nsb)) {
+                let co = (j * nsb + sb) * 16l
+                let qo = (j * nsb + sb) * 160l
+                let dd = f16_to_f32(uint(kc[co]) | (uint(kc[co + 1l]) << 8u))
+                let dm = f16_to_f32(uint(kc[co + 2l]) | (uint(kc[co + 3l]) << 8u))
+                for (js in range64(8l)) {
+                    let s = k4_ref_sc_mn(kc, co + 4l, js)
+                    let ds = dd * float(s.x)
+                    let dmn = dm * float(s.y)
+                    for (l in range64(32l)) {
+                        let qv = int(kq[qo + (js / 2l) * 32l + l])
+                        let nib = (js & 1l) == 0l ? (qv & 15) : (qv >> 4)
+                        let hb = (int(kq[qo + 128l + l]) >> int(js)) & 1
+                        acc += (ds * float(nib | (hb << 4)) - dmn) * xf[b * n + sb * 256l + js * 32l + l]
+                    }
+                }
+            }
+            y[b * refd + j] = acc
+        }
+    }
+    return <- y
+}
+
+// CPU reference for the k6 arms: q = ql nibble | 2 qh bits, w = d * sc16 * (q - 32)
+def private cpu_ref_k6(kq : array<uint8>; ksc : array<uint8>; kd : array<uint8>; xf : array<float>; n, nb_streams, refd : int64) : array<float> {
+    var y : array<float>
+    y |> resize(nb_streams * refd)
+    let nsb = n / 256l
+    for (b in range64(nb_streams)) {
+        for (j in range64(refd)) {
+            var acc = 0.0
+            for (sb in range64(nsb)) {
+                let so = (j * nsb + sb) * 16l
+                let qo = (j * nsb + sb) * 192l
+                let dd = f16_to_f32(uint(kd[(j * nsb + sb) * 2l]) | (uint(kd[(j * nsb + sb) * 2l + 1l]) << 8u))
+                for (g in range64(8l)) {   // 32-elem group g: half = g/4, within-half group g%4
+                    let half = g / 4l
+                    let gg = g % 4l
+                    let qlb = qo + half * 64l + (gg & 1l) * 32l
+                    let qhb = qo + 128l + half * 32l
+                    let sh = gg < 2l ? 0 : 4
+                    let hb = int(gg) * 2
+                    for (l in range64(32l)) {
+                        let q6 = ((int(kq[qlb + l]) >> sh) & 15) | (((int(kq[qhb + l]) >> hb) & 3) << 4)
+                        let sci = so + half * 8l + gg * 2l + l / 16l
+                        let sc = (int(ksc[sci]) ^ 128) - 128
+                        acc += dd * float(sc) * float(q6 - 32) * xf[b * n + sb * 256l + half * 128l + gg * 32l + l]
+                    }
+                }
             }
             y[b * refd + j] = acc
         }
@@ -1228,7 +2619,7 @@ def private compile_lab_pso(dev; v : LabVariant) {
 
 // one timed encoder: set state once, dispatch `reps` back-to-back (hazard tracking on the shared
 // y buffer serializes them); returns per-dispatch GPU milliseconds, or -1 on failure
-def private time_reps(queue; pso; bufs; groups : uint3; reps : int; tgmem : uint64) : double {
+def private time_reps(queue; pso; bufs; groups : uint3; reps : int; tgmem : uint64; tgsz : int = 128) : double {
     var err : string
     var gpu_ms = 0.0lf
     let ok = with_compute_encoder_timed(queue, err, gpu_ms) $(enc) {
@@ -1240,7 +2631,7 @@ def private time_reps(queue; pso; bufs; groups : uint3; reps : int; tgmem : uint
             metal_set_threadgroup_memory_length(enc, tgmem, 0)
         }
         for (_i in range(reps)) {
-            metal_dispatch_threadgroups(enc, groups, uint3(128u, 1u, 1u))
+            metal_dispatch_threadgroups(enc, groups, uint3(uint(tgsz), 1u, 1u))
         }
     }
     if (!ok) {
@@ -1290,7 +2681,56 @@ def private want(filter_env, name : string) : bool {
 def private sk_idx(sv : int) : int => sv == 2 ? 0 : (sv == 4 ? 1 : 2)
 
 // per-variant buffer list in binding order — generic (untyped params) so non-Apple never compiles it
-def private make_bufs(v : LabVariant; var wbuf; var sbuf; var xfbuf; var xtbuf; var xqbuf; var xsbuf; var ybuf; var ndimbuf; var ddimbuf; var bbuf; var partbuf; var skbuf) {
+// per-output-row weight bytes for the wGB/s report: q8 planar = n + n/8; kq = superblocks x
+// (quant + scale block) — k4 144B compact / 148B with the padded 20B plane, k5 176B, k6 210B
+def private kq_wrow_bytes(v : LabVariant; n : int64) : int64 {
+    if (v.kq == 5) {
+        return (n / 256l) * 176l
+    }
+    if (v.kq == 6) {
+        return (n / 256l) * 210l
+    }
+    if (v.kq == 4) {
+        return (n / 256l) * (v.kq16 || v.kq_ggml ? 144l : 148l)
+    }
+    return n + n / 8l
+}
+
+// kq buffer-array slots (built per shape in run_lab, indexed by the make_bufs kq branches)
+let KQA_Q4 = 0
+let KQA_S4 = 1
+let KQA_G4 = 2
+let KQA_C4 = 3
+let KQA_Q5 = 4
+let KQA_C5 = 5
+let KQA_G5 = 6
+let KQA_Q6 = 7
+let KQA_SC6 = 8
+let KQA_D6 = 9
+let KQA_G6 = 10
+
+def private make_bufs(v : LabVariant; var wbuf; var sbuf; var xfbuf; var xtbuf; var xqbuf; var xsbuf; var ybuf; var ndimbuf; var ddimbuf; var bbuf; var partbuf; var skbuf; var kqarr) {
+    if (v.kq_ggml) {   // interleaved stream bound per view (f16 / uint / byte where the arm needs it)
+        if (v.kq == 5) {
+            return <- [kqarr[KQA_G5], kqarr[KQA_G5], kqarr[KQA_G5], xfbuf, ybuf, ndimbuf, ddimbuf]
+        }
+        if (v.kq == 6) {
+            return <- [kqarr[KQA_G6], kqarr[KQA_G6], xfbuf, ybuf, ndimbuf, ddimbuf]
+        }
+        return <- [kqarr[KQA_G4], kqarr[KQA_G4], xfbuf, ybuf, ndimbuf, ddimbuf]
+    }
+    if (v.kq == 5) {   // 16B compact scale blocks (f16 + uint4 views) + the quant plane
+        return <- [kqarr[KQA_C5], kqarr[KQA_C5], kqarr[KQA_Q5], xfbuf, ybuf, ndimbuf, ddimbuf]
+    }
+    if (v.kq == 6) {   // split scale planes: f16 d plane + 16B sub-scale blocks + the quant plane
+        return <- [kqarr[KQA_D6], kqarr[KQA_SC6], kqarr[KQA_Q6], xfbuf, ybuf, ndimbuf, ddimbuf]
+    }
+    if (v.kq16) {      // k4: compact scale blocks bound twice (f16 + uint4 views) + the quant plane
+        return <- [kqarr[KQA_C4], kqarr[KQA_C4], kqarr[KQA_Q4], xfbuf, ybuf, ndimbuf, ddimbuf]
+    }
+    if (v.kq != 0) {   // k4 negative control: the production 20B scale plane
+        return <- [kqarr[KQA_S4], kqarr[KQA_S4], kqarr[KQA_Q4], xfbuf, ybuf, ndimbuf, ddimbuf]
+    }
     if (v.gemm_sk) {
         return <- [wbuf, sbuf, xfbuf, partbuf, ndimbuf, ddimbuf, skbuf]
     }
@@ -1377,8 +2817,66 @@ def private run_lab(b : B?; variants) {
         for (i in range64(bmax * n)) {
             xft[(i % n) * bmax + i / n] = xf[i]
         }
+        // the k4 arms' weight streams (built only when a kq arm survives the filter — the cls
+        // shape's three extra layouts are ~450MB of host fill otherwise wasted)
+        var anyk4 = false
+        var anyk5 = false
+        var anyk6 = false
+        for (v in variants) {
+            let on = want("DASMETAL_LAB_VARIANTS", v.name)
+            anyk4 ||= v.kq == 4 && on
+            anyk5 ||= v.kq == 5 && on
+            anyk6 ||= v.kq == 6 && on
+        }
+        var k4q_h : array<uint8>
+        var k4s_h : array<uint8>
+        var k4g_h : array<uint8>
+        var k4c_h : array<uint8>
+        var yref_k4 : array<float>
+        if (anyk4) {
+            fill_exact_k4(k4q_h, k4s_h, k4g_h, d, n, 7l)
+            yref_k4 <- cpu_ref_k4(k4q_h, k4s_h, xf, n, bmax, refd)
+            // the 16B compact scale plane = the 20B blocks with the pads stripped
+            let nsb_all = (d * n) / 256l
+            k4c_h |> resize(nsb_all * 16l)
+            for (sb in range64(nsb_all)) {
+                for (i in range64(16l)) {
+                    k4c_h[sb * 16l + i] = k4s_h[sb * 20l + i]
+                }
+            }
+        }
+        var k5q_h : array<uint8>
+        var k5c_h : array<uint8>
+        var k5g_h : array<uint8>
+        var yref_k5 : array<float>
+        if (anyk5) {
+            fill_exact_k5(k5q_h, k5c_h, k5g_h, d, n, 9l)
+            yref_k5 <- cpu_ref_k5(k5q_h, k5c_h, xf, n, bmax, refd)
+        }
+        var k6q_h : array<uint8>
+        var k6sc_h : array<uint8>
+        var k6d_h : array<uint8>
+        var k6g_h : array<uint8>
+        var yref_k6 : array<float>
+        if (anyk6) {
+            fill_exact_k6(k6q_h, k6sc_h, k6d_h, k6g_h, d, n, 11l)
+            yref_k6 <- cpu_ref_k6(k6q_h, k6sc_h, k6d_h, xf, n, bmax, refd)
+        }
         var wbuf = upload_array(dev, wq, d * n)
         var sbuf = upload_array(dev, ws, d * nb * 4l)
+        let nsball = (d * n) / 256l
+        var kq4buf = anyk4 ? upload_array(dev, k4q_h, nsball * 128l) : null
+        var ks4buf = anyk4 ? upload_array(dev, k4s_h, nsball * 20l) : null
+        var kg4buf = anyk4 ? upload_array(dev, k4g_h, nsball * 144l) : null
+        var kc4buf = anyk4 ? upload_array(dev, k4c_h, nsball * 16l) : null
+        var kq5buf = anyk5 ? upload_array(dev, k5q_h, nsball * 160l) : null
+        var kc5buf = anyk5 ? upload_array(dev, k5c_h, nsball * 16l) : null
+        var kg5buf = anyk5 ? upload_array(dev, k5g_h, nsball * 176l) : null
+        var kq6buf = anyk6 ? upload_array(dev, k6q_h, nsball * 192l) : null
+        var ksc6buf = anyk6 ? upload_array(dev, k6sc_h, nsball * 16l) : null
+        var kd6buf = anyk6 ? upload_array(dev, k6d_h, nsball * 2l) : null
+        var kg6buf = anyk6 ? upload_array(dev, k6g_h, nsball * 210l) : null
+        var kqarr <- [kq4buf, ks4buf, kg4buf, kc4buf, kq5buf, kc5buf, kg5buf, kq6buf, ksc6buf, kd6buf, kg6buf]
         var xfbuf = upload_array(dev, xf, xrows * n * 4l)
         var xtbuf = upload_array(dev, xft, n * bmax * 4l)
         var xqbuf = upload_array(dev, xq, xrows * n)
@@ -1391,7 +2889,6 @@ def private run_lab(b : B?; variants) {
         var ddimbuf = upload_u32(dev, uint(d))
         let setup_ms = double(ref_time_ticks() - t_shape0) / 1000000.0lf
         to_log(LOG_INFO, "=== {sh._0} n={n} d={d} === (setup {setup_ms} ms)\n")
-        let groups = uint3(uint((d + 3l) / 4l), 1u, 1u)
         let groups_gemm = uint3(uint(d / 32l), 1u, 1u)   // (32/32 token tiles) x (d/32 output tiles)
         let groups_gemm64 = uint3(uint(d / 64l), 1u, 1u)
         // flattened (variant, B) runs — interleaved timing across ALL runs neutralizes drift
@@ -1420,7 +2917,7 @@ def private run_lab(b : B?; variants) {
             best[ri] = 1.0e30lf
             let vi = run_v[ri]
             let nbatch = run_b[ri]
-            var bufs <- make_bufs(variants[vi], wbuf, sbuf, xfbuf, xtbuf, xqbuf, xsbuf, ybuf, ndimbuf, ddimbuf, bbufs[find_bbuf(nbatch)], partbuf, skbufs[sk_idx(variants[vi].sk)])
+            var bufs <- make_bufs(variants[vi], wbuf, sbuf, xfbuf, xtbuf, xqbuf, xsbuf, ybuf, ndimbuf, ddimbuf, bbufs[find_bbuf(nbatch)], partbuf, skbufs[sk_idx(variants[vi].sk)], kqarr)
             var ms = 0.0lf   // warmup + correctness dispatch
             if (variants[vi].gemm_sk) {
                 var rbufs <- [partbuf, ybuf, totalbuf, skbufs[sk_idx(variants[vi].sk)]]
@@ -1431,7 +2928,8 @@ def private run_lab(b : B?; variants) {
                     delete rbufs
                 }
             } else {
-                ms = time_reps(queue, psos[vi], bufs, variants[vi].gemm64_fx ? groups_gemm64 : ((variants[vi].gemm || variants[vi].gemm_fx) ? groups_gemm : groups), 1, variants[vi].tgmem)
+                let vgroups = uint3(uint((d + int64(variants[vi].rtg) - 1l) / int64(variants[vi].rtg)), 1u, 1u)
+                ms = time_reps(queue, psos[vi], bufs, variants[vi].gemm64_fx ? groups_gemm64 : ((variants[vi].gemm || variants[vi].gemm_fx) ? groups_gemm : vgroups), 1, variants[vi].tgmem, variants[vi].tgsz)
             }
             bufs |> clear()   // borrowed handles — delete of array<T?> would free the pointees
             unsafe {
@@ -1444,7 +2942,16 @@ def private run_lab(b : B?; variants) {
             est_ms[ri] = ms
             download_floats(ybuf, ygot, int64(nbatch) * d)
             var firstBad = -1l
-            let bad = count_mismatch_sampled(ygot, yref, d, int64(nbatch), refd, firstBad)
+            var bad = 0l
+            if (variants[vi].kq == 4) {
+                bad = count_mismatch_sampled(ygot, yref_k4, d, int64(nbatch), refd, firstBad)
+            } elif (variants[vi].kq == 5) {
+                bad = count_mismatch_sampled(ygot, yref_k5, d, int64(nbatch), refd, firstBad)
+            } elif (variants[vi].kq == 6) {
+                bad = count_mismatch_sampled(ygot, yref_k6, d, int64(nbatch), refd, firstBad)
+            } else {
+                bad = count_mismatch_sampled(ygot, yref, d, int64(nbatch), refd, firstBad)
+            }
             b |> success(bad == 0l, "{variants[vi].name}/B{nbatch} {sh._0}: bit-exact vs CPU reference")
             if (bad != 0l) {
                 to_log(LOG_ERROR, "{variants[vi].name}/B{nbatch} {sh._0}: {bad} mismatches, first at {firstBad}: got {ygot[firstBad]}\n")
@@ -1459,7 +2966,7 @@ def private run_lab(b : B?; variants) {
                     continue
                 }
                 let vi = run_v[ri]
-                var bufs <- make_bufs(variants[vi], wbuf, sbuf, xfbuf, xtbuf, xqbuf, xsbuf, ybuf, ndimbuf, ddimbuf, bbufs[find_bbuf(run_b[ri])], partbuf, skbufs[sk_idx(variants[vi].sk)])
+                var bufs <- make_bufs(variants[vi], wbuf, sbuf, xfbuf, xtbuf, xqbuf, xsbuf, ybuf, ndimbuf, ddimbuf, bbufs[find_bbuf(run_b[ri])], partbuf, skbufs[sk_idx(variants[vi].sk)], kqarr)
                 let reps = clamp(int(25.0lf / max(est_ms[ri], 0.01lf)) + 1, 1, 128)
                 var ms = 0.0lf
                 if (variants[vi].gemm_sk) {
@@ -1471,7 +2978,8 @@ def private run_lab(b : B?; variants) {
                         delete rbufs
                     }
                 } else {
-                    ms = time_reps(queue, psos[vi], bufs, variants[vi].gemm64_fx ? groups_gemm64 : ((variants[vi].gemm || variants[vi].gemm_fx) ? groups_gemm : groups), reps, variants[vi].tgmem)
+                    let vgroups = uint3(uint((d + int64(variants[vi].rtg) - 1l) / int64(variants[vi].rtg)), 1u, 1u)
+                    ms = time_reps(queue, psos[vi], bufs, variants[vi].gemm64_fx ? groups_gemm64 : ((variants[vi].gemm || variants[vi].gemm_fx) ? groups_gemm : vgroups), reps, variants[vi].tgmem, variants[vi].tgsz)
                 }
                 if (ms > 0.0lf && ms < best[ri]) {
                     best[ri] = ms
@@ -1482,19 +2990,42 @@ def private run_lab(b : B?; variants) {
                 }
             }
         }
-        // weight traffic: n quant bytes + n/8 scale bytes per output row (planar f32 scales)
-        let wbytes = double(d * (n + n / 8l))
+        // weight traffic: q8 planar = n quant + n/8 scale bytes per output row; k4 = 148B
+        // (planes, 128+20) or 144B (ggml interleaved) per 256 elems
         for (ri in range(length(run_v))) {
             if (!alive[ri]) {
                 continue
             }
+            let vi = run_v[ri]
+            let wbytes = double(d * kq_wrow_bytes(variants[vi], n))
             let nbatch = run_b[ri]
             let gbs = wbytes / (best[ri] * 1.0e6lf)
             let gmacs = double(n * d * int64(nbatch)) / (best[ri] * 1.0e6lf)
-            to_log(LOG_INFO, "{variants[run_v[ri]].name}/B{nbatch}  {sh._0} {best[ri]} ms  {gbs} wGB/s  {gmacs} GMAC/s\n")
+            to_log(LOG_INFO, "{variants[vi].name}/B{nbatch}  {sh._0} {best[ri]} ms  {gbs} wGB/s  {gmacs} GMAC/s\n")
         }
         metal_release(wbuf)
         metal_release(sbuf)
+        if (anyk4) {
+            metal_release(kq4buf)
+            metal_release(ks4buf)
+            metal_release(kg4buf)
+            metal_release(kc4buf)
+        }
+        if (anyk5) {
+            metal_release(kq5buf)
+            metal_release(kc5buf)
+            metal_release(kg5buf)
+        }
+        if (anyk6) {
+            metal_release(kq6buf)
+            metal_release(ksc6buf)
+            metal_release(kd6buf)
+            metal_release(kg6buf)
+        }
+        kqarr |> clear()   // borrowed handles — released above
+        unsafe {
+            delete kqarr
+        }
         metal_release(partbuf)
         metal_release(totalbuf)
         for (skb in skbufs) {
@@ -1524,6 +3055,20 @@ def private run_lab(b : B?; variants) {
         delete xf
         delete xft
         delete yref
+        delete k4q_h
+        delete k4s_h
+        delete k4g_h
+        delete k4c_h
+        delete yref_k4
+        delete k5q_h
+        delete k5c_h
+        delete k5g_h
+        delete yref_k5
+        delete k6q_h
+        delete k6sc_h
+        delete k6d_h
+        delete k6g_h
+        delete yref_k6
     }
     delete shapes
     for (bbuf in bbufs) {
@@ -1617,7 +3162,35 @@ def bench_metal_gemv_kernels(b : B?) {
             LabVariant(name = "gemm_sk4", src = lab_gemm_sk_msl, entry = lab_gemm_sk_msl_entry,
                        b_list <- [8], gemm_sk = true, sk = 4, tgmem = lab_gemm_sk_msl_tgmem),
             LabVariant(name = "gemm_sk8", src = lab_gemm_sk_msl, entry = lab_gemm_sk_msl_entry,
-                       b_list <- [8], gemm_sk = true, sk = 8, tgmem = lab_gemm_sk_msl_tgmem)
+                       b_list <- [8], gemm_sk = true, sk = 8, tgmem = lab_gemm_sk_msl_tgmem),
+            LabVariant(name = "k4_lcpp", src = lab_k4_lcpp_msl, entry = lab_k4_lcpp_msl_entry,
+                       b_list <- [1], kq = 4, kq_ggml = true, tgsz = 64),
+            LabVariant(name = "k4_b1", src = lab_k4_b1_msl, entry = lab_k4_b1_msl_entry,
+                       b_list <- [1], kq = 4, tgsz = 64),
+            LabVariant(name = "k4_b1c", src = lab_k4_b1c_msl, entry = lab_k4_b1c_msl_entry,
+                       b_list <- [1], kq = 4, kq16 = true, tgsz = 64),
+            LabVariant(name = "k5_lcpp", src = lab_k5_lcpp_msl, entry = lab_k5_lcpp_msl_entry,
+                       b_list <- [1], kq = 5, kq_ggml = true, tgsz = 64, rtg = 2),
+            LabVariant(name = "k5_b1c", src = lab_k5_b1c_msl, entry = lab_k5_b1c_msl_entry,
+                       b_list <- [1], kq = 5, kq16 = true, tgsz = 64, rtg = 2),
+            LabVariant(name = "k5_b1d", src = lab_k5_b1d_msl, entry = lab_k5_b1d_msl_entry,
+                       b_list <- [1], kq = 5, kq16 = true, tgsz = 64, rtg = 2),
+            LabVariant(name = "k5_b2r", src = lab_k5_b2r_msl, entry = lab_k5_b2r_msl_entry,
+                       b_list <- [1], kq = 5, kq16 = true, tgsz = 64),
+            LabVariant(name = "k6_lcpp", src = lab_k6_lcpp_msl, entry = lab_k6_lcpp_msl_entry,
+                       b_list <- [1], kq = 6, kq_ggml = true, tgsz = 64),
+            LabVariant(name = "k6_b1c", src = lab_k6_b1c_msl, entry = lab_k6_b1c_msl_entry,
+                       b_list <- [1], kq = 6, kq16 = true, tgsz = 64),
+            LabVariant(name = "k6_b1d", src = lab_k6_b1d_msl, entry = lab_k6_b1d_msl_entry,
+                       b_list <- [1], kq = 6, kq16 = true, tgsz = 64),
+            LabVariant(name = "k4_mvb2", src = lab_k4_mvb2_msl, entry = lab_k4_mvb2_msl_entry,
+                       b_list <- [2], kq = 4, kq16 = true, tgsz = 64, rtg = 2),
+            LabVariant(name = "k4_mvb2ctl", src = lab_k4_mvb2ctl_msl, entry = lab_k4_mvb2ctl_msl_entry,
+                       b_list <- [1], kq = 4, kq16 = true, tgsz = 64, rtg = 2),
+            LabVariant(name = "k5_mvb2", src = lab_k5_mvb2_msl, entry = lab_k5_mvb2_msl_entry,
+                       b_list <- [2], kq = 5, kq16 = true, tgsz = 64, rtg = 2),
+            LabVariant(name = "k6_mvb2", src = lab_k6_mvb2_msl, entry = lab_k6_mvb2_msl_entry,
+                       b_list <- [2], kq = 6, kq16 = true, tgsz = 64, rtg = 2)
         ]
         run_lab(b, variants)
         delete variants
