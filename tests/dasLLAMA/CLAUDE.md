@@ -42,6 +42,9 @@ batch test: `batch` (whole test), `batchB7-partd`, `batchB8-kq`. Prefill parity:
 kq cont dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b`. The
 `kernels` suite (test_metal_prefill_kernels — model-less kernel units, ~80s) has no arms;
 remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
+The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
+carrier, model-free, runs in CI) `smol tower whisper voxtral`; the voxtral arm re-saves a
+5.4 GB image from cold every run by design (it IS the >2 GiB-plane IO coverage).
 
 ## Model tiers
 
