@@ -1309,15 +1309,21 @@ def caps_(m : Model) : LlmCaps {
 
 // Look the arch up, apply its config flags, and copy its (copyable) block kernels onto the model.
 // The full descriptor stays in the registry; only the hot-path pointers ride on the Model.
-// public: the image loader re-binds blocks + re-runs the arch's configure (idempotent) after
-// deserializing the model meta — same registry path as load_gguf
 def resolve_arch(var t : Model; arch : string) {
+    rebind_arch_blocks(t, arch)
+    g_arch_registry[arch].configure(t.config)
+}
+
+// The image loader's post-read half of resolve_arch: block kernels re-bind from the registry,
+// but configure must NOT re-run — the serialized config already carries configure's flags PLUS
+// the gguf's overrides, and configures set overridable fallbacks (gemma4's sliding_window = 1024
+// clobbered the E2B's real 512 and drifted tokens past the window).
+def rebind_arch_blocks(var t : Model; arch : string) {
     if (!key_exists(g_arch_registry, arch)) {
         let registered = join(arch_names(), ", ")
         panic("dasLLAMA: unsupported architecture '{arch}' (registered: {registered})")
     }
     t.arch = arch
-    g_arch_registry[arch].configure(t.config)
     t.blocks = g_arch_registry[arch].blocks
 }
 

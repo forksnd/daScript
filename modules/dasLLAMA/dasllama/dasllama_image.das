@@ -296,9 +296,11 @@ def count_meta_fields(var t) : int {
     return n
 }
 
-// Model's post-read fix-up: blocks re-bind from the registry (+ the arch's idempotent configure)
+// Model's post-read fix-up: blocks re-bind from the registry. Deliberately NOT resolve_arch —
+// its configure would clobber serialized gguf overrides with the arch's fallbacks (see
+// rebind_arch_blocks).
 def private image_post_load(var t : Model) {
-    resolve_arch(t, t.arch)
+    rebind_arch_blocks(t, t.arch)
 }
 
 // ===== save =====

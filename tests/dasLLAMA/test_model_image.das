@@ -223,12 +223,36 @@ def private gen_ids(tr : Model; prompt : array<int64>; n_gen : int) : array<int6
     return <- out
 }
 
+// first config field whose value differs between two loads ("" = none) — catches an arch
+// configure clobbering serialized gguf overrides even when short gens can't (sliding_window
+// only bites past the window)
+def private config_diff_field(a, b : Config) : string {
+    var names : array<string>
+    var vals : array<string>
+    apply(a) $(name : string; field) {
+        names |> push(name)
+        vals |> push("{field}")
+    }
+    var bad = ""
+    var i = 0
+    apply(b) $ [unused_argument(name)] (name : string; field) {
+        if (empty(bad) && "{field}" != vals[i]) {
+            bad = "{names[i]}: gguf={vals[i]} image={field}"
+        }
+        i++
+    }
+    delete names
+    delete vals
+    return bad
+}
+
 def private text_image_roundtrip(t : T?; path : string; n_gen : int) {
     let img = image_path_for(path)
     remove(img)   // cold start: the first facade load must regenerate + save
     var a <- load_model(path, QuantMode.q8)
     t |> success(a.image_map == null, "cold load is gguf-backed")
     t |> success(stat(img).is_valid, "cold load saved an image")
+    var cfg_a := a.config   // the gguf truth, kept past delete for the round-trip compare
     if (a.config.seq_len > 2048l) {
         a.config.seq_len = 2048l
     }
@@ -237,6 +261,9 @@ def private text_image_roundtrip(t : T?; path : string; n_gen : int) {
     delete a
     var b <- load_model(path, QuantMode.q8)
     t |> success(b.image_map != null, "warm load is image-backed")
+    let cfg_diff = config_diff_field(cfg_a, b.config)
+    t |> success(empty(cfg_diff), "config round-trips exactly ({cfg_diff})")
+    delete cfg_a
     if (b.config.seq_len > 2048l) {
         b.config.seq_len = 2048l
     }
@@ -292,6 +319,27 @@ def test_voxtral_mini_image(t : T?) {
         text_image_roundtrip(t, path, 12)
         // the arm exists for the 64-bit plane IO: the q8 image must actually cross 2 GiB
         t |> success(stat(image_path_for(path)).size > 0x80000000ul, "image crosses 2 GiB")
+    }
+}
+
+[test]
+def test_gemma4_image_roundtrip(t : T?) {
+    t |> run("gemma-4-E2B q8: arch-configure fallbacks must not clobber mapped config") @(t : T?) {
+        // gemma4's configure sets gguf-overridable fallbacks (sliding_window, swa_pattern);
+        // re-running it on an image load stomped the serialized overrides (caught 2026-07-16:
+        // token drift on the mapped E2B while every llama-arch carrier round-tripped clean)
+        if (!arm_on(t, "gemma")) {
+            return
+        }
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-E2B-it-Q8_0.gguf")
+        if (!model_available(t, path)) {
+            return
+        }
+        text_image_roundtrip(t, path, 16)
     }
 }
 
