@@ -21,7 +21,7 @@ require dasllama/dasllama_math   // active_kernel_backend — half the image ide
 // stay lazy (full verification belongs to the offline tool, not load).
 
 // bump on ANY layout/serialization change — a mismatched image regenerates from the gguf
-let IMAGE_VERSION = 1
+let IMAGE_VERSION = 2
 let IMAGE_PAGE = 16384l          // Apple-Silicon page: the bytesNoCopy alignment contract
 let IMAGE_HEADER_BYTES = 64l     // magic..identity, inside the first page
 let IMAGE_MAGIC = 0x314D4C44u    // 'DLM1'
@@ -32,9 +32,14 @@ struct private ImgSection {
     bytes : uint64
 }
 
-// the box + knob identity an image is valid for; folded into the file name AND the header
+// the box + knob identity an image is valid for; folded into the file name AND the header.
+// It names the exact plane layout, so it must be computed AFTER the same backend select the
+// gguf loader runs at repack time — the entry-time auto default is a different backend.
 def image_identity : string {
-    return "v{IMAGE_VERSION}|{active_kernel_backend()}|{get_wscale_f16() ? "s16" : "s32"}"
+    select_matmul_backend_for_load()
+    return ("v{IMAGE_VERSION}|{active_kernel_backend()}|{get_wscale_f16() ? "s16" : "s32"}"
+        + "|q8 mr{active_q8_layout_mr()} b{active_q8_wbias()} g{active_q8_kgroup()}"
+        + "|kq {active_kq_layout_mr(4)}/{active_kq_layout_mr(5)}/{active_kq_layout_mr(6)}/{active_kq_layout_mr(40)}")
 }
 
 // the image path for (gguf, current identity) — knob combos coexist as separate files
@@ -59,14 +64,14 @@ def private write_zeros(f : file; n : uint64) {
 
 def private store_u32(var b : array<uint8>; at : int; v : uint) {
     unsafe {
-        var p = unsafe(addr<uint?>(b[at]))
+        var p = unsafe(addr < uint ? > (b[at]))
         p[0] = v
     }
 }
 
 def private store_u64(var b : array<uint8>; at : int; v : uint64) {
     unsafe {
-        var p = unsafe(addr<uint64?>(b[at]))
+        var p = unsafe(addr < uint64 ? > (b[at]))
         p[0] = v
     }
 }
@@ -142,7 +147,7 @@ def private serialize_strings(var arch : Archive; var a : array<string>) {
             let n = lens[i]
             if (n > 0) {
                 unsafe {
-                    a[i] = string(temp_array(addr<uint8?>(blob[at]), n, type<uint8>))
+                    a[i] = string(temp_array(addr < uint8 ? > (blob[at]), n, type<uint8>))
                 }
             } else {
                 a[i] = ""
@@ -303,12 +308,20 @@ def save_model_image(var t : Model; path : string) : bool {
         apply(t) $(name : string; var field) {
             static_if (typeinfo is_array(field)) {
                 if (!empty(field)) {
-                    let nbytes = uint64(length(field)) * uint64(typeinfo sizeof(field[0]))
+                    // long_length, NOT length: a >2 GiB plane (voxtral-mini qblob = 3.6 G elements)
+                    // wraps int32 length negative, and -jit inlines length() without the C++ guard
+                    let nbytes = uint64(long_length(field)) * uint64(typeinfo sizeof(field[0]))
                     let at = pad_to_page(cur)
                     write_zeros(f, at - cur)
                     f |> fwrite(field)
                     sections |> push(ImgSection(name = name, off = at, bytes = nbytes))
                     cur = at + nbytes
+                    // fwrite and the section table must agree byte-for-byte, or the mapped
+                    // planes land at the wrong offsets — fail the save loudly, not the load
+                    if (uint64(ftell(f)) != cur) {
+                        to_log(LOG_ERROR, "dasLLAMA image: plane '{name}' wrote {ftell(f)} != accounted {cur} (nbytes {nbytes}) — image save aborted\n")
+                        ok = false
+                    }
                 }
             }
         }
@@ -352,6 +365,7 @@ def save_model_image(var t : Model; path : string) : bool {
         delete meta
     }
     if (!ok) {
+        remove(tmp_path)
         return false
     }
     remove(path)   // rename-over is not portable — drop any stale image first
@@ -371,6 +385,9 @@ def load_model_image(path : string; var t : Model) : bool {
     if (!stat(path).is_valid) {
         return false
     }
+    // the mapped planes are packed for the load backend — activate it before any kernel runs
+    // (same select the gguf loader does; the identity check below then names that backend)
+    select_matmul_backend_for_load()
     var msize = 0ul
     var base : void?
     unsafe {
@@ -383,6 +400,9 @@ def load_model_image(path : string; var t : Model) : bool {
     if (int64(msize) < IMAGE_HEADER_BYTES ||
             (read_u32(bp, 0l) != IMAGE_MAGIC || read_u32(bp, 4l) != uint(IMAGE_VERSION)) ||
             (read_u32(bp, 8l) != uint(IMAGE_PAGE) || read_u64(bp, 40l) != hash(image_identity()))) {
+        // every decline is loud (short of the file simply not existing) — a silently
+        // regenerating cache is undebuggable
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — size {msize} magic {read_u32(bp, 0l)} version {read_u32(bp, 4l)} (want {IMAGE_VERSION}) page {read_u32(bp, 8l)} identity {read_u64(bp, 40l)} (want {hash(image_identity())} = '{image_identity()}')\n")
         unsafe {
             fmap_close(base, msize)
         }
@@ -393,6 +413,7 @@ def load_model_image(path : string; var t : Model) : bool {
     let meta_bytes = read_u64(bp, 24l)
     let file_bytes = read_u64(bp, 32l)
     if (file_bytes != msize || meta_off + meta_bytes > msize) {
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — header says {file_bytes} bytes / meta {meta_off}+{meta_bytes}, mapped {msize}\n")
         unsafe {
             fmap_close(base, msize)
         }
@@ -418,6 +439,7 @@ def load_model_image(path : string; var t : Model) : bool {
                 let sec = by_name?[name] ?? ImgSection()
                 let esz = uint64(typeinfo sizeof(field[0]))
                 if (sec.off % uint64(IMAGE_PAGE) != 0ul || sec.off + sec.bytes > msize || sec.bytes % esz != 0ul) {
+                    to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — section '{name}' at {sec.off}+{sec.bytes} (esz {esz}) is malformed\n")
                     ok = false
                 } else {
                     unsafe {

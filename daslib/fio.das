@@ -109,9 +109,28 @@ def fread(f : file; buf : auto(BufType) const implicit) {
 [generic]
 def fread(f : file; buf : array<auto(BufType)> const implicit) {
     concept_assert(typeinfo is_raw(type<BufType>), "'fread' accepts only raw POD type arrays")
-    unsafe {
-        return _builtin_read(f, addr(buf[0]), length(buf) * (typeinfo sizeof(type<BufType>)))
+    let nbytes = long_length(buf) * typeinfo sizeof(type<BufType>)
+    if (nbytes <= int64(INT_MAX)) {
+        unsafe {
+            return _builtin_read(f, addr(buf[0]), int(nbytes))
+        }
     }
+    // past 2 GiB an int32 byte count wraps negative and the C runtime sign-extends it to a
+    // huge size_t — out-of-bounds. Chunk in int64; the return clamps to INT_MAX by necessity.
+    var p = unsafe(addr<uint8?>(buf[0]))
+    var done = 0l
+    while (done < nbytes) {
+        let chunk = min(nbytes - done, int64(0x40000000))
+        var got = 0
+        unsafe {
+            got = _builtin_read(f, p + done, int(chunk))
+        }
+        done += int64(got)
+        if (int64(got) != chunk) {
+            break
+        }
+    }
+    return int(min(done, int64(INT_MAX)))
 }
 
 [generic]
@@ -125,9 +144,29 @@ def fwrite(f : file; buf : auto(BufType) const implicit) {
 [generic]
 def fwrite(f : file; buf : array<auto(BufType)> const implicit) {
     concept_assert(typeinfo is_raw(type<BufType>), "'fwrite' accepts only raw POD type arrays")
-    unsafe {
-        return _builtin_write(f, addr(buf[0]), length(buf) * (typeinfo sizeof(type<BufType>)))
+    let nbytes = long_length(buf) * typeinfo sizeof(type<BufType>)
+    if (nbytes <= int64(INT_MAX)) {
+        unsafe {
+            return _builtin_write(f, addr(buf[0]), int(nbytes))
+        }
     }
+    // past 2 GiB an int32 byte count wraps negative and the C runtime sign-extends it to a
+    // huge size_t — fwrite then streams heap garbage past the buffer into the file, silently.
+    // Chunk in int64; the return clamps to INT_MAX by necessity.
+    var p = unsafe(addr<uint8?>(buf[0]))
+    var done = 0l
+    while (done < nbytes) {
+        let chunk = min(nbytes - done, int64(0x40000000))
+        var wrote = 0
+        unsafe {
+            wrote = _builtin_write(f, p + done, int(chunk))
+        }
+        done += int64(wrote)
+        if (int64(wrote) != chunk) {
+            break
+        }
+    }
+    return int(min(done, int64(INT_MAX)))
 }
 
 [generic]
