@@ -32,7 +32,8 @@ clang++ -std=c++17 -O2 -I include -I ggml/include simple_ids.cpp \
 ### Run a parity check
 
 ```sh
-# fp32 storage for an F16/F32 file; q8 for a Q8_0 file; q4 for Q4_0
+# fp32 storage for an F16/F32 file; q8 for everything quantized (Q8_0, and the K-quant /
+# mxfp4 / Q4_0 formats serve their native planes under q8)
 modules/dasLLAMA/harness/parity.sh ~/Work/llama.cpp/models/tinyllama-1.1b-v0.3-f16.gguf 40 fp32
 modules/dasLLAMA/harness/parity.sh ~/Work/llama.cpp/models/Qwen2.5-0.5B-Instruct-Q8_0.gguf 40 q8
 ```

@@ -14,7 +14,7 @@ require math
 // This tutorial covers:
 //   - Why model programs always run with -jit (and _jit_fast_math)
 //   - Threading the kernels: with_job_que + the jobque dispatch knobs
-//   - Quantization: fp32 vs q8 vs q4 — memory and speed
+//   - Quantization: fp32 vs q8 vs q4_0 — memory and speed
 //   - Reading stats(): prefill vs generation, time to first token
 //
 // Prerequisites: tutorial 01.
@@ -89,9 +89,10 @@ def section_threads(m : Model) {
 //
 // QuantMode picks the in-memory weight representation, whatever the GGUF stores:
 //   fp32 — the token-exact reference (4 bytes/weight); what the test suite validates
-//   q8   — int8 blocks (~1 byte/weight), the fast everyday choice
-//   q4   — 4-bit blocks, half of q8 again — but currently served by a scalar kernel
-//          with no batched prefill, so it's the smallest footprint, not the fastest
+//   q8   — the fast everyday choice: int8 blocks (~1 byte/weight); a K-quant / mxfp4 /
+//          Q4_0 file keeps its native 4-6 bit planes on the same fast rails
+//   q4_0 — the legacy requant tier: squeeze THIS f32/q8 load down to 4-bit blocks —
+//          per-row kernels, no batched prefill, so smallest footprint, not fastest
 // Generation is bandwidth-bound, so between fp32 and q8, smaller is also faster.
 
 def section_quant(path : string; mode : QuantMode; tag : string) {
@@ -134,7 +135,7 @@ def main() {
     print("\n")
     section_quant(path, QuantMode.fp32, "fp32")
     section_quant(path, QuantMode.q8, "q8  ")
-    section_quant(path, QuantMode.q4, "q4  ")
+    section_quant(path, QuantMode.q4_0, "q4_0")
 
     // Where to go deeper: modules/dasLLAMA/tune_for_this_box.md covers kernel tuning
     // (token-block size, unrolls, the [dasllama_grid] tuner) when you want to squeeze

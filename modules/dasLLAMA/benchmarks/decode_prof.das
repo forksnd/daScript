@@ -97,7 +97,7 @@ def private wbytes(q : QuantMode; wscale16 : bool = false) : double {
     if (q == QuantMode.q8) {
         return 1.0lf + (wscale16 ? 2.0lf : 4.0lf) / 32.0lf
     }
-    if (q == QuantMode.q4) {
+    if (q == QuantMode.q4_0) {
         return 0.5lf + 4.0lf / 32.0lf
     }
     return 4.0lf

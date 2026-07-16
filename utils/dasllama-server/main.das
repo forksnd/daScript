@@ -47,7 +47,7 @@ struct ServerArgs {
     port : int
 
     @clarg_short = "q"
-    @clarg_doc = "Weight serving mode: fp32 | q8 | q4 (default q8); file-format spellings q4_k | q5_k | q6_k | mxfp4 | f16 | bf16 select q8, where those planes serve natively"
+    @clarg_doc = "Weight serving mode: fp32 | q8 (default); file-format spellings q8_0 | q4_0 | q4_k | q5_k | q6_k | mxfp4 | f16 | bf16 select q8, where those planes serve natively; q4 = legacy requant tier"
     quant : string
 
     @clarg_doc = "KV cache codec: f32 | f16 | q8_0 | tq4 (default f16)"
@@ -239,20 +239,21 @@ def apply_config(var cfg : ServerArgs) : bool {
     return true
 }
 
-// Besides the serving modes (fp32 | q8 | q4), the FILE formats the gguf loader reads are
-// first-class spellings too: q4_k / q5_k / q6_k (any case, _M/_S suffixes fine), mxfp4,
-// f16 / bf16, q8_0 — all of those serve under QuantMode.q8 (K-quant and mx4 planes run
-// NATIVELY on the kq tier). "q4" stays the legacy q4_0 requant tier — do not use it for
-// K-quant files (per-row fallback paths, the 14x prefill stall).
+// The serving modes are QuantMode fp32/q8/q4_0, CLI spellings "fp32" | "q8" | "q4" — "q4"
+// selects the legacy q4_0 requant tier (per-row kernels only, no batched prefill), whose one
+// use is squeezing an f16/f32 file down to 4 bits for RAM. The FILE formats the gguf loader
+// reads are first-class spellings too: q8_0 / q4_0 / q4_k / q5_k / q6_k (any case, _M/_S
+// suffixes fine), mxfp4, f16 / bf16 — all of those serve under QuantMode.q8 (K-quant, mx4,
+// and Q4_0 planes run NATIVELY on the kq tier).
 def pick_quant(s : string) : QuantMode {
     let l = to_lower(s)
     if (l == "fp32" || l == "f32") {
         return QuantMode.fp32
-    } elif (l == "q4" || l == "q4_0") {
-        return QuantMode.q4
-    } elif (!empty(l) && l != "q8" && l != "q8_0" && l != "mxfp4" && l != "f16" && l != "bf16"
+    } elif (l == "q4") {
+        return QuantMode.q4_0
+    } elif (!empty(l) && l != "q8" && l != "q8_0" && l != "q4_0" && l != "mxfp4" && l != "f16" && l != "bf16"
             && !(starts_with(l, "q4_k") || starts_with(l, "q5_k") || starts_with(l, "q6_k"))) {
-        to_log(LOG_WARNING, "dasllama-server: unknown --quant '{s}', using q8 (valid: fp32 | q8 | q4 | q4_k | q5_k | q6_k | mxfp4 | f16 | bf16)\n")
+        to_log(LOG_WARNING, "dasllama-server: unknown --quant '{s}', using q8 (valid: fp32 | q8 | q8_0 | q4_0 | q4_k | q5_k | q6_k | mxfp4 | f16 | bf16 | q4 = legacy requant)\n")
     }
     return QuantMode.q8
 }

@@ -48,8 +48,8 @@ def main {
         let fp32 = run_once(t, c, "fp32 ")  // quant defaults to fp32
         quantize_weights(t)                 // sets t.quant = q8
         let q8 = run_once(t, c, "q8   ")
-        quantize_weights_q4(t)              // sets t.quant = q4
-        let q4 = run_once(t, c, "q4   ")
-        print("  q8 speedup: {q8 / fp32}x, q4 speedup: {q4 / fp32}x\n")
+        quantize_weights_q4(t)              // sets t.quant = q4_0
+        let q4 = run_once(t, c, "q4_0 ")
+        print("  q8 speedup: {q8 / fp32}x, q4_0 speedup: {q4 / fp32}x\n")
     }
 }

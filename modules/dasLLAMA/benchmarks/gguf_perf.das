@@ -89,12 +89,12 @@ def main {
         quantize_weights(t)
         let q8_ids <- run_capture(t, c, "q8  ", q8)
         quantize_weights_q4(t)
-        let q4_ids <- run_capture(t, c, "q4  ", q4)
+        let q4_ids <- run_capture(t, c, "q4_0", q4)
 
-        print("\nspeedup: q8 {q8 / fp}x, q4 {q4 / fp}x\n")
-        print("tracks fp32 greedy: q8 {match_len(fp32_ids, q8_ids)}/{length(fp32_ids)}, q4 {match_len(fp32_ids, q4_ids)}/{length(fp32_ids)} tokens\n")
+        print("\nspeedup: q8 {q8 / fp}x, q4_0 {q4 / fp}x\n")
+        print("tracks fp32 greedy: q8 {match_len(fp32_ids, q8_ids)}/{length(fp32_ids)}, q4_0 {match_len(fp32_ids, q4_ids)}/{length(fp32_ids)} tokens\n")
         print("\nfp32: {decode_ids(tok, fp32_ids, 48)}\n")
         print("q8  : {decode_ids(tok, q8_ids, 48)}\n")
-        print("q4  : {decode_ids(tok, q4_ids, 48)}\n")
+        print("q4_0: {decode_ids(tok, q4_ids, 48)}\n")
     }
 }

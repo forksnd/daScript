@@ -49,7 +49,7 @@ def main {
     with_job_que() {
         var sref <- make_run_state(c)
         let ref_ids <- generate(t, sref, [1l], N_TOKENS)  // gold: fp32 (quant defaults fp32)
-        quantize_weights_q4(t)                            // sets t.quant = q4
+        quantize_weights_q4(t)                            // sets t.quant = q4_0
         var sq <- make_run_state(c)
         let q_ids <- generate(t, sq, [1l], N_TOKENS)
 

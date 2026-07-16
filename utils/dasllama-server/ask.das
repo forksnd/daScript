@@ -61,7 +61,7 @@ struct AskArgs {
     @clarg_doc = "Override the sampling seed, 0 = keep the session's fixed default seed (default 0)"
     seed : int
 
-    @clarg_doc = "Weight quantization: fp32 | q8 | q4 (default q8)"
+    @clarg_doc = "Weight serving mode: fp32 | q8 (default; file-format spellings serve natively under q8) | q4 = legacy requant"
     quant : string
 
     @clarg_doc = "Re-tune this box's dasLLAMA kernels, then relaunch"
@@ -75,7 +75,7 @@ struct AskArgs {
 
 def pick_quant(s : string) : QuantMode {
     if (s == "fp32") return QuantMode.fp32
-    if (s == "q4") return QuantMode.q4
+    if (s == "q4") return QuantMode.q4_0
     return QuantMode.q8
 }
 
