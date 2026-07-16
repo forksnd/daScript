@@ -238,6 +238,8 @@ namespace das {
     const FILE * builtin_fopen  ( const char *, const char *, Context *, LineInfoArg * ) GENERATE_IO_STUB_RET
     vec4f builtin_read ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
     vec4f builtin_write ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
+    vec4f builtin_read64 ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
+    vec4f builtin_write64 ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
     vec4f builtin_load ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
     bool builtin_stat ( const char *, FStat & ) GENERATE_IO_STUB_RET
     bool builtin_chdir ( const char * ) GENERATE_IO_STUB_RET
@@ -408,14 +410,24 @@ namespace das {
         munmap(data, size_t(size));
     }
 
+    // plain ftell/fseek take `long`, which is 32-bit on Windows (LLP64) — use the explicit
+    // 64-bit forms so offsets past 2GB survive on every platform
     int64_t builtin_ftell ( const FILE * f, Context * context, LineInfoArg * at ) {
         if ( !f ) context->throw_error_at(at, "can't ftell NULL");
-        return ftell((FILE *)f);
+#ifdef _MSC_VER
+        return _ftelli64((FILE *)f);
+#else
+        return ftello((FILE *)f);
+#endif
     }
 
     int64_t builtin_fseek ( const FILE * f, int64_t offset, int32_t mode, Context * context, LineInfoArg * at ) {
         if ( !f ) context->throw_error_at(at, "can't fseek NULL");
-        return fseek((FILE *)f, long(offset), mode);
+#ifdef _MSC_VER
+        return _fseeki64((FILE *)f, offset, mode);
+#else
+        return fseeko((FILE *)f, off_t(offset), mode);
+#endif
     }
 
     char * builtin_fread ( const FILE * f, Context * context, LineInfoArg * at ) {
@@ -480,6 +492,9 @@ namespace das {
         if ( !fp ) context.throw_error_at(call->debugInfo, "can't read NULL");
         auto buf = cast<void *>::to(args[1]);
         auto len = cast<int32_t>::to(args[2]);
+        // a negative count is an int32 wrap upstream; fread would sign-extend it to a huge
+        // size_t and stream out of bounds — refuse loudly instead
+        if ( len < 0 ) context.throw_error_at(call->debugInfo, "read of negative byte count %i (int32 wrap?) — use the 64-bit rail (long_fread)", len);
         int32_t res = (int32_t) fread(buf,1,len,fp);
         return cast<int32_t>::from(res);
     }
@@ -491,8 +506,35 @@ namespace das {
         if ( !fp ) context.throw_error_at(call->debugInfo, "can't write NULL");
         auto buf = cast<void *>::to(args[1]);
         auto len = cast<int32_t>::to(args[2]);
+        if ( len < 0 ) context.throw_error_at(call->debugInfo, "write of negative byte count %i (int32 wrap?) — use the 64-bit rail (long_fwrite)", len);
         int32_t res = (int32_t) fwrite(buf,1,len,fp);
         return cast<int32_t>::from(res);
+    }
+
+    vec4f builtin_read64 ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        DAS_ASSERT ( call->types[1]->isRef() || call->types[1]->isRefType()
+            || call->types[1]->type==Type::tString || call->types[1]->type==Type::tPointer);
+        auto fp = cast<FILE *>::to(args[0]);
+        if ( !fp ) context.throw_error_at(call->debugInfo, "can't read NULL");
+        auto buf = cast<void *>::to(args[1]);
+        auto len = cast<int64_t>::to(args[2]);
+        if ( len < 0 ) context.throw_error_at(call->debugInfo, "read of negative byte count %lli", (long long)len);
+        if ( sizeof(size_t) < 8 && uint64_t(len) > uint64_t(SIZE_MAX) ) context.throw_error_at(call->debugInfo, "read of %lli bytes exceeds this platform's address space", (long long)len);
+        int64_t res = (int64_t) fread(buf,1,size_t(len),fp);
+        return cast<int64_t>::from(res);
+    }
+
+    vec4f builtin_write64 ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        DAS_ASSERT ( call->types[1]->isRef() || call->types[1]->isRefType()
+            || call->types[1]->type==Type::tString || call->types[1]->type==Type::tPointer);
+        auto fp = cast<FILE *>::to(args[0]);
+        if ( !fp ) context.throw_error_at(call->debugInfo, "can't write NULL");
+        auto buf = cast<void *>::to(args[1]);
+        auto len = cast<int64_t>::to(args[2]);
+        if ( len < 0 ) context.throw_error_at(call->debugInfo, "write of negative byte count %lli", (long long)len);
+        if ( sizeof(size_t) < 8 && uint64_t(len) > uint64_t(SIZE_MAX) ) context.throw_error_at(call->debugInfo, "write of %lli bytes exceeds this platform's address space", (long long)len);
+        int64_t res = (int64_t) fwrite(buf,1,size_t(len),fp);
+        return cast<int64_t>::from(res);
     }
 
 #ifdef _MSC_VER
@@ -1985,6 +2027,12 @@ namespace das {
                     ->args({"file","buffer","length"});
             addInterop<builtin_write,int,const FILE*,vec4f,int32_t>(*this, lib, "_builtin_write",
                 SideEffects::modifyExternal, "builtin_write")
+                    ->args({"file","buffer","length"});
+            addInterop<builtin_read64,int64_t,const FILE*,vec4f,int64_t>(*this, lib, "_builtin_read64",
+                SideEffects::modifyExternal, "builtin_read64")
+                    ->args({"file","buffer","length"});
+            addInterop<builtin_write64,int64_t,const FILE*,vec4f,int64_t>(*this, lib, "_builtin_write64",
+                SideEffects::modifyExternal, "builtin_write64")
                     ->args({"file","buffer","length"});
             addInterop<builtin_load,void,const FILE*,int64_t,const Block &>(*this, lib, "_builtin_load",
                 das::SideEffects::modifyExternal, "builtin_load")

@@ -323,12 +323,12 @@ def save_image(var t; path : string; tag : string = "") : bool {
         apply(t) $(name : string; var field) {
             static_if (typeinfo is_array(field)) {
                 if (!empty(field)) {
-                    // long_length, NOT length: a >2 GiB plane (voxtral-mini qblob = 3.6 G elements)
-                    // wraps int32 length negative, and -jit inlines length() without the C++ guard
+                    // long_ forms: a plane past 2 GiB (voxtral-mini qblob = 3.6 G elements)
+                    // does not fit the int32 length/byte-count rail
                     let nbytes = uint64(long_length(field)) * uint64(typeinfo sizeof(field[0]))
                     let at = pad_to_page(cur)
                     write_zeros(f, at - cur)
-                    f |> fwrite(field)
+                    f |> long_fwrite(field)
                     sections |> push(ImgSection(name = name, off = at, bytes = nbytes))
                     cur = at + nbytes
                     // fwrite and the section table must agree byte-for-byte, or the mapped

@@ -71,7 +71,7 @@ def fload(file : file; size : int64; blk : block<(data : array<uint8>) : void>) 
 def fload(f : file; buf : auto(BufType) -const) {
     var dfh : df_header
     let r1 = _builtin_read(f, dfh, typeinfo sizeof(type<df_header>))
-    if (r1 < 0 || dfh.magic != df_magic) return false
+    if (r1 < 0 || dfh.magic != df_magic || dfh.size < 0) return false
     var loaded = false
     _builtin_load(f, int64(dfh.size)) $(data : array<uint8>) {
         if (length(data) != 0) {
@@ -86,7 +86,11 @@ def fload(f : file; buf : auto(BufType) -const) {
 def fsave(f : file; buf : auto(BufType) const) {
     var r1, r2 : int
     binary_save(buf) $(data) {
-        let len = length(data)
+        let len64 = long_length(data)
+        if (len64 > int64(INT_MAX)) {
+            panic("fsave: {len64}-byte payload does not fit the df_header int size field")
+        }
+        let len = int(len64)
         let dfh = df_header(magic = df_magic, size = len)
         r1 = _builtin_write(f, dfh, typeinfo sizeof(type<df_header>))
         unsafe {
@@ -110,27 +114,22 @@ def fread(f : file; buf : auto(BufType) const implicit) {
 def fread(f : file; buf : array<auto(BufType)> const implicit) {
     concept_assert(typeinfo is_raw(type<BufType>), "'fread' accepts only raw POD type arrays")
     let nbytes = long_length(buf) * typeinfo sizeof(type<BufType>)
-    if (nbytes <= int64(INT_MAX)) {
-        unsafe {
-            return _builtin_read(f, addr(buf[0]), int(nbytes))
-        }
+    if (nbytes > int64(INT_MAX)) {
+        panic("fread: {nbytes} bytes does not fit the int byte count — use long_fread")
     }
-    // past 2 GiB an int32 byte count wraps negative and the C runtime sign-extends it to a
-    // huge size_t — out-of-bounds. Chunk in int64; the return clamps to INT_MAX by necessity.
-    var p = unsafe(addr<uint8?>(buf[0]))
-    var done = 0l
-    while (done < nbytes) {
-        let chunk = min(nbytes - done, int64(0x40000000))
-        var got = 0
-        unsafe {
-            got = _builtin_read(f, p + done, int(chunk))
-        }
-        done += int64(got)
-        if (int64(got) != chunk) {
-            break
-        }
+    unsafe {
+        return _builtin_read(f, addr(buf[0]), int(nbytes))
     }
-    return int(min(done, int64(INT_MAX)))
+}
+
+//! 64-bit fread: fills the whole array regardless of size (fread panics past 2 GiB).
+//! Returns bytes read as int64.
+[generic]
+def long_fread(f : file; buf : array<auto(BufType)> const implicit) : int64 {
+    concept_assert(typeinfo is_raw(type<BufType>), "'long_fread' accepts only raw POD type arrays")
+    unsafe {
+        return _builtin_read64(f, addr(buf[0]), long_length(buf) * typeinfo sizeof(type<BufType>))
+    }
 }
 
 [generic]
@@ -145,28 +144,22 @@ def fwrite(f : file; buf : auto(BufType) const implicit) {
 def fwrite(f : file; buf : array<auto(BufType)> const implicit) {
     concept_assert(typeinfo is_raw(type<BufType>), "'fwrite' accepts only raw POD type arrays")
     let nbytes = long_length(buf) * typeinfo sizeof(type<BufType>)
-    if (nbytes <= int64(INT_MAX)) {
-        unsafe {
-            return _builtin_write(f, addr(buf[0]), int(nbytes))
-        }
+    if (nbytes > int64(INT_MAX)) {
+        panic("fwrite: {nbytes} bytes does not fit the int byte count — use long_fwrite")
     }
-    // past 2 GiB an int32 byte count wraps negative and the C runtime sign-extends it to a
-    // huge size_t — fwrite then streams heap garbage past the buffer into the file, silently.
-    // Chunk in int64; the return clamps to INT_MAX by necessity.
-    var p = unsafe(addr<uint8?>(buf[0]))
-    var done = 0l
-    while (done < nbytes) {
-        let chunk = min(nbytes - done, int64(0x40000000))
-        var wrote = 0
-        unsafe {
-            wrote = _builtin_write(f, p + done, int(chunk))
-        }
-        done += int64(wrote)
-        if (int64(wrote) != chunk) {
-            break
-        }
+    unsafe {
+        return _builtin_write(f, addr(buf[0]), int(nbytes))
     }
-    return int(min(done, int64(INT_MAX)))
+}
+
+//! 64-bit fwrite: writes the whole array regardless of size (fwrite panics past 2 GiB).
+//! Returns bytes written as int64.
+[generic]
+def long_fwrite(f : file; buf : array<auto(BufType)> const implicit) : int64 {
+    concept_assert(typeinfo is_raw(type<BufType>), "'long_fwrite' accepts only raw POD type arrays")
+    unsafe {
+        return _builtin_write64(f, addr(buf[0]), long_length(buf) * typeinfo sizeof(type<BufType>))
+    }
 }
 
 [generic]
