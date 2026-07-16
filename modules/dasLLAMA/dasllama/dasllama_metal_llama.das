@@ -761,6 +761,14 @@ var private g_bmv = true
 // DASLLAMA_METAL_BATCH_MV8=0 = the GEMM-policy A/B rail.
 var private g_bmv8 = true
 
+// pin the batched unfused add+rms pair (ew2-add + rms_b) that dim > ADD_RMS_MAX_DIM selects —
+// the tests' parity rail for that path on models whose dim fits the fused slab
+var private g_b_addrms_unfused = false
+
+def public set_metal_batch_addrms_unfused(v : bool) {
+    g_b_addrms_unfused = v
+}
+
 // one-deep encode-ahead for the batch driver (the copy-validated pipe): a step commits BEFORE the
 // previous one is waited on; sessions then hold the PREVIOUS step's logits until the next call or
 // metal_decode_flush. That is exact for fixed-token throughput protocols and WRONG for
@@ -816,9 +824,6 @@ def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : arra
             (kdt != KVDtype.f16 && kdt != KVDtype.f32 &&
              kdt != KVDtype.q8_0 && kdt != KVDtype.tq4)) {
         return MetalDecodeDecline.kv_dtype
-    }
-    if (c.dim > (nrows <= 4l ? ADD_RMS_MAX_DIM : 3072l)) {
-        return MetalDecodeDecline.batch_dim_cap
     }
     for (i in range64(nrows)) {
         if (sessions[i].uid == 0ul) {
@@ -893,6 +898,19 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     let blockc = kdt == KVDtype.q8_0 || tq4  // block codec: byte-offset row table + codec kernel twins
     let rowb = kv_row_bytes(kdt, kv_dim)
     let esz = f16 ? 2l : 4l
+    // reserve the whole step's arena demand BEFORE pinning — growth is a release-all rebuild
+    // and cannot run once the batch's rows are pinned (the readiness check above already
+    // finished any in-flight step when a session needs a new slice)
+    var demand = 0ul
+    for (i in range64(nrows)) {
+        demand += mirror_arena_demand(t, *sessions[i], ws.positions[i])
+    }
+    if (!mirror_reserve(demand)) {
+        finish_pending_step()
+        g_lp_err = false
+        batch_decline(MetalDecodeDecline.mirror)
+        return false
+    }
     // pin the batch's uids: a later row's mirror alloc must never evict an earlier row's slice
     for (i in range64(nrows)) {
         g_pin |> insert(sessions[i].uid)
@@ -902,26 +920,43 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     g_b_voffs |> resize(int(nrows))
     g_b_caps |> resize(int(nrows))
     var maxcnt = 0l
-    var rows_ok = true
-    for (i in range64(nrows)) {
-        var sp = sessions[i]
-        let mir = mirror_prepare(t, *sp, ws.positions[i])
-        if (!mir.ok) {
-            rows_ok = false
+    var rows_ok = false
+    for (attempt in range(2)) {
+        rows_ok = true
+        maxcnt = 0l
+        for (i in range64(nrows)) {
+            var sp = sessions[i]
+            let mir = mirror_prepare(t, *sp, ws.positions[i])
+            if (!mir.ok) {
+                rows_ok = false
+                break
+            }
+            g_b_koffs[i] = mir.koff
+            g_b_voffs[i] = mir.voff
+            g_b_caps[i] = mir.cap
+            let cnt = ws.positions[i] + 1l
+            maxcnt = max(maxcnt, cnt)
+            // block codecs address in BYTES (there is no scalar element size); scalar mirrors keep
+            // their element-offset entries
+            // uint32 holds any arena offset: the arena clamps at 4096MB (= 2^32), so offsets < 2^32
+            g_b_rte[i * 4l] = uint(blockc ? mir.koff : mir.koff / uint64(esz))
+            g_b_rte[i * 4l + 1l] = uint(blockc ? mir.voff : mir.voff / uint64(esz))
+            g_b_rte[i * 4l + 2l] = uint(mir.cap)
+            g_b_rte[i * 4l + 3l] = uint(cnt)
+        }
+        if (rows_ok) {
             break
         }
-        g_b_koffs[i] = mir.koff
-        g_b_voffs[i] = mir.voff
-        g_b_caps[i] = mir.cap
-        let cnt = ws.positions[i] + 1l
-        maxcnt = max(maxcnt, cnt)
-        // block codecs address in BYTES (there is no scalar element size); scalar mirrors keep
-        // their element-offset entries
-        // uint32 holds any arena offset: the arena clamps at 4096MB (= 2^32), so offsets < 2^32
-        g_b_rte[i * 4l] = uint(blockc ? mir.koff : mir.koff / uint64(esz))
-        g_b_rte[i * 4l + 1l] = uint(blockc ? mir.voff : mir.voff / uint64(esz))
-        g_b_rte[i * 4l + 2l] = uint(mir.cap)
-        g_b_rte[i * 4l + 3l] = uint(cnt)
+        // an exact-fit step can strand contiguity around older residents — retry ONCE on an
+        // empty arena (re-uploads ride the watermark contract; sequential packing then holds
+        // whenever the demand fits capacity-wise)
+        g_pin |> clear()
+        if (attempt != 0 || !mirror_defrag(demand)) {
+            break
+        }
+        for (i in range64(nrows)) {
+            g_pin |> insert(sessions[i].uid)
+        }
     }
     g_pin |> clear()
     if (!rows_ok) {
@@ -941,10 +976,10 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         g_b_pipe = env_int("DASLLAMA_METAL_BATCH_PIPE", 0) != 0
     }
     // the fixed-B GEMV forms cover 4 rows — past that the GEMM is mandatory (the knob can only
-    // pull the crossover DOWN) unless the MV8 probe column-tiles; nrows > 4 with dim > 3072
-    // already declined above
+    // pull the crossover DOWN) unless the MV8 probe column-tiles (its tiling is probe-tuned to
+    // dim <= 3072; wider models ride the GEMM's fixed K-tiles at any dim)
     let mv8 = g_bmv8 && g_bmv && nrows > 4l && nrows <= 8l && dim <= 3072l
-    let use_gemm = (nrows >= g_bgemm_min || nrows > 4l) && dim <= 3072l && !mv8
+    let use_gemm = (nrows >= g_bgemm_min || nrows > 4l) && !mv8
     // the mul_mm rail (opt-in, DASLLAMA_METAL_BATCH_MM=1): the prefill kernel on shared 34B
     // blobs + raw f32 X (quant tails disappear; every GEMM'd width % 64). MEASURED NEGATIVE at
     // M-pad-32 (3B d512 -n 32: B=8 145.2 vs GemmB 153.3, B=16 275.7 vs 285.0): mm's 32x64 tile
@@ -1221,9 +1256,16 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
             // -> W2 -> fused add + the NEXT layer's attention norm (plain add on the last)
             if (g_skip != "ew") {
                 var bw_ffn = upload_region(addr < void ? > (t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
-                // add_rms updates the residual bx in place AND writes the norm-out bxb
+                // add_rms updates the residual bx in place AND writes the norm-out bxb; past the
+                // fused kernel's row slab the unfused pair does the same in two dispatches
                 bar_dep(enc, haz, HZ_BX | HZ_BXB2, HZ_BX | HZ_BXB)
-                enc_add_rms_b(enc, bx, bxb2, bw_ffn, bxb, u_dim, u_eps, nrows)
+                if (dim <= ADD_RMS_MAX_DIM && !g_b_addrms_unfused) {
+                    enc_add_rms_b(enc, bx, bxb2, bw_ffn, bxb, u_dim, u_eps, nrows)
+                } else {
+                    enc_ew2(enc, g_pso_add, bx, 0ul, bxb2, 0ul, u_total_dim, nrows * dim)
+                    bar_dep(enc, haz, HZ_BX, HZ_BXB)
+                    enc_rms_b(enc, bx, bw_ffn, bxb, u_dim, u_eps, nrows)
+                }
             }
             if (g_skip != "gemv") {
                 if (f1 != KqFmt.q8) {
@@ -1306,7 +1348,13 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 if (l + 1l < c.n_layers) {
                     var bw_attn = upload_region(addr < void ? > (t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
                     bar_dep(enc, haz, HZ_BX | HZ_BXB, HZ_BX | HZ_BXB)
-                    enc_add_rms_b(enc, bx, bxb, bw_attn, bxb, u_dim, u_eps, nrows)
+                    if (dim <= ADD_RMS_MAX_DIM && !g_b_addrms_unfused) {
+                        enc_add_rms_b(enc, bx, bxb, bw_attn, bxb, u_dim, u_eps, nrows)
+                    } else {
+                        enc_ew2(enc, g_pso_add, bx, 0ul, bxb, 0ul, u_total_dim, nrows * dim)
+                        bar_dep(enc, haz, HZ_BX, HZ_BXB)
+                        enc_rms_b(enc, bx, bw_attn, bxb, u_dim, u_eps, nrows)
+                    }
                 } else {
                     // last layer: plain residual add into bx (the final rms reads bx)
                     bar_dep(enc, haz, HZ_BX | HZ_BXB, HZ_BX)

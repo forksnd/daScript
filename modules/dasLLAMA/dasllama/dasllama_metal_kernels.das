@@ -4474,7 +4474,8 @@ class MetalRopeStoreBTq4 {
 }
 
 // Batched fused residual add + rmsnorm (MetalAddRms with a row grid): one threadgroup per row,
-// x += a in place, y = rms(x)·w. Same tgmem row slab — dim caps at ADD_RMS_MAX_DIM.
+// x += a in place, y = rms(x)·w. Same tgmem row slab — dim caps at ADD_RMS_MAX_DIM (the batch
+// driver pairs enc_ew2-add + enc_rms_b past the slab, mirroring enc_add_rms_site).
 class MetalAddRmsB {
     @ssbo @binding = 0 x : array<float>     // [B x dim] residual stream, add target
     @ssbo @binding = 1 a : array<float>     // [B x dim] addend

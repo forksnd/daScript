@@ -50,7 +50,8 @@ enum MetalDecodeDecline {
                         // limits surface as `mirror` (the arena cannot hold the session's slice)
     no_uid              // session without a real uid (mirror keying)
     rope_rows           // the position's rope row not built
-    batch_dim_cap       // batch: dim exceeds the add+rms/GEMM row slabs for this B
+    batch_dim_cap       // RETIRED (M2.6): the batch add+rms falls back to the unfused pair past
+                        // the fused slab, and the GEMM's fixed K-tiles serve any dim at B > 4
     device              // metal_decode_init failed (no device / PSO build failure)
     mirror              // the mirror arena cannot hold the KV slice
     gpu_error           // dispatch failed at execution time
@@ -161,10 +162,11 @@ def arena_free_slice(off : uint64; size : uint64) {
     }
 }
 
-//! The KV-mirror CEILING (M2.7): bounds both the arena's grow-on-demand size (256MB start,
-//! hard max 4096MB — the batch row table's uint32 offsets) and the resident-bytes LRU eviction
-//! of idle sessions' mirrors. Negative restores the env default (`DASLLAMA_METAL_KV_MIRROR_MB`,
-//! else 4096).
+//! The KV-mirror cap (M2.7), one knob with two readers: the arena's grow-on-demand CEILING
+//! (256MB start; the value clamps to 64..4096MB there — 4096 is the batch row table's uint32
+//! hard max) and the RAW resident-bytes target for LRU eviction of idle sessions' mirrors
+//! (tiny values are legitimate evict-aggressively policy). Negative restores the env default
+//! (`DASLLAMA_METAL_KV_MIRROR_MB`, else 4096).
 def public set_metal_decode_mirror_cap_mb(v : int) {
     g_mirror_cap_mb = v
 }
@@ -535,6 +537,100 @@ def mirror_evict_to_cap(cap_bytes : uint64; keep : uint64) {
     }
 }
 
+// the slice mirror_prepare would build for (s, pos): chunked high-water cap (pow2 from 256,
+// never past the session's own seq cap) and the K/V plane sizes
+def private mirror_slice_shape(t : Model; s : Session; pos : int64) : tuple<cap : int64; kbytes : uint64; vbytes : uint64> {
+    let c = t.config
+    let kv_dim = layer_kv_dim(c, 0l)
+    let needed = pos + 1l
+    var cap = 256l
+    while (cap < needed) {
+        cap *= 2l
+    }
+    cap = clamp(cap, needed, c.seq_len)
+    return (cap = cap, kbytes = uint64(c.n_layers * cap * kv_row_bytes(s.kv_dtype_k, kv_dim)),
+            vbytes = uint64(c.n_layers * cap * kv_row_bytes(s.kv_dtype_v, kv_dim)))
+}
+
+def private mirror_ceiling_bytes : uint64 {
+    let ceil_mb = uint64(clamp(g_mirror_cap_mb >= 0 ? g_mirror_cap_mb : env_int("DASLLAMA_METAL_KV_MIRROR_MB", 4096), 64, 4096))
+    return ceil_mb * 1024ul * 1024ul
+}
+
+// release-all rebuild at `want` (clamped to the ceiling): every mirror re-uploads via its
+// watermark, and the epoch bump invalidates any pre-encoded step whose kernels reference the
+// OLD arena buffer. Callers must ensure nothing is pinned and no step is in flight.
+def private arena_rebuild(want : uint64; ceil_bytes : uint64) {
+    for (mr in values(g_mirrors)) {
+        mirror_release(mr)
+    }
+    unsafe {
+        delete g_mirrors
+    }
+    g_mirror_bytes = 0ul
+    metal_release(g_arena)
+    g_arena_bytes = min(want, ceil_bytes)
+    g_arena = metal_new_buffer(g_dev, g_arena_bytes)
+    g_arena_free |> clear()
+    g_arena_free |> push((off = 0ul, size = g_arena_bytes))
+    g_arena_epoch++
+    to_log(LOG_INFO, "dasLLAMA metal decode: KV mirror arena grown to {int(g_arena_bytes / (1024ul * 1024ul))}MB (ceiling {int(ceil_bytes / (1024ul * 1024ul))}MB)\n")
+}
+
+// the arena bytes session s will occupy after mirror_prepare(t, s, pos): its existing slice
+// when capacity + dtypes already fit, else the rebuilt slice's size
+def mirror_arena_demand(t : Model; s : Session; pos : int64) : uint64 {
+    if (key_exists(g_mirrors, s.uid)) {
+        let mr0 = g_mirrors[s.uid]
+        if (mr0.cap_rows >= pos + 1l && mr0.kdt == s.kv_dtype_k && mr0.vdt == s.kv_dtype_v) {
+            return mr0.bytes
+        }
+    }
+    let shp = mirror_slice_shape(t, s, pos)
+    return shp.kbytes + shp.vbytes
+}
+
+// grow the arena until it can hold `total` bytes of slices — the batch driver reserves its
+// WHOLE step's demand through this before pinning any row (growth is a release-all rebuild,
+// forbidden under pins). false = total exceeds the ceiling (a genuine capability limit).
+def mirror_reserve(total : uint64) : bool {
+    let ceil_bytes = mirror_ceiling_bytes()
+    if (total > ceil_bytes) {
+        return false
+    }
+    if (g_arena == null) {
+        g_arena_bytes = clamp(256ul * 1024ul * 1024ul, total, ceil_bytes)   // total <= ceiling here
+        g_arena = metal_new_buffer(g_dev, g_arena_bytes)
+        g_arena_free |> clear()
+        g_arena_free |> push((off = 0ul, size = g_arena_bytes))
+        return true
+    }
+    if (g_arena_bytes >= total) {
+        return true
+    }
+    if (!empty(g_pin)) {
+        return false
+    }
+    var want = g_arena_bytes
+    while (want < total) {
+        want *= 2ul
+    }
+    arena_rebuild(want, ceil_bytes)
+    return true
+}
+
+// release-all rebuild sized for `total` — the batch driver's fragmentation fallback when the
+// per-session prepares can't pack a step that DOES fit capacity-wise (exact-fit demand around
+// older residents can strand contiguity). Callers unpin first; false = past the ceiling.
+def mirror_defrag(total : uint64) : bool {
+    let ceil_bytes = mirror_ceiling_bytes()
+    if (total > ceil_bytes || !empty(g_pin) || g_arena == null) {
+        return false
+    }
+    arena_rebuild(max(g_arena_bytes, total), ceil_bytes)
+    return true
+}
+
 // Ensure s.uid's mirror exists, is big enough, and holds logical rows [0, pos) — the watermark
 // contract (module header). Returns (ok, koff, voff, cap_rows) — arena byte offsets; the caller
 // writes row `pos` GPU-side and advances the watermark to pos + 1 only after the step + writeback
@@ -560,21 +656,17 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
         // offsets rely on arena size <= 2^32). Growth releases every mirror and reallocates;
         // the watermark contract re-uploads from the CPU cache, so a rebuild only costs the
         // next steps' re-mirror. Growth never runs while a batch step holds pinned rows.
-        let ceil_mb = uint64(clamp(g_mirror_cap_mb >= 0 ? g_mirror_cap_mb : env_int("DASLLAMA_METAL_KV_MIRROR_MB", 4096), 64, 4096))
-        let ceil_bytes = ceil_mb * 1024ul * 1024ul
+        let ceil_bytes = mirror_ceiling_bytes()
         if (g_arena == null) {
             g_arena_bytes = min(256ul * 1024ul * 1024ul, ceil_bytes)
             g_arena = metal_new_buffer(g_dev, g_arena_bytes)
             g_arena_free |> clear()
             g_arena_free |> push((off = 0ul, size = g_arena_bytes))
         }
-        var cap = 256l
-        while (cap < needed) {
-            cap *= 2l
-        }
-        cap = clamp(cap, needed, c.seq_len)   // chunked high-water, never past the session's own cap
-        let kbytes = uint64(c.n_layers * cap * krow)
-        let vbytes = uint64(c.n_layers * cap * vrow)
+        let shp = mirror_slice_shape(t, s, pos)
+        let cap = shp.cap
+        let kbytes = shp.kbytes
+        let vbytes = shp.vbytes
         var off = arena_alloc(kbytes + vbytes)
         while (off < 0l) {   // arena full — evict LRU until the slice fits (or nothing evictable)
             var victim = 0ul
@@ -586,28 +678,12 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
                 }
             }
             if (victim == 0ul) {
-                // nothing left to evict — grow the arena toward the ceiling (rebuild: every
-                // mirror re-uploads via its watermark; the epoch bump invalidates any
-                // pre-encoded step whose kernels reference the OLD arena buffer), unless a
-                // batch step holds pinned rows
-                let want = max(g_arena_bytes * 2ul, kbytes + vbytes)
+                // nothing left to evict — grow toward the ceiling, unless a batch step holds
+                // pinned rows (the batch driver's mirror_reserve pre-grows for that case)
                 if (!empty(g_pin) || g_arena_bytes >= ceil_bytes || kbytes + vbytes > ceil_bytes) {
                     return (ok = false, koff = 0ul, voff = 0ul, cap = 0l)
                 }
-                for (mr in values(g_mirrors)) {
-                    mirror_release(mr)
-                }
-                unsafe {
-                    delete g_mirrors
-                }
-                g_mirror_bytes = 0ul
-                metal_release(g_arena)
-                g_arena_bytes = min(want, ceil_bytes)
-                g_arena = metal_new_buffer(g_dev, g_arena_bytes)
-                g_arena_free |> clear()
-                g_arena_free |> push((off = 0ul, size = g_arena_bytes))
-                g_arena_epoch++
-                to_log(LOG_INFO, "dasLLAMA metal decode: KV mirror arena grown to {int(g_arena_bytes / (1024ul * 1024ul))}MB (ceiling {int(ceil_mb)}MB)\n")
+                arena_rebuild(max(g_arena_bytes * 2ul, kbytes + vbytes), ceil_bytes)
             } else {
                 mirror_release(g_mirrors[victim])
                 g_mirrors |> erase(victim)
@@ -618,6 +694,8 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
             koff = uint64(off), voff = uint64(off) + kbytes, bytes = kbytes + vbytes)
         g_mirror_bytes += mr.bytes
         g_mirrors[s.uid] = mr
+        // the evict target honors the RAW knob (a tiny cap is legitimate idle-eviction policy —
+        // the LRU churn tests rely on it); only the arena GROWTH ceiling carries the 64MB floor
         let cap_mb = uint64(g_mirror_cap_mb >= 0 ? g_mirror_cap_mb : env_int("DASLLAMA_METAL_KV_MIRROR_MB", 4096))
         mirror_evict_to_cap(cap_mb * 1024ul * 1024ul, s.uid)
     }
