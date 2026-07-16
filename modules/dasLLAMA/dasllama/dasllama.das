@@ -18,6 +18,7 @@ module dasllama shared public
 require dasllama/dasllama_transformer public   // the engine + arch registry; every arch [init] fires
 require dasllama/dasllama_image   // the prepared-image cache: load_model maps it when present
 require daslib/fio   // the DASLLAMA_IMAGE kill switch
+require strings   // ends_with — the direct .dlim path form
 require dasllama/dasllama_prefix public        // page-granular prefix cache over the paged pool
 require dasllama/dasllama_chat public          // layer 2: chat sessions over the same engine
 require dasllama/dasllama_audio public         // audio tower (mel frontend + whisper encoder + projectors)
@@ -45,7 +46,20 @@ def load_model(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     //! (``QuantMode.fp32`` = the token-exact reference, ``QuantMode.q8`` = the fast int8 path).
     //! Q8 loads keep a PREPARED IMAGE next to the gguf (box + knob specific): the first load
     //! saves it, later loads map it in milliseconds with zero-copy weight planes.
-    //! ``DASLLAMA_IMAGE=0`` disables the cache.
+    //! ``DASLLAMA_IMAGE=0`` disables the cache. Passing a ``.dlim`` path loads that image
+    //! DIRECTLY (no gguf needed — wrong identity panics; there is nothing to regenerate from).
+    if (path |> ends_with(".dlim")) {
+        // a prepared image named directly — first-class once the source gguf is gone. No
+        // fallback exists here, so a wrong box/knob/version identity panics instead of hiding.
+        apply_box_profile_runtime()
+        let ts_img = ref_time_ticks()
+        var t = Model()
+        if (!load_model_image(path, t)) {
+            panic("dasLLAMA: '{path}' is not a prepared image for this box/knobs (identity {image_identity()}) — regenerate it from the source gguf")
+        }
+        to_log(LOG_INFO, "dasLLAMA: prepared image mapped in {get_time_usec(ts_img) / 1000} ms — {path}\n")
+        return <- t
+    }
     if (mode == QuantMode.q8 && get_env_variable("DASLLAMA_IMAGE") != "0") {
         apply_box_profile_runtime()   // a backend pin must precede the identity (it names the backend)
         let img = image_path_for(path)
