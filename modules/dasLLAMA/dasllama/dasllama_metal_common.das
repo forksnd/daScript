@@ -1084,7 +1084,8 @@ def metal_common_release {
 // twin; the support-matrix test asserts these names as strings)
 enum MetalPrefillDecline {
     none                // supported — the prefill runs on the GPU
-    start_pos           // continuation prefill (start_pos > 0) is CPU-only today
+    start_pos           // RETIRED (M2.5): a continuation chunk gathers the session's existing
+                        // rows into the K/V panels and shifts the causal diagonal by start_pos
     npos_window         // npos below g_min_npos or above g_max_npos
     quant_mode          // weights not loaded under QuantMode.q8
     kquant_native       // per-tensor K-quant planes: not readable as qblob offsets (kernels = W4)

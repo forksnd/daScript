@@ -41,8 +41,9 @@ require _model_tier
 // engage/fallback per the cells above, required = a CAPABILITY decline panics (policy declines
 // — the prefill npos window — stay quiet CPU fallbacks). Batch kq: B <= 8 = per-stream GEMVs,
 // B >= 9 = the kq mul_mm twins (%64 shapes gated).
-// plus the prefill-only window clauses: npos < min_npos declines npos_window, a continuation
-// chunk (start_pos > 0) declines start_pos.
+// plus the prefill-only window clause: npos < min_npos declines npos_window. A continuation
+// chunk (start_pos > 0) SERVES since M2.5 (existing rows gather into the K/V panels, the
+// causal diagonal shifts).
 
 def private counting_prompt(start, last : int) : string {
     return build_string() $(var w) {
@@ -234,10 +235,11 @@ def test_metal_support_matrix(t : T?) {
                 matrix_cell(t, tr, KVDtype.tq4, "q8/s32/tq4", "", "", "")
             }
 
-            // the prefill window clauses ride the same model: npos below the default min_npos
-            // declines npos_window; a continuation chunk (start_pos > 0) declines start_pos
+            // the prefill window clause rides the same model: npos below the default min_npos
+            // declines npos_window; a continuation chunk (start_pos > 0) SERVES since M2.5
             if (arm_on(t, "window")) {
                 var pfd0 <- metal_prefill_declines()
+                let pf0 = metal_prefill_stats().prefills
                 with_job_que() {
                     setup_dasllama_jobque()
                     var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
@@ -246,7 +248,7 @@ def test_metal_support_matrix(t : T?) {
                     select_prefill_override("metal")   // min_npos stays at the 64 default
                     eval_(tr, s, short_p)              // npos < 64 -> npos_window
                     set_metal_prefill_min_npos(1l)
-                    eval_(tr, s, cont_p)               // start_pos = n_past > 0 -> start_pos
+                    eval_(tr, s, cont_p)               // start_pos = n_past > 0 -> SERVES (M2.5)
                     set_metal_prefill_min_npos(64l)
                     select_prefill_override("")
                     delete s
@@ -254,8 +256,10 @@ def test_metal_support_matrix(t : T?) {
                 var pfd <- metal_prefill_declines()
                 t |> success((pfd?["npos_window"] ?? 0l) > (pfd0?["npos_window"] ?? 0l),
                     "short prompt below min_npos declines npos_window")
-                t |> success((pfd?["start_pos"] ?? 0l) > (pfd0?["start_pos"] ?? 0l),
-                    "continuation prefill (start_pos > 0) declines start_pos")
+                t |> success(metal_prefill_stats().prefills - pf0 > 0l,
+                    "continuation prefill (start_pos > 0) ENGAGES on the GPU (M2.5)")
+                t |> success((pfd?["start_pos"] ?? 0l) == (pfd0?["start_pos"] ?? 0l),
+                    "the retired start_pos clause records nothing")
                 delete pfd0
                 delete pfd
             }
@@ -393,19 +397,28 @@ def test_metal_support_matrix(t : T?) {
                     eval_batch_(trk, ws, sess, cur)
                     t |> success(metal_batch_decode_stats().steps - ba0 > 0l,
                         "required: kq batched step serves on the GPU (M2.1 per-stream form)")
-                    // a CAPABILITY decline under required must still panic — a continuation
-                    // prefill (start_pos > 0) has no GPU form yet (M2.5)
+                    // a continuation chunk under required SERVES since M2.5...
                     var sc = make_run_state(trk.config, KVDtype.f16, KVDtype.f16)
                     set_metal_prefill_min_npos(1l)
+                    let pfc0 = metal_prefill_stats().prefills
                     eval_(trk, sc, kprompt)      // chunk 1: fresh-start, GPU-serves
+                    eval_(trk, sc, kprompt)      // chunk 2: start_pos = n_past > 0 — GPU-serves too
+                    t |> success(metal_prefill_stats().prefills - pfc0 == 2l,
+                        "required: continuation prefill (start_pos > 0) serves on the GPU (M2.5)")
+                    // ... and a CAPABILITY decline still panics — pin the legacy quantized GEMM,
+                    // which has no kq twins (the kquant_native clause)
+                    set_metal_prefill_mulmm_legacy(true)
+                    var sd = make_run_state(trk.config, KVDtype.f16, KVDtype.f16)
                     var pf2_panicked = false
                     try {
-                        eval_(trk, sc, kprompt)  // chunk 2: start_pos = n_past > 0
+                        eval_(trk, sd, kprompt)
                     } recover {
                         pf2_panicked = true
                     }
+                    set_metal_prefill_mulmm_legacy(false)
                     set_metal_prefill_min_npos(64l)
-                    t |> success(pf2_panicked, "required: continuation prefill (start_pos > 0) panics instead of CPU fallback")
+                    t |> success(pf2_panicked, "required: a kq load on the legacy GEMM (kquant_native capability decline) panics instead of CPU fallback")
+                    delete sd
                     set_metal_mode(MetalMode.off)
                     sess |> clear()   // borrowed handles — delete of array<T?> cascades to the pointees
                     unsafe {

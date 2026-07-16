@@ -3701,6 +3701,33 @@ def kv_store_row(var dst0 : uint8?; dt : KVDtype; kv_dim, row, sub, n : int64; s
     }
 }
 
+// kv_store_row's read twin: dequant row `row`'s [sub, sub + n) elements into f32 `dst` — the
+// Metal prefill continuation gathers the session's existing rows into its attention panels
+// through this. tq4 values come out in the ROTATED basis; callers un-rotate per head.
+def kv_load_row(src0 : uint8 const?; dt : KVDtype; kv_dim, row, sub, n : int64; var dst : float?) {
+    if (dt == KVDtype.f32) {
+        unsafe {
+            var sp = reinterpret<float const?>(src0)
+            copy_floats(dst, sp + row * kv_dim + sub, n)
+        }
+    } elif (dt == KVDtype.f16) {
+        unsafe {
+            var sp = reinterpret<uint16 const?>(src0)
+            cvt_f16_to_f32(dst, sp + row * kv_dim + sub, n)
+        }
+    } elif (dt == KVDtype.q8_0) {
+        unsafe {
+            cvt_q8kv_to_f32(dst, src0 + (row * kv_dim + sub) / 32l * 34l, n)
+        }
+    } elif (dt == KVDtype.tq4) {
+        unsafe {
+            cvt_tq4kv_to_f32(dst, src0 + (row * kv_dim + sub) / 32l * 18l, n)
+        }
+    } else {
+        panic("KV cache codec not yet implemented")
+    }
+}
+
 // Read-side glue: overload per cache element type, resolved inside the monomorphized workers.
 def private kv_dot(a : float const?; b : float const?; n : int64) : float => dot(a, b, n)
 def private kv_axpy(var d : float?; s : float const?; scale : float; n : int64) {
@@ -4219,6 +4246,16 @@ def tq4_rotate_batch(var buf : array<float>; nrows, stride, head_size : int64; s
 def private tq4_unrotate_batch(var buf : array<float>; nrows, stride, head_size : int64; signs : float const?) {
     unsafe {
         var p = addr(buf[0])
+        for (sg in range64(nrows * (stride / head_size))) {
+            fwht_unsign_row(p + sg * head_size, signs, head_size)
+        }
+    }
+}
+
+// tq4_unrotate_batch's raw-pointer twin — the Metal prefill continuation un-rotates gathered
+// panel rows in place (the GPU attention runs in the raw basis)
+def tq4_unrotate_rows(var p : float?; nrows, stride, head_size : int64; signs : float const?) {
+    unsafe {
         for (sg in range64(nrows * (stride / head_size))) {
             fwht_unsign_row(p + sg * head_size, signs, head_size)
         }

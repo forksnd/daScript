@@ -42,6 +42,39 @@ def private counting_prompt() : string {
     }
 }
 
+// chunked prompt-to-continuation: eval chunk 1, eval chunk 2 (start_pos > 0 on the second),
+// then n greedy steps — the M2.5 continuation arm's control/GPU shape (probe-proven)
+def private chunked_greedy(tr : Model; c1, c2 : array<int64>; kdt : KVDtype; nsteps : int) : array<int64> {
+    var ids : array<int64>
+    with_job_que() {
+        setup_dasllama_jobque()
+        var s = make_run_state(tr.config, kdt, kdt)
+        eval_(tr, s, c1)
+        eval_(tr, s, c2)
+        let vocab = tr.config.vocab_size
+        var cur = 0l
+        for (v in range64(1l, vocab)) {
+            if (s.logits[v] > s.logits[cur]) {
+                cur = v
+            }
+        }
+        for (_i in range(nsteps)) {
+            ids |> push(cur)
+            var one <- [cur]
+            eval_(tr, s, one)
+            delete one
+            cur = 0l
+            for (v in range64(1l, vocab)) {
+                if (s.logits[v] > s.logits[cur]) {
+                    cur = v
+                }
+            }
+        }
+        delete s
+    }
+    return <- ids
+}
+
 def private continuation(t : Model; prompt : array<int64>; n_gen : int) : array<int64> {
     var got : array<int64>
     with_job_que() {
@@ -158,6 +191,44 @@ def test_metal_prefill_parity(t : T?) {
                 delete trk
             } else {
                 feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); kq prefill arm skipped\n")
+            }
+
+            // continuation arm (M2.5): a chunked prompt — chunk 1 is a fresh GPU prefill,
+            // chunk 2 rides the NEW start_pos > 0 path (existing rows gathered into the K/V
+            // panels, causal diagonal shifted by qoff). All three session codecs; the q8_0/tq4
+            // gathers dequant the codec rows (tq4 un-rotates to the raw basis). Token-exact
+            // vs the all-CPU chunked control.
+            if (arm_on(t, "cont")) {
+                set_wscale_f16(false)
+                pin_kernel_backend("portable")
+                var trc <- load_model(path, QuantMode.q8)
+                if (trc.config.seq_len > 2048l) {
+                    trc.config.seq_len = 2048l
+                }
+                let nfull = int64(length(prompt))
+                let cut = int(nfull * 3l / 5l)
+                var ch1 <- [for (i in range(cut)); prompt[i]]
+                var ch2 <- [for (i in range(cut, int(nfull))); prompt[i]]
+                for (kdt in [KVDtype.f16, KVDtype.q8_0, KVDtype.tq4]) {
+                    var cpu_c <- chunked_greedy(trc, ch1, ch2, kdt, 24)
+                    select_prefill_override("metal")
+                    set_metal_prefill_min_npos(1l)
+                    let pfc0 = metal_prefill_stats().prefills
+                    var gpu_c <- chunked_greedy(trc, ch1, ch2, kdt, 24)
+                    select_prefill_override("")
+                    set_metal_prefill_min_npos(64l)
+                    t |> success(metal_prefill_stats().prefills - pfc0 == 2l,
+                        "{kdt} chunks served on the GPU (fresh + start_pos > 0 continuation)")
+                    t |> success(same(cpu_c, gpu_c), "chunked {kdt} continuation matches the all-CPU control (M2.5)")
+                    delete cpu_c
+                    delete gpu_c
+                }
+                clear_kernel_backend_pin()
+                select_kernel_backend(prior_backend)
+                set_wscale_f16(prior_wscale)
+                delete ch1
+                delete ch2
+                delete trc
             }
 
             // dim-4096 arm (M2.6): past the fused add+rms+quant slab (dim <= 3072) the prefill
