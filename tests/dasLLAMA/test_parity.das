@@ -143,25 +143,6 @@ def test_parity_gemma2(t : T?) {
     }
 }
 
-// gemma-2-2b-it Q4_K_M (a local llama-quantize requant of the Q8_0 above) — the SOFTCAP arm of
-// the native-kq gate: final_logit_softcap routes decode logits through the fused classifier
-// chain (cls_softcap_chain), whose kq rows cores read Q8_K-form activations (kq v2). No other
-// fixture reaches that rail (Qwen3 has no softcap); its Q8_0-form feed shipped unnoticed with
-// the k4 rework because of exactly this hole. Oracle simple_ids per-file; continues identically
-// to GEMMA2_GEN.
-[test]
-def test_parity_gemma2_q4k(t : T?) {
-    t |> run("gemma2 forward (gemma-2-2b-it Q4_K_M, native kq planes + softcap classifier)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "gemma-2-2b-it-Q4_K_M.gguf")
-        if (!model_available(t, path)) return
-        t |> success(kq_parity_ok(path, GEMMA2_PROMPT, GEMMA2_GEN), "gemma2 Q4_K_M token-for-token")
-    }
-}
-
 // TinyLlama-1.1B-v0.3 F16, "Once upon a time" (BOS=1) — the old gguf_run.das oracle (llama.cpp greedy
 // on the same F16 file). Loaded fp32 (F16 -> fp32) to match how that oracle was produced.
 let TINYLLAMA_V03_PROMPT <- [1l, 9038l, 2501l, 263l, 931l]
@@ -224,28 +205,6 @@ def test_parity_qwen25_15b(t : T?) {
         let path = path_join(models_dir(), "Qwen2.5-1.5B-Instruct-Q8_0.gguf")
         if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, QWEN25_15B_PROMPT, QWEN25_15B_GEN), "qwen2.5-1.5b token-for-token")
-    }
-}
-
-// Phi-3.5-mini-instruct Q8, prompt "1, 2, 3, 4, 5, 6, 7," (no BOS) — same confident-prompt
-// reasoning as the Qwen fixture (Phi matches prose to ~0.06 logits and flips only near-ties).
-let PHI35_PROMPT <- [29871l, 29896l, 29892l, 29871l, 29906l, 29892l, 29871l, 29941l, 29892l, 29871l,
-                     29946l, 29892l, 29871l, 29945l, 29892l, 29871l, 29953l, 29892l, 29871l, 29955l, 29892l]
-let PHI35_GEN <- [29871l, 29947l, 29892l, 29871l, 29929l, 29892l, 29871l, 29896l, 29900l, 29892l,
-                  29871l, 29896l, 29896l, 29892l, 29871l, 29896l, 29906l, 29892l, 29871l, 29896l,
-                  29941l, 29892l, 29871l, 29896l, 29946l, 29892l, 29871l, 29896l, 29945l, 29892l,
-                  29871l, 29896l, 29953l, 29892l, 29871l, 29896l, 29955l, 29892l, 29871l, 29896l]
-
-[test]
-def test_parity_phi35(t : T?) {
-    t |> run("phi3 forward (Phi-3.5-mini-instruct Q8, fused QKV + LongRoPE)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "Phi-3.5-mini-instruct-Q8_0.gguf")
-        if (!model_available(t, path)) return
-        t |> success(parity_ok(path, QuantMode.q8, PHI35_PROMPT, PHI35_GEN), "phi-3.5 token-for-token")
     }
 }
 
@@ -397,178 +356,6 @@ def test_parity_qwen3next(t : T?) {
     }
 }
 
-// Qwen3.5-122B-A10B Q4_K_M — the qwen35moe arch at 122B geometry (48L hybrid, dim 3072,
-// 248320 vocab), and the first NATIVE SPLIT fixture: the model ships as 3 shards and loads
-// through gguf_shard_paths / parse_gguf_meta_shards (shard 0 = metadata+vocab only). Huge
-// tier (~71 GB total): DASLLAMA_PARITY_FULL=1.
-[test]
-def test_parity_qwen35moe_122b(t : T?) {
-    t |> run("qwen35moe forward (Qwen3.5-122B-A10B Q4_K_M, 3-shard split gguf)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "Qwen3.5-122B-A10B/Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf")
-        if (!model_available(t, path)) return
-        var tr <- load_gguf(path, QuantMode.q8)
-        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
-            tr.config.seq_len = 2048l
-        }
-        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen35moe-122b token-for-token")
-        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN, [dn_chunked = true]), "qwen35moe-122b chunked-prefill token-for-token")
-        delete tr
-    }
-}
-
-// Same model, Q8_0 — a 4-shard split riding the q8 transcode rail (>2^31 weight-scale blocks,
-// the wscale int64 regression shape). Huge tier (~130 GB resident): DASLLAMA_PARITY_FULL=1.
-[test]
-def test_parity_qwen35moe_122b_q8(t : T?) {
-    t |> run("qwen35moe forward (Qwen3.5-122B-A10B Q8_0, 4-shard split gguf)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "Qwen3.5-122B-A10B/Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf")
-        if (!model_available(t, path)) return
-        var tr <- load_gguf(path, QuantMode.q8)
-        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
-            tr.config.seq_len = 2048l
-        }
-        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen35moe-122b Q8_0 token-for-token")
-        delete tr
-    }
-}
-
-// Qwen3-Coder-Next again, Q8_0 (merged locally from its 3-part split download) — rides the q8
-// transcode rail instead of the kq/dequant arms the Q4_K_M fixture exercises. Huge tier (~79 GB).
-[test]
-def test_parity_qwen3next_q8(t : T?) {
-    t |> run("qwen3next forward (Qwen3-Coder-Next Q8_0, merged single file)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "Qwen3-Coder-Next-Q8_0.gguf")
-        if (!model_available(t, path)) return
-        var tr <- load_gguf(path, QuantMode.q8)
-        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
-            tr.config.seq_len = 2048l
-        }
-        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3next Q8_0 token-for-token")
-        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN, [dn_chunked = true]), "qwen3next Q8_0 chunked-prefill token-for-token")
-        delete tr
-    }
-}
-
-// Mistral-Medium-3.5-128B Q4_K_M — arch `mistral3` (the llama dense shape at 88 layers / dim
-// 12288 / 96Q 8KV heads) and the first YaRN fixture with non-default betas (factor 64 over a
-// 4096 original context, beta_fast 4 from metadata — the correction band starts at pair 23, not
-// the default-32 band's 13). pixtral pre-tokenizer (= the default llama3 splitter; verified
-// id-for-id vs the oracle on this prompt). 3-shard split, huge tier (~75 GB):
-// DASLLAMA_PARITY_FULL=1. Oracle simple_ids, counting prompt "1, 2, 3, 4, 5, 6, 7," (BOS=1),
-// frozen 2026-07-15.
-let MISTRAL35_PROMPT <- [1l, 1049l, 1044l, 1032l, 1050l, 1044l, 1032l, 1051l, 1044l, 1032l,
-                         1052l, 1044l, 1032l, 1053l, 1044l, 1032l, 1054l, 1044l, 1032l, 1055l,
-                         1044l]
-let MISTRAL35_GEN <- [1032l, 1056l, 1044l, 1032l, 1057l, 1044l, 1032l, 1049l, 1048l, 1044l,
-                      1032l, 1049l, 1049l, 1044l, 1032l, 1049l, 1050l, 1044l, 1032l, 1049l,
-                      1051l, 1044l, 1032l, 1049l, 1052l, 1044l, 1032l, 1049l, 1053l, 1044l,
-                      1032l, 1049l, 1054l, 1044l, 1032l, 1049l, 1055l, 1044l, 1032l, 1049l]
-
-[test]
-def test_parity_mistral35_q4k(t : T?) {
-    t |> run("mistral3 forward (Mistral-Medium-3.5-128B Q4_K_M, 3-shard split gguf)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "Mistral-Medium-3.5-128B/Q4_K_M/Mistral-Medium-3.5-128B-Q4_K_M-00001-of-00003.gguf")
-        if (!model_available(t, path)) return
-        var tr <- load_gguf(path, QuantMode.q8)
-        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
-            tr.config.seq_len = 2048l
-        }
-        t |> success(parity_gen_ok(tr, MISTRAL35_PROMPT, MISTRAL35_GEN), "mistral3-128b Q4_K_M token-for-token")
-        delete tr
-    }
-}
-
-// Same model, Q8_0 — a 4-shard split riding the q8 transcode rail instead of the native kq
-// planes. Its own simple_ids oracle continues identically to the Q4_K_M file, so the id arrays
-// are shared. Huge tier (~130 GB resident): DASLLAMA_PARITY_FULL=1.
-[test]
-def test_parity_mistral35_q8(t : T?) {
-    t |> run("mistral3 forward (Mistral-Medium-3.5-128B Q8_0, 4-shard split gguf)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "Mistral-Medium-3.5-128B/Q8_0/Mistral-Medium-3.5-128B-Q8_0-00001-of-00004.gguf")
-        if (!model_available(t, path)) return
-        var tr <- load_gguf(path, QuantMode.q8)
-        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
-            tr.config.seq_len = 2048l
-        }
-        t |> success(parity_gen_ok(tr, MISTRAL35_PROMPT, MISTRAL35_GEN), "mistral3-128b Q8_0 token-for-token")
-        delete tr
-    }
-}
-
-// GLM-4.5-Air 106B-A12B — arch `glm4moe`: leading dense layer + 45 routed-MoE layers (128
-// experts top-8, sigmoid gating with the exp_probs_b selection bias, UNGATED shared expert),
-// QKV bias, NEOX partial rotary (64 of head 128 — the first partial-rope model on the STD
-// attention path), pre-FFN norm named post_attention_norm, and a NextN draft block with its
-// OWN embed_tokens/shared_head_head (loader disables the MTP head, trunk = 46 layers — the
-// llama.cpp forward exactly). glm4 pre-tokenizer = the llama3 splitter (verified id-for-id,
-// no BOS: glm4 nulls it). 2-shard split, huge tier (~63 GB): DASLLAMA_PARITY_FULL=1. Oracle
-// simple_ids, counting prompt "1, 2, 3, 4, 5, 6, 7,", frozen 2026-07-15.
-let GLM45AIR_PROMPT <- [16l, 11l, 220l, 17l, 11l, 220l, 18l, 11l, 220l, 19l,
-                        11l, 220l, 20l, 11l, 220l, 21l, 11l, 220l, 22l, 11l]
-let GLM45AIR_GEN <- [220l, 23l, 11l, 220l, 24l, 11l, 220l, 98668l, 11l, 220l,
-                     98965l, 11l, 220l, 98886l, 11l, 220l, 99366l, 11l, 220l, 99367l,
-                     11l, 220l, 99082l, 11l, 220l, 99317l, 11l, 220l, 99419l, 11l,
-                     220l, 99243l, 11l, 220l, 98729l, 11l, 220l, 98360l, 11l, 220l]
-
-[test]
-def test_parity_glm45air_q4km(t : T?) {
-    t |> run("glm4moe forward (GLM-4.5-Air Q4_K_M, 2-shard split gguf)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "GLM-4.5-Air/Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf")
-        if (!model_available(t, path)) return
-        var tr <- load_gguf(path, QuantMode.q8)
-        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
-            tr.config.seq_len = 2048l
-        }
-        t |> success(parity_gen_ok(tr, GLM45AIR_PROMPT, GLM45AIR_GEN), "glm4moe-air Q4_K_M token-for-token")
-        delete tr
-    }
-}
-
-// Same model, Q8_0 — a 3-shard split on the q8 transcode rail. Its own simple_ids oracle
-// continues identically to the Q4_K_M file, so the id arrays are shared. Huge tier (~110 GB
-// resident): DASLLAMA_PARITY_FULL=1.
-[test]
-def test_parity_glm45air_q8(t : T?) {
-    t |> run("glm4moe forward (GLM-4.5-Air Q8_0, 3-shard split gguf)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "GLM-4.5-Air/Q8_0/GLM-4.5-Air-Q8_0-00001-of-00003.gguf")
-        if (!model_available(t, path)) return
-        var tr <- load_gguf(path, QuantMode.q8)
-        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
-            tr.config.seq_len = 2048l
-        }
-        t |> success(parity_gen_ok(tr, GLM45AIR_PROMPT, GLM45AIR_GEN), "glm4moe-air Q8_0 token-for-token")
-        delete tr
-    }
-}
-
 // Native K-quant rail: the same counting fixture over the Q4_K_M / Q5_K_M / Q6_K files of the
 // SAME model, forced through kquant_native planes (grp repack + kq kernels + kq embed gather).
 // The oracles were produced per-file by simple_ids (all three continue identically, equal to
@@ -649,44 +436,11 @@ def test_parity_qwen2moe(t : T?) {
     }
 }
 
-// Qwen3-30B-A3B Q8 — the qwen3moe arch: Qwen3 attention (per-head QK-norm pre-RoPE, NEOX rope, no
-// QKV bias) with routed experts — softmax router → RENORMALIZED top-8-of-128, and NO shared expert
-// (vs qwen2moe's un-renormalized top-4 + sigmoid shared expert). Same Qwen BPE vocab and counting
-// continuation as the dense Qwen fixtures, so the id arrays are shared. Runs through BOTH MoE prefill
-// paths off one load (grouped default + per-position reference) — bit-identical by construction.
-//
-// Unlike the gemma-4-26B MoE (which capped at 11), qwen3moe holds the full 40-token counting
-// continuation token-for-token: at every confident step das tracks the oracle (verified through
-// oracle margins as tight as 0.08 logits on a prose probe), with no systematic router flips — the
-// shared float `ffn_norm` already tracks ggml's double-accumulated norm closely enough for the
-// discrete top-8-of-128 pick. High-entropy prompts still diverge at the model's OWN near-ties (a
-// prose probe flips at the first coin-flip: oracle top-1/top-2 gap 0.04 at step 6, das picks the
-// oracle's #2 — not a forward bug). Large-tier (~32 GB): DASLLAMA_PARITY_FULL=1.
-[test]
-def test_parity_qwen3moe_30b(t : T?) {
-    t |> run("qwen3moe forward (Qwen3-30B-A3B Q8: QK-norm attn, softmax top-8-of-128 renormalized, no shared expert)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "Qwen3-30B-A3B-Q8_0.gguf")
-        if (!model_available(t, path)) return
-        var tr <- load_gguf(path, QuantMode.q8)
-        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
-            tr.config.seq_len = 2048l
-        }
-        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3moe token-for-token")
-        set_moe_grouped_prefill(false)
-        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3moe reference-prefill token-for-token")
-        set_moe_grouped_prefill(true)
-        delete tr
-    }
-}
-
-// Qwen3-30B-A3B-Instruct-2507 Q4_K_M — the MoE arm of the native-kq gate: expert weights live as
-// kq planes and the grouped prefill gathers per-expert token batches off the K-form batch image
-// (the seam the dense arms above never touch). Oracle simple_ids per-file; continues identically
-// to QWEN3_GEN. Large-tier (~18 GB): DASLLAMA_PARITY_FULL=1.
+// Qwen3-30B-A3B-Instruct-2507 Q4_K_M — the qwen3moe arch (QK-norm attention, softmax router →
+// RENORMALIZED top-8-of-128, NO shared expert) and the MoE arm of the native-kq gate: expert
+// weights live as kq planes and the grouped prefill gathers per-expert token batches off the
+// K-form batch image (the seam the dense arms above never touch). Oracle simple_ids per-file;
+// continues identically to QWEN3_GEN. Large-tier (~18 GB): DASLLAMA_PARITY_FULL=1.
 [test]
 def test_parity_qwen3moe_30b_q4k(t : T?) {
     t |> run("qwen3moe forward (Qwen3-30B-A3B-Instruct-2507 Q4_K_M, native kq planes)") @(t : T?) {
@@ -766,15 +520,13 @@ def test_parity_gemma3_4b(t : T?) {
     }
 }
 
-// gemma-4-12B-it Q8 — the heterogeneous-geometry arch: sliding layers 16Q/8KV heads of 256 vs
-// global 16Q/1KV of 512 (per-layer bool SWA pattern), p-RoPE factors on global layers only,
-// weightless V-norm, V-from-K on global layers, unit attention scale, per-layer output scale,
-// final softcap 30, suppressed <image|>/<audio|> logits. The prompt is "1, 2, …, 320," (~1490
-// tokens) ENCODED IN-TEST through the model's gemma4 tokenizer (verified id-for-id against the
-// oracle's tokenization), so this gates the tokenizer AND the forward, and the 1024-token sliding
-// window is genuinely engaged (kstart > 0). The short 21-token counting prompt was rejected as a
-// fixture: its oracle continuation drifts into the channel format on a near-tie that flips under
-// the pinned classic+libm kernels — the long prompt's list momentum is kernel-robust.
+// The shared gemma4 counting fixture (frozen on the 12B, reused by every dense gemma4 arm below —
+// same vocab, all count): the prompt is "1, 2, …, 320," (~1490 tokens) ENCODED IN-TEST through the
+// model's gemma4 tokenizer (verified id-for-id against the oracle's tokenization), so it gates the
+// tokenizer AND the forward, and the sliding window is genuinely engaged (kstart > 0). The short
+// 21-token counting prompt was rejected as a fixture: its oracle continuation drifts into the
+// channel format on a near-tie that flips under the pinned classic+libm kernels — the long
+// prompt's list momentum is kernel-robust.
 let GEMMA4_12B_GEN <- [236743l, 236800l, 236778l, 236770l, 236764l, 236743l, 236800l, 236778l, 236778l, 236764l,
                        236743l, 236800l, 236778l, 236800l, 236764l, 236743l, 236800l, 236778l, 236812l, 236764l,
                        236743l, 236800l, 236778l, 236810l, 236764l, 236743l, 236800l, 236778l, 236825l, 236764l,
@@ -801,38 +553,6 @@ def private parity_text_ok(path : string; quant : QuantMode; text : string; want
     let ok = parity_gen_ok(tr, prompt, want)
     delete tr
     return ok
-}
-
-[test]
-def test_parity_gemma4_12b(t : T?) {
-    t |> run("gemma4 forward (gemma-4-12B-it Q8, heterogeneous SWA/global geometry, window engaged)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "gemma-4-12B-it-Q8_0.gguf")
-        if (!model_available(t, path)) return
-        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-12b token-for-token")
-    }
-}
-
-// gemma-4-31B-it Q8 — the SAME heterogeneous gemma4 arch as the 12B, scaled up (60 layers,
-// embd 5376, 32Q/[16x5,4]KV heads; PLE off, shared_kv 0, softcap 30, 5-local:1-global SWA).
-// A verify-only slice: it runs the existing gemma4 forward with no code change, and continues
-// the 1..320 counting prompt byte-identically to the 12B (same vocab, both count) — so it reuses
-// GEMMA4_12B_GEN. Verified 40/40 vs simple_ids (harness/parity.sh) 2026-07-07. Large-tier
-// (32 GB): the fast loop skips it; DASLLAMA_PARITY_FULL=1 runs it.
-[test]
-def test_parity_gemma4_31b(t : T?) {
-    t |> run("gemma4 forward (gemma-4-31B-it Q8, same arch as 12B scaled: 60L/5376d)") @(t : T?) {
-        if (!jit_enabled()) {
-            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
-            return
-        }
-        let path = path_join(models_dir(), "gemma-4-31B-it-Q8_0.gguf")
-        if (!model_available(t, path)) return
-        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-31b token-for-token")
-    }
 }
 
 // gemma-4-26B-A4B-it Q8 — the gemma4 arch's MoE member (30 layers, embd 2816, 16Q/[8×5,2]KV heads;

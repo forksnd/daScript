@@ -224,19 +224,19 @@ def test_mtp_reject_rollback(t : T?) {
     }
 }
 
-// Qwen3.6-27B-MTP Q8 — the 64-trunk-layer carrier: its draft block sits at layer index 64, the
+// Qwen3.6-27B-MTP Q4_K_M — the 64-trunk-layer carrier: its draft block sits at layer index 64, the
 // exact index where the pre-fix per-layer masks wrapped (mask >> 64 == mask >> 0 on x86) — this
 // arm regresses that whole bug class (layer_is_recurrent / layer_is_sliding / wv_offs guards)
-// besides being the model the feature is FOR (1.39x decode when frozen). Large tier (~25 GB):
+// besides being the model the feature is FOR (1.39x decode when frozen). Large tier (~16 GB):
 // DASLLAMA_PARITY_FULL=1.
 [test]
 def test_mtp_invariance_27b(t : T?) {
-    t |> run("MTP self-spec output-invariance (Qwen3.6-27B-MTP Q8, draft block at layer 64)") @(t : T?) {
+    t |> run("MTP self-spec output-invariance (Qwen3.6-27B-MTP Q4_K_M, draft block at layer 64)") @(t : T?) {
         if (!jit_enabled()) {
             t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
-        let path = path_join(models_dir(), "Qwen3.6-27B-MTP-Q8_0.gguf")
+        let path = path_join(models_dir(), "Qwen3.6-27B-MTP-Q4_K_M.gguf")
         if (!model_available(t, path)) return
         var tr <- load_gguf(path, QuantMode.q8)
         t |> equal(tr.config.n_layer_nextn, 1l)

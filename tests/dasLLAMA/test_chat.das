@@ -117,7 +117,7 @@ def test_chat_gemma(t : T?) {
 [test]
 def test_chat_phi(t : T?) {
     t |> run("Phi-3.5 (SPM) renders the Phi-3 prefill") @(t : T?) {
-        let path = path_join(models_dir(), "Phi-3.5-mini-instruct-Q8_0.gguf")
+        let path = path_join(models_dir(), "Phi-3.5-mini-instruct-Q4_K_M.gguf")
         if (!stat(path).is_valid) {
             t |> skip("{path} not present")
             return
