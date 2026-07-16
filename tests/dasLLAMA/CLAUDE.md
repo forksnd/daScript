@@ -39,7 +39,9 @@ never mask a red.
 Arm names — decode parity: `arm1-basic arm2-hybrid arm3-step arm4-paged arm5-rewind
 arm6-churn arm7-q8kv arm7b-tq4kv arm8-s16 arm9-reload arm10-kq arm11-depth arm12-dim`,
 batch test: `batch` (whole test), `batchB7-partd`, `batchB8-kq`. Prefill parity: `base s16
-kq dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b`.
+kq cont dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b`. The
+`kernels` suite (test_metal_prefill_kernels — model-less kernel units, ~80s) has no arms;
+remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
 
 ## Model tiers
 

@@ -1808,8 +1808,8 @@ def private pf_upload_region(src : void?; bytes : uint64) : MetalBuffer? {
 // (f32, or the raw-f16 qscales16 under wscale_f16; the encoding is part of the cache identity)
 def private upload_blob_region(t : Model; off, rows, k : int64) : MetalBuffer? {
     unsafe {
-        let s = t.wscale_f16 ? addr < void ? > (t.qscales16[off / 32l]) : addr < void ? > (t.qscales[off / 32l])
-        return metal_blob_region(g_pf_dev, addr < void ? > (t.qblob[off]), s, rows, k, t.wscale_f16)
+        let s = t.wscale_f16 ? addr < void? >(t.qscales16[off / 32l]) : addr < void? >(t.qscales[off / 32l])
+        return metal_blob_region(g_pf_dev, addr < void? >(t.qblob[off]), s, rows, k, t.wscale_f16)
     }
 }
 
@@ -2254,9 +2254,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     // upload the embedded rows + this prefill's rope table (built for the chunk's GLOBAL
     // positions — build_rope_table takes start_pos)
     unsafe {
-        memcpy(metal_buffer_contents(bx), addr < void ? > (s.x_b[0]), int(npos * dim * 4l))
-        memcpy(metal_buffer_contents(bcos), addr < void ? > (s.rope_cos[0]), int(npos * half * 4l))
-        memcpy(metal_buffer_contents(bsin), addr < void ? > (s.rope_sin[0]), int(npos * half * 4l))
+        memcpy(metal_buffer_contents(bx), addr < void? >(s.x_b[0]), int(npos * dim * 4l))
+        memcpy(metal_buffer_contents(bcos), addr < void? >(s.rope_cos[0]), int(npos * half * 4l))
+        memcpy(metal_buffer_contents(bsin), addr < void? >(s.rope_sin[0]), int(npos * half * 4l))
     }
     // continuation: gather the session's existing rows [0, start_pos) into every layer's panel
     // head as f32 (kv_load_row dequants the codec; paged sessions gather through kv_runs; tq4
@@ -2265,8 +2265,8 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     if (start_pos > 0l) {
         unsafe {
             let gather_nrun = kv_runs(s, 0l, start_pos, s.kv_runs)
-            let runsg = addr < KVRun const ? > (s.kv_runs[0])
-            let sgp = (s.kv_dtype_k == KVDtype.tq4 || s.kv_dtype_v == KVDtype.tq4) ? addr < float const ? > (s.kv_signs[0]) : null
+            let runsg = addr < KVRun const? >(s.kv_runs[0])
+            let sgp = (s.kv_dtype_k == KVDtype.tq4 || s.kv_dtype_v == KVDtype.tq4) ? addr < float const? >(s.kv_signs[0]) : null
             for (l in range64(c.n_layers)) {
                 var kdst = reinterpret<float?>(metal_buffer_contents(bks[l]))
                 var vdst = reinterpret<float?>(metal_buffer_contents(bvs[l]))
@@ -2367,8 +2367,8 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 enc = metal_new_compute_encoder(cb)
             }
             unsafe {
-                var bw_att = pf_upload_region(addr < void ? > (t.fblob[t.rms_att_off + l * dim]), uint64(dim * 4l))
-                var bw_ffn = pf_upload_region(addr < void ? > (t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
+                var bw_att = pf_upload_region(addr < void? >(t.fblob[t.rms_att_off + l * dim]), uint64(dim * 4l))
+                var bw_ffn = pf_upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
                 // attention: [pending W2 residual +] norm -> [requant ->] Q/K/V -> rope ->
                 // scores+softmax -> P.V -> out-proj (fused path folds each residual add into
                 // the FOLLOWING add+rms+quant; the last layer's pending add lands after the loop;
@@ -2413,12 +2413,12 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         enc_gemm_mm(enc, bwkb, bxb, bks[l], u_dim, u_kvd, mp, kv_dim, koff)
                         enc_gemm_mm(enc, bwvb, bxb, bvs[l], u_dim, u_kvd, mp, kv_dim, koff)
                     } else {
-                        var bwq = pf_upload_region(addr < void ? > (t.qblob[t.wq_offs[l]]), uint64(qd * dim))
-                        var bwq_s = pf_upload_region(addr < void ? > (t.qscales[t.wq_offs[l] / 32l]), uint64(qd * (dim / 32l) * 4l))
-                        var bwk = pf_upload_region(addr < void ? > (t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim))
-                        var bwk_s = pf_upload_region(addr < void ? > (t.qscales[t.wk_offs[l] / 32l]), uint64(kv_dim * (dim / 32l) * 4l))
-                        var bwv = pf_upload_region(addr < void ? > (t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
-                        var bwv_s = pf_upload_region(addr < void ? > (t.qscales[t.wv_offs[l] / 32l]), uint64(kv_dim * (dim / 32l) * 4l))
+                        var bwq = pf_upload_region(addr < void? >(t.qblob[t.wq_offs[l]]), uint64(qd * dim))
+                        var bwq_s = pf_upload_region(addr < void? >(t.qscales[t.wq_offs[l] / 32l]), uint64(qd * (dim / 32l) * 4l))
+                        var bwk = pf_upload_region(addr < void? >(t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim))
+                        var bwk_s = pf_upload_region(addr < void? >(t.qscales[t.wk_offs[l] / 32l]), uint64(kv_dim * (dim / 32l) * 4l))
+                        var bwv = pf_upload_region(addr < void? >(t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
+                        var bwv_s = pf_upload_region(addr < void? >(t.qscales[t.wv_offs[l] / 32l]), uint64(kv_dim * (dim / 32l) * 4l))
                         enc_gemm(enc, bwq, bwq_s, bxq, bxs, bq, u_dim, u_qd, mp, qd)
                         enc_gemm(enc, bwk, bwk_s, bxq, bxs, bks[l], u_dim, u_kvd, mp, kv_dim, koff)
                         enc_gemm(enc, bwv, bwv_s, bxq, bxs, bvs[l], u_dim, u_kvd, mp, kv_dim, koff)
@@ -2462,8 +2462,8 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         var bwob = upload_blob_region(t, t.wo_offs[l], dim, qd)
                         enc_gemm_mm(enc, bwob, bxb, bxb2, u_qd, u_dim, mp, dim)
                     } else {
-                        var bwo = pf_upload_region(addr < void ? > (t.qblob[t.wo_offs[l]]), uint64(dim * qd))
-                        var bwo_s = pf_upload_region(addr < void ? > (t.qscales[t.wo_offs[l] / 32l]), uint64(dim * (qd / 32l) * 4l))
+                        var bwo = pf_upload_region(addr < void? >(t.qblob[t.wo_offs[l]]), uint64(dim * qd))
+                        var bwo_s = pf_upload_region(addr < void? >(t.qscales[t.wo_offs[l] / 32l]), uint64(dim * (qd / 32l) * 4l))
                         enc_gemm(enc, bwo, bwo_s, bxq, bxs, bxb2, u_qd, u_dim, mp, dim)
                     }
                 }
@@ -2499,10 +2499,10 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         enc_gemm_mm(enc, bw1b, bxb, bhb, u_dim, u_hidden, mp, hidden)
                         enc_gemm_mm(enc, bw3b, bxb, bhb2, u_dim, u_hidden, mp, hidden)
                     } else {
-                        var bw1 = pf_upload_region(addr < void ? > (t.qblob[t.w1_offs[l]]), uint64(hidden * dim))
-                        var bw1_s = pf_upload_region(addr < void ? > (t.qscales[t.w1_offs[l] / 32l]), uint64(hidden * (dim / 32l) * 4l))
-                        var bw3 = pf_upload_region(addr < void ? > (t.qblob[t.w3_offs[l]]), uint64(hidden * dim))
-                        var bw3_s = pf_upload_region(addr < void ? > (t.qscales[t.w3_offs[l] / 32l]), uint64(hidden * (dim / 32l) * 4l))
+                        var bw1 = pf_upload_region(addr < void? >(t.qblob[t.w1_offs[l]]), uint64(hidden * dim))
+                        var bw1_s = pf_upload_region(addr < void? >(t.qscales[t.w1_offs[l] / 32l]), uint64(hidden * (dim / 32l) * 4l))
+                        var bw3 = pf_upload_region(addr < void? >(t.qblob[t.w3_offs[l]]), uint64(hidden * dim))
+                        var bw3_s = pf_upload_region(addr < void? >(t.qscales[t.w3_offs[l] / 32l]), uint64(hidden * (dim / 32l) * 4l))
                         enc_gemm(enc, bw1, bw1_s, bxq, bxs, bhb, u_dim, u_hidden, mp, hidden)
                         enc_gemm(enc, bw3, bw3_s, bxq, bxs, bhb2, u_dim, u_hidden, mp, hidden)
                     }
@@ -2525,8 +2525,8 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         var bw2b = upload_blob_region(t, t.w2_offs[l], dim, hidden)
                         enc_gemm_mm(enc, bw2b, bhb, bxb, u_hidden, u_dim, mp, dim)
                     } else {
-                        var bw2 = pf_upload_region(addr < void ? > (t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
-                        var bw2_s = pf_upload_region(addr < void ? > (t.qscales[t.w2_offs[l] / 32l]), uint64(dim * (hidden / 32l) * 4l))
+                        var bw2 = pf_upload_region(addr < void? >(t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
+                        var bw2_s = pf_upload_region(addr < void? >(t.qscales[t.w2_offs[l] / 32l]), uint64(dim * (hidden / 32l) * 4l))
                         enc_gemm(enc, bw2, bw2_s, bxq, bxs, bxb, u_hidden, u_dim, mp, dim)
                     }
                 }
@@ -2542,15 +2542,15 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
             // final rmsnorm on the LAST position + classifier GEMV — the caller samples from
             // s.logits, so this closes the whole forward inside the GPU window
             unsafe {
-                var bwfin = pf_upload_region(addr < void ? > (t.fblob[t.rms_final_off]), uint64(dim * 4l))
+                var bwfin = pf_upload_region(addr < void? >(t.fblob[t.rms_final_off]), uint64(dim * 4l))
                 enc_rms_last(enc, bx, uint64((npos - 1l) * dim * 4l), bwfin, bxf, u_dim, u_eps)
                 if (cls_fmt != KqFmt.q8) {
                     pf_enc_kq_gemv(enc, t, cls_fmt, t.wcls_off, c.vocab_size, dim, bxf, 0ul, blog, u_dim, u_vocab)
                 } else {
-                    var bwc = pf_upload_region(addr < void ? > (t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
+                    var bwc = pf_upload_region(addr < void? >(t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
                     var bwc_s = (t.wscale_f16 ?
-                        pf_upload_region(addr < void ? > (t.qscales16[t.wcls_off / 32l]), uint64(c.vocab_size * (dim / 32l) * 2l)) :
-                        pf_upload_region(addr < void ? > (t.qscales[t.wcls_off / 32l]), uint64(c.vocab_size * (dim / 32l) * 4l)))
+                        pf_upload_region(addr < void? >(t.qscales16[t.wcls_off / 32l]), uint64(c.vocab_size * (dim / 32l) * 2l)) :
+                        pf_upload_region(addr < void? >(t.qscales[t.wcls_off / 32l]), uint64(c.vocab_size * (dim / 32l) * 4l)))
                     pf_enc_gemv(enc, t.wscale_f16, bwc, bwc_s, bxf, blog, u_dim, u_vocab, c.vocab_size)
                 }
             }
@@ -2571,7 +2571,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     var readback_us = 0l
     unsafe {
         let store_nrun = kv_runs(s, start_pos, start_pos + npos, s.kv_runs)
-        let runsp = addr < KVRun const ? > (s.kv_runs[0])
+        let runsp = addr < KVRun const? >(s.kv_runs[0])
         for (cbi, i in cbs, count()) {
             metal_wait_until_completed(cbi)
             let e = metal_command_buffer_error(cbi)
@@ -2595,13 +2595,13 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     // the chunk's rows sit past a continuation's gathered panel head
                     var kpan = reinterpret<uint8?>(metal_buffer_contents(bks[l]))
                     var vpan = reinterpret<uint8?>(metal_buffer_contents(bvs[l]))
-                    memcpy(addr < void ? > (s.k_b[0]), reinterpret<void?>(kpan + int64(koff)), int(npos * kv_dim * 4l))
-                    memcpy(addr < void ? > (s.v_b[0]), reinterpret<void?>(vpan + int64(koff)), int(npos * kv_dim * 4l))
+                    memcpy(addr < void? >(s.k_b[0]), reinterpret<void?>(kpan + int64(koff)), int(npos * kv_dim * 4l))
+                    memcpy(addr < void? >(s.v_b[0]), reinterpret<void?>(vpan + int64(koff)), int(npos * kv_dim * 4l))
                     // tq4 sessions store in the ROTATED basis: the GPU ran attention unrotated,
                     // so rotate the readback rows per head before the codec store (the CPU
                     // prefill's exact discipline — dasllama_common's tq4 store path)
                     if (s.kv_dtype_k == KVDtype.tq4 || s.kv_dtype_v == KVDtype.tq4) {
-                        let sgp = addr < float const ? > (s.kv_signs[0])
+                        let sgp = addr < float const? >(s.kv_signs[0])
                         if (s.kv_dtype_k == KVDtype.tq4) {
                             tq4_rotate_batch(s.k_b, npos, kv_dim, head_size, sgp)
                         }
@@ -2626,9 +2626,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     if (ran) {
         let ts_rb = ref_time_ticks()
         unsafe {
-            memcpy(addr < void ? > (s.x_b[0]), metal_buffer_contents(bx), int(npos * dim * 4l))
+            memcpy(addr < void? >(s.x_b[0]), metal_buffer_contents(bx), int(npos * dim * 4l))
             if (gpu_logits) {
-                memcpy(addr < void ? > (s.logits[0]), metal_buffer_contents(blog), int(c.vocab_size * 4l))
+                memcpy(addr < void? >(s.logits[0]), metal_buffer_contents(blog), int(c.vocab_size * 4l))
             }
         }
         if (gpu_logits) {

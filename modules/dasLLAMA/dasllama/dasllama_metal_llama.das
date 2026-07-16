@@ -122,7 +122,7 @@ def private kq_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q
 def private enc_site_gemv(enc : MetalComputeEncoder?; t : Model; s16 : bool; fmt : KqFmt; woff, rows, n : int64; bx, by, bn, bd : MetalBuffer?; yoff : uint64 = 0ul) {
     if (fmt == KqFmt.q8) {
         unsafe {
-            var bw = upload_region(addr < void ? > (t.qblob[woff]), uint64(rows * n))
+            var bw = upload_region(addr < void? >(t.qblob[woff]), uint64(rows * n))
             var bws = upload_scales(t, woff, rows, n)
             enc_gemv(enc, s16, bw, bws, bx, by, bn, bd, rows, yoff)
         }
@@ -296,9 +296,9 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
 // the token-dependent input bytes — the ONLY step state not known at encode time
 def private poke_step(s : Session; r : StepRes) {
     unsafe {
-        memcpy(metal_buffer_contents(r.bx), addr < void ? > (s.x[0]), int(r.bytes_x))
-        memcpy(metal_buffer_contents(r.bcos), addr < void ? > (s.rope_cos[0]), int(r.bytes_tab))
-        memcpy(metal_buffer_contents(r.bsin), addr < void ? > (s.rope_sin[0]), int(r.bytes_tab))
+        memcpy(metal_buffer_contents(r.bx), addr < void? >(s.x[0]), int(r.bytes_x))
+        memcpy(metal_buffer_contents(r.bcos), addr < void? >(s.rope_cos[0]), int(r.bytes_tab))
+        memcpy(metal_buffer_contents(r.bsin), addr < void? >(s.rope_sin[0]), int(r.bytes_tab))
     }
 }
 
@@ -333,7 +333,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
         // the speculative head: greedy-pick the previous step's logits, gather the winner's
         // embedding row into r.bx (the cls_q8 linear plane — gated in pre_encode_next)
         unsafe {
-            var bembq = upload_region(addr < void ? > (t.qblob[t.emb_q8_off]), uint64(c.vocab_size * dim))
+            var bembq = upload_region(addr < void? >(t.qblob[t.emb_q8_off]), uint64(c.vocab_size * dim))
             var bembs = upload_scales(t, t.emb_q8_off, c.vocab_size, dim)
             enc_argmax(enc, prev_blog, r.btok, r.u_vocab)
             enc_embed(enc, r.s16, bembq, bembs, r.btok, r.bx, r.u_dim, dim)
@@ -342,7 +342,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     // layer-0 attention norm — the per-layer trailing add+rms is fused and feeds the NEXT layer
     if (g_skip != "ew") {
         unsafe {
-            var bw_att0 = upload_region(addr < void ? > (t.fblob[t.rms_att_off]), uint64(dim * 4l))
+            var bw_att0 = upload_region(addr < void? >(t.fblob[t.rms_att_off]), uint64(dim * 4l))
             enc_rms(enc, r.bx, bw_att0, r.bxb, r.u_dim, r.u_eps)
         }
     }
@@ -360,9 +360,9 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             if (g_skip != "gemv") {
                 if (qkv_q8) {
                     var bwqkv = upload_region_cat3(
-                        addr < void ? > (t.qblob[t.wq_offs[l]]), uint64(qd * dim),
-                        addr < void ? > (t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
-                        addr < void ? > (t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
+                        addr < void? >(t.qblob[t.wq_offs[l]]), uint64(qd * dim),
+                        addr < void? >(t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
+                        addr < void? >(t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
                     var bwqkv_s = upload_scales_cat3(t, t.wq_offs[l], qd, t.wk_offs[l], kv_dim, t.wv_offs[l], kv_dim, dim)
                     if (fused_qkv) {
                         enc_gemv_qkv_rs(enc, f16v, bwqkv, bwqkv_s, r.bxb, r.bqkv, g_arena, g_arena,
@@ -429,7 +429,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             // ffn: fused add+norm -> fused W1|W3 GEMV -> swiglu -> W2 GEMV -> fused add + the
             // NEXT layer's attention norm (plain add on the last layer — the final norm follows)
             if (g_skip != "ew") {
-                var bw_ffn = upload_region(addr < void ? > (t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
+                var bw_ffn = upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
                 enc_add_rms_site(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, dim)
             }
             let f1 = kq_fmt_at(t.w1_fmt, l)
@@ -438,8 +438,8 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             if (g_skip != "gemv") {
                 if (w13_q8) {
                     var bw13 = upload_region_cat3(
-                        addr < void ? > (t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
-                        addr < void ? > (t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
+                        addr < void? >(t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
+                        addr < void? >(t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
                     var bw13_s = upload_scales_cat3(t, t.w1_offs[l], hidden, t.w3_offs[l], hidden, 0l, 0l, dim)
                     if (r.s16) {   // fused gate+up dot with the swiglu epilogue — one dispatch
                         enc_gemv_w13sw(enc, bw13, bw13_s, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
@@ -459,7 +459,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             }
             if (g_skip != "ew") {
                 if (l + 1l < c.n_layers) {
-                    var bw_attn = upload_region(addr < void ? > (t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
+                    var bw_attn = upload_region(addr < void? >(t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
                     enc_add_rms_site(enc, r.bx, r.bxb, bw_attn, r.bxb, r.u_dim, r.u_eps, dim)
                 } else {
                     enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb, 0ul, r.u_dim, dim)
@@ -470,7 +470,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     if (r.gpu_logits) {
         // final rmsnorm (one row) + classifier GEMV — the caller samples straight from s.logits
         unsafe {
-            var bwfin = upload_region(addr < void ? > (t.fblob[t.rms_final_off]), uint64(dim * 4l))
+            var bwfin = upload_region(addr < void? >(t.fblob[t.rms_final_off]), uint64(dim * 4l))
             enc_rms(enc, r.bx, bwfin, r.bxf, r.u_dim, r.u_eps)
         }
         let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
@@ -502,7 +502,7 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
         let pos = r.pos
         let cap = r.cap
         unsafe {
-            memcpy(addr < void ? > (s.x[0]), metal_buffer_contents(r.bx), int(r.bytes_x))
+            memcpy(addr < void? >(s.x[0]), metal_buffer_contents(r.bx), int(r.bytes_x))
             var kmp = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + r.koff
             var vmp = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + r.voff
             let prow = kv_phys_row(s, pos)
@@ -513,7 +513,7 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
                     reinterpret<void?>(vmp + (l * cap + pos) * rowb), int(rowb))
             }
             if (r.gpu_logits) {
-                memcpy(addr < void ? > (s.logits[0]), metal_buffer_contents(r.blog), int(r.bytes_log))
+                memcpy(addr < void? >(s.logits[0]), metal_buffer_contents(r.blog), int(r.bytes_log))
             }
         }
         if (r.gpu_logits) {
@@ -619,8 +619,8 @@ def private pre_encode_next(t : Model; s : Session; npos : int64; var prev_blog 
         r.btok = pool_acquire(g_pool, g_dev, 64ul)
         build_decode_rope_row(t, npos, g_rope_cos_next, g_rope_sin_next)
         unsafe {
-            memcpy(metal_buffer_contents(r.bcos), addr < void ? > (g_rope_cos_next[0]), int(r.bytes_tab))
-            memcpy(metal_buffer_contents(r.bsin), addr < void ? > (g_rope_sin_next[0]), int(r.bytes_tab))
+            memcpy(metal_buffer_contents(r.bcos), addr < void? >(g_rope_cos_next[0]), int(r.bytes_tab))
+            memcpy(metal_buffer_contents(r.bsin), addr < void? >(g_rope_sin_next[0]), int(r.bytes_tab))
         }
         encode_step(t, r, true, prev_blog)
     } else {
@@ -1087,10 +1087,10 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         g_b_ulays[l] = uniform_u32(uint(l))
     }
     unsafe {
-        memcpy(metal_buffer_contents(bx), addr < void ? > (ws.scr.x_b[0]), int(nrows * dim * 4l))
-        memcpy(metal_buffer_contents(bcos), addr < void ? > (ws.scr.rope_cos[0]), int(bytes_tab))
-        memcpy(metal_buffer_contents(bsin), addr < void ? > (ws.scr.rope_sin[0]), int(bytes_tab))
-        memcpy(metal_buffer_contents(brt), addr < void ? > (g_b_rte[0]), int(bytes_rt))
+        memcpy(metal_buffer_contents(bx), addr < void? >(ws.scr.x_b[0]), int(nrows * dim * 4l))
+        memcpy(metal_buffer_contents(bcos), addr < void? >(ws.scr.rope_cos[0]), int(bytes_tab))
+        memcpy(metal_buffer_contents(bsin), addr < void? >(ws.scr.rope_sin[0]), int(bytes_tab))
+        memcpy(metal_buffer_contents(brt), addr < void? >(g_b_rte[0]), int(bytes_rt))
     }
     g_us_bsetup += int64(get_time_usec(ts_all))
     let ts_enc = ref_time_ticks()
@@ -1108,7 +1108,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     // layer-0 attention norm (the per-layer trailing add+rms feeds the NEXT layer's)
     if (g_skip != "ew") {
         unsafe {
-            var bw_att0 = upload_region(addr < void ? > (t.fblob[t.rms_att_off]), uint64(dim * 4l))
+            var bw_att0 = upload_region(addr < void? >(t.fblob[t.rms_att_off]), uint64(dim * 4l))
             bar_dep(enc, haz, HZ_BX, HZ_BXB)
             enc_rms_b(enc, bx, bw_att0, bxb, u_dim, u_eps, nrows)
         }
@@ -1144,9 +1144,9 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                         nrows, uint64(dim * 4l), u_nrows_mv, u_nrows_mv2)
                 } else {
                     var bwqkv = upload_region_cat3(
-                        addr < void ? > (t.qblob[t.wq_offs[l]]), uint64(qd * dim),
-                        addr < void ? > (t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
-                        addr < void ? > (t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
+                        addr < void? >(t.qblob[t.wq_offs[l]]), uint64(qd * dim),
+                        addr < void? >(t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
+                        addr < void? >(t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
                     var bwqkv_s = upload_scales_cat3(t, t.wq_offs[l], qd, t.wk_offs[l], kv_dim, t.wv_offs[l], kv_dim, dim)
                     if (qkv_sk > 0l) {
                         bar_dep(enc, haz, HZ_BXB, HZ_BPSK)
@@ -1236,7 +1236,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     enc_mv_site(enc, blob_of(t, t.wo_offs[l], dim, qd), bxb, bxb2,
                         u_qd, u_dim, u_xs4_qd, dim, nrows, uint64(qd * 4l), u_nrows_mv, u_nrows_mv2)
                 } else {
-                    var bwo = upload_region(addr < void ? > (t.qblob[t.wo_offs[l]]), uint64(dim * qd))
+                    var bwo = upload_region(addr < void? >(t.qblob[t.wo_offs[l]]), uint64(dim * qd))
                     var bwo_s = upload_scales(t, t.wo_offs[l], dim, qd)
                     if (wo_sk > 0l) {
                         bar_dep(enc, haz, HZ_BXB, HZ_BPSK)
@@ -1255,7 +1255,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
             // ffn: fused add+norm -> W1 / W3 (the cat region at byte offsets) -> swiglu
             // -> W2 -> fused add + the NEXT layer's attention norm (plain add on the last)
             if (g_skip != "ew") {
-                var bw_ffn = upload_region(addr < void ? > (t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
+                var bw_ffn = upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
                 // add_rms updates the residual bx in place AND writes the norm-out bxb; past the
                 // fused kernel's row slab the unfused pair does the same in two dispatches
                 bar_dep(enc, haz, HZ_BX | HZ_BXB2, HZ_BX | HZ_BXB)
@@ -1288,8 +1288,8 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                         u_dim, u_hidden, u_xs4_dim, hidden, nrows, uint64(dim * 4l), u_nrows_mv, u_nrows_mv2)
                 } else {
                     var bw13 = upload_region_cat3(
-                        addr < void ? > (t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
-                        addr < void ? > (t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
+                        addr < void? >(t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
+                        addr < void? >(t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
                     var bw13_s = upload_scales_cat3(t, t.w1_offs[l], hidden, t.w3_offs[l], hidden, 0l, 0l, dim)
                     if (fuse13) {
                         // one fused dispatch: gate+up dot + swiglu straight into bhb (w2's input)
@@ -1328,7 +1328,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     enc_mv_site(enc, blob_of(t, t.w2_offs[l], dim, hidden), bhb, bxb,
                         u_hidden, u_dim, u_xs4_hid, dim, nrows, uint64(hidden * 4l), u_nrows_mv, u_nrows_mv2)
                 } else {
-                    var bw2 = upload_region(addr < void ? > (t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
+                    var bw2 = upload_region(addr < void? >(t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
                     var bw2_s = upload_scales(t, t.w2_offs[l], dim, hidden)
                     if (w2_sk > 0l) {
                         bar_dep(enc, haz, HZ_BHB, HZ_BPSK)
@@ -1346,7 +1346,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
             }
             if (g_skip != "ew") {
                 if (l + 1l < c.n_layers) {
-                    var bw_attn = upload_region(addr < void ? > (t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
+                    var bw_attn = upload_region(addr < void? >(t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
                     bar_dep(enc, haz, HZ_BX | HZ_BXB, HZ_BX | HZ_BXB)
                     if (dim <= ADD_RMS_MAX_DIM && !g_b_addrms_unfused) {
                         enc_add_rms_b(enc, bx, bxb, bw_attn, bxb, u_dim, u_eps, nrows)
@@ -1379,7 +1379,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     if (gpu_logits) {
         // batched final rmsnorm + classifier — the caller's CPU classifier step is skipped
         unsafe {
-            var bwfin = upload_region(addr < void ? > (t.fblob[t.rms_final_off]), uint64(dim * 4l))
+            var bwfin = upload_region(addr < void? >(t.fblob[t.rms_final_off]), uint64(dim * 4l))
             bar_dep(enc, haz, HZ_BX, HZ_BXF)
             enc_rms_b(enc, bx, bwfin, bxf, u_dim, u_eps, nrows)
             bar_dep(enc, haz, HZ_BXF, HZ_BLOG)
@@ -1391,7 +1391,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 enc_mv_site(enc, blob_of(t, t.wcls_off, c.vocab_size, dim), bxf, blog,
                     u_dim, u_vocab, u_xs4_dim, c.vocab_size, nrows, uint64(dim * 4l), u_nrows_mv, u_nrows_mv2)
             } else {
-                var bwc = upload_region(addr < void ? > (t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
+                var bwc = upload_region(addr < void? >(t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
                 var bwc_s = upload_scales(t, t.wcls_off, c.vocab_size, dim)
                 if (cls64) {
                     enc_gemm64_b(enc, bwc, 0ul, bwc_s, 0ul, bxf, blog, u_dim, u_vocab, u_s16, mp, c.vocab_size)
@@ -1501,7 +1501,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     if (!gpu_logits) {
         g_lp_xb = bx   // the CPU-classifier tail reads x_b — sync-only writeback
         unsafe {
-            g_lp_xb_dst = addr < void ? > (ws.scr.x_b[0])
+            g_lp_xb_dst = addr < void? >(ws.scr.x_b[0])
         }
         g_lp_xb_bytes = nrows * dim * 4l
     }

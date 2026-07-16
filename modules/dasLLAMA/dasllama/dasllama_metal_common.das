@@ -400,17 +400,17 @@ def upload_scales(t : Model; off, rows, n : int64) : MetalBuffer? {
     let cnt = rows * (n / 32l)
     unsafe {
         if (t.wscale_f16) {
-            return upload_region(addr < void ? > (t.qscales16[off / 32l]), uint64(cnt * 2l))
+            return upload_region(addr < void? >(t.qscales16[off / 32l]), uint64(cnt * 2l))
         }
-        return upload_region(addr < void ? > (t.qscales[off / 32l]), uint64(cnt * 4l))
+        return upload_region(addr < void? >(t.qscales[off / 32l]), uint64(cnt * 4l))
     }
 }
 
 // one tensor's resident 34B q8-block blob (the prefill module's cache — shared, repacked once)
 def blob_of(t : Model; off, rows, n : int64) : MetalBuffer? {
     unsafe {
-        let q = addr < void ? > (t.qblob[off])
-        let s = t.wscale_f16 ? addr < void ? > (t.qscales16[off / 32l]) : addr < void ? > (t.qscales[off / 32l])
+        let q = addr < void? >(t.qblob[off])
+        let s = t.wscale_f16 ? addr < void? >(t.qscales16[off / 32l]) : addr < void? >(t.qscales[off / 32l])
         return metal_blob_region(g_dev, q, s, rows, n, t.wscale_f16)
     }
 }
@@ -420,11 +420,11 @@ def upload_scales_cat3(t : Model; off0, rows0, off1, rows1, off2, rows2, n : int
     let ssz = t.wscale_f16 ? 2l : 4l
     let nb = n / 32l
     unsafe {
-        let p0 = t.wscale_f16 ? addr < void ? > (t.qscales16[off0 / 32l]) : addr < void ? > (t.qscales[off0 / 32l])
-        let p1 = t.wscale_f16 ? addr < void ? > (t.qscales16[off1 / 32l]) : addr < void ? > (t.qscales[off1 / 32l])
+        let p0 = t.wscale_f16 ? addr < void? >(t.qscales16[off0 / 32l]) : addr < void? >(t.qscales[off0 / 32l])
+        let p1 = t.wscale_f16 ? addr < void? >(t.qscales16[off1 / 32l]) : addr < void? >(t.qscales[off1 / 32l])
         var p2 : void?
         if (rows2 > 0l) {
-            p2 = t.wscale_f16 ? addr < void ? > (t.qscales16[off2 / 32l]) : addr < void ? > (t.qscales[off2 / 32l])
+            p2 = t.wscale_f16 ? addr < void? >(t.qscales16[off2 / 32l]) : addr < void? >(t.qscales[off2 / 32l])
         }
         return upload_region_cat3(p0, uint64(rows0 * nb * ssz), p1, uint64(rows1 * nb * ssz), p2, uint64(rows2 * nb * ssz))
     }
@@ -438,12 +438,12 @@ def kq_upload_quants(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : 
     let nsb = (rows * n) / 256l
     unsafe {
         if (fmt == KqFmt.k4) {
-            return kq_region(dev, addr < void ? > (t.k4q[sb0 * 128l]), uint64(nsb * 128l))
+            return kq_region(dev, addr < void? >(t.k4q[sb0 * 128l]), uint64(nsb * 128l))
         }
         if (fmt == KqFmt.k5) {
-            return kq_region(dev, addr < void ? > (t.k5q[sb0 * 160l]), uint64(nsb * 160l))
+            return kq_region(dev, addr < void? >(t.k5q[sb0 * 160l]), uint64(nsb * 160l))
         }
-        return kq_region(dev, addr < void ? > (t.k6q[sb0 * 192l]), uint64(nsb * 192l))
+        return kq_region(dev, addr < void? >(t.k6q[sb0 * 192l]), uint64(nsb * 192l))
     }
 }
 
@@ -477,7 +477,7 @@ def kq_upload_scales(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : 
             }
             var buf = metal_new_buffer_untracked(dev, uint64(nsb * 18l))
             var d = reinterpret<uint8?>(metal_buffer_contents(buf))
-            let src = addr < uint8 const ? > (t.k6s[sb0 * 18l])
+            let src = addr < uint8 const? >(t.k6s[sb0 * 18l])
             for (sb in range64(nsb)) {
                 memcpy(reinterpret<void?>(d + sb * 16l), reinterpret<void const?>(src + sb * 18l), 16)
                 d[nsb * 16l + sb * 2l] = src[sb * 18l + 16l]
@@ -486,7 +486,7 @@ def kq_upload_scales(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : 
             g_regions[key] = buf
             return buf
         }
-        let src = fmt == KqFmt.k4 ? addr < uint8 const ? > (t.k4s[sb0 * 20l]) : addr < uint8 const ? > (t.k5s[sb0 * 20l])
+        let src = fmt == KqFmt.k4 ? addr < uint8 const? >(t.k4s[sb0 * 20l]) : addr < uint8 const? >(t.k5s[sb0 * 20l])
         let key = intptr(src)
         if (key_exists(g_regions, key)) {
             return g_regions[key]
@@ -741,7 +741,7 @@ def signs_buffer() : MetalBuffer? {
         tq4_fill_signs(signs, 128l)
         g_signs = metal_new_buffer(g_dev, 512ul)
         unsafe {
-            memcpy(metal_buffer_contents(g_signs), addr < void ? > (signs[0]), 512)
+            memcpy(metal_buffer_contents(g_signs), addr < void? >(signs[0]), 512)
         }
         delete signs
     }
@@ -795,9 +795,9 @@ var g_cat_blobs : table<uint64; MetalBuffer?>
 def repack_blocks(base : int8?; blk0 : int64; t : Model; off, rows, n : int64) {
     let nblocks = rows * (n / 32l)
     unsafe {
-        var qp = addr < int8 ? > (t.qblob[off])
+        var qp = addr < int8? >(t.qblob[off])
         if (t.wscale_f16) {
-            var sp16 = addr < uint16 ? > (t.qscales16[off / 32l])
+            var sp16 = addr < uint16? >(t.qscales16[off / 32l])
             for (b in range64(nblocks)) {
                 let o = (blk0 + b) * 34l
                 var pb = reinterpret<uint16?>(base + o)
@@ -805,7 +805,7 @@ def repack_blocks(base : int8?; blk0 : int64; t : Model; off, rows, n : int64) {
                 memcpy(reinterpret<void?>(base + o + 2l), reinterpret<void?>(qp + b * 32l), 32)
             }
         } else {
-            var sp = addr < float ? > (t.qscales[off / 32l])
+            var sp = addr < float? >(t.qscales[off / 32l])
             for (b in range64(nblocks)) {
                 let o = (blk0 + b) * 34l
                 var ph = reinterpret<float16?>(base + o)
@@ -914,7 +914,7 @@ def finish_pending_step {
                         reinterpret<void?>(ab + (g_lp_voffs[i] + uint64((l * cap + pos) * g_lp_rowb))), int(g_lp_rowb))
                 }
                 if (lgp != null) {
-                    memcpy(addr < void ? > (sp.logits[0]),
+                    memcpy(addr < void? >(sp.logits[0]),
                         reinterpret<void?>(lgp + i * g_lp_vocab * 4l), int(g_lp_vocab * 4l))
                 }
                 if (key_exists(g_mirrors, sp.uid)) {   // never regress the optimistic commit-time mark

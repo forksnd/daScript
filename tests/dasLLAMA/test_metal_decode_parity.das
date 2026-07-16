@@ -96,8 +96,8 @@ def private kv_row_max_diff_one(cache_a, cache_b : array<uint8>; base_a, base_b 
     var maxd = 0.0
     let rowb = kv_row_bytes(dt, kv_dim)
     unsafe {
-        let pa = addr < uint8 const ? > (cache_a[0]) + (base_a + pos * rowb)
-        let pb = addr < uint8 const ? > (cache_b[0]) + (base_b + pos * rowb)
+        let pa = addr < uint8 const? >(cache_a[0]) + (base_a + pos * rowb)
+        let pb = addr < uint8 const? >(cache_b[0]) + (base_b + pos * rowb)
         if (dt == KVDtype.f16) {
             var ha = reinterpret<uint16 const?>(pa)
             var hb = reinterpret<uint16 const?>(pb)

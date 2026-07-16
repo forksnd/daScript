@@ -274,6 +274,19 @@ namespace das {
         memcpy(left, right, size);
     }
 
+    // const-source overloads: das accepts a const pointer for a void? extern argument, and the
+    // emitted call then casts through das_cast<void const *> — these bind it without touching
+    // the das-side signatures (the non-const originals stay the bound externs, so no AOT-hash
+    // churn). memcpy keeps a strictly-writable destination.
+    DAS_SUPPRESS_UB
+    __forceinline int das_memcmp ( const void * left, const void * right, int size ) {
+        return memcmp(left, right, size);
+    }
+    DAS_SUPPRESS_UB
+    __forceinline void das_memcpy ( void * left, const void * right, int size ) {
+        memcpy(left, right, size);
+    }
+
     // Suppress null argument with size = 0
     DAS_SUPPRESS_UB
     __forceinline void das_memset8 ( void * left, uint8_t value, int size ) {
