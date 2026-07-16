@@ -110,12 +110,14 @@ struct KVMirror {
 var g_mirrors : table<uint64; KVMirror>
 var g_mirror_bytes = 0ul
 var g_tick = 0l
-var g_mirror_cap_mb = -1   // <0 = unset: DASLLAMA_METAL_KV_MIRROR_MB (default 1024) reads at use
+var g_mirror_cap_mb = -1   // <0 = unset: DASLLAMA_METAL_KV_MIRROR_MB (default 4096) reads at use
+                           // — a CEILING (M2.7): the arena starts at 256MB and grows on demand
 
 // the mirror arena: one buffer, first-fit free-list suballocation (slices are per-session and
 // coarse, so fragmentation stays trivial; a failed fit evicts LRU mirrors and retries)
 var g_arena : MetalBuffer?
 var g_arena_bytes = 0ul
+var g_arena_epoch = 0l   // bumps on every grow-rebuild — pre-encoded steps referencing the old buffer are stale
 var g_arena_free : array<tuple<off : uint64; size : uint64>>   // sorted by off, coalesced
 // uids a batch step is actively encoding against — eviction must never free a batch row's slice
 // out from under the step being assembled (the single path's `keep` protects only one uid)
@@ -159,8 +161,10 @@ def arena_free_slice(off : uint64; size : uint64) {
     }
 }
 
-//! Cap the resident KV-mirror bytes (LRU eviction of idle sessions' mirrors past it) — the churn
-//! gate's rail. Negative restores the env default (`DASLLAMA_METAL_KV_MIRROR_MB`, 1024).
+//! The KV-mirror CEILING (M2.7): bounds both the arena's grow-on-demand size (256MB start,
+//! hard max 4096MB — the batch row table's uint32 offsets) and the resident-bytes LRU eviction
+//! of idle sessions' mirrors. Negative restores the env default (`DASLLAMA_METAL_KV_MIRROR_MB`,
+//! else 4096).
 def public set_metal_decode_mirror_cap_mb(v : int) {
     g_mirror_cap_mb = v
 }
@@ -551,9 +555,15 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
         }
     }
     if (!key_exists(g_mirrors, s.uid)) {
+        // the mirror cap is a CEILING (M2.7): the arena starts small and grows on demand up to
+        // clamp(cap, 64, 4096)MB — 4096MB is a HARD max (the batch row table's uint32 arena
+        // offsets rely on arena size <= 2^32). Growth releases every mirror and reallocates;
+        // the watermark contract re-uploads from the CPU cache, so a rebuild only costs the
+        // next steps' re-mirror. Growth never runs while a batch step holds pinned rows.
+        let ceil_mb = uint64(clamp(g_mirror_cap_mb >= 0 ? g_mirror_cap_mb : env_int("DASLLAMA_METAL_KV_MIRROR_MB", 4096), 64, 4096))
+        let ceil_bytes = ceil_mb * 1024ul * 1024ul
         if (g_arena == null) {
-            let mb = uint64(clamp(env_int("DASLLAMA_METAL_KV_MIRROR_MB", 1024), 64, 4096))
-            g_arena_bytes = mb * 1024ul * 1024ul
+            g_arena_bytes = min(256ul * 1024ul * 1024ul, ceil_bytes)
             g_arena = metal_new_buffer(g_dev, g_arena_bytes)
             g_arena_free |> clear()
             g_arena_free |> push((off = 0ul, size = g_arena_bytes))
@@ -576,17 +586,39 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
                 }
             }
             if (victim == 0ul) {
-                return (ok = false, koff = 0ul, voff = 0ul, cap = 0l)
+                // nothing left to evict — grow the arena toward the ceiling (rebuild: every
+                // mirror re-uploads via its watermark; the epoch bump invalidates any
+                // pre-encoded step whose kernels reference the OLD arena buffer), unless a
+                // batch step holds pinned rows
+                let want = max(g_arena_bytes * 2ul, kbytes + vbytes)
+                if (!empty(g_pin) || g_arena_bytes >= ceil_bytes || kbytes + vbytes > ceil_bytes) {
+                    return (ok = false, koff = 0ul, voff = 0ul, cap = 0l)
+                }
+                for (mr in values(g_mirrors)) {
+                    mirror_release(mr)
+                }
+                unsafe {
+                    delete g_mirrors
+                }
+                g_mirror_bytes = 0ul
+                metal_release(g_arena)
+                g_arena_bytes = min(want, ceil_bytes)
+                g_arena = metal_new_buffer(g_dev, g_arena_bytes)
+                g_arena_free |> clear()
+                g_arena_free |> push((off = 0ul, size = g_arena_bytes))
+                g_arena_epoch++
+                to_log(LOG_INFO, "dasLLAMA metal decode: KV mirror arena grown to {int(g_arena_bytes / (1024ul * 1024ul))}MB (ceiling {int(ceil_mb)}MB)\n")
+            } else {
+                mirror_release(g_mirrors[victim])
+                g_mirrors |> erase(victim)
             }
-            mirror_release(g_mirrors[victim])
-            g_mirrors |> erase(victim)
             off = arena_alloc(kbytes + vbytes)
         }
         let mr = KVMirror(uid = s.uid, kdt = s.kv_dtype_k, vdt = s.kv_dtype_v, cap_rows = cap,
             koff = uint64(off), voff = uint64(off) + kbytes, bytes = kbytes + vbytes)
         g_mirror_bytes += mr.bytes
         g_mirrors[s.uid] = mr
-        let cap_mb = uint64(g_mirror_cap_mb >= 0 ? g_mirror_cap_mb : env_int("DASLLAMA_METAL_KV_MIRROR_MB", 1024))
+        let cap_mb = uint64(g_mirror_cap_mb >= 0 ? g_mirror_cap_mb : env_int("DASLLAMA_METAL_KV_MIRROR_MB", 4096))
         mirror_evict_to_cap(cap_mb * 1024ul * 1024ul, s.uid)
     }
     g_tick++

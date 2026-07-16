@@ -856,10 +856,11 @@ def test_metal_decode_parity(t : T?) {
             {
                 var trd <- load_model(path, QuantMode.q8)
                 trd.config.seq_len = min(trd.config.seq_len, 2176l)
-                var deep_p <- encode(trd, counting_prompt(1, 620), true, false)
-                if (int64(length(deep_p)) > 2030l) {
-                    deep_p |> resize(2030)
-                }
+                var deep_p <- encode(trd, counting_prompt(1, 700), true, false)
+                // the guard is load-bearing: a shorter prompt makes every "past 2048" claim below
+                // vacuous (counting to 620 tokenized to only 1860 — the arm silently tested nothing)
+                t |> success(int64(length(deep_p)) >= 2030l, "deep prompt reaches 2030 tokens")
+                deep_p |> resize(2030)
                 let dcpu16 <- continuation(trd, deep_p, 40, KVDtype.f16)
                 select_decode_override("metal")
                 before = metal_decode_stats().decodes
@@ -879,11 +880,12 @@ def test_metal_decode_parity(t : T?) {
                 let path3d = path_join(models_dir(), "Llama-3.2-3B-Instruct-Q8_0.gguf")
                 if (stat(path3d).is_valid) {
                     var trd3 <- load_model(path3d, QuantMode.q8)
-                    trd3.config.seq_len = min(trd3.config.seq_len, 2176l)
-                    var deep_p3 <- encode(trd3, counting_prompt(1, 620), true, false)
-                    if (int64(length(deep_p3)) > 2030l) {
-                        deep_p3 |> resize(2030)
-                    }
+                    // seq 4224 makes the mirror slice ~470MB: the fresh 256MB arena MUST grow
+                    // (M2.7 grow-on-demand exercised under parity — the rebuild re-mirrors)
+                    trd3.config.seq_len = min(trd3.config.seq_len, 4224l)
+                    var deep_p3 <- encode(trd3, counting_prompt(1, 700), true, false)
+                    t |> success(int64(length(deep_p3)) >= 2030l, "deep partD prompt reaches 2030 tokens")
+                    deep_p3 |> resize(2030)
                     let d3cpu <- continuation(trd3, deep_p3, 40, KVDtype.f16)
                     select_decode_override("metal")
                     before = metal_decode_stats().decodes

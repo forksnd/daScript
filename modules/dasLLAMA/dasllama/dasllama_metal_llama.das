@@ -183,8 +183,9 @@ struct private StepRes {
                           // parked committed across an idle gap trips the GPU watchdog)
     cb : MetalCommandBuffer?
     btok : MetalBuffer?   // the argmax winner (spec steps; read back to verify the prediction)
-    koff : uint64         // mirror arena offsets captured at encode time (rebuilds can't
-    voff : uint64         // intervene: the slow path discards the pre-step before mirror_prepare)
+    koff : uint64         // mirror arena offsets captured at encode time; arena_epoch pins the
+    voff : uint64         // BUFFER those offsets index (a grow-rebuild frees it — stale pre-steps discard)
+    arena_epoch : int64
     cap : int64
     bx : MetalBuffer?
     bxb : MetalBuffer?
@@ -240,7 +241,7 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     let h2 = 2l * hidden
     var r = StepRes(valid = true, pos = pos, uid = s.uid,
         kdt = s.kv_dtype_k, s16 = t.wscale_f16,
-        koff = koff, voff = voff, cap = cap,
+        koff = koff, voff = voff, cap = cap, arena_epoch = g_arena_epoch,
         bytes_x = uint64(dim * 4l), bytes_q = uint64(qd * 4l), bytes_qkv = uint64(qkvd * 4l),
         bytes_h2 = uint64(h2 * 4l), bytes_tab = uint64((head_size / 2l) * 4l),
         bytes_log = uint64(c.vocab_size * 4l))
@@ -672,7 +673,8 @@ def metal_decode_forward(t : Model; var s : Session; token, pos : int64) : bool 
         return false
     }
     if (!(g_pre.valid && g_pre.uid == s.uid && g_pre.pos == pos &&
-            g_pre.kdt == s.kv_dtype_k && g_pre.s16 == t.wscale_f16)) {
+            g_pre.kdt == s.kv_dtype_k && g_pre.s16 == t.wscale_f16 &&
+            g_pre.arena_epoch == g_arena_epoch)) {
         discard_pre()
         return metal_decode_slow(t, s, pos)
     }
