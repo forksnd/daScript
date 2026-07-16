@@ -5,7 +5,7 @@ options gen2
 // failure produces error 30111 = "macro [sql_table] failed to apply to the
 // structure". Validation is fail-fast (first error aborts that struct's
 // apply()) so each struct contributes exactly one error.
-expect 20800:12
+expect 20800:13
 
 require daslib/sql
 require sqlite/sqlite_boost
@@ -138,6 +138,16 @@ struct C12 {
     @sql_primary_key Id : int
     @sql_references = "C12NoPk"
     ParentId : int
+}
+
+// 13. @sql_unique on a generated column — use an explicit [sql_index] only
+//     when the target provider supports indexing that expression.
+[sql_table(name = "C13")]
+struct C13 {
+    @sql_primary_key Id : int
+    @sql_unique
+    @sql_computed = "Id * 2"
+    DoubleId : int
 }
 
 [export]

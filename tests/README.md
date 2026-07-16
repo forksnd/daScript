@@ -232,7 +232,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_54_upsert_single_col.das | `_sql_upsert(row, _.Col, set_dict)` single-column ON CONFLICT key (insert vs merge branch, _excluded reference) | |
 | test_55_upsert_composite.das | `_sql_upsert` multi-column composite conflict keys via tuple `(_.Email, _.Tenant)` | |
 | test_56_upsert_returning.das | `_sql_upsert_returning` UPSERT ... RETURNING (post-merge row on conflict, fresh row on insert) | |
-| test_57_sql_unique.das | `@sql_unique` column annotation (DDL emission, constraint enforcement, distinct values allowed) | |
+| test_57_sql_unique.das | `@sql_unique` portable generated-index emission, named-table rewrite, constraint enforcement, distinct values allowed | |
 | test_58_sql_references.das | `@sql_references` / `@sql_on_delete` foreign-key relationships (DDL REFERENCES clause, CASCADE delete semantics) | |
 | test_59_sql_index.das | `[sql_index]` DDL emission (single-col, composite, unique indexes with auto-naming) | |
 | test_60_defaults_computed.das | Defaults (native field init → DEFAULT, `@sql_default_fn` built-ins) and computed columns (`@sql_computed` VIRTUAL/STORED) | |
@@ -271,7 +271,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_sql_json_blob_kind_collision.das | Payload type kind collision rejection (same type in `@sql_json` vs `@sql_blob`) | **expect** `30111:3` |
 | failed_sql_macro.das | `_sql` / `_sql_text` analyzer failures (22 malformed chains: invalid roots, duplicate modifiers, unsupported expressions) | **expect** `40104:22, 30304:2, 30503:2` |
 | failed_sql_pragma_vacuum.das | `_sql_pragma` / `_sql_vacuum_into` argument-shape validation (wrong types, arg counts) | **expect** `40104:5` |
-| failed_sql_table_schema.das | `[sql_table]` schema-validation failures (computed+PK collision, defaults+initializers, FK actions, reference resolution) | **expect** `30111:12` |
+| failed_sql_table_schema.das | `[sql_table]` schema-validation failures (computed+PK/UNIQUE collisions, defaults+initializers, FK actions, reference resolution) | **expect** `20800:13` |
 | failed_sql_update_delete.das | `_sql_update` / `_sql_delete` analyzer failures (wrong arity, non-type args, typos, duplicate columns) | **expect** `40104:7` |
 | failed_sql_upsert.das | `_sql_upsert` analyzer failures (wrong arity, on_conflict/do_update validation, duplicate columns) | **expect** `40104:10` |
 | failed_sql_view_mutations.das | `_sql_update` / `_sql_delete` / `_sql_upsert` against `[sql_view]` types (read-only rejection) | **expect** `40104:8` |

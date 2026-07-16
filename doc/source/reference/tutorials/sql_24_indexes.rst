@@ -10,12 +10,14 @@ SQL-24 --- Indexes
     single: Tutorial; index
     single: Tutorial; CREATE INDEX
     single: Tutorial; sql_index
+    single: Tutorial; sql_unique
     single: Tutorial; UNIQUE INDEX
     single: Tutorial; composite index
 
-``[sql_index]`` is a sibling annotation to ``[sql_table]``: each
-``[sql_index]`` emits one ``CREATE [UNIQUE] INDEX`` statement, run
-right after the ``CREATE TABLE`` inside the same transaction.
+``@sql_unique`` is the concise field-level form for one-column
+uniqueness. ``[sql_index]`` is the configurable sibling annotation for
+named, non-unique, unique, and composite indexes. Both emit portable
+``CREATE [UNIQUE] INDEX`` statements after ``CREATE TABLE``.
 
 Sibling-annotation shape
 ========================
@@ -32,6 +34,7 @@ with ``[sql_table]`` first.
     struct User {
         @sql_primary_key Id : int
         Email : string
+        @sql_unique
         Name : string
         City : string
         LastSeen : int64
@@ -58,6 +61,7 @@ DDL emitted
 .. code-block:: text
 
     CREATE TABLE "Users" (...);
+    CREATE UNIQUE INDEX "uq_Users_Name" ON "Users" ("Name");
     CREATE UNIQUE INDEX "idx_Users_Email" ON "Users" ("Email");
     CREATE INDEX "idx_Users_City_LastSeen" ON "Users" ("City", "LastSeen");
     CREATE INDEX "ix_users_lastseen" ON "Users" ("LastSeen");
@@ -68,6 +72,28 @@ and asserts.
 .. code-block:: das
 
     let idx_sql = _sql_create_indexes_sql(type<User>)
+
+Field-level single-column uniqueness
+====================================
+
+``@sql_unique`` creates a provider-neutral UNIQUE INDEX with the
+generated name ``uq_<table>_<column>``. It goes through
+``_sql_create_indexes_sql`` instead of being embedded in SQLite-style
+column DDL, so the same annotation is enforced by SQLite, DuckDB, and
+PostgreSQL.
+
+.. code-block:: das
+
+    struct User {
+        @sql_primary_key Id : int
+        @sql_unique
+        Name : string
+    }
+
+    // CREATE UNIQUE INDEX "uq_Users_Name" ON "Users" ("Name")
+
+Use ``[sql_index(fields = "Name", unique = true, name = "...")]``
+instead when the index name must be controlled explicitly.
 
 Indexes are transparent at the query side
 =========================================
@@ -104,10 +130,9 @@ is how you declare one --- there is no separate
 ``[sql_unique]`` table-level annotation.
 
 Single-column uniqueness can use either ``@sql_unique`` on the field
-(emits ``UNIQUE`` directly in the column DDL) or
-``[sql_index(unique = true, fields = "Col")]`` (separate
-``CREATE UNIQUE INDEX``). Both work for the upsert path; the index
-form is preferable when you also need to control the index name.
+or ``[sql_index(unique = true, fields = "Col")]``. Both work on
+SQLite, DuckDB, and PostgreSQL and both satisfy the upsert conflict
+target. The index form is preferable when you need to control its name.
 
 .. seealso::
 

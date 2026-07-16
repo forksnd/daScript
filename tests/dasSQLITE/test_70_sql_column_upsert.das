@@ -25,10 +25,13 @@ struct Counter {
 [test]
 def test_create_table_uses_renamed_unique_column(t : T?) {
     let ddl = _::_sql_create_table_sql(type<Counter>)
-    t |> success(ddl |> find("\"for\" TEXT NOT NULL UNIQUE") >= 0,
-        "renamed UNIQUE column shows up as 'for' in DDL")
+    t |> success(ddl |> find("\"for\" TEXT NOT NULL") >= 0,
+        "renamed column shows up as 'for' in table DDL")
     t |> success(ddl |> find("\"col_for\"") < 0,
         "daslang field 'col_for' must NOT appear in DDL")
+    t |> equal(_::_sql_create_indexes_sql(type<Counter>),
+        "CREATE UNIQUE INDEX \"uq_Counters_for\" ON \"Counters\" (\"for\")",
+        "@sql_unique uses the renamed SQL column in its portable index")
 }
 
 [test]

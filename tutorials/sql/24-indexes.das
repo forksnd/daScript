@@ -6,10 +6,13 @@ require daslib/sql_linq
 
 // Tutorial 24 — indexes: declaring `CREATE INDEX` from struct annotations.
 //
-// SHAPE: `[sql_index(fields = ..., unique = ..., name = ...)]` is a
-// sibling annotation alongside `[sql_table]`. Both must live in the
-// **same** bracket pair, comma-separated, and `[sql_table]` must come
-// first — `[sql_index]` rewrites a helper that `[sql_table]` emits.
+// `@sql_unique` is the concise single-column form. It emits a portable
+// `CREATE UNIQUE INDEX` through the same helper used by `[sql_index]`.
+//
+// SHAPE: `[sql_index(fields = ..., unique = ..., name = ...)]` is the
+// configurable sibling annotation alongside `[sql_table]`. Both must
+// live in the **same** bracket pair, comma-separated, and `[sql_table]`
+// must come first — `[sql_index]` rewrites a helper emitted there.
 //
 //   [sql_table(name = "Users"),
 //    sql_index(fields = "Email", unique = true),
@@ -37,6 +40,7 @@ require daslib/sql_linq
 struct User {
     @sql_primary_key Id : int
     Email : string
+    @sql_unique
     Name : string
     City : string
     LastSeen : int64
@@ -51,6 +55,7 @@ def main {
         // creation back).
         // SQL emitted:
         //   CREATE TABLE "Users" (...);
+        //   CREATE UNIQUE INDEX "uq_Users_Name" ON "Users" ("Name");
         //   CREATE UNIQUE INDEX "idx_Users_Email" ON "Users" ("Email");
         //   CREATE INDEX "idx_Users_City_LastSeen" ON "Users" ("City", "LastSeen");
         //   CREATE INDEX "ix_users_lastseen" ON "Users" ("LastSeen");
@@ -108,7 +113,7 @@ def main {
 // separate `[sql_unique]` table-level annotation.
 //
 // Single-column uniqueness can use either `@sql_unique` on the field
-// (emits `UNIQUE` directly in the column DDL) or `[sql_index(unique =
-// true, fields = "Col")]` (separate `CREATE UNIQUE INDEX`). Both work
-// for the upsert path; the index form is preferable when you also need
-// to control the index name.
+// (portable generated name `uq_<table>_<column>`) or
+// `[sql_index(unique = true, fields = "Col")]` (configurable index
+// name). Both work on SQLite, DuckDB, and PostgreSQL and both satisfy
+// the upsert conflict-target requirement.

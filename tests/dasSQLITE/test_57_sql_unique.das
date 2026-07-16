@@ -18,14 +18,19 @@ def private fixture(db : SqlRunner) {
 }
 
 [test]
-def test_unique_emitted_in_ddl(t : T?) {
-    let ddl = _sql_create_table_sql(type<User>)
-    t |> success(ddl |> ends_with("\"Email\" TEXT NOT NULL UNIQUE, \"Name\" TEXT NOT NULL)"),
-                 "@sql_unique appends UNIQUE to the column declaration")
+def test_unique_emitted_as_portable_index(t : T?) {
+    let table_ddl = _sql_create_table_sql(type<User>)
+    t |> success(table_ddl |> find("\"Email\" TEXT NOT NULL UNIQUE") < 0,
+        "@sql_unique is emitted through the provider-neutral index helper")
+    t |> equal(_sql_create_indexes_sql(type<User>),
+        "CREATE UNIQUE INDEX \"uq_Users_Email\" ON \"Users\" (\"Email\")")
+    t |> equal(_::_sql_create_indexes_sql(default<User>, "UsersNext"),
+        "CREATE UNIQUE INDEX \"uq_UsersNext_Email\" ON \"UsersNext\" (\"Email\")",
+        "named-table helper rewrites both the table and generated index name")
 }
 
 [test]
-def test_unique_constraint_rejects_duplicate(t : T?) {
+def test_unique_index_rejects_duplicate(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture(db)
         let r = db |> try_insert(User(Id = 2, Email = "a@x.com", Name = "anne"))

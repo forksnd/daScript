@@ -126,7 +126,7 @@ Field annotations:
 |---|---|
 | `@sql_primary_key` | INTEGER PRIMARY KEY (AUTOINCREMENT for `int`); rejected on `Option<T>` and `@sql_computed` |
 | `@sql_column = "..."` | Rename the on-disk column (escape hatch for daslang field names that clash with SQL keywords or the existing schema) |
-| `@sql_unique` | Single-column UNIQUE in the column DDL |
+| `@sql_unique` | Single-column UNIQUE via portable generated index `uq_<table>_<column>` |
 | `@sql_references = "Parent"` | Foreign key to another `[sql_table]` struct's primary key |
 | `@sql_on_delete` / `@sql_on_update` | One of `cascade` / `set_null` / `set_default` / `restrict` / `no_action`. Only valid with `@sql_references` |
 | `@sql_default_fn = "FN"` | Whitelisted SQL built-in (`CURRENT_TIMESTAMP` / `CURRENT_DATE` / `CURRENT_TIME`); emits ` DEFAULT FN` |
@@ -144,7 +144,7 @@ Sibling annotation `[sql_index(fields = ..., unique = ..., name = ...)]` lives i
 struct UserAcct { ... }
 ```
 
-`fields` is a single string or a tuple of strings. `unique` defaults to `false`. `name` defaults to `idx_<table>_<col1>_<col2>`. Multiple `[sql_index]` lines are stackable. Composite UNIQUE via `[sql_index(unique = true, fields = (...))]` is the prerequisite for `_sql_upsert` composite-conflict targets.
+`fields` is a single string or a tuple of strings. `unique` defaults to `false`. `name` defaults to `idx_<table>_<col1>_<col2>`. Multiple `[sql_index]` lines are stackable. `@sql_unique` uses the same provider-neutral index rail for the one-column case; `[sql_index]` adds explicit naming and composite keys. Composite UNIQUE via `[sql_index(unique = true, fields = (...))]` is the prerequisite for `_sql_upsert` composite-conflict targets.
 
 `db |> create_table(type<T>)` issues the CREATE TABLE + every `[sql_index]` DDL. `db |> drop_table_if_exists(type<T>)` is the idempotent teardown. `db |> check_schema(type<T>)` validates the open DB matches the struct on (name, type, NOT NULL, PRIMARY KEY) — recommended startup pattern for code that opens a DB it didn't just create.
 
