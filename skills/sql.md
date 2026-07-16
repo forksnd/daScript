@@ -313,9 +313,18 @@ db |> _sql_upsert(
     UserAcct(Id = 999, Email = "x@y.com", Name = "alice2", Tenant = "acme"),
     tuple(_.Email, _.Tenant),
     (Name = _excluded.Name))
+
+// Default integer PK is unset: omit it so the provider auto-assigns it.
+// Useful when conflict targets another UNIQUE column.
+let inserted <- db |> _sql_upsert_returning(
+    WordHit(Id = 0, Word = "new", Hits = 1, Last = 1234l),
+    _.Word,
+    (Hits = _.Hits + _excluded.Hits))
 ```
 
 Each macro has the four-way fan-out: `_sql_update` / `_sql_try_update` / `_sql_update_returning` / `_sql_try_update_returning`, parallel for `_sql_delete` and `_sql_upsert`.
+
+For `_sql_upsert`, a default-valued integer `@sql_primary_key` is treated as unset just like `insert`: the macro omits that column so SQLite can assign rowid, DuckDB can draw from its sequence, and PostgreSQL can use its identity column. Explicit non-default primary keys remain in the INSERT. This applies to strict/`try_` and returning/non-returning variants.
 
 The `_sql_` prefix is deliberate — it carries SQL provenance to the call site and avoids name collisions with hypothetical future non-SQL `_update` / `_delete` macros. Function siblings stay unprefixed (`update` / `delete_` / `delete_by_id`).
 

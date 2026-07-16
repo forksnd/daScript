@@ -23,7 +23,8 @@ require daslib/sql_linq
 // `tuple(_.A, _.B)` and the underlying UNIQUE constraint must be a
 // composite index (see tutorial 24).
 
-[sql_table(name = "WordHits")]
+[sql_table(name = "WordHits"),
+ sql_index(fields = "Word", unique = true)]
 struct WordHit {
     @sql_primary_key Id : int
     Word : string
@@ -88,6 +89,24 @@ def main {
             _.Id,
             (Hits = _.Hits + 1, Last = _excluded.Last))
         to_log(LOG_INFO, "single-key upsert touched {bumped} row(s)\n")
+
+        // Auto-assigned integer primary key -------------------------------
+        // Id=0 is the same "unset primary key" convention used by insert().
+        // When the conflict target is another UNIQUE column, `_sql_upsert`
+        // omits Id from INSERT so the provider assigns it. This is portable:
+        // SQLite uses rowid, DuckDB a sequence, PostgreSQL an identity.
+        let created <- db |> _sql_upsert_returning(
+            WordHit(Id = 0, Word = "automatic", Hits = 1, Last = 2000l),
+            _.Word,
+            (Hits = _.Hits + _excluded.Hits, Last = _excluded.Last))
+        to_log(LOG_INFO, "auto-assigned upsert Id = {created[0].Id}\n")
+
+        // The same UNIQUE Word now takes the UPDATE path. Id=0 remains
+        // omitted and never overwrites the stored primary key.
+        db |> _sql_upsert(
+            WordHit(Id = 0, Word = "automatic", Hits = 4, Last = 3000l),
+            _.Word,
+            (Hits = _.Hits + _excluded.Hits, Last = _excluded.Last))
 
         // Composite conflict target — `tuple(_.Email, _.Tenant)` resolves
         // against the UNIQUE index on `(Email, Tenant)` declared on the

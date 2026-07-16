@@ -5331,50 +5331,29 @@ def private analyze_upsert_set_clause(var setExpr : ExpressionPtr; var rootT : T
 }
 
 [macro_function]
-def private emit_upsert_body(prog : ProgramPtr; var call : ExprCallMacro?;
-                             var rootT : TypeDeclPtr;
-                             isTry : bool; isReturning : bool) : ExpressionPtr {
-    if (rootT == null || rootT.structType == null) {
-        macro_error(prog, call.at, "_sql_upsert: row type must be a [sql_table] struct (got {describe(rootT)})")
-        return null
+def private build_upsert_sql(rootT : TypeDeclPtr; tableName : string;
+                             conflictCols : array<string>;
+                             setSqlClauses : array<string>;
+                             includePk : bool; isReturning : bool;
+                             var nRowBinds : int&) : string {
+    var insertCols : array<string>
+    for (field in rootT.structType.fields) {
+        if (is_field_computed(field)) continue
+        let isPk = find_annotation(field.annotation, "sql_primary_key", false)
+        if (!includePk && isPk) continue
+        insertCols |> push(field_to_column_name(rootT, string(field.name)))
     }
-    var st = rootT.structType
-    var dbE = call.arguments[0]
-    var rowE = call.arguments[1]
-    var conflictE = call.arguments[2]
-    var doUpdateE = call.arguments[3]
-    let tableName = sql_table_name_from_type(rootT)
-    let provIdx = find_sql_provider_by_runner(dbE._type)
-    if (provIdx < 0) {
-        macro_error(prog, call.at, "_sql_upsert: no SQL provider registered for runner type {describe(dbE._type)} (registered: {sql_provider_names()})")
-        return null
-    }
-    // 1) on_conflict columns
-    var conflictCols : array<string>
-    if (!analyze_upsert_conflict_inner(conflictE, rootT, conflictCols, prog, call.at)) return null
-    // 2) do_update SET clauses (with upsertMode=true so `_excluded.Col` resolves)
-    var setSqlClauses : array<string>
-    var setBindExprs : array<ExpressionPtr>
-    if (!analyze_upsert_set_clause(doUpdateE, rootT, tableName, provIdx, setSqlClauses, setBindExprs, prog, call.at)) return null
-    // 3) INSERT column list (non-computed only) — SQL-side names, positional bind indices.
-    var nonComputedCols : array<string>
-    var nRowBinds = 0
-    for (f in st.fields) {
-        if (is_field_computed(f)) continue
-        nonComputedCols |> push(field_to_column_name(rootT, string(f.name)))
-        nRowBinds++
-    }
-    // 4) Assemble SQL. conflictCols arrive in daslang names — translate via field_to_column_name at emission.
+    nRowBinds = length(insertCols)
     var sql = build_string() $(var w) {
         w |> write("INSERT INTO \"{tableName}\" (")
-        for (i in range(length(nonComputedCols))) {
+        for (i in range(length(insertCols))) {
             if (i > 0) {
                 w |> write(", ")
             }
-            w |> write("\"{nonComputedCols[i]}\"")
+            w |> write("\"{insertCols[i]}\"")
         }
         w |> write(") VALUES (")
-        for (i in range(length(nonComputedCols))) {
+        for (i in range(length(insertCols))) {
             if (i > 0) {
                 w |> write(", ")
             }
@@ -5399,27 +5378,91 @@ def private emit_upsert_body(prog : ProgramPtr; var call : ExprCallMacro?;
     if (isReturning) {
         sql += build_returning_clause(rootT)
     }
-    // 5) Bind order: row binds (1..N_row) via `_sql_bind_row`, then SET binds (N_row+1..).
+    return sql
+}
+
+[macro_function]
+def private emit_upsert_variant(var dbE : ExpressionPtr; var rootT : TypeDeclPtr;
+                                sql : string; nRowBinds : int; includePk : bool;
+                                setBindExprs : array<ExpressionPtr>;
+                                isTry : bool; isReturning : bool;
+                                provIdx : int; at : LineInfo) : ExpressionPtr {
     var bindStmts : array<ExpressionPtr>
     bindStmts |> reserve(1 + length(setBindExprs))
     bindStmts |> push <| qmacro_expr(${
-        _::_sql_bind_row(_sql_stmt, $e(rowE), true);
+        _::_sql_bind_row(_sql_stmt, _sql_upsert_row, $v(includePk));
     })
     for (i in range(length(setBindExprs))) {
         let bindIdx = nRowBinds + i + 1
-        var be = setBindExprs[i]
         bindStmts |> push <| qmacro_expr(${
-            sql_bind_to_stmt(_sql_stmt, $v(bindIdx), $e(be));
+            sql_bind_to_stmt(_sql_stmt, $v(bindIdx), $e(setBindExprs[i]));
         })
     }
-    // Row binds come from `_sql_bind_row` (not enumerated as `?` walking targets); pass empty binds to fold.
     var noBinds : array<ExpressionPtr>
     var frags : array<SqlFrag>
     sql_to_frags(sql, noBinds, frags)
     var sqlExpr : ExpressionPtr
     var bindExprs : array<ExpressionPtr>
-    fold_to_builder(frags, provIdx, call.at, sqlExpr, bindExprs)
-    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, provIdx, call.at)
+    fold_to_builder(frags, provIdx, at, sqlExpr, bindExprs)
+    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, provIdx, at)
+}
+
+[macro_function]
+def private emit_upsert_body(prog : ProgramPtr; var call : ExprCallMacro?;
+                             var rootT : TypeDeclPtr;
+                             isTry : bool; isReturning : bool) : ExpressionPtr {
+    if (rootT == null || rootT.structType == null) {
+        macro_error(prog, call.at, "_sql_upsert: row type must be a [sql_table] struct (got {describe(rootT)})")
+        return null
+    }
+    var dbE = call.arguments[0]
+    var rowE = call.arguments[1]
+    var conflictE = call.arguments[2]
+    var doUpdateE = call.arguments[3]
+    let tableName = sql_table_name_from_type(rootT)
+    let provIdx = find_sql_provider_by_runner(dbE._type)
+    if (provIdx < 0) {
+        macro_error(prog, call.at, "_sql_upsert: no SQL provider registered for runner type {describe(dbE._type)} (registered: {sql_provider_names()})")
+        return null
+    }
+    // 1) on_conflict columns
+    var conflictCols : array<string>
+    if (!analyze_upsert_conflict_inner(conflictE, rootT, conflictCols, prog, call.at)) return null
+    // 2) do_update SET clauses (with upsertMode=true so `_excluded.Col` resolves)
+    var setSqlClauses : array<string>
+    var setBindExprs : array<ExpressionPtr>
+    if (!analyze_upsert_set_clause(doUpdateE, rootT, tableName, provIdx, setSqlClauses, setBindExprs, prog, call.at)) return null
+    // 3) Build both INSERT spellings. An unset integer primary key must be
+    // omitted so each provider's auto-assignment mechanism can run.
+    var nWithoutPk = 0
+    let sqlWithoutPk = build_upsert_sql(rootT, tableName, conflictCols, setSqlClauses,
+        false, isReturning, nWithoutPk)
+    var nWithPk = 0
+    let sqlWithPk = build_upsert_sql(rootT, tableName, conflictCols, setSqlClauses,
+        true, isReturning, nWithPk)
+    var withoutPkCall = emit_upsert_variant(clone_expression(dbE), rootT,
+        sqlWithoutPk, nWithoutPk, false, setBindExprs,
+        isTry, isReturning, provIdx, call.at)
+    var withPkCall = emit_upsert_variant(clone_expression(dbE), rootT,
+        sqlWithPk, nWithPk, true, setBindExprs,
+        isTry, isReturning, provIdx, call.at)
+    var dispatchT = clone_type(rootT)
+    dispatchT.flags.constant = true
+    var dispatchBlock : ExpressionPtr
+    if (isReturning) {
+        dispatchBlock = qmacro($(_sql_upsert_row : $t(dispatchT)) {
+            if (_::_sql_pk_is_unset(_sql_upsert_row)) {
+                return <- $e(withoutPkCall)
+            }
+            return <- $e(withPkCall)
+        })
+    } else {
+        dispatchBlock = qmacro($(_sql_upsert_row : $t(dispatchT)) =>
+            _::_sql_pk_is_unset(_sql_upsert_row) ? $e(withoutPkCall) : $e(withPkCall))
+    }
+    var res = qmacro(invoke($e(dispatchBlock), $e(rowE)))
+    res |> force_at(call.at)
+    return res
 }
 
 [call_macro(name="_sql_upsert")]

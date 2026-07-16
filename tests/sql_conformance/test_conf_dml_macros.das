@@ -9,7 +9,8 @@ options no_unused_function_arguments = false
 require dastest/testing_boost public
 require _conformance_provider
 
-[sql_table(name = "ConfHits")]
+[sql_table(name = "ConfHits"),
+ sql_index(fields = "Word", unique = true)]
 struct ConfHit {
     @sql_primary_key Id : int
     Word : string
@@ -77,6 +78,36 @@ def test_conf_sql_upsert(t : T?) {
             t |> equal(_sql(db |> select_from(type<ConfHit>) |> count()), 4)
         }
     }
+    t |> run("unset integer primary key is auto-assigned") @(t : T?) {
+        with_conf_db() $(db) {
+            db |> create_table(type<ConfHit>)
+            db |> _sql_upsert(
+                ConfHit(Id = 0, Word = "first", Hits = 1, Active = true),
+                _.Word,
+                (Hits = _excluded.Hits))
+            db |> _sql_upsert(
+                ConfHit(Id = 0, Word = "second", Hits = 2, Active = true),
+                _.Word,
+                (Hits = _excluded.Hits))
+            db |> _sql_upsert(
+                ConfHit(Id = 0, Word = "first", Hits = 7, Active = true),
+                _.Word,
+                (Hits = _excluded.Hits))
+            let tried = db |> _sql_try_upsert(
+                ConfHit(Id = 0, Word = "third", Hits = 3, Active = true),
+                _.Word,
+                (Hits = _excluded.Hits))
+            t |> success(tried |> is_ok)
+            t |> equal(tried |> unwrap, 1)
+            let rows <- _sql(db |> select_from(type<ConfHit>) |> _order_by(_.Id))
+            t |> equal(length(rows), 3)
+            t |> success(rows[0].Id != 0 && rows[1].Id != 0 && rows[2].Id != 0)
+            t |> success(rows[0].Id != rows[1].Id && rows[1].Id != rows[2].Id)
+            t |> equal(rows[0].Hits, 7)
+            t |> equal(rows[1].Hits, 2)
+            t |> equal(rows[2].Hits, 3)
+        }
+    }
 }
 
 [test]
@@ -100,6 +131,26 @@ def test_conf_returning(t : T?) {
             let gone <- db |> _sql_delete_returning(type<ConfHit>, _.Hits >= 5)
             t |> equal(length(gone), 1)
             t |> equal(gone[0].Word, "world")
+        }
+    }
+    t |> run("upsert returning auto-assigns an unset integer primary key") @(t : T?) {
+        with_conf_db() $(db) {
+            db |> create_table(type<ConfHit>)
+            let inserted <- db |> _sql_upsert_returning(
+                ConfHit(Id = 0, Word = "returning", Hits = 4, Active = true),
+                _.Word,
+                (Hits = _excluded.Hits))
+            t |> equal(length(inserted), 1)
+            t |> success(inserted[0].Id != 0)
+            let tried <- db |> _sql_try_upsert_returning(
+                ConfHit(Id = 0, Word = "try-returning", Hits = 5, Active = true),
+                _.Word,
+                (Hits = _excluded.Hits))
+            t |> success(tried |> is_ok)
+            let tried_rows <- tried |> unwrap
+            t |> equal(length(tried_rows), 1)
+            t |> success(tried_rows[0].Id != 0)
+            t |> success(tried_rows[0].Id != inserted[0].Id)
         }
     }
 }
