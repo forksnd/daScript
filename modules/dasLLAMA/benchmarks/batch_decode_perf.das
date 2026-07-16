@@ -171,7 +171,13 @@ def main() {
     if (g_fixed_tok >= 0l) {
         print("fixed-token protocol: {g_fixed_tok} (no per-step sampling)\n")
     }
-    if (has_env_variable("DASLLAMA_PIN_DECODE")) {
+    if (has_env_variable("DASLLAMA_METAL_MODE")) {
+        // the M3 mode rail: off | auto | required (auto = when_available). != off pins the
+        // portable backend itself; off leaves the default (repack) backend — the real CPU config
+        let mv = get_env_variable("DASLLAMA_METAL_MODE")
+        set_metal_mode(mv == "required" ? MetalMode.required : (mv == "auto" ? MetalMode.when_available : MetalMode.off))
+        print("metal mode: {mv}\n")
+    } elif (has_env_variable("DASLLAMA_PIN_DECODE")) {
         let dv = get_env_variable("DASLLAMA_PIN_DECODE")
         if (dv == "metal") {
             // measurement runs are MetalMode.required: a CPU fallback anywhere in the run
