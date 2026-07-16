@@ -324,11 +324,11 @@ def test_batch_decode_q4_fallback(t : T?) {
             return
         }
         var tr <- load_checkpoint(MODEL_PATH)
-        quantize_weights_q4(tr)  // all 2D weights -> Q4_0, tr.quant = q4 => eval_batch_ per-row path
+        quantize_weights_q4(tr)  // all 2D weights -> Q4_0, tr.quant = q4_0 => eval_batch_ per-row path
         let prev_fused = get_fused_decode()
         set_fused_decode(false)
         with_job_que() {
-            batch_vs_ref(t, tr, KVDtype.f32, 6l, 0.0, "q4")   // fallback IS forward(): bit-exact
+            batch_vs_ref(t, tr, KVDtype.f32, 6l, 0.0, "q4_0")   // fallback IS forward(): bit-exact
         }
         set_fused_decode(prev_fused)
         delete tr

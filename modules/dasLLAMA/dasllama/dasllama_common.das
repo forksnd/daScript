@@ -29,11 +29,12 @@ require daslib/strings_boost  // join() for the arch-registry diagnostic
 // allocator's power-of-2 rounding.
 
 //! Which weight representation forward routes its 2D matmuls through. fp32 is the default;
-//! q8/q4 select the quantized kernels (and the matching big-weight storage).
+//! q8 selects the fast integer rails (K-quant / mxfp4 / Q4_0 files keep their native planes);
+//! q4_0 is the legacy requant tier — weights held as q4_0 blocks, per-row kernels only.
 enum QuantMode {
     fp32
     q8
-    q4
+    q4_0
 }
 
 //! Per-weight storage format under a q8-mode load with native K-quant planes (kquant_native):
@@ -1104,7 +1105,7 @@ def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var 
             gguf_read_tensor_f32(m, bytes, name, scratch, 0l, n, src_off)
             quantize_q8_0_into(scratch, n, t.qblob, t.qscales, woff, woff / 32l)
         }
-    } elif (t.quant == QuantMode.q4) {
+    } elif (t.quant == QuantMode.q4_0) {
         if (gguf_tensor_type(m, name) == GGML_TYPE_Q4_0) {
             gguf_transcode_q4_0(m, bytes, name, t.q4blob, t.q4scales, woff / 2l, woff / 32l, n, src_off)
         } else {
@@ -1169,7 +1170,7 @@ def private load_dn_grouped(m : GGUFMeta; bytes : array<uint8> | #; var t : Mode
     let woff = t.dnout_offs[l]
     if (t.quant == QuantMode.q8) {
         quantize_q8_0_into(scratch, n, t.qblob, t.qscales, woff, woff / 32l)
-    } elif (t.quant == QuantMode.q4) {
+    } elif (t.quant == QuantMode.q4_0) {
         quantize_q4_0_into(scratch, n, t.q4blob, t.q4scales, woff / 2l, woff / 32l)
     } else {
         for (i in range64(n)) {
@@ -2268,7 +2269,7 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             t.qblob |> resize(sz.wblob_n)
             t.qscales |> reserve(sz.wblob_n / 32l)
             t.qscales |> resize(sz.wblob_n / 32l)
-        } elif (mode == QuantMode.q4) {
+        } elif (mode == QuantMode.q4_0) {
             t.q4blob |> reserve(sz.wblob_n / 2l)
             t.q4blob |> resize(sz.wblob_n / 2l)
             t.q4scales |> reserve(sz.wblob_n / 32l)
@@ -2586,7 +2587,7 @@ def quantize_weights_q4(var t : Model) {
     var qt <- quantize_q4_0(t.wblob, n)
     t.q4blob <- qt.q
     t.q4scales <- qt.scales
-    t.quant = QuantMode.q4
+    t.quant = QuantMode.q4_0
 }
 
 //! Resident memory footprint of a loaded model, in bytes, broken down by region. aux_fp32 is the
@@ -4538,7 +4539,7 @@ def private mm_b_f(var s : Session; var y : array<float>; t : Model; fmt : KqFmt
 def private mm(var y : array<float>; t : Model; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; n, d : int64) {
     if (t.quant == QuantMode.q8) {
         mm_at_q8(y, t, woff, x, xq, xs, n, d)
-    } elif (t.quant == QuantMode.q4) {
+    } elif (t.quant == QuantMode.q4_0) {
         mm_at_q4(y, t, woff, x, n, d)
     } else {
         mm_at(y, t, woff, x, n, d)
@@ -6382,7 +6383,7 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         }
         prof_add("moe_reduce", ts_red)
     } else {
-        // fp32 reference path: the per-expert loop (q4 never routes here — MoE loads are q8/fp32)
+        // fp32 reference path: the per-expert loop (q4_0 never routes here — MoE loads are q8/fp32)
         for (j in range64(k)) {
             let e = l * ne + s.moe_idx[j]
             let base = s.moe_idx[j] * ege
@@ -6942,7 +6943,7 @@ def forward(t : Model; var s : Session; token, pos : int64) {
         cls_softcap_chain(t, s, c.final_logit_softcap)
     } else {
         if (tied_f32) {
-            // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
+            // tied weights (fp32/q4_0 loads): the classifier IS the fp32 embedding table
             mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
         } elif (cls_fmt != KqFmt.q8) {
             // K-quant classifier (tied plane copy or untied kq output.weight)
@@ -7112,7 +7113,7 @@ def private mtp_prefill_warm(t : Model; var s : Session; tokens : array<int64>; 
 //! position's logits — else one position, plain-eval semantics. Advances ``n_past``; telemetry
 //! accumulates in ``mtp_drafted``/``mtp_accepted``. Output-invariant vs plain greedy decode by
 //! construction: the draft only gates acceptance. Falls back to a plain eval step (returning
-//! false) when the model has no head, the handoff is cold (fresh/foreign session), q4 mode has
+//! false) when the model has no head, the handoff is cold (fresh/foreign session), q4_0 mode has
 //! no batch rail, or the context can't fit two rows. Requires [[set_mtp_spec]] ON so prefills
 //! maintain the head's KV.
 def mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool {
@@ -7120,7 +7121,7 @@ def mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : int64&
     let pos = s.n_past
     // pos < 1: nothing evaled yet — the zero-init mtp_h_pos1 sentinel COLLIDES with pos == 0
     // (0 != 0 would pass the cold check and draft at row -1), so gate it explicitly
-    if (c.n_layer_nextn <= 0l || t.quant == QuantMode.q4 || pos < 1l || s.mtp_h_pos1 != pos
+    if (c.n_layer_nextn <= 0l || t.quant == QuantMode.q4_0 || pos < 1l || s.mtp_h_pos1 != pos
             || pos + 2l > c.seq_len) {
         forward(t, s, tok, pos)   // plain step (forward re-stashes the handoff for the next tick)
         s.n_past = pos + 1l
@@ -7162,8 +7163,8 @@ def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total
                         var n_drafted, n_accepted : int64&) : array<int64> {
     let c = t.config
     assert(c.n_layer_nextn > 0l)
-    if (t.quant == QuantMode.q4) {   // no batched prefill rail: the 2-row verify (and the warm) need it
-        panic("dasLLAMA: MTP self-spec decode needs the batched prefill path — load q8 or fp32, not q4")
+    if (t.quant == QuantMode.q4_0) {   // no batched prefill rail: the 2-row verify (and the warm) need it
+        panic("dasLLAMA: MTP self-spec decode needs the batched prefill path — load q8 or fp32, not q4_0")
     }
     let np = int64(length(prompt))
     var ids : array<int64>
@@ -9493,7 +9494,7 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
 }
 
 // MoE FFN, prefill: norm, then either the grouped expert-bucketed path (Q8, default) or the
-// per-position reference path through the decode scratch (fp32 models — q4 never prefills — and
+// per-position reference path through the decode scratch (fp32 models — q4_0 never prefills — and
 // the bit-identical A/B switch).
 def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
@@ -9536,7 +9537,7 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
 
 def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64) {
     let c = t.config
-    if (t.quant == QuantMode.q4 || npos <= 0l) {
+    if (t.quant == QuantMode.q4_0 || npos <= 0l) {
         for (p in range64(npos)) {
             forward(t, s, tokens[p], start_pos + p)
         }
@@ -9588,8 +9589,8 @@ def forward_prefill_embd(t : Model; var s : Session; embd : array<float>; npos, 
     if (npos <= 0l) {
         return
     }
-    if (t.quant == QuantMode.q4) {
-        panic("forward_prefill_embd: q4 mode has no batched prefill path (use q8 or fp32)")
+    if (t.quant == QuantMode.q4_0) {
+        panic("forward_prefill_embd: q4_0 mode has no batched prefill path (use q8 or fp32)")
     }
     if (int64(length(embd)) < npos * t.config.dim) {
         panic("forward_prefill_embd: embd has {length(embd)} floats — npos={npos} rows of dim={t.config.dim} need {npos * t.config.dim}")
@@ -9648,7 +9649,7 @@ def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int6
     if (npos <= 0l) {
         return
     }
-    if (t.quant != QuantMode.q4 && npos > 1l) {
+    if (t.quant != QuantMode.q4_0 && npos > 1l) {
         // batched prefill fills s.x_b (npos × dim residual) and leaves it intact; the body norms only
         // the last position, so re-apply the final RMSNorm to EVERY position and accumulate.
         forward_prefill(t, s, tokens, npos, 0l)
@@ -9657,7 +9658,7 @@ def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int6
             add_inplace(unsafe(addr(out[0])), unsafe(addr(s.xb[0])), dim)
         }
     } else {
-        // q4 (no batched prefill) or a single token: per-token forward leaves s.xb = post-final-norm hidden.
+        // q4_0 (no batched prefill) or a single token: per-token forward leaves s.xb = post-final-norm hidden.
         for (p in range64(npos)) {
             forward(t, s, tokens[p], p)
             add_inplace(unsafe(addr(out[0])), unsafe(addr(s.xb[0])), dim)
@@ -10055,7 +10056,7 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; sessions 
 //! scatter into sessions[i].logits, and each session advances by one. Sessions must be distinct,
 //! same-geometry (one model, equal cache sizes, uniform KV dtype; paged sessions share ONE pool —
 //! never mix paged and flat rows) and have room for one position. Ragged batches: pass only the
-//! still-active sessions (B may shrink between calls). B == 1, q4 weights, a non-std attention
+//! still-active sessions (B may shrink between calls). B == 1, q4_0 weights, a non-std attention
 //! arch, or the classic (non-table) rope path fall back to the exact per-row forward() loop.
 def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; tokens : array<int64>) {   // nolint:LINT014 — rows mutate THROUGH the pointers; a const array constifies the pointees
     let c = t.config
@@ -10092,10 +10093,10 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
             panic("eval_batch: sessions[{i}] cache size differs from sessions[0] — same model + same seq_len required")
         }
     }
-    // per-row fallback keeps every configuration correct: B == 1 keeps the fused decode chain, q4
+    // per-row fallback keeps every configuration correct: B == 1 keeps the fused decode chain, q4_0
     // has no batched kernels, non-std arches have no batch attention worker, and the classic rope
     // path can't express per-row positions
-    if (nrows == 1l || t.quant == QuantMode.q4 || !t.blocks.attn_is_std || !g_use_rope_table) {
+    if (nrows == 1l || t.quant == QuantMode.q4_0 || !t.blocks.attn_is_std || !g_use_rope_table) {
         for (i in range64(nrows)) {
             var sp = sessions[i]
             forward(t, *sp, tokens[i], sp.n_past)
@@ -10179,7 +10180,7 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         ws.logits_b |> resize(nrows * vocab)
         let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
         if (c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8) {
-            // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
+            // tied weights (fp32/q4_0 loads): the classifier IS the fp32 embedding table
             mm_fblob_b(ws.logits_b, t, t.tok_emb_off, ws.scr.xb_b, dim, vocab, nrows)
         } elif (cls_fmt != KqFmt.q8) {
             mm_b_kq(ws.scr, ws.logits_b, t, cls_fmt, t.wcls_off, ws.scr.xb_b, dim, vocab, nrows)

@@ -654,7 +654,9 @@ what it costs today and what the fix would change.
   test/ship parity for is Q8_0 on disk (plus gpt-oss MXFP4→Q8); no Q4_0 GGUF anywhere in the
   fixture set. q4 only fires when a user opts into `QuantMode q4` for footprint. Priority rises
   only if the MXFP4→Q4_0 halfway house above lands (q4 becomes the resident format of a real
-  20B model).
+  20B model). **RESOLVED DIFFERENTLY (2026-07-16):** Q4_0 *files* now serve natively on the kq
+  rails under q8 mode (KqFmt.q40, #3481) — batched prefill included; the legacy tier was renamed
+  `QuantMode.q4_0` and remains the requant-from-f32 footprint option, per-row kernels unchanged.
 - **LOW PRIORITY: f32 projection GEMM is untiled — dot-per-token, no token block.**
   `matmul_batch` (dasllama_math.das) is the exact pre-#3315 shape the Q8 path had: weight-
   stationary nest with one horizontal-reduce `dot()` per (row, token), zero register reuse

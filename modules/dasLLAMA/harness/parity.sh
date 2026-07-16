@@ -3,7 +3,8 @@
 #
 # Usage:   parity.sh <model.gguf> [N] [quant] [prompt] [kv] [ctk]
 #   N       generated tokens to compare (default 40)
-#   quant   dasLLAMA storage: fp32|q8|q4 — pick the file's native type (default q8; use fp32 for F16/F32)
+#   quant   dasLLAMA storage: fp32|q8|q4_0 — default q8 (K-quant/mxfp4/Q4_0 files serve their native
+#           planes under q8; use fp32 for F16/F32; q4_0 = legacy requant tier)
 #   prompt  raw continuation prompt (default "Once upon a time")
 #   kv      dasLLAMA KV-cache dtype: f32|f16|q8_0 (default f32)
 #   ctk     ORACLE KV-cache type: f16|q8_0 (default: llama.cpp's own default; pass q8_0 with kv=q8_0

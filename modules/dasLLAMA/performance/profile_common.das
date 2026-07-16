@@ -159,8 +159,8 @@ def quant_str(q : QuantMode) : string {
     if (q == QuantMode.q8) {
         return "q8"
     }
-    if (q == QuantMode.q4) {
-        return "q4"
+    if (q == QuantMode.q4_0) {
+        return "q4_0"
     }
     return "fp32"
 }
