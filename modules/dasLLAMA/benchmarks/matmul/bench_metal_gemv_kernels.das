@@ -1965,6 +1965,330 @@ class MetalKqLabK6B1D {
     }
 }
 
+// ===== K-quant batched mv arms (M2.1) — B x-streams through ONE weight pass =====
+// STATUS (2026-07-15, round 1 verdict): NEGATIVE so far — the weight-amortization thesis is
+// wrong for these shapes. The kq GEMV is ALU/ISSUE-bound, not BW-bound (b1c cls3b executes
+// ~94 G sg-instr/s at ~500 instrs per row-token; DRAM had headroom at 327 of ~400 GB/s), so
+// sharing the weight pass across streams saves bytes that were not the bottleneck while the
+// per-stream accumulator sets + w[32] block cost occupancy (0x200 vs 0x2c0) and drop the
+// execution rate ~1.75x. v4 (float4 x views, registered pre-folded weights, batch-load runs)
+// is ISA-clean — 362 instrs / 17 vector loads / 4 waits vs b1c's 393/17/3 — and still loses:
+// cls3b 2.37 ms vs 2 x b1c = 1.35. The stream-0-only control (k4_mvb2ctl, B=1) pins the split:
+// the 1-row/sg + w-register structure costs 0.976 vs b1c 0.677; the second stream adds 1.39.
+// Iteration levers, in order: (a) hoist the row-invariant min-side sums (sy = per-quarter
+// x-sums — every ROW recomputes identical values; a d-independent prepass kills ~25% of the
+// per-token ALU), (b) inline per-quarter dequant (8 live w regs, not 32) for occupancy,
+// (c) fp16 x panels (2x fma rate) — accuracy call. Production interim: B=2..8 as B separate
+// B1 dispatches per site (= the lcpp wall exactly; honest, GPU-only, no CPU fallback).
+// Address-alignment lesson (cost v1-v3 their 3-7x): a runtime-uniform term (b*ndim) in a
+// scalar-view index defeats LLVM's vector-load merge — it cannot prove 16B alignment. Bind a
+// float4 VIEW and index in float4 units; alignment holds by construction (the production q8
+// mv kernels' xs4 discipline).
+
+class MetalKqLabK4MvB2 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>  // float4 view: stream-strided reads stay provably 16B-aligned
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k4_mvb2_msl")]
+    def lab_k4_mvb2 {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u
+        let it = lane % 8u
+        let iq = it / 4u
+        let ir = it % 4u
+        let nb = ndim / 256u
+        let row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + ir * 8u
+            let blk = row * nb + ib
+            let sv = ks4[blk]
+            let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+            let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+            let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qb = blk * 32u + iq * 8u + ir * 2u
+            let q1a = kqu[qb]
+            let q1b = kqu[qb + 1u]
+            let q2a = kqu[qb + 16u]
+            let q2b = kqu[qb + 17u]
+            // dequant ONCE into quarter-major registers, mask folds pre-applied — the per-elem
+            // converts amortize across the B streams; the x side then reads consecutive runs
+            var w : float[32]
+            for [unroll_full] (i in range(4)) {
+                let sh = 16u * (uint(i) & 1u)
+                let q1 = ((i < 2 ? q1a : q1b) >> sh) & 0xFFFF
+                let q2 = ((i < 2 ? q2a : q2b) >> sh) & 0xFFFF
+                w[2 * i] = float(q1 & 0x000F)
+                w[2 * i + 1] = float(q1 & 0x0F00) * 0.00390625
+                w[8 + 2 * i] = float(q1 & 0x00F0) * 0.0625
+                w[8 + 2 * i + 1] = float(q1 & 0xF000) * 0.000244140625
+                w[16 + 2 * i] = float(q2 & 0x000F)
+                w[16 + 2 * i + 1] = float(q2 & 0x0F00) * 0.00390625
+                w[24 + 2 * i] = float(q2 & 0x00F0) * 0.0625
+                w[24 + 2 * i + 1] = float(q2 & 0xF000) * 0.000244140625
+            }
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            for [unroll_full] (b in range(2)) {
+                let xb4 = uint(b) * (ndim / 4u) + yb / 4u
+                var acc : float[4]
+                var sy : float[4]
+                for [unroll_full] (q4 in range(4)) {
+                    let qo4 = q4 == 0 ? 0u : (q4 == 1 ? 8u : (q4 == 2 ? 32u : 40u))
+                    let va = x[xb4 + qo4]
+                    let vb = x[xb4 + qo4 + 1u]
+                    acc[q4] += va.x * w[q4 * 8] + va.y * w[q4 * 8 + 1] + va.z * w[q4 * 8 + 2] + va.w * w[q4 * 8 + 3]
+                    acc[q4] += vb.x * w[q4 * 8 + 4] + vb.y * w[q4 * 8 + 5] + vb.z * w[q4 * 8 + 6] + vb.w * w[q4 * 8 + 7]
+                    sy[q4] += va.x + va.y + va.z + va.w + vb.x + vb.y + vb.z + vb.w
+                }
+                sumf[b] += dd * (acc[0] * float(sc0 & 255u) + acc[1] * float(sc0 >> 8u)
+                    + acc[2] * float(sc2 & 255u) + acc[3] * float(sc2 >> 8u))
+                sumf[b] -= dm * (sy[0] * float(sc1 & 255u) + sy[1] * float(sc1 >> 8u)
+                    + sy[2] * float(sc3 & 255u) + sy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (b in range(2)) {
+            let sm = simd_sum(sumf[b])
+            if (lane == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
+class MetalKqLabK4MvB2Ctl {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>  // float4 view: stream-strided reads stay provably 16B-aligned
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k4_mvb2ctl_msl")]
+    def lab_k4_mvb2ctl {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u
+        let it = lane % 8u
+        let iq = it / 4u
+        let ir = it % 4u
+        let nb = ndim / 256u
+        let row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + ir * 8u
+            let blk = row * nb + ib
+            let sv = ks4[blk]
+            let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+            let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+            let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qb = blk * 32u + iq * 8u + ir * 2u
+            let q1a = kqu[qb]
+            let q1b = kqu[qb + 1u]
+            let q2a = kqu[qb + 16u]
+            let q2b = kqu[qb + 17u]
+            // dequant ONCE into quarter-major registers, mask folds pre-applied — the per-elem
+            // converts amortize across the B streams; the x side then reads consecutive runs
+            var w : float[32]
+            for [unroll_full] (i in range(4)) {
+                let sh = 16u * (uint(i) & 1u)
+                let q1 = ((i < 2 ? q1a : q1b) >> sh) & 0xFFFF
+                let q2 = ((i < 2 ? q2a : q2b) >> sh) & 0xFFFF
+                w[2 * i] = float(q1 & 0x000F)
+                w[2 * i + 1] = float(q1 & 0x0F00) * 0.00390625
+                w[8 + 2 * i] = float(q1 & 0x00F0) * 0.0625
+                w[8 + 2 * i + 1] = float(q1 & 0xF000) * 0.000244140625
+                w[16 + 2 * i] = float(q2 & 0x000F)
+                w[16 + 2 * i + 1] = float(q2 & 0x0F00) * 0.00390625
+                w[24 + 2 * i] = float(q2 & 0x00F0) * 0.0625
+                w[24 + 2 * i + 1] = float(q2 & 0xF000) * 0.000244140625
+            }
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            for [unroll_full] (b in range(1)) {
+                let xb4 = uint(b) * (ndim / 4u) + yb / 4u
+                var acc : float[4]
+                var sy : float[4]
+                for [unroll_full] (q4 in range(4)) {
+                    let qo4 = q4 == 0 ? 0u : (q4 == 1 ? 8u : (q4 == 2 ? 32u : 40u))
+                    let va = x[xb4 + qo4]
+                    let vb = x[xb4 + qo4 + 1u]
+                    acc[q4] += va.x * w[q4 * 8] + va.y * w[q4 * 8 + 1] + va.z * w[q4 * 8 + 2] + va.w * w[q4 * 8 + 3]
+                    acc[q4] += vb.x * w[q4 * 8 + 4] + vb.y * w[q4 * 8 + 5] + vb.z * w[q4 * 8 + 6] + vb.w * w[q4 * 8 + 7]
+                    sy[q4] += va.x + va.y + va.z + va.w + vb.x + vb.y + vb.z + vb.w
+                }
+                sumf[b] += dd * (acc[0] * float(sc0 & 255u) + acc[1] * float(sc0 >> 8u)
+                    + acc[2] * float(sc2 & 255u) + acc[3] * float(sc2 >> 8u))
+                sumf[b] -= dm * (sy[0] * float(sc1 & 255u) + sy[1] * float(sc1 >> 8u)
+                    + sy[2] * float(sc3 & 255u) + sy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (b in range(2)) {
+            let sm = simd_sum(sumf[b])
+            if (lane == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
+class MetalKqLabK5MvB2 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqb : array<uint8>
+    @ssbo @binding = 3 x : array<float4>  // float4 view: stream-strided reads stay provably 16B-aligned
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k5_mvb2_msl")]
+    def lab_k5_mvb2 {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 4u
+        let ix = lane % 4u
+        let iq = tid / 4u
+        let ir = tid % 4u
+        let l0 = ir * 8u
+        let hb0 = 2u * iq
+        let nb = ndim / 256u
+        let row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + l0
+            let blk = row * nb + ib
+            let sv = ks4[blk]
+            let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+            let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+            let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qs0 = blk * 160u + iq * 32u + l0
+            let qh0 = blk * 160u + 128u + l0
+            var w : float[32]
+            for [unroll_full] (l in range(8)) {
+                let q1 = uint(kqb[qs0 + uint(l)])
+                let q2 = uint(kqb[qs0 + 64u + uint(l)])
+                let h = uint(kqb[qh0 + uint(l)]) >> hb0
+                w[l] = float((q1 & 0x0F) | ((h & 1u) << 4u))
+                w[8 + l] = float((q1 >> 4u) | ((h & 2u) << 3u))
+                w[16 + l] = float((q2 & 0x0F) | ((h & 16u) << 0u))
+                w[24 + l] = float((q2 >> 4u) | ((h & 32u) >> 1u))
+            }
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            for [unroll_full] (b in range(2)) {
+                let xb4 = uint(b) * (ndim / 4u) + yb / 4u
+                var acc : float[4]
+                var sy : float[4]
+                for [unroll_full] (q4 in range(4)) {
+                    let qo4 = q4 == 0 ? 0u : (q4 == 1 ? 8u : (q4 == 2 ? 32u : 40u))
+                    let va = x[xb4 + qo4]
+                    let vb = x[xb4 + qo4 + 1u]
+                    acc[q4] += va.x * w[q4 * 8] + va.y * w[q4 * 8 + 1] + va.z * w[q4 * 8 + 2] + va.w * w[q4 * 8 + 3]
+                    acc[q4] += vb.x * w[q4 * 8 + 4] + vb.y * w[q4 * 8 + 5] + vb.z * w[q4 * 8 + 6] + vb.w * w[q4 * 8 + 7]
+                    sy[q4] += va.x + va.y + va.z + va.w + vb.x + vb.y + vb.z + vb.w
+                }
+                sumf[b] += dd * (float(sc0 & 255u) * acc[0] + float(sc0 >> 8u) * acc[1]
+                    + float(sc2 & 255u) * acc[2] + float(sc2 >> 8u) * acc[3])
+                sumf[b] -= dm * (sy[0] * float(sc1 & 255u) + sy[1] * float(sc1 >> 8u)
+                    + sy[2] * float(sc3 & 255u) + sy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (b in range(2)) {
+            let sm = simd_sum(sumf[b])
+            if (lane == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
+class MetalKqLabK6MvB2 {
+    @ssbo @binding = 0 kdh : array<float16>
+    @ssbo @binding = 1 ksc : array<uint4>
+    @ssbo @binding = 2 kqb : array<uint8>
+    @ssbo @binding = 3 x : array<float4>  // float4 view: stream-strided reads stay provably 16B-aligned
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k6_mvb2_msl")]
+    def lab_k6_mvb2 {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 2u
+        let ix = lane % 2u
+        let ip = tid / 8u
+        let il = tid % 8u
+        let l0 = il * 4u
+        let o = (l0 / 16u) * 8u
+        let nb = ndim / 256u
+        let row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + ip * 128u + l0
+            let blk = row * nb + ib
+            let ql0 = blk * 192u + ip * 64u + l0
+            let qh0 = blk * 192u + 128u + ip * 32u + l0
+            var w : float[16]
+            for [unroll_full] (l in range(4)) {
+                let q1 = uint(kqb[ql0 + uint(l)])
+                let q2 = uint(kqb[ql0 + 32u + uint(l)])
+                let h = uint(kqb[qh0 + uint(l)])
+                w[l] = float((q1 & 0x0F) | ((h & 0x03) << 4u)) - 32.0
+                w[4 + l] = float((q2 & 0x0F) | ((h & 0x0C) << 2u)) - 32.0
+                w[8 + l] = float((q1 >> 4u) | (h & 0x30)) - 32.0
+                w[12 + l] = float((q2 >> 4u) | ((h & 0xC0) >> 2u)) - 32.0
+            }
+            let sv = ksc[blk]
+            let ulo = ip != 0u ? sv.z : sv.x
+            let uhi = ip != 0u ? sv.w : sv.y
+            let s0 = float(((int(ulo >> o) & 255) ^ 128) - 128)
+            let s2 = float(((int(ulo >> (o + 16u)) & 255) ^ 128) - 128)
+            let s4 = float(((int(uhi >> o) & 255) ^ 128) - 128)
+            let s6 = float(((int(uhi >> (o + 16u)) & 255) ^ 128) - 128)
+            let dd = float(kdh[blk])
+            for [unroll_full] (b in range(2)) {
+                let xb4 = uint(b) * (ndim / 4u) + yb / 4u
+                var acc : float[4]
+                for [unroll_full] (q4 in range(4)) {
+                    let v = x[xb4 + uint(q4) * 8u]
+                    acc[q4] += v.x * w[q4 * 4] + v.y * w[q4 * 4 + 1] + v.z * w[q4 * 4 + 2] + v.w * w[q4 * 4 + 3]
+                }
+                sumf[b] += dd * (acc[0] * s0 + acc[1] * s2 + acc[2] * s4 + acc[3] * s6)
+            }
+            ib += 2u
+        }
+        for [unroll_full] (b in range(2)) {
+            let sm = simd_sum(sumf[b])
+            if (lane == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
 // ===== driver (Apple-only; every Metal-typed helper is a generic so non-Apple never compiles it) =====
 
 struct private LabVariant {
@@ -2858,7 +3182,15 @@ def bench_metal_gemv_kernels(b : B?) {
             LabVariant(name = "k6_b1c", src = lab_k6_b1c_msl, entry = lab_k6_b1c_msl_entry,
                        b_list <- [1], kq = 6, kq16 = true, tgsz = 64),
             LabVariant(name = "k6_b1d", src = lab_k6_b1d_msl, entry = lab_k6_b1d_msl_entry,
-                       b_list <- [1], kq = 6, kq16 = true, tgsz = 64)
+                       b_list <- [1], kq = 6, kq16 = true, tgsz = 64),
+            LabVariant(name = "k4_mvb2", src = lab_k4_mvb2_msl, entry = lab_k4_mvb2_msl_entry,
+                       b_list <- [2], kq = 4, kq16 = true, tgsz = 64, rtg = 2),
+            LabVariant(name = "k4_mvb2ctl", src = lab_k4_mvb2ctl_msl, entry = lab_k4_mvb2ctl_msl_entry,
+                       b_list <- [1], kq = 4, kq16 = true, tgsz = 64, rtg = 2),
+            LabVariant(name = "k5_mvb2", src = lab_k5_mvb2_msl, entry = lab_k5_mvb2_msl_entry,
+                       b_list <- [2], kq = 5, kq16 = true, tgsz = 64, rtg = 2),
+            LabVariant(name = "k6_mvb2", src = lab_k6_mvb2_msl, entry = lab_k6_mvb2_msl_entry,
+                       b_list <- [2], kq = 6, kq16 = true, tgsz = 64, rtg = 2)
         ]
         run_lab(b, variants)
         delete variants
