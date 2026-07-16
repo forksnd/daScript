@@ -29,10 +29,11 @@ require _model_tier
 //   q8        f32     q8_0   ENGAGE               ENGAGE (W3)          ENGAGE (W3)
 //   q8        f32     tq4    ENGAGE               ENGAGE (W3)          ENGAGE (W3)
 //   q8        f16     f16    ENGAGE (W2)          ENGAGE               ENGAGE
-//   Q4_K_M    f32     f16    decline kquant_native ENGAGE (W4)          decline kquant_native
-//   Q4_K_M    f32     q8_0   decline kquant_native ENGAGE (W4)          decline kquant_native
-// (W4: single-stream decode serves K-quant weights via the per-site kq plane GEMVs; the batched
-// mv/GEMM forms and prefill mul_mm keep the kquant_native guard until their kq twins land.)
+//   Q4_K_M    f32     f16    decline kquant_native ENGAGE (W4)          ENGAGE B<=8 (M2.1)
+//   Q4_K_M    f32     q8_0   decline kquant_native ENGAGE (W4)          ENGAGE B<=8 (M2.1)
+// (W4: single-stream decode serves K-quant weights via the per-site kq plane GEMVs; M2.1: the
+// batched step serves kq at B <= 8 via nrows per-stream plane GEMVs — B >= 9 keeps the
+// kquant_native guard until the kq GEMM twins land, as does prefill until its mul_mm twins.)
 // The MetalMode knob (M1) rides the same matrix: off = overrides deselected, when_available =
 // engage/fallback per the cells above, required = a CAPABILITY decline panics (policy declines
 // — the prefill npos window — stay quiet CPU fallbacks).
@@ -280,8 +281,8 @@ def test_metal_support_matrix(t : T?) {
                 var trk <- load_model(kpath, QuantMode.q8)
                 trk.config.seq_len = min(trk.config.seq_len, 512l)
                 t |> success(trk.kquant_native, "Q4_K_M under a q8-mode load keeps native K-quant planes")
-                matrix_cell(t, trk, KVDtype.f16, "k4/s32/f16", "kquant_native", "", "kquant_native")
-                matrix_cell(t, trk, KVDtype.q8_0, "k4/s32/q8_0", "kquant_native", "", "kquant_native")
+                matrix_cell(t, trk, KVDtype.f16, "k4/s32/f16", "kquant_native", "", "")
+                matrix_cell(t, trk, KVDtype.q8_0, "k4/s32/q8_0", "kquant_native", "", "")
                 // the output half: GPU kq decode tokens must be the CPU truth
                 let kprompt <- encode(trk, counting_prompt(1, 30), true, false)
                 var cpu_ids : array<int64>
@@ -307,8 +308,8 @@ def test_metal_support_matrix(t : T?) {
                 delete gpu_ids
 
                 // ===== MetalMode.required on the kq model: capability declines PANIC =====
-                // single-stream decode (servable) runs; the >= min_npos prefill and the batched
-                // step (kq kernels pending on those paths) fail hard instead of falling back
+                // single-stream decode AND the B=2 batched step (both servable) run; the
+                // >= min_npos prefill (kq mul_mm pending) fails hard instead of falling back
                 with_job_que() {
                     setup_dasllama_jobque()
                     var sa = make_run_state(trk.config, KVDtype.f16, KVDtype.f16)
@@ -329,7 +330,6 @@ def test_metal_support_matrix(t : T?) {
                         pf_panicked = true
                     }
                     t |> success(pf_panicked, "required: kq prefill (>= min_npos) panics instead of CPU fallback")
-                    var ba_panicked = false
                     var ws <- create_batch_workspace_(trk)
                     var sess : array<Session?>
                     unsafe {
@@ -337,12 +337,10 @@ def test_metal_support_matrix(t : T?) {
                         sess |> push(addr(sb))
                     }
                     var cur <- [greedy_top(sa.logits, trk.config.vocab_size), greedy_top(sb.logits, trk.config.vocab_size)]
-                    try {
-                        eval_batch_(trk, ws, sess, cur)
-                    } recover {
-                        ba_panicked = true
-                    }
-                    t |> success(ba_panicked, "required: kq batched step panics instead of CPU fallback")
+                    let ba0 = metal_batch_decode_stats().steps
+                    eval_batch_(trk, ws, sess, cur)
+                    t |> success(metal_batch_decode_stats().steps - ba0 > 0l,
+                        "required: kq batched step serves on the GPU (M2.1 per-stream form)")
                     set_metal_mode(MetalMode.off)
                     sess |> clear()   // borrowed handles — delete of array<T?> cascades to the pointees
                     unsafe {

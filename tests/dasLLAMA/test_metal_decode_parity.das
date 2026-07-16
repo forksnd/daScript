@@ -610,6 +610,32 @@ def test_metal_batch_decode_parity(t : T?) {
                 feint("Llama-3.2-3B model not present; partD hs=128 arm skipped\n")
             }
 
+            // arm B8: K-quant weights (Q4_K_M — M2.1): the batched step serves B <= 8 via nrows
+            // per-stream kq plane GEMVs (mixed k4/k6 tensors, split w13 + ew2 swiglu, kq batch
+            // classifier); the CPU kq batch path is the oracle. B=3 f16 + B=2 q8_0-KV combos.
+            let kpath_b = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
+            if (stat(kpath_b).is_valid) {
+                var trkb <- load_model(kpath_b, QuantMode.q8)
+                trkb.config.seq_len = min(trkb.config.seq_len, 512l)
+                var promptsk <- [ <- encode(trkb, counting_prompt(1, 52), true, false),
+                                 <- encode(trkb, counting_prompt(6, 41), true, false),
+                                 <- encode(trkb, counting_prompt(3, 64), true, false)]
+                let cpuk <- batch_greedy(trkb, promptsk, 16, KVDtype.f16, false, -1, 0)
+                before = metal_batch_decode_stats().steps
+                let gpuk <- batch_greedy(trkb, promptsk, 16, KVDtype.f16, true, -1, 0)
+                t |> success(metal_batch_decode_stats().steps - before > 0l, "kq batch arm served on the GPU")
+                t |> success(streams_match(cpuk, gpuk), "B=3 kq batched greedy streams match the CPU control")
+                var promptsk2 <- [ <- clone_to_move(promptsk[0]), <- clone_to_move(promptsk[1])]
+                let cpuk2 <- batch_greedy(trkb, promptsk2, 14, KVDtype.q8_0, false, -1, 0)
+                let gpuk2 <- batch_greedy(trkb, promptsk2, 14, KVDtype.q8_0, true, -1, 0)
+                t |> success(streams_match(cpuk2, gpuk2), "B=2 kq q8_0-KV batched greedy streams match the CPU control")
+                delete promptsk
+                delete promptsk2
+                delete trkb
+            } else {
+                feint("Llama-3.2-1B Q4_K_M not present; kq batch arm skipped\n")
+            }
+
             // the leak gate: every GPU object the driver holds releases
             metal_decode_stage_report()
             metal_decode_shutdown()
