@@ -91,6 +91,12 @@ def main {
                            |> _order_by(_.Rank)
                            |> take(2))
         to_log(LOG_INFO, "top 2 fox results: {length(top2)}")
+
+        // --- Typed predicate DELETE --------------------------------------
+        // FTS5 virtual tables have no declared daslang primary key, but the
+        // predicate form is fully typed and reports the affected row count.
+        let removed = db |> _sql_delete(type<Doc>, _.Body |> text_match("quicksand"))
+        to_log(LOG_INFO, "removed {removed} obsolete search row")
     }
 
     // --- text_match outside SQL --- nolint:STYLE014
@@ -121,9 +127,10 @@ def main {
     // Self-contained mode only — the FTS5 table holds both content and
     // index. External-content mode (FTS5 indexing rows of a separate
     // [sql_table]) ships when asked. Default tokenizer is unicode61
-    // (case-fold + Unicode word boundaries). UPDATE / DELETE on FTS5
-    // rows aren't typed in v1 — drop and re-INSERT, or use raw
-    // `db |> exec("DELETE FROM docs_idx WHERE rowid = ?", id)`.
+    // (case-fold + Unicode word boundaries). Predicate DELETE is typed:
+    // `_sql_delete(type<Doc>, predicate)`. Row-shaped UPDATE /
+    // DELETE-by-PK helpers are unavailable because the virtual table has no
+    // declared daslang PK; update by deleting and re-inserting, or use raw SQL.
     // BM25 weighting, snippet/highlight helpers, and per-column query
     // filters (`Body:fox`) all work via the FTS5 query string but
     // don't have typed wrappers in v1.

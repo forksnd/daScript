@@ -260,7 +260,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_91_sql_vacuum_into_macro.das | `_sql_vacuum_into(path)` macro form (vacuum into file path, runtime string path, verification across reopen) | |
 | test_92_order_by_runtime.das | Runtime `_order_by(string)` column-name binding (const string folds to compile-time, runtime path uses sql_quote_id) | |
 | test_93_attach.das | `with_attached(path, alias)` attach secondary database file (query across attached, temp-file cleanup) | |
-| test_94_fts5.das | `[sql_fts5]` full-text search (CREATE VIRTUAL TABLE fts5, `@sql_fts_rank` hidden rank column, INSERT skips rank) | |
+| test_94_fts5.das | `[sql_fts5]` full-text search (CREATE VIRTUAL TABLE fts5, `@sql_fts_rank` hidden rank column, INSERT skips rank, typed predicate DELETE) | |
 | failed_create_view.das | `_create_view` macro validation failures (column count/type mismatches, non-annotated struct, bound parameters) | **expect** `40104:7` |
 | failed_each_sql_terminals.das | `_each_sql` rejects materializing terminals (`_to_array`, `_first`, `_first_opt`, aggregates) | **expect** `40104:4` |
 | failed_pred_json_path_typo.das | Predicate-side JSON-path validation (typo detection in `_.Field.nested` chains) | **expect** `40104:3, 30503:3` |

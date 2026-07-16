@@ -1775,8 +1775,8 @@ class private SqlFts5Macro : AstStructureAnnotation {
         let select_all_sql = build_fts5_select_all_sql(table_name, fields)
         let insert_sql = build_fts5_insert_sql(table_name, fields)
         let st_name = string(st.name)
-        let panic_msg_pk = "[sql_fts5] {st_name}: cannot {0} on an FTS5 virtual table — UPDATE/DELETE-by-PK is not supported in v1. Drop and re-INSERT, or use raw `db |> exec(\"DELETE FROM ... WHERE rowid = ?\", id)`."
-        let panic_msg_bind = "[sql_fts5] {st_name}: cannot {0} on an FTS5 virtual table — not supported in v1. Use raw `db |> exec(...)` for DELETE/UPDATE."
+        let panic_msg_pk = "[sql_fts5] {st_name}: cannot {0} on an FTS5 virtual table — row-shaped UPDATE/DELETE-by-PK is not supported. Use `_sql_delete(type<{st_name}>, predicate)` for typed predicate deletes; UPDATE still requires delete + re-INSERT or raw SQL."
+        let panic_msg_bind = "[sql_fts5] {st_name}: cannot {0} on an FTS5 virtual table — row-shaped mutation helpers are not supported. Use `_sql_delete(type<{st_name}>, predicate)` for typed predicate deletes; UPDATE still requires delete + re-INSERT or raw SQL."
         var fn_table_name = make_const_string_helper_fn(st, "_sql_table_name", table_name)
         compiling_module() |> add_function(fn_table_name)
         var fn_drop = make_const_string_helper_fn(st, "_sql_drop_table_if_exists_sql",
@@ -1801,7 +1801,8 @@ class private SqlFts5Macro : AstStructureAnnotation {
         compiling_module() |> add_function(fn_bind)
         var fn_col_info = make_fts5_column_info_fn(st, fields)
         compiling_module() |> add_function(fn_col_info)
-        // UPDATE/DELETE not supported in v1 — runtime panic stubs (compile error would be nicer but the macro expander generates the calls unconditionally for `[sql_table]`-shape APIs).
+        // Row-shaped UPDATE/DELETE-by-PK helpers are unsupported — runtime panic stubs
+        // (predicate `_sql_delete(type<T>, predicate)` uses table metadata directly and works).
         var fn_upd_pk = make_string_panic_stub_helper_fn(st, "_sql_update_by_pk_sql",
             panic_msg_pk |> replace("{0}", "update by primary key"))
         compiling_module() |> add_function(fn_upd_pk)

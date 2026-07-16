@@ -98,3 +98,20 @@ def test_fts5_runtime_phrase_match(t : T?) {
         t |> equal(length(hits), 1, "phrase match only finds adjacent tokens in order")
     }
 }
+
+[test]
+def test_fts5_runtime_typed_predicate_delete(t : T?) {
+    with_sqlite(":memory:") $(db) {
+        db |> create_table(type<Doc>)
+        db |> insert(Doc(Body = "obsolete fox note"))
+        db |> insert(Doc(Body = "obsolete turtle note"))
+        db |> insert(Doc(Body = "current fox note"))
+
+        let removed = db |> _sql_delete(type<Doc>, _.Body |> text_match("obsolete"))
+        t |> equal(removed, 2, "_sql_delete removes every matching FTS5 row")
+
+        let remaining <- _sql(db |> select_from(type<Doc>))
+        t |> equal(length(remaining), 1)
+        t |> equal(remaining[0].Body, "current fox note")
+    }
+}

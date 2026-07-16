@@ -493,13 +493,15 @@ let foxes <- _sql(db |> select_from(type<Doc>)
                      |> _where(_.Body |> text_match("quick fox"))
                      |> _order_by(_.Rank))
 // SELECT "Body", rank FROM "docs_idx" WHERE "Body" MATCH ? ORDER BY rank
+
+let removed = db |> _sql_delete(type<Doc>, _.Body |> text_match("obsolete"))
 ```
 
 `text_match(col, query)` lowers to `col MATCH ?`. The same predicate is also a `daslib/strings_boost` (via `daslib/fts5_query`) in-memory matcher — one call site for both SQL and in-memory filtering. `text_match` on a non-`[sql_fts5]` column is a compile error pointing at `contains` (LIKE-based) or adding `[sql_fts5]`.
 
 Query-string syntax: whitespace-AND, `*` prefix (`quick*` matches `quicksand`), `"phrase match"` (quoted), Boolean `AND` / `OR` / `NOT` (uppercase), `NEAR(a b, N)` proximity. Default tokenizer is `unicode61` (Unicode word boundaries + ASCII case-fold).
 
-v1 limitations: self-contained mode only (FTS5 holds both content and index); UPDATE / DELETE on FTS5 rows aren't typed (drop and re-insert, or raw `exec`); BM25 weighting / snippet helpers / per-column query filters work via the FTS5 query string but lack typed wrappers.
+Limitations: self-contained mode only (FTS5 holds both content and index); row-shaped UPDATE / DELETE-by-PK helpers are unavailable because the virtual table has no declared daslang PK. Predicate DELETE is typed through `_sql_delete(type<T>, predicate)`; update by deleting and re-inserting, or use raw SQL. BM25 weighting / snippet helpers / per-column query filters work via the FTS5 query string but lack typed wrappers.
 
 ## User-defined SQL functions — `register_function` / `[sql_function]` (`caps.client_udfs`)
 

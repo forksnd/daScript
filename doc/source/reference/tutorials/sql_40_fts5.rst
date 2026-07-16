@@ -79,6 +79,21 @@ ascending BM25 score (lower = more relevant first):
     //   SELECT "Body", rank FROM "docs_idx"
     //   WHERE "Body" MATCH ? ORDER BY rank
 
+Typed predicate DELETE
+======================
+
+FTS5 virtual tables have no declared daslang primary key, but predicate
+deletes use the regular typed DML macro:
+
+.. code-block:: das
+
+    let removed = db |> _sql_delete(
+        type<Doc>,
+        _.Body |> text_match("obsolete"))
+
+This emits a bound ``DELETE FROM "docs_idx" WHERE "Body" MATCH ?`` and
+returns the number of removed rows.
+
 FTS5 query syntax (passed through to ``MATCH``)
 ===============================================
 
@@ -171,8 +186,10 @@ v1 limitations
 * **Default tokenizer is unicode61** (case-fold + Unicode word
   boundaries). Custom tokenizers (``porter``, ``ascii``,
   ``unicode61 remove_diacritics 2``) need raw DDL.
-* **No typed UPDATE / DELETE.** Drop and re-INSERT, or use raw
-  ``db |> exec("DELETE FROM docs_idx WHERE rowid = ?", id)``.
+* **No row-shaped UPDATE / DELETE-by-PK helpers.** The virtual table has
+  no declared daslang primary key. Predicate DELETE is typed via
+  ``_sql_delete(type<Doc>, predicate)``; update by deleting and
+  re-inserting, or use raw SQL.
 * **BM25 weighting, snippet/highlight helpers, per-column query
   filters (``Body:fox``)** all work via the FTS5 query string
   but don't have typed wrappers in v1.
