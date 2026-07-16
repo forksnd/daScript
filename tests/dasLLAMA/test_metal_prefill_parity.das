@@ -77,60 +77,66 @@ def test_metal_prefill_parity(t : T?) {
                 tr.config.seq_len = 2048l
             }
             let prompt <- encode(tr, counting_prompt(), true, false)
-            let cpu <- continuation(tr, prompt, 40)
-            t |> equal(length(cpu), 40)
-            t |> success(select_prefill_override("metal"), "override registered")
-            set_metal_prefill_min_npos(1l)
-            let before = metal_prefill_stats().prefills
-            let gpu <- continuation(tr, prompt, 40)         // default = lcpp mul_mm (f32 activations)
-            let served = metal_prefill_stats().prefills - before
-            set_metal_prefill_mulmm_legacy(true)            // the quantized path — bit-identical to CPU
-            let before2 = metal_prefill_stats().prefills
-            let gpu_legacy <- continuation(tr, prompt, 40)
-            let served2 = metal_prefill_stats().prefills - before2
-            set_metal_prefill_mulmm_legacy(false)
-            select_prefill_override("")
-            set_metal_prefill_min_npos(64l)
-            clear_kernel_backend_pin()
-            select_kernel_backend(prior_backend)
-            set_wscale_f16(prior_wscale)
-            if (served == 0l || served2 == 0l) {
-                metal_prefill_shutdown()
-                delete tr
-                feint("metal prefill declined (no Metal device?); GPU parity skipped\n")
-                return
+            if (arm_on(t, "base")) {
+                let cpu <- continuation(tr, prompt, 40)
+                t |> equal(length(cpu), 40)
+                t |> success(select_prefill_override("metal"), "override registered")
+                set_metal_prefill_min_npos(1l)
+                let before = metal_prefill_stats().prefills
+                let gpu <- continuation(tr, prompt, 40)         // default = lcpp mul_mm (f32 activations)
+                let served = metal_prefill_stats().prefills - before
+                set_metal_prefill_mulmm_legacy(true)            // the quantized path — bit-identical to CPU
+                let before2 = metal_prefill_stats().prefills
+                let gpu_legacy <- continuation(tr, prompt, 40)
+                let served2 = metal_prefill_stats().prefills - before2
+                set_metal_prefill_mulmm_legacy(false)
+                select_prefill_override("")
+                set_metal_prefill_min_npos(64l)
+                clear_kernel_backend_pin()
+                select_kernel_backend(prior_backend)
+                set_wscale_f16(prior_wscale)
+                if (served == 0l || served2 == 0l) {
+                    metal_prefill_shutdown()
+                    delete tr
+                    feint("metal prefill declined (no Metal device?); GPU parity skipped\n")
+                    return
+                }
+                t |> success(same(cpu, gpu_legacy), "40-token continuation matches the CPU control (legacy quantized GEMM)")
+                t |> success(same(cpu, gpu), "40-token continuation matches the CPU control (lcpp mul_mm, f32 activations)")
             }
-            t |> success(same(cpu, gpu_legacy), "40-token continuation matches the CPU control (legacy quantized GEMM)")
-            t |> success(same(cpu, gpu), "40-token continuation matches the CPU control (lcpp mul_mm, f32 activations)")
 
             // s16 arm (W2): the DEFAULT-load scale plane — blobs read raw f16 scales, the
             // classifier GEMV takes its halfword twin; a fresh load owns fresh weight regions.
             // The restores above un-pinned the backend — re-pin row-major (the donor contract)
-            set_wscale_f16(true)
-            pin_kernel_backend("portable")
-            var tr16 <- load_model(path, QuantMode.q8)
-            if (tr16.config.seq_len > 2048l) {
-                tr16.config.seq_len = 2048l
+            if (arm_on(t, "s16")) {
+                set_wscale_f16(true)
+                pin_kernel_backend("portable")
+                var tr16 <- load_model(path, QuantMode.q8)
+                if (tr16.config.seq_len > 2048l) {
+                    tr16.config.seq_len = 2048l
+                }
+                let cpu16 <- continuation(tr16, prompt, 40)
+                t |> success(select_prefill_override("metal"), "override registered (s16)")
+                set_metal_prefill_min_npos(1l)
+                let before16 = metal_prefill_stats().prefills
+                let gpu16 <- continuation(tr16, prompt, 40)
+                t |> success(metal_prefill_stats().prefills - before16 > 0l, "wscale16 prefill served on the GPU")
+                select_prefill_override("")
+                set_metal_prefill_min_npos(64l)
+                clear_kernel_backend_pin()
+                select_kernel_backend(prior_backend)
+                set_wscale_f16(prior_wscale)
+                t |> success(same(cpu16, gpu16), "40-token wscale16 continuation matches the CPU control (s16 mul_mm + s16 classifier)")
+                delete tr16
             }
-            let cpu16 <- continuation(tr16, prompt, 40)
-            t |> success(select_prefill_override("metal"), "override registered (s16)")
-            set_metal_prefill_min_npos(1l)
-            let before16 = metal_prefill_stats().prefills
-            let gpu16 <- continuation(tr16, prompt, 40)
-            t |> success(metal_prefill_stats().prefills - before16 > 0l, "wscale16 prefill served on the GPU")
-            select_prefill_override("")
-            set_metal_prefill_min_npos(64l)
-            clear_kernel_backend_pin()
-            select_kernel_backend(prior_backend)
-            set_wscale_f16(prior_wscale)
-            t |> success(same(cpu16, gpu16), "40-token wscale16 continuation matches the CPU control (s16 mul_mm + s16 classifier)")
-            delete tr16
 
             // kq arm (M2.3): K-quant prefill — the kq mul_mm twins (mixed k4/k6 tensors per
             // layer) + the kq classifier GEMV. The CPU kq prefill is the control; the envelope
             // is the kq one (f32-x GPU vs Q8_K CPU activations), tokens exact on the fixture.
             let kpath = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
-            if (stat(kpath).is_valid) {
+            if (!arm_on(t, "kq")) {
+                // filtered — the skip is already registered
+            } elif (stat(kpath).is_valid) {
                 set_wscale_f16(false)
                 pin_kernel_backend("portable")
                 var trk <- load_model(kpath, QuantMode.q8)
@@ -154,11 +160,39 @@ def test_metal_prefill_parity(t : T?) {
                 feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); kq prefill arm skipped\n")
             }
 
+            // dim-4096 arm (M2.6): past the fused add+rms+quant slab (dim <= 3072) the prefill
+            // driver runs the unfused dispatch set — this is that rail's first real-model
+            // parity. The 8B is large-tier: it runs only under DASLLAMA_PARITY_FULL.
+            if (arm_on(t, "dim")) {
+                let path8 = path_join(models_dir(), "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf")
+                if (model_available(t, path8)) {
+                    set_wscale_f16(false)
+                    pin_kernel_backend("portable")
+                    var tr8 <- load_model(path8, QuantMode.q8)
+                    if (tr8.config.seq_len > 2048l) {
+                        tr8.config.seq_len = 2048l
+                    }
+                    let cpu8 <- continuation(tr8, prompt, 40)
+                    t |> success(select_prefill_override("metal"), "override registered (dim4096)")
+                    set_metal_prefill_min_npos(1l)
+                    let before8 = metal_prefill_stats().prefills
+                    let gpu8 <- continuation(tr8, prompt, 40)
+                    t |> success(metal_prefill_stats().prefills - before8 > 0l, "dim-4096 prefill served on the GPU")
+                    select_prefill_override("")
+                    set_metal_prefill_min_npos(64l)
+                    clear_kernel_backend_pin()
+                    select_kernel_backend(prior_backend)
+                    set_wscale_f16(prior_wscale)
+                    t |> success(same(cpu8, gpu8), "40-token dim-4096 continuation matches the CPU control (unfused prefill set)")
+                    delete tr8
+                }
+            }
+
             // GPU-prefill x quantized-KV arm: the prefill KV writeback into q8_0/tq4 SESSION
             // codecs — this combo engaged since W3 but its output was never explicitly verified
             // (the decode parity arms use CPU prefill). GPU prefill + GPU decode vs the all-CPU
             // control on the same codec, token-exact.
-            {
+            if (arm_on(t, "qkv")) {
                 set_wscale_f16(false)
                 pin_kernel_backend("portable")
                 var trq <- load_model(path, QuantMode.q8)

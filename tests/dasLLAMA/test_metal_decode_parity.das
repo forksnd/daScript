@@ -325,9 +325,12 @@ def private streams_match(a, b : array<array<int64>>) : bool {
 
 // one CPU batch step and one GPU batch step from identical prefilled states: per-row logits +
 // stored-KV-row envelope (the batch twin of single_step_gate)
-[unused_argument(t, tr, nb, kdt, tol_logits, tol_kv, tag)]   // off-Apple the gated body is empty
-def private batch_step_gate(t : T?; tr : Model; nb : int; kdt : KVDtype; tol_logits, tol_kv : float; tag : string) {
+[unused_argument(t, tr, nb, kdt, tol_logits, tol_kv, tag, plen)]   // off-Apple the gated body is empty
+def private batch_step_gate(t : T?; tr : Model; nb : int; kdt : KVDtype; tol_logits, tol_kv : float; tag : string;
+                            plen : int = 40) {
     // whole-body gate: see single_step_gate — off-Apple this helper just needs to compile
+    // (plen scales the per-session prompts DOWN for the big dim-ladder models, whose CPU
+    // control prefills dominate the arm's wall time)
     static_if (typeinfo builtin_module_exists(das_metal)) {
         let c = tr.config
         let vocab = c.vocab_size
@@ -339,7 +342,7 @@ def private batch_step_gate(t : T?; tr : Model; nb : int; kdt : KVDtype; tol_log
             sa |> reserve(nb)
             sb |> reserve(nb)
             for (i in range(nb)) {
-                let prompt <- encode(tr, counting_prompt(1 + i, 40 + 7 * i), true, false)
+                let prompt <- encode(tr, counting_prompt(1 + i, plen + 7 * i), true, false)
                 sa |> emplace <| make_run_state(c, kdt, kdt)
                 sb |> emplace <| make_run_state(c, kdt, kdt)
                 eval_(tr, sa[i], prompt)
@@ -467,6 +470,9 @@ def test_metal_batch_decode_parity(t : T?) {
                 t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
                 return
             }
+            if (!arm_on(t, "batch")) {
+                return
+            }
             let path = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q8_0.gguf")
             if (!model_available(t, path)) {
                 return
@@ -589,62 +595,66 @@ def test_metal_batch_decode_parity(t : T?) {
             // are hs=64 and keep the chunked pair, so the 3B is partD's only parity coverage;
             // plain stat check — a mid-test model_available skip would flip the whole test)
             let path3b = path_join(models_dir(), "Llama-3.2-3B-Instruct-Q8_0.gguf")
-            if (stat(path3b).is_valid) {
-                var tr3 <- load_model(path3b, QuantMode.q8)
-                tr3.config.seq_len = min(tr3.config.seq_len, 512l)
-                var promptsd <- [ <- encode(tr3, counting_prompt(1, 48), true, false),
-                                 <- encode(tr3, counting_prompt(5, 62), true, false),
-                                 <- encode(tr3, counting_prompt(3, 39), true, false)]
-                let cpud <- batch_greedy(tr3, promptsd, 16, KVDtype.f16, false, -1, 0)
-                before = metal_batch_decode_stats().steps
-                let gpud <- batch_greedy(tr3, promptsd, 16, KVDtype.f16, true, -1, 0)
-                t |> success(metal_batch_decode_stats().steps - before > 0l, "hs=128 partD arm served on the GPU")
-                t |> success(streams_match(cpud, gpud), "B=3 hs=128 batched greedy streams match the CPU control (partD attention)")
-                batch_step_gate(t, tr3, 3, KVDtype.f16, 0.5, 0.25, "B=3 hs128 f16")
-                batch_step_gate(t, tr3, 3, KVDtype.f32, 0.5, 0.25, "B=3 hs128 f32")
-                batch_step_gate(t, tr3, 3, KVDtype.q8_0, 0.5, 0.25, "B=3 hs128 q8_0")   // the partD q8 twin
-                batch_step_gate(t, tr3, 3, KVDtype.tq4, 1.0, 2.0, "B=3 hs128 tq4")      // ... and the partD tq4 twin
-                delete promptsd
-                delete tr3
-            } else {
-                feint("Llama-3.2-3B model not present; partD hs=128 arm skipped\n")
+            if (arm_on(t, "batchB7-partd")) {
+                if (stat(path3b).is_valid) {
+                    var tr3 <- load_model(path3b, QuantMode.q8)
+                    tr3.config.seq_len = min(tr3.config.seq_len, 512l)
+                    var promptsd <- [ <- encode(tr3, counting_prompt(1, 48), true, false),
+                                     <- encode(tr3, counting_prompt(5, 62), true, false),
+                                     <- encode(tr3, counting_prompt(3, 39), true, false)]
+                    let cpud <- batch_greedy(tr3, promptsd, 16, KVDtype.f16, false, -1, 0)
+                    before = metal_batch_decode_stats().steps
+                    let gpud <- batch_greedy(tr3, promptsd, 16, KVDtype.f16, true, -1, 0)
+                    t |> success(metal_batch_decode_stats().steps - before > 0l, "hs=128 partD arm served on the GPU")
+                    t |> success(streams_match(cpud, gpud), "B=3 hs=128 batched greedy streams match the CPU control (partD attention)")
+                    batch_step_gate(t, tr3, 3, KVDtype.f16, 0.5, 0.25, "B=3 hs128 f16")
+                    batch_step_gate(t, tr3, 3, KVDtype.f32, 0.5, 0.25, "B=3 hs128 f32")
+                    batch_step_gate(t, tr3, 3, KVDtype.q8_0, 0.5, 0.25, "B=3 hs128 q8_0")   // the partD q8 twin
+                    batch_step_gate(t, tr3, 3, KVDtype.tq4, 1.0, 2.0, "B=3 hs128 tq4")      // ... and the partD tq4 twin
+                    delete promptsd
+                    delete tr3
+                } else {
+                    feint("Llama-3.2-3B model not present; partD hs=128 arm skipped\n")
+                }
             }
 
             // arm B8: K-quant weights (Q4_K_M — M2.1): the batched step serves B <= 8 via nrows
             // per-stream kq plane GEMVs (mixed k4/k6 tensors, split w13 + ew2 swiglu, kq batch
             // classifier); the CPU kq batch path is the oracle. B=3 f16 + B=2 q8_0-KV combos.
             let kpath_b = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
-            if (stat(kpath_b).is_valid) {
-                var trkb <- load_model(kpath_b, QuantMode.q8)
-                trkb.config.seq_len = min(trkb.config.seq_len, 512l)
-                var promptsk <- [ <- encode(trkb, counting_prompt(1, 52), true, false),
-                                 <- encode(trkb, counting_prompt(6, 41), true, false),
-                                 <- encode(trkb, counting_prompt(3, 64), true, false)]
-                let cpuk <- batch_greedy(trkb, promptsk, 16, KVDtype.f16, false, -1, 0)
-                before = metal_batch_decode_stats().steps
-                let gpuk <- batch_greedy(trkb, promptsk, 16, KVDtype.f16, true, -1, 0)
-                t |> success(metal_batch_decode_stats().steps - before > 0l, "kq batch arm served on the GPU")
-                t |> success(streams_match(cpuk, gpuk), "B=3 kq batched greedy streams match the CPU control")
-                var promptsk2 <- [ <- clone_to_move(promptsk[0]), <- clone_to_move(promptsk[1])]
-                let cpuk2 <- batch_greedy(trkb, promptsk2, 14, KVDtype.q8_0, false, -1, 0)
-                let gpuk2 <- batch_greedy(trkb, promptsk2, 14, KVDtype.q8_0, true, -1, 0)
-                t |> success(streams_match(cpuk2, gpuk2), "B=2 kq q8_0-KV batched greedy streams match the CPU control")
-                // B=12: the kq mul_mm batch form (B >= 9 leaves the per-stream GEMVs)
-                var promptsk12 : array<array<int64>>
-                for (i in range(12)) {
-                    promptsk12 |> emplace <| encode(trkb, counting_prompt(1 + i, 34 + 2 * i), true, false)
+            if (arm_on(t, "batchB8-kq")) {
+                if (stat(kpath_b).is_valid) {
+                    var trkb <- load_model(kpath_b, QuantMode.q8)
+                    trkb.config.seq_len = min(trkb.config.seq_len, 512l)
+                    var promptsk <- [ <- encode(trkb, counting_prompt(1, 52), true, false),
+                                     <- encode(trkb, counting_prompt(6, 41), true, false),
+                                     <- encode(trkb, counting_prompt(3, 64), true, false)]
+                    let cpuk <- batch_greedy(trkb, promptsk, 16, KVDtype.f16, false, -1, 0)
+                    before = metal_batch_decode_stats().steps
+                    let gpuk <- batch_greedy(trkb, promptsk, 16, KVDtype.f16, true, -1, 0)
+                    t |> success(metal_batch_decode_stats().steps - before > 0l, "kq batch arm served on the GPU")
+                    t |> success(streams_match(cpuk, gpuk), "B=3 kq batched greedy streams match the CPU control")
+                    var promptsk2 <- [ <- clone_to_move(promptsk[0]), <- clone_to_move(promptsk[1])]
+                    let cpuk2 <- batch_greedy(trkb, promptsk2, 14, KVDtype.q8_0, false, -1, 0)
+                    let gpuk2 <- batch_greedy(trkb, promptsk2, 14, KVDtype.q8_0, true, -1, 0)
+                    t |> success(streams_match(cpuk2, gpuk2), "B=2 kq q8_0-KV batched greedy streams match the CPU control")
+                    // B=12: the kq mul_mm batch form (B >= 9 leaves the per-stream GEMVs)
+                    var promptsk12 : array<array<int64>>
+                    for (i in range(12)) {
+                        promptsk12 |> emplace <| encode(trkb, counting_prompt(1 + i, 34 + 2 * i), true, false)
+                    }
+                    let cpuk12 <- batch_greedy(trkb, promptsk12, 10, KVDtype.f16, false, -1, 0)
+                    before = metal_batch_decode_stats().steps
+                    let gpuk12 <- batch_greedy(trkb, promptsk12, 10, KVDtype.f16, true, -1, 0)
+                    t |> success(metal_batch_decode_stats().steps - before > 0l, "B=12 kq arm served on the GPU")
+                    t |> success(streams_match(cpuk12, gpuk12), "B=12 kq batched greedy streams match the CPU control (kq mul_mm)")
+                    delete promptsk12
+                    delete promptsk
+                    delete promptsk2
+                    delete trkb
+                } else {
+                    feint("Llama-3.2-1B Q4_K_M not present; kq batch arm skipped\n")
                 }
-                let cpuk12 <- batch_greedy(trkb, promptsk12, 10, KVDtype.f16, false, -1, 0)
-                before = metal_batch_decode_stats().steps
-                let gpuk12 <- batch_greedy(trkb, promptsk12, 10, KVDtype.f16, true, -1, 0)
-                t |> success(metal_batch_decode_stats().steps - before > 0l, "B=12 kq arm served on the GPU")
-                t |> success(streams_match(cpuk12, gpuk12), "B=12 kq batched greedy streams match the CPU control (kq mul_mm)")
-                delete promptsk12
-                delete promptsk
-                delete promptsk2
-                delete trkb
-            } else {
-                feint("Llama-3.2-1B Q4_K_M not present; kq batch arm skipped\n")
             }
 
             // the leak gate: every GPU object the driver holds releases
@@ -689,140 +699,161 @@ def test_metal_decode_parity(t : T?) {
             let cpu16 <- continuation(tr, prompt, 40, KVDtype.f16)
             t |> equal(length(cpu16), 40)
 
+            var before = 0l
             // arm 1: CPU-prefill → GPU-decode, 40-token token-exact parity
-            t |> success(select_decode_override("metal"), "override registered")
-            var before = metal_decode_stats().decodes
-            let gpu16 <- continuation(tr, prompt, 40, KVDtype.f16)
-            let served = metal_decode_stats().decodes - before
-            select_decode_override("")
-            if (served == 0l) {
-                metal_decode_shutdown()
-                clear_kernel_backend_pin()
-                select_kernel_backend(prior_backend)
-                set_wscale_f16(prior_wscale)
-                delete tr
-                feint("metal decode declined (no Metal device?); GPU parity skipped\n")
-                return
+            if (arm_on(t, "arm1-basic")) {
+                t |> success(select_decode_override("metal"), "override registered")
+                before = metal_decode_stats().decodes
+                let gpu16 <- continuation(tr, prompt, 40, KVDtype.f16)
+                let served = metal_decode_stats().decodes - before
+                select_decode_override("")
+                if (served == 0l) {
+                    metal_decode_shutdown()
+                    clear_kernel_backend_pin()
+                    select_kernel_backend(prior_backend)
+                    set_wscale_f16(prior_wscale)
+                    delete tr
+                    feint("metal decode declined (no Metal device?); GPU parity skipped\n")
+                    return
+                }
+                t |> success(same(cpu16, gpu16), "40-token continuation matches the CPU control (CPU prefill → GPU decode)")
             }
-            t |> success(same(cpu16, gpu16), "40-token continuation matches the CPU control (CPU prefill → GPU decode)")
 
             // arm 2: Metal-prefill → GPU-decode (both residents live, one queue each)
-            t |> success(select_prefill_override("metal"), "prefill override registered")
-            set_metal_prefill_min_npos(1l)
-            select_decode_override("metal")
-            before = metal_decode_stats().decodes
-            let pf_before = metal_prefill_stats().prefills
-            let hyb <- continuation(tr, prompt, 40, KVDtype.f16)
-            let hyb_decodes = metal_decode_stats().decodes - before
-            let hyb_prefills = metal_prefill_stats().prefills - pf_before
-            select_decode_override("")
-            select_prefill_override("")
-            set_metal_prefill_min_npos(64l)
-            t |> success(hyb_decodes > 0l && hyb_prefills > 0l, "hybrid arm served on both devices")
-            t |> success(same(cpu16, hyb), "40-token continuation matches the CPU control (Metal prefill → GPU decode)")
+            if (arm_on(t, "arm2-hybrid")) {
+                t |> success(select_prefill_override("metal"), "prefill override registered")
+                set_metal_prefill_min_npos(1l)
+                select_decode_override("metal")
+                before = metal_decode_stats().decodes
+                let pf_before = metal_prefill_stats().prefills
+                let hyb <- continuation(tr, prompt, 40, KVDtype.f16)
+                let hyb_decodes = metal_decode_stats().decodes - before
+                let hyb_prefills = metal_prefill_stats().prefills - pf_before
+                select_decode_override("")
+                select_prefill_override("")
+                set_metal_prefill_min_npos(64l)
+                t |> success(hyb_decodes > 0l && hyb_prefills > 0l, "hybrid arm served on both devices")
+                t |> success(same(cpu16, hyb), "40-token continuation matches the CPU control (Metal prefill → GPU decode)")
+            }
 
             // arm 3: single-step logits + stored-KV-row tolerance, both mirror dtypes (NOT
             // byte-equality — f32-X GEMVs vs CPU q8 activations, online GPU softmax)
-            single_step_gate(t, tr, prompt, KVDtype.f16, 0.5, 0.25, "f16")
-            single_step_gate(t, tr, prompt, KVDtype.f32, 0.5, 0.25, "f32")
+            if (arm_on(t, "arm3-step")) {
+                single_step_gate(t, tr, prompt, KVDtype.f16, 0.5, 0.25, "f16")
+                single_step_gate(t, tr, prompt, KVDtype.f32, 0.5, 0.25, "f32")
+            }
 
             // arm 4: paged sessions — interleaved page tables force multi-run mirror gathers
-            let paged_cpu <- paged_greedy(tr, prompt, 64l, 16, false)
-            before = metal_decode_stats().decodes
-            let paged_gpu <- paged_greedy(tr, prompt, 64l, 16, true)
-            t |> success(metal_decode_stats().decodes - before > 0l, "paged arm served on the GPU")
-            t |> success(same(paged_cpu, paged_gpu), "16-token paged continuation matches the CPU control")
+            if (arm_on(t, "arm4-paged")) {
+                let paged_cpu <- paged_greedy(tr, prompt, 64l, 16, false)
+                before = metal_decode_stats().decodes
+                let paged_gpu <- paged_greedy(tr, prompt, 64l, 16, true)
+                t |> success(metal_decode_stats().decodes - before > 0l, "paged arm served on the GPU")
+                t |> success(same(paged_cpu, paged_gpu), "16-token paged continuation matches the CPU control")
+            }
 
             // arm 5: rewind — n_past = 0 reuse re-mirrors from scratch (watermark contract)
-            var sc = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
-            var rewind_cpu : array<int64>
-            with_job_que() {
-                setup_dasllama_jobque()
-                eval_(tr, sc, prompt2)
-                rewind_cpu <- greedy_steps(tr, sc, 16)
+            if (arm_on(t, "arm5-rewind")) {
+                var sc = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                var rewind_cpu : array<int64>
+                with_job_que() {
+                    setup_dasllama_jobque()
+                    eval_(tr, sc, prompt2)
+                    rewind_cpu <- greedy_steps(tr, sc, 16)
+                }
+                delete sc
+                before = metal_decode_stats().decodes
+                let rewind_gpu <- rewind_greedy(tr, prompt, prompt2, 16)
+                t |> success(metal_decode_stats().decodes - before > 0l, "rewind arm served on the GPU")
+                t |> success(same(rewind_cpu, rewind_gpu), "16-token post-rewind continuation matches the CPU control")
             }
-            delete sc
-            before = metal_decode_stats().decodes
-            let rewind_gpu <- rewind_greedy(tr, prompt, prompt2, 16)
-            t |> success(metal_decode_stats().decodes - before > 0l, "rewind arm served on the GPU")
-            t |> success(same(rewind_cpu, rewind_gpu), "16-token post-rewind continuation matches the CPU control")
 
             // arm 6: session churn under a tiny LRU cap — retired sessions' mirrors evict
-            set_metal_decode_mirror_cap_mb(1)
-            with_job_que() {
-                setup_dasllama_jobque()
-                select_decode_override("metal")
-                for (_i in range(3)) {
-                    var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
-                    eval_(tr, s, prompt2)
-                    var ids <- greedy_steps(tr, s, 4)
-                    delete ids
-                    delete s
+            if (arm_on(t, "arm6-churn")) {
+                set_metal_decode_mirror_cap_mb(1)
+                with_job_que() {
+                    setup_dasllama_jobque()
+                    select_decode_override("metal")
+                    for (_i in range(3)) {
+                        var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                        eval_(tr, s, prompt2)
+                        var ids <- greedy_steps(tr, s, 4)
+                        delete ids
+                        delete s
+                    }
+                    select_decode_override("")
                 }
-                select_decode_override("")
+                t |> equal(metal_decode_mirror_stats().mirrors, 1l)
+                set_metal_decode_mirror_cap_mb(-1)
             }
-            t |> equal(metal_decode_mirror_stats().mirrors, 1l)
-            set_metal_decode_mirror_cap_mb(-1)
 
             // arm 7: q8_0 KV mirror — the block-codec decode path (format-matrix W3): GPU
             // rope+quantize store + dual-view block-dequant attention; the CPU q8_0 decode
             // path is the oracle (both arms consume the same codec)
-            let cpu8 <- continuation(tr, prompt, 40, KVDtype.q8_0)
-            select_decode_override("metal")
-            before = metal_decode_stats().decodes
-            let gpu8 <- continuation(tr, prompt, 40, KVDtype.q8_0)
-            select_decode_override("")
-            t |> success(metal_decode_stats().decodes - before > 0l, "q8_0 arm served on the GPU")
-            t |> success(same(cpu8, gpu8), "40-token q8_0-cache continuation matches the CPU control")
-            single_step_gate(t, tr, prompt, KVDtype.q8_0, 0.5, 0.25, "q8_0")
+            if (arm_on(t, "arm7-q8kv")) {
+                let cpu8 <- continuation(tr, prompt, 40, KVDtype.q8_0)
+                select_decode_override("metal")
+                before = metal_decode_stats().decodes
+                let gpu8 <- continuation(tr, prompt, 40, KVDtype.q8_0)
+                select_decode_override("")
+                t |> success(metal_decode_stats().decodes - before > 0l, "q8_0 arm served on the GPU")
+                t |> success(same(cpu8, gpu8), "40-token q8_0-cache continuation matches the CPU control")
+                single_step_gate(t, tr, prompt, KVDtype.q8_0, 0.5, 0.25, "q8_0")
+            }
 
             // arm 7b: tq4 KV mirror — the rotated 4-bit codec (W3): threadgroup-per-head FWHT
             // store, nibble attention, fwht-unsign epilogue; the CPU tq4 path is the oracle.
             // Envelopes are quant-step scale (d = amax/8 ⇒ one flipped cell moves a stored row
             // ~1.3 and logits ~0.65 — measured on the 1B; tokens stay exact on the fixture), so
             // both tolerances sit at ~2x the q8_0 arm's.
-            let cpu4 <- continuation(tr, prompt, 40, KVDtype.tq4)
-            select_decode_override("metal")
-            before = metal_decode_stats().decodes
-            let gpu4 <- continuation(tr, prompt, 40, KVDtype.tq4)
-            select_decode_override("")
-            t |> success(metal_decode_stats().decodes - before > 0l, "tq4 arm served on the GPU")
-            t |> success(same(cpu4, gpu4), "40-token tq4-cache continuation matches the CPU control")
-            single_step_gate(t, tr, prompt, KVDtype.tq4, 1.0, 2.0, "tq4")
+            if (arm_on(t, "arm7b-tq4kv")) {
+                let cpu4 <- continuation(tr, prompt, 40, KVDtype.tq4)
+                select_decode_override("metal")
+                before = metal_decode_stats().decodes
+                let gpu4 <- continuation(tr, prompt, 40, KVDtype.tq4)
+                select_decode_override("")
+                t |> success(metal_decode_stats().decodes - before > 0l, "tq4 arm served on the GPU")
+                t |> success(same(cpu4, gpu4), "40-token tq4-cache continuation matches the CPU control")
+                single_step_gate(t, tr, prompt, KVDtype.tq4, 1.0, 2.0, "tq4")
+            }
 
             // arm 8: wscale_f16 model — the f16-scale GEMV twin reads the qscales16 halfword
             // plane (llama.cpp q8_0 byte parity); a fresh load owns fresh weight regions
-            set_wscale_f16(true)
-            var tr16 <- load_model(path, QuantMode.q8)
-            if (tr16.config.seq_len > 2048l) {
-                tr16.config.seq_len = 2048l
+            if (arm_on(t, "arm8-s16")) {
+                set_wscale_f16(true)
+                var tr16 <- load_model(path, QuantMode.q8)
+                if (tr16.config.seq_len > 2048l) {
+                    tr16.config.seq_len = 2048l
+                }
+                let cpu16s <- continuation(tr16, prompt, 40, KVDtype.f16)
+                select_decode_override("metal")
+                before = metal_decode_stats().decodes
+                let gpu16s <- continuation(tr16, prompt, 40, KVDtype.f16)
+                select_decode_override("")
+                t |> success(metal_decode_stats().decodes - before > 0l, "wscale16 arm served on the GPU")
+                t |> success(same(cpu16s, gpu16s), "40-token wscale16 continuation matches the CPU control")
+                set_wscale_f16(false)
+                delete tr16
             }
-            let cpu16s <- continuation(tr16, prompt, 40, KVDtype.f16)
-            select_decode_override("metal")
-            before = metal_decode_stats().decodes
-            let gpu16s <- continuation(tr16, prompt, 40, KVDtype.f16)
-            select_decode_override("")
-            t |> success(metal_decode_stats().decodes - before > 0l, "wscale16 arm served on the GPU")
-            t |> success(same(cpu16s, gpu16s), "40-token wscale16 continuation matches the CPU control")
-            set_wscale_f16(false)
-            delete tr16
 
             // arm 9: model reload — the weights-epoch guard. The weight caches key by HOST
             // ADDRESS; deleting a model and loading another can land the new arrays at recycled
             // addresses, and a stale cache hit serves the DEAD model's buffers (pre-W4 this
             // produced silent garbage continuations; the load-epoch flush is the fix)
-            var trr <- load_model(path, QuantMode.q8)
-            if (trr.config.seq_len > 2048l) {
-                trr.config.seq_len = 2048l
+            if (arm_on(t, "arm9-reload")) {
+                var trr <- load_model(path, QuantMode.q8)
+                if (trr.config.seq_len > 2048l) {
+                    trr.config.seq_len = 2048l
+                }
+                let cpu_r <- continuation(trr, prompt, 40, KVDtype.f16)
+                select_decode_override("metal")
+                before = metal_decode_stats().decodes
+                let gpu_r <- continuation(trr, prompt, 40, KVDtype.f16)
+                select_decode_override("")
+                t |> success(metal_decode_stats().decodes - before > 0l, "reload arm served on the GPU")
+                t |> success(same(cpu_r, gpu_r), "40-token post-reload continuation matches the CPU control (weights-epoch guard)")
+                delete trr
             }
-            let cpu_r <- continuation(trr, prompt, 40, KVDtype.f16)
-            select_decode_override("metal")
-            before = metal_decode_stats().decodes
-            let gpu_r <- continuation(trr, prompt, 40, KVDtype.f16)
-            select_decode_override("")
-            t |> success(metal_decode_stats().decodes - before > 0l, "reload arm served on the GPU")
-            t |> success(same(cpu_r, gpu_r), "40-token post-reload continuation matches the CPU control (weights-epoch guard)")
-            delete trr
 
             // arm 10: K-quant weights (Q4_K_M — format-matrix W4): per-site kq plane GEMVs,
             // mixed k4/k6 tensors incl. the tied Q6_K classifier on the GPU-logits path. The
@@ -830,30 +861,32 @@ def test_metal_decode_parity(t : T?) {
             // the GPU kernels stream f32 x, so the two paths' WEIGHT math differs (measured
             // one-step logits maxd ~0.42 vs ~0.25 on the q8 arm); tokens stay exact on the fixture.
             let kpath = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
-            if (stat(kpath).is_valid) {
-                var trk <- load_model(kpath, QuantMode.q8)
-                if (trk.config.seq_len > 2048l) {
-                    trk.config.seq_len = 2048l
+            if (arm_on(t, "arm10-kq")) {
+                if (stat(kpath).is_valid) {
+                    var trk <- load_model(kpath, QuantMode.q8)
+                    if (trk.config.seq_len > 2048l) {
+                        trk.config.seq_len = 2048l
+                    }
+                    let cpu_k <- continuation(trk, prompt, 40, KVDtype.f16)
+                    select_decode_override("metal")
+                    before = metal_decode_stats().decodes
+                    let gpu_k <- continuation(trk, prompt, 40, KVDtype.f16)
+                    select_decode_override("")
+                    t |> success(metal_decode_stats().decodes - before > 0l, "kq arm served on the GPU")
+                    t |> success(same(cpu_k, gpu_k), "40-token K-quant continuation matches the CPU control")
+                    single_step_gate(t, trk, prompt, KVDtype.f16, 0.8, 0.5, "kq/f16")
+                    single_step_gate(t, trk, prompt, KVDtype.q8_0, 0.8, 0.5, "kq/q8_0")
+                    delete trk
+                } else {
+                    feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); kq arm skipped\n")
                 }
-                let cpu_k <- continuation(trk, prompt, 40, KVDtype.f16)
-                select_decode_override("metal")
-                before = metal_decode_stats().decodes
-                let gpu_k <- continuation(trk, prompt, 40, KVDtype.f16)
-                select_decode_override("")
-                t |> success(metal_decode_stats().decodes - before > 0l, "kq arm served on the GPU")
-                t |> success(same(cpu_k, gpu_k), "40-token K-quant continuation matches the CPU control")
-                single_step_gate(t, trk, prompt, KVDtype.f16, 0.8, 0.5, "kq/f16")
-                single_step_gate(t, trk, prompt, KVDtype.q8_0, 0.8, 0.5, "kq/q8_0")
-                delete trk
-            } else {
-                feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); kq arm skipped\n")
             }
 
             // arm 11: depth past 2048 (M2.4 — the retired MAX_ATTN_ROWS gate): a ~2030-token
             // prompt + 40 decode steps crosses the old cap mid-continuation; chunked attention
             // (1B, hs=64) scans the full depth. f16 + q8_0 mirrors (block-codec row offsets at
             // depth). The CPU control is depth-unbounded by construction.
-            {
+            if (arm_on(t, "arm11-depth")) {
                 var trd <- load_model(path, QuantMode.q8)
                 trd.config.seq_len = min(trd.config.seq_len, 2176l)
                 var deep_p <- encode(trd, counting_prompt(1, 700), true, false)
@@ -897,6 +930,34 @@ def test_metal_decode_parity(t : T?) {
                     delete trd3
                 } else {
                     feint("Llama-3.2-3B model not present; deep partD arm skipped\n")
+                }
+            }
+
+            // arm 12: the dim ladder (M2.6 — the retired batch_dim_cap gate): dim 4096 (8B)
+            // past B=4 rides the q8 GEMM tier; the batched unfused add+rms pair (what
+            // dim > 4096 selects) parity-rides the 1B via its pin (a 70B batch CPU control
+            // streams 40GB against the GPU's wired copy — it OOM-killed this box; the 70B
+            // batch cells stay ENGAGE-gated in the support matrix, GPU-only). The 8B/70B are
+            // large-tier: they run only under DASLLAMA_PARITY_FULL (the pre-commit gate).
+            if (arm_on(t, "arm12-dim")) {
+                let path8 = path_join(models_dir(), "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf")
+                if (model_available(t, path8)) {
+                    var tr8 <- load_model(path8, QuantMode.q8)
+                    tr8.config.seq_len = min(tr8.config.seq_len, 512l)
+                    batch_step_gate(t, tr8, 8, KVDtype.f16, 0.5, 0.25, "B=8 dim4096 f16", [plen = 12])
+                    delete tr8
+                }
+                set_metal_batch_addrms_unfused(true)
+                batch_step_gate(t, tr, 3, KVDtype.f16, 0.5, 0.25, "B=3 unfused add+rms pair", [plen = 12])
+                set_metal_batch_addrms_unfused(false)
+                let path70 = path_join(models_dir(), "Llama-3.3-70B-Instruct-Q4_K_M.gguf")
+                if (model_available(t, path70)) {
+                    var tr70 <- load_model(path70, QuantMode.q8)
+                    tr70.config.seq_len = min(tr70.config.seq_len, 256l)
+                    var p70 <- encode(tr70, counting_prompt(1, 12), true, false)
+                    single_step_gate(t, tr70, p70, KVDtype.f16, 0.8, 0.5, "70B dim8192 kq/f16")
+                    delete p70
+                    delete tr70
                 }
             }
 

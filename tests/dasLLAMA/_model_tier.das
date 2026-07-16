@@ -13,6 +13,7 @@ module _model_tier shared public
 require dastest/testing_boost public
 require daslib/fio public
 require strings public
+require daslib/strings_boost   // split — the DASLLAMA_TEST_ARMS comma list
 require dasllama/dasllama_gguf   // gguf_shard_paths — split models tier on their TOTAL size
 
 // Models larger than this are large-tier. 6 GiB cleanly splits the ~5GB-and-under carriers
@@ -28,6 +29,24 @@ def models_dir() : string {
 // True when the large tier is enabled for this run (the pre-PR full sweep).
 def parity_full_mode() : bool {
     return !empty(get_env_variable("DASLLAMA_PARITY_FULL"))
+}
+
+// Arm filter for the metal suites: DASLLAMA_TEST_ARMS = comma-separated substrings; when set,
+// only arm blocks whose name matches a token run. The skip is LOUD (t |> skip) so a filtered
+// run can never masquerade as full coverage. Unset/empty = every arm runs. Drive through
+// tests/dasLLAMA/run.das — see tests/dasLLAMA/CLAUDE.md.
+def arm_on(t : T?; name : string) : bool {
+    let filter = get_env_variable("DASLLAMA_TEST_ARMS")
+    if (empty(filter)) {
+        return true
+    }
+    for (tok in split(filter, ",")) {
+        if (!empty(tok) && find(name, tok) >= 0) {
+            return true
+        }
+    }
+    t |> skip("arm '{name}' filtered out (DASLLAMA_TEST_ARMS={filter})")
+    return false
 }
 
 // Presence + tier gate for a model-loading test. Returns true if the caller should proceed to

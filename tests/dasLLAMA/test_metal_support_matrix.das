@@ -29,12 +29,14 @@ require _model_tier
 //   q8        f32     q8_0   ENGAGE               ENGAGE (W3)          ENGAGE (W3)
 //   q8        f32     tq4    ENGAGE               ENGAGE (W3)          ENGAGE (W3)
 //   q8        f16     f16    ENGAGE (W2)          ENGAGE               ENGAGE
-//   Q4_K_M    f32     f16    ENGAGE (M2.3)        ENGAGE (W4)          ENGAGE B<=8 (M2.1)
-//   Q4_K_M    f32     q8_0   ENGAGE (M2.3)        ENGAGE (W4)          ENGAGE B<=8 (M2.1)
+//   Q4_K_M    f32     f16    ENGAGE (M2.3)        ENGAGE (W4)          ENGAGE (M2.1/W4)
+//   Q4_K_M    f32     q8_0   ENGAGE (M2.3)        ENGAGE (W4)          ENGAGE (M2.1/W4)
 // (W4: single-stream decode serves K-quant weights via the per-site kq plane GEMVs; M2.1: the
-// batched step serves kq at B <= 8 via nrows per-stream plane GEMVs — B >= 9 keeps the
-// kquant_native guard until the batch kq GEMM lands; M2.3: prefill serves kq via the mul_mm
-// twins, same %64 shape gates as the s16 path.)
+// batched step serves kq at B <= 8 via nrows per-stream plane GEMVs, B >= 9 via the kq mul_mm
+// twins (%64 shape gates); M2.3: prefill serves kq via the mul_mm twins, same gates.)
+// The dim ladder (M2.6) rides two extra models when present: an 8B (dim 4096, q8) engages at
+// every B — past B=4 the GEMM's fixed K-tiles take any width — and a 70B-class kq model
+// (dim 8192) engages all three paths with the batched add+rms running as the unfused pair.
 // The MetalMode knob (M1) rides the same matrix: off = overrides deselected, when_available =
 // engage/fallback per the cells above, required = a CAPABILITY decline panics (policy declines
 // — the prefill npos window — stay quiet CPU fallbacks). Batch kq: B <= 8 = per-stream GEMVs,
@@ -141,6 +143,51 @@ def private matrix_cell(t : T?; tr : Model; kdt : KVDtype; tag : string;
     }
 }
 
+[unused_argument(t, tr, nb, tag)]   // off-Apple the gated body is empty
+def private dim_ladder_batch_cell(t : T?; tr : Model; nb : int; tag : string) {
+    // one B=nb batched step under the metal decode override — the M2.6 coverage past B=4
+    // (GPU prefill fills the sessions so the wide models stay cheap)
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        let c = tr.config
+        let vocab = c.vocab_size
+        var served = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            var ss : array<Session>
+            ss |> reserve(nb)
+            var sess : array<Session?>
+            var cur : array<int64>
+            select_prefill_override("metal")
+            set_metal_prefill_min_npos(1l)
+            for (i in range(nb)) {
+                ss |> emplace <| make_run_state(c, KVDtype.f16, KVDtype.f16)
+                let p <- encode(tr, counting_prompt(1 + i, 14 + i), true, false)
+                eval_(tr, ss[i], p)
+                unsafe {
+                    sess |> push(addr(ss[i]))
+                }
+                cur |> push(greedy_top(ss[i].logits, vocab))
+            }
+            set_metal_prefill_min_npos(64l)
+            select_prefill_override("")
+            var ws <- create_batch_workspace_(tr)
+            let ba0 = metal_batch_decode_stats().steps
+            select_decode_override("metal")
+            eval_batch_(tr, ws, sess, cur)
+            select_decode_override("")
+            served = metal_batch_decode_stats().steps - ba0
+            sess |> clear()   // borrowed handles — delete of array<T?> cascades to the pointees
+            unsafe {
+                delete ws
+                delete sess
+            }
+            delete cur
+            delete ss
+        }
+        t |> success(served > 0l, "{tag}: B={nb} batched step ENGAGES on the GPU ({served} served)")
+    }
+}
+
 // "" = the path must ENGAGE (served > 0); otherwise it must sit out (served == 0) with `want`
 // recorded as a first-failing clause in the window
 def private check_cell(t : T?; cell : string; want : string; served : int64;
@@ -180,14 +227,16 @@ def test_metal_support_matrix(t : T?) {
             set_wscale_f16(false)
             var tr <- load_model(path, QuantMode.q8)
             tr.config.seq_len = min(tr.config.seq_len, 512l)
-            matrix_cell(t, tr, KVDtype.f16, "q8/s32/f16", "", "", "")
-            matrix_cell(t, tr, KVDtype.f32, "q8/s32/f32", "", "", "")
-            matrix_cell(t, tr, KVDtype.q8_0, "q8/s32/q8_0", "", "", "")
-            matrix_cell(t, tr, KVDtype.tq4, "q8/s32/tq4", "", "", "")
+            if (arm_on(t, "cells-q8")) {
+                matrix_cell(t, tr, KVDtype.f16, "q8/s32/f16", "", "", "")
+                matrix_cell(t, tr, KVDtype.f32, "q8/s32/f32", "", "", "")
+                matrix_cell(t, tr, KVDtype.q8_0, "q8/s32/q8_0", "", "", "")
+                matrix_cell(t, tr, KVDtype.tq4, "q8/s32/tq4", "", "", "")
+            }
 
             // the prefill window clauses ride the same model: npos below the default min_npos
             // declines npos_window; a continuation chunk (start_pos > 0) declines start_pos
-            {
+            if (arm_on(t, "window")) {
                 var pfd0 <- metal_prefill_declines()
                 with_job_que() {
                     setup_dasllama_jobque()
@@ -212,15 +261,17 @@ def test_metal_support_matrix(t : T?) {
             }
 
             // ===== q8 weights, f16 scale plane (the load DEFAULT since wscale16) =====
-            set_wscale_f16(true)
-            var tr16 <- load_model(path, QuantMode.q8)
-            tr16.config.seq_len = min(tr16.config.seq_len, 512l)
-            matrix_cell(t, tr16, KVDtype.f16, "q8/s16/f16", "", "", "")
-            set_wscale_f16(false)
-            delete tr16
+            if (arm_on(t, "cells-s16")) {
+                set_wscale_f16(true)
+                var tr16 <- load_model(path, QuantMode.q8)
+                tr16.config.seq_len = min(tr16.config.seq_len, 512l)
+                matrix_cell(t, tr16, KVDtype.f16, "q8/s16/f16", "", "", "")
+                set_wscale_f16(false)
+                delete tr16
+            }
 
             // ===== the MetalMode knob (M1) on a fully-servable q8 config =====
-            {
+            if (arm_on(t, "mode")) {
                 let de_off = metal_decode_stats().decodes
                 set_metal_mode(MetalMode.off)
                 t |> success(active_decode_override() == "", "mode off: overrides deselected")
@@ -274,11 +325,13 @@ def test_metal_support_matrix(t : T?) {
             }
 
             // ===== native K-quant weights (Q4_K_M) =====
-            // All three paths ENGAGE (W4 decode, M2.1 batch B<=8, M2.3 prefill mul_mm twins) —
-            // Q4_K_M mixes k4 and k6 per tensor, incl. the tied Q6_K classifier on the
-            // GPU-logits paths; B >= 9 batch keeps the kquant_native guard
+            // All three paths ENGAGE (W4 decode, M2.1 batch B<=8 + W4 mul_mm twins past that,
+            // M2.3 prefill mul_mm twins) — Q4_K_M mixes k4 and k6 per tensor, incl. the tied
+            // Q6_K classifier on the GPU-logits paths
             let kpath = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
-            if (stat(kpath).is_valid) {
+            if (!arm_on(t, "kq")) {
+                // filtered — the skip is already registered
+            } elif (stat(kpath).is_valid) {
                 var trk <- load_model(kpath, QuantMode.q8)
                 trk.config.seq_len = min(trk.config.seq_len, 512l)
                 t |> success(trk.kquant_native, "Q4_K_M under a q8-mode load keeps native K-quant planes")
@@ -309,9 +362,9 @@ def test_metal_support_matrix(t : T?) {
                 delete gpu_ids
 
                 // ===== MetalMode.required on the kq model =====
-                // every implemented path serves (prefill mul_mm, single decode, batch B<=8);
-                // the remaining capability gap — a B=9 batched step (kq GEMM pending) — fails
-                // hard instead of falling back
+                // every implemented path serves (prefill mul_mm, single decode, batched steps);
+                // the remaining capability gap — a continuation prefill (start_pos > 0, M2.5) —
+                // fails hard instead of falling back
                 with_job_que() {
                     setup_dasllama_jobque()
                     var sa = make_run_state(trk.config, KVDtype.f16, KVDtype.f16)
@@ -368,6 +421,32 @@ def test_metal_support_matrix(t : T?) {
                 delete trk
             } else {
                 feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); K-quant cells skipped\n")
+            }
+
+            // ===== the dim ladder (M2.6): batch dim caps retired =====
+            // past ADD_RMS_MAX_DIM the batched add+rms runs as the unfused pair, and past the
+            // mv8 probe's dim 3072 the B > 4 GEMM tier serves any width — an 8B (dim 4096)
+            // batches at every B and a 70B-class kq model (dim 8192) serves all three paths.
+            // Both are large-tier: they run only under DASLLAMA_PARITY_FULL (the pre-commit gate).
+            if (arm_on(t, "dim8b")) {
+                let path8 = path_join(models_dir(), "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf")
+                if (model_available(t, path8)) {
+                    var tr8 <- load_model(path8, QuantMode.q8)
+                    tr8.config.seq_len = min(tr8.config.seq_len, 512l)
+                    matrix_cell(t, tr8, KVDtype.f16, "8B-q8/s32/f16", "", "", "")
+                    dim_ladder_batch_cell(t, tr8, 8, "8B dim4096")   // the q8 GEMM tier past B=4
+                    delete tr8
+                }
+            }
+            if (arm_on(t, "dim70b")) {
+                let path70 = path_join(models_dir(), "Llama-3.3-70B-Instruct-Q4_K_M.gguf")
+                if (model_available(t, path70)) {
+                    var tr70 <- load_model(path70, QuantMode.q8)
+                    tr70.config.seq_len = min(tr70.config.seq_len, 128l)
+                    matrix_cell(t, tr70, KVDtype.f16, "70B-kq/s32/f16", "", "", "")
+                    dim_ladder_batch_cell(t, tr70, 12, "70B dim8192")   // the kq mul_mm twin at dim 8192
+                    delete tr70
+                }
             }
 
             // the decline tables surface in the human report too, and the leak gate holds
