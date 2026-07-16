@@ -29,7 +29,10 @@ require _model_tier
 //   q8        f32     q8_0   ENGAGE               ENGAGE (W3)          ENGAGE (W3)
 //   q8        f32     tq4    ENGAGE               ENGAGE (W3)          ENGAGE (W3)
 //   q8        f16     f16    ENGAGE (W2)          ENGAGE               ENGAGE
-//   Q4_K_M    f32     f16    decline kquant_native x3 (the silent-misread guard — W4 lifts it)
+//   Q4_K_M    f32     f16    decline kquant_native ENGAGE (W4)          decline kquant_native
+//   Q4_K_M    f32     q8_0   decline kquant_native ENGAGE (W4)          decline kquant_native
+// (W4: single-stream decode serves K-quant weights via the per-site kq plane GEMVs; the batched
+// mv/GEMM forms and prefill mul_mm keep the kquant_native guard until their kq twins land.)
 // plus the prefill-only window clauses: npos < min_npos declines npos_window, a continuation
 // chunk (start_pos > 0) declines start_pos.
 
@@ -210,16 +213,19 @@ def test_metal_support_matrix(t : T?) {
             set_wscale_f16(false)
             delete tr16
 
-            // ===== native K-quant weights (Q4_K_M) — the silent-misread guard, runtime-verified =====
-            // a K-quant file PASSES the q8-mode check (t.quant == q8) but its per-tensor planes are
-            // not qblob offsets; without the kquant_native decline the GPU reads the wrong plane
+            // ===== native K-quant weights (Q4_K_M) =====
+            // W4: single-stream decode ENGAGES (per-site kq plane GEMVs — Q4_K_M mixes k4 and k6
+            // per tensor, incl. the tied Q6_K classifier on the GPU-logits path); prefill and the
+            // batched forms keep the kquant_native guard (a K-quant file passes the q8-mode check
+            // but its per-tensor planes are not qblob offsets — blob_of would read garbage)
             let kpath = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
             if (stat(kpath).is_valid) {
                 var trk <- load_model(kpath, QuantMode.q8)
                 trk.config.seq_len = min(trk.config.seq_len, 512l)
                 t |> success(trk.kquant_native, "Q4_K_M under a q8-mode load keeps native K-quant planes")
-                matrix_cell(t, trk, KVDtype.f16, "k4/s32/f16", "kquant_native", "kquant_native", "kquant_native")
-                // the guard's output half: with the overrides ON the tokens must be the CPU truth
+                matrix_cell(t, trk, KVDtype.f16, "k4/s32/f16", "kquant_native", "", "kquant_native")
+                matrix_cell(t, trk, KVDtype.q8_0, "k4/s32/q8_0", "kquant_native", "", "kquant_native")
+                // the output half: GPU kq decode tokens must be the CPU truth
                 let kprompt <- encode(trk, counting_prompt(1, 30), true, false)
                 var cpu_ids : array<int64>
                 var gpu_ids : array<int64>

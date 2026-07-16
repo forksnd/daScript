@@ -770,6 +770,48 @@ def test_metal_decode_parity(t : T?) {
             set_wscale_f16(false)
             delete tr16
 
+            // arm 9: model reload — the weights-epoch guard. The weight caches key by HOST
+            // ADDRESS; deleting a model and loading another can land the new arrays at recycled
+            // addresses, and a stale cache hit serves the DEAD model's buffers (pre-W4 this
+            // produced silent garbage continuations; the load-epoch flush is the fix)
+            var trr <- load_model(path, QuantMode.q8)
+            if (trr.config.seq_len > 2048l) {
+                trr.config.seq_len = 2048l
+            }
+            let cpu_r <- continuation(trr, prompt, 40, KVDtype.f16)
+            select_decode_override("metal")
+            before = metal_decode_stats().decodes
+            let gpu_r <- continuation(trr, prompt, 40, KVDtype.f16)
+            select_decode_override("")
+            t |> success(metal_decode_stats().decodes - before > 0l, "reload arm served on the GPU")
+            t |> success(same(cpu_r, gpu_r), "40-token post-reload continuation matches the CPU control (weights-epoch guard)")
+            delete trr
+
+            // arm 10: K-quant weights (Q4_K_M — format-matrix W4): per-site kq plane GEMVs,
+            // mixed k4/k6 tensors incl. the tied Q6_K classifier on the GPU-logits path. The
+            // envelope is wider than q8's: the CPU kq dots run Q8_K-quantized activations while
+            // the GPU kernels stream f32 x, so the two paths' WEIGHT math differs (measured
+            // one-step logits maxd ~0.42 vs ~0.25 on the q8 arm); tokens stay exact on the fixture.
+            let kpath = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
+            if (stat(kpath).is_valid) {
+                var trk <- load_model(kpath, QuantMode.q8)
+                if (trk.config.seq_len > 2048l) {
+                    trk.config.seq_len = 2048l
+                }
+                let cpu_k <- continuation(trk, prompt, 40, KVDtype.f16)
+                select_decode_override("metal")
+                before = metal_decode_stats().decodes
+                let gpu_k <- continuation(trk, prompt, 40, KVDtype.f16)
+                select_decode_override("")
+                t |> success(metal_decode_stats().decodes - before > 0l, "kq arm served on the GPU")
+                t |> success(same(cpu_k, gpu_k), "40-token K-quant continuation matches the CPU control")
+                single_step_gate(t, trk, prompt, KVDtype.f16, 0.8, 0.5, "kq/f16")
+                single_step_gate(t, trk, prompt, KVDtype.q8_0, 0.8, 0.5, "kq/q8_0")
+                delete trk
+            } else {
+                feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); kq arm skipped\n")
+            }
+
             // the leak gate: every GPU object both drivers hold releases
             metal_decode_stage_report()
             metal_decode_shutdown()

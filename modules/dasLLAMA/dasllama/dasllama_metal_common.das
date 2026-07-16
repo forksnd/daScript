@@ -415,6 +415,62 @@ def upload_scales_cat3(t : Model; off0, rows0, off1, rows1, off2, rows2, n : int
     }
 }
 
+// One kq tensor's quant plane slice, uploaded BYTE-IDENTICAL (disk-order superblock payloads —
+// the backend_repack decline excludes grp-repacked loads, and the non-repack backends leave the
+// planes disk-order). Cached in g_regions by source address like every weight region.
+def kq_upload_quants(t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
+    let sb0 = off / 256l
+    let nsb = (rows * n) / 256l
+    unsafe {
+        if (fmt == KqFmt.k4) {
+            return upload_region(addr < void ? > (t.k4q[sb0 * 128l]), uint64(nsb * 128l))
+        }
+        if (fmt == KqFmt.k5) {
+            return upload_region(addr < void ? > (t.k5q[sb0 * 160l]), uint64(nsb * 160l))
+        }
+        return upload_region(addr < void ? > (t.k6q[sb0 * 192l]), uint64(nsb * 192l))
+    }
+}
+
+// One kq tensor's GPU-form scale buffer (the gemv lab's layout verdicts): k4/k5 = 16B compact
+// blocks (the production 20B block minus its pad — the 20B stride's varying mod-16 phase defeats
+// the compiler's vector-load merge); k6 = [16B sub-scale blocks][packed f16 d plane] in ONE
+// buffer, the d plane at byte nsb*16 (the kernel binds the buffer twice with offsets).
+def kq_upload_scales(t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
+    let sb0 = off / 256l
+    let nsb = (rows * n) / 256l
+    unsafe {
+        if (fmt == KqFmt.k6) {
+            let key = intptr(addr(t.k6s[sb0 * 18l]))
+            if (key_exists(g_regions, key)) {
+                return g_regions[key]
+            }
+            var buf = metal_new_buffer_untracked(g_dev, uint64(nsb * 18l))
+            var d = reinterpret<uint8?>(metal_buffer_contents(buf))
+            let src = addr < uint8 const ? > (t.k6s[sb0 * 18l])
+            for (sb in range64(nsb)) {
+                memcpy(reinterpret<void?>(d + sb * 16l), reinterpret<void const?>(src + sb * 18l), 16)
+                d[nsb * 16l + sb * 2l] = src[sb * 18l + 16l]
+                d[nsb * 16l + sb * 2l + 1l] = src[sb * 18l + 17l]
+            }
+            g_regions[key] = buf
+            return buf
+        }
+        let src = fmt == KqFmt.k4 ? addr < uint8 const ? > (t.k4s[sb0 * 20l]) : addr < uint8 const ? > (t.k5s[sb0 * 20l])
+        let key = intptr(src)
+        if (key_exists(g_regions, key)) {
+            return g_regions[key]
+        }
+        var buf = metal_new_buffer_untracked(g_dev, uint64(nsb * 16l))
+        var d = reinterpret<uint8?>(metal_buffer_contents(buf))
+        for (sb in range64(nsb)) {
+            memcpy(reinterpret<void?>(d + sb * 16l), reinterpret<void const?>(src + sb * 20l), 16)
+        }
+        g_regions[key] = buf
+        return buf
+    }
+}
+
 def uniform_u32(v : uint) : MetalBuffer? {
     var buf = pool_acquire_untracked(g_upool, g_dev, 4ul)
     var p = unsafe(reinterpret<uint?>(metal_buffer_contents(buf)))
@@ -798,6 +854,44 @@ def metal_common_init : bool {
 //! Release the shared state (blob/cat-blob/region caches, mirrors, arena, pools, signs, queue,
 //! device). Callers land in-flight work first (finish_pending_step) and release PSOs before the
 //! device goes (metal_kernels_release) — metal_decode_shutdown is the public rail.
+// ===== the weights-epoch guard =====
+// g_regions / g_cat_blobs / the shared blob cache all key by host address; see weights_epoch's
+// doc for why a model reload makes those keys lie. Drivers call the flush at their entry points
+// when the epoch has moved (after quiescing any in-flight step — its unretained cb may
+// reference cached buffers).
+var g_weight_cache_epoch = -1l
+
+def weight_caches_stale() : bool {
+    return weights_epoch() != g_weight_cache_epoch
+}
+
+def weight_caches_flush_on_reload {
+    if (!weight_caches_stale()) {
+        return
+    }
+    finish_pending_step()
+    metal_blob_regions_release()
+    for (buf in values(g_cat_blobs)) {
+        if (buf != null) {
+            metal_release(buf)
+        }
+        buf = null
+    }
+    unsafe {
+        delete g_cat_blobs
+    }
+    for (buf in values(g_regions)) {
+        if (buf != null) {
+            metal_release(buf)
+        }
+        buf = null
+    }
+    unsafe {
+        delete g_regions
+    }
+    g_weight_cache_epoch = weights_epoch()
+}
+
 def metal_common_release {
     metal_blob_regions_release()   // the batch mm path creates blobs in the prefill module's cache
     for (buf in values(g_cat_blobs)) {

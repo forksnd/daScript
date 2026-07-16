@@ -1525,7 +1525,29 @@ def private pf_enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; 
 //! The PrefillOverrideFn: runs the whole llama layer stack GPU-resident. true = done (KV cache
 //! filled, x_b final); false = declined, the caller runs the CPU loop (x_b untouched, so the
 //! fallback recomputes from clean state).
+// the prefill half of the weights-epoch guard (see dasllama_metal_common): flush the module's
+// own address-keyed region cache when a model (re)load may have recycled the addresses
+var private g_pf_cache_epoch = -1l
+
+def private pf_weight_caches_flush_on_reload {
+    if (weights_epoch() == g_pf_cache_epoch) {
+        return
+    }
+    weight_caches_flush_on_reload()   // the shared caches (blob regions live there too)
+    for (buf in values(g_pf_regions)) {
+        if (buf != null) {
+            metal_release(buf)
+        }
+        buf = null
+    }
+    unsafe {
+        delete g_pf_regions
+    }
+    g_pf_cache_epoch = weights_epoch()
+}
+
 def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) : bool {
+    pf_weight_caches_flush_on_reload()
     var why = prefill_decline(t, s, npos, start_pos)
     if (why == MetalPrefillDecline.none && !metal_prefill_init()) {
         why = MetalPrefillDecline.device

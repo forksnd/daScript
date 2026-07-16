@@ -56,12 +56,6 @@ def private decode_shape_decline(t : Model) : MetalDecodeDecline {
     if (t.quant != QuantMode.q8) {
         return MetalDecodeDecline.quant_mode
     }
-    // kquant_native: the per-tensor K-quant planes are NOT readable as qblob offsets — without
-    // this decline a Q4_K_M file passes the q8-mode check and blob_of reads the wrong plane
-    // (silent garbage). Real K-quant kernels are the format-matrix arc's W4.
-    if (t.kquant_native) {
-        return MetalDecodeDecline.kquant_native
-    }
     if (t.arch != "llama") {
         return MetalDecodeDecline.arch
     }
@@ -120,6 +114,24 @@ def private decode_decline(t : Model; s : Session; pos : int64) : MetalDecodeDec
         return MetalDecodeDecline.rope_rows
     }
     return MetalDecodeDecline.none
+}
+
+def private kq_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
+
+// One weight site's GEMV — a q8-tagged tensor rides the planar q8 kernels, a kq tensor the
+// plane GEMVs (kq_upload_quants/scales + enc_kq_gemv). yoff places the k/v/w3 output segments.
+def private enc_site_gemv(enc : MetalComputeEncoder?; t : Model; s16 : bool; fmt : KqFmt; woff, rows, n : int64; bx, by, bn, bd : MetalBuffer?; yoff : uint64 = 0ul) {
+    if (fmt == KqFmt.q8) {
+        unsafe {
+            var bw = upload_region(addr < void ? > (t.qblob[woff]), uint64(rows * n))
+            var bws = upload_scales(t, woff, rows, n)
+            enc_gemv(enc, s16, bw, bws, bx, by, bn, bd, rows, yoff)
+        }
+    } else {
+        var bq = kq_upload_quants(t, fmt, woff, rows, n)
+        var bs = kq_upload_scales(t, fmt, woff, rows, n)
+        enc_kq_gemv(enc, fmt, bq, bs, bx, by, bn, bd, rows, n, yoff)
+    }
 }
 
 // Evict least-recently-used mirrors (never `keep`, never a pinned batch row) until the resident
@@ -240,8 +252,9 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     // mirrors the prefill gates — q8 untied classifier, no softcap, no suppress pins
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
+    // q8 AND K-quant classifiers serve (the kq plane GEMVs — W4); only the tied-fp32 table stays CPU
     r.gpu_logits = (!g_logits_cpu && get_env_variable("DASLLAMA_METAL_LOGITS") != "0" && empty(g_skip) &&
-        cls_fmt == KqFmt.q8 && !tied_f32 && c.final_logit_softcap <= 0.0 &&
+        !tied_f32 && c.final_logit_softcap <= 0.0 &&
         empty(t.suppress) && t.wcls_off >= 0l)
     if (r.gpu_logits) {
         r.bxf = pool_acquire(g_pool, g_dev, r.bytes_x)
@@ -316,22 +329,34 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
         unsafe {
             // attention: fused QKV GEMV (+rope+store on the s16 path — one dispatch, one
             // serialization level) -> single-query attention over [0, pos] -> out-proj ->
-            // fused residual add + ffn norm
+            // fused residual add + ffn norm. K-quant sites (formats mix PER TENSOR — Q4_K_M
+            // sends attn_v to Q6_K) split into per-tensor plane GEMVs at q|k|v output offsets.
+            let fq = kq_fmt_at(t.wq_fmt, l)
+            let fk = kq_fmt_at(t.wk_fmt, l)
+            let fv = kq_fmt_at(t.wv_fmt, l)
+            let qkv_q8 = fq == KqFmt.q8 && fk == KqFmt.q8 && fv == KqFmt.q8
+            let fused_qkv = r.s16 && scalar_kv && qkv_q8
             if (g_skip != "gemv") {
-                var bwqkv = upload_region_cat3(
-                    addr < void ? > (t.qblob[t.wq_offs[l]]), uint64(qd * dim),
-                    addr < void ? > (t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
-                    addr < void ? > (t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
-                var bwqkv_s = upload_scales_cat3(t, t.wq_offs[l], qd, t.wk_offs[l], kv_dim, t.wv_offs[l], kv_dim, dim)
-                if (r.s16 && scalar_kv) {
-                    enc_gemv_qkv_rs(enc, f16v, bwqkv, bwqkv_s, r.bxb, r.bqkv, g_arena, g_arena,
-                        r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
-                        r.bcos, r.bsin, r.u_dim, r.u_qkvd, r.u_qd, r.u_kvd, r.u_hs, qkvd)
+                if (qkv_q8) {
+                    var bwqkv = upload_region_cat3(
+                        addr < void ? > (t.qblob[t.wq_offs[l]]), uint64(qd * dim),
+                        addr < void ? > (t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
+                        addr < void ? > (t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
+                    var bwqkv_s = upload_scales_cat3(t, t.wq_offs[l], qd, t.wk_offs[l], kv_dim, t.wv_offs[l], kv_dim, dim)
+                    if (fused_qkv) {
+                        enc_gemv_qkv_rs(enc, f16v, bwqkv, bwqkv_s, r.bxb, r.bqkv, g_arena, g_arena,
+                            r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
+                            r.bcos, r.bsin, r.u_dim, r.u_qkvd, r.u_qd, r.u_kvd, r.u_hs, qkvd)
+                    } else {
+                        enc_gemv(enc, r.s16, bwqkv, bwqkv_s, r.bxb, r.bqkv, r.u_dim, r.u_qkvd, qkvd)
+                    }
                 } else {
-                    enc_gemv(enc, r.s16, bwqkv, bwqkv_s, r.bxb, r.bqkv, r.u_dim, r.u_qkvd, qkvd)
+                    enc_site_gemv(enc, t, r.s16, fq, t.wq_offs[l], qd, dim, r.bxb, r.bqkv, r.u_dim, r.u_qd)
+                    enc_site_gemv(enc, t, r.s16, fk, t.wk_offs[l], kv_dim, dim, r.bxb, r.bqkv, r.u_dim, r.u_kvd, uint64(qd * 4l))
+                    enc_site_gemv(enc, t, r.s16, fv, t.wv_offs[l], kv_dim, dim, r.bxb, r.bqkv, r.u_dim, r.u_kvd, uint64((qd + kv_dim) * 4l))
                 }
             }
-            if (g_skip != "ew" && !(r.s16 && scalar_kv)) {
+            if (g_skip != "ew" && !fused_qkv) {
                 if (r.kdt == KVDtype.q8_0) {
                     enc_rope_store_q8(enc, r.bqkv, uint64((qd + kv_dim) * 4l), g_arena, g_arena,
                         r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
@@ -378,9 +403,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 }
             }
             if (g_skip != "gemv") {
-                var bwo = upload_region(addr < void ? > (t.qblob[t.wo_offs[l]]), uint64(dim * qd))
-                var bwo_s = upload_scales(t, t.wo_offs[l], dim, qd)
-                enc_gemv(enc, r.s16, bwo, bwo_s, r.bxb, r.bxb2, r.u_qd, r.u_dim, dim)
+                enc_site_gemv(enc, t, r.s16, kq_fmt_at(t.wo_fmt, l), t.wo_offs[l], dim, qd, r.bxb, r.bxb2, r.u_qd, r.u_dim)
             }
             // ffn: fused add+norm -> fused W1|W3 GEMV -> swiglu -> W2 GEMV -> fused add + the
             // NEXT layer's attention norm (plain add on the last layer — the final norm follows)
@@ -388,24 +411,30 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 var bw_ffn = upload_region(addr < void ? > (t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
                 enc_add_rms_site(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, dim)
             }
+            let f1 = kq_fmt_at(t.w1_fmt, l)
+            let f3 = kq_fmt_at(t.w3_fmt, l)
+            let w13_q8 = f1 == KqFmt.q8 && f3 == KqFmt.q8
             if (g_skip != "gemv") {
-                var bw13 = upload_region_cat3(
-                    addr < void ? > (t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
-                    addr < void ? > (t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
-                var bw13_s = upload_scales_cat3(t, t.w1_offs[l], hidden, t.w3_offs[l], hidden, 0l, 0l, dim)
-                if (r.s16) {   // fused gate+up dot with the swiglu epilogue — one dispatch
-                    enc_gemv_w13sw(enc, bw13, bw13_s, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
+                if (w13_q8) {
+                    var bw13 = upload_region_cat3(
+                        addr < void ? > (t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
+                        addr < void ? > (t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
+                    var bw13_s = upload_scales_cat3(t, t.w1_offs[l], hidden, t.w3_offs[l], hidden, 0l, 0l, dim)
+                    if (r.s16) {   // fused gate+up dot with the swiglu epilogue — one dispatch
+                        enc_gemv_w13sw(enc, bw13, bw13_s, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
+                    } else {
+                        enc_gemv(enc, false, bw13, bw13_s, r.bxb, r.bh12, r.u_dim, r.u_h2, h2)
+                    }
                 } else {
-                    enc_gemv(enc, false, bw13, bw13_s, r.bxb, r.bh12, r.u_dim, r.u_h2, h2)
+                    enc_site_gemv(enc, t, r.s16, f1, t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
+                    enc_site_gemv(enc, t, r.s16, f3, t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
                 }
             }
-            if (g_skip != "ew" && !r.s16) {
+            if (g_skip != "ew" && !(r.s16 && w13_q8)) {
                 enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(hidden * 4l), r.u_hidden, hidden)
             }
             if (g_skip != "gemv") {
-                var bw2 = upload_region(addr < void ? > (t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
-                var bw2_s = upload_scales(t, t.w2_offs[l], dim, hidden)
-                enc_gemv(enc, r.s16, bw2, bw2_s, r.bh12, r.bxb, r.u_hidden, r.u_dim, dim)
+                enc_site_gemv(enc, t, r.s16, kq_fmt_at(t.w2_fmt, l), t.w2_offs[l], dim, hidden, r.bh12, r.bxb, r.u_hidden, r.u_dim)
             }
             if (g_skip != "ew") {
                 if (l + 1l < c.n_layers) {
@@ -421,11 +450,10 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
         // final rmsnorm (one row) + classifier GEMV — the caller samples straight from s.logits
         unsafe {
             var bwfin = upload_region(addr < void ? > (t.fblob[t.rms_final_off]), uint64(dim * 4l))
-            var bwc = upload_region(addr < void ? > (t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
-            var bwc_s = upload_scales(t, t.wcls_off, c.vocab_size, dim)
             enc_rms(enc, r.bx, bwfin, r.bxf, r.u_dim, r.u_eps)
-            enc_gemv(enc, r.s16, bwc, bwc_s, r.bxf, r.blog, r.u_dim, r.u_vocab, c.vocab_size)
         }
+        let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+        enc_site_gemv(enc, t, r.s16, cls_fmt, t.wcls_off, c.vocab_size, dim, r.bxf, r.blog, r.u_dim, r.u_vocab)
     }
     metal_end_encoding(enc)
     metal_release(enc)
@@ -609,6 +637,10 @@ def metal_decode_forward(t : Model; var s : Session; token, pos : int64) : bool 
     // mixed batch/single schedules: a pipelined batch step may still own this session's KV row
     // and logits — land it before reading anything session-side (no-op when nothing pends)
     finish_pending_step()
+    if (weight_caches_stale()) {   // a model (re)load may have recycled cached weight addresses
+        discard_pre()
+        weight_caches_flush_on_reload()
+    }
     g_lp_err = false
     var why = decode_decline(t, s, pos)
     if (why == MetalDecodeDecline.none && !metal_decode_init()) {
@@ -725,6 +757,12 @@ var private g_b_ulays : array<MetalBuffer?>   // per-layer uniforms, pooled per 
 // rope rows built, and dim within the add+rms row slabs (the GEMM path caps at 3072, the
 // fixed-B GEMV path at ADD_RMS_MAX_DIM — B >= 5 on a wider model declines)
 def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : array<Session?>; nrows : int64) : MetalDecodeDecline {
+    // kquant_native: the batched mv/GEMM forms have no K-quant twins yet (single-stream decode
+    // serves kq loads; batch kq is the W4 tail) — and without this decline blob_of would read
+    // qblob offsets that index a kq plane (silent garbage)
+    if (t.kquant_native) {
+        return MetalDecodeDecline.kquant_native
+    }
     let shape = decode_shape_decline(t)
     if (shape != MetalDecodeDecline.none) {
         return shape
@@ -760,6 +798,10 @@ def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : arra
 //! residuals; the CPU tail (final rms, classifier, scatter, n_past++) stays with the caller.
 //! false = declined — the CPU layer loop recomputes from clean state (x_b written only on ok).
 def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; nrows : int64) : bool {
+    if (weight_caches_stale()) {   // a model (re)load may have recycled cached weight addresses
+        discard_pre()
+        weight_caches_flush_on_reload()
+    }
     var why = batch_decode_decline(t, ws, sessions, nrows)
     if (why == MetalDecodeDecline.none && !metal_decode_init()) {
         why = MetalDecodeDecline.device
