@@ -67,6 +67,25 @@ def test_conf_join(t : T?) {
             t |> equal(orders[1].Amount, 250)
         }
     }
+    t |> run("_aggregate consumes a whole-source join projection") @(tt : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let stats = _sql(db |> select_from(type<ConfCust>)
+                |> _join(db |> select_from(type<ConfOrder>),
+                         $(c : ConfCust, o : ConfOrder) => c.Id == o.CustId,
+                         $(c : ConfCust, o : ConfOrder) => o)
+                |> _where(_.Amount >= 100)
+                |> _aggregate($(_rows) => (
+                    N = _rows |> count,
+                    Total = _rows |> _select(_.Amount) |> sum,
+                    First = _rows |> _select(_.Amount) |> min,
+                    Last = _rows |> _select(_.Amount) |> max)))
+            tt |> equal(stats.N, 2)
+            tt |> equal(stats.Total, 350)
+            tt |> equal(stats.First, 100)
+            tt |> equal(stats.Last, 250)
+        }
+    }
     t |> run("whole-source join results may feed another join") @(t : T?) {
         with_conf_db() $(db) {
             seed(db)

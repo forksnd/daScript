@@ -57,6 +57,43 @@ def _first(arr : array<auto(TT)>) : TT -const -& {
     return first(arr)
 }
 
+def _aggregate_rows(rows : array<auto(TT)>; aggregate_block : block<(rows : array<TT>) : auto(RR)>) {
+    //! Compute several global aggregates from one source. In ordinary in-memory
+    //! chains the block runs over ``rows`` directly. Inside ``_sql(...)`` the
+    //! terminal lowers a named tuple of ``count`` / ``long_count`` / ``sum`` /
+    //! ``average`` / ``min`` / ``max`` expressions into one SQL SELECT row.
+    static_if (typeinfo can_copy(default<RR -const -#>)) {
+        return invoke(aggregate_block, rows)
+    } else {
+        return <- invoke(aggregate_block, rows)
+    }
+}
+
+[call_macro(name="_aggregate")]
+class private SqlGlobalAggregate : AstCallMacro {
+    def override visit(prog : ProgramPtr; mod : Module?; var call : ExprCallMacro?) : Expression? {
+        macro_verify(call.arguments |> length == 2, prog, call.at, "_aggregate expects `(source, aggregate_block)`")
+        assume sourceType = call.arguments[0]._type
+        macro_verify(sourceType != null, prog, call.at, "_aggregate source is not inferred yet")
+        macro_verify(sourceType.isGoodArrayType, prog, call.at, "_aggregate expects an array-backed source")
+        macro_verify(!sourceType.firstType.isAutoOrAlias, prog, call.at, "_aggregate source element type cannot be auto or alias")
+        macro_verify(call.arguments[1] is ExprMakeBlock, prog, call.at, "_aggregate expects a one-argument block returning a named tuple")
+        var aggregateLambda = call.arguments[1] as ExprMakeBlock
+        var aggregateBlock = aggregateLambda._block as ExprBlock
+        macro_verify(aggregateBlock != null && aggregateBlock.arguments |> length == 1,
+            prog, call.at, "_aggregate block must take exactly one rowset argument")
+        if (aggregateBlock.arguments[0]._type == null || aggregateBlock.arguments[0]._type.isAutoOrAlias) {
+            var rowsType = clone_type(sourceType)
+            rowsType.flags.constant = true
+            aggregateBlock.arguments[0]._type = rowsType
+        }
+        aggregateBlock.arguments[0].flags.can_shadow = true
+        var res = qmacro(_aggregate_rows($e(call.arguments[0]), $e(call.arguments[1])))
+        res.force_at(call.at)
+        return res
+    }
+}
+
 // ===== to_sql_literal — runtime stringifier for `_create_view` body inlining =====
 // `_::` resolution lets users extend with a one-line overload in their own module
 // (`def to_sql_literal(s : Status) : string => "{int(s)}"`).
@@ -1665,6 +1702,40 @@ def private analyze_chain(var node : ExpressionPtr; var q : SqlQuery&; prog : Pr
             return analyze_chain(foCall.arguments[0], q, prog, at)
         }
     }
+    // Peel `_aggregate(prev, block)` — one named row containing several
+    // global aggregates, all evaluated by one SQL source scan.
+    {
+        var gaCall = match_call_in_module(node, "_aggregate_rows", "sql_linq")
+        if (gaCall != null) {
+            if (q.seenTerminal || q.seenToArray) {
+                macro_error(prog, at, "_sql: only one terminal allowed per chain")
+                return false
+            }
+            if (gaCall.arguments |> length != 2) {
+                macro_error(prog, at, "_sql: `_aggregate` expects `(source, aggregate_block)`")
+                return false
+            }
+            // Pre-set terminal state so a join source does not mistake this
+            // outer terminal for a terminal embedded in its own LHS/RHS.
+            q.matr = Materializer.One
+            q.seenTerminal = true
+            if (!analyze_chain(gaCall.arguments[0], q, prog, at)) return false
+            if (q.seenGroupBy || q.seenHaving) {
+                macro_error(prog, at, "_sql: `_aggregate` is a global aggregate and cannot follow `_group_by` / `_having`; use grouped `_select` aggregates instead")
+                return false
+            }
+            if (q.seenDistinct || !empty(q.distinctByCol) || q.seenSetOp
+                    || q.seenTake || q.seenSkip || q.seenOrderBy) {
+                macro_error(prog, at, "_sql: `_aggregate` v1 supports filtered table/join sources only — `distinct`, `_distinct_by`, set ops, ordering, take, and skip need an explicit subquery-composition rail")
+                return false
+            }
+            if (q.seenSelect && !q.seenJoin) {
+                macro_error(prog, at, "_sql: `_aggregate` v1 cannot follow a standalone `_select`; aggregate fields directly from the source row inside the `_aggregate` block")
+                return false
+            }
+            return analyze_global_aggregate_projection(gaCall.arguments[1], q, prog, at)
+        }
+    }
     // Peel count(prev) / long_count(prev) → SELECT COUNT(*) (or COUNT(DISTINCT col) when fronted by `_distinct_by(_.col)`).
     {
         if (peel_count_terminal(node, q, "count", false, prog, at)
@@ -2605,6 +2676,181 @@ def private try_translate_group_aggregate(var node : ExpressionPtr; var q : SqlQ
         }
     }
     return false
+}
+
+// nolint:STYLE015 Translates one `_aggregate` tuple slot. The terminal's block argument represents the full filtered rowset: `rows |> count` becomes COUNT(*), while `rows |> _select($(r:T) => r.Field) |> min/max/sum/average` wraps the exact source column. Post-join fields resolve through the join's `into` projection registry, so a whole-source projection (`$(l,r)=>r`) remains fully qualified.
+[macro_function]
+def private try_translate_global_aggregate(var node : ExpressionPtr; rowsArgName : string;
+                                           var q : SqlQuery&; prog : ProgramPtr; at : LineInfo;
+                                           var sqlOut : string&; var typeOut : TypeDeclPtr&) : bool {
+    var n = node
+    if (n is ExprRef2Value) {
+        n = (n as ExprRef2Value).subexpr
+    }
+    if (n == null || !(n is ExprCall)) return false
+    var call = n as ExprCall
+    if (call.func == null) return false
+    var fname = string(call.func.name)
+    if (call.func.fromGeneric != null) {
+        fname = string(call.func.fromGeneric.name)
+    }
+    let argc = user_arg_count(call)
+    if ((fname == "count" || fname == "long_count") && argc == 1) {
+        var rowsArg = call.arguments[0]
+        if (rowsArg is ExprRef2Value) {
+            rowsArg = (rowsArg as ExprRef2Value).subexpr
+        }
+        if (rowsArg != null && rowsArg is ExprVar
+                && (rowsArg as ExprVar).name == rowsArgName) {
+            sqlOut = "COUNT(*)"
+            typeOut = new TypeDecl(
+                at = at,
+                baseType = fname == "long_count" ? Type.tInt64 : Type.tInt)
+            return true
+        }
+        macro_error(prog, at, "_sql: `_aggregate` {fname} must consume the aggregate block's `{rowsArgName}` rowset directly")
+        return true
+    }
+    if ((fname == "sum" || fname == "average" || fname == "min" || fname == "max") && argc == 1) {
+        var innerCall = match_call_in_linq(call.arguments[0], "select")
+        if (innerCall == null || innerCall.arguments |> length != 2) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} requires `{rowsArgName} |> _select($(row : T) => row.Field) |> {fname}`")
+            return true
+        }
+        var selectRows = innerCall.arguments[0]
+        if (selectRows is ExprRef2Value) {
+            selectRows = (selectRows as ExprRef2Value).subexpr
+        }
+        if (selectRows == null || !(selectRows is ExprVar)
+                || (selectRows as ExprVar).name != rowsArgName) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} must select from the aggregate block's `{rowsArgName}` rowset")
+            return true
+        }
+        var selector = innerCall.arguments[1]
+        if (selector == null || !(selector is ExprMakeBlock)) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} selector has unexpected shape")
+            return true
+        }
+        var selectorBlock = (selector as ExprMakeBlock)._block as ExprBlock
+        if (selectorBlock == null || selectorBlock.arguments |> length != 1) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} selector must take exactly one row argument")
+            return true
+        }
+        let selectorArgName = string(selectorBlock.arguments[0].name)
+        var selectorBody = peel_lambda_single_return(selector)
+        if (selectorBody == null) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} selector lambda has unexpected shape")
+            return true
+        }
+        var receiver : ExpressionPtr
+        var fieldName : string
+        if (!qmatch(selectorBody, $e(receiver).$f(fieldName)).matched
+                || receiver == null || !(receiver is ExprVar)
+                || (receiver as ExprVar).name != selectorArgName) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} selector must be `<row>.<field>` and may not read an outer capture; got: {describe(selectorBody)}")
+            return true
+        }
+        var sqlArg : string
+        var fieldType : TypeDeclPtr
+        if (q.seenJoin) {
+            let aliasIdx = find_projection_alias(q, fieldName)
+            if (aliasIdx < 0) {
+                macro_error(prog, at, "_sql: `_aggregate` {fname} field '{fieldName}' is not an alias of the preceding join projection (valid aliases: {projection_alias_list(q)})")
+                return true
+            }
+            sqlArg = render_projection_alias_sql(q, aliasIdx)
+            if (empty(sqlArg)) {
+                macro_error(prog, at, "_sql: `_aggregate` {fname} cannot render join projection field '{fieldName}'")
+                return true
+            }
+            fieldType = clone_type(q.joinSelectColTypes[aliasIdx])
+        } else {
+            fieldType = lookup_struct_field_type(q.rootType, fieldName)
+            if (fieldType == null) {
+                macro_error(prog, at, "_sql: `_aggregate` {fname} cannot resolve field '{fieldName}' on the source row")
+                return true
+            }
+            sqlArg = column_sql_for_alias("", q.rootType, fieldName)
+        }
+        var sqlOp : string
+        if (fname == "sum") {
+            sqlOp = "SUM"
+        } elif (fname == "average") {
+            sqlOp = "AVG"
+        } elif (fname == "min") {
+            sqlOp = "MIN"
+        } else {
+            sqlOp = "MAX"
+        }
+        sqlOut = "{sqlOp}({sqlArg})"
+        if (fname == "average") {
+            typeOut = new TypeDecl(at = at, baseType = Type.tDouble)
+        } else {
+            typeOut = fieldType
+        }
+        return true
+    }
+    return false
+}
+
+[macro_function]
+def private analyze_global_aggregate_projection(var aggregateLambda : ExpressionPtr;
+                                                var q : SqlQuery&; prog : ProgramPtr; at : LineInfo) : bool {
+    if (aggregateLambda == null || !(aggregateLambda is ExprMakeBlock)) {
+        macro_error(prog, at, "_sql: `_aggregate` expects a one-argument block returning a named tuple")
+        return false
+    }
+    var aggregateBlock = (aggregateLambda as ExprMakeBlock)._block as ExprBlock
+    if (aggregateBlock == null || aggregateBlock.arguments |> length != 1) {
+        macro_error(prog, at, "_sql: `_aggregate` block must take exactly one rowset argument")
+        return false
+    }
+    let rowsArgName = string(aggregateBlock.arguments[0].name)
+    var body = peel_lambda_single_return(aggregateLambda)
+    if (body is ExprRef2Value) {
+        body = (body as ExprRef2Value).subexpr
+    }
+    if (body == null || !(body is ExprMakeTuple)) {
+        macro_error(prog, at, "_sql: `_aggregate` block must return a named tuple such as `(N = rows |> count, MinX = rows |> _select($(r:T) => r.X) |> min)`")
+        return false
+    }
+    var mkTup = body as ExprMakeTuple
+    var tupT = mkTup._type
+    if (tupT == null || tupT.baseType != Type.tTuple
+            || empty(tupT.argNames)
+            || length(tupT.argNames) != length(mkTup.values)) {
+        macro_error(prog, at, "_sql: `_aggregate` result must be a NAMED tuple — every aggregate needs `Name = expression`")
+        return false
+    }
+    q.selectCols |> clear
+    q.selectColAliases |> clear
+    q.selectColTypes |> clear
+    q.selectColSqlFragments |> clear
+    q.projRecordNames |> clear
+    q.projBindExprs |> clear
+    let n = length(mkTup.values)
+    q.selectCols |> reserve(n)
+    q.selectColAliases |> reserve(n)
+    q.selectColTypes |> reserve(n)
+    q.selectColSqlFragments |> reserve(n)
+    q.projRecordNames |> reserve(n)
+    for (i in range(n)) {
+        var sqlFrag : string
+        var resultType : TypeDeclPtr
+        if (!try_translate_global_aggregate(
+                mkTup.values[i], rowsArgName, q, prog, at, sqlFrag, resultType)) {
+            macro_error(prog, at, "_sql: `_aggregate` tuple values must be `rows |> count/long_count` or `rows |> _select($(row:T) => row.Field) |> sum/average/min/max`; got: {describe(mkTup.values[i])}")
+            return false
+        }
+        if (empty(sqlFrag) || resultType == null) return false
+        push_computed_proj_slot(q, sqlFrag, resultType, string(tupT.argNames[i]))
+    }
+    q.projectedRowType = null
+    q.proj = ProjectionShape.NamedTuple
+    q.matr = Materializer.One
+    q.seenSelect = true
+    q.seenTerminal = true
+    return true
 }
 
 // nolint:STYLE015 Recognizes `_._1 |> first()` (== `first(_._1)`) in a `_select` after `_group_by`. Mirrors `try_translate_group_aggregate`'s name+receiver match shape — qmatch's `_._1.first()` doesn't match the call form.

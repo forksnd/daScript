@@ -268,6 +268,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_sql_column.das | `@sql_column` annotation validation (empty value, embedded quotes/backslashes, cross-field collisions) | **expect** `30111:5` |
 | failed_sql_fts5.das | `[sql_fts5]` field-annotation rejections (`@sql_column` / `@sql_fts_unindexed` on rank) | **expect** `20800:2` |
 | failed_sql_fts5_unindexed_match.das | `_sql` rejects `text_match` on `@sql_fts_unindexed` metadata | **expect** `50503:1` |
+| failed_sql_global_aggregate.das | `_aggregate` rejects unnamed/non-aggregate results and unsupported pre-projection/distinct/grouped/ordered/paged source shapes | **expect** `50503:9` |
 | failed_sql_index.das | `[sql_index]` validation (missing fields, nonexistent columns, ordering with `[sql_table]`) | **expect** `30111:4` |
 | failed_sql_json_blob_kind_collision.das | Payload type kind collision rejection (same type in `@sql_json` vs `@sql_blob`) | **expect** `30111:3` |
 | failed_sql_macro.das | `_sql` / `_sql_text` analyzer failures (22 malformed chains: invalid roots, duplicate modifiers, unsupported expressions) | **expect** `40104:22, 30304:2, 30503:2` |
@@ -1023,8 +1024,8 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 | _conformance_provider.das | *(shim)* Provider under test — `with_conf_db` scoped runner + `CONF_HAS_*` capability constants | |
 | test_conf_table_crud.das | `[sql_table]` DDL round-trip, check_schema, column_info, insert single+bulk, update / delete_ / delete_by_id | |
 | test_conf_sql_select.das | `_sql` reads — _where + captured binds, _order_by, take/skip, distinct, _first/_first_opt, _sql_text shape | |
-| test_conf_projection_agg.das | _select forms (column / named-tuple / computed), aggregates, _group_by + _having | |
-| test_conf_joins_subq.das | _join, _left_join (Option right side), _in / _not_in, _any / _none | |
+| test_conf_projection_agg.das | _select forms (column / named-tuple / computed), scalar aggregates, one-scan `_aggregate`, _group_by + _having | |
+| test_conf_joins_subq.das | _join (including exact whole-source projections and `_aggregate`), _left_join (Option right side), _in / _not_in, _any / _none | |
 | test_conf_nullability.das | Option<T> columns — DDL nullability, some/none round-trip, is_some / is_none / unwrap_or | |
 | test_conf_adapters.das | sql_bind / sql_extract rail — custom type, enum, Option-over-custom, @sql_json + path descent | |
 | test_conf_dml_macros.das | _sql_update / _sql_delete / _sql_upsert + returning variants (capability-checked) | |

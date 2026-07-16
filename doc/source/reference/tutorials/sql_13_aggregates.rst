@@ -14,20 +14,36 @@ SQL-13 --- Aggregates: ``sum``/``avg``/...
     single: Tutorial; MAX
     single: Tutorial; COUNT
 
-==============================================  ============================  ========================
-Source shape                                    Emitted SQL                   Result type
-==============================================  ============================  ========================
-``... |> count()``                              ``SELECT COUNT(*) ...``       ``int``
-``... |> _select(_.Col) |> sum()``              ``SELECT SUM("Col") ...``     column type
-``... |> _select(_.Col) |> average()``          ``SELECT AVG("Col") ...``     ``double``
-``... |> _select(_.Col) |> min()``              ``SELECT MIN("Col") ...``     column type
-``... |> _select(_.Col) |> max()``              ``SELECT MAX("Col") ...``     column type
-==============================================  ============================  ========================
+.. list-table::
+    :header-rows: 1
 
-All five are *terminals* --- they end the chain and produce a
-scalar, not an array. The four column-driven aggregates need a
-``_select(_.Col)`` to pick the column; ``count`` operates on rows,
-not values, and stands alone.
+    * - Source shape
+      - Emitted SQL
+      - Result type
+    * - ``... |> count()``
+      - ``SELECT COUNT(*) ...``
+      - ``int``
+    * - ``... |> _select(_.Col) |> sum()``
+      - ``SELECT SUM("Col") ...``
+      - column type
+    * - ``... |> _select(_.Col) |> average()``
+      - ``SELECT AVG("Col") ...``
+      - ``double``
+    * - ``... |> _select(_.Col) |> min()``
+      - ``SELECT MIN("Col") ...``
+      - column type
+    * - ``... |> _select(_.Col) |> max()``
+      - ``SELECT MAX("Col") ...``
+      - column type
+    * - ``... |> _aggregate($(rows) => (...))``
+      - several aggregates, one row
+      - named tuple
+
+The five scalar forms are *terminals* --- they end the chain and
+produce one scalar, not an array. The four column-driven aggregates
+need a ``_select(_.Col)`` to pick the column; ``count`` operates on
+rows, not values, and stands alone. ``_aggregate`` is the typed
+one-row counterpart when several scalar facts are needed together.
 
 ``count`` --- whole-source row count
 ====================================
@@ -98,6 +114,48 @@ A ``_where`` predicate filters the input rows the aggregate sees:
                                 |> _select(_.Price)
                                 |> sum())
     // SELECT SUM("Price") FROM "Cars" WHERE "Price" > ?
+
+Several global aggregates in one scan
+======================================
+
+``_aggregate`` returns a named tuple containing several global
+aggregates while executing one SQL statement and scanning the filtered
+source once:
+
+.. code-block:: das
+
+    let stats = _sql(
+        db |> select_from(type<Car>)
+           |> _where(_.Price >= cutoff)
+           |> _aggregate($(rows) => (
+                N = rows |> count,
+                Total = rows |> _select(_.Price) |> sum,
+                Cheapest = rows |> _select(_.Price) |> min,
+                Priciest = rows |> _select(_.Price) |> max,
+                Mean = rows |> _select(_.Price) |> average)))
+
+The emitted query has one aggregate expression per named tuple field:
+
+.. code-block:: sql
+
+    SELECT COUNT(*) AS "N",
+           SUM("Price") AS "Total",
+           MIN("Price") AS "Cheapest",
+           MAX("Price") AS "Priciest",
+           AVG("Price") AS "Mean"
+    FROM "Cars"
+    WHERE "Price" >= ?
+    LIMIT 1
+
+The same ``_aggregate`` expression also works on an in-memory array,
+where its block runs directly over the array. An empty SQL source
+returns the daslang type default for every slot: zero for the numeric
+aggregates shown above.
+
+The first version deliberately accepts filtered table and join sources.
+It rejects prior ``distinct``, paging, ordering, grouping, set
+operations, and standalone projections because those shapes require an
+explicit subquery-composition rail.
 
 Per-bucket aggregates --- ``_group_by``
 =======================================

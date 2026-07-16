@@ -100,7 +100,6 @@ struct CadmusSearchRow {
     @sql_fts_rank Rank : float
 }
 
-[sql_table(name = "_cadmus_mention_stats_row")]
 struct CadmusMentionStats {
     Total : int
     FirstDate : int64
@@ -902,16 +901,23 @@ def cadmus_mention_stats(path : string; chat_id : int64; question : string) : Ca
         return result
     }
     with_cadmus_database(path) $(db) {
-        // Global multi-aggregate projection is the remaining typed-query gap here; keep this
-        // one raw statement so FTS is scanned once rather than issuing COUNT/MIN/MAX separately.
-        result <- db |> query_one(
-            "SELECT COUNT(*) AS Total, " +
-            "COALESCE(MIN(m.MessageDate), 0) AS FirstDate, " +
-            "COALESCE(MAX(m.MessageDate), 0) AS LastDate " +
-            "FROM cadmus_message_fts f JOIN cadmus_messages m " +
-            "ON m.ChatId = f.ChatId AND m.TelegramMessageId = f.TelegramMessageId " +
-            "WHERE f.ChatId = ? AND f.Body MATCH ? AND m.Deleted = 0",
-            type<CadmusMentionStats>, chat_id, query_text)
+        let stats = _sql(
+            (db |> select_from(type<CadmusSearchRow>)
+                |> _where(_.ChatId == chat_id && _.Body |> text_match(query_text)))
+            |> _join(
+                db |> select_from(type<CadmusMessage>)
+                   |> _where(_.ChatId == chat_id && !_.Deleted),
+                $(f : CadmusSearchRow, m : CadmusMessage) =>
+                    f.TelegramMessageId == m.TelegramMessageId,
+                $(f : CadmusSearchRow, m : CadmusMessage) => m)
+            |> _aggregate($(_rows) => (
+                Total = _rows |> count,
+                FirstDate = _rows |> _select(_.MessageDate) |> min,
+                LastDate = _rows |> _select(_.MessageDate) |> max)))
+        result = CadmusMentionStats(
+            Total = stats.Total,
+            FirstDate = stats.FirstDate,
+            LastDate = stats.LastDate)
     }
     return result
 }

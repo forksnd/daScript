@@ -22,7 +22,7 @@ Capability gates are **compile-time** `macro_error`s naming the provider (`caps`
 
 ```das
 require sqlite/sqlite_boost         // provider: SqlRunner, exec/query runtime, [sql_fts5], [sql_function]
-require daslib/sql_linq             // _sql / _try_sql / _each_sql / _sql_update / _sql_delete / _sql_upsert / _create_view / _sql_text
+require daslib/sql_linq             // _sql / _try_sql / _each_sql / _aggregate / _sql_update / _sql_delete / _sql_upsert / _create_view / _sql_text
 require daslib/linq_das             // OPTIONAL: `%linq! from row : T in db ... %%`; lowers through the same SQL analyzer
 require sqlite/sqlite_migrate       // OPTIONAL — [sql_migration], migrate_to_latest, with_latest_sqlite, baseline
 ```
@@ -209,7 +209,7 @@ let cars <- _sql(db |> select_from(type<Car>)
 | **Page** | `take(n)`, `skip(m)` — canonical fast form is `skip(m) \|> take(n)`. `take`/`skip` BEFORE an aggregate (`take(n) \|> count()`, `_select(_.X) \|> take(n) \|> sum()`) wraps the bounded rows into an inner subquery so the LIMIT applies pre-aggregate |
 | **Distinct** | `distinct()` |
 | **Distinct-by** | `_distinct_by(_.K)` — one row per key: first in pk order; `reverse() \|> _distinct_by(_.K)` picks the last. Terminators: row-returning (`to_array` / `_first`, trailing `_order_by`/`take`/`skip` OK), `count()` (→ `COUNT(DISTINCT K)`), `_count(p)`, `_select(_.X) \|> sum/min/max/average()`. Provider-lowered via `caps.distinct_on`: `DISTINCT ON (K)` (PG, DuckDB) or SQLite's bare-aggregate `GROUP BY`. Requires a single `@sql_primary_key`; composing with `_where`/`_join`/`_group_by`/set ops is a compile error (v1) |
-| **Aggregate** | `count()`, `sum`, `average`, `min`, `max` (terminal) |
+| **Aggregate** | Scalar terminals: `count()`, `sum`, `average`, `min`, `max`. One-row summary: `_aggregate($(rows) => (N = rows \|> count, Total = rows \|> _select(_.X) \|> sum, ...))` lowers all named slots into one SELECT |
 | **Joins** | `_join(other, $(l, r) => l.X == r.Y, $(l, r) => projection)`, including exact whole-source results (`$(l, r) => r` returns `array<TRight>`); `_left_join(...)` flows the right side as `Option<TB>` through `into` |
 | **Subqueries** | `x._in(subq)`, `x._not_in(subq)`, `subq._any()`, `subq._any(p)`, `subq._none()`, `subq._none(p)` |
 | **Terminals** | `_to_array()` (default), `_first()` (panic on empty), `_first_opt()` (Option<T>) |
@@ -243,6 +243,28 @@ to_log(LOG_INFO, "SQL: {_sql_text(db |> select_from(type<Car>) |> _where(_.Price
 ```
 
 `options log` on the file dumps the post-macro daslang code — useful for seeing the runtime helper call the analyzer emits.
+
+### Several global aggregates in one scan
+
+Use `_aggregate` when one answer needs several facts about the same
+filtered source:
+
+```das
+let stats = _sql(
+    db |> select_from(type<Order>)
+       |> _where(_.State == wanted)
+       |> _aggregate($(rows) => (
+            N = rows |> count,
+            Total = rows |> _select(_.Amount) |> sum,
+            First = rows |> _select(_.CreatedAt) |> min,
+            Last = rows |> _select(_.CreatedAt) |> max)))
+```
+
+The result is a typed named tuple and the provider executes one query
+with one result row. The same expression works on an in-memory array.
+V1 accepts filtered table or join sources and field selectors; it
+compile-errors on pre-projection, grouping, distinct/set operations,
+ordering, or paging until explicit subquery composition exists.
 
 ### Composability
 
