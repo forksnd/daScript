@@ -362,8 +362,7 @@ def set_metal_mode(mode : MetalMode) {
         if (mode == MetalMode.required) {
             panic("dasLLAMA: metal mode `required`, but the metal overrides are not registered (non-Apple build or dasMetal missing)")
         }
-        to_log(LOG_WARNING, "dasLLAMA: metal mode requested, but the metal overrides are not registered — staying on the CPU paths
-")
+        to_log(LOG_WARNING, "dasLLAMA: metal mode requested, but the metal overrides are not registered — staying on the CPU paths\n")
         g_metal_mode = MetalMode.off
         return
     }
