@@ -18,6 +18,7 @@ require daslib/fts5_query   // for in-memory text_match against the same query s
 // API surface:
 //
 //   [sql_fts5(name="...")]    — struct annotation: virtual table
+//   @sql_fts_unindexed        — stored typed metadata, excluded from MATCH
 //   @sql_fts_rank             — read-only float column → FTS5 `rank`
 //   text_match(col, query)    — _where predicate → `col MATCH ?`
 //
@@ -27,6 +28,7 @@ require daslib/fts5_query   // for in-memory text_match against the same query s
 
 [sql_fts5(name = "docs_idx")]
 struct Doc {
+    @sql_fts_unindexed Id : int64
     Body : string
     @sql_fts_rank Rank : float
     // FTS5 fills `Rank` on SELECT (BM25 score; lower = more relevant).
@@ -39,13 +41,20 @@ def main {
         db |> apply_recommended_pragmas()
         db |> create_table(type<Doc>)
         // => CREATE VIRTUAL TABLE IF NOT EXISTS "docs_idx"
-        //        USING fts5("Body", tokenize='unicode61')
+        //        USING fts5("Id" UNINDEXED, "Body", tokenize='unicode61')
 
         // --- INSERT: just like a regular [sql_table] ----------------------
-        db |> insert(Doc(Body = "The quick brown fox jumps over the lazy dog"))
-        db |> insert(Doc(Body = "A swift red fox escaped the hounds at dawn"))
-        db |> insert(Doc(Body = "Quicksand swallowed the hiker's boot yesterday"))
-        db |> insert(Doc(Body = "Code review is the most cost-effective bug filter"))
+        db |> insert(Doc(Id = 1l, Body = "The quick brown fox jumps over the lazy dog"))
+        db |> insert(Doc(Id = 2l, Body = "A swift red fox escaped the hounds at dawn"))
+        db |> insert(Doc(Id = 3l, Body = "Quicksand swallowed the hiker's boot yesterday"))
+        db |> insert(Doc(Id = 4l, Body = "Code review is the most cost-effective bug filter"))
+
+        // --- Typed metadata ----------------------------------------------
+        // `Id` round-trips as int64 and supports ordinary predicates, but
+        // FTS5 does not tokenize it or allow text_match(Id, ...).
+        let first_fox <- _sql(db |> select_from(type<Doc>)
+                                |> _where(_.Id == 1l && (_.Body |> text_match("fox"))))
+        to_log(LOG_INFO, "metadata-filtered fox hits: {length(first_fox)}")
 
         // --- text_match: simple keyword search ---------------------------
         // Whitespace-AND: both tokens must appear (any order, any
@@ -91,6 +100,12 @@ def main {
                            |> _order_by(_.Rank)
                            |> take(2))
         to_log(LOG_INFO, "top 2 fox results: {length(top2)}")
+
+        // --- Typed predicate DELETE --------------------------------------
+        // FTS5 virtual tables have no declared daslang primary key, but the
+        // predicate form is fully typed and reports the affected row count.
+        let removed = db |> _sql_delete(type<Doc>, _.Id == 3l)
+        to_log(LOG_INFO, "removed {removed} obsolete search row")
     }
 
     // --- text_match outside SQL --- nolint:STYLE014
@@ -121,9 +136,10 @@ def main {
     // Self-contained mode only — the FTS5 table holds both content and
     // index. External-content mode (FTS5 indexing rows of a separate
     // [sql_table]) ships when asked. Default tokenizer is unicode61
-    // (case-fold + Unicode word boundaries). UPDATE / DELETE on FTS5
-    // rows aren't typed in v1 — drop and re-INSERT, or use raw
-    // `db |> exec("DELETE FROM docs_idx WHERE rowid = ?", id)`.
+    // (case-fold + Unicode word boundaries). Predicate DELETE is typed:
+    // `_sql_delete(type<Doc>, predicate)`. Row-shaped UPDATE /
+    // DELETE-by-PK helpers are unavailable because the virtual table has no
+    // declared daslang PK; update by deleting and re-inserting, or use raw SQL.
     // BM25 weighting, snippet/highlight helpers, and per-column query
     // filters (`Body:fox`) all work via the FTS5 query string but
     // don't have typed wrappers in v1.

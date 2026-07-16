@@ -1,9 +1,10 @@
 options gen2
 
-// Regression: an identity / whole-row `_select($(x) => x)` over a SQL `_join` previously crashed the
-// `_sql` analyzer (SIGSEGV — `pred_to_sql` dereferenced a null rendering the bare-variable row). It must
-// instead be a clean macro_error (50503): a whole-row select has no SQL column form. One reject (the
-// trailing cascade from the now-untyped result is expected).
+// Regression: an identity `_select($(x) => x)` over a scalar SQL join projection previously crashed the
+// `_sql` analyzer (SIGSEGV — `pred_to_sql` dereferenced a null rendering the bare variable). It must
+// instead be a clean macro_error (50503). A join's `into` may now return one source struct directly,
+// but a later scalar/tuple identity projection still has no SQL row shape. One reject (the trailing
+// cascade from the now-untyped result is expected).
 expect 50503
 
 require daslib/sql

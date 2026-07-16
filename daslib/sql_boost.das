@@ -382,6 +382,7 @@ struct FieldInfo {
     is_json : bool
     is_blob : bool
     is_fts_rank : bool   // [sql_fts5] only — read-only, emits `rank`, skipped on INSERT
+    is_fts_unindexed : bool   // [sql_fts5] only — stored metadata excluded from the inverted index
     computed_sql : string
     default_clause : string
     references_clause : string
@@ -539,6 +540,21 @@ def private derive_index_name(table_name : string; sql_cols : array<string>) : s
         for (col in sql_cols) {
             w |> write("_")
             w |> write(col)
+        }
+    }
+}
+
+def private build_field_unique_indexes_sql(table_name : string; fields : array<FieldInfo>) : string {
+    var stmt_count = 0
+    return build_string() $(var w) {
+        for (info in fields) {
+            if (!info.is_unique || info.is_pk) continue
+            if (stmt_count > 0) {
+                w |> write("; ")
+            }
+            stmt_count++
+            w |> write("CREATE UNIQUE INDEX \"uq_{table_name}_{info.col_name}\"")
+            w |> write(" ON \"{table_name}\" (\"{info.col_name}\")")
         }
     }
 }
@@ -731,6 +747,10 @@ class SqlTableMacro : AstStructureAnnotation {
                 errors := "[sql_table]: field '{fname}' cannot be both @sql_primary_key and @sql_computed — SQLite rejects PRIMARY KEY on a generated column."
                 return false
             }
+            if (is_computed && is_unique) {
+                errors := "[sql_table]: field '{fname}' cannot be both @sql_unique and @sql_computed — declare an explicit [sql_index(fields=\"{fname}\", unique=true)] if the provider supports indexing that generated expression."
+                return false
+            }
             if (is_computed && field.init != null) {
                 errors := "[sql_table]: field '{fname}' is @sql_computed; remove the daslang field initializer (the SQL expression provides the value)."
                 return false
@@ -896,8 +916,10 @@ class SqlTableMacro : AstStructureAnnotation {
             // finish-pass) returns the 1-arg form whose body owns the burned-in SQL.
             var fn_indexes_named = make_create_indexes_sql_named_fn(st, table_name)
             compiling_module() |> add_function(fn_indexes_named)
-            // Empty `_sql_create_indexes_sql` placeholder; [sql_index] siblings accumulate into it.
-            var fn_indexes = make_create_indexes_sql_fn(st, "")
+            // Field-level @sql_unique constraints start the provider-neutral
+            // CREATE INDEX list; [sql_index] siblings append to the same helper.
+            let unique_indexes_sql = build_field_unique_indexes_sql(table_name, fields)
+            var fn_indexes = make_create_indexes_sql_fn(st, unique_indexes_sql)
             compiling_module() |> add_function(fn_indexes)
             var fn_ins_pk_named = make_insert_sql_named_fn(st, fields, true)
             compiling_module() |> add_function(fn_ins_pk_named)
@@ -1096,11 +1118,13 @@ class SqlTableMacro : AstStructureAnnotation {
         //! ``[sql_index(name=...)]`` is preserved.
         let orig_quoted = "\"{table_name}\""
         let orig_idx_prefix = "\"idx_{table_name}_"
+        let orig_unique_prefix = "\"uq_{table_name}_"
         var fn = qmacro_function("_sql_create_indexes_sql") $(typ : $t(st); name : string) : string {
             let escaped_name = name |> replace("\"", "\"\"")
             return (_sql_create_indexes_sql(default<$t(st)>)
                 |> replace($v(orig_quoted), "\"" + escaped_name + "\"")
-                |> replace($v(orig_idx_prefix), "\"idx_" + escaped_name + "_"))
+                |> replace($v(orig_idx_prefix), "\"idx_" + escaped_name + "_")
+                |> replace($v(orig_unique_prefix), "\"uq_" + escaped_name + "_"))
         }
         fn.flags.generated = true
         fn.body |> force_at(st.at)
@@ -1143,9 +1167,6 @@ class SqlTableMacro : AstStructureAnnotation {
                     suffix = " PRIMARY KEY"
                 } elif (!info.is_optional) {
                     suffix = " NOT NULL"
-                }
-                if (info.is_unique && !info.is_pk) {
-                    suffix += " UNIQUE"
                 }
                 suffix += info.default_clause
                 suffix += info.references_clause

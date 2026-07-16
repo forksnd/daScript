@@ -232,7 +232,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_54_upsert_single_col.das | `_sql_upsert(row, _.Col, set_dict)` single-column ON CONFLICT key (insert vs merge branch, _excluded reference) | |
 | test_55_upsert_composite.das | `_sql_upsert` multi-column composite conflict keys via tuple `(_.Email, _.Tenant)` | |
 | test_56_upsert_returning.das | `_sql_upsert_returning` UPSERT ... RETURNING (post-merge row on conflict, fresh row on insert) | |
-| test_57_sql_unique.das | `@sql_unique` column annotation (DDL emission, constraint enforcement, distinct values allowed) | |
+| test_57_sql_unique.das | `@sql_unique` portable generated-index emission, named-table rewrite, constraint enforcement, distinct values allowed | |
 | test_58_sql_references.das | `@sql_references` / `@sql_on_delete` foreign-key relationships (DDL REFERENCES clause, CASCADE delete semantics) | |
 | test_59_sql_index.das | `[sql_index]` DDL emission (single-col, composite, unique indexes with auto-naming) | |
 | test_60_defaults_computed.das | Defaults (native field init → DEFAULT, `@sql_default_fn` built-ins) and computed columns (`@sql_computed` VIRTUAL/STORED) | |
@@ -260,18 +260,20 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_91_sql_vacuum_into_macro.das | `_sql_vacuum_into(path)` macro form (vacuum into file path, runtime string path, verification across reopen) | |
 | test_92_order_by_runtime.das | Runtime `_order_by(string)` column-name binding (const string folds to compile-time, runtime path uses sql_quote_id) | |
 | test_93_attach.das | `with_attached(path, alias)` attach secondary database file (query across attached, temp-file cleanup) | |
-| test_94_fts5.das | `[sql_fts5]` full-text search (CREATE VIRTUAL TABLE fts5, `@sql_fts_rank` hidden rank column, INSERT skips rank) | |
+| test_94_fts5.das | `[sql_fts5]` full-text search (`@sql_fts_unindexed` typed metadata, `@sql_fts_rank`, MATCH, INSERT, typed predicate DELETE) | |
 | failed_create_view.das | `_create_view` macro validation failures (column count/type mismatches, non-annotated struct, bound parameters) | **expect** `40104:7` |
 | failed_each_sql_terminals.das | `_each_sql` rejects materializing terminals (`_to_array`, `_first`, `_first_opt`, aggregates) | **expect** `40104:4` |
 | failed_pred_json_path_typo.das | Predicate-side JSON-path validation (typo detection in `_.Field.nested` chains) | **expect** `40104:3, 30503:3` |
 | failed_register_function.das | `register_function` compile-time type validation (struct args, struct returns, pointers, non-function references) | **expect** `40104:5` |
 | failed_sql_column.das | `@sql_column` annotation validation (empty value, embedded quotes/backslashes, cross-field collisions) | **expect** `30111:5` |
-| failed_sql_fts5.das | `[sql_fts5]` field-annotation rejections (`@sql_column` on `@sql_fts_rank`) | **expect** `30111:1` |
+| failed_sql_fts5.das | `[sql_fts5]` field-annotation rejections (`@sql_column` / `@sql_fts_unindexed` on rank) | **expect** `20800:2` |
+| failed_sql_fts5_unindexed_match.das | `_sql` rejects `text_match` on `@sql_fts_unindexed` metadata | **expect** `50503:1` |
+| failed_sql_global_aggregate.das | `_aggregate` rejects unnamed/non-aggregate results and unsupported pre-projection/distinct/grouped/ordered/paged source shapes | **expect** `50503:9` |
 | failed_sql_index.das | `[sql_index]` validation (missing fields, nonexistent columns, ordering with `[sql_table]`) | **expect** `30111:4` |
 | failed_sql_json_blob_kind_collision.das | Payload type kind collision rejection (same type in `@sql_json` vs `@sql_blob`) | **expect** `30111:3` |
 | failed_sql_macro.das | `_sql` / `_sql_text` analyzer failures (22 malformed chains: invalid roots, duplicate modifiers, unsupported expressions) | **expect** `40104:22, 30304:2, 30503:2` |
 | failed_sql_pragma_vacuum.das | `_sql_pragma` / `_sql_vacuum_into` argument-shape validation (wrong types, arg counts) | **expect** `40104:5` |
-| failed_sql_table_schema.das | `[sql_table]` schema-validation failures (computed+PK collision, defaults+initializers, FK actions, reference resolution) | **expect** `30111:12` |
+| failed_sql_table_schema.das | `[sql_table]` schema-validation failures (computed+PK/UNIQUE collisions, defaults+initializers, FK actions, reference resolution) | **expect** `20800:13` |
 | failed_sql_update_delete.das | `_sql_update` / `_sql_delete` analyzer failures (wrong arity, non-type args, typos, duplicate columns) | **expect** `40104:7` |
 | failed_sql_upsert.das | `_sql_upsert` analyzer failures (wrong arity, on_conflict/do_update validation, duplicate columns) | **expect** `40104:10` |
 | failed_sql_view_mutations.das | `_sql_update` / `_sql_delete` / `_sql_upsert` against `[sql_view]` types (read-only rejection) | **expect** `40104:8` |
@@ -1022,8 +1024,8 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 | _conformance_provider.das | *(shim)* Provider under test — `with_conf_db` scoped runner + `CONF_HAS_*` capability constants | |
 | test_conf_table_crud.das | `[sql_table]` DDL round-trip, check_schema, column_info, insert single+bulk, update / delete_ / delete_by_id | |
 | test_conf_sql_select.das | `_sql` reads — _where + captured binds, _order_by, take/skip, distinct, _first/_first_opt, _sql_text shape | |
-| test_conf_projection_agg.das | _select forms (column / named-tuple / computed), aggregates, _group_by + _having | |
-| test_conf_joins_subq.das | _join, _left_join (Option right side), _in / _not_in, _any / _none | |
+| test_conf_projection_agg.das | _select forms (column / named-tuple / computed), scalar aggregates, one-scan `_aggregate`, _group_by + _having | |
+| test_conf_joins_subq.das | _join (including exact whole-source projections and `_aggregate`), _left_join (Option right side), _in / _not_in, _any / _none | |
 | test_conf_nullability.das | Option<T> columns — DDL nullability, some/none round-trip, is_some / is_none / unwrap_or | |
 | test_conf_adapters.das | sql_bind / sql_extract rail — custom type, enum, Option-over-custom, @sql_json + path descent | |
 | test_conf_dml_macros.das | _sql_update / _sql_delete / _sql_upsert + returning variants (capability-checked) | |

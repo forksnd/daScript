@@ -6,7 +6,7 @@ options gen2
 // some malformed chains additionally cascade real type errors before the
 // analyzer ever runs — e.g. `_select(_.Name) |> _select(_.Price)` is a
 // genuine type bug (string has no `Price` field). Those cascades are expected.
-expect 30341, 30928:2, 50503:24
+expect 30341, 30928:2, 50503:23
 
 require daslib/sql
 require sqlite/sqlite_boost
@@ -92,20 +92,6 @@ def main() {
                         |> _join(db |> select_from(type<Owner>),
                                  $(c : Car, o : Owner) => c.Id == o.CarId && c.Name == o.Name,
                                  $(c : Car, o : Owner) => (Name = c.Name, Owner = o.Name)))
-
-    // 16. Two joins in one chain (3+ table). Chunk 5 ships single-join
-    //     only — the `q.joins` slot is one-deep. The second `_join`'s
-    //     `on` must be a valid single-column equi-join (`==`), or
-    //     linq_boost rejects it before sql_linq's multi-join guard
-    //     fires; here we equi-join on `.Name` (cosmetically meaningless
-    //     but well-formed) so the diagnostic comes from sql_linq.
-    let bad16 <- _sql(db |> select_from(type<Car>)
-                        |> _join(db |> select_from(type<Owner>),
-                                 $(c : Car, o : Owner) => c.Id == o.CarId,
-                                 $(c : Car, o : Owner) => o)
-                        |> _join(db |> select_from(type<Owner>),
-                                 $(t : Owner, o : Owner) => t.Id == o.Id,
-                                 $(t : Owner, o : Owner) => o))
 
     // 17. Set-op nested inside a set-op — chunk 5 restricts to one set-op
     //     per chain (chained set-ops would need parenthesization

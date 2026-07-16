@@ -57,6 +57,43 @@ def _first(arr : array<auto(TT)>) : TT -const -& {
     return first(arr)
 }
 
+def _aggregate_rows(rows : array<auto(TT)>; aggregate_block : block<(rows : array<TT>) : auto(RR)>) {
+    //! Compute several global aggregates from one source. In ordinary in-memory
+    //! chains the block runs over ``rows`` directly. Inside ``_sql(...)`` the
+    //! terminal lowers a named tuple of ``count`` / ``long_count`` / ``sum`` /
+    //! ``average`` / ``min`` / ``max`` expressions into one SQL SELECT row.
+    static_if (typeinfo can_copy(default<RR -const -#>)) {
+        return invoke(aggregate_block, rows)
+    } else {
+        return <- invoke(aggregate_block, rows)
+    }
+}
+
+[call_macro(name="_aggregate")]
+class private SqlGlobalAggregate : AstCallMacro {
+    def override visit(prog : ProgramPtr; mod : Module?; var call : ExprCallMacro?) : Expression? {
+        macro_verify(call.arguments |> length == 2, prog, call.at, "_aggregate expects `(source, aggregate_block)`")
+        assume sourceType = call.arguments[0]._type
+        macro_verify(sourceType != null, prog, call.at, "_aggregate source is not inferred yet")
+        macro_verify(sourceType.isGoodArrayType, prog, call.at, "_aggregate expects an array-backed source")
+        macro_verify(!sourceType.firstType.isAutoOrAlias, prog, call.at, "_aggregate source element type cannot be auto or alias")
+        macro_verify(call.arguments[1] is ExprMakeBlock, prog, call.at, "_aggregate expects a one-argument block returning a named tuple")
+        var aggregateLambda = call.arguments[1] as ExprMakeBlock
+        var aggregateBlock = aggregateLambda._block as ExprBlock
+        macro_verify(aggregateBlock != null && aggregateBlock.arguments |> length == 1,
+            prog, call.at, "_aggregate block must take exactly one rowset argument")
+        if (aggregateBlock.arguments[0]._type == null || aggregateBlock.arguments[0]._type.isAutoOrAlias) {
+            var rowsType = clone_type(sourceType)
+            rowsType.flags.constant = true
+            aggregateBlock.arguments[0]._type = rowsType
+        }
+        aggregateBlock.arguments[0].flags.can_shadow = true
+        var res = qmacro(_aggregate_rows($e(call.arguments[0]), $e(call.arguments[1])))
+        res.force_at(call.at)
+        return res
+    }
+}
+
 // ===== to_sql_literal — runtime stringifier for `_create_view` body inlining =====
 // `_::` resolution lets users extend with a one-line overload in their own module
 // (`def to_sql_literal(s : Status) : string => "{int(s)}"`).
@@ -159,6 +196,10 @@ struct private JoinSpec {
 
 struct private SqlQuery {
     rootType    : TypeDeclPtr
+    // Exact struct type reconstructed by a whole-source join projection (`$(l, r) => r`).
+    // rootType remains the FROM root (source 0), so materialization and subquery wrapping
+    // consult this override whenever proj == FullRow.
+    projectedRowType : TypeDeclPtr
     tableName   : string
     rootAlias   : string
     selectCols  : array<string>
@@ -961,6 +1002,7 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
     var projType = inner_projection_type(q, at)
     // Reset q to wrap state. Clear all join/where/projection state so outer can re-fill.
     q.rootType = null
+    q.projectedRowType = null
     q.tableName := ""
     q.rootAlias := ""
     q.selectCols |> clear
@@ -1480,7 +1522,9 @@ def private fromrow_alias_list(rowT : TypeDeclPtr) : string {
 // fromRowType is the witness pred_to_sql consults to know "is this an over-subquery outer Q, and what aliases does it expose?"
 [macro_function]
 def private inner_projection_type(var inner : SqlQuery&; at : LineInfo) : TypeDeclPtr {
-    if (inner.proj == ProjectionShape.FullRow) return inner.rootType
+    if (inner.proj == ProjectionShape.FullRow) {
+        return inner.projectedRowType != null ? inner.projectedRowType : inner.rootType
+    }
     if (inner.proj == ProjectionShape.NamedTuple) {
         let n = length(inner.selectCols)
         var tupT = new TypeDecl(at = at, baseType = Type.tTuple)
@@ -1555,9 +1599,11 @@ def private divert_to_inner(var node : ExpressionPtr; var q : SqlQuery&;
         q.providerIdx = subQ.providerIdx
     }
     if (subQ.proj == ProjectionShape.FullRow) {
-        // FullRow inner: outer treats wrapped subquery as the original table; v1 path — unchanged.
+        // FullRow inner: outer treats the wrapped subquery as its exact projected struct.
+        // Usually this is the original table type; a whole-source join projection may instead
+        // return one joined source (`$(l, r) => r`).
         if (q.rootType == null) {
-            q.rootType = subQ.rootType
+            q.rootType = q.fromRowType
         }
         if (q.proj == ProjectionShape.FullRow && empty(q.selectCols) && q.rootType != null) {
             fill_default_columns(q, q.rootType, prog, at)
@@ -1654,6 +1700,40 @@ def private analyze_chain(var node : ExpressionPtr; var q : SqlQuery&; prog : Pr
             q.matr = Materializer.OneOpt
             q.seenTerminal = true
             return analyze_chain(foCall.arguments[0], q, prog, at)
+        }
+    }
+    // Peel `_aggregate(prev, block)` — one named row containing several
+    // global aggregates, all evaluated by one SQL source scan.
+    {
+        var gaCall = match_call_in_module(node, "_aggregate_rows", "sql_linq")
+        if (gaCall != null) {
+            if (q.seenTerminal || q.seenToArray) {
+                macro_error(prog, at, "_sql: only one terminal allowed per chain")
+                return false
+            }
+            if (gaCall.arguments |> length != 2) {
+                macro_error(prog, at, "_sql: `_aggregate` expects `(source, aggregate_block)`")
+                return false
+            }
+            // Pre-set terminal state so a join source does not mistake this
+            // outer terminal for a terminal embedded in its own LHS/RHS.
+            q.matr = Materializer.One
+            q.seenTerminal = true
+            if (!analyze_chain(gaCall.arguments[0], q, prog, at)) return false
+            if (q.seenGroupBy || q.seenHaving) {
+                macro_error(prog, at, "_sql: `_aggregate` is a global aggregate and cannot follow `_group_by` / `_having`; use grouped `_select` aggregates instead")
+                return false
+            }
+            if (q.seenDistinct || !empty(q.distinctByCol) || q.seenSetOp
+                    || q.seenTake || q.seenSkip || q.seenOrderBy) {
+                macro_error(prog, at, "_sql: `_aggregate` v1 supports filtered table/join sources only — `distinct`, `_distinct_by`, set ops, ordering, take, and skip need an explicit subquery-composition rail")
+                return false
+            }
+            if (q.seenSelect && !q.seenJoin) {
+                macro_error(prog, at, "_sql: `_aggregate` v1 cannot follow a standalone `_select`; aggregate fields directly from the source row inside the `_aggregate` block")
+                return false
+            }
+            return analyze_global_aggregate_projection(gaCall.arguments[1], q, prog, at)
         }
     }
     // Peel count(prev) / long_count(prev) → SELECT COUNT(*) (or COUNT(DISTINCT col) when fronted by `_distinct_by(_.col)`).
@@ -2290,10 +2370,48 @@ def private analyze_projection_impl(var body : ExpressionPtr; var q : SqlQuery&;
             return false
         }
     }
-    // Bare-var (identity / whole-row `$(x)=>x`) projection has no SQL column form — reject cleanly (else the computed-scalar `pred_to_sql` path below null-derefs on the whole-row var → SIGSEGV).
+    q.projectedRowType = null
+    // A join's bare source variable projects that exact source struct. Expand it to the
+    // source's qualified columns and reconstruct the nominal struct in build_row_builder.
+    // Single-source identity and scalar identity remain unsupported.
     if (body is ExprVar) {
-        macro_error(prog, at, "_sql: identity / whole-row `_select` (e.g. `$(x) => x`) is not supported — project named columns off the row, e.g. `_select($(x) => (Name = x.name, City = x.city))`")
-        return false
+        let argName = string((body as ExprVar).name)
+        if (!q.seenJoin) {
+            macro_error(prog, at, "_sql: identity `_select` (e.g. `$(x) => x`) is not supported in single-source mode — omit the `_select` for a full row, or project named columns")
+            return false
+        }
+        let srcIdx = resolve_proj_arg_to_source(q, argName, prog, at)
+        if (srcIdx < 0) return false
+        let srcType = source_rootType_for_idx(q, srcIdx)
+        let bodyType = body._type
+        if (srcType == null || srcType.structType == null
+                || bodyType == null || bodyType.structType == null) {
+            macro_error(prog, at, "_sql: whole-source join projection `{argName}` must be a non-nullable struct row — nullable outer-join sides and scalar/tuple identities are not supported; project named scalar fields instead")
+            return false
+        }
+        let n = length(srcType.structType.fields)
+        q.selectCols |> clear
+        q.selectColAliases |> clear
+        q.selectColTypes |> clear
+        q.selectColSqlFragments |> clear
+        q.projRecordNames |> clear
+        q.selectCols |> reserve(n)
+        q.selectColAliases |> reserve(n)
+        q.selectColTypes |> reserve(n)
+        q.selectColSqlFragments |> reserve(n)
+        q.projRecordNames |> reserve(n)
+        let sourceAlias = source_alias_for_idx(q, srcIdx)
+        for (field in srcType.structType.fields) {
+            let fieldName = string(field.name)
+            q.selectCols |> push(fieldName) // nolint:PERF006 reserved above
+            q.selectColAliases |> push(sourceAlias) // nolint:PERF006 reserved above
+            q.selectColTypes |> push(clone_type(field._type)) // nolint:PERF006 reserved above
+            q.selectColSqlFragments |> push("") // nolint:PERF006 reserved above
+            q.projRecordNames |> push(fieldName) // nolint:PERF006 reserved above
+        }
+        q.projectedRowType = clone_type(srcType)
+        q.proj = ProjectionShape.FullRow
+        return true
     }
     // Multi-level field chain `<arg>.Col.path…` — descends via json_extract for @sql_json.
     {
@@ -2558,6 +2676,181 @@ def private try_translate_group_aggregate(var node : ExpressionPtr; var q : SqlQ
         }
     }
     return false
+}
+
+// nolint:STYLE015 Translates one `_aggregate` tuple slot. The terminal's block argument represents the full filtered rowset: `rows |> count` becomes COUNT(*), while `rows |> _select($(r:T) => r.Field) |> min/max/sum/average` wraps the exact source column. Post-join fields resolve through the join's `into` projection registry, so a whole-source projection (`$(l,r)=>r`) remains fully qualified.
+[macro_function]
+def private try_translate_global_aggregate(var node : ExpressionPtr; rowsArgName : string;
+                                           var q : SqlQuery&; prog : ProgramPtr; at : LineInfo;
+                                           var sqlOut : string&; var typeOut : TypeDeclPtr&) : bool {
+    var n = node
+    if (n is ExprRef2Value) {
+        n = (n as ExprRef2Value).subexpr
+    }
+    if (n == null || !(n is ExprCall)) return false
+    var call = n as ExprCall
+    if (call.func == null) return false
+    var fname = string(call.func.name)
+    if (call.func.fromGeneric != null) {
+        fname = string(call.func.fromGeneric.name)
+    }
+    let argc = user_arg_count(call)
+    if ((fname == "count" || fname == "long_count") && argc == 1) {
+        var rowsArg = call.arguments[0]
+        if (rowsArg is ExprRef2Value) {
+            rowsArg = (rowsArg as ExprRef2Value).subexpr
+        }
+        if (rowsArg != null && rowsArg is ExprVar
+                && (rowsArg as ExprVar).name == rowsArgName) {
+            sqlOut = "COUNT(*)"
+            typeOut = new TypeDecl(
+                at = at,
+                baseType = fname == "long_count" ? Type.tInt64 : Type.tInt)
+            return true
+        }
+        macro_error(prog, at, "_sql: `_aggregate` {fname} must consume the aggregate block's `{rowsArgName}` rowset directly")
+        return true
+    }
+    if ((fname == "sum" || fname == "average" || fname == "min" || fname == "max") && argc == 1) {
+        var innerCall = match_call_in_linq(call.arguments[0], "select")
+        if (innerCall == null || innerCall.arguments |> length != 2) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} requires `{rowsArgName} |> _select($(row : T) => row.Field) |> {fname}`")
+            return true
+        }
+        var selectRows = innerCall.arguments[0]
+        if (selectRows is ExprRef2Value) {
+            selectRows = (selectRows as ExprRef2Value).subexpr
+        }
+        if (selectRows == null || !(selectRows is ExprVar)
+                || (selectRows as ExprVar).name != rowsArgName) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} must select from the aggregate block's `{rowsArgName}` rowset")
+            return true
+        }
+        var selector = innerCall.arguments[1]
+        if (selector == null || !(selector is ExprMakeBlock)) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} selector has unexpected shape")
+            return true
+        }
+        var selectorBlock = (selector as ExprMakeBlock)._block as ExprBlock
+        if (selectorBlock == null || selectorBlock.arguments |> length != 1) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} selector must take exactly one row argument")
+            return true
+        }
+        let selectorArgName = string(selectorBlock.arguments[0].name)
+        var selectorBody = peel_lambda_single_return(selector)
+        if (selectorBody == null) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} selector lambda has unexpected shape")
+            return true
+        }
+        var receiver : ExpressionPtr
+        var fieldName : string
+        if (!qmatch(selectorBody, $e(receiver).$f(fieldName)).matched
+                || receiver == null || !(receiver is ExprVar)
+                || (receiver as ExprVar).name != selectorArgName) {
+            macro_error(prog, at, "_sql: `_aggregate` {fname} selector must be `<row>.<field>` and may not read an outer capture; got: {describe(selectorBody)}")
+            return true
+        }
+        var sqlArg : string
+        var fieldType : TypeDeclPtr
+        if (q.seenJoin) {
+            let aliasIdx = find_projection_alias(q, fieldName)
+            if (aliasIdx < 0) {
+                macro_error(prog, at, "_sql: `_aggregate` {fname} field '{fieldName}' is not an alias of the preceding join projection (valid aliases: {projection_alias_list(q)})")
+                return true
+            }
+            sqlArg = render_projection_alias_sql(q, aliasIdx)
+            if (empty(sqlArg)) {
+                macro_error(prog, at, "_sql: `_aggregate` {fname} cannot render join projection field '{fieldName}'")
+                return true
+            }
+            fieldType = clone_type(q.joinSelectColTypes[aliasIdx])
+        } else {
+            fieldType = lookup_struct_field_type(q.rootType, fieldName)
+            if (fieldType == null) {
+                macro_error(prog, at, "_sql: `_aggregate` {fname} cannot resolve field '{fieldName}' on the source row")
+                return true
+            }
+            sqlArg = column_sql_for_alias("", q.rootType, fieldName)
+        }
+        var sqlOp : string
+        if (fname == "sum") {
+            sqlOp = "SUM"
+        } elif (fname == "average") {
+            sqlOp = "AVG"
+        } elif (fname == "min") {
+            sqlOp = "MIN"
+        } else {
+            sqlOp = "MAX"
+        }
+        sqlOut = "{sqlOp}({sqlArg})"
+        if (fname == "average") {
+            typeOut = new TypeDecl(at = at, baseType = Type.tDouble)
+        } else {
+            typeOut = fieldType
+        }
+        return true
+    }
+    return false
+}
+
+[macro_function]
+def private analyze_global_aggregate_projection(var aggregateLambda : ExpressionPtr;
+                                                var q : SqlQuery&; prog : ProgramPtr; at : LineInfo) : bool {
+    if (aggregateLambda == null || !(aggregateLambda is ExprMakeBlock)) {
+        macro_error(prog, at, "_sql: `_aggregate` expects a one-argument block returning a named tuple")
+        return false
+    }
+    var aggregateBlock = (aggregateLambda as ExprMakeBlock)._block as ExprBlock
+    if (aggregateBlock == null || aggregateBlock.arguments |> length != 1) {
+        macro_error(prog, at, "_sql: `_aggregate` block must take exactly one rowset argument")
+        return false
+    }
+    let rowsArgName = string(aggregateBlock.arguments[0].name)
+    var body = peel_lambda_single_return(aggregateLambda)
+    if (body is ExprRef2Value) {
+        body = (body as ExprRef2Value).subexpr
+    }
+    if (body == null || !(body is ExprMakeTuple)) {
+        macro_error(prog, at, "_sql: `_aggregate` block must return a named tuple such as `(N = rows |> count, MinX = rows |> _select($(r:T) => r.X) |> min)`")
+        return false
+    }
+    var mkTup = body as ExprMakeTuple
+    var tupT = mkTup._type
+    if (tupT == null || tupT.baseType != Type.tTuple
+            || empty(tupT.argNames)
+            || length(tupT.argNames) != length(mkTup.values)) {
+        macro_error(prog, at, "_sql: `_aggregate` result must be a NAMED tuple — every aggregate needs `Name = expression`")
+        return false
+    }
+    q.selectCols |> clear
+    q.selectColAliases |> clear
+    q.selectColTypes |> clear
+    q.selectColSqlFragments |> clear
+    q.projRecordNames |> clear
+    q.projBindExprs |> clear
+    let n = length(mkTup.values)
+    q.selectCols |> reserve(n)
+    q.selectColAliases |> reserve(n)
+    q.selectColTypes |> reserve(n)
+    q.selectColSqlFragments |> reserve(n)
+    q.projRecordNames |> reserve(n)
+    for (i in range(n)) {
+        var sqlFrag : string
+        var resultType : TypeDeclPtr
+        if (!try_translate_global_aggregate(
+                mkTup.values[i], rowsArgName, q, prog, at, sqlFrag, resultType)) {
+            macro_error(prog, at, "_sql: `_aggregate` tuple values must be `rows |> count/long_count` or `rows |> _select($(row:T) => row.Field) |> sum/average/min/max`; got: {describe(mkTup.values[i])}")
+            return false
+        }
+        if (empty(sqlFrag) || resultType == null) return false
+        push_computed_proj_slot(q, sqlFrag, resultType, string(tupT.argNames[i]))
+    }
+    q.projectedRowType = null
+    q.proj = ProjectionShape.NamedTuple
+    q.matr = Materializer.One
+    q.seenSelect = true
+    q.seenTerminal = true
+    return true
 }
 
 // nolint:STYLE015 Recognizes `_._1 |> first()` (== `first(_._1)`) in a `_select` after `_group_by`. Mirrors `try_translate_group_aggregate`'s name+receiver match shape — qmatch's `_._1.first()` doesn't match the call form.
@@ -3611,9 +3904,15 @@ def private fn_call_to_sql(var call : ExprCall?; var q : SqlQuery&; prog : Progr
             return "{lhs} LIKE ? ESCAPE '\\'"
         }
     }
-    // ---- FTS5 (tut 40): text_match(_.Body, q) on [sql_fts5] → `Body MATCH ?`; non-FTS5 is a compile error.
+    // ---- FTS5 (tut 40): text_match(_.Body, q) on indexed [sql_fts5] content → `Body MATCH ?`.
     if (fname == "text_match" && argc == 2) {
         if (!has_struct_annotation(q.rootType, "sql_fts5")) return pred_fail(q, prog, at, "_sql: text_match() requires an [sql_fts5] struct, got '{describe(q.rootType)}'. Options: use contains(_.Col, q) for LIKE-based substring match, or annotate the struct with [sql_fts5] for indexed full-text search.")
+        var receiver : ExpressionPtr
+        var fieldName : string
+        if (qmatch(call.arguments[0], $e(receiver).$f(fieldName)).matched
+            && has_field_annotation(q.rootType, fieldName, "sql_fts_unindexed")) {
+            return pred_fail(q, prog, at, "_sql: text_match() cannot target @sql_fts_unindexed field '{fieldName}' — UNINDEXED metadata is stored and filterable with ordinary comparisons, but deliberately excluded from FTS5 MATCH. Match an indexed string field instead.")
+        }
         let lhs = pred_to_sql(call.arguments[0], q, prog, at)
         return "" if (q.hadError)
         if (q.inHaving) {
@@ -4574,8 +4873,8 @@ def private build_row_builder(var q : SqlQuery&; prog : ProgramPtr; at : LineInf
         return mkTup
     }
     // FullRow (default)
-    var rootType = clone_type(q.rootType)
-    return qmacro(_::_sql_read_row(_sql_stmt, type<$t(rootType)>))
+    var rowType = clone_type(q.projectedRowType != null ? q.projectedRowType : q.rootType)
+    return qmacro(_::_sql_read_row(_sql_stmt, type<$t(rowType)>))
 }
 
 // nolint:STYLE015 Single-source row-var normalization: `_sql` resolves one source against placeholder `_`,
@@ -5331,50 +5630,29 @@ def private analyze_upsert_set_clause(var setExpr : ExpressionPtr; var rootT : T
 }
 
 [macro_function]
-def private emit_upsert_body(prog : ProgramPtr; var call : ExprCallMacro?;
-                             var rootT : TypeDeclPtr;
-                             isTry : bool; isReturning : bool) : ExpressionPtr {
-    if (rootT == null || rootT.structType == null) {
-        macro_error(prog, call.at, "_sql_upsert: row type must be a [sql_table] struct (got {describe(rootT)})")
-        return null
+def private build_upsert_sql(rootT : TypeDeclPtr; tableName : string;
+                             conflictCols : array<string>;
+                             setSqlClauses : array<string>;
+                             includePk : bool; isReturning : bool;
+                             var nRowBinds : int&) : string {
+    var insertCols : array<string>
+    for (field in rootT.structType.fields) {
+        if (is_field_computed(field)) continue
+        let isPk = find_annotation(field.annotation, "sql_primary_key", false)
+        if (!includePk && isPk) continue
+        insertCols |> push(field_to_column_name(rootT, string(field.name)))
     }
-    var st = rootT.structType
-    var dbE = call.arguments[0]
-    var rowE = call.arguments[1]
-    var conflictE = call.arguments[2]
-    var doUpdateE = call.arguments[3]
-    let tableName = sql_table_name_from_type(rootT)
-    let provIdx = find_sql_provider_by_runner(dbE._type)
-    if (provIdx < 0) {
-        macro_error(prog, call.at, "_sql_upsert: no SQL provider registered for runner type {describe(dbE._type)} (registered: {sql_provider_names()})")
-        return null
-    }
-    // 1) on_conflict columns
-    var conflictCols : array<string>
-    if (!analyze_upsert_conflict_inner(conflictE, rootT, conflictCols, prog, call.at)) return null
-    // 2) do_update SET clauses (with upsertMode=true so `_excluded.Col` resolves)
-    var setSqlClauses : array<string>
-    var setBindExprs : array<ExpressionPtr>
-    if (!analyze_upsert_set_clause(doUpdateE, rootT, tableName, provIdx, setSqlClauses, setBindExprs, prog, call.at)) return null
-    // 3) INSERT column list (non-computed only) — SQL-side names, positional bind indices.
-    var nonComputedCols : array<string>
-    var nRowBinds = 0
-    for (f in st.fields) {
-        if (is_field_computed(f)) continue
-        nonComputedCols |> push(field_to_column_name(rootT, string(f.name)))
-        nRowBinds++
-    }
-    // 4) Assemble SQL. conflictCols arrive in daslang names — translate via field_to_column_name at emission.
+    nRowBinds = length(insertCols)
     var sql = build_string() $(var w) {
         w |> write("INSERT INTO \"{tableName}\" (")
-        for (i in range(length(nonComputedCols))) {
+        for (i in range(length(insertCols))) {
             if (i > 0) {
                 w |> write(", ")
             }
-            w |> write("\"{nonComputedCols[i]}\"")
+            w |> write("\"{insertCols[i]}\"")
         }
         w |> write(") VALUES (")
-        for (i in range(length(nonComputedCols))) {
+        for (i in range(length(insertCols))) {
             if (i > 0) {
                 w |> write(", ")
             }
@@ -5399,27 +5677,91 @@ def private emit_upsert_body(prog : ProgramPtr; var call : ExprCallMacro?;
     if (isReturning) {
         sql += build_returning_clause(rootT)
     }
-    // 5) Bind order: row binds (1..N_row) via `_sql_bind_row`, then SET binds (N_row+1..).
+    return sql
+}
+
+[macro_function]
+def private emit_upsert_variant(var dbE : ExpressionPtr; var rootT : TypeDeclPtr;
+                                sql : string; nRowBinds : int; includePk : bool;
+                                setBindExprs : array<ExpressionPtr>;
+                                isTry : bool; isReturning : bool;
+                                provIdx : int; at : LineInfo) : ExpressionPtr {
     var bindStmts : array<ExpressionPtr>
     bindStmts |> reserve(1 + length(setBindExprs))
     bindStmts |> push <| qmacro_expr(${
-        _::_sql_bind_row(_sql_stmt, $e(rowE), true);
+        _::_sql_bind_row(_sql_stmt, _sql_upsert_row, $v(includePk));
     })
     for (i in range(length(setBindExprs))) {
         let bindIdx = nRowBinds + i + 1
-        var be = setBindExprs[i]
         bindStmts |> push <| qmacro_expr(${
-            sql_bind_to_stmt(_sql_stmt, $v(bindIdx), $e(be));
+            sql_bind_to_stmt(_sql_stmt, $v(bindIdx), $e(setBindExprs[i]));
         })
     }
-    // Row binds come from `_sql_bind_row` (not enumerated as `?` walking targets); pass empty binds to fold.
     var noBinds : array<ExpressionPtr>
     var frags : array<SqlFrag>
     sql_to_frags(sql, noBinds, frags)
     var sqlExpr : ExpressionPtr
     var bindExprs : array<ExpressionPtr>
-    fold_to_builder(frags, provIdx, call.at, sqlExpr, bindExprs)
-    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, provIdx, call.at)
+    fold_to_builder(frags, provIdx, at, sqlExpr, bindExprs)
+    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, provIdx, at)
+}
+
+[macro_function]
+def private emit_upsert_body(prog : ProgramPtr; var call : ExprCallMacro?;
+                             var rootT : TypeDeclPtr;
+                             isTry : bool; isReturning : bool) : ExpressionPtr {
+    if (rootT == null || rootT.structType == null) {
+        macro_error(prog, call.at, "_sql_upsert: row type must be a [sql_table] struct (got {describe(rootT)})")
+        return null
+    }
+    var dbE = call.arguments[0]
+    var rowE = call.arguments[1]
+    var conflictE = call.arguments[2]
+    var doUpdateE = call.arguments[3]
+    let tableName = sql_table_name_from_type(rootT)
+    let provIdx = find_sql_provider_by_runner(dbE._type)
+    if (provIdx < 0) {
+        macro_error(prog, call.at, "_sql_upsert: no SQL provider registered for runner type {describe(dbE._type)} (registered: {sql_provider_names()})")
+        return null
+    }
+    // 1) on_conflict columns
+    var conflictCols : array<string>
+    if (!analyze_upsert_conflict_inner(conflictE, rootT, conflictCols, prog, call.at)) return null
+    // 2) do_update SET clauses (with upsertMode=true so `_excluded.Col` resolves)
+    var setSqlClauses : array<string>
+    var setBindExprs : array<ExpressionPtr>
+    if (!analyze_upsert_set_clause(doUpdateE, rootT, tableName, provIdx, setSqlClauses, setBindExprs, prog, call.at)) return null
+    // 3) Build both INSERT spellings. An unset integer primary key must be
+    // omitted so each provider's auto-assignment mechanism can run.
+    var nWithoutPk = 0
+    let sqlWithoutPk = build_upsert_sql(rootT, tableName, conflictCols, setSqlClauses,
+        false, isReturning, nWithoutPk)
+    var nWithPk = 0
+    let sqlWithPk = build_upsert_sql(rootT, tableName, conflictCols, setSqlClauses,
+        true, isReturning, nWithPk)
+    var withoutPkCall = emit_upsert_variant(clone_expression(dbE), rootT,
+        sqlWithoutPk, nWithoutPk, false, setBindExprs,
+        isTry, isReturning, provIdx, call.at)
+    var withPkCall = emit_upsert_variant(clone_expression(dbE), rootT,
+        sqlWithPk, nWithPk, true, setBindExprs,
+        isTry, isReturning, provIdx, call.at)
+    var dispatchT = clone_type(rootT)
+    dispatchT.flags.constant = true
+    var dispatchBlock : ExpressionPtr
+    if (isReturning) {
+        dispatchBlock = qmacro($(_sql_upsert_row : $t(dispatchT)) {
+            if (_::_sql_pk_is_unset(_sql_upsert_row)) {
+                return <- $e(withoutPkCall)
+            }
+            return <- $e(withPkCall)
+        })
+    } else {
+        dispatchBlock = qmacro($(_sql_upsert_row : $t(dispatchT)) =>
+            _::_sql_pk_is_unset(_sql_upsert_row) ? $e(withoutPkCall) : $e(withPkCall))
+    }
+    var res = qmacro(invoke($e(dispatchBlock), $e(rowE)))
+    res |> force_at(call.at)
+    return res
 }
 
 [call_macro(name="_sql_upsert")]

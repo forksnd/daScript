@@ -128,10 +128,12 @@ part re-uses the same [sql_table] from Part 1.
     subqueries — they need a multi-source emitter. Covers API_MISSING §22.
     **Shipped:** [tutorials/sql/12-distinct.das](../../tutorials/sql/12-distinct.das) (chunk 4).
 13. **Aggregates — `count` / `sum` / `average` / `min` / `max`** —
-    terminal aggregates on the whole source. `count` stands alone;
-    the four column-driven aggregates compose with `_select(_.Col)`
-    upstream. AVG promotes to `double`; SUM/MIN/MAX inherit the
-    column type. Covers API_MISSING §18.
+    scalar terminal aggregates on the whole source. `count` stands
+    alone; the four column-driven aggregates compose with
+    `_select(_.Col)` upstream. `_aggregate($(rows) => (...))` returns
+    several named global aggregates from one provider-neutral SELECT.
+    AVG promotes to `double`; SUM/MIN/MAX inherit the column type.
+    Covers API_MISSING §18.
     **Shipped:** [tutorials/sql/13-aggregates.das](../../tutorials/sql/13-aggregates.das) (chunk 4).
 14. **`_group_by` + `_having`** — aggregate per bucket, post-aggregate
     filter. Group rows surface as IGrouping-shaped tuples (`_._0` =
@@ -423,7 +425,7 @@ E. **Forward-looking: `dasSQL` abstraction layer** — the roadmap beyond
 | 10 | `_order_by` / `_order_by_descending` (+ tuple key) | `10-order_by.das` | **Shipped** (chunk 4); `_then_by` and per-column ASC/DESC mix deferred |
 | 11 | `take` / `skip` (LIMIT / OFFSET) | `11-take_skip.das` | **Shipped** (chunk 4); keyset pagination is a future concept tut |
 | 12 | `distinct` (set ops deferred) | `12-distinct.das` | **Shipped** (chunk 4); UNION/INTERSECT/EXCEPT punted to chunk 5 alongside joins/subqueries |
-| 13 | Aggregates — `count` / `sum` / `average` / `min` / `max` | `13-aggregates.das` | **Shipped** (chunk 4) |
+| 13 | Aggregates — scalar terminals + one-scan `_aggregate` summaries | `13-aggregates.das` | **Shipped** (chunk 4; `_aggregate` extension shipped later) |
 | 14 | `_group_by` + `_having` | `14-group_by.das` (`19-group_by.das.mockup` superseded — IGrouping shape, see API_REWORK §19) | **Shipped** (chunk 4) |
 | 15 | `_join` — inner equi-join | `23-joins.das` | Has mockup |
 | 16 | `_left_join` — outer | `23-joins.das` | Has mockup (shared) |

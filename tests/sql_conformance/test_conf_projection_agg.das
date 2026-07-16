@@ -8,6 +8,7 @@ options no_unused_function_arguments = false
 
 require dastest/testing_boost public
 require _conformance_provider
+require daslib/strings_boost
 
 [sql_table(name = "ConfSales")]
 struct ConfSale {
@@ -82,6 +83,70 @@ def test_conf_aggregates(t : T?) {
                 |> _where(_.Region == "east") |> _select(_.Amount) |> average())
             t |> numericEqual(avg, 200.0lf)
         }
+    }
+    t |> run("_aggregate returns several global aggregates from one scan") @(tt : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let stats = _sql(
+                db |> select_from(type<ConfSale>)
+                   |> _where(_.Region != "north")
+                   |> _aggregate($(_rows) => (
+                        N = _rows |> count,
+                        LongN = _rows |> long_count,
+                        Total = _rows |> _select(_.Amount) |> sum,
+                        MinAmount = _rows |> _select(_.Amount) |> min,
+                        MaxAmount = _rows |> _select(_.Amount) |> max,
+                        Average = _rows |> _select(_.Amount) |> average)))
+            tt |> equal(stats.N, 4)
+            tt |> equal(stats.LongN, 4l)
+            tt |> equal(stats.Total, 650)
+            tt |> equal(stats.MinAmount, 50)
+            tt |> equal(stats.MaxAmount, 300)
+            tt |> numericEqual(stats.Average, 162.5lf)
+            let sql = _sql_text(
+                db |> select_from(type<ConfSale>)
+                   |> _aggregate($(_rows) => (
+                        N = _rows |> count,
+                        Total = _rows |> _select(_.Amount) |> sum)))
+            tt |> success(sql |> contains("COUNT(*) AS \"N\""))
+            tt |> success(sql |> contains("SUM(\"Amount\") AS \"Total\""))
+        }
+    }
+    t |> run("_aggregate returns type defaults for an empty source") @(tt : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let stats = _sql(
+                db |> select_from(type<ConfSale>)
+                   |> _where(_.Region == "missing")
+                   |> _aggregate($(_rows) => (
+                        N = _rows |> count,
+                        Total = _rows |> _select(_.Amount) |> sum,
+                        MinAmount = _rows |> _select(_.Amount) |> min,
+                        MaxAmount = _rows |> _select(_.Amount) |> max,
+                        Average = _rows |> _select(_.Amount) |> average)))
+            tt |> equal(stats.N, 0)
+            tt |> equal(stats.Total, 0)
+            tt |> equal(stats.MinAmount, 0)
+            tt |> equal(stats.MaxAmount, 0)
+            tt |> numericEqual(stats.Average, 0.0lf)
+        }
+    }
+    t |> run("_aggregate keeps the same shape for in-memory arrays") @(tt : T?) {
+        let rows = [
+            ConfSale(Id = 1, Region = "east", Amount = 100),
+            ConfSale(Id = 2, Region = "east", Amount = 300),
+            ConfSale(Id = 3, Region = "west", Amount = 50)]
+        let stats = rows |> _aggregate($(_rows) => (
+            N = _rows |> count,
+            LongN = _rows |> long_count,
+            Total = _rows |> _select(_.Amount) |> sum,
+            MinAmount = _rows |> _select(_.Amount) |> min,
+            MaxAmount = _rows |> _select(_.Amount) |> max))
+        tt |> equal(stats.N, 3)
+        tt |> equal(stats.LongN, 3l)
+        tt |> equal(stats.Total, 450)
+        tt |> equal(stats.MinAmount, 50)
+        tt |> equal(stats.MaxAmount, 300)
     }
 }
 

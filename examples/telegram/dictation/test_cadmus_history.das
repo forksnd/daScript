@@ -37,9 +37,14 @@ def test_history_migrations_linq_and_fts(t : T?) {
     remove(path)
     ensure_cadmus_database(path)
 
-    t |> run("starts at migration seven") @(t : T?) {
+    t |> run("starts at migration eight with unindexed typed FTS keys") @(t : T?) {
         with_sqlite(path) $(db) {
-            t |> equal(db |> current_schema_version(), 7)
+            t |> equal(db |> current_schema_version(), 8)
+            let ddl = db |> query_scalar(
+                "SELECT sql FROM sqlite_master WHERE name = 'cadmus_message_fts'",
+                type<string>)
+            t |> success(find(ddl, "\"ChatId\" UNINDEXED") >= 0)
+            t |> success(find(ddl, "\"TelegramMessageId\" UNINDEXED") >= 0)
         }
     }
 
@@ -342,5 +347,42 @@ def test_history_migrations_linq_and_fts(t : T?) {
         t |> success(has_ready_cadmus_live_audio(path, 3100l))
     }
 
+    remove(path)
+}
+
+[test]
+def test_history_v8_rebuild_preserves_existing_search_rows(t : T?) {
+    var error : string
+    let path = path_join(temp_directory(error), "cadmus_history_v7_upgrade_test.db")
+    remove(path)
+    with_sqlite(path) $(db) {
+        cadmus_migration_001(db)
+        cadmus_migration_002(db)
+        cadmus_migration_003(db)
+        cadmus_migration_004(db)
+        cadmus_migration_005(db)
+        cadmus_migration_006(db)
+        cadmus_migration_007(db)
+        db |> baseline(7)
+        db |> insert(test_message(77l, 1l, 5l, 100l, "legacy migration needle"))
+        db |> exec(
+            "INSERT INTO cadmus_message_fts(ChatId, TelegramMessageId, Body) VALUES (?, ?, ?)",
+            "77", "1", "legacy migration needle")
+    }
+
+    ensure_cadmus_database(path)
+    let rows <- search_cadmus_messages(path, 77l, "migration needle", 10)
+    t |> equal(length(rows), 1)
+    if (length(rows) == 1) {
+        t |> equal(rows[0].TelegramMessageId, 1l)
+    }
+    with_sqlite(path) $(db) {
+        t |> equal(db |> current_schema_version(), 8)
+        t |> equal(
+            db |> query_scalar(
+                "SELECT typeof(ChatId) FROM cadmus_message_fts WHERE TelegramMessageId = 1",
+                type<string>),
+            "integer")
+    }
     remove(path)
 }

@@ -12,6 +12,7 @@ require _conformance_provider
 [sql_table(name = "ConfCars")]
 struct ConfCar {
     @sql_primary_key Id : int
+    @sql_unique
     Name : string
     Price : int
 }
@@ -57,6 +58,15 @@ def test_conf_insert_select(t : T?) {
                 ConfCar(Id = 0, Name = "c", Price = 3)])
             let rows <- db |> select_from(type<ConfCar>)
             t |> equal(length(rows), 3)
+        }
+    }
+    t |> run("@sql_unique rejects duplicate field values") @(t : T?) {
+        with_conf_db() $(db) {
+            db |> create_table(type<ConfCar>)
+            db |> insert(ConfCar(Id = 0, Name = "same", Price = 1))
+            let duplicate = db |> try_insert(ConfCar(Id = 0, Name = "same", Price = 2))
+            t |> success(duplicate |> is_err)
+            t |> equal(_sql(db |> select_from(type<ConfCar>) |> count()), 1)
         }
     }
 }

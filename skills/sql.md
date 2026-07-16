@@ -22,7 +22,7 @@ Capability gates are **compile-time** `macro_error`s naming the provider (`caps`
 
 ```das
 require sqlite/sqlite_boost         // provider: SqlRunner, exec/query runtime, [sql_fts5], [sql_function]
-require daslib/sql_linq             // _sql / _try_sql / _each_sql / _sql_update / _sql_delete / _sql_upsert / _create_view / _sql_text
+require daslib/sql_linq             // _sql / _try_sql / _each_sql / _aggregate / _sql_update / _sql_delete / _sql_upsert / _create_view / _sql_text
 require daslib/linq_das             // OPTIONAL: `%linq! from row : T in db ... %%`; lowers through the same SQL analyzer
 require sqlite/sqlite_migrate       // OPTIONAL — [sql_migration], migrate_to_latest, with_latest_sqlite, baseline
 ```
@@ -126,7 +126,7 @@ Field annotations:
 |---|---|
 | `@sql_primary_key` | INTEGER PRIMARY KEY (AUTOINCREMENT for `int`); rejected on `Option<T>` and `@sql_computed` |
 | `@sql_column = "..."` | Rename the on-disk column (escape hatch for daslang field names that clash with SQL keywords or the existing schema) |
-| `@sql_unique` | Single-column UNIQUE in the column DDL |
+| `@sql_unique` | Single-column UNIQUE via portable generated index `uq_<table>_<column>` |
 | `@sql_references = "Parent"` | Foreign key to another `[sql_table]` struct's primary key |
 | `@sql_on_delete` / `@sql_on_update` | One of `cascade` / `set_null` / `set_default` / `restrict` / `no_action`. Only valid with `@sql_references` |
 | `@sql_default_fn = "FN"` | Whitelisted SQL built-in (`CURRENT_TIMESTAMP` / `CURRENT_DATE` / `CURRENT_TIME`); emits ` DEFAULT FN` |
@@ -144,7 +144,7 @@ Sibling annotation `[sql_index(fields = ..., unique = ..., name = ...)]` lives i
 struct UserAcct { ... }
 ```
 
-`fields` is a single string or a tuple of strings. `unique` defaults to `false`. `name` defaults to `idx_<table>_<col1>_<col2>`. Multiple `[sql_index]` lines are stackable. Composite UNIQUE via `[sql_index(unique = true, fields = (...))]` is the prerequisite for `_sql_upsert` composite-conflict targets.
+`fields` is a single string or a tuple of strings. `unique` defaults to `false`. `name` defaults to `idx_<table>_<col1>_<col2>`. Multiple `[sql_index]` lines are stackable. `@sql_unique` uses the same provider-neutral index rail for the one-column case; `[sql_index]` adds explicit naming and composite keys. Composite UNIQUE via `[sql_index(unique = true, fields = (...))]` is the prerequisite for `_sql_upsert` composite-conflict targets.
 
 `db |> create_table(type<T>)` issues the CREATE TABLE + every `[sql_index]` DDL. `db |> drop_table_if_exists(type<T>)` is the idempotent teardown. `db |> check_schema(type<T>)` validates the open DB matches the struct on (name, type, NOT NULL, PRIMARY KEY) — recommended startup pattern for code that opens a DB it didn't just create.
 
@@ -209,8 +209,8 @@ let cars <- _sql(db |> select_from(type<Car>)
 | **Page** | `take(n)`, `skip(m)` — canonical fast form is `skip(m) \|> take(n)`. `take`/`skip` BEFORE an aggregate (`take(n) \|> count()`, `_select(_.X) \|> take(n) \|> sum()`) wraps the bounded rows into an inner subquery so the LIMIT applies pre-aggregate |
 | **Distinct** | `distinct()` |
 | **Distinct-by** | `_distinct_by(_.K)` — one row per key: first in pk order; `reverse() \|> _distinct_by(_.K)` picks the last. Terminators: row-returning (`to_array` / `_first`, trailing `_order_by`/`take`/`skip` OK), `count()` (→ `COUNT(DISTINCT K)`), `_count(p)`, `_select(_.X) \|> sum/min/max/average()`. Provider-lowered via `caps.distinct_on`: `DISTINCT ON (K)` (PG, DuckDB) or SQLite's bare-aggregate `GROUP BY`. Requires a single `@sql_primary_key`; composing with `_where`/`_join`/`_group_by`/set ops is a compile error (v1) |
-| **Aggregate** | `count()`, `sum`, `average`, `min`, `max` (terminal) |
-| **Joins** | `_join(other, $(l, r) => l.X == r.Y, $(l, r) => projection)`, `_left_join(...)` (right side flows as `Option<TB>` through `into`) |
+| **Aggregate** | Scalar terminals: `count()`, `sum`, `average`, `min`, `max`. One-row summary: `_aggregate($(rows) => (N = rows \|> count, Total = rows \|> _select(_.X) \|> sum, ...))` lowers all named slots into one SELECT |
+| **Joins** | `_join(other, $(l, r) => l.X == r.Y, $(l, r) => projection)`, including exact whole-source results (`$(l, r) => r` returns `array<TRight>`); `_left_join(...)` flows the right side as `Option<TB>` through `into` |
 | **Subqueries** | `x._in(subq)`, `x._not_in(subq)`, `subq._any()`, `subq._any(p)`, `subq._none()`, `subq._none(p)` |
 | **Terminals** | `_to_array()` (default), `_first()` (panic on empty), `_first_opt()` (Option<T>) |
 | **String predicates** | `\|> starts_with(s)`, `\|> ends_with(s)`, `\|> contains(s)` (LIKE patterns); `\|> to_lower()`, `\|> to_upper()` (LOWER/UPPER); `length(s)` (LENGTH) |
@@ -225,7 +225,7 @@ let cars <- _sql(db |> select_from(type<Car>)
 Compile-time `macro_error` pointing at the offending node:
 
 - Unknown function calls in `_where` / `_select`
-- `_select` struct-type projection — a whole-struct project is a deferred follow-up; `_.Field`, named-tuple, and computed-scalar `_.A + _.B` projections are supported, including workhorse casts (`int64(_.A) * int64(_.B)` lowers to `CAST(...)`)
+- Single-source identity `_select($(x) => x)` remains unsupported (omit `_select` to return the full row). A join's `into` may return one non-nullable source struct directly (`$(l, r) => r`); `_.Field`, named-tuple, and computed-scalar `_.A + _.B` projections are also supported, including workhorse casts (`int64(_.A) * int64(_.B)` lowers to `CAST(...)`)
 - Multiple `_select` calls in one chain
 - Multiple terminals in one chain (`_to_array() |> _first()`)
 - `text_match` on a non-`[sql_fts5]` column (suggests `contains` or `[sql_fts5]`)
@@ -243,6 +243,28 @@ to_log(LOG_INFO, "SQL: {_sql_text(db |> select_from(type<Car>) |> _where(_.Price
 ```
 
 `options log` on the file dumps the post-macro daslang code — useful for seeing the runtime helper call the analyzer emits.
+
+### Several global aggregates in one scan
+
+Use `_aggregate` when one answer needs several facts about the same
+filtered source:
+
+```das
+let stats = _sql(
+    db |> select_from(type<Order>)
+       |> _where(_.State == wanted)
+       |> _aggregate($(rows) => (
+            N = rows |> count,
+            Total = rows |> _select(_.Amount) |> sum,
+            First = rows |> _select(_.CreatedAt) |> min,
+            Last = rows |> _select(_.CreatedAt) |> max)))
+```
+
+The result is a typed named tuple and the provider executes one query
+with one result row. The same expression works on an in-memory array.
+V1 accepts filtered table or join sources and field selectors; it
+compile-errors on pre-projection, grouping, distinct/set operations,
+ordering, or paging until explicit subquery composition exists.
 
 ### Composability
 
@@ -313,9 +335,18 @@ db |> _sql_upsert(
     UserAcct(Id = 999, Email = "x@y.com", Name = "alice2", Tenant = "acme"),
     tuple(_.Email, _.Tenant),
     (Name = _excluded.Name))
+
+// Default integer PK is unset: omit it so the provider auto-assigns it.
+// Useful when conflict targets another UNIQUE column.
+let inserted <- db |> _sql_upsert_returning(
+    WordHit(Id = 0, Word = "new", Hits = 1, Last = 1234l),
+    _.Word,
+    (Hits = _.Hits + _excluded.Hits))
 ```
 
 Each macro has the four-way fan-out: `_sql_update` / `_sql_try_update` / `_sql_update_returning` / `_sql_try_update_returning`, parallel for `_sql_delete` and `_sql_upsert`.
+
+For `_sql_upsert`, a default-valued integer `@sql_primary_key` is treated as unset just like `insert`: the macro omits that column so SQLite can assign rowid, DuckDB can draw from its sequence, and PostgreSQL can use its identity column. Explicit non-default primary keys remain in the INSERT. This applies to strict/`try_` and returning/non-returning variants.
 
 The `_sql_` prefix is deliberate — it carries SQL provenance to the call site and avoids name collisions with hypothetical future non-SQL `_update` / `_delete` macros. Function siblings stay unprefixed (`update` / `delete_` / `delete_by_id`).
 
@@ -473,24 +504,29 @@ For window functions, recursive CTEs, custom helpers the chain doesn't translate
 ```das
 [sql_fts5(name = "docs_idx")]
 struct Doc {
+    @sql_fts_unindexed Id : int64  // stored/filterable metadata, excluded from MATCH
     Body : string
     @sql_fts_rank Rank : float       // FTS5 fills on SELECT (BM25); INSERT skips
 }
 
 db |> create_table(type<Doc>)                    // CREATE VIRTUAL TABLE … USING fts5(...)
-db |> insert(Doc(Body = "The quick brown fox jumps"))
+db |> insert(Doc(Id = 42l, Body = "The quick brown fox jumps"))
 
 let foxes <- _sql(db |> select_from(type<Doc>)
-                     |> _where(_.Body |> text_match("quick fox"))
+                     |> _where(_.Id == 42l && (_.Body |> text_match("quick fox")))
                      |> _order_by(_.Rank))
-// SELECT "Body", rank FROM "docs_idx" WHERE "Body" MATCH ? ORDER BY rank
+// SELECT "Id", "Body", rank FROM "docs_idx" WHERE "Id" = ? AND "Body" MATCH ? ORDER BY rank
+
+let removed = db |> _sql_delete(type<Doc>, _.Body |> text_match("obsolete"))
 ```
+
+`@sql_fts_unindexed` emits FTS5's `UNINDEXED` column suffix. Use it for typed IDs, timestamps, kinds, or tenant/chat metadata that must round-trip with hits and participate in ordinary comparisons without being tokenized. The normal `sql_bind` / `sql_extract` adapter rail supplies its storage type. `text_match` on an unindexed field is a compile error.
 
 `text_match(col, query)` lowers to `col MATCH ?`. The same predicate is also a `daslib/strings_boost` (via `daslib/fts5_query`) in-memory matcher — one call site for both SQL and in-memory filtering. `text_match` on a non-`[sql_fts5]` column is a compile error pointing at `contains` (LIKE-based) or adding `[sql_fts5]`.
 
 Query-string syntax: whitespace-AND, `*` prefix (`quick*` matches `quicksand`), `"phrase match"` (quoted), Boolean `AND` / `OR` / `NOT` (uppercase), `NEAR(a b, N)` proximity. Default tokenizer is `unicode61` (Unicode word boundaries + ASCII case-fold).
 
-v1 limitations: self-contained mode only (FTS5 holds both content and index); UPDATE / DELETE on FTS5 rows aren't typed (drop and re-insert, or raw `exec`); BM25 weighting / snippet helpers / per-column query filters work via the FTS5 query string but lack typed wrappers.
+Limitations: self-contained mode only (FTS5 holds both content and index); row-shaped UPDATE / DELETE-by-PK helpers are unavailable because the virtual table has no declared daslang PK. Predicate DELETE is typed through `_sql_delete(type<T>, predicate)`; update by deleting and re-inserting, or use raw SQL. BM25 weighting / snippet helpers / per-column query filters work via the FTS5 query string but lack typed wrappers.
 
 ## User-defined SQL functions — `register_function` / `[sql_function]` (`caps.client_udfs`)
 

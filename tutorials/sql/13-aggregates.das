@@ -5,7 +5,8 @@ require sqlite/sqlite_boost
 require daslib/sql_linq
 
 // Tutorial 13 — Column aggregates: `sum`, `average`, `min`, `max`,
-// plus `count` (already shown in tutorial 6).
+// plus `count` (already shown in tutorial 6) and `_aggregate`, which
+// returns several named global aggregates from one source scan.
 //
 // All five are *terminals* — they end the chain and produce a
 // scalar, not an array. The translation pattern is the same for the
@@ -74,6 +75,22 @@ def main() {
                                     |> sum())
         to_log(LOG_INFO, "SUM(Price) WHERE Price>100 = {total_over_100}\n")
 
+        // ── Several global aggregates in one scan ───────────────────────────
+        // `_aggregate` receives the filtered rowset and returns a named tuple.
+        // Each tuple slot must be a global aggregate over that rowset.
+        let stats = _sql(
+            db |> select_from(type<Car>)
+               |> _where(_.Price >= cutoff)
+               |> _aggregate($(_rows) => (
+                    N = _rows |> count,
+                    Total = _rows |> _select(_.Price) |> sum,
+                    Cheapest = _rows |> _select(_.Price) |> min,
+                    Priciest = _rows |> _select(_.Price) |> max,
+                    Mean = _rows |> _select(_.Price) |> average)))
+        to_log(LOG_INFO,
+            "one-scan stats: count={stats.N}, total={stats.Total}, " +
+            "min={stats.Cheapest}, max={stats.Priciest}, avg={stats.Mean}\n")
+
         // ── Aggregating a computed expression ────────────────────────────
         // `_select` takes a computed scalar, not just a bare column —
         // the expression lowers into the aggregate's argument.
@@ -99,8 +116,18 @@ def main() {
         let sql_expr = _sql_text(db |> select_from(type<Car>)
                                    |> _select(int64(_.Price) * int64(_.Id))
                                    |> sum())
+        let sql_stats = _sql_text(
+            db |> select_from(type<Car>)
+               |> _where(_.Price >= cutoff)
+               |> _aggregate($(_rows) => (
+                    N = _rows |> count,
+                    Total = _rows |> _select(_.Price) |> sum,
+                    Cheapest = _rows |> _select(_.Price) |> min,
+                    Priciest = _rows |> _select(_.Price) |> max,
+                    Mean = _rows |> _select(_.Price) |> average)))
         to_log(LOG_INFO, "  SUM SQL: {sql_sum}\n")
         to_log(LOG_INFO, "  AVG SQL: {sql_avg}\n")
         to_log(LOG_INFO, "  computed SUM SQL: {sql_expr}\n")
+        to_log(LOG_INFO, "  one-scan stats SQL: {sql_stats}\n")
     }
 }

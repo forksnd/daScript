@@ -78,6 +78,27 @@ def main {
         //   Alice placed an order of 250
         //   Bob   placed an order of  50
 
+        // The `into` projection may also return one source row directly.
+        // `_sql` selects every qualified column from that source and
+        // reconstructs the exact nominal struct — no `(Id=o.Id, ...)`
+        // tuple is needed. This is especially useful when a join only
+        // supplies filtering/ranking context but the caller wants table rows.
+        let large_orders : array<Order> <- _sql(db |> select_from(type<User>)
+                                                   |> _join(db |> select_from(type<Order>),
+                                                            $(u : User, o : Order) => u.Id == o.UserId,
+                                                            $(u : User, o : Order) => o)
+                                                   |> _where(_.Total >= 100)
+                                                   |> _order_by(_.Total))
+        to_log(LOG_INFO, "whole Order rows from join: {length(large_orders)}")
+        for (o in large_orders) {
+            to_log(LOG_INFO, "  order {o.Id}: {o.Total}")
+        }
+        // SELECT "t1"."Id", "t1"."UserId", "t1"."Total"
+        //   FROM "Users" AS "t0"
+        //   INNER JOIN "Orders" AS "t1"
+        //     ON "t0"."Id" = "t1"."UserId"
+        //  WHERE "t1"."Total" >= ?
+
         // Pre-join `_where` filters the LEFT source before the join.
         // Column refs qualify with the left alias `t0` automatically.
         let active_only <- _sql(db |> select_from(type<User>)

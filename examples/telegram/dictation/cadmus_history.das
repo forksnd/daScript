@@ -6,7 +6,6 @@ require sqlite/sqlite_migrate
 require daslib/sql_linq
 require daslib/linq_das
 require daslib/strings_boost
-require daslib/strings_convert
 require math
 
 let CADMUS_ROLE_USER = "user"
@@ -95,13 +94,12 @@ struct CadmusLiveAudio {
 
 [sql_fts5(name = "cadmus_message_fts")]
 struct CadmusSearchRow {
-    ChatId : string
-    TelegramMessageId : string
+    @sql_fts_unindexed ChatId : int64
+    @sql_fts_unindexed TelegramMessageId : int64
     Body : string
     @sql_fts_rank Rank : float
 }
 
-[sql_table(name = "_cadmus_mention_stats_row")]
 struct CadmusMentionStats {
     Total : int
     FirstDate : int64
@@ -233,6 +231,23 @@ def cadmus_migration_007(db : SqlRunner) {
     db |> exec("ALTER TABLE cadmus_live_audio ADD COLUMN TranscriptLanguage TEXT NOT NULL DEFAULT ''")
 }
 
+// FTS keys are relational metadata, not searchable prose. Rebuild once so new typed queries bind
+// int64 directly and FTS5 stops tokenizing chat/message IDs into its inverted index.
+[sql_migration(version = 8, description = "store Cadmus FTS keys as typed unindexed metadata")]
+def cadmus_migration_008(db : SqlRunner) {
+    db |> exec("DROP TABLE cadmus_message_fts")
+    db |> exec(
+        "CREATE VIRTUAL TABLE cadmus_message_fts USING fts5(" +
+        "\"ChatId\" UNINDEXED, \"TelegramMessageId\" UNINDEXED, \"Body\", " +
+        "tokenize='unicode61')")
+    db |> exec(
+        "INSERT INTO cadmus_message_fts(ChatId, TelegramMessageId, Body) " +
+        "SELECT ChatId, TelegramMessageId, " +
+        "trim(Content || char(10) || Caption || char(10) || RawTranscript) " +
+        "FROM cadmus_messages WHERE Deleted = 0 AND " +
+        "length(trim(Content || Caption || RawTranscript)) > 0")
+}
+
 def with_cadmus_database(path : string; blk : block<(db : SqlRunner) : void>) {
     with_latest_sqlite(path) $(db) {
         db |> set_pragma("busy_timeout", 120000l)
@@ -353,12 +368,10 @@ def load_cadmus_assistant_sources(
     return <- result
 }
 
-// FTS5 v1 has typed INSERT + SELECT but no typed UPDATE/DELETE. Keep that narrow
-// provider gap here; every ordinary application read/write uses LINQ/_sql below.
 def private sync_cadmus_search(db : SqlRunner; msg : CadmusMessage) {
-    db |> exec(
-        "DELETE FROM cadmus_message_fts WHERE ChatId = ? AND TelegramMessageId = ?",
-        "{msg.ChatId}", "{msg.TelegramMessageId}")
+    db |> _sql_delete(
+        type<CadmusSearchRow>,
+        _.ChatId == msg.ChatId && _.TelegramMessageId == msg.TelegramMessageId)
     if (!msg.Deleted && !empty(strip("{msg.Content}{msg.Caption}{msg.RawTranscript}"))) {
         let body = build_string() $(var writer) {
             if (!empty(strip(msg.Content))) {
@@ -374,8 +387,8 @@ def private sync_cadmus_search(db : SqlRunner; msg : CadmusMessage) {
             }
         }
         db |> insert(CadmusSearchRow(
-            ChatId = "{msg.ChatId}",
-            TelegramMessageId = "{msg.TelegramMessageId}",
+            ChatId = msg.ChatId,
+            TelegramMessageId = msg.TelegramMessageId,
             Body = body,
             Rank = 0.0))
     }
@@ -427,8 +440,7 @@ def upsert_cadmus_import_media_db(db : SqlRunner; item : CadmusImportMedia) {
         return
     }
     var upsert_item = item
-    upsert_item.Id = db |> query_scalar(
-        "SELECT COALESCE(MAX(Id), 0) + 1 FROM cadmus_import_media", type<int>)
+    upsert_item.Id = 0
     db |> _sql_upsert(
         upsert_item,
         tuple(_.ChatId, _.TelegramMessageId),
@@ -680,9 +692,9 @@ def mark_cadmus_message_deleted(path : string; chat_id, message_id, edited_at : 
                 type<CadmusMessage>,
                 _.ChatId == chat_id && _.TelegramMessageId == message_id,
                 (Deleted = true, EditedAt = edited_at))
-            db |> exec(
-                "DELETE FROM cadmus_message_fts WHERE ChatId = ? AND TelegramMessageId = ?",
-                "{chat_id}", "{message_id}")
+            db |> _sql_delete(
+                type<CadmusSearchRow>,
+                _.ChatId == chat_id && _.TelegramMessageId == message_id)
         }
     }
 }
@@ -737,15 +749,6 @@ def private cadmus_fts_query(
     return terms |> join(require_all ? " AND " : " OR ")
 }
 
-def private parse_stored_int64(value : string; var result : int64&) : bool {
-    let parsed = try_to_int64(value)
-    if (parsed |> is_err) {
-        return false
-    }
-    result = parsed |> unwrap
-    return true
-}
-
 def search_cadmus_messages(path : string; chat_id : int64; question : string; count : int) : array<CadmusMessage> {
     var result : array<CadmusMessage>
     let query_text = cadmus_fts_query(question)
@@ -753,19 +756,15 @@ def search_cadmus_messages(path : string; chat_id : int64; question : string; co
         return <- result
     }
     with_cadmus_database(path) $(db) {
-        let chat_key = "{chat_id}"
         let hits <- _sql(
             db |> select_from(type<CadmusSearchRow>)
-               |> _where(_.ChatId == chat_key && _.Body |> text_match(query_text))
+               |> _where(_.ChatId == chat_id && _.Body |> text_match(query_text))
                |> _order_by(_.Rank)
                |> take(count))
         for (hit in hits) {
-            var message_id = 0l
-            if (!parse_stored_int64(hit.TelegramMessageId, message_id)) {
-                continue
-            }
             let rows <- %linq! from m : CadmusMessage in db
-                               where m.ChatId == chat_id && m.TelegramMessageId == message_id && !m.Deleted
+                               where m.ChatId == chat_id &&
+                                     m.TelegramMessageId == hit.TelegramMessageId && !m.Deleted
                                select m %%
             if (!empty(rows)) {
                 result |> push(rows[0])
@@ -811,20 +810,16 @@ def private search_cadmus_message_variant(
         return <- result
     }
     with_cadmus_database(path) $(db) {
-        let chat_key = "{chat_id}"
         let candidate_count = clamp(count * 6, 24, 100)
         let hits <- _sql(
             db |> select_from(type<CadmusSearchRow>)
-               |> _where(_.ChatId == chat_key && _.Body |> text_match(query_text))
+               |> _where(_.ChatId == chat_id && _.Body |> text_match(query_text))
                |> _order_by(_.Rank)
                |> take(candidate_count))
         for (hit in hits) {
-            var message_id = 0l
-            if (!parse_stored_int64(hit.TelegramMessageId, message_id)) {
-                continue
-            }
             let rows <- %linq! from m : CadmusMessage in db
-                               where m.ChatId == chat_id && m.TelegramMessageId == message_id &&
+                               where m.ChatId == chat_id &&
+                                     m.TelegramMessageId == hit.TelegramMessageId &&
                                      m.Role == CADMUS_ROLE_USER && !m.Deleted &&
                                      (sender_id == 0l || m.SenderId == sender_id) &&
                                      (before_message_id == 0l ||
@@ -884,13 +879,17 @@ def search_cadmus_messages_chronological(
         return <- result
     }
     with_cadmus_database(path) $(db) {
-        result <- db |> query(
-            "SELECT m.* FROM cadmus_message_fts f JOIN cadmus_messages m " +
-            "ON m.ChatId = CAST(f.ChatId AS INTEGER) " +
-            "AND m.TelegramMessageId = CAST(f.TelegramMessageId AS INTEGER) " +
-            "WHERE f.ChatId = ? AND f.Body MATCH ? AND m.Deleted = 0 " +
-            "ORDER BY m.MessageDate ASC, m.TelegramMessageId ASC LIMIT ?",
-            type<CadmusMessage>, "{chat_id}", query_text, count)
+        result <- _sql(
+            db |> select_from(type<CadmusSearchRow>)
+               |> _where(_.ChatId == chat_id && _.Body |> text_match(query_text))
+               |> _join(
+                    db |> select_from(type<CadmusMessage>)
+                       |> _where(_.ChatId == chat_id && !_.Deleted),
+                    $(f : CadmusSearchRow, m : CadmusMessage) =>
+                        f.TelegramMessageId == m.TelegramMessageId,
+                    $(f : CadmusSearchRow, m : CadmusMessage) => m)
+               |> _order_by((_.MessageDate, _.TelegramMessageId))
+               |> take(count))
     }
     return <- result
 }
@@ -902,15 +901,23 @@ def cadmus_mention_stats(path : string; chat_id : int64; question : string) : Ca
         return result
     }
     with_cadmus_database(path) $(db) {
-        result <- db |> query_one(
-            "SELECT COUNT(*) AS Total, " +
-            "COALESCE(MIN(m.MessageDate), 0) AS FirstDate, " +
-            "COALESCE(MAX(m.MessageDate), 0) AS LastDate " +
-            "FROM cadmus_message_fts f JOIN cadmus_messages m " +
-            "ON m.ChatId = CAST(f.ChatId AS INTEGER) " +
-            "AND m.TelegramMessageId = CAST(f.TelegramMessageId AS INTEGER) " +
-            "WHERE f.ChatId = ? AND f.Body MATCH ? AND m.Deleted = 0",
-            type<CadmusMentionStats>, "{chat_id}", query_text)
+        let stats = _sql(
+            (db |> select_from(type<CadmusSearchRow>)
+                |> _where(_.ChatId == chat_id && _.Body |> text_match(query_text)))
+            |> _join(
+                db |> select_from(type<CadmusMessage>)
+                   |> _where(_.ChatId == chat_id && !_.Deleted),
+                $(f : CadmusSearchRow, m : CadmusMessage) =>
+                    f.TelegramMessageId == m.TelegramMessageId,
+                $(f : CadmusSearchRow, m : CadmusMessage) => m)
+            |> _aggregate($(_rows) => (
+                Total = _rows |> count,
+                FirstDate = _rows |> _select(_.MessageDate) |> min,
+                LastDate = _rows |> _select(_.MessageDate) |> max)))
+        result = CadmusMentionStats(
+            Total = stats.Total,
+            FirstDate = stats.FirstDate,
+            LastDate = stats.LastDate)
     }
     return result
 }
@@ -1000,20 +1007,16 @@ def search_cadmus_user_messages(
         return <- result
     }
     with_cadmus_database(path) $(db) {
-        let chat_key = "{chat_id}"
         let candidate_count = count * 4 <= 100 ? count * 4 : 100
         let hits <- _sql(
             db |> select_from(type<CadmusSearchRow>)
-               |> _where(_.ChatId == chat_key && _.Body |> text_match(query_text))
+               |> _where(_.ChatId == chat_id && _.Body |> text_match(query_text))
                |> _order_by(_.Rank)
                |> take(candidate_count))
         for (hit in hits) {
-            var message_id = 0l
-            if (!parse_stored_int64(hit.TelegramMessageId, message_id)) {
-                continue
-            }
             let rows <- %linq! from m : CadmusMessage in db
-                               where m.ChatId == chat_id && m.TelegramMessageId == message_id &&
+                               where m.ChatId == chat_id &&
+                                     m.TelegramMessageId == hit.TelegramMessageId &&
                                      m.Role == CADMUS_ROLE_USER && !m.Deleted
                                select m %%
             if (!empty(rows)) {

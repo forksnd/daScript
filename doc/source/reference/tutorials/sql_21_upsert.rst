@@ -14,6 +14,7 @@ SQL-21 --- UPSERT
     single: Tutorial; _sql_upsert
     single: Tutorial; _sql_upsert_returning
     single: Tutorial; _excluded
+    single: Tutorial; auto-assigned primary key
 
 Three SQL shapes for "INSERT but, if it collides with a UNIQUE / PK
 constraint, do something instead":
@@ -79,6 +80,45 @@ ON CONFLICT ... DO UPDATE --- the proper merge
     //   ON CONFLICT("Id") DO UPDATE SET
     //     "Hits" = ("Hits") + (?),
     //     "Last" = excluded."Last"
+
+Auto-assigned integer primary keys
+==================================
+
+An integer primary key at its default value (usually ``Id = 0``) is
+treated as unset, just like it is by ``insert``. ``_sql_upsert`` omits
+that column from the attempted ``INSERT``, allowing the provider to
+assign it: SQLite uses its rowid alias, DuckDB uses a sequence, and
+PostgreSQL uses an identity column.
+
+This is most useful when the conflict target is a different UNIQUE
+column. The first call inserts with a generated ID; later calls with
+the same key update the existing row without replacing its ID.
+
+.. code-block:: das
+
+    [sql_table(name = "WordHits"),
+     sql_index(fields = "Word", unique = true)]
+    struct WordHit {
+        @sql_primary_key Id : int
+        Word : string
+        Hits : int
+        Last : int64
+    }
+
+    let created <- db |> _sql_upsert_returning(
+        WordHit(Id = 0, Word = "automatic", Hits = 1, Last = 2000l),
+        _.Word,
+        (Hits = _.Hits + _excluded.Hits, Last = _excluded.Last))
+
+    // `created[0].Id` is provider-assigned and non-zero.
+    db |> _sql_upsert(
+        WordHit(Id = 0, Word = "automatic", Hits = 4, Last = 3000l),
+        _.Word,
+        (Hits = _.Hits + _excluded.Hits, Last = _excluded.Last))
+
+The rule applies equally to ``_sql_try_upsert``,
+``_sql_upsert_returning``, and ``_sql_try_upsert_returning``. An
+explicit non-default primary key remains part of the ``INSERT``.
 
 Composite conflict targets
 ==========================
