@@ -4208,7 +4208,7 @@ def kv_store_batch(var kcp : uint8?; var vcp : uint8?;
 // tq4 basis change over a batch buffer: rotate (or un-rotate) every head segment of every row in
 // place — q_b rows at stride qd, k_b/v_b rows at stride kv_dim, xb_b rows at stride qd. Segments
 // are independent; the cost is O(rows · stride · log head_size), noise next to the GEMMs.
-def private tq4_rotate_batch(var buf : array<float>; nrows, stride, head_size : int64; signs : float const?) {
+def tq4_rotate_batch(var buf : array<float>; nrows, stride, head_size : int64; signs : float const?) {
     unsafe {
         var p = addr(buf[0])
         for (sg in range64(nrows * (stride / head_size))) {

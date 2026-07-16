@@ -128,8 +128,8 @@ def private enc_site_gemv(enc : MetalComputeEncoder?; t : Model; s16 : bool; fmt
             enc_gemv(enc, s16, bw, bws, bx, by, bn, bd, rows, yoff)
         }
     } else {
-        var bq = kq_upload_quants(t, fmt, woff, rows, n)
-        var bs = kq_upload_scales(t, fmt, woff, rows, n)
+        var bq = kq_upload_quants(g_dev, t, fmt, woff, rows, n)
+        var bs = kq_upload_scales(g_dev, t, fmt, woff, rows, n)
         enc_kq_gemv(enc, fmt, bq, bs, bx, by, bn, bd, rows, n, yoff)
     }
 }
@@ -141,8 +141,8 @@ def private enc_site_gemv(enc : MetalComputeEncoder?; t : Model; s16 : bool; fmt
 def private enc_kq_site_b(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; woff, rows, n : int64;
                           bx : MetalBuffer?; xstride : int64; by : MetalBuffer?; ystride, ycol : int64;
                           bn, bd : MetalBuffer?; nrows : int64) {
-    var bq = kq_upload_quants(t, fmt, woff, rows, n)
-    var bs = kq_upload_scales(t, fmt, woff, rows, n)
+    var bq = kq_upload_quants(g_dev, t, fmt, woff, rows, n)
+    var bs = kq_upload_scales(g_dev, t, fmt, woff, rows, n)
     for (b in range64(nrows)) {
         enc_kq_gemv(enc, fmt, bq, bs, bx, by, bn, bd, rows, n,
             uint64((b * ystride + ycol) * 4l), uint64(b * xstride * 4l))

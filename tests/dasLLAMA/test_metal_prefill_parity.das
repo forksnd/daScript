@@ -1,10 +1,12 @@
 options gen2
 options persistent_heap   // + explicit deletes: the model frees before the process exits
+options stack = 131072   // by-value Sessions in the kq + quantized-KV arms (test_batch_decode sizing)
 
 require dastest/testing_boost public
 require dasllama/dasllama   // the public facade — pulls the engine + arch registrations + (on Apple) the metal prefill override
 require dasllama/dasllama_math   // set_wscale_f16 — the resident path reads the f32 scale plane
 require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — min-npos setter + stats + the shutdown/leak rail
+require ?das_metal dasllama/dasllama_metal_llama  // nolint:STYLE030 — decode shutdown (the kq/quantized-KV arms touch the decode driver)
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — metal_live_object_count for the leak gate
 require daslib/jobque_boost
 require daslib/fio  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
@@ -124,7 +126,77 @@ def test_metal_prefill_parity(t : T?) {
             t |> success(same(cpu16, gpu16), "40-token wscale16 continuation matches the CPU control (s16 mul_mm + s16 classifier)")
             delete tr16
 
+            // kq arm (M2.3): K-quant prefill — the kq mul_mm twins (mixed k4/k6 tensors per
+            // layer) + the kq classifier GEMV. The CPU kq prefill is the control; the envelope
+            // is the kq one (f32-x GPU vs Q8_K CPU activations), tokens exact on the fixture.
+            let kpath = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
+            if (stat(kpath).is_valid) {
+                set_wscale_f16(false)
+                pin_kernel_backend("portable")
+                var trk <- load_model(kpath, QuantMode.q8)
+                if (trk.config.seq_len > 2048l) {
+                    trk.config.seq_len = 2048l
+                }
+                let cpuk <- continuation(trk, prompt, 40)
+                t |> success(select_prefill_override("metal"), "override registered (kq)")
+                set_metal_prefill_min_npos(1l)
+                let beforek = metal_prefill_stats().prefills
+                let gpuk <- continuation(trk, prompt, 40)
+                t |> success(metal_prefill_stats().prefills - beforek > 0l, "kq prefill served on the GPU")
+                select_prefill_override("")
+                set_metal_prefill_min_npos(64l)
+                clear_kernel_backend_pin()
+                select_kernel_backend(prior_backend)
+                set_wscale_f16(prior_wscale)
+                t |> success(same(cpuk, gpuk), "40-token kq continuation matches the CPU control (kq mul_mm + kq classifier)")
+                delete trk
+            } else {
+                feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); kq prefill arm skipped\n")
+            }
+
+            // GPU-prefill x quantized-KV arm: the prefill KV writeback into q8_0/tq4 SESSION
+            // codecs — this combo engaged since W3 but its output was never explicitly verified
+            // (the decode parity arms use CPU prefill). GPU prefill + GPU decode vs the all-CPU
+            // control on the same codec, token-exact.
+            {
+                set_wscale_f16(false)
+                pin_kernel_backend("portable")
+                var trq <- load_model(path, QuantMode.q8)
+                if (trq.config.seq_len > 2048l) {
+                    trq.config.seq_len = 2048l
+                }
+                for (kdt in [KVDtype.q8_0, KVDtype.tq4]) {
+                    var cpuq : array<int64>
+                    var gpuq : array<int64>
+                    with_job_que() {
+                        setup_dasllama_jobque()
+                        var sa = make_run_state(trq.config, kdt, kdt)
+                        let ids <- generate(trq, sa, prompt, length(prompt) + 24)
+                        cpuq := ids
+                        delete sa
+                        select_prefill_override("metal")
+                        select_decode_override("metal")
+                        set_metal_prefill_min_npos(1l)
+                        var sb = make_run_state(trq.config, kdt, kdt)
+                        let ids2 <- generate(trq, sb, prompt, length(prompt) + 24)
+                        gpuq := ids2
+                        delete sb
+                        select_prefill_override("")
+                        select_decode_override("")
+                        set_metal_prefill_min_npos(64l)
+                    }
+                    t |> success(same(cpuq, gpuq), "GPU prefill x {kdt} KV: 24-token continuation matches the all-CPU control")
+                    delete cpuq
+                    delete gpuq
+                }
+                clear_kernel_backend_pin()
+                select_kernel_backend(prior_backend)
+                set_wscale_f16(prior_wscale)
+                delete trq
+            }
+
             metal_prefill_shutdown()
+            metal_decode_shutdown()   // the kq uploads + the quantized-KV arm's decode steps live in the decode driver's caches
             t |> equal(metal_live_object_count(), 0l)
             delete tr
         } else {

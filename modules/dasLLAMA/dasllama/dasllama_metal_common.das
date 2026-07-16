@@ -429,25 +429,40 @@ def upload_scales_cat3(t : Model; off0, rows0, off1, rows1, off2, rows2, n : int
 // One kq tensor's quant plane slice, uploaded BYTE-IDENTICAL (disk-order superblock payloads —
 // the backend_repack decline excludes grp-repacked loads, and the non-repack backends leave the
 // planes disk-order). Cached in g_regions by source address like every weight region.
-def kq_upload_quants(t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
+def kq_upload_quants(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
     let sb0 = off / 256l
     let nsb = (rows * n) / 256l
     unsafe {
         if (fmt == KqFmt.k4) {
-            return upload_region(addr < void ? > (t.k4q[sb0 * 128l]), uint64(nsb * 128l))
+            return kq_region(dev, addr < void ? > (t.k4q[sb0 * 128l]), uint64(nsb * 128l))
         }
         if (fmt == KqFmt.k5) {
-            return upload_region(addr < void ? > (t.k5q[sb0 * 160l]), uint64(nsb * 160l))
+            return kq_region(dev, addr < void ? > (t.k5q[sb0 * 160l]), uint64(nsb * 160l))
         }
-        return upload_region(addr < void ? > (t.k6q[sb0 * 192l]), uint64(nsb * 192l))
+        return kq_region(dev, addr < void ? > (t.k6q[sb0 * 192l]), uint64(nsb * 192l))
     }
+}
+
+// upload_region's device-parameterized twin (the kq helpers serve BOTH resident drivers — the
+// prefill driver owns its own device handle; same shared address-keyed cache)
+def private kq_region(dev : MetalDevice?; src : void?; bytes : uint64) : MetalBuffer? {
+    let key = intptr(src)
+    if (key_exists(g_regions, key)) {
+        return g_regions[key]
+    }
+    var buf = metal_new_buffer_untracked(dev, bytes)
+    unsafe {
+        memcpy(metal_buffer_contents(buf), src, int(bytes))
+    }
+    g_regions[key] = buf
+    return buf
 }
 
 // One kq tensor's GPU-form scale buffer (the gemv lab's layout verdicts): k4/k5 = 16B compact
 // blocks (the production 20B block minus its pad — the 20B stride's varying mod-16 phase defeats
 // the compiler's vector-load merge); k6 = [16B sub-scale blocks][packed f16 d plane] in ONE
 // buffer, the d plane at byte nsb*16 (the kernel binds the buffer twice with offsets).
-def kq_upload_scales(t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
+def kq_upload_scales(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
     let sb0 = off / 256l
     let nsb = (rows * n) / 256l
     unsafe {
@@ -456,7 +471,7 @@ def kq_upload_scales(t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer
             if (key_exists(g_regions, key)) {
                 return g_regions[key]
             }
-            var buf = metal_new_buffer_untracked(g_dev, uint64(nsb * 18l))
+            var buf = metal_new_buffer_untracked(dev, uint64(nsb * 18l))
             var d = reinterpret<uint8?>(metal_buffer_contents(buf))
             let src = addr < uint8 const ? > (t.k6s[sb0 * 18l])
             for (sb in range64(nsb)) {
@@ -472,7 +487,7 @@ def kq_upload_scales(t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer
         if (key_exists(g_regions, key)) {
             return g_regions[key]
         }
-        var buf = metal_new_buffer_untracked(g_dev, uint64(nsb * 16l))
+        var buf = metal_new_buffer_untracked(dev, uint64(nsb * 16l))
         var d = reinterpret<uint8?>(metal_buffer_contents(buf))
         for (sb in range64(nsb)) {
             memcpy(reinterpret<void?>(d + sb * 16l), reinterpret<void const?>(src + sb * 20l), 16)
