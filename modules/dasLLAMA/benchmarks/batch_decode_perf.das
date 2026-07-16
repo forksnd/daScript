@@ -173,11 +173,18 @@ def main() {
     }
     if (has_env_variable("DASLLAMA_PIN_DECODE")) {
         let dv = get_env_variable("DASLLAMA_PIN_DECODE")
-        if (!select_decode_override(dv)) {
+        if (dv == "metal") {
+            // measurement runs are MetalMode.required: a CPU fallback anywhere in the run
+            // (prefill, decode, batch) PANICS with the decline reason instead of silently
+            // polluting the numbers with CPU or mixed steps
+            set_metal_mode(MetalMode.required)
+            print("decode override: metal (single-stream + batch + prefill), MetalMode.required — CPU fallback fails the run\n")
+        } elif (!select_decode_override(dv)) {
             print("unknown decode override `{dv}`\n")
             return
+        } else {
+            print("decode override: {dv} (single-stream + batch)\n")
         }
-        print("decode override: {dv} (single-stream + batch)\n")
     }
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)
