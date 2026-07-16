@@ -210,7 +210,7 @@ let cars <- _sql(db |> select_from(type<Car>)
 | **Distinct** | `distinct()` |
 | **Distinct-by** | `_distinct_by(_.K)` — one row per key: first in pk order; `reverse() \|> _distinct_by(_.K)` picks the last. Terminators: row-returning (`to_array` / `_first`, trailing `_order_by`/`take`/`skip` OK), `count()` (→ `COUNT(DISTINCT K)`), `_count(p)`, `_select(_.X) \|> sum/min/max/average()`. Provider-lowered via `caps.distinct_on`: `DISTINCT ON (K)` (PG, DuckDB) or SQLite's bare-aggregate `GROUP BY`. Requires a single `@sql_primary_key`; composing with `_where`/`_join`/`_group_by`/set ops is a compile error (v1) |
 | **Aggregate** | `count()`, `sum`, `average`, `min`, `max` (terminal) |
-| **Joins** | `_join(other, $(l, r) => l.X == r.Y, $(l, r) => projection)`, `_left_join(...)` (right side flows as `Option<TB>` through `into`) |
+| **Joins** | `_join(other, $(l, r) => l.X == r.Y, $(l, r) => projection)`, including exact whole-source results (`$(l, r) => r` returns `array<TRight>`); `_left_join(...)` flows the right side as `Option<TB>` through `into` |
 | **Subqueries** | `x._in(subq)`, `x._not_in(subq)`, `subq._any()`, `subq._any(p)`, `subq._none()`, `subq._none(p)` |
 | **Terminals** | `_to_array()` (default), `_first()` (panic on empty), `_first_opt()` (Option<T>) |
 | **String predicates** | `\|> starts_with(s)`, `\|> ends_with(s)`, `\|> contains(s)` (LIKE patterns); `\|> to_lower()`, `\|> to_upper()` (LOWER/UPPER); `length(s)` (LENGTH) |
@@ -225,7 +225,7 @@ let cars <- _sql(db |> select_from(type<Car>)
 Compile-time `macro_error` pointing at the offending node:
 
 - Unknown function calls in `_where` / `_select`
-- `_select` struct-type projection — a whole-struct project is a deferred follow-up; `_.Field`, named-tuple, and computed-scalar `_.A + _.B` projections are supported, including workhorse casts (`int64(_.A) * int64(_.B)` lowers to `CAST(...)`)
+- Single-source identity `_select($(x) => x)` remains unsupported (omit `_select` to return the full row). A join's `into` may return one non-nullable source struct directly (`$(l, r) => r`); `_.Field`, named-tuple, and computed-scalar `_.A + _.B` projections are also supported, including workhorse casts (`int64(_.A) * int64(_.B)` lowers to `CAST(...)`)
 - Multiple `_select` calls in one chain
 - Multiple terminals in one chain (`_to_array() |> _first()`)
 - `text_match` on a non-`[sql_fts5]` column (suggests `contains` or `[sql_fts5]`)

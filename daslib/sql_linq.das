@@ -159,6 +159,10 @@ struct private JoinSpec {
 
 struct private SqlQuery {
     rootType    : TypeDeclPtr
+    // Exact struct type reconstructed by a whole-source join projection (`$(l, r) => r`).
+    // rootType remains the FROM root (source 0), so materialization and subquery wrapping
+    // consult this override whenever proj == FullRow.
+    projectedRowType : TypeDeclPtr
     tableName   : string
     rootAlias   : string
     selectCols  : array<string>
@@ -961,6 +965,7 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
     var projType = inner_projection_type(q, at)
     // Reset q to wrap state. Clear all join/where/projection state so outer can re-fill.
     q.rootType = null
+    q.projectedRowType = null
     q.tableName := ""
     q.rootAlias := ""
     q.selectCols |> clear
@@ -1480,7 +1485,9 @@ def private fromrow_alias_list(rowT : TypeDeclPtr) : string {
 // fromRowType is the witness pred_to_sql consults to know "is this an over-subquery outer Q, and what aliases does it expose?"
 [macro_function]
 def private inner_projection_type(var inner : SqlQuery&; at : LineInfo) : TypeDeclPtr {
-    if (inner.proj == ProjectionShape.FullRow) return inner.rootType
+    if (inner.proj == ProjectionShape.FullRow) {
+        return inner.projectedRowType != null ? inner.projectedRowType : inner.rootType
+    }
     if (inner.proj == ProjectionShape.NamedTuple) {
         let n = length(inner.selectCols)
         var tupT = new TypeDecl(at = at, baseType = Type.tTuple)
@@ -1555,9 +1562,11 @@ def private divert_to_inner(var node : ExpressionPtr; var q : SqlQuery&;
         q.providerIdx = subQ.providerIdx
     }
     if (subQ.proj == ProjectionShape.FullRow) {
-        // FullRow inner: outer treats wrapped subquery as the original table; v1 path — unchanged.
+        // FullRow inner: outer treats the wrapped subquery as its exact projected struct.
+        // Usually this is the original table type; a whole-source join projection may instead
+        // return one joined source (`$(l, r) => r`).
         if (q.rootType == null) {
-            q.rootType = subQ.rootType
+            q.rootType = q.fromRowType
         }
         if (q.proj == ProjectionShape.FullRow && empty(q.selectCols) && q.rootType != null) {
             fill_default_columns(q, q.rootType, prog, at)
@@ -2290,10 +2299,48 @@ def private analyze_projection_impl(var body : ExpressionPtr; var q : SqlQuery&;
             return false
         }
     }
-    // Bare-var (identity / whole-row `$(x)=>x`) projection has no SQL column form — reject cleanly (else the computed-scalar `pred_to_sql` path below null-derefs on the whole-row var → SIGSEGV).
+    q.projectedRowType = null
+    // A join's bare source variable projects that exact source struct. Expand it to the
+    // source's qualified columns and reconstruct the nominal struct in build_row_builder.
+    // Single-source identity and scalar identity remain unsupported.
     if (body is ExprVar) {
-        macro_error(prog, at, "_sql: identity / whole-row `_select` (e.g. `$(x) => x`) is not supported — project named columns off the row, e.g. `_select($(x) => (Name = x.name, City = x.city))`")
-        return false
+        let argName = string((body as ExprVar).name)
+        if (!q.seenJoin) {
+            macro_error(prog, at, "_sql: identity `_select` (e.g. `$(x) => x`) is not supported in single-source mode — omit the `_select` for a full row, or project named columns")
+            return false
+        }
+        let srcIdx = resolve_proj_arg_to_source(q, argName, prog, at)
+        if (srcIdx < 0) return false
+        let srcType = source_rootType_for_idx(q, srcIdx)
+        let bodyType = body._type
+        if (srcType == null || srcType.structType == null
+                || bodyType == null || bodyType.structType == null) {
+            macro_error(prog, at, "_sql: whole-source join projection `{argName}` must be a non-nullable struct row — nullable outer-join sides and scalar/tuple identities are not supported; project named scalar fields instead")
+            return false
+        }
+        let n = length(srcType.structType.fields)
+        q.selectCols |> clear
+        q.selectColAliases |> clear
+        q.selectColTypes |> clear
+        q.selectColSqlFragments |> clear
+        q.projRecordNames |> clear
+        q.selectCols |> reserve(n)
+        q.selectColAliases |> reserve(n)
+        q.selectColTypes |> reserve(n)
+        q.selectColSqlFragments |> reserve(n)
+        q.projRecordNames |> reserve(n)
+        let sourceAlias = source_alias_for_idx(q, srcIdx)
+        for (field in srcType.structType.fields) {
+            let fieldName = string(field.name)
+            q.selectCols |> push(fieldName) // nolint:PERF006 reserved above
+            q.selectColAliases |> push(sourceAlias) // nolint:PERF006 reserved above
+            q.selectColTypes |> push(clone_type(field._type)) // nolint:PERF006 reserved above
+            q.selectColSqlFragments |> push("") // nolint:PERF006 reserved above
+            q.projRecordNames |> push(fieldName) // nolint:PERF006 reserved above
+        }
+        q.projectedRowType = clone_type(srcType)
+        q.proj = ProjectionShape.FullRow
+        return true
     }
     // Multi-level field chain `<arg>.Col.path…` — descends via json_extract for @sql_json.
     {
@@ -4580,8 +4627,8 @@ def private build_row_builder(var q : SqlQuery&; prog : ProgramPtr; at : LineInf
         return mkTup
     }
     // FullRow (default)
-    var rootType = clone_type(q.rootType)
-    return qmacro(_::_sql_read_row(_sql_stmt, type<$t(rootType)>))
+    var rowType = clone_type(q.projectedRowType != null ? q.projectedRowType : q.rootType)
+    return qmacro(_::_sql_read_row(_sql_stmt, type<$t(rowType)>))
 }
 
 // nolint:STYLE015 Single-source row-var normalization: `_sql` resolves one source against placeholder `_`,

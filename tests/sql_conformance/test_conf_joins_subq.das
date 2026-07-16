@@ -19,6 +19,7 @@ struct ConfCust {
 struct ConfOrder {
     @sql_primary_key Id : int
     CustId : int
+    @sql_column = "amount_value"
     Amount : int
 }
 
@@ -49,6 +50,38 @@ def test_conf_join(t : T?) {
             t |> equal(pairs[0].Who, "alice")
             t |> equal(pairs[0].HowMuch, 100)
             t |> equal(pairs[2].Who, "bob")
+        }
+    }
+    t |> run("_join may return one exact source row") @(t : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let orders : array<ConfOrder> <- _sql(db |> select_from(type<ConfCust>)
+                |> _join(db |> select_from(type<ConfOrder>),
+                         $(c : ConfCust, o : ConfOrder) => c.Id == o.CustId,
+                         $(c : ConfCust, o : ConfOrder) => o)
+                |> _where(_.Amount >= 100)
+                |> _order_by(_.Amount))
+            t |> equal(length(orders), 2)
+            t |> equal(orders[0].CustId, 1)
+            t |> equal(orders[0].Amount, 100)
+            t |> equal(orders[1].Amount, 250)
+        }
+    }
+    t |> run("whole-source join results may feed another join") @(t : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let orders : array<ConfOrder> <- _sql(db |> select_from(type<ConfCust>)
+                |> _join(db |> select_from(type<ConfOrder>),
+                         $(c : ConfCust, o : ConfOrder) => c.Id == o.CustId,
+                         $(c : ConfCust, o : ConfOrder) => o)
+                |> _join(db |> select_from(type<ConfOrder>),
+                         $(left : ConfOrder, right : ConfOrder) => left.Id == right.Id,
+                         $(left : ConfOrder, right : ConfOrder) => right)
+                |> _order_by(_.Amount))
+            t |> equal(length(orders), 3)
+            t |> equal(orders[0].Amount, 50)
+            t |> equal(orders[1].Amount, 100)
+            t |> equal(orders[2].Amount, 250)
         }
     }
     t |> run("_left_join flows unmatched right side as none") @(t : T?) {

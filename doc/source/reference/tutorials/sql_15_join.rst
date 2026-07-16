@@ -91,6 +91,34 @@ Single-column and named-tuple projections both work. Per-source
 projections (``_select(...)`` on the right side) are rejected ---
 the join's ``into`` lambda is the only projection.
 
+Returning one source row
+========================
+
+When the result should be one of the joined table rows, return that
+source argument directly from ``into``. ``_sql`` expands the source
+to its qualified columns and reconstructs the exact nominal struct:
+
+.. code-block:: das
+
+    let large_orders : array<Order> <- _sql(
+        db |> select_from(type<User>)
+           |> _join(db |> select_from(type<Order>),
+                    $(u : User, o : Order) => u.Id == o.UserId,
+                    $(u : User, o : Order) => o)
+           |> _where(_.Total >= 100)
+           |> _order_by(_.Total))
+    // SELECT "t1"."Id", "t1"."UserId", "t1"."Total"
+    //   FROM "Users" AS "t0"
+    //   INNER JOIN "Orders" AS "t1"
+    //     ON "t0"."Id" = "t1"."UserId"
+    //  WHERE "t1"."Total" >= ?
+
+The result type is ``array<Order>``, not a generated tuple. This form
+is useful when the other source only supplies filtering, ranking, or
+existence context. A nullable side of an outer join cannot be returned
+as a bare struct; project named scalar fields (including an
+``is_some`` probe) when unmatched rows must be represented.
+
 Joining + grouping
 ==================
 
