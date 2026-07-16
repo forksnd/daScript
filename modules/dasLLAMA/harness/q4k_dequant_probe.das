@@ -23,7 +23,7 @@ def dump_tensor(m : GGUFMeta; bytes : array<uint8>#; name : string; n : int64) {
 
 [export]
 def main {
-    var path = "D:/Work/llama.cpp/models/gemma-4-12B-it-Q4_K_M.requant.gguf"
+    var path = "D:/Work/llama.cpp/models/gemma-4-12B-it-Q4_K_M.gguf"
     let args = get_command_line_arguments()
     if (!empty(args)) {
         path = args[length(args) - 1]

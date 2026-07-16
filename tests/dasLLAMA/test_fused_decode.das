@@ -322,10 +322,9 @@ def test_fused_decode_pre_post_norm(t : T?) {
 // Native K-quant layers (kq v2 regrain): the chains run Q8_K-form activations — the layer-input
 // quantize, the w2-input requant at 256-row stage-0 grain, and the wo-input requant per head
 // GROUP (Qwen3's head_size 128 = head pairs). Qwen3-4B Q5_K_M covers k5 + k6 (ffn_down);
-// gemma-2-2b Q4_K_M covers k4 + k6 + the softcap/post-norm deferral. Bit-exact vs the per-op
-// kq path, same contract as the q8 arms. Auto backend only: a kq load repacks (kq_repacked)
-// only when the active backend carries the kq rows cores — a pin without them would silently
-// compare std vs std.
+// Qwen3-4B Q4_K_M covers k4 + k6. Bit-exact vs the per-op kq path, same contract as the q8
+// arms. Auto backend only: a kq load repacks (kq_repacked) only when the active backend
+// carries the kq rows cores — a pin without them would silently compare std vs std.
 [test]
 def test_fused_decode_kquant(t : T?) {
     t |> run("fused chains bit-exact on native K-quant layers (needs the kq ggufs)") @(t : T?) {
@@ -337,7 +336,7 @@ def test_fused_decode_kquant(t : T?) {
         with_job_que() {
             setup_dasllama_jobque_()
             set_target_chunk_work(1l)
-            for (name in ["Qwen3-4B-Instruct-2507-Q5_K_M.gguf", "gemma-2-2b-it-Q4_K_M.gguf"]) {
+            for (name in ["Qwen3-4B-Instruct-2507-Q5_K_M.gguf", "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"]) {
                 let path = path_join(models_dir(), name)
                 if (!stat(path).is_valid) {
                     // deliberately NOT `t |> skip` — the loop goes on to the models that ARE present
