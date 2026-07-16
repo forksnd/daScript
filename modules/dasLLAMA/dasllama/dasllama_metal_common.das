@@ -21,9 +21,6 @@ require dasllama/dasllama_math
 
 // ===== driver state =====
 
-// the attention kernel's threadgroup score slab — contexts deeper than this decline per call (the
-// CPU path serves the step; the watermark contract re-mirrors the missed rows if depth drops back)
-let MAX_ATTN_ROWS = 2048l
 // chunk width of the split-K attention pair (64 rows per threadgroup — must match the part
 // kernels' slab + hardcoded chunk math; 64 beats 128 on M1: more threadgroups in flight + half
 // the serial per-lane pass length)
@@ -49,7 +46,8 @@ enum MetalDecodeDecline {
     shape               // head/dim alignment outside the kernel grids
     layers              // per-layer non-uniformity (kv_dim/head_size/hidden/sliding/missing wv)
     kv_dtype            // session KV codec not uniform f16/f32 (the mirror moves raw row bytes)
-    depth               // context deeper than MAX_ATTN_ROWS
+    depth               // RETIRED (M2.4): the chunked/partD attention scans any depth — capacity
+                        // limits surface as `mirror` (the arena cannot hold the session's slice)
     no_uid              // session without a real uid (mirror keying)
     rope_rows           // the position's rope row not built
     batch_dim_cap       // batch: dim exceeds the add+rms/GEMM row slabs for this B

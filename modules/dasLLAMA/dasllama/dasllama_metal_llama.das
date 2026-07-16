@@ -90,17 +90,16 @@ def private decode_shape_decline(t : Model) : MetalDecodeDecline {
 }
 
 // ... plus the decode-specific gates (uniform f16/f32 KV, attention depth, a real session uid)
+[unused_argument(pos)]   // depth retired (M2.4) — pos stays in the gate signature for future clauses
 def private decode_decline(t : Model; s : Session; pos : int64) : MetalDecodeDecline {
     // the mirror + writeback move raw row bytes, so the session codec must equal the mirror
-    // dtype; the attention kernel's threadgroup score slab caps the depth — deeper steps run on
-    // the CPU and the watermark contract mirrors them back in if the driver is ever re-entered
+    // dtype. Depth is unbounded (M2.4): the chunked/partD attention scans any context — the
+    // remaining capacity limit is the mirror arena (mirror_prepare declines when the session's
+    // slice cannot fit), and the watermark contract re-mirrors if the driver is re-entered
     if (s.kv_dtype_k != s.kv_dtype_v ||
             (s.kv_dtype_k != KVDtype.f16 && s.kv_dtype_k != KVDtype.f32 &&
              s.kv_dtype_k != KVDtype.q8_0 && s.kv_dtype_k != KVDtype.tq4)) {
         return MetalDecodeDecline.kv_dtype
-    }
-    if (pos + 1l > MAX_ATTN_ROWS) {
-        return MetalDecodeDecline.depth
     }
     if (s.uid == 0ul) {
         return MetalDecodeDecline.no_uid
@@ -823,9 +822,6 @@ def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : arra
         if (sessions[i].uid == 0ul) {
             return MetalDecodeDecline.no_uid
         }
-        if (ws.positions[i] + 1l > MAX_ATTN_ROWS) {
-            return MetalDecodeDecline.depth
-        }
     }
     if (int64(length(ws.scr.rope_cos)) < nrows * (c.head_size / 2l)) {
         return MetalDecodeDecline.rope_rows
@@ -919,6 +915,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         maxcnt = max(maxcnt, cnt)
         // block codecs address in BYTES (there is no scalar element size); scalar mirrors keep
         // their element-offset entries
+        // uint32 holds any arena offset: the arena clamps at 4096MB (= 2^32), so offsets < 2^32
         g_b_rte[i * 4l] = uint(blockc ? mir.koff : mir.koff / uint64(esz))
         g_b_rte[i * 4l + 1l] = uint(blockc ? mir.voff : mir.voff / uint64(esz))
         g_b_rte[i * 4l + 2l] = uint(mir.cap)

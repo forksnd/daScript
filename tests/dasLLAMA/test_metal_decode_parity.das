@@ -849,6 +849,55 @@ def test_metal_decode_parity(t : T?) {
                 feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); kq arm skipped\n")
             }
 
+            // arm 11: depth past 2048 (M2.4 — the retired MAX_ATTN_ROWS gate): a ~2030-token
+            // prompt + 40 decode steps crosses the old cap mid-continuation; chunked attention
+            // (1B, hs=64) scans the full depth. f16 + q8_0 mirrors (block-codec row offsets at
+            // depth). The CPU control is depth-unbounded by construction.
+            {
+                var trd <- load_model(path, QuantMode.q8)
+                trd.config.seq_len = min(trd.config.seq_len, 2176l)
+                var deep_p <- encode(trd, counting_prompt(1, 620), true, false)
+                if (int64(length(deep_p)) > 2030l) {
+                    deep_p |> resize(2030)
+                }
+                let dcpu16 <- continuation(trd, deep_p, 40, KVDtype.f16)
+                select_decode_override("metal")
+                before = metal_decode_stats().decodes
+                let dgpu16 <- continuation(trd, deep_p, 40, KVDtype.f16)
+                select_decode_override("")
+                t |> success(metal_decode_stats().decodes - before > 30l, "deep arm: decode steps past 2048 served on the GPU")
+                t |> success(same(dcpu16, dgpu16), "40-token continuation crossing depth 2048 matches the CPU control")
+                let dcpu8 <- continuation(trd, deep_p, 40, KVDtype.q8_0)
+                select_decode_override("metal")
+                let dgpu8 <- continuation(trd, deep_p, 40, KVDtype.q8_0)
+                select_decode_override("")
+                t |> success(same(dcpu8, dgpu8), "40-token q8_0-KV continuation crossing depth 2048 matches the CPU control")
+                delete deep_p
+                delete trd
+                // ... and the partD form (hs=128 — the 3B): its 16-simdgroup slice loop is the
+                // other attention shape that never ran past the old cap
+                let path3d = path_join(models_dir(), "Llama-3.2-3B-Instruct-Q8_0.gguf")
+                if (stat(path3d).is_valid) {
+                    var trd3 <- load_model(path3d, QuantMode.q8)
+                    trd3.config.seq_len = min(trd3.config.seq_len, 2176l)
+                    var deep_p3 <- encode(trd3, counting_prompt(1, 620), true, false)
+                    if (int64(length(deep_p3)) > 2030l) {
+                        deep_p3 |> resize(2030)
+                    }
+                    let d3cpu <- continuation(trd3, deep_p3, 40, KVDtype.f16)
+                    select_decode_override("metal")
+                    before = metal_decode_stats().decodes
+                    let d3gpu <- continuation(trd3, deep_p3, 40, KVDtype.f16)
+                    select_decode_override("")
+                    t |> success(metal_decode_stats().decodes - before > 30l, "deep partD arm served on the GPU")
+                    t |> success(same(d3cpu, d3gpu), "40-token hs=128 continuation crossing depth 2048 matches the CPU control (partD)")
+                    delete deep_p3
+                    delete trd3
+                } else {
+                    feint("Llama-3.2-3B model not present; deep partD arm skipped\n")
+                }
+            }
+
             // the leak gate: every GPU object both drivers hold releases
             metal_decode_stage_report()
             metal_decode_shutdown()
