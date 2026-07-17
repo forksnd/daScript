@@ -105,7 +105,7 @@ def main() : int {
         return 0
     }
     if (cfg.full == !empty(cfg.arm)) {   // both set, or neither
-        to_log(LOG_ERROR, "pass exactly ONE of --arm <filter> (iteration) or --full (the pre-commit gate)\n")
+        to_log(LOG_ERROR, "pass --arm <filter> scoped to what the change can affect (--full is disabled while the Metal build-out is in progress; large tier = DASLLAMA_PARITY_FULL=1 with --arm)\n")
         return 2
     }
     if (cfg.full) {
