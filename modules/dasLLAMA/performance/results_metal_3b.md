@@ -3,7 +3,9 @@
 Llama-3.2-3B-Instruct, Metal vs Metal, one rep per cell. das = dasLLAMA (`-jit`, mapped `.dlim`
 image, `MetalMode.required` — CPU fallback panics, so every cell is honestly GPU). llama.cpp =
 stock flags, Metal default, `-fa auto`; single-stream from `llama-bench -r 1`, batch ladder from
-`llama-batched-bench -npp 512 -ntg 128` (das twin: `batch_decode_perf --fixed-token`). lcpp
+`llama-batched-bench -npp 512 -ntg 128`. das protocol: tg128 B=1 rows are GREEDY (the real
+single-stream workload — the speculative decode chain is a product feature and fixed-token
+feeding defeats it, costing q8 14%); batch rows use `--fixed-token` (batched-bench parity). lcpp
 baselines are pinned in `baseline_metal_3b_m1.tsv` and are NOT re-measured — only the das side
 reruns. Hand-maintained (not generated). Ratio = das / llama.cpp, >1 = das faster; winners bold.
 
@@ -17,7 +19,7 @@ decode=metal, backend=portable, mirror 3072MB, batch pipe on) + `prefill_perf.da
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 1197.9 | 1213.5 | 0.99x |
-| tg128 B=1 | 108.6 | 101.5 | **1.07x** |
+| tg128 B=1 | 112.5 | 101.5 | **1.11x** |
 | tg128 B=2 | 146.1 | 112.8 | **1.30x** |
 | tg128 B=4 | 188.3 | 167.1 | **1.13x** |
 | tg128 B=8 | 204.7 | 200.3 | **1.02x** |
@@ -34,15 +36,18 @@ single loop); das beats both.
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 1380.5 | 1395.9 | 0.99x |
-| tg128 B=1 | 71.9 | 86.4 | **0.83x RED** |
+| tg128 B=1 | 82.7 | 86.4 | **0.96x RED** |
 | tg128 B=2 | 140.4 | 127.9 | **1.10x** |
 | tg128 B=4 | 232.9 | 218.7 | **1.07x** |
 | tg128 B=8 | 250.4 | 252.7 | 0.99x |
 | tg128 B=16 | 401.2 | 362.7 | **1.11x** |
 
-OPEN RED CELLS: tg128 B=1 at 0.83x — and the tell: das's OWN batched path at B=1 does 79.9
-(both pipe modes), beating the dedicated single-stream driver's 71.9-72.9. The single-stream
-rail is leaving ~10% on the table on q8 specifically (Q4_K_M shows no such split: 108.4 both
-forms). Under diagnosis. B=8 at 0.99x (-0.9%) — the emission-arc soft cell, improved from
-0.94x but still a hair short; candidate fix = the ext-form twin with the q8 A-stage replacing
-mv8 at B=5..8. pp512 0.99x (-1.1%) — same class as the Q4_K_M deferral.
+OPEN RED CELLS: tg128 B=1 at 0.96x — the fixed-token artifact is resolved (was 0.83x); the
+residual splits into ~3.5% sequential-vs-batched-B1 scheduling (das batched form does 85.6 =
+0.99x on the same steps; decode_prof shows a 136us-total CPU tail, so it's driver commit
+cadence, not CPU work) and ~1% to lcpp at what is a bandwidth-saturated shape (das 276 GB/s
+effective vs lcpp 292, 3.37 GB/token). B=8 at 0.99x (-0.9%) — the emission-arc soft cell,
+improved from 0.94x; candidate fix = the ext-form twin with the q8 A-stage replacing mv8 at
+B=5..8. pp512 0.99x (-1.1%) — same class as the Q4_K_M deferral. Q4_K_M follow-up lever:
+its spec chain is gated OFF (tied cls = k6, not cls_q8) — extending speculation to the kq
+classifier stacks on its 1.11x.
