@@ -41,6 +41,8 @@ def main {
     }
     let srcs <- {
         "k4_b1c" => lab_k4_b1c_msl,
+        "q8_b1i" => lab_q8_b1i_msl,
+        "q8_b1p" => lab_q8_b1p_msl,
         "k4_mvb2" => lab_k4_mvb2_msl,
         "k4_ext2" => lab_k4_ext2_msl,
         "k4_ext4" => lab_k4_ext4_msl,

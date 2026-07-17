@@ -267,6 +267,121 @@ class MetalGemvLabB1 {
     }
 }
 
+// ===== production-B1 addressing A/B (index vs pointer-stream) — same buffers, same geometry =====
+// q8_b1i = the EXACT production MetalQ8Gemv body (4 blocks in flight, array-index addressing);
+// q8_b1p = the identical structure spelled as unsafe(addr()) pointer streams walked once per
+// 128-stride iteration with immediate offsets inside the body (the MvB2 discipline). The single
+// variable is the addressing shape the compiler sees — the A/B for whether the production
+// single-stream GEMV leaves load-batching on the table.
+// VERDICT (2026-07-17, M1 Max, clean disasm + timing): a WASH — identical ISA load structure
+// (16 loads / 4 waits / 20 ffma both; the pointer form is 11 instrs LONGER on walk iadds),
+// timing within noise both directions on all 6 shapes, occupancy identical (0x400). The
+// compiler canonicalizes both spellings at this shape; don't re-litigate without new silicon.
+// Both forms stream 327-388 wGB/s = at the effective wall — the e2e q8 B=1 deficit is
+// BETWEEN dispatches (driver cadence), not in the kernel.
+class MetalGemvLabQ8B1I {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 x : array<float4>
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 ndim : uint
+    @uniform @binding = 5 ddim : uint
+
+    [metal_kernel(name="lab_q8_b1i_msl")]
+    def lab_q8_b1i {
+        let row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (row >= ddim) {
+            return
+        }
+        let lane = gl_SubgroupInvocationID
+        let nb4 = ndim / 4u
+        let wbase = row * nb4
+        let sbase = row * (ndim / 32u)
+        var acc = 0.0
+        var k = lane
+        while (k + 96u < nb4) {
+            let wa = float4(int4(wq[wbase + k]))
+            let xa = x[k]
+            let wb = float4(int4(wq[wbase + (k + 32u)]))
+            let xb = x[k + 32u]
+            let wc = float4(int4(wq[wbase + (k + 64u)]))
+            let xc = x[k + 64u]
+            let wd = float4(int4(wq[wbase + (k + 96u)]))
+            let xd = x[k + 96u]
+            acc += (wa.x * xa.x + wa.y * xa.y + wa.z * xa.z + wa.w * xa.w) * ws[sbase + k / 8u]
+            acc += (wb.x * xb.x + wb.y * xb.y + wb.z * xb.z + wb.w * xb.w) * ws[sbase + (k + 32u) / 8u]
+            acc += (wc.x * xc.x + wc.y * xc.y + wc.z * xc.z + wc.w * xc.w) * ws[sbase + (k + 64u) / 8u]
+            acc += (wd.x * xd.x + wd.y * xd.y + wd.z * xd.z + wd.w * xd.w) * ws[sbase + (k + 96u) / 8u]
+            k += 128u
+        }
+        while (k < nb4) {
+            let w4 = float4(int4(wq[wbase + k]))
+            let x4 = x[k]
+            acc += (w4.x * x4.x + w4.y * x4.y + w4.z * x4.z + w4.w * x4.w) * ws[sbase + k / 8u]
+            k += gl_SubgroupSize
+        }
+        acc = simd_sum(acc)
+        if (lane == 0u) {
+            y[row] = acc
+        }
+    }
+}
+
+class MetalGemvLabQ8B1P {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 x : array<float4>
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 ndim : uint
+    @uniform @binding = 5 ddim : uint
+
+    [metal_kernel(name="lab_q8_b1p_msl")]
+    def lab_q8_b1p {
+        let row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (row >= ddim) {
+            return
+        }
+        let lane = gl_SubgroupInvocationID
+        let nb4 = ndim / 4u
+        let wbase = row * nb4
+        let sbase = row * (ndim / 32u)
+        // pointer streams bound ONCE; walked per 128-stride iteration, immediate offsets inside
+        var wp = unsafe(addr(wq[wbase + lane]))
+        var xp = unsafe(addr(x[lane]))
+        var sp = unsafe(addr(ws[sbase + lane / 8u]))
+        var acc = 0.0
+        var k = lane
+        while (k + 96u < nb4) {
+            let wa = float4(int4(unsafe(wp[0])))
+            let xa = unsafe(xp[0])
+            let wb = float4(int4(unsafe(wp[32])))
+            let xb = unsafe(xp[32])
+            let wc = float4(int4(unsafe(wp[64])))
+            let xc = unsafe(xp[64])
+            let wd = float4(int4(unsafe(wp[96])))
+            let xd = unsafe(xp[96])
+            acc += (wa.x * xa.x + wa.y * xa.y + wa.z * xa.z + wa.w * xa.w) * unsafe(sp[0])
+            acc += (wb.x * xb.x + wb.y * xb.y + wb.z * xb.z + wb.w * xb.w) * unsafe(sp[4])
+            acc += (wc.x * xc.x + wc.y * xc.y + wc.z * xc.z + wc.w * xc.w) * unsafe(sp[8])
+            acc += (wd.x * xd.x + wd.y * xd.y + wd.z * xd.z + wd.w * xd.w) * unsafe(sp[12])
+            wp = unsafe(wp + 128)
+            xp = unsafe(xp + 128)
+            sp = unsafe(sp + 16)
+            k += 128u
+        }
+        while (k < nb4) {
+            let w4 = float4(int4(wq[wbase + k]))
+            let x4 = x[k]
+            acc += (w4.x * x4.x + w4.y * x4.y + w4.z * x4.z + w4.w * x4.w) * ws[sbase + k / 8u]
+            k += gl_SubgroupSize
+        }
+        acc = simd_sum(acc)
+        if (lane == 0u) {
+            y[row] = acc
+        }
+    }
+}
+
 // Chunked-prefetch twins (lcpp mul_mv_ext's chpt=4 discipline, plus per-lane-CONSECUTIVE chunks):
 // each lane owns 4 adjacent byte4s (16 elements) per k step, so the whole chunk sits inside ONE
 // scale block — 1 scale load per 16 elements instead of 4 — and the quant loads share a base
@@ -3445,6 +3560,10 @@ def bench_metal_gemv_kernels(b : B?) {
             LabVariant(name = "gemv_q8x", src = lab_gemv_q8x_msl, entry = lab_gemv_q8x_msl_entry,
                        b_list <- [1], q8x = true),
             LabVariant(name = "gemv_b1", src = lab_gemv_b1_msl, entry = lab_gemv_b1_msl_entry,
+                       b_list <- [1]),
+            LabVariant(name = "q8_b1i", src = lab_q8_b1i_msl, entry = lab_q8_b1i_msl_entry,
+                       b_list <- [1]),
+            LabVariant(name = "q8_b1p", src = lab_q8_b1p_msl, entry = lab_q8_b1p_msl_entry,
                        b_list <- [1]),
             LabVariant(name = "gemv_b4t", src = lab_gemv_b4t_msl, entry = lab_gemv_b4t_msl_entry,
                        b_list <- [4], xt = true),
