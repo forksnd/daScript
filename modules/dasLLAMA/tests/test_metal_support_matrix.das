@@ -44,6 +44,14 @@ require _model_tier
 // plus the prefill-only window clause: npos < min_npos declines npos_window. A continuation
 // chunk (start_pos > 0) SERVES since M2.5 (existing rows gather into the K/V panels, the
 // causal diagonal shifts).
+//
+// The FAMILY matrix (family waves A, test_metal_family_matrix below): the gate is no longer
+// arch-named — the block set declares the graph (`graph` decline) and metal_needs derives the
+// feature set (`feature` + need_* declines) against per-path implemented masks. Served today:
+// llama + phi3 (neox) + qwen2 (neox+qkv_bias) + qwen3 (neox+qk_norm+qd_neq_dim), each row
+// token-parity-proven. mistral3 (empty config = the llama shape) serves by construction; no
+// <= 35B mistral3-arch GGUF exists to validate against (Mistral Small 3.x converts as llama),
+// so its real-model row waits on a fixture. gemma/MoE/deltanet = waves B-D.
 
 def private counting_prompt(start, last : int) : string {
     return build_string() $(var w) {
@@ -555,6 +563,10 @@ def test_metal_family_matrix(t : T?) {
             family_cells(t, path_join(models_dir(), "Qwen3-0.6B-Q8_0.gguf"), "qwen3",
                 "qwen3-0.6b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim,
                 "", KVDtype.tq4)
+            // the wave's showcase model: k4/k6 mixed sites x qk_norm x qd != dim at 4B scale
+            family_cells(t, path_join(models_dir(), "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"), "qwen3",
+                "qwen3-4b/k4/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim,
+                "")
             // qwen2 = NEOX + QKV bias — ENGAGE since the wave A bias epilogue; two carriers
             // cover the hs-64 and hs-128 bias geometries (the 0.5B also proves q8_0-KV bias)
             family_cells(t, path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf"), "qwen2",
