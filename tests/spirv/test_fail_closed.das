@@ -84,5 +84,14 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_rt_incoming_stage", "@incoming_ray_payload 'fc_rti_prd' is only valid in a miss or closest-hit shader")
         check_rejects(t, "_fc_rt_hitattr_stage", "@hit_attribute 'fc_rth_bary' is only valid in a closest-hit shader")
         check_rejects(t, "_fc_rt_trace_payload", "the payload argument must be a @ray_payload / @incoming_ray_payload global")
+        // subgroup ops are compute-only (v1)
+        check_rejects(t, "_fc_subgroup_stage", "subgroupAdd is only valid in a compute shader")
+        // spec constants: 32-bit scalar only, literal default required, unique SpecIds (incl. the
+        // local_size_*_id axes), and read-only in the shader body
+        check_rejects(t, "_fc_spec_type", "must be a 32-bit scalar")
+        check_rejects(t, "_fc_spec_noinit", "needs a literal scalar initializer")
+        check_rejects(t, "_fc_spec_dupid", "duplicate @constant_id 8")
+        check_rejects(t, "_fc_spec_write", "are read-only in a shader")
+        check_rejects(t, "_fc_spec_axis_dup", "duplicates another SpecId")
     }
 }

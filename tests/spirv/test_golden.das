@@ -197,5 +197,10 @@ def test_golden_disassembly(t : T?) {
         check(t, "task_payload", task_payload_words())
         check(t, "mesh_payload", mesh_payload_words())
         check(t, "lattice", lattice_words())
+        // subgroup ops + spec constants (visitor baseline): byte-identical check() pins the
+        // GroupNonUniform operand shapes (scope id + Reduce literal) and the OpSpecConstant /
+        // WorkgroupSize-composite emission order.
+        check(t, "subgroup", subgroup_words())
+        check(t, "specc", specc_words())
     }
 }

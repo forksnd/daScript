@@ -135,6 +135,35 @@ def public subpassLoad(i : subpassInput) : float4 {
 [unused_argument(compare, value), sideeffects] def public atomicCompSwap(mem : int &; compare, value : int) : int { return mem }
 [unused_argument(compare, value), sideeffects] def public atomicCompSwap(mem : uint &; compare, value : uint) : uint { return mem }
 
+// ===== subgroup operations (Vulkan 1.1 / SPIR-V 1.3 GroupNonUniform*) =====
+// Cross-lane cooperation within one subgroup (warp/wave). The reduce family folds a value across
+// all active lanes and every lane receives the result; shuffleXor exchanges values across a
+// butterfly mask (lane ^ mask); broadcastFirst propagates the lowest active lane's value;
+// elect() is true on exactly one active lane (single-lane writeback guard). Lowered to
+// OpGroupNonUniform* at Subgroup scope, compute-only. The stub bodies model the one-invocation
+// view (identity / true) and never run in a shader -- only the call AST is read.
+var gl_SubgroupSize         : uint      // BuiltIn SubgroupSize (Input) — lanes per subgroup (32 on NV, 32/64 on AMD)
+var gl_SubgroupInvocationID : uint      // BuiltIn SubgroupLocalInvocationId (Input) — this lane's index within its subgroup
+var gl_NumSubgroups         : uint      // BuiltIn NumSubgroups (Input) — subgroups per workgroup
+var gl_SubgroupID           : uint      // BuiltIn SubgroupId (Input) — this subgroup's index within the workgroup
+
+[unused_argument(value), sideeffects] def public subgroupAdd(value : float) : float { return value }
+[unused_argument(value), sideeffects] def public subgroupAdd(value : int) : int { return value }
+[unused_argument(value), sideeffects] def public subgroupAdd(value : uint) : uint { return value }
+[unused_argument(value), sideeffects] def public subgroupMin(value : float) : float { return value }
+[unused_argument(value), sideeffects] def public subgroupMin(value : int) : int { return value }
+[unused_argument(value), sideeffects] def public subgroupMin(value : uint) : uint { return value }
+[unused_argument(value), sideeffects] def public subgroupMax(value : float) : float { return value }
+[unused_argument(value), sideeffects] def public subgroupMax(value : int) : int { return value }
+[unused_argument(value), sideeffects] def public subgroupMax(value : uint) : uint { return value }
+[unused_argument(value, mask), sideeffects] def public subgroupShuffleXor(value : float; mask : uint) : float { return value }
+[unused_argument(value, mask), sideeffects] def public subgroupShuffleXor(value : int; mask : uint) : int { return value }
+[unused_argument(value, mask), sideeffects] def public subgroupShuffleXor(value : uint; mask : uint) : uint { return value }
+[unused_argument(value), sideeffects] def public subgroupBroadcastFirst(value : float) : float { return value }
+[unused_argument(value), sideeffects] def public subgroupBroadcastFirst(value : int) : int { return value }
+[unused_argument(value), sideeffects] def public subgroupBroadcastFirst(value : uint) : uint { return value }
+[sideeffects] def public subgroupElect() : bool { return true }
+
 // ===== mesh + task shader minimum intrinsics (VK_EXT_mesh_shader) =====
 // SetMeshOutputsEXT(vertex_count, primitive_count): the mesh-shader prologue. The SPV_EXT_mesh_shader
 // spec requires this call once per workgroup at workgroup-uniform control flow BEFORE any access to

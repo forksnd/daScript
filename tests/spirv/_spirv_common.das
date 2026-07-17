@@ -1786,3 +1786,76 @@ def lattice_kernel {
 def public lattice_words : array<uint> {
     return clone_to_move(lattice_spv)
 }
+
+// ===== subgroup ops: the GroupNonUniform reduce family (8 opcodes — IAdd serves both int
+// classes), shuffle-xor, broadcast-first, elect, + the four subgroup builtins. The
+// GroupNonUniform* capabilities ride the declared OpCapability. =====
+def public subgroup_emitter_opcodes : table<uint> {
+    var s <- lattice_emitter_opcodes()
+    for (op in [
+        SpvOp.GroupNonUniformIAdd, SpvOp.GroupNonUniformFAdd,
+        SpvOp.GroupNonUniformSMin, SpvOp.GroupNonUniformUMin, SpvOp.GroupNonUniformFMin,
+        SpvOp.GroupNonUniformSMax, SpvOp.GroupNonUniformUMax, SpvOp.GroupNonUniformFMax,
+        SpvOp.GroupNonUniformShuffleXor, SpvOp.GroupNonUniformBroadcastFirst, SpvOp.GroupNonUniformElect
+    ]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+var @ssbo @binding = 0 sg_f : array<float>
+var @ssbo @binding = 1 sg_u : array<uint>
+var @ssbo @binding = 2 sg_i : array<int>
+
+[compute_shader(local_size_x=64, name="subgroup_spv"), marker(no_coverage)]
+def subgroup_kernel {
+    let gi = gl_GlobalInvocationID.x
+    let fs = subgroupAdd(sg_f[gi]) + subgroupMin(sg_f[gi]) + subgroupMax(sg_f[gi])
+    let us = (subgroupAdd(sg_u[gi]) + subgroupMin(sg_u[gi]) + subgroupMax(sg_u[gi])
+        + subgroupShuffleXor(sg_u[gi], 2u) + subgroupBroadcastFirst(sg_u[gi]))
+    let si = (subgroupAdd(sg_i[gi]) + subgroupMin(sg_i[gi]) + subgroupMax(sg_i[gi])
+        + subgroupShuffleXor(sg_i[gi], 4u) + subgroupBroadcastFirst(sg_i[gi]))
+    let bf = subgroupBroadcastFirst(sg_f[gi]) + subgroupShuffleXor(sg_f[gi], 1u)
+    let lane = gl_SubgroupSize + gl_SubgroupInvocationID + gl_NumSubgroups
+    if (subgroupElect()) {
+        sg_f[gl_SubgroupID] = fs + bf + float(us + uint(si)) + float(lane)
+    }
+}
+
+def public subgroup_words : array<uint> {
+    return clone_to_move(subgroup_spv)
+}
+
+// ===== spec constants: @constant_id scalars (uint / int / float / both bool defaults — the census
+// needs SpecConstantTrue AND SpecConstantFalse) + a local_size_x_id workgroup axis (per-axis
+// OpSpecConstant folded into an OpSpecConstantComposite decorated BuiltIn WorkgroupSize). The
+// SpecId decorations ride the declared OpDecorate. =====
+def public spec_emitter_opcodes : table<uint> {
+    var s <- subgroup_emitter_opcodes()
+    for (op in [SpvOp.SpecConstant, SpvOp.SpecConstantTrue, SpvOp.SpecConstantFalse, SpvOp.SpecConstantComposite]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+var @constant_id = 1 spc_scale_u : uint = 8u
+var @constant_id = 2 spc_bias_i : int = -3
+var @constant_id = 3 spc_gain_f : float = 1.5
+var @constant_id = 4 spc_on_b : bool = true
+var @constant_id = 5 spc_off_b : bool = false
+
+var @ssbo @binding = 0 spc_data : array<float>
+
+[compute_shader(local_size_x=64, local_size_x_id=0, name="specc_spv"), marker(no_coverage)]
+def specc_kernel {
+    let gi = gl_GlobalInvocationID.x
+    var acc = float(spc_scale_u) * spc_gain_f + float(spc_bias_i)
+    if (spc_on_b || spc_off_b) {
+        acc++
+    }
+    spc_data[gi] = acc
+}
+
+def public specc_words : array<uint> {
+    return clone_to_move(specc_spv)
+}

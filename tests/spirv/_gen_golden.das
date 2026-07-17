@@ -101,4 +101,7 @@ def main {
     // 16/8-bit lattice: ctors + width converts + fp16 arithmetic (pins the FConvert/SConvert/
     // UConvert emission and the type-factory-pulled Float16/Int16 capabilities)
     emit_golden(dir, "lattice", lattice_words())
+    // subgroup ops (GroupNonUniform*) + spec constants (@constant_id / local_size_x_id)
+    emit_golden(dir, "subgroup", subgroup_words())
+    emit_golden(dir, "specc", specc_words())
 }

@@ -143,7 +143,11 @@ def public op_operand_is_literal(opName : string; idx : int) : bool {
     // so every operand is a literal -- group it with the other all-operand-literal opcodes.
     if (opName == "OpEntryPoint" || opName == "OpCapability" || opName == "OpMemoryModel" || opName == "OpExtension") return true
     if (opName == "OpExecutionMode" || opName == "OpDecorate" || opName == "OpMemberDecorate" || opName == "OpExtInstImport") return idx >= 1
-    if (opName == "OpConstant") return idx == 2
+    if (opName == "OpConstant" || opName == "OpSpecConstant") return idx == 2
+    // GroupNonUniform reduces: resultType(0) result(1) scope-id(2) GroupOperation(3 = literal) value(4)
+    if (opName == "OpGroupNonUniformIAdd" || opName == "OpGroupNonUniformFAdd" ||
+            opName == "OpGroupNonUniformSMin" || opName == "OpGroupNonUniformUMin" || opName == "OpGroupNonUniformFMin" ||
+            opName == "OpGroupNonUniformSMax" || opName == "OpGroupNonUniformUMax" || opName == "OpGroupNonUniformFMax") return idx == 3
     if (opName == "OpTypeInt") return idx == 1 || idx == 2
     if (opName == "OpTypeFloat") return idx == 1
     if (opName == "OpTypeVector" || opName == "OpTypeMatrix") return idx == 2
