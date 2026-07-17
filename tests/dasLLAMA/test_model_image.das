@@ -237,7 +237,7 @@ def test_image_mechanics(t : T?) {
         patch_u32(t, path, 32l, 0x1u)   // header now lies about the file size
         var m6 = ImgProbe()
         t |> success(!load_image(path, m6, "img-probe"), "size-lying header declines")
-        remove(path)
+        t |> success(remove(path), "probe image removed")   // also makes the absent-decline below honest
         var m7 = ImgProbe()
         t |> success(!load_image(path, m7, "img-probe"), "absent file declines")
         delete p

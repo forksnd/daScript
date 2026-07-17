@@ -47,7 +47,8 @@ def load_model(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     //! Q8 loads keep a PREPARED IMAGE next to the gguf (box + knob specific): the first load
     //! saves it, later loads map it in milliseconds with zero-copy weight planes.
     //! ``DASLLAMA_IMAGE=0`` disables the cache. Passing a ``.dlim`` path loads that image
-    //! DIRECTLY (no gguf needed — wrong identity panics; there is nothing to regenerate from).
+    //! DIRECTLY (no gguf needed — wrong identity panics; there is nothing to regenerate from);
+    //! the image's baked-in quantization applies and ``mode`` is ignored on that path.
     if (path |> ends_with(".dlim")) {
         // a prepared image named directly — first-class once the source gguf is gone. No
         // fallback exists here, so a wrong box/knob/version identity panics instead of hiding.
