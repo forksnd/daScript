@@ -11,7 +11,7 @@ wrapper rather than the internal ``clipboard_core`` module:
 
     [export]
     def main() {
-        if (clipboard_set_text("Hello, 🌍") == ClipboardStatus.ok) {
+        if (clipboard_set_text("Hello, UTF-8") == ClipboardStatus.ok) {
             var text : string
             if (clipboard_get_text(text) == ClipboardStatus.ok) {
                 print("{text}\n")
