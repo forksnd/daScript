@@ -379,28 +379,29 @@ namespace das {
     // owns it and unmaps via fmap_close. Read-only shared pages: clean (droppable under memory
     // pressure, never swapped) and shared across processes through the OS page cache. The FILE
     // closes right after mapping — both POSIX and the win32 shim keep the view alive through
-    // the mapping's own file reference.
+    // the mapping's own file reference. Failure returns null (size stays 0) rather than
+    // throwing: this is a cache probe — the caller declines and regenerates from the source.
     void * builtin_fmap_open ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) {
         if ( !size ) context->throw_error_at(at, "fmap_open: null size out-param");
         *size = 0;
         if ( !name ) context->throw_error_at(at, "fmap_open: null path");
         FILE * f = fopen(name, "rb");
-        if ( !f ) context->throw_error_at(at, "fmap_open: can't open '%s'", name);
+        if ( !f ) return nullptr;
         das_filestat st;
         int fd = fileno(f);
         if ( das_fstat64(fd, st) != 0 ) {
             fclose(f);
-            context->throw_error_at(at, "fmap_open: can't stat '%s'", name);
+            return nullptr;
         }
-        if ( st.st_size == 0 ) {
+        // empty files can't map (mmap(0) is EINVAL); a size that doesn't survive the size_t
+        // round-trip would truncate the mapping on 32-bit targets
+        if ( st.st_size == 0 || uint64_t(st.st_size) != uint64_t(size_t(st.st_size)) ) {
             fclose(f);
-            context->throw_error_at(at, "fmap_open: '%s' is empty", name);
+            return nullptr;
         }
         void * data = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
         fclose(f);
-        if ( data == MAP_FAILED ) {
-            context->throw_error_at(at, "fmap_open: can't map '%s' (%llu bytes)", name, (unsigned long long)st.st_size);
-        }
+        if ( data == MAP_FAILED ) return nullptr;
         *size = uint64_t(st.st_size);
         return data;
     }

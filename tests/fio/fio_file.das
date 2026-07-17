@@ -21,6 +21,32 @@ def operator ==(a, b : array<uint8> implicit) {
 }
 
 [test]
+def test_empty_array_io(t : T?) {
+    t |> run("fwrite/fread of an empty array is a 0-byte no-op, not an OOB addr") @(t : T?) {
+        let tmp = empty(get_env_variable("TMPDIR")) ? "/tmp" : get_env_variable("TMPDIR")
+        let fname = "{tmp}/fio_empty_io_{ref_time_ticks()}.bin"
+        var none : array<int>
+        var wrote = false
+        fopen(fname, "wb") $(f) {
+            if (f != null) {
+                t |> equal(fwrite(f, none), 0)
+                t |> equal(long_fwrite(f, none), 0l)
+                wrote = true
+            }
+        }
+        t |> success(wrote, "opened for write")
+        fopen(fname, "rb") $(f) {
+            if (f != null) {
+                t |> equal(fread(f, none), 0)
+                t |> equal(long_fread(f, none), 0l)
+            }
+        }
+        t |> success(remove(fname))
+        delete none
+    }
+}
+
+[test]
 def test_fopen(t : T?) {
     t |> run("fuzz fopen") @@(t : T?) {
         var fake <- Faker()

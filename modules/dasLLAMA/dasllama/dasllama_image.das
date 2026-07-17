@@ -436,7 +436,8 @@ def private borrow_plane(bp : uint8 const?; msize : uint64; path : string;
     }
     let sec = by_name?[name] ?? ImgSection()
     let esz = uint64(typeinfo sizeof(field[0]))
-    if (sec.off % uint64(IMAGE_PAGE) != 0ul || sec.off + sec.bytes > msize || sec.bytes % esz != 0ul) {
+    // bytes-then-offset ordering keeps the bounds math wrap-free (off + bytes could overflow)
+    if (sec.off % uint64(IMAGE_PAGE) != 0ul || sec.bytes > msize || sec.off > msize - sec.bytes || sec.bytes % esz != 0ul) {
         to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — section '{name}' at {sec.off}+{sec.bytes} (esz {esz}) is malformed\n")
         ok = false
     } else {
@@ -462,9 +463,17 @@ def load_image(path : string; var t; tag : string = "") : bool {
     unsafe {
         base = fmap_open(path, addr(msize))
     }
+    if (base == null || int64(msize) < IMAGE_HEADER_BYTES) {
+        // fmap_open declines with null (vanished file, mmap failure, >size_t on 32-bit) —
+        // treat it like any other decline; the header reads below need a real mapping
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — cannot map ({msize} bytes)\n")
+        if (base != null) {
+            unsafe(fmap_close(base, msize))
+        }
+        return false
+    }
     var bp = unsafe(reinterpret<uint8 const?>(base))
-    if (int64(msize) < IMAGE_HEADER_BYTES ||
-            (read_u32(bp, 0l) != IMAGE_MAGIC || read_u32(bp, 4l) != uint(IMAGE_VERSION)) ||
+    if ((read_u32(bp, 0l) != IMAGE_MAGIC || read_u32(bp, 4l) != uint(IMAGE_VERSION)) ||
             (read_u32(bp, 8l) != uint(IMAGE_PAGE) || read_u64(bp, 40l) != hash(image_identity(tag)))) {
         // every decline is loud (short of the file simply not existing) — a silently
         // regenerating cache is undebuggable
@@ -476,7 +485,9 @@ def load_image(path : string; var t; tag : string = "") : bool {
     let meta_off = read_u64(bp, 16l)
     let meta_bytes = read_u64(bp, 24l)
     let file_bytes = read_u64(bp, 32l)
-    if (file_bytes != msize || meta_off + meta_bytes > msize) {
+    // bytes-first ordering keeps meta_off + meta_bytes wrap-free; the INT_MAX cap bounds the
+    // int() casts the copy below takes (real meta blobs are a few MB)
+    if (file_bytes != msize || meta_bytes > msize || meta_off > msize - meta_bytes || meta_bytes > uint64(INT_MAX)) {
         to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — header says {file_bytes} bytes / meta {meta_off}+{meta_bytes}, mapped {msize}\n")
         unsafe(fmap_close(base, msize))
         return false
@@ -519,8 +530,10 @@ def load_image(path : string; var t; tag : string = "") : bool {
         delete meta
     }
     if (!ok || nsections < 0) {
-        // a malformed section table: forget whatever was borrowed and unmap
+        // a malformed section table: forget whatever was borrowed (the finalizer), THEN unmap —
+        // image_map was never set, so the finalizer alone would leak the mapping
         delete t
+        unsafe(fmap_close(base, msize))
         return false
     }
     t.image_map = base

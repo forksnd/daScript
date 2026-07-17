@@ -113,6 +113,7 @@ def fread(f : file; buf : auto(BufType) const implicit) {
 [generic]
 def fread(f : file; buf : array<auto(BufType)> const implicit) {
     concept_assert(typeinfo is_raw(type<BufType>), "'fread' accepts only raw POD type arrays")
+    return 0 if (empty(buf))   // a 0-byte read; addr(buf[0]) on an empty array is out of bounds
     let nbytes = long_length(buf) * typeinfo sizeof(type<BufType>)
     if (nbytes > int64(INT_MAX)) {
         panic("fread: {nbytes} bytes does not fit the int byte count — use long_fread")
@@ -127,6 +128,7 @@ def fread(f : file; buf : array<auto(BufType)> const implicit) {
 [generic]
 def long_fread(f : file; buf : array<auto(BufType)> const implicit) : int64 {
     concept_assert(typeinfo is_raw(type<BufType>), "'long_fread' accepts only raw POD type arrays")
+    return 0l if (empty(buf))   // a 0-byte read; addr(buf[0]) on an empty array is out of bounds
     unsafe {
         return _builtin_read64(f, addr(buf[0]), long_length(buf) * typeinfo sizeof(type<BufType>))
     }
@@ -143,6 +145,7 @@ def fwrite(f : file; buf : auto(BufType) const implicit) {
 [generic]
 def fwrite(f : file; buf : array<auto(BufType)> const implicit) {
     concept_assert(typeinfo is_raw(type<BufType>), "'fwrite' accepts only raw POD type arrays")
+    return 0 if (empty(buf))   // a 0-byte write; addr(buf[0]) on an empty array is out of bounds
     let nbytes = long_length(buf) * typeinfo sizeof(type<BufType>)
     if (nbytes > int64(INT_MAX)) {
         panic("fwrite: {nbytes} bytes does not fit the int byte count — use long_fwrite")
@@ -157,6 +160,7 @@ def fwrite(f : file; buf : array<auto(BufType)> const implicit) {
 [generic]
 def long_fwrite(f : file; buf : array<auto(BufType)> const implicit) : int64 {
     concept_assert(typeinfo is_raw(type<BufType>), "'long_fwrite' accepts only raw POD type arrays")
+    return 0l if (empty(buf))   // a 0-byte write; addr(buf[0]) on an empty array is out of bounds
     unsafe {
         return _builtin_write64(f, addr(buf[0]), long_length(buf) * typeinfo sizeof(type<BufType>))
     }
