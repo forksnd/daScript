@@ -376,8 +376,11 @@ namespace das {
     }
 
     // split fmap (the prepared-model-image loader): the mapping OUTLIVES the call — the caller
-    // owns it and unmaps via fmap_close. Read-only shared pages: clean (droppable under memory
-    // pressure, never swapped) and shared across processes through the OS page cache. The FILE
+    // owns it and unmaps via fmap_close. POSIX maps PROT_READ/MAP_SHARED: OS-enforced
+    // read-only, clean droppable pages shared across processes through the page cache. The
+    // win32 mmap shim below ignores prot and maps PAGE_WRITECOPY/FILE_MAP_COPY instead —
+    // copy-on-write, so an accidental write does NOT fault there (it just privatizes the
+    // page); pages stay clean and shareable only as long as nothing writes them. The FILE
     // closes right after mapping — both POSIX and the win32 shim keep the view alive through
     // the mapping's own file reference. Failure returns null (size stays 0) rather than
     // throwing: this is a cache probe — the caller declines and regenerates from the source.
