@@ -465,6 +465,7 @@ def private paged_batch_greedy(tr : Model; prompts : array<array<int64>>; page_r
 [test]
 def test_metal_batch_decode_parity(t : T?) {
     t |> run("GPU batched decode == CPU batch control, greedy streams (Llama-3.2-1B Q8)") <| @(t : T?) {
+        if (!family_on(t, "llama")) return
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!jit_enabled()) {
                 t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
@@ -657,6 +658,34 @@ def test_metal_batch_decode_parity(t : T?) {
                 }
             }
 
+            // the k5 half of the same arm (Q5_K_M — k5-dominant planes, k6 mixed in): B <= 8
+            // rides the kq ext mv twins. B=3 = the ext4 form with nr=3 gating the pad column;
+            // B=2 = the ext2 form. Same greedy CPU oracle.
+            let kpath_5 = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q5_K_M.gguf")
+            if (arm_on(t, "batchB8-kq")) {
+                if (stat(kpath_5).is_valid) {
+                    var trk5 <- load_model(kpath_5, QuantMode.q8)
+                    trk5.config.seq_len = min(trk5.config.seq_len, 512l)
+                    var prompts5 <- [ <- encode(trk5, counting_prompt(2, 47), true, false),
+                                     <- encode(trk5, counting_prompt(4, 58), true, false),
+                                     <- encode(trk5, counting_prompt(7, 36), true, false)]
+                    let cpu5 <- batch_greedy(trk5, prompts5, 16, KVDtype.f16, false, -1, 0)
+                    before = metal_batch_decode_stats().steps
+                    let gpu5 <- batch_greedy(trk5, prompts5, 16, KVDtype.f16, true, -1, 0)
+                    t |> success(metal_batch_decode_stats().steps - before > 0l, "k5 batch arm served on the GPU")
+                    t |> success(streams_match(cpu5, gpu5), "B=3 k5 batched greedy streams match the CPU control (kq ext mv twins)")
+                    var prompts52 <- [ <- clone_to_move(prompts5[0]), <- clone_to_move(prompts5[1])]
+                    let cpu52 <- batch_greedy(trk5, prompts52, 14, KVDtype.f16, false, -1, 0)
+                    let gpu52 <- batch_greedy(trk5, prompts52, 14, KVDtype.f16, true, -1, 0)
+                    t |> success(streams_match(cpu52, gpu52), "B=2 k5 batched greedy streams match the CPU control (ext2 form)")
+                    delete prompts5
+                    delete prompts52
+                    delete trk5
+                } else {
+                    feint("Llama-3.2-1B Q5_K_M not present; k5 batch arm skipped\n")
+                }
+            }
+
             // the leak gate: every GPU object the driver holds releases
             metal_decode_stage_report()
             metal_decode_shutdown()
@@ -675,6 +704,7 @@ def test_metal_batch_decode_parity(t : T?) {
 [test]
 def test_metal_decode_parity(t : T?) {
     t |> run("GPU-resident decode == CPU control, greedy continuations (Llama-3.2-1B Q8)") <| @(t : T?) {
+        if (!family_on(t, "llama")) return
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!jit_enabled()) {
                 t |> skip("interpreted (dasLLAMA model tests are JIT-only)")

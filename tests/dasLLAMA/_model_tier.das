@@ -50,6 +50,26 @@ def arm_on(t : T?; name : string) : bool {
     return false
 }
 
+// Family filter for the model-loading suites: DASLLAMA_TEST_FAMILY = comma-separated family
+// tokens (llama, gemma, ultravox, whisper, voxtral) matched EXACTLY — not substrings, so
+// "llama" can never accidentally select a non-llama block. When set, only blocks tagged with a
+// listed family run; model-free blocks (kernel units, the image mechanics arm) carry no tag and
+// always run. Loud-skip contract identical to arm_on. Drive through run.das --family — the
+// profiling cadence gate: a llama-format round re-verifies the llama family only.
+def family_on(t : T?; name : string) : bool {
+    let filter = get_env_variable("DASLLAMA_TEST_FAMILY")
+    if (empty(filter)) {
+        return true
+    }
+    for (tok in split(filter, ",")) {
+        if (strip(tok) == name) {
+            return true
+        }
+    }
+    t |> skip("family '{name}' filtered out (DASLLAMA_TEST_FAMILY={filter})")
+    return false
+}
+
 // Presence + tier gate for a model-loading test. Returns true if the caller should proceed to
 // load `path`; otherwise registers a LOUD skip on `t` (model absent, or large-tier without
 // DASLLAMA_PARITY_FULL) and returns false — the arm lands in the suite's skipped count instead
