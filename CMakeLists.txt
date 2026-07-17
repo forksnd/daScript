@@ -864,19 +864,25 @@ SOURCE_GROUP_FILES("ast" AST_SRC)
 
 # Clipboard is a core service, but the native desktop implementation is
 # platform-specific.  `clip` v1.15 is vendored under 3rdparty/clip (MIT) and
-# built text-only.  Linux/X11 is enabled when XCB development files are
+# built with custom text formats. Windows image transport is implemented by
+# the core wrapper as canonical RGBA8 <-> CF_DIBV5. Linux/X11 is enabled when XCB development files are
 # available; Wayland-only, Emscripten, and other targets retain the same API
 # and report `unsupported` at runtime rather than using clip's process-local
 # fallback as a fake system clipboard.
 set(DAS_CLIPBOARD_NATIVE_SUPPORTED 0)
+set(DAS_CLIPBOARD_IMAGE_SUPPORTED 0)
+set(DAS_CLIPBOARD_CLIP_IMAGE 0)
 set(DAS_CLIPBOARD_PLATFORM_SOURCE 3rdparty/clip/clip_none.cpp)
 set(DAS_CLIPBOARD_USE_XCB OFF)
 if(WIN32)
     set(DAS_CLIPBOARD_NATIVE_SUPPORTED 1)
+    set(DAS_CLIPBOARD_IMAGE_SUPPORTED 1)
     set(DAS_CLIPBOARD_PLATFORM_SOURCE 3rdparty/clip/clip_win.cpp)
 elseif(APPLE)
     enable_language(OBJCXX)
     set(DAS_CLIPBOARD_NATIVE_SUPPORTED 1)
+    set(DAS_CLIPBOARD_IMAGE_SUPPORTED 1)
+    set(DAS_CLIPBOARD_CLIP_IMAGE 1)
     set(DAS_CLIPBOARD_PLATFORM_SOURCE 3rdparty/clip/clip_osx.mm)
 elseif(UNIX AND NOT EMSCRIPTEN)
     find_package(PkgConfig QUIET)
@@ -1269,9 +1275,10 @@ foreach(DAS_CLIPBOARD_TARGET libDaScript_runtime libDaScriptDyn_runtime)
     target_include_directories(${DAS_CLIPBOARD_TARGET} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/clip)
     target_compile_definitions(${DAS_CLIPBOARD_TARGET} PRIVATE
-        CLIP_ENABLE_IMAGE=0
+        CLIP_ENABLE_IMAGE=${DAS_CLIPBOARD_CLIP_IMAGE}
         CLIP_ENABLE_LIST_FORMATS=0
-        DAS_CLIPBOARD_NATIVE_SUPPORTED=${DAS_CLIPBOARD_NATIVE_SUPPORTED})
+        DAS_CLIPBOARD_NATIVE_SUPPORTED=${DAS_CLIPBOARD_NATIVE_SUPPORTED}
+        DAS_CLIPBOARD_IMAGE_SUPPORTED=${DAS_CLIPBOARD_IMAGE_SUPPORTED})
     if(DAS_CLIPBOARD_USE_XCB)
         target_compile_definitions(${DAS_CLIPBOARD_TARGET} PRIVATE HAVE_XCB_XLIB_H=1)
         target_link_libraries(${DAS_CLIPBOARD_TARGET} PkgConfig::DAS_CLIPBOARD_XCB Threads::Threads)
