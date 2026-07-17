@@ -54,7 +54,7 @@ def test_big_write_read(t : T?) {
         }
         t |> equal(buf[BIG - 1l], uint8(0xAB))
         delete buf
-        remove(path)
+        t |> success(remove(path))   // a stuck multi-GiB temp file poisons later runs
     }
     t |> run("int32 fwrite/fread panic past 2 GiB") @@(t : T?) {
         let path = big_io_path("das_big_io_panic.bin")
@@ -81,7 +81,7 @@ def test_big_write_read(t : T?) {
         }
         t |> success(read_panicked)
         delete buf
-        remove(path)
+        t |> success(remove(path))   // a stuck multi-GiB temp file poisons later runs
     }
     t |> run("fseek/ftell past 2 GiB") @@(t : T?) {
         let path = big_io_path("das_big_io_seek.bin")
@@ -93,6 +93,6 @@ def test_big_write_read(t : T?) {
             t |> equal(ftell(f), pos + 1l)   // pre-fix on Windows: 32-bit ftell truncates
         }
         t |> equal(int64(stat(path).size), pos + 1l)
-        remove(path)
+        t |> success(remove(path))   // a stuck multi-GiB temp file poisons later runs
     }
 }

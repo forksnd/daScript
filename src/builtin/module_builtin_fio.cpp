@@ -427,6 +427,11 @@ namespace das {
 #ifdef _MSC_VER
         return _fseeki64((FILE *)f, offset, mode);
 #else
+        // off_t can be 32-bit (no _FILE_OFFSET_BITS=64) — a truncated offset would silently
+        // seek to the wrong position; fail loudly instead
+        if ( int64_t(off_t(offset)) != offset ) {
+            context->throw_error_at(at, "fseek: offset %lli does not fit off_t", (long long int)offset);
+        }
         return fseeko((FILE *)f, off_t(offset), mode);
 #endif
     }

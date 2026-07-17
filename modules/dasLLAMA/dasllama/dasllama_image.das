@@ -526,6 +526,19 @@ def load_image(path : string; var t; tag : string = "") : bool {
         return false
     }
     var by_name <- {for (sec in sections); sec.name => sec}
+    // duplicate section names would silently overwrite table entries and borrow the wrong
+    // plane — a valid save never produces them, so a collision is corruption
+    if (length(by_name) != length(sections)) {
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — {length(sections)} sections carry duplicate names\n")
+        delete by_name
+        delete sections
+        delete meta_blob
+        unsafe {
+            delete meta
+        }
+        unsafe(fmap_close(base, msize))
+        return false
+    }
     _::serialize_image_meta(rarch, t)
     // a truncated/corrupt meta blob reads back as silent zero-progress (MemSerializer sets
     // lastError, no panic) — decline BEFORE post_load, which would panic on garbage (e.g. an
