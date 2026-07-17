@@ -1309,7 +1309,7 @@ def caps_(m : Model) : LlmCaps {
 
 // Look the arch up, apply its config flags, and copy its (copyable) block kernels onto the model.
 // The full descriptor stays in the registry; only the hot-path pointers ride on the Model.
-def resolve_arch(var t : Model; arch : string) {
+def private resolve_arch(var t : Model; arch : string) {
     rebind_arch_blocks(t, arch)
     g_arch_registry[arch].configure(t.config)
 }
