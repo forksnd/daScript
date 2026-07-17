@@ -109,6 +109,30 @@ def test_clipboard_memory_clear_and_empty_offer(t : T?) {
 }
 
 [test]
+def test_clipboard_clone_only_selected_formats(t : T?) {
+    var content = ClipboardContent(
+        plain_text = "",
+        markdown = "unselected Markdown",
+        html = "unselected HTML",
+        uri_list = "unselected URI",
+        image = ClipboardImage(width = 1, height = 1, stride = 4))
+    content.formats.plain_text = true
+    content.image.rgba8 <- [1u8, 2u8, 3u8, 4u8]
+
+    var cloned <- clipboard_clone_content(content)
+    t |> success(cloned.formats.plain_text && empty(cloned.plain_text),
+                 "selected empty plain text remains an explicit offer")
+    t |> success(empty(cloned.markdown) && empty(cloned.html) && empty(cloned.uri_list),
+                 "unselected strings are not retained")
+    t |> success(empty(cloned.image.rgba8) && cloned.image.width == 0
+              && cloned.image.height == 0 && cloned.image.stride == 0,
+                 "unselected image storage and metadata are not retained")
+
+    clipboard_dispose_content(content)
+    clipboard_dispose_content(cloned)
+}
+
+[test]
 def test_clipboard_content_validation(t : T?) {
     let invalid_utf8 = string([uint8(0xC3), uint8(0x28)])
     var content = ClipboardContent()

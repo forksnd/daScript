@@ -105,17 +105,27 @@ def public clipboard_dispose_content(var content : ClipboardContent) {
 }
 
 def public clipboard_clone_content(content : ClipboardContent const) : ClipboardContent {
-    var result = ClipboardContent(
-        formats = content.formats,
-        plain_text = content.plain_text,
-        markdown = content.markdown,
-        html = content.html,
-        uri_list = content.uri_list,
-        image = ClipboardImage(
+    let f = content.formats
+    var result = ClipboardContent(formats = f)
+    if (f.plain_text) {
+        result.plain_text = content.plain_text
+    }
+    if (f.markdown) {
+        result.markdown = content.markdown
+    }
+    if (f.html) {
+        result.html = content.html
+    }
+    if (f.uri_list) {
+        result.uri_list = content.uri_list
+    }
+    if (f.image_rgba8) {
+        result.image = ClipboardImage(
             width = content.image.width,
             height = content.image.height,
-            stride = content.image.stride))
-    result.image.rgba8 := content.image.rgba8
+            stride = content.image.stride)
+        result.image.rgba8 := content.image.rgba8
+    }
     return <- result
 }
 

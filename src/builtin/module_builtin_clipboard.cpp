@@ -436,6 +436,23 @@ namespace das {
             return ClipboardStatus::ok;
         }
 
+        bool setClipboardTextLocked(clip::lock & lock, const char * text,
+                                    size_t textSize) {
+#if defined(_WIN32)
+            if (textSize == 0) {
+                HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
+                                             sizeof(wchar_t));
+                if (!memory) return false;
+                if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+                    GlobalFree(memory);
+                    return false;
+                }
+                return true;
+            }
+#endif
+            return lock.set_data(clip::text_format(), text ? text : "", textSize);
+        }
+
         ClipboardStatus getClipboardText(std::string & text) {
             text.clear();
             if (!nativeClipboardAvailable()) return unavailableStatus();
@@ -464,13 +481,8 @@ namespace das {
         if (!lock.clear()) {
             return statusCode(ClipboardStatus::failed);
         }
-        // Clearing is the correct system representation of empty clipboard
-        // text.  clip's Windows text backend intentionally rejects zero bytes.
-        if (text_size == 0) {
-            return statusCode(ClipboardStatus::ok);
-        }
-        return statusCode(lock.set_data(clip::text_format(), text,
-                                        static_cast<size_t>(text_size))
+        return statusCode(setClipboardTextLocked(lock, text,
+                                                 static_cast<size_t>(text_size))
             ? ClipboardStatus::ok : ClipboardStatus::failed);
     }
 
@@ -559,9 +571,9 @@ namespace das {
             success = setRegisteredData(lock, uriListFormat(), uriList,
                                         static_cast<size_t>(uriListSize)) && success;
         }
-        if ((formats & clipboard_plain_text) != 0 && plainTextSize != 0) {
-            success = lock.set_data(clip::text_format(), plainText,
-                                    static_cast<size_t>(plainTextSize)) && success;
+        if ((formats & clipboard_plain_text) != 0) {
+            success = setClipboardTextLocked(lock, plainText,
+                                             static_cast<size_t>(plainTextSize)) && success;
         }
         return statusCode(success ? ClipboardStatus::ok : ClipboardStatus::failed);
     }
