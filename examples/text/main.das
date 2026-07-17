@@ -6,6 +6,7 @@ options indenting = 4
 require imgui/imgui_harness
 require imgui/imgui_file_dialog
 require imgui/imgui_fonts
+require imgui/imgui_icons
 require imgui/imgui_markdown_view
 require imgui/imgui_theme_daslang
 require daslib/clargs
@@ -252,13 +253,16 @@ def private draw_document() {
         }
     }
 
-    if (small_button(MODE_MARKDOWN, (text = "Markdown"))) {
-        set_mode(TextViewMode.markdown)
+    let rendered = g_mode == TextViewMode.markdown
+    if (icon_button(MODE_TOGGLE,
+            (glyph = rendered ? "edit" : "visible",
+             tip = rendered ? "Show Markdown source" : "Render Markdown",
+             size = 18.0f, weight = 1.0f))) {
+        set_mode(rendered ? TextViewMode.plain_text : TextViewMode.markdown)
     }
     same_line()
-    if (small_button(MODE_PLAIN, (text = "Plain text"))) {
-        set_mode(TextViewMode.plain_text)
-    }
+    text_disabled(MODE_LABEL,
+        (text = rendered ? "Rendered Markdown" : "Markdown source"))
     same_line()
     text_disabled(STATUS, (text = g_status))
 
@@ -272,7 +276,7 @@ def private draw_document() {
     if (edit_slider_int(safe_addr(g_zoom_percent),
             (id = "TEXT_VIEWER_ZOOM", text = "##zoom", v_min = 50,
              v_max = 300, format = "%d%%"))) {
-        g_zoom_percent = clamp(((g_zoom_percent + 5) / 10) * 10, 50, 300)
+        g_zoom_percent = clamp(((g_zoom_percent + 2) / 5) * 5, 50, 300)
     }
     same_line()
     if (small_button(ZOOM_RESET, (text = "100%"))) {
@@ -294,9 +298,9 @@ def private handle_shortcuts_and_zoom() {
     }
     if (IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows) && command_down) {
         if (io.MouseWheel > 0.0f) {
-            g_zoom_percent = min(g_zoom_percent + 10, 300)
+            g_zoom_percent = min(g_zoom_percent + 5, 300)
         } elif (io.MouseWheel < 0.0f) {
-            g_zoom_percent = max(g_zoom_percent - 10, 50)
+            g_zoom_percent = max(g_zoom_percent - 5, 50)
         }
     }
 }
@@ -339,7 +343,7 @@ def text_viewer_set_mode(input : JsonValue?) : JsonValue? {
 [live_command(description = "Set the fixed-step viewer zoom percentage.")]
 def text_viewer_set_zoom(input : JsonValue?) : JsonValue? {
     let args = from_JV(input, type<TextViewerZoomArgs>)
-    g_zoom_percent = clamp(((args.percent + 5) / 10) * 10, 50, 300)
+    g_zoom_percent = clamp(((args.percent + 2) / 5) * 5, 50, 300)
     return JV((ok = true, zoom_percent = g_zoom_percent))
 }
 

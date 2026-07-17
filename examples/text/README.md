@@ -12,6 +12,6 @@ daslang-live examples/text/main.das -- README.md
 in plain-text mode. Use `--markdown` or `--plain` before the path to override
 that choice. The View menu and bottom mode buttons can switch at runtime.
 
-The main document window is dockable. Zoom is a fixed-step 50–300% setting at
+The main document window is dockable. Zoom is a fixed 5% step from 50–300% at
 the bottom-right, and Ctrl+mouse-wheel adjusts it while the document is hovered.
 On macOS, the usual Command key is used in place of Ctrl.

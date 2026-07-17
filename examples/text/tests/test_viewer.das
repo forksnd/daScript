@@ -45,21 +45,21 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         t |> success(file_observed, "loaded Markdown becomes the rendered document")
         if (!file_observed) return
 
-        click(app, "DOCK_ROOT/DOCUMENT_WINDOW/MODE_PLAIN")
+        click(app, "DOCK_ROOT/DOCUMENT_WINDOW/MODE_TOGGLE")
         let plain_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             return (viewer_state(app)?["mode"] ?? "") == "plain"
         }
         t |> success(plain_observed, "bottom mode control switches to plain text")
 
         let zoomed = post_command(app, "text_viewer_set_zoom", JV((percent = 137)))
-        t |> equal(zoomed?["zoom_percent"] ?? 0, 140,
-                   "zoom command snaps to a ten-percent step")
+        t |> equal(zoomed?["zoom_percent"] ?? 0, 135,
+                   "zoom command snaps to a five-percent step")
         let zoom_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
-            return (viewer_state(app)?["zoom_percent"] ?? 0) == 140
+            return (viewer_state(app)?["zoom_percent"] ?? 0) == 135
         }
         t |> success(zoom_observed, "snapped zoom reaches rendered app state")
 
-        click(app, "DOCK_ROOT/DOCUMENT_WINDOW/MODE_MARKDOWN")
+        click(app, "DOCK_ROOT/DOCUMENT_WINDOW/MODE_TOGGLE")
         let markdown_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             var state = viewer_state(app)
             return ((state?["mode"] ?? "") == "markdown"
