@@ -478,10 +478,13 @@ def test_metal_support_matrix(t : T?) {
     }
 }
 
-[unused_argument(t, path, family, tag, expect_needs, want)]   // off-Apple the gated body is empty
-def private family_cells(t : T?; path, family, tag : string; expect_needs : MetalNeed; want : string) {
+[unused_argument(t, path, family, tag, expect_needs, want, kv2)]   // off-Apple the gated body is empty
+def private family_cells(t : T?; path, family, tag : string; expect_needs : MetalNeed; want : string;
+                         kv2 : KVDtype = KVDtype.f16) {
     // one family's row: pin the metal_needs derivation bits, then the three path cells — each
     // asserts ENGAGE ("") or DECLINE with the named need_* reason. Wave stages flip these.
+    // An ENGAGE row ("" cells) ALSO proves token parity: a metal-overrides generate must equal
+    // the CPU truth. kv2 != f16 adds a second cell row on that KV codec (its rope-store twin).
     static_if (typeinfo builtin_module_exists(das_metal)) {
         if (!family_on(t, family) || !arm_on(t, "fam-{family}") || !model_available(t, path)) {
             return
@@ -492,6 +495,35 @@ def private family_cells(t : T?; path, family, tag : string; expect_needs : Meta
         t |> success((uint(derived) & uint(expect_needs)) == uint(expect_needs),
             "{tag}: metal_needs derives {expect_needs} (got {derived})")
         matrix_cell(t, tr, KVDtype.f16, tag, want, want, want)
+        if (kv2 != KVDtype.f16) {
+            matrix_cell(t, tr, kv2, "{tag}+{kv2}", want, want, want)
+        }
+        if (want == "") {
+            let prompt <- encode(tr, counting_prompt(1, 30), true, false)
+            var cpu_ids : array<int64>
+            var gpu_ids : array<int64>
+            with_job_que() {
+                setup_dasllama_jobque()
+                var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                let ids <- generate(tr, s, prompt, length(prompt) + 8)
+                cpu_ids := ids
+                delete s
+                select_decode_override("metal")
+                select_prefill_override("metal")
+                set_metal_prefill_min_npos(1l)
+                var s2 = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                let ids2 <- generate(tr, s2, prompt, length(prompt) + 8)
+                gpu_ids := ids2
+                delete s2
+                set_metal_prefill_min_npos(64l)
+                select_decode_override("")
+                select_prefill_override("")
+            }
+            t |> success(same(cpu_ids, gpu_ids),
+                "{tag}: metal-overrides generate matches the CPU truth token-for-token")
+            delete cpu_ids
+            delete gpu_ids
+        }
         delete tr
     }
 }
@@ -524,9 +556,16 @@ def test_metal_family_matrix(t : T?) {
             family_cells(t, path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf"), "qwen2",
                 "qwen2.5-0.5b/q8/f16", MetalNeed.neox | MetalNeed.qkv_bias,
                 "need_qkv_bias")
+            // phi3 = NEOX only — ENGAGE since the wave A rope twins; the Q4 row also proves the
+            // q8_0-KV rope-store's NEOX block loop, the Q8/s16 row the fused qkv_rs NEOX mapping
             family_cells(t, path_join(models_dir(), "Phi-3.5-mini-instruct-Q4_K_M.gguf"), "phi3",
                 "phi3.5-mini/k4/f16", MetalNeed.neox,
-                "need_neox")
+                "", KVDtype.q8_0)
+            set_wscale_f16(true)
+            family_cells(t, path_join(models_dir(), "Phi-3.5-mini-instruct-Q8_0.gguf"), "phi3",
+                "phi3.5-mini/q8/s16", MetalNeed.neox,
+                "")
+            set_wscale_f16(false)
             metal_decode_shutdown()
             metal_prefill_shutdown()
             t |> equal(metal_live_object_count(), 0l)

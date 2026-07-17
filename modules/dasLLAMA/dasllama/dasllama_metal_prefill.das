@@ -1308,9 +1308,10 @@ class MetalKqMvB4K5 {
     }
 }
 
-// One thread per rotation pair, NORM layout (adjacent elements 2j, 2j+1 within each head):
-// v0*c - v1*s / v0*s + v1*c with this position's precomputed table row — rope_scaled_tab exactly.
-// One kernel serves q (n = qd) and k (n = kv_dim) as two dispatches.
+// One thread per rotation pair: NORM (adjacent elements 2j, 2j+1 within each head) or NEOX
+// (j, j+half) per the mode uniform — v0*c - v1*s / v0*s + v1*c with this position's precomputed
+// table row, rope_scaled_tab / rope_scaled_neox_tab exactly. One kernel serves q (n = qd) and
+// k (n = kv_dim) as two dispatches.
 class MetalRope {
     @ssbo @binding = 0 v : array<float>     // [ntok x n], roped in place
     @ssbo @binding = 1 tcos : array<float>  // [ntok x head_size/2]
@@ -1318,6 +1319,7 @@ class MetalRope {
     @uniform @binding = 3 n : uint          // row width (qd or kv_dim), % head_size
     @uniform @binding = 4 head_size : uint
     @uniform @binding = 5 npairs : uint     // ntok * n/2 — grid guard
+    @uniform @binding = 6 neox : uint       // pair (j, j+half) instead of (2j, 2j+1); same table row j
 
     [metal_kernel(name="metal_rope_msl")]
     def metal_rope {
@@ -1331,13 +1333,14 @@ class MetalRope {
         let half = head_size / 2u
         let h = rem / half
         let j = rem % half
-        let i = p * n + h * head_size + 2u * j
+        let i = p * n + h * head_size + (neox != 0u ? j : 2u * j)
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[p * half + j]
         let fci = tsin[p * half + j]
         let v0 = v[i]
-        let v1 = v[i + 1u]
+        let v1 = v[i2]
         v[i] = v0 * fcr - v1 * fci
-        v[i + 1u] = v0 * fci + v1 * fcr
+        v[i2] = v0 * fci + v1 * fcr
     }
 }
 
@@ -1461,6 +1464,7 @@ class MetalRopeQK {
     @uniform @binding = 6 head_size : uint
     @uniform @binding = 7 npairs_q : uint   // ntok * qd/2 — the q half of the grid
     @uniform @binding = 8 npairs : uint     // + ntok * kv_dim/2 — grid guard
+    @uniform @binding = 9 neox : uint       // pair (j, j+half) instead of (2j, 2j+1); same table row j
 
     [metal_kernel(name="metal_rope_qk_msl")]
     def metal_rope_qk {
@@ -1477,19 +1481,20 @@ class MetalRopeQK {
         let half = head_size / 2u
         let h = rem / half
         let j = rem % half
-        let i = p * n + h * head_size + 2u * j
+        let i = p * n + h * head_size + (neox != 0u ? j : 2u * j)
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[p * half + j]
         let fci = tsin[p * half + j]
         if (isK) {
             let v0 = k[i]
-            let v1 = k[i + 1u]
+            let v1 = k[i2]
             k[i] = v0 * fcr - v1 * fci
-            k[i + 1u] = v0 * fci + v1 * fcr
+            k[i2] = v0 * fci + v1 * fcr
         } else {
             let v0 = q[i]
-            let v1 = q[i + 1u]
+            let v1 = q[i2]
             q[i] = v0 * fcr - v1 * fci
-            q[i + 1u] = v0 * fci + v1 * fcr
+            q[i2] = v0 * fci + v1 * fcr
         }
     }
 }
@@ -1973,7 +1978,7 @@ var private g_pf_regions : table<uint64; MetalBuffer?>    // base address -> res
 var private g_pf_pool : MetalBufferPool
 var private g_pf_upool : MetalBufferPool     // UNTRACKED pool: uniforms + rope tables (GPU-read-only)
 // what the prefill kernels implement beyond the base llama dense block — grows wave by wave
-let PF_NEEDS_OK = default<MetalNeed>
+let PF_NEEDS_OK = MetalNeed.neox
 
 var private g_min_npos = 64l
 var private g_max_npos = 2048l          // naive-attention P footprint cap: heads x npos^2 floats
@@ -2438,7 +2443,7 @@ def private pf_enc_gemv(enc : MetalComputeEncoder?; s16 : bool; bwq, bws, bx, by
     metal_dispatch_threadgroups(enc, uint3(uint((d + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
-def private enc_rope(enc : MetalComputeEncoder?; bv, bcos, bsin, bn, bhs, bnpairs : MetalBuffer?; npairs : int64; off : uint64 = 0ul) {
+def private enc_rope(enc : MetalComputeEncoder?; bv, bcos, bsin, bn, bhs, bnpairs, bneox : MetalBuffer?; npairs : int64; off : uint64 = 0ul) {
     metal_set_pipeline(enc, g_pso_rope)
     metal_set_buffer(enc, bv, off, 0)
     metal_set_buffer(enc, bcos, 0ul, 1)
@@ -2446,6 +2451,7 @@ def private enc_rope(enc : MetalComputeEncoder?; bv, bcos, bsin, bn, bhs, bnpair
     metal_set_buffer(enc, bn, 0ul, 3)
     metal_set_buffer(enc, bhs, 0ul, 4)
     metal_set_buffer(enc, bnpairs, 0ul, 5)
+    metal_set_buffer(enc, bneox, 0ul, 6)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -2475,7 +2481,7 @@ def private enc_swiglu_quant(enc : MetalComputeEncoder?; bg, bu, bxq, bxs, bn, b
     metal_dispatch_threadgroups(enc, uint3(uint((nblk + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
-def private enc_rope_qk(enc : MetalComputeEncoder?; bq, bk, bcos, bsin, bqd, bkvd, bhs, bnpq, bnpall : MetalBuffer?; npairs : int64; koff : uint64 = 0ul) {
+def private enc_rope_qk(enc : MetalComputeEncoder?; bq, bk, bcos, bsin, bqd, bkvd, bhs, bnpq, bnpall, bneox : MetalBuffer?; npairs : int64; koff : uint64 = 0ul) {
     metal_set_pipeline(enc, g_pso_ropeqk)
     metal_set_buffer(enc, bq, 0ul, 0)
     metal_set_buffer(enc, bk, koff, 1)
@@ -2486,6 +2492,7 @@ def private enc_rope_qk(enc : MetalComputeEncoder?; bq, bk, bcos, bsin, bqd, bkv
     metal_set_buffer(enc, bhs, 0ul, 6)
     metal_set_buffer(enc, bnpq, 0ul, 7)
     metal_set_buffer(enc, bnpall, 0ul, 8)
+    metal_set_buffer(enc, bneox, 0ul, 9)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -2717,6 +2724,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     var u_nblk_h = pf_uniform_u32(uint(npos * (hidden / 32l)))
     var u_npairs_q = pf_uniform_u32(uint(npos * qd / 2l))
     var u_npairs_k = pf_uniform_u32(uint(npos * kv_dim / 2l))
+    var u_neox = pf_uniform_u32(c.rope_neox ? 1u : 0u)
     var u_total_dim = pf_uniform_u32(uint(npos * dim))
     var u_total_h = pf_uniform_u32(uint(npos * hidden))
     var u_scale = pf_uniform_f32(scale)
@@ -2833,10 +2841,10 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 }
                 if (g_pf_skip != "ew" && g_pf_skip != "nongemm") {
                     if (fused) {
-                        enc_rope_qk(enc, bq, bks[l], bcos, bsin, u_qd, u_kvd, u_hs, u_npairs_q, u_npairs_all, npos * (qd + kv_dim) / 2l, koff)
+                        enc_rope_qk(enc, bq, bks[l], bcos, bsin, u_qd, u_kvd, u_hs, u_npairs_q, u_npairs_all, u_neox, npos * (qd + kv_dim) / 2l, koff)
                     } else {
-                        enc_rope(enc, bq, bcos, bsin, u_qd, u_hs, u_npairs_q, npos * qd / 2l)
-                        enc_rope(enc, bks[l], bcos, bsin, u_kvd, u_hs, u_npairs_k, npos * kv_dim / 2l, koff)
+                        enc_rope(enc, bq, bcos, bsin, u_qd, u_hs, u_npairs_q, u_neox, npos * qd / 2l)
+                        enc_rope(enc, bks[l], bcos, bsin, u_kvd, u_hs, u_npairs_k, u_neox, npos * kv_dim / 2l, koff)
                     }
                 }
                 if (g_pf_skip != "attn" && g_pf_skip != "nongemm") {
@@ -3088,6 +3096,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     pool_release(g_pf_upool, u_nblk_h, 4ul)
     pool_release(g_pf_upool, u_npairs_q, 4ul)
     pool_release(g_pf_upool, u_npairs_k, 4ul)
+    pool_release(g_pf_upool, u_neox, 4ul)
     pool_release(g_pf_upool, u_total_dim, 4ul)
     pool_release(g_pf_upool, u_total_h, 4ul)
     pool_release(g_pf_upool, u_scale, 4ul)

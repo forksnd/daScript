@@ -1100,9 +1100,9 @@ class MetalSqAttnComb {
     }
 }
 
-// Fused QKV GEMV + rope + KV-row store: element pairs (2r, 2r+1) of q/k ARE weight rows 2r, 2r+1
-// of the fused QKV region, so one simdgroup holds a whole rope pair in registers after its two
-// row dots. Deletes the separate rope_store dispatch entirely.
+// The 2-rows-per-simdgroup fused QKV GEMV + rope + KV-row store: the rope pair's two elements
+// of q/k ARE two weight rows of the fused region — adjacent (2p, 2p+1) under NORM, (r, r+hs/2)
+// within the head under NEOX. Deletes the separate rope_store dispatch entirely.
 class MetalQ8GemvQkvRsF16 {
     @ssbo @binding = 0 wq : array<byte4>    // fused QKV rows (concat region)
     @ssbo @binding = 1 ws : array<float16>  // fused scale planes, halfwords
@@ -1117,12 +1117,24 @@ class MetalQ8GemvQkvRsF16 {
     @uniform @binding = 10 qd : uint
     @uniform @binding = 11 kvd : uint
     @uniform @binding = 12 hs : uint
+    @uniform @binding = 13 neox : uint      // rope pair = rows (r, r+hs/2) instead of (2p, 2p+1)
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs16_msl")]
     def metal_q8_gemv_qkv_rs16 {
-        let row = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * 2u
-        if (row >= ddim) {
+        let pr = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (pr * 2u >= ddim) {
             return
+        }
+        // the simdgroup's two rows ARE the rope pair: adjacent under NORM; (r, r+half) within
+        // the row's head under NEOX for the q/k ranges (v rows stay adjacent — no rope)
+        let half = hs / 2u
+        var row = pr * 2u
+        var row2 = row + 1u
+        if (neox != 0u && row < qd + kvd) {
+            let lp = row < qd ? pr : pr - qd / 2u
+            let seg = row < qd ? 0u : qd
+            row = seg + (lp / half) * hs + lp % half
+            row2 = row + half
         }
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
@@ -1133,9 +1145,9 @@ class MetalQ8GemvQkvRsF16 {
         while (k < nb4) {
             let x4 = x[k]
             let w0 = float4(int4(wq[row * nb4 + k]))
-            let w1 = float4(int4(wq[(row + 1u) * nb4 + k]))
+            let w1 = float4(int4(wq[row2 * nb4 + k]))
             acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(ws[row * nb + k / 8u])
-            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[(row + 1u) * nb + k / 8u])
+            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[row2 * nb + k / 8u])
             k += gl_SubgroupSize
         }
         acc0 = simd_sum(acc0)
@@ -1144,18 +1156,19 @@ class MetalQ8GemvQkvRsF16 {
             return
         }
         if (row < qd) {
-            let j = (row % hs) / 2u
+            let j = neox != 0u ? row % hs : (row % hs) / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
             qo[row] = acc0 * fcr - acc1 * fci
-            qo[row + 1u] = acc0 * fci + acc1 * fcr
+            qo[row2] = acc0 * fci + acc1 * fcr
         } elif (row < qd + kvd) {
             let ik = row - qd
-            let j = (ik % hs) / 2u
+            let ik2 = row2 - qd
+            let j = neox != 0u ? ik % hs : (ik % hs) / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
             kd[ik] = float16(min(max(acc0 * fcr - acc1 * fci, -65504.0), 65504.0))   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
-            kd[ik + 1u] = float16(min(max(acc0 * fci + acc1 * fcr, -65504.0), 65504.0))   // nolint:STYLE019
+            kd[ik2] = float16(min(max(acc0 * fci + acc1 * fcr, -65504.0), 65504.0))   // nolint:STYLE019
         } else {
             let iv = row - qd - kvd
             vd[iv] = float16(min(max(acc0, -65504.0), 65504.0))   // nolint:STYLE019
@@ -1179,12 +1192,22 @@ class MetalQ8GemvQkvRsF32 {
     @uniform @binding = 10 qd : uint
     @uniform @binding = 11 kvd : uint
     @uniform @binding = 12 hs : uint
+    @uniform @binding = 13 neox : uint
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs32_msl")]
     def metal_q8_gemv_qkv_rs32 {
-        let row = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * 2u
-        if (row >= ddim) {
+        let pr = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (pr * 2u >= ddim) {
             return
+        }
+        let half = hs / 2u
+        var row = pr * 2u
+        var row2 = row + 1u
+        if (neox != 0u && row < qd + kvd) {
+            let lp = row < qd ? pr : pr - qd / 2u
+            let seg = row < qd ? 0u : qd
+            row = seg + (lp / half) * hs + lp % half
+            row2 = row + half
         }
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
@@ -1195,9 +1218,9 @@ class MetalQ8GemvQkvRsF32 {
         while (k < nb4) {
             let x4 = x[k]
             let w0 = float4(int4(wq[row * nb4 + k]))
-            let w1 = float4(int4(wq[(row + 1u) * nb4 + k]))
+            let w1 = float4(int4(wq[row2 * nb4 + k]))
             acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(ws[row * nb + k / 8u])
-            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[(row + 1u) * nb + k / 8u])
+            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[row2 * nb + k / 8u])
             k += gl_SubgroupSize
         }
         acc0 = simd_sum(acc0)
@@ -1206,18 +1229,19 @@ class MetalQ8GemvQkvRsF32 {
             return
         }
         if (row < qd) {
-            let j = (row % hs) / 2u
+            let j = neox != 0u ? row % hs : (row % hs) / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
             qo[row] = acc0 * fcr - acc1 * fci
-            qo[row + 1u] = acc0 * fci + acc1 * fcr
+            qo[row2] = acc0 * fci + acc1 * fcr
         } elif (row < qd + kvd) {
             let ik = row - qd
-            let j = (ik % hs) / 2u
+            let ik2 = row2 - qd
+            let j = neox != 0u ? ik % hs : (ik % hs) / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
             kd[ik] = acc0 * fcr - acc1 * fci
-            kd[ik + 1u] = acc0 * fci + acc1 * fcr
+            kd[ik2] = acc0 * fci + acc1 * fcr
         } else {
             let iv = row - qd - kvd
             vd[iv] = acc0
@@ -1443,6 +1467,7 @@ class MetalRopeStoreF16 {
     @uniform @binding = 7 head_size : uint
     @uniform @binding = 8 npairs_q : uint   // qd/2 — the q half of the grid
     @uniform @binding = 9 npairs : uint     // + kvd/2 — grid guard
+    @uniform @binding = 10 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
 
     [metal_kernel(name="metal_rope_store16_msl")]
     def metal_rope_store16 {
@@ -1454,23 +1479,25 @@ class MetalRopeStoreF16 {
         let lgid = isK ? gid - npairs_q : gid
         let half = head_size / 2u
         let j = lgid % half
-        let i = (lgid / half) * head_size + 2u * j
+        let hbase = (lgid / half) * head_size
+        let i = neox != 0u ? hbase + j : hbase + 2u * j
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[j]
         let fci = tsin[j]
         if (isK) {
             let v0 = qk[qd + i]
-            let v1 = qk[qd + i + 1u]
+            let v1 = qk[qd + i2]
             let r0 = v0 * fcr - v1 * fci
             let r1 = v0 * fci + v1 * fcr
             kd[i] = float16(min(max(r0, -65504.0), 65504.0))   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
-            kd[i + 1u] = float16(min(max(r1, -65504.0), 65504.0))   // nolint:STYLE019
+            kd[i2] = float16(min(max(r1, -65504.0), 65504.0))   // nolint:STYLE019
             vd[i] = float16(min(max(vs[i], -65504.0), 65504.0))   // nolint:STYLE019
-            vd[i + 1u] = float16(min(max(vs[i + 1u], -65504.0), 65504.0))   // nolint:STYLE019
+            vd[i2] = float16(min(max(vs[i2], -65504.0), 65504.0))   // nolint:STYLE019
         } else {
             let v0 = qk[i]
-            let v1 = qk[i + 1u]
+            let v1 = qk[i2]
             qk[i] = v0 * fcr - v1 * fci
-            qk[i + 1u] = v0 * fci + v1 * fcr
+            qk[i2] = v0 * fci + v1 * fcr
         }
     }
 }
@@ -1487,6 +1514,7 @@ class MetalRopeStoreF32 {
     @uniform @binding = 7 head_size : uint
     @uniform @binding = 8 npairs_q : uint
     @uniform @binding = 9 npairs : uint
+    @uniform @binding = 10 neox : uint
 
     [metal_kernel(name="metal_rope_store32_msl")]
     def metal_rope_store32 {
@@ -1498,21 +1526,23 @@ class MetalRopeStoreF32 {
         let lgid = isK ? gid - npairs_q : gid
         let half = head_size / 2u
         let j = lgid % half
-        let i = (lgid / half) * head_size + 2u * j
+        let hbase = (lgid / half) * head_size
+        let i = neox != 0u ? hbase + j : hbase + 2u * j
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[j]
         let fci = tsin[j]
         if (isK) {
             let v0 = qk[qd + i]
-            let v1 = qk[qd + i + 1u]
+            let v1 = qk[qd + i2]
             kd[i] = v0 * fcr - v1 * fci
-            kd[i + 1u] = v0 * fci + v1 * fcr
+            kd[i2] = v0 * fci + v1 * fcr
             vd[i] = vs[i]
-            vd[i + 1u] = vs[i + 1u]
+            vd[i2] = vs[i2]
         } else {
             let v0 = qk[i]
-            let v1 = qk[i + 1u]
+            let v1 = qk[i2]
             qk[i] = v0 * fcr - v1 * fci
-            qk[i + 1u] = v0 * fci + v1 * fcr
+            qk[i2] = v0 * fci + v1 * fcr
         }
     }
 }
@@ -1533,6 +1563,7 @@ class MetalRopeStoreQ8 {
     @uniform @binding = 9 head_size : uint
     @uniform @binding = 10 npairs_q : uint  // qd/2 — the q-rope half of the grid
     @uniform @binding = 11 nblk : uint      // kv_dim/32 — K blocks (V adds the same again)
+    @uniform @binding = 12 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
 
     [metal_kernel(name="metal_rope_store_q8_msl")]
     def metal_rope_store_q8 {
@@ -1543,13 +1574,15 @@ class MetalRopeStoreQ8 {
         let half = head_size / 2u
         if (gid < npairs_q) {
             let j = gid % half
-            let i = (gid / half) * head_size + 2u * j
+            let hbase = (gid / half) * head_size
+            let i = neox != 0u ? hbase + j : hbase + 2u * j
+            let i2 = neox != 0u ? i + half : i + 1u
             let fcr = tcos[j]
             let fci = tsin[j]
             let v0 = qk[i]
-            let v1 = qk[i + 1u]
+            let v1 = qk[i2]
             qk[i] = v0 * fcr - v1 * fci
-            qk[i + 1u] = v0 * fci + v1 * fcr
+            qk[i2] = v0 * fci + v1 * fcr
             return
         }
         let bi = gid - npairs_q
@@ -1561,6 +1594,22 @@ class MetalRopeStoreQ8 {
             var e = 0u
             while (e < 32u) {
                 vals[e] = vs[base + e]
+                e++
+            }
+        } elif (neox != 0u) {
+            // NEOX pairs straddle 32-blocks (partner at ±half) — rope per ELEMENT; partner
+            // reads come from qk, which no K/V thread writes, so cross-block reads are safe
+            var e = 0u
+            while (e < 32u) {
+                let ge = base + e
+                let hp = ge % head_size
+                let isHi = hp >= half
+                let j = isHi ? hp - half : hp
+                let fcr = tcos[j]
+                let fci = tsin[j]
+                let mine = qk[qd + ge]
+                let other = qk[qd + (isHi ? ge - half : ge + half)]
+                vals[e] = isHi ? other * fci + mine * fcr : mine * fcr - other * fci
                 e++
             }
         } else {
@@ -1620,6 +1669,7 @@ class MetalRopeStoreTq4 {
     @uniform @binding = 10 head_size : uint
     @uniform @binding = 11 nheads : uint
     @uniform @binding = 12 kv_mul : uint
+    @uniform @binding = 13 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
     @workgroup buf : float[128]
 
     [metal_kernel(name="metal_rope_store_tq4_msl")]
@@ -1627,6 +1677,7 @@ class MetalRopeStoreTq4 {
         let tgid = gl_WorkGroupID.x
         let lid = gl_LocalInvocationID.x
         let hs = head_size
+        let half = hs / 2u
         let nkvh = nheads / kv_mul
         let isQ = tgid < nheads
         let isK = !isQ && tgid < nheads + nkvh
@@ -1635,13 +1686,14 @@ class MetalRopeStoreTq4 {
         let base = isQ ? tgid * hs : (isK ? qd + hh * hs : hh * hs)
         var v = 0.0
         if (isQ || isK) {
-            // rope via the pair partner (pairs are adjacent and never straddle threads' loads)
-            let j = lid / 2u
+            // rope via the pair partner (the whole head is resident in this tg either way)
+            let isHi = neox != 0u ? lid >= half : (lid & 1u) != 0u
+            let j = neox != 0u ? (isHi ? lid - half : lid) : lid / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
             let mine = qk[base + lid]
-            let other = qk[base + (lid ^ 1u)]
-            v = (lid & 1u) == 0u ? mine * fcr - other * fci : other * fci + mine * fcr
+            let other = qk[base + (neox != 0u ? (isHi ? lid - half : lid + half) : (lid ^ 1u))]
+            v = isHi ? other * fci + mine * fcr : mine * fcr - other * fci
         } else {
             v = vs[base + lid]
         }
@@ -3875,6 +3927,7 @@ class MetalRopeStoreBF16 {
     @uniform @binding = 10 npairs_q : uint  // qd/2 — the q half of the pair grid
     @uniform @binding = 11 npairs : uint    // + kvd/2 — grid guard
     @uniform @binding = 12 qstride : uint
+    @uniform @binding = 13 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
 
     [metal_kernel(name="metal_rope_store_b16_msl")]
     def metal_rope_store_b16 {
@@ -3889,25 +3942,27 @@ class MetalRopeStoreBF16 {
         let isK = gid >= npairs_q
         let lgid = isK ? gid - npairs_q : gid
         let j = lgid % half
-        let i = (lgid / half) * head_size + 2u * j
+        let hbase = (lgid / half) * head_size
+        let i = neox != 0u ? hbase + j : hbase + 2u * j
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[bb * half + j]
         let fci = tsin[bb * half + j]
         if (isK) {
             let kdst = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
             let vdst = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
             let v0 = qk[qbase + qd + i]
-            let v1 = qk[qbase + qd + i + 1u]
+            let v1 = qk[qbase + qd + i2]
             let r0 = v0 * fcr - v1 * fci
             let r1 = v0 * fci + v1 * fcr
             kd[kdst + i] = float16(min(max(r0, -65504.0), 65504.0))   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
-            kd[kdst + i + 1u] = float16(min(max(r1, -65504.0), 65504.0))   // nolint:STYLE019
+            kd[kdst + i2] = float16(min(max(r1, -65504.0), 65504.0))   // nolint:STYLE019
             vd[vdst + i] = float16(min(max(qk[qbase + qd + kv_dim + i], -65504.0), 65504.0))   // nolint:STYLE019
-            vd[vdst + i + 1u] = float16(min(max(qk[qbase + qd + kv_dim + i + 1u], -65504.0), 65504.0))   // nolint:STYLE019
+            vd[vdst + i2] = float16(min(max(qk[qbase + qd + kv_dim + i2], -65504.0), 65504.0))   // nolint:STYLE019
         } else {
             let v0 = qk[qbase + i]
-            let v1 = qk[qbase + i + 1u]
+            let v1 = qk[qbase + i2]
             qk[qbase + i] = v0 * fcr - v1 * fci
-            qk[qbase + i + 1u] = v0 * fci + v1 * fcr
+            qk[qbase + i2] = v0 * fci + v1 * fcr
         }
     }
 }
@@ -3927,6 +3982,7 @@ class MetalRopeStoreBF32 {
     @uniform @binding = 10 npairs_q : uint
     @uniform @binding = 11 npairs : uint
     @uniform @binding = 12 qstride : uint
+    @uniform @binding = 13 neox : uint
 
     [metal_kernel(name="metal_rope_store_b32_msl")]
     def metal_rope_store_b32 {
@@ -3941,23 +3997,25 @@ class MetalRopeStoreBF32 {
         let isK = gid >= npairs_q
         let lgid = isK ? gid - npairs_q : gid
         let j = lgid % half
-        let i = (lgid / half) * head_size + 2u * j
+        let hbase = (lgid / half) * head_size
+        let i = neox != 0u ? hbase + j : hbase + 2u * j
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[bb * half + j]
         let fci = tsin[bb * half + j]
         if (isK) {
             let kdst = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
             let vdst = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
             let v0 = qk[qbase + qd + i]
-            let v1 = qk[qbase + qd + i + 1u]
+            let v1 = qk[qbase + qd + i2]
             kd[kdst + i] = v0 * fcr - v1 * fci
-            kd[kdst + i + 1u] = v0 * fci + v1 * fcr
+            kd[kdst + i2] = v0 * fci + v1 * fcr
             vd[vdst + i] = qk[qbase + qd + kv_dim + i]
-            vd[vdst + i + 1u] = qk[qbase + qd + kv_dim + i + 1u]
+            vd[vdst + i2] = qk[qbase + qd + kv_dim + i2]
         } else {
             let v0 = qk[qbase + i]
-            let v1 = qk[qbase + i + 1u]
+            let v1 = qk[qbase + i2]
             qk[qbase + i] = v0 * fcr - v1 * fci
-            qk[qbase + i + 1u] = v0 * fci + v1 * fcr
+            qk[qbase + i2] = v0 * fci + v1 * fcr
         }
     }
 }
@@ -4106,6 +4164,7 @@ class MetalRopeStoreBQ8 {
     @uniform @binding = 11 head_size : uint
     @uniform @binding = 12 npairs_q : uint  // qd/2 — the q-rope half of the grid
     @uniform @binding = 13 qstride : uint
+    @uniform @binding = 14 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
 
     [metal_kernel(name="metal_rope_store_b_q8_msl")]
     def metal_rope_store_b_q8 {
@@ -4119,13 +4178,15 @@ class MetalRopeStoreBQ8 {
         let half = head_size / 2u
         if (gid < npairs_q) {
             let j = gid % half
-            let i = (gid / half) * head_size + 2u * j
+            let hbase = (gid / half) * head_size
+            let i = neox != 0u ? hbase + j : hbase + 2u * j
+            let i2 = neox != 0u ? i + half : i + 1u
             let fcr = tcos[bb * half + j]
             let fci = tsin[bb * half + j]
             let v0 = qk[qbase + i]
-            let v1 = qk[qbase + i + 1u]
+            let v1 = qk[qbase + i2]
             qk[qbase + i] = v0 * fcr - v1 * fci
-            qk[qbase + i + 1u] = v0 * fci + v1 * fcr
+            qk[qbase + i2] = v0 * fci + v1 * fcr
             return
         }
         let rowb = nblk * 34u
@@ -4138,6 +4199,22 @@ class MetalRopeStoreBQ8 {
             var e = 0u
             while (e < 32u) {
                 vals[e] = qk[qbase + qd + nblk * 32u + base + e]   // the raw v third of the QKV row
+                e++
+            }
+        } elif (neox != 0u) {
+            // NEOX pairs straddle 32-blocks (partner at ±half) — rope per ELEMENT; partner
+            // reads come from qk, which no K/V thread writes, so cross-block reads are safe
+            var e = 0u
+            while (e < 32u) {
+                let ge = base + e
+                let hp = ge % head_size
+                let isHi = hp >= half
+                let j = isHi ? hp - half : hp
+                let fcr = tcos[bb * half + j]
+                let fci = tsin[bb * half + j]
+                let mine = qk[qbase + qd + ge]
+                let other = qk[qbase + qd + (isHi ? ge - half : ge + half)]
+                vals[e] = isHi ? other * fci + mine * fcr : mine * fcr - other * fci
                 e++
             }
         } else {
@@ -4338,6 +4415,7 @@ class MetalRopeStoreBTq4 {
     @uniform @binding = 12 nheads : uint
     @uniform @binding = 13 kv_mul : uint
     @uniform @binding = 14 qstride : uint
+    @uniform @binding = 15 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
     @workgroup buf : float[128]
 
     [metal_kernel(name="metal_rope_store_b_tq4_msl")]
@@ -4358,12 +4436,13 @@ class MetalRopeStoreBTq4 {
         let base = qbase + (isQ ? tgid * hs : (isK ? qd + hh * hs : qd + kv_dim + hh * hs))
         var v = 0.0
         if (isQ || isK) {
-            let j = lid / 2u
+            let isHi = neox != 0u ? lid >= half : (lid & 1u) != 0u
+            let j = neox != 0u ? (isHi ? lid - half : lid) : lid / 2u
             let fcr = tcos[bb * half + j]
             let fci = tsin[bb * half + j]
             let mine = qk[base + lid]
-            let other = qk[base + (lid ^ 1u)]
-            v = (lid & 1u) == 0u ? mine * fcr - other * fci : other * fci + mine * fcr
+            let other = qk[base + (neox != 0u ? (isHi ? lid - half : lid + half) : (lid ^ 1u))]
+            v = isHi ? other * fci + mine * fcr : mine * fcr - other * fci
         } else {
             v = qk[base + lid]
         }
@@ -4761,7 +4840,7 @@ def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?) {
 // fused rope + KV-row store: the v source binds the SAME QKV buffer at its v byte offset
 def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; vsoff : uint64;
                    kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                   bcos, bsin, bqd, bhs, bnpq, bnpall : MetalBuffer?; npairs : int64) {
+                   bcos, bsin, bqd, bhs, bnpq, bnpall, bneox : MetalBuffer?; npairs : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_rpst16 : g_pso_rpst32)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, bqkv, vsoff, 1)
@@ -4773,6 +4852,7 @@ def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; 
     metal_set_buffer(enc, bhs, 0ul, 7)
     metal_set_buffer(enc, bnpq, 0ul, 8)
     metal_set_buffer(enc, bnpall, 0ul, 9)
+    metal_set_buffer(enc, bneox, 0ul, 10)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -4781,7 +4861,7 @@ def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; 
 
 def enc_rope_store_tq4(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : uint64;
                        kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                       bcos, bsin, bqd, bhs, bnh, bkvm : MetalBuffer?; ntg, head_size : int64) {
+                       bcos, bsin, bqd, bhs, bnh, bkvm, bneox : MetalBuffer?; ntg, head_size : int64) {
     metal_set_pipeline(enc, g_pso_rpst_tq4)
     metal_set_threadgroup_memory_length(enc, metal_rope_store_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, bqkv, 0ul, 0)
@@ -4797,6 +4877,7 @@ def enc_rope_store_tq4(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bnh, 0ul, 11)
     metal_set_buffer(enc, bkvm, 0ul, 12)
+    metal_set_buffer(enc, bneox, 0ul, 13)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -4815,7 +4896,7 @@ def enc_fwht_unsign(enc : MetalComputeEncoder?; byo, bhs, bqs : MetalBuffer?; nh
 // same row offset); grid covers the q pairs + one thread per K/V 32-block
 def enc_rope_store_q8(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : uint64;
                       kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                      bcos, bsin, bqd, bhs, bnpq, bnblk : MetalBuffer?; nthreads : int64) {
+                      bcos, bsin, bqd, bhs, bnpq, bnblk, bneox : MetalBuffer?; nthreads : int64) {
     metal_set_pipeline(enc, g_pso_rpst_q8)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, bqkv, vsoff, 1)
@@ -4829,13 +4910,14 @@ def enc_rope_store_q8(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : u
     metal_set_buffer(enc, bhs, 0ul, 9)
     metal_set_buffer(enc, bnpq, 0ul, 10)
     metal_set_buffer(enc, bnblk, 0ul, 11)
+    metal_set_buffer(enc, bneox, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint((nthreads + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // the fused QKV+rope+store dispatch (2 rows per simdgroup — grid covers ddim/2 pairs)
 def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bwq, bws, bx, bq : MetalBuffer?;
                     kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                    bcos, bsin, bn, bd, bqd, bkvd, bhs : MetalBuffer?; d : int64) {
+                    bcos, bsin, bn, bd, bqd, bkvd, bhs, bneox : MetalBuffer?; d : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_qkvrs16 : g_pso_qkvrs32)
     metal_set_buffer(enc, bwq, 0ul, 0)
     metal_set_buffer(enc, bws, 0ul, 1)
@@ -4850,6 +4932,7 @@ def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bwq, bws, bx, bq : M
     metal_set_buffer(enc, bqd, 0ul, 10)
     metal_set_buffer(enc, bkvd, 0ul, 11)
     metal_set_buffer(enc, bhs, 0ul, 12)
+    metal_set_buffer(enc, bneox, 0ul, 13)
     let pairs = d / 2l
     metal_dispatch_threadgroups(enc, uint3(uint((pairs + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
@@ -5407,7 +5490,7 @@ def enc_attn_comb_d(enc : MetalComputeEncoder?; bpart, by, brt, bnsg, bnh, bhs :
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, brt, blay, bkvd, bqd, bhs, bnpq, bnpall, bqs : MetalBuffer?; npairs, nrows : int64) {
+def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, brt, blay, bkvd, bqd, bhs, bnpq, bnpall, bqs, bneox : MetalBuffer?; npairs, nrows : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_rpstb16 : g_pso_rpstb32)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, g_arena, 0ul, 1)
@@ -5422,11 +5505,12 @@ def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, b
     metal_set_buffer(enc, bnpq, 0ul, 10)
     metal_set_buffer(enc, bnpall, 0ul, 11)
     metal_set_buffer(enc, bqs, 0ul, 12)
+    metal_set_buffer(enc, bneox, 0ul, 13)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
 }
 
 // tq4-mirror batched rope+store: one threadgroup per (head, batch row), arena bound four ways
-def enc_rope_store_b_tq4(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bqd, bhs, bnh, bkvm, bqs : MetalBuffer?; ntg, nrows, head_size : int64) {
+def enc_rope_store_b_tq4(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bqd, bhs, bnh, bkvm, bqs, bneox : MetalBuffer?; ntg, nrows, head_size : int64) {
     metal_set_pipeline(enc, g_pso_rpstb_tq4)
     metal_set_threadgroup_memory_length(enc, metal_rope_store_b_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, bqkv, 0ul, 0)
@@ -5444,12 +5528,13 @@ def enc_rope_store_b_tq4(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay
     metal_set_buffer(enc, bnh, 0ul, 12)
     metal_set_buffer(enc, bkvm, 0ul, 13)
     metal_set_buffer(enc, bqs, 0ul, 14)
+    metal_set_buffer(enc, bneox, 0ul, 15)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // q8_0-mirror batched rope+store: arena bound four ways (K/V x scale/byte views); grid covers
 // the q pairs + one thread per K/V 32-block, one grid row per batch row
-def enc_rope_store_b_q8(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bnblk, bqd, bhs, bnpq, bqs : MetalBuffer?; nthreads, nrows : int64) {
+def enc_rope_store_b_q8(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bnblk, bqd, bhs, bnpq, bqs, bneox : MetalBuffer?; nthreads, nrows : int64) {
     metal_set_pipeline(enc, g_pso_rpstb_q8)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, g_arena, 0ul, 1)
@@ -5465,6 +5550,7 @@ def enc_rope_store_b_q8(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay,
     metal_set_buffer(enc, bhs, 0ul, 11)
     metal_set_buffer(enc, bnpq, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
+    metal_set_buffer(enc, bneox, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint((nthreads + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
 }
 

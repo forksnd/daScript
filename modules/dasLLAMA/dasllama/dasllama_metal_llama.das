@@ -54,8 +54,8 @@ def public metal_decode_shutdown {
 }
 
 // what each decode path's kernels implement beyond the base llama dense block — grows wave by wave
-let DECODE_NEEDS_OK = default<MetalNeed>   // single-stream decode
-let BATCH_NEEDS_OK = default<MetalNeed>    // batched decode
+let DECODE_NEEDS_OK = MetalNeed.neox   // single-stream decode
+let BATCH_NEEDS_OK = MetalNeed.neox    // batched decode
 
 def private decode_shape_decline(t : Model; needs_ok : MetalNeed) : MetalDecodeDecline {
     if (t.quant != QuantMode.q8) {
@@ -215,6 +215,7 @@ struct private StepRes {
     u_vocab : MetalBuffer?
     u_nch : MetalBuffer?
     u_nblk : MetalBuffer?  // kv_dim/32 — the block-codec kernels' row-width uniform (q8_0 only)
+    u_neox : MetalBuffer?  // rope pairing mode (0 = NORM adjacent, 1 = NEOX j/j+half)
     bytes_x : uint64
     bytes_q : uint64
     bytes_xb : uint64      // max(dim, qd) — bxb holds dim-wide norm outs AND the qd-wide attention out
@@ -269,6 +270,7 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     r.u_npall = uniform_u32(uint((qd + kv_dim) / 2l))
     r.u_scale = uniform_f32(1.0 / sqrt(float(head_size)))
     r.u_eps = uniform_f32(c.norm_eps)
+    r.u_neox = uniform_u32(c.rope_neox ? 1u : 0u)
     if (r.kdt == KVDtype.q8_0 || r.kdt == KVDtype.tq4) {
         r.u_nblk = uniform_u32(uint(kv_dim / 32l))
     }
@@ -366,7 +368,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     if (fused_qkv) {
                         enc_gemv_qkv_rs(enc, f16v, bwqkv, bwqkv_s, r.bxb, r.bqkv, g_arena, g_arena,
                             r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
-                            r.bcos, r.bsin, r.u_dim, r.u_qkvd, r.u_qd, r.u_kvd, r.u_hs, qkvd)
+                            r.bcos, r.bsin, r.u_dim, r.u_qkvd, r.u_qd, r.u_kvd, r.u_hs, r.u_neox, qkvd)
                     } else {
                         enc_gemv(enc, r.s16, bwqkv, bwqkv_s, r.bxb, r.bqkv, r.u_dim, r.u_qkvd, qkvd)
                     }
@@ -380,16 +382,16 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 if (r.kdt == KVDtype.q8_0) {
                     enc_rope_store_q8(enc, r.bqkv, uint64((qd + kv_dim) * 4l), g_arena, g_arena,
                         r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
-                        r.bcos, r.bsin, r.u_qd, r.u_hs, r.u_npq, r.u_nblk, qd / 2l + 2l * (kv_dim / 32l))
+                        r.bcos, r.bsin, r.u_qd, r.u_hs, r.u_npq, r.u_nblk, r.u_neox, qd / 2l + 2l * (kv_dim / 32l))
                 } elif (r.kdt == KVDtype.tq4) {
                     enc_rope_store_tq4(enc, r.bqkv, uint64((qd + kv_dim) * 4l), g_arena, g_arena,
                         r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
-                        r.bcos, r.bsin, r.u_qd, r.u_hs, r.u_nh, r.u_kvm,
+                        r.bcos, r.bsin, r.u_qd, r.u_hs, r.u_nh, r.u_kvm, r.u_neox,
                         n_heads + 2l * (kv_dim / head_size), head_size)
                 } else {
                     enc_rope_store(enc, f16v, r.bqkv, uint64((qd + kv_dim) * 4l), g_arena, g_arena,
                         r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
-                        r.bcos, r.bsin, r.u_qd, r.u_hs, r.u_npq, r.u_npall, (qd + kv_dim) / 2l)
+                        r.bcos, r.bsin, r.u_qd, r.u_hs, r.u_npq, r.u_npall, r.u_neox, (qd + kv_dim) / 2l)
                 }
             }
             if (g_skip != "attn") {
@@ -573,6 +575,7 @@ def private release_step(var r : StepRes) {
     pool_release(g_upool, r.u_cnt, 4ul)
     pool_release(g_upool, r.u_npq, 4ul)
     pool_release(g_upool, r.u_npall, 4ul)
+    pool_release(g_upool, r.u_neox, 4ul)
     pool_release(g_upool, r.u_scale, 4ul)
     pool_release(g_upool, r.u_eps, 4ul)
     r.valid = false
@@ -1050,6 +1053,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     var u_eps = uniform_f32(c.norm_eps)
     var u_npq = uniform_u32(uint(qd / 2l))
     var u_npall = uniform_u32(uint((qd + kv_dim) / 2l))
+    var u_neox = uniform_u32(c.rope_neox ? 1u : 0u)
     var u_s16 = uniform_u32(s16 ? 1u : 0u)
     var u_total_dim = uniform_u32(uint(nrows * dim))
     var u_total_h = uniform_u32(uint(nrows * hidden))
@@ -1153,13 +1157,13 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 // rope reads+writes bqkv in place and writes the current KV row into the arena
                 bar_dep(enc, haz, HZ_BQKV, HZ_BQKV | HZ_ARENA)
                 if (tq4) {
-                    enc_rope_store_b_tq4(enc, bqkv, bcos, bsin, brt, ulay, u_qd, u_hs, u_nh, u_kvm, u_qkvd,
+                    enc_rope_store_b_tq4(enc, bqkv, bcos, bsin, brt, ulay, u_qd, u_hs, u_nh, u_kvm, u_qkvd, u_neox,
                         n_heads + 2l * (kv_dim / head_size), nrows, head_size)
                 } elif (blockc) {
-                    enc_rope_store_b_q8(enc, bqkv, bcos, bsin, brt, ulay, u_nblk, u_qd, u_hs, u_npq, u_qkvd,
+                    enc_rope_store_b_q8(enc, bqkv, bcos, bsin, brt, ulay, u_nblk, u_qd, u_hs, u_npq, u_qkvd, u_neox,
                         qd / 2l + 2l * (kv_dim / 32l), nrows)
                 } else {
-                    enc_rope_store_b(enc, f16, bqkv, bcos, bsin, brt, ulay, u_kvd, u_qd, u_hs, u_npq, u_npall, u_qkvd,
+                    enc_rope_store_b(enc, f16, bqkv, bcos, bsin, brt, ulay, u_kvd, u_qd, u_hs, u_npq, u_npall, u_qkvd, u_neox,
                         (qd + kv_dim) / 2l, nrows)
                 }
             }
@@ -1492,6 +1496,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     g_lp_upooled |> push((buf = u_eps, size = 4ul))
     g_lp_upooled |> push((buf = u_npq, size = 4ul))
     g_lp_upooled |> push((buf = u_npall, size = 4ul))
+    g_lp_upooled |> push((buf = u_neox, size = 4ul))
     g_lp_upooled |> push((buf = u_s16, size = 4ul))
     g_lp_upooled |> push((buf = u_total_dim, size = 4ul))
     g_lp_upooled |> push((buf = u_total_h, size = 4ul))

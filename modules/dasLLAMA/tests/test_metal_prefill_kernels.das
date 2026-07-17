@@ -335,7 +335,8 @@ def test_metal_prefill_kernels(t : T?) {
                 var brn = buf_u32(dev, uint(QD))
                 var brhs = buf_u32(dev, uint(HEAD_SIZE))
                 var brnp = buf_u32(dev, uint(NPOS * QD / 2))
-                var ropebufs <- [brv, brc, brs, brn, brhs, brnp]
+                var brnx = buf_u32(dev, 0u)
+                var ropebufs <- [brv, brc, brs, brn, brhs, brnp, brnx]
                 let roperan = run_compute_1d(queue, pso_rope, ropebufs, uint(NPOS * QD / 2), 64u, err)
                 t |> success(roperan, "rope dispatch: {err}")
                 t |> equal(buf_mismatch_approx(brv, rvwant), 0)
@@ -344,6 +345,31 @@ def test_metal_prefill_kernels(t : T?) {
                     delete ropebufs
                 }
                 metal_release(brv)
+                metal_release(brnx)
+
+                // ===== the same kernel, NEOX pairing (j, j+half) — vs rope_scaled_neox_tab =====
+                for (k in range(NPOS * QD)) {
+                    rv[k] = 0.13 * float(k % 37) - 1.9
+                    rvwant[k] = rv[k]
+                }
+                unsafe {
+                    for (p in range(NPOS)) {
+                        rope_scaled_neox_tab(addr(rvwant[p * QD]), int64(HEAD_SIZE), int64(QD),
+                            addr<float const?>(rcos[p * half]), addr<float const?>(rsin[p * half]))
+                    }
+                }
+                var brv2 = buf_upload(dev, rv)
+                var brnx1 = buf_u32(dev, 1u)
+                var ropebufs2 <- [brv2, brc, brs, brn, brhs, brnp, brnx1]
+                let roperan2 = run_compute_1d(queue, pso_rope, ropebufs2, uint(NPOS * QD / 2), 64u, err)
+                t |> success(roperan2, "rope NEOX dispatch: {err}")
+                t |> equal(buf_mismatch_approx(brv2, rvwant), 0)
+                ropebufs2 |> clear()
+                unsafe {
+                    delete ropebufs2
+                }
+                metal_release(brv2)
+                metal_release(brnx1)
                 metal_release(brc)
                 metal_release(brs)
                 metal_release(brn)
