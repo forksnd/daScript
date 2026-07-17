@@ -188,6 +188,11 @@ def test_image_mechanics(t : T?) {
         t |> equal(long_length(m2.nested.blob), 2048l)
         delete m2
 
+        t |> success(save_image(p, path, "img-probe"), "re-save over an existing image")
+        var m2b = ImgProbe()
+        t |> success(load_image(path, m2b, "img-probe"), "re-saved image maps")
+        delete m2b
+
         var m3 = ImgProbe()
         t |> success(!load_image(path, m3, "wrong-tag"), "identity mismatch declines")
         patch_u32(t, path, 4l, 0xDEADu)

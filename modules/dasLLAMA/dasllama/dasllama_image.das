@@ -329,10 +329,12 @@ def private write_plane(f : file; var sections : array<ImgSection>; var cur : ui
 }
 
 //! Serialize a loaded weight-carrying struct as a prepared image: array planes page-aligned
-//! raw (borrowed back at load), everything else archived. Atomic (tmp + rename). Returns
-//! false on any IO failure. The caller's module must provide `serialize_image_meta(Archive,
-//! T)` for every non-array field and `image_post_load(T)` for post-read fix-ups (`_::`
-//! dispatch — Model's live here, AudioTower's in dasllama_audio).
+//! raw (borrowed back at load), everything else archived. Tmp + rename: atomic replace where
+//! rename-over-existing works (POSIX); where it doesn't (Windows) a brief missing-file window
+//! exists and a concurrent reader just regenerates. Returns false on any IO failure. The
+//! caller's module must provide `serialize_image_meta(Archive, T)` for every non-array field
+//! and `image_post_load(T)` for post-read fix-ups (`_::` dispatch — Model's live here,
+//! AudioTower's in dasllama_audio).
 def save_image(var t; path : string; tag : string = "") : bool {
     // per-writer tmp name: concurrent savers (parallel test workers on one cache miss) must
     // not clobber each other's half-written file; last atomic rename wins with same content
@@ -414,7 +416,12 @@ def save_image(var t; path : string; tag : string = "") : bool {
         remove(tmp_path)
         return false
     }
-    remove(path)   // rename-over is not portable — drop any stale image first
+    if (rename(tmp_path, path)) {
+        return true   // the atomic replace (POSIX rename-over)
+    }
+    // rename-over-existing is not portable (Windows) — drop the stale image and retry; the
+    // brief missing-file window only costs a concurrent reader a regenerate
+    remove(path)
     if (!rename(tmp_path, path)) {
         remove(tmp_path)
         return false
