@@ -343,15 +343,14 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
-- **QK-norm rides a prepass dispatch, not the rope-store fuse (Metal family wave A,
-  2026-07-17).** qwen3-line decode adds ONE MetalQkNorm dispatch per layer between the QKV
-  GEMV and rope-store (+~4.3us launch gap x n_layers: ~0.6% of a 4B token, ~3% of a 0.6B
-  token), and the fused qkv_rs (s16) stands down under qk_norm — split GEMV + prepass +
-  rope-store instead. The fused fix is a threadgroup-per-head rope-store family (the tq4
-  kernel's shape: per-head load -> RMS reduce -> rope pair via partner -> codec store) for
-  f16/f32/q8 x single/batch, which also re-admits a norm-capable fused qkv_rs two-pass form.
-  Build it when the Qwen3-4B roster scoreboard shows the gap; the family-matrix parity rows
-  gate the swap.
+- **QK-norm rope-store fusion — the f16 single-stream H-form SHIPPED (wave A chase round 2);
+  the rest of the family is the residual (2026-07-17).** MetalRopeStoreHF16 folds bias +
+  per-head RMS + rope + store into one threadgroup-per-head dispatch on QK-norm x f16-mirror
+  single-stream decode (+~1% on the 4B board; Q6_K B=1 tied lcpp exactly). Residual scope,
+  build when a board shows the gap: the f32/q8_0/tq4 codec twins and the BATCH H twins
+  (those paths keep the MetalQkNorm prepass + flat rope-store — batch amortizes the extra
+  dispatch over B rows, so the gap is smaller there), and a norm-capable fused qkv_rs
+  two-pass form for the s16 path (fused qkv_rs still stands down under qk_norm).
 
 - **Embeddings path (spotted building `/v1/embeddings`, 2026-07-06).** Two small items, neither
   chased: (1) `embed_forward` takes approach A — reuse `forward_prefill` then re-norm every
