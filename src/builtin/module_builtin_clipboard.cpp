@@ -494,7 +494,7 @@ namespace das {
         std::string text;
         ClipboardStatus status = getClipboardText(text);
         resultStatus = statusCode(status);
-        return context->allocateString(text, at);
+        return context->allocateString(text.data(), text.size(), at);
     }
 
     const char * builtin_clipboard_get_text_temporary(int32_t & resultStatus) {
@@ -626,10 +626,10 @@ namespace das {
 #endif
         if (formats == 0) return statusCode(ClipboardStatus::no_content);
 
-        plainText = context->allocateString(plainValue, at);
-        markdown = context->allocateString(markdownValue, at);
-        html = context->allocateString(htmlValue, at);
-        uriList = context->allocateString(uriValue, at);
+        plainText = context->allocateString(plainValue.data(), plainValue.size(), at);
+        markdown = context->allocateString(markdownValue.data(), markdownValue.size(), at);
+        html = context->allocateString(htmlValue.data(), htmlValue.size(), at);
+        uriList = context->allocateString(uriValue.data(), uriValue.size(), at);
         array_resize(*context, imageRgba8, static_cast<uint32_t>(imageValue.size()),
                      sizeof(uint8_t), false, at);
         if (!imageValue.empty()) {

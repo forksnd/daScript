@@ -1044,13 +1044,15 @@ namespace das {
             close(execError[0]);
             if ( setsid() == -1 ) {
                 int error = errno;
-                write(execError[1], &error, sizeof(error));
+                const ssize_t written = write(execError[1], &error, sizeof(error));
+                (void)written;
                 _exit(127);
             }
             pid_t child = fork();
             if ( child == -1 ) {
                 int error = errno;
-                write(execError[1], &error, sizeof(error));
+                const ssize_t written = write(execError[1], &error, sizeof(error));
+                (void)written;
                 _exit(127);
             }
             if ( child > 0 ) {
@@ -1064,7 +1066,8 @@ namespace das {
             }
             execvp(cargv[0], cargv.data());
             int error = errno;
-            write(execError[1], &error, sizeof(error));
+            const ssize_t written = write(execError[1], &error, sizeof(error));
+            (void)written;
             _exit(127);
         }
         close(execError[1]);
