@@ -194,8 +194,9 @@ namespace das {
     // pages instead of copying — unified memory makes the same bytes GPU-visible. Both pointer
     // and length must be PAGE-ALIGNED (Metal's bytesNoCopy contract; 16KB on Apple Silicon —
     // the image format page-aligns every GPU-bound plane). No deallocator: the caller's
-    // mapping must outlive the buffer (release the buffer before fmap_close). Untracked like
-    // the weight buffers above — the wrapped planes are GPU-read-only.
+    // mapping must outlive the buffer (release the buffer before fmap_close). TRACKED, unlike
+    // the weight buffers above: wrapped storage may carry GPU writes (the zero-copy logits
+    // rail), which need cross-cb read/write hazards.
     MetalBuffer * metal_new_buffer_no_copy ( MetalDevice * dev, void * data, uint64_t bytes, Context * ctx, LineInfoArg * at ) {
         if ( !dev ) ctx->throw_error_at(at, "metal_new_buffer_no_copy: null device");
         if ( !data ) ctx->throw_error_at(at, "metal_new_buffer_no_copy: null data");
@@ -208,7 +209,7 @@ namespace das {
         @autoreleasepool {
             id<MTLDevice> d = (__bridge id<MTLDevice>)(void *) dev;
             id<MTLBuffer> b = [d newBufferWithBytesNoCopy:data length:bytes
-                options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked
+                options:MTLResourceStorageModeShared
                 deallocator:nil];
             if ( !b ) ctx->throw_error_at(at, "metal_new_buffer_no_copy: wrap failed (%llu bytes)", (unsigned long long)bytes);
             return retain_handle<MetalBuffer>(b);

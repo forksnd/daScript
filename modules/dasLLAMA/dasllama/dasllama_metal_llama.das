@@ -207,7 +207,8 @@ struct private StepRes {
     bsin : MetalBuffer?
     bpart : MetalBuffer?
     bxf : MetalBuffer?
-    blog : MetalBuffer?
+    blog : MetalBuffer?   // pooled staging — only when bnc is unavailable
+    bnc : MetalBuffer?    // zero-copy logits: the session's wrapped storage (registry-owned, never released here)
     u_dim : MetalBuffer?
     u_qd : MetalBuffer?
     u_kvd : MetalBuffer?
@@ -290,7 +291,15 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
         empty(t.suppress) && t.wcls_off >= 0l)
     if (r.gpu_logits) {
         r.bxf = pool_acquire(g_pool, g_dev, r.bytes_x)
-        r.blog = pool_acquire(g_pool, g_dev, r.bytes_log)
+        // zero-copy logits: the classifier writes straight into s.logits via the session's
+        // wrapped storage — the pooled staging (+ its landing memcpy) serves as fallback.
+        // Spec-capable models (cls_q8) keep staging TOO: the speculative chain reads previous
+        // logits from a cb that outlives forward(), so it must only ever touch pooled memory
+        // (a GPU tail copy nc -> staging feeds it; see encode_step)
+        r.bnc = nc_logits_for(g_dev, s)
+        if (r.bnc == null || t.cls_q8) {
+            r.blog = pool_acquire(g_pool, g_dev, r.bytes_log)
+        }
         r.u_vocab = uniform_u32(uint(c.vocab_size))
     }
     // chunked split-K attention above the single-tg depth (128-row chunks, cross-chunk combine)
@@ -485,7 +494,14 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             enc_rms(enc, r.bx, bwfin, r.bxf, r.u_dim, r.u_eps)
         }
         let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
-        enc_site_gemv(enc, t, r.s16, cls_fmt, t.wcls_off, c.vocab_size, dim, r.bxf, r.blog, r.u_dim, r.u_vocab)
+        var bcls = r.bnc != null ? r.bnc : r.blog
+        enc_site_gemv(enc, t, r.s16, cls_fmt, t.wcls_off, c.vocab_size, dim, r.bxf, bcls, r.u_dim, r.u_vocab)
+        if (r.bnc != null && r.blog != null) {
+            // spec-capable step: mirror the zero-copy logits into pooled staging — the next
+            // step's speculative argmax reads THAT, never session memory (tracked hazards
+            // order the copy behind the classifier)
+            enc_copy_row(enc, r.bnc, 0ul, r.blog, r.u_vocab, c.vocab_size)
+        }
     }
     metal_end_encoding(enc)
     metal_release(enc)
@@ -523,7 +539,7 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
                 memcpy(reinterpret<void?>(kv_layer_vbase(s, l, c.seq_len) + prow * rowb),
                     reinterpret<void?>(vmp + (l * cap + pos) * rowb), int(rowb))
             }
-            if (r.gpu_logits) {
+            if (r.gpu_logits && r.bnc == null) {   // zero-copy steps: the GPU already wrote s.logits
                 memcpy(addr < void? >(s.logits[0]), metal_buffer_contents(r.blog), int(r.bytes_log))
             }
         }
@@ -557,7 +573,9 @@ def private release_step(var r : StepRes) {
     pool_release(g_upool, r.bsin, r.bytes_tab)
     if (r.gpu_logits) {
         pool_release(g_pool, r.bxf, r.bytes_x)
-        pool_release(g_pool, r.blog, r.bytes_log)
+        if (r.blog != null) {   // bnc steps have no staging; bnc itself is registry-owned
+            pool_release(g_pool, r.blog, r.bytes_log)
+        }
         pool_release(g_upool, r.u_vocab, 4ul)
     }
     if (r.chunked) {
@@ -627,6 +645,10 @@ def private pre_encode_next(t : Model; s : Session; npos : int64; var prev_blog 
         // speculative chain: the cb runs the moment the previous one drains — the CPU tail,
         // sampling, and the next forward() call all overlap GPU execution
         r.spec = true
+        // a spec step is IN FLIGHT after forward() returns — it must NOT touch session memory
+        // (zero-copy would clobber s.logits async, and outlive a deleted session). Staging
+        // only (cls_q8 acquired r.blog); acceptance lands it via the finish_step memcpy.
+        r.bnc = null
         r.btok = pool_acquire(g_pool, g_dev, 64ul)
         build_decode_rope_row(t, npos, g_rope_cos_next, g_rope_sin_next)
         unsafe {
@@ -1389,6 +1411,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
             haz.r = 0u
         }
     }
+    var nc_all = false
     if (gpu_logits) {
         // batched final rmsnorm + classifier — the caller's CPU classifier step is skipped
         unsafe {
@@ -1413,6 +1436,21 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 } else {
                     enc_gemv_b(enc, nrows > 2l, bwc, 0ul, bwc_s, 0ul, bxf, blog, u_dim, u_vocab, u_s16, c.vocab_size)
                 }
+            }
+        }
+        // zero-copy logits: scatter each staging row into its session's wrapped storage ON the
+        // cb — the landing memcpy for logits disappears (the KV writeback stays). All-or-nothing
+        // per step: one unwrappable session keeps the whole step on the landing scatter. In pipe
+        // mode the in-flight step now writes s.logits ASYNCHRONOUSLY — the pipe stays
+        // fixed-token-only by its existing contract.
+        nc_all = true
+        for (i in range64(nrows)) {
+            nc_all &&= nc_logits_for(g_dev, *sessions[i]) != null
+        }
+        if (nc_all) {
+            bar_dep(enc, haz, HZ_BLOG, 0u)
+            for (i in range64(nrows)) {
+                enc_copy_row(enc, blog, uint64(i * c.vocab_size * 4l), nc_logits_for(g_dev, *sessions[i]), u_vocab, c.vocab_size)
             }
         }
     }
@@ -1512,7 +1550,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         g_lp_upooled |> push((buf = ul, size = 4ul))
     }
     g_b_ulays |> clear()
-    g_lp_blog = gpu_logits ? blog : null
+    g_lp_blog = gpu_logits && !nc_all ? blog : null   // nc steps: the GPU scatter already fed s.logits
     g_lp_xb = null
     if (!gpu_logits) {
         g_lp_xb = bx   // the CPU-classifier tail reads x_b — sync-only writeback
