@@ -66,7 +66,9 @@ class public MemSerializer : Serializer {
         let newOffset = readOffset + size
         let maxOffset = length(data)
         if (newOffset > maxOffset) {
-            error("reading past the end of stream")
+            // self-> matters: a bare error(...) resolves to the BUILTIN error (a stderr
+            // print), leaving lastError unset — OK() then reports a truncated stream as fine
+            self->error("reading past the end of stream")   // nolint:STYLE028 — dropping self-> rebinds to the builtin, probe-verified 2026-07-17
             readOffset = maxOffset
             return false
         }
