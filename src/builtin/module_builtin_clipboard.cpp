@@ -153,6 +153,7 @@ namespace das {
 #endif
         }
 
+#if defined(_WIN32)
         std::string makeCfHtml(const char * fragment, size_t fragmentSize) {
             constexpr const char * prefix =
                 "<html><body>\r\n<!--StartFragment-->";
@@ -219,7 +220,9 @@ namespace das {
             // is more useful than discarding an otherwise valid representation.
             return data;
         }
+#endif
 
+#if DAS_CLIPBOARD_IMAGE_SUPPORTED
         uint8_t extractMaskedChannel(uint32_t pixel, uint32_t mask, uint8_t fallback) {
             if (!mask) return fallback;
             unsigned shift = 0;
@@ -229,6 +232,7 @@ namespace das {
             const uint32_t value = (pixel & mask) >> shift;
             return static_cast<uint8_t>((value * 255u + shiftedMask / 2u) / shiftedMask);
         }
+#endif
 
 #if defined(_WIN32) && DAS_CLIPBOARD_IMAGE_SUPPORTED
         bool setWindowsImage(const TArray<uint8_t> & rgba8,
