@@ -23,7 +23,7 @@ struct RunArgs {
     full : bool
 
     @clarg_short = "s"
-    @clarg_doc = "Suite: decode | prefill | matrix | kernels | all (default all)"
+    @clarg_doc = "Suite: decode | prefill | matrix | kernels | image | all (default all)"
     suite : string = "all"
 
     @clarg_short = "n"
@@ -48,11 +48,14 @@ def private suite_files(name : string) : array<string> {
         return <- [ "tests/dasLLAMA/test_metal_support_matrix.das" ]
     } elif (name == "kernels") {
         return <- [ "tests/dasLLAMA/test_metal_prefill_kernels.das" ]
+    } elif (name == "image") {
+        return <- [ "tests/dasLLAMA/test_model_image.das" ]
     } elif (name == "all") {
         return <- [ "tests/dasLLAMA/test_metal_decode_parity.das",
                     "tests/dasLLAMA/test_metal_prefill_parity.das",
                     "tests/dasLLAMA/test_metal_support_matrix.das",
-                    "tests/dasLLAMA/test_metal_prefill_kernels.das" ]
+                    "tests/dasLLAMA/test_metal_prefill_kernels.das",
+                    "tests/dasLLAMA/test_model_image.das" ]
     }
     var none : array<string>
     return <- none
@@ -103,7 +106,7 @@ def main() : int {
     }
     var files <- suite_files(cfg.suite)
     if (empty(files)) {
-        to_log(LOG_ERROR, "unknown --suite '{cfg.suite}' (decode | prefill | matrix | kernels | all)\n")
+        to_log(LOG_ERROR, "unknown --suite '{cfg.suite}' (decode | prefill | matrix | kernels | image | all)\n")
         return 2
     }
     let tmp = empty(get_env_variable("TMPDIR")) ? "/tmp" : get_env_variable("TMPDIR")

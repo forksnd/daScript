@@ -139,6 +139,7 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_arch_gptoss.das
     modules/dasLLAMA/dasllama/dasllama_arch_mistral3.das
     modules/dasLLAMA/dasllama/dasllama_arch_glm4moe.das
+    modules/dasLLAMA/dasllama/dasllama_image.das
     modules/dasLLAMA/dasllama/dasllama_transformer.das
     modules/dasLLAMA/dasllama/dasllama_asr.das
     modules/dasLLAMA/dasllama/dasllama_chat.das

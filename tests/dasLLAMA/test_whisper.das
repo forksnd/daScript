@@ -279,8 +279,7 @@ def test_asr_surface(t : T?) {
         // "auto" on a multilingual model is accepted; a junk code still panics loudly
         let s <- create_session(m, "auto")
         t |> equal(s.w.lang_id, -1, "auto defers detection")
-        delete m.whisper.dblob
-        delete m.whisper.enc.fblob
+        delete m   // whole-model delete: image-backed planes are locked views, only the finalizer may release them
     }
 }
 
@@ -555,10 +554,9 @@ def test_whisper_q8_gate(t : T?) {
             }
             t |> success(mismatches == 0, "q8/fp32 token-identical ({mismatches}/{total} flips)")
         }
-        delete m.whisper.dblob
-        delete m.whisper.enc.fblob
-        delete mf.whisper.dblob
-        delete mf.whisper.enc.fblob
+        // whole-model deletes: image-backed planes are locked views, only the finalizer may release them
+        delete m
+        delete mf
     }
 }
 

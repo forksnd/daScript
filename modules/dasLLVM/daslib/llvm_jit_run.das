@@ -33,7 +33,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x42ul   // full-stack prologue emission reads LlvmJitFlags (0x41: bounded kq i16 pair-sum chains)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x43ul   // length() emits the >INT_MAX guard (0x42: full-stack prologue emission reads LlvmJitFlags)
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 

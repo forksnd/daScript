@@ -36,6 +36,8 @@ namespace das {
 
     DAS_MOD_API MetalBuffer * metal_new_buffer ( MetalDevice * dev, uint64_t bytes, Context * ctx, LineInfoArg * at );
     DAS_MOD_API MetalBuffer * metal_new_buffer_untracked ( MetalDevice * dev, uint64_t bytes, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API MetalBuffer * metal_new_buffer_no_copy ( MetalDevice * dev, void * data, uint64_t bytes, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API uint64_t metal_max_buffer_length ( MetalDevice * dev, Context * ctx, LineInfoArg * at );
     DAS_MOD_API void * metal_buffer_contents ( MetalBuffer * buf, Context * ctx, LineInfoArg * at );
 
     DAS_MOD_API MetalCommandBuffer * metal_new_command_buffer ( MetalCommandQueue * queue, Context * ctx, LineInfoArg * at );

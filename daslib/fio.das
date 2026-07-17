@@ -71,7 +71,7 @@ def fload(file : file; size : int64; blk : block<(data : array<uint8>) : void>) 
 def fload(f : file; buf : auto(BufType) -const) {
     var dfh : df_header
     let r1 = _builtin_read(f, dfh, typeinfo sizeof(type<df_header>))
-    if (r1 < 0 || dfh.magic != df_magic) return false
+    if (r1 < 0 || dfh.magic != df_magic || dfh.size < 0) return false
     var loaded = false
     _builtin_load(f, int64(dfh.size)) $(data : array<uint8>) {
         if (length(data) != 0) {
@@ -86,11 +86,17 @@ def fload(f : file; buf : auto(BufType) -const) {
 def fsave(f : file; buf : auto(BufType) const) {
     var r1, r2 : int
     binary_save(buf) $(data) {
-        let len = length(data)
+        let len64 = long_length(data)
+        if (len64 > int64(INT_MAX)) {
+            panic("fsave: {len64}-byte payload does not fit the df_header int size field")
+        }
+        let len = int(len64)
         let dfh = df_header(magic = df_magic, size = len)
         r1 = _builtin_write(f, dfh, typeinfo sizeof(type<df_header>))
-        unsafe {
-            r2 = _builtin_write(f, addr(data[0]), len)
+        if (len > 0) {   // addr(data[0]) on an empty payload is out of bounds
+            unsafe {
+                r2 = _builtin_write(f, addr(data[0]), len)
+            }
         }
     }
     if (r1 < 0) return r1
@@ -109,8 +115,24 @@ def fread(f : file; buf : auto(BufType) const implicit) {
 [generic]
 def fread(f : file; buf : array<auto(BufType)> const implicit) {
     concept_assert(typeinfo is_raw(type<BufType>), "'fread' accepts only raw POD type arrays")
+    return 0 if (empty(buf))   // a 0-byte read; addr(buf[0]) on an empty array is out of bounds
+    let nbytes = long_length(buf) * typeinfo sizeof(type<BufType>)
+    if (nbytes > int64(INT_MAX)) {
+        panic("fread: {nbytes} bytes does not fit the int byte count — use long_fread")
+    }
     unsafe {
-        return _builtin_read(f, addr(buf[0]), length(buf) * (typeinfo sizeof(type<BufType>)))
+        return _builtin_read(f, addr(buf[0]), int(nbytes))
+    }
+}
+
+//! 64-bit fread: fills the whole array regardless of size (fread panics past 2 GiB).
+//! Returns bytes read as int64.
+[generic]
+def long_fread(f : file; buf : array<auto(BufType)> const implicit) : int64 {
+    concept_assert(typeinfo is_raw(type<BufType>), "'long_fread' accepts only raw POD type arrays")
+    return 0l if (empty(buf))   // a 0-byte read; addr(buf[0]) on an empty array is out of bounds
+    unsafe {
+        return _builtin_read64(f, addr(buf[0]), long_length(buf) * typeinfo sizeof(type<BufType>))
     }
 }
 
@@ -125,8 +147,24 @@ def fwrite(f : file; buf : auto(BufType) const implicit) {
 [generic]
 def fwrite(f : file; buf : array<auto(BufType)> const implicit) {
     concept_assert(typeinfo is_raw(type<BufType>), "'fwrite' accepts only raw POD type arrays")
+    return 0 if (empty(buf))   // a 0-byte write; addr(buf[0]) on an empty array is out of bounds
+    let nbytes = long_length(buf) * typeinfo sizeof(type<BufType>)
+    if (nbytes > int64(INT_MAX)) {
+        panic("fwrite: {nbytes} bytes does not fit the int byte count — use long_fwrite")
+    }
     unsafe {
-        return _builtin_write(f, addr(buf[0]), length(buf) * (typeinfo sizeof(type<BufType>)))
+        return _builtin_write(f, addr(buf[0]), int(nbytes))
+    }
+}
+
+//! 64-bit fwrite: writes the whole array regardless of size (fwrite panics past 2 GiB).
+//! Returns bytes written as int64.
+[generic]
+def long_fwrite(f : file; buf : array<auto(BufType)> const implicit) : int64 {
+    concept_assert(typeinfo is_raw(type<BufType>), "'long_fwrite' accepts only raw POD type arrays")
+    return 0l if (empty(buf))   // a 0-byte write; addr(buf[0]) on an empty array is out of bounds
+    unsafe {
+        return _builtin_write64(f, addr(buf[0]), long_length(buf) * typeinfo sizeof(type<BufType>))
     }
 }
 

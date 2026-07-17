@@ -3,11 +3,16 @@ options gen2
 module dasllama_audio shared public
 
 require math
+require strings
 require daslib/fio
+require daslib/apply
+require daslib/archive
 require dasllama/dasllama_math
 require dasllama/dasllama_par
 require dasllama/dasllama_gguf
 require dasllama/dasllama_quant
+require dasllama/dasllama_common   // apply_box_profile_runtime for the tower-image identity
+require dasllama/dasllama_image
 
 // Whisper-family audio frontend: 16 kHz mono PCM -> log-mel chunks, in two oracle-exact
 // flavors: log_mel_chunks mirrors llama.cpp mtmd (tools/mtmd/mtmd-audio.cpp, qwen2a tower),
@@ -628,7 +633,71 @@ struct AudioTower {
     normpre_off : int64       // ultravox RMS-pre weight [d·stack]
     normmid_off : int64       // ultravox RMS-mid weight [mm1_out/2]
     mm2_w_off : int64         // ultravox/voxtral second projector matrix
+    image_map : void?         // non-null when the planes borrow a mapped .dlim (dasllama_image)
+    image_bytes : uint64
 }
+
+def finalize(var t : AudioTower) {
+    apply(t) $ [unused_argument(name)] (name : string; var field) {
+        static_if (typeinfo is_array(field)) {
+            if (lock_count(field) != 0) {
+                unsafe {
+                    _builtin_forget_temp_array(field)
+                }
+            } else {
+                delete field
+            }
+        }
+    }
+    if (t.image_map != null) {
+        unsafe {
+            fmap_close(t.image_map, t.image_bytes)
+        }
+        t.image_map = null
+        t.image_bytes = 0ul
+    }
+}
+
+// the tripwire: serialize_image_meta(AudioTower) covers 28 fields; image_map + image_bytes
+// are deliberate skips. A new non-array AudioTower field trips this until BOTH agree.
+let private TOWER_META_FIELDS = 28 + 2
+
+// every non-array AudioTower field, explicitly, both directions (see dasllama_image).
+// Public: WhisperModel's serialize_image_meta reuses it for its nested `enc` tower.
+def serialize_image_meta(var arch : Archive; var t : AudioTower) {
+    verify(count_meta_fields(t) == TOWER_META_FIELDS)   // grew AudioTower? extend this list
+    arch |> serialize_raw(t.n_mel)
+    arch |> serialize_raw(t.d_model)
+    arch |> serialize_raw(t.n_head)
+    arch |> serialize_raw(t.n_layer)
+    arch |> serialize_raw(t.n_ff)
+    arch |> serialize_raw(t.n_ctx)
+    arch |> serialize_raw(t.proj_dim)
+    arch |> serialize_raw(t.gelu_tanh)
+    arch |> serialize_raw(t.eps)
+    arch |> serialize_raw(t.proj_kind)
+    arch |> serialize_raw(t.stack_factor)
+    arch |> serialize_raw(t.mm1_out)
+    arch |> serialize_raw(t.has_k_bias)
+    arch |> serialize_raw(t.q8)
+    arch |> serialize_raw(t.conv1_w_off)
+    arch |> serialize_raw(t.conv1_b_off)
+    arch |> serialize_raw(t.conv2_w_off)
+    arch |> serialize_raw(t.conv2_b_off)
+    arch |> serialize_raw(t.pos_off)
+    arch |> serialize_raw(t.layers_off)
+    arch |> serialize_raw(t.layer_stride)
+    arch |> serialize_raw(t.lnp_w_off)
+    arch |> serialize_raw(t.lnp_b_off)
+    arch |> serialize_raw(t.proj_w_off)
+    arch |> serialize_raw(t.proj_b_off)
+    arch |> serialize_raw(t.normpre_off)
+    arch |> serialize_raw(t.normmid_off)
+    arch |> serialize_raw(t.mm2_w_off)
+}
+
+[unused_argument(t)]
+def private image_post_load(var t : AudioTower) {}   // no derived state — offsets ARE the meta
 
 def audio_has_avgpool(t : AudioTower) : bool => (
     t.proj_kind == AudioProjKind.qwen2a || t.proj_kind == AudioProjKind.voxtral)
@@ -910,7 +979,42 @@ def private load_conv_permuted(m : GGUFMeta; bytes : array<uint8> | #; name : st
 //! into an AudioTower: hparams from the ``clip.audio.*`` keys, every tensor fp32 into the blob
 //! in ``enc_layer_offsets`` order, conv weights permuted for im2col. Vision tensors in a
 //! combined omni mmproj are skipped (the loader only reads ``a.*`` / ``mm.a.*`` names).
+//! Like ``load_model``, keeps a PREPARED IMAGE next to the mmproj (box + knob specific):
+//! the first load saves it, later loads map it in milliseconds with zero-copy planes.
+//! ``DASLLAMA_IMAGE=0`` disables the cache; a ``.dlim`` path loads that image directly.
 def load_audio_tower(path : string; q8 : bool = false) : AudioTower {
+    let tag = q8 ? "tower-q8" : "tower-f32"
+    if (path |> ends_with(".dlim")) {
+        // named directly — no mmproj to regenerate from, so a wrong identity panics
+        apply_box_profile_runtime()
+        let ts_img = ref_time_ticks()
+        var t = AudioTower()
+        if (!load_image(path, t, tag)) {
+            panic("dasLLAMA: '{path}' is not a prepared audio-tower image for this box/knobs (identity {image_identity(tag)}) — regenerate it from the source mmproj gguf")
+        }
+        to_log(LOG_INFO, "dasLLAMA: prepared tower image mapped in {get_time_usec(ts_img) / 1000} ms — {path}\n")
+        return <- t
+    }
+    if (get_env_variable("DASLLAMA_IMAGE") != "0") {
+        apply_box_profile_runtime()   // a backend pin must precede the identity (it names the backend)
+        let img = image_path_for(path, tag)
+        let ts_img = ref_time_ticks()
+        var t = AudioTower()
+        if (load_image(img, t, tag)) {
+            to_log(LOG_INFO, "dasLLAMA: prepared tower image mapped in {get_time_usec(ts_img) / 1000} ms — {img}\n")
+            return <- t
+        }
+        var m <- load_audio_tower_(path, q8)
+        let ts_save = ref_time_ticks()
+        if (save_image(m, img, tag)) {
+            to_log(LOG_INFO, "dasLLAMA: prepared tower image saved in {get_time_usec(ts_save) / 1000} ms — {img}\n")
+        }
+        return <- m
+    }
+    return <- load_audio_tower_(path, q8)
+}
+
+def private load_audio_tower_(path : string; q8 : bool = false) : AudioTower {
     var t = AudioTower()
     let f = fopen(path, "rb")
     if (f == null) {

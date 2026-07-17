@@ -20,6 +20,7 @@ require daslib/json_boost  // read_json / read_json_field for the box profile's 
 require math
 require daslib/random  // int4 RNG state + random_float for token sampling
 require daslib/strings_boost  // join() for the arch-registry diagnostic
+require daslib/apply  // the Model finalizer + the image save/load walk both iterate Model fields
 
 // dasLLAMA inference engine. A model is split into two regions by role: a small fp32 aux blob
 // (the embedding table + the norm weights, which forward always reads as fp32) and the big 2D
@@ -630,6 +631,38 @@ struct Model {
     mtp_enorm_off : int64 = -1      // fblob: nextn.enorm (token-embedding RMS weight), dim
     mtp_hnorm_off : int64 = -1      // fblob: nextn.hnorm (trunk-hidden RMS weight), dim
     mtp_headnorm_off : int64 = -1   // fblob: nextn.shared_head_norm, dim (-1 = output_norm)
+    // prepared-model image backing (dasllama_image): when set, every locked array field above
+    // is a borrowed VIEW into this mapping (zero-copy) and the finalizer below unmaps it.
+    // Both fields are skipped by the image save/load field walk.
+    image_map : void?
+    image_bytes : uint64
+}
+
+// Model's finalizer (every `delete model` site lowers to _::finalize and lands here): image-
+// backed models hold locked BORROWED views over the mapping — those must be forgotten (reset
+// without freeing) before the mapping unmaps; everything owned deletes as usual. The apply walk
+// keeps this valid for future fields without maintenance.
+def finalize(var t : Model) {
+    apply(t) $ [unused_argument(name)] (name : string; var field) {
+        static_if (typeinfo is_array(field)) {
+            if (lock_count(field) != 0) {
+                unsafe {
+                    _builtin_forget_temp_array(field)
+                }
+            } else {
+                delete field
+            }
+        } static_elif (typeinfo is_struct(field)) {
+            delete field
+        }
+    }
+    if (t.image_map != null) {
+        unsafe {
+            fmap_close(t.image_map, t.image_bytes)
+        }
+        t.image_map = null
+        t.image_bytes = 0ul
+    }
 }
 
 // ===== Arch registry: per-architecture blocks + chat template =====
@@ -1277,12 +1310,20 @@ def caps_(m : Model) : LlmCaps {
 // Look the arch up, apply its config flags, and copy its (copyable) block kernels onto the model.
 // The full descriptor stays in the registry; only the hot-path pointers ride on the Model.
 def private resolve_arch(var t : Model; arch : string) {
+    rebind_arch_blocks(t, arch)
+    g_arch_registry[arch].configure(t.config)
+}
+
+// The image loader's post-read half of resolve_arch: block kernels re-bind from the registry,
+// but configure must NOT re-run — the serialized config already carries configure's flags PLUS
+// the gguf's overrides, and configures set overridable fallbacks (gemma4's sliding_window = 1024
+// clobbered the E2B's real 512 and drifted tokens past the window).
+def rebind_arch_blocks(var t : Model; arch : string) {
     if (!key_exists(g_arch_registry, arch)) {
         let registered = join(arch_names(), ", ")
         panic("dasLLAMA: unsupported architecture '{arch}' (registered: {registered})")
     }
     t.arch = arch
-    g_arch_registry[arch].configure(t.config)
     t.blocks = g_arch_registry[arch].blocks
 }
 
@@ -1770,6 +1811,13 @@ var private g_weights_epoch = 0l
 //! model's buffers.
 def public weights_epoch() : int64 {
     return g_weights_epoch
+}
+
+//! The image loader's half of the same contract: mapping a prepared image lands planes at
+//! fresh (possibly recycled) addresses exactly like a gguf load does, so it must move the
+//! epoch too — dasllama_image calls this on every successful load_image.
+def public bump_weights_epoch() {
+    g_weights_epoch++
 }
 
 def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {

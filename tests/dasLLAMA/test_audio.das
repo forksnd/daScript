@@ -162,7 +162,7 @@ def test_ultravox_tower(t : T?) {
             t |> success(abs(float(sum / double(187l * tw.proj_dim)) - 0.002889) < 5e-4, "mean")
             t |> success(abs(mx - 4.306354) < 5e-2, "max")
         }
-        delete tw.fblob
+        delete tw   // image-backed planes are locked views — only the finalizer may release them
     }
 }
 
@@ -204,7 +204,7 @@ def test_voxtral_tower(t : T?) {
             t |> success(abs(float(sum / double(187l * tw.proj_dim)) + 0.001517) < 5e-4, "mean")
             t |> success(abs(mx - 1.459851) < 5e-2, "max")
         }
-        delete tw.fblob
+        delete tw   // image-backed planes are locked views — only the finalizer may release them
     }
 }
 
@@ -218,7 +218,7 @@ def test_omni_tower(t : T?) {
         t |> equal(tw.proj_dim, 2048l, "proj_dim (3B decoder)")
         t |> equal(tw.n_layer, 32l, "layers")
         t |> equal(audio_tokens_per_chunk(tw), 750l, "tokens per 30 s chunk")
-        delete tw.fblob
+        delete tw   // image-backed planes are locked views — only the finalizer may release them
     }
 }
 
@@ -265,6 +265,6 @@ def test_encoder_oracle(t : T?) {
         let mean = sum / double(750l * tw.proj_dim)
         t |> success(abs(float(mean) - 0.009261) < 5e-4, "mean")
         t |> success(abs(mx - 7.527778) < 5e-2, "max")
-        delete tw.fblob
+        delete tw   // image-backed planes are locked views — only the finalizer may release them
     }
 }

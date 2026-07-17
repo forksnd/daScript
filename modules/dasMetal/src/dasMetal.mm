@@ -190,6 +190,37 @@ namespace das {
         }
     }
 
+    // ZERO-COPY buffer over caller-owned memory (the prepared-model-image mappings): wraps the
+    // pages instead of copying — unified memory makes the same bytes GPU-visible. Both pointer
+    // and length must be PAGE-ALIGNED (Metal's bytesNoCopy contract; 16KB on Apple Silicon —
+    // the image format page-aligns every GPU-bound plane). No deallocator: the caller's
+    // mapping must outlive the buffer (release the buffer before fmap_close). Untracked like
+    // the weight buffers above — the wrapped planes are GPU-read-only.
+    MetalBuffer * metal_new_buffer_no_copy ( MetalDevice * dev, void * data, uint64_t bytes, Context * ctx, LineInfoArg * at ) {
+        if ( !dev ) ctx->throw_error_at(at, "metal_new_buffer_no_copy: null device");
+        if ( !data ) ctx->throw_error_at(at, "metal_new_buffer_no_copy: null data");
+        if ( bytes == 0 ) ctx->throw_error_at(at, "metal_new_buffer_no_copy: zero size");
+        uint64_t page = uint64_t(getpagesize());
+        if ( (uintptr_t(data) % page) != 0 || (bytes % page) != 0 ) {
+            ctx->throw_error_at(at, "metal_new_buffer_no_copy: pointer and length must be page-aligned (%llu)",
+                (unsigned long long)page);
+        }
+        @autoreleasepool {
+            id<MTLDevice> d = (__bridge id<MTLDevice>)(void *) dev;
+            id<MTLBuffer> b = [d newBufferWithBytesNoCopy:data length:bytes
+                options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked
+                deallocator:nil];
+            if ( !b ) ctx->throw_error_at(at, "metal_new_buffer_no_copy: wrap failed (%llu bytes)", (unsigned long long)bytes);
+            return retain_handle<MetalBuffer>(b);
+        }
+    }
+
+    uint64_t metal_max_buffer_length ( MetalDevice * dev, Context * ctx, LineInfoArg * at ) {
+        if ( !dev ) ctx->throw_error_at(at, "metal_max_buffer_length: null device");
+        id<MTLDevice> d = (__bridge id<MTLDevice>)(void *) dev;
+        return (uint64_t) d.maxBufferLength;
+    }
+
     void * metal_buffer_contents ( MetalBuffer * buf, Context * ctx, LineInfoArg * at ) {
         if ( !buf ) ctx->throw_error_at(at, "metal_buffer_contents: null buffer");
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)(void *) buf;
@@ -511,6 +542,12 @@ namespace das {
             addExtern<DAS_BIND_FUN(metal_new_buffer_untracked)>(*this, lib, "metal_new_buffer_untracked",
                 SideEffects::modifyExternal, "metal_new_buffer_untracked")
                     ->args({"device", "bytes", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_new_buffer_no_copy)>(*this, lib, "metal_new_buffer_no_copy",
+                SideEffects::modifyExternal, "metal_new_buffer_no_copy")
+                    ->args({"device", "data", "bytes", "context", "at"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(metal_max_buffer_length)>(*this, lib, "metal_max_buffer_length",
+                SideEffects::accessExternal, "metal_max_buffer_length")
+                    ->args({"device", "context", "at"});
             addExtern<DAS_BIND_FUN(metal_buffer_contents)>(*this, lib, "metal_buffer_contents",
                 SideEffects::modifyExternal, "metal_buffer_contents")
                     ->args({"buffer", "context", "at"});

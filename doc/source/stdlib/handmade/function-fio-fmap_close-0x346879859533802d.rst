@@ -1,0 +1,1 @@
+Unmaps a mapping produced by ``fmap_open``. ``data`` and ``size`` must be exactly the base pointer and byte count that ``fmap_open`` returned; every pointer or borrowed view into the mapping is invalid after the call.

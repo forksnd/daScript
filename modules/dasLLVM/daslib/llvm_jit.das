@@ -1556,6 +1556,23 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     def make_call(expr : ExprCallFunc?; doesNotNeedSp : bool) {
+        // $::length over an array truncates Array.size (u64) to i32 — guard the truncation to
+        // match the ALWAYS-ON C++ builtin_array_size panic (interp + AOT). Deliberately not
+        // gated on option_no_range_check: the C++ guard is not a bounds check and never
+        // disables, so the hint must not reintroduce the divergence.
+        if (expr.func.name == "length" && expr.func._module.name == "$" &&
+                (length(expr.arguments) == 1 && expr.arguments[0]._type.isGoodArrayType)) {
+            var arr0 = LLVMBuildLoad2(g_builder, type_to_llvm_type(expr.arguments[0]._type), getE(expr.arguments[0]), "arr.lenguard")
+            var size_i64 = LLVMBuildExtractValue(g_builder, arr0, uint(JIT_ARRAY.SIZE), "array.size.guard")
+            var guard_fail = append_basic_block("len_guard_fail")
+            var guard_end = append_basic_block("len_guard_end")
+            var too_big = LLVMBuildICmp(g_builder, LLVMIntPredicate.LLVMIntUGT, size_i64, LLVMConstInt(types.t_int64, uint64(INT_MAX), 0), "len_over_i32")
+            LLVMBuildCondBr(g_builder, too_big, guard_fail, guard_end)
+            LLVMPositionBuilderAtEnd(g_builder, guard_fail)
+            build_exception("array size exceeds INT_MAX; use long_length() instead", expr.at)
+            LLVMBuildBr(g_builder, guard_end)
+            LLVMPositionBuilderAtEnd(g_builder, guard_end)
+        }
         // lookup intrinsics first
         var intrin_call = lookup_intinsic(g_ctx, g_builder, types, expr, [for (x in expr.arguments); getE(x)])
         if (intrin_call != null) {

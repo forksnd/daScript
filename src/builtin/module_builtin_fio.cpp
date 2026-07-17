@@ -171,6 +171,8 @@ namespace das {
     void builtin_fclose ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     void builtin_fflush ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     void builtin_map_file(const FILE* f, const TBlock<void, TTemporary<TArray<uint8_t>>>& blk, Context* context, LineInfoArg * at) GENERATE_IO_STUB
+    void * builtin_fmap_open ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    void builtin_fmap_close ( void * data, uint64_t size, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int64_t builtin_ftell ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int64_t builtin_fseek ( const FILE * f, int64_t offset, int32_t mode, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * builtin_fread ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
@@ -236,6 +238,8 @@ namespace das {
     const FILE * builtin_fopen  ( const char *, const char *, Context *, LineInfoArg * ) GENERATE_IO_STUB_RET
     vec4f builtin_read ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
     vec4f builtin_write ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
+    vec4f builtin_read64 ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
+    vec4f builtin_write64 ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
     vec4f builtin_load ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
     bool builtin_stat ( const char *, FStat & ) GENERATE_IO_STUB_RET
     bool builtin_chdir ( const char * ) GENERATE_IO_STUB_RET
@@ -371,14 +375,68 @@ namespace das {
         munmap(data, size_t(st.st_size));
     }
 
+    // split fmap (the prepared-model-image loader): the mapping OUTLIVES the call — the caller
+    // owns it and unmaps via fmap_close. POSIX maps PROT_READ/MAP_SHARED: OS-enforced
+    // read-only, clean droppable pages shared across processes through the page cache. The
+    // win32 mmap shim below ignores prot and maps PAGE_WRITECOPY/FILE_MAP_COPY instead —
+    // copy-on-write, so an accidental write does NOT fault there (it just privatizes the
+    // page); pages stay clean and shareable only as long as nothing writes them. The FILE
+    // closes right after mapping — both POSIX and the win32 shim keep the view alive through
+    // the mapping's own file reference. Failure returns null (size stays 0) rather than
+    // throwing: this is a cache probe — the caller declines and regenerates from the source.
+    void * builtin_fmap_open ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) {
+        if ( !size ) context->throw_error_at(at, "fmap_open: null size out-param");
+        *size = 0;
+        if ( !name ) context->throw_error_at(at, "fmap_open: null path");
+        FILE * f = fopen(name, "rb");
+        if ( !f ) return nullptr;
+        das_filestat st;
+        int fd = fileno(f);
+        if ( das_fstat64(fd, st) != 0 ) {
+            fclose(f);
+            return nullptr;
+        }
+        // empty files can't map (mmap(0) is EINVAL); a size that doesn't survive the size_t
+        // round-trip would truncate the mapping on 32-bit targets
+        if ( st.st_size == 0 || uint64_t(st.st_size) != uint64_t(size_t(st.st_size)) ) {
+            fclose(f);
+            return nullptr;
+        }
+        void * data = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+        fclose(f);
+        if ( data == MAP_FAILED ) return nullptr;
+        *size = uint64_t(st.st_size);
+        return data;
+    }
+
+    void builtin_fmap_close ( void * data, uint64_t size, Context * context, LineInfoArg * at ) {
+        if ( !data ) context->throw_error_at(at, "fmap_close: null mapping");
+        munmap(data, size_t(size));
+    }
+
+    // plain ftell/fseek take `long`, which is 32-bit on Windows (LLP64) — use the explicit
+    // 64-bit forms so offsets past 2GB survive on every platform
     int64_t builtin_ftell ( const FILE * f, Context * context, LineInfoArg * at ) {
         if ( !f ) context->throw_error_at(at, "can't ftell NULL");
-        return ftell((FILE *)f);
+#ifdef _MSC_VER
+        return _ftelli64((FILE *)f);
+#else
+        return ftello((FILE *)f);
+#endif
     }
 
     int64_t builtin_fseek ( const FILE * f, int64_t offset, int32_t mode, Context * context, LineInfoArg * at ) {
         if ( !f ) context->throw_error_at(at, "can't fseek NULL");
-        return fseek((FILE *)f, long(offset), mode);
+#ifdef _MSC_VER
+        return _fseeki64((FILE *)f, offset, mode);
+#else
+        // off_t can be 32-bit (no _FILE_OFFSET_BITS=64) — a truncated offset would silently
+        // seek to the wrong position; fail loudly instead
+        if ( int64_t(off_t(offset)) != offset ) {
+            context->throw_error_at(at, "fseek: offset %lli does not fit off_t", (long long int)offset);
+        }
+        return fseeko((FILE *)f, off_t(offset), mode);
+#endif
     }
 
     char * builtin_fread ( const FILE * f, Context * context, LineInfoArg * at ) {
@@ -443,6 +501,9 @@ namespace das {
         if ( !fp ) context.throw_error_at(call->debugInfo, "can't read NULL");
         auto buf = cast<void *>::to(args[1]);
         auto len = cast<int32_t>::to(args[2]);
+        // a negative count is an int32 wrap upstream; fread would sign-extend it to a huge
+        // size_t and stream out of bounds — refuse loudly instead
+        if ( len < 0 ) context.throw_error_at(call->debugInfo, "read of negative byte count %i (int32 wrap?) — use the 64-bit rail (long_fread)", len);
         int32_t res = (int32_t) fread(buf,1,len,fp);
         return cast<int32_t>::from(res);
     }
@@ -454,8 +515,35 @@ namespace das {
         if ( !fp ) context.throw_error_at(call->debugInfo, "can't write NULL");
         auto buf = cast<void *>::to(args[1]);
         auto len = cast<int32_t>::to(args[2]);
+        if ( len < 0 ) context.throw_error_at(call->debugInfo, "write of negative byte count %i (int32 wrap?) — use the 64-bit rail (long_fwrite)", len);
         int32_t res = (int32_t) fwrite(buf,1,len,fp);
         return cast<int32_t>::from(res);
+    }
+
+    vec4f builtin_read64 ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        DAS_ASSERT ( call->types[1]->isRef() || call->types[1]->isRefType()
+            || call->types[1]->type==Type::tString || call->types[1]->type==Type::tPointer);
+        auto fp = cast<FILE *>::to(args[0]);
+        if ( !fp ) context.throw_error_at(call->debugInfo, "can't read NULL");
+        auto buf = cast<void *>::to(args[1]);
+        auto len = cast<int64_t>::to(args[2]);
+        if ( len < 0 ) context.throw_error_at(call->debugInfo, "read of negative byte count %lli", (long long)len);
+        if ( sizeof(size_t) < 8 && uint64_t(len) > uint64_t(SIZE_MAX) ) context.throw_error_at(call->debugInfo, "read of %lli bytes exceeds this platform's address space", (long long)len);
+        int64_t res = (int64_t) fread(buf,1,size_t(len),fp);
+        return cast<int64_t>::from(res);
+    }
+
+    vec4f builtin_write64 ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        DAS_ASSERT ( call->types[1]->isRef() || call->types[1]->isRefType()
+            || call->types[1]->type==Type::tString || call->types[1]->type==Type::tPointer);
+        auto fp = cast<FILE *>::to(args[0]);
+        if ( !fp ) context.throw_error_at(call->debugInfo, "can't write NULL");
+        auto buf = cast<void *>::to(args[1]);
+        auto len = cast<int64_t>::to(args[2]);
+        if ( len < 0 ) context.throw_error_at(call->debugInfo, "write of negative byte count %lli", (long long)len);
+        if ( sizeof(size_t) < 8 && uint64_t(len) > uint64_t(SIZE_MAX) ) context.throw_error_at(call->debugInfo, "write of %lli bytes exceeds this platform's address space", (long long)len);
+        int64_t res = (int64_t) fwrite(buf,1,size_t(len),fp);
+        return cast<int64_t>::from(res);
     }
 
 #ifdef _MSC_VER
@@ -1921,6 +2009,12 @@ namespace das {
             addExtern<DAS_BIND_FUN(builtin_map_file)>(*this, lib, "fmap",
                 SideEffects::modifyExternal, "builtin_map_file")
                     ->args({"file","block","context","line"});
+            addExtern<DAS_BIND_FUN(builtin_fmap_open)>(*this, lib, "fmap_open",
+                SideEffects::modifyExternal, "builtin_fmap_open")
+                    ->args({"path","size","context","line"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(builtin_fmap_close)>(*this, lib, "fmap_close",
+                SideEffects::modifyExternal, "builtin_fmap_close")
+                    ->args({"data","size","context","line"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(builtin_fgets)>(*this, lib, "fgets",
                 SideEffects::modifyExternal, "builtin_fgets")
                     ->args({"file","context","line"});
@@ -1942,6 +2036,12 @@ namespace das {
                     ->args({"file","buffer","length"});
             addInterop<builtin_write,int,const FILE*,vec4f,int32_t>(*this, lib, "_builtin_write",
                 SideEffects::modifyExternal, "builtin_write")
+                    ->args({"file","buffer","length"});
+            addInterop<builtin_read64,int64_t,const FILE*,vec4f,int64_t>(*this, lib, "_builtin_read64",
+                SideEffects::modifyExternal, "builtin_read64")
+                    ->args({"file","buffer","length"});
+            addInterop<builtin_write64,int64_t,const FILE*,vec4f,int64_t>(*this, lib, "_builtin_write64",
+                SideEffects::modifyExternal, "builtin_write64")
                     ->args({"file","buffer","length"});
             addInterop<builtin_load,void,const FILE*,int64_t,const Block &>(*this, lib, "_builtin_load",
                 das::SideEffects::modifyExternal, "builtin_load")
