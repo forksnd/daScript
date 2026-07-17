@@ -122,6 +122,13 @@ def private decode_decline(t : Model; s : Session; pos : int64) : MetalDecodeDec
 
 def private kq_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
 
+// Can the speculative chain feed itself on this model? It needs a GPU embed gather for the
+// argmax winner: the q8 linear copy (cls_q8), or a tied k6 classifier (every K-quant file on
+// the current boards ties a Q6_K token_embd — MetalEmbedK6 gathers straight off the kq planes).
+def private spec_cls_capable(t : Model) : bool {
+    return t.cls_q8 || (t.config.shared_weights && t.emb_fmt == KqFmt.k6)
+}
+
 // One weight site's GEMV — a q8-tagged tensor rides the planar q8 kernels, a kq tensor the
 // plane GEMVs (kq_upload_quants/scales + enc_kq_gemv). yoff places the k/v/w3 output segments.
 def private enc_site_gemv(enc : MetalComputeEncoder?; t : Model; s16 : bool; fmt : KqFmt; woff, rows, n : int64; bx, by, bn, bd : MetalBuffer?; yoff : uint64 = 0ul) {
@@ -289,7 +296,7 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
         r.bxf = pool_acquire(g_pool, g_dev, r.bytes_x)
         // zero-copy logits write straight into s.logits; the pooled staging is fallback (spec-capable models keep staging too — the speculative chain must only ever touch pooled memory)
         r.bnc = nc_logits_for(g_dev, s)
-        if (r.bnc == null || t.cls_q8) {
+        if (r.bnc == null || spec_cls_capable(t)) {
             r.blog = pool_acquire(g_pool, g_dev, r.bytes_log)
         }
         r.u_vocab = uniform_u32(uint(c.vocab_size))
@@ -339,10 +346,16 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     if (r.spec) {
         // the speculative head: greedy-pick the previous step's logits, gather the winner's embedding row into r.bx
         unsafe {
-            var bembq = upload_region(addr < void? >(t.qblob[t.emb_q8_off]), uint64(c.vocab_size * dim))
-            var bembs = upload_scales(t, t.emb_q8_off, c.vocab_size, dim)
             enc_argmax(enc, prev_blog, r.btok, r.u_vocab)
-            enc_embed(enc, r.s16, bembq, bembs, r.btok, r.bx, r.u_dim, dim)
+            if (t.cls_q8) {
+                var bembq = upload_region(addr < void? >(t.qblob[t.emb_q8_off]), uint64(c.vocab_size * dim))
+                var bembs = upload_scales(t, t.emb_q8_off, c.vocab_size, dim)
+                enc_embed(enc, r.s16, bembq, bembs, r.btok, r.bx, r.u_dim, dim)
+            } else {
+                var bembq = kq_upload_quants(g_dev, t, KqFmt.k6, t.wcls_off, c.vocab_size, dim)
+                var bembs = kq_upload_scales(g_dev, t, KqFmt.k6, t.wcls_off, c.vocab_size, dim)
+                enc_embed_k6(enc, bembq, bembs, r.btok, r.bx, r.u_dim, dim, (c.vocab_size * dim) / 256l)
+            }
         }
     }
     // layer-0 attention norm — the per-layer trailing add+rms is fused and feeds the NEXT layer
@@ -638,7 +651,7 @@ def private pre_encode_next(t : Model; s : Session; npos : int64; var prev_blog 
     }
     let ts_enc = ref_time_ticks()
     var r = acquire_step(t, s, npos, mr.koff, mr.voff, mr.cap_rows)
-    if (r.gpu_logits && prev_blog != null && t.cls_q8 && t.config.embed_scale == 1.0 &&
+    if (r.gpu_logits && prev_blog != null && spec_cls_capable(t) && t.config.embed_scale == 1.0 &&
             !has_ple(t.config) && spec_armed()) {
         // speculative chain: the cb runs the moment the previous one drains — CPU tail/sampling/next forward() all overlap GPU execution
         r.spec = true

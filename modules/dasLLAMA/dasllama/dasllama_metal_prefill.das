@@ -782,6 +782,93 @@ class MetalKqGemvK5 {
     }
 }
 
+// Q5_K, select-form nr0=1 twin (the gemv-lab b1c winner): one row per simdgroup, lcpp's q5 lane
+// map, qh via mask-selects into a 16x accumulator pair instead of the int compose. Wins at
+// n < 3072 at EVERY d (4B round: -9..-11% vs b2r on qkv/w13/cls) and at the small-d kv shape
+// (b2r under-occupied); b2r keeps n >= 3072 (3B round). enc_kq_gemv picks per site.
+class MetalKqGemvK5C {
+    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
+    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
+    @ssbo @binding = 2 kqb : array<uint8>   // k5 quant plane, byte view (qs at 160*blk, qh at +128)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="metal_kq_gemv_k5c_msl")]
+    def metal_kq_gemv_k5c {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 4u
+        let ix = lane % 4u
+        let iq = tid / 4u
+        let ir = tid % 4u
+        let l0 = ir * 8u
+        let hm1 = 1u << (2u * iq)
+        let hm2 = hm1 << 1u
+        let hm3 = hm1 << 4u
+        let hm4 = hm2 << 4u
+        let nb = ndim / 256u
+        let first_row = gl_WorkGroupID.x * 2u + gl_SubgroupID
+        var yl : float[16]
+        var yh : float[16]
+        var sumf = 0.0
+        var ib = ix
+        while (ib < nb) {
+            let yb = ib * 256u + iq * 64u + l0
+            var sumy : float[4]
+            for [unroll_full] (l in range(8)) {
+                yl[l] = x[yb + uint(l)]
+                sumy[0] += yl[l]
+                yl[l + 8] = x[yb + 32u + uint(l)]
+                sumy[1] += yl[l + 8]
+                yh[l] = x[yb + 128u + uint(l)]
+                sumy[2] += yh[l]
+                yh[l + 8] = x[yb + 160u + uint(l)]
+                sumy[3] += yh[l + 8]
+            }
+            let blk = first_row * nb + ib
+            let sv = ks4[blk]
+            let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+            let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+            let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+            let sc0 = hw0 & 0x3F3F
+            let sc1 = hw2 & 0x3F3F
+            let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+            let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+            let qs0 = blk * 160u + iq * 32u + l0
+            let qh0 = blk * 160u + 128u + l0
+            var acc1 : float[4]
+            var acc2 : float[4]
+            for [unroll_full] (l in range(8)) {
+                let q1 = uint(kqb[qs0 + uint(l)])
+                let q2 = uint(kqb[qs0 + 64u + uint(l)])
+                let h = uint(kqb[qh0 + uint(l)])
+                acc1[0] += yl[l] * float(q1 & 0x0F)
+                acc1[1] += yl[l + 8] * float(q1 & 0xF0)
+                acc1[2] += yh[l] * float(q2 & 0x0F)
+                acc1[3] += yh[l + 8] * float(q2 & 0xF0)
+                acc2[0] += (h & hm1) != 0u ? yl[l] : 0.0
+                acc2[1] += (h & hm2) != 0u ? yl[l + 8] : 0.0
+                acc2[2] += (h & hm3) != 0u ? yh[l] : 0.0
+                acc2[3] += (h & hm4) != 0u ? yh[l + 8] : 0.0
+            }
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            sumf += dd * (float(sc0 & 255u) * (acc1[0] + 16.0 * acc2[0])
+                + float(sc0 >> 8u) * (acc1[1] * 0.0625 + 16.0 * acc2[1])
+                + float(sc2 & 255u) * (acc1[2] + 16.0 * acc2[2])
+                + float(sc2 >> 8u) * (acc1[3] * 0.0625 + 16.0 * acc2[3]))
+            sumf -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            ib += 4u
+        }
+        let s = simd_sum(sumf)
+        if (lane == 0u && first_row < ddim) {
+            y[first_row] = s
+        }
+    }
+}
+
 // Q6_K: 6-bit q = nibble | 2 qh bits, minus 32; per-16-element SIGNED sub-scales as 4 scattered
 // byte loads (the uint4+select form costs 2 resident simdgroups); d off the trailing f16 plane.
 class MetalKqGemvK6 {

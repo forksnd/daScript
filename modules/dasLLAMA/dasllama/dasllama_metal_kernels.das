@@ -1415,6 +1415,48 @@ class MetalEmbedQ8S16 {
     }
 }
 
+// k6 twin (tied Q6_K classifiers — the spec chain for kq): dequant the winner's row from the
+// disk-order k6 planes, dequant_k6_plane_superblock's exact math — (d * sc16) * (q - 32), the
+// same split scale layout as MetalKqGemvK6 (16B sub-scale blocks @0, f16 d plane @nsb*16).
+class MetalEmbedK6 {
+    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
+    @ssbo @binding = 2 kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
+    @ssbo @binding = 3 tok : array<uint>
+    @ssbo @binding = 4 xo : array<float>    // [dim] residual input out
+    @uniform @binding = 5 dim : uint
+
+    [metal_kernel(name="metal_embed_k6_msl")]
+    def metal_embed_k6 {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= dim) {
+            return
+        }
+        let nb = dim / 256u
+        let ib = gid / 256u
+        let blk = tok[0] * nb + ib
+        let p = gid % 256u
+        let ip = p / 128u
+        let rr = p % 128u
+        let quarter = rr / 32u
+        let l = rr % 32u
+        let qlb = uint(kqb[blk * 192u + ip * 64u + l + ((quarter & 1u) != 0u ? 32u : 0u)])
+        let h = uint(kqb[blk * 192u + 128u + ip * 32u + l])
+        var qv = 0u
+        if (quarter == 0u) {
+            qv = (qlb & 0x0F) | ((h & 0x03) << 4u)
+        } elif (quarter == 1u) {
+            qv = (qlb & 0x0F) | ((h & 0x0C) << 2u)
+        } elif (quarter == 2u) {
+            qv = (qlb >> 4u) | (h & 0x30)
+        } else {
+            qv = (qlb >> 4u) | ((h & 0xC0) >> 2u)
+        }
+        let sc = float((int(kscb[blk * 16u + ip * 8u + l / 16u + quarter * 2u]) ^ 128) - 128)
+        xo[gid] = float(kdh[blk]) * sc * (float(qv) - 32.0)
+    }
+}
+
 // Fused residual-add + rmsnorm: x += a in place, then y = rms(x)·w, one dispatch instead of two.
 // The added row stages through the threadgroup slab since barrier() is a threadgroup fence only.
 // dim caps at the slab; wider models take the unfused pair (enc_add_rms_site).
@@ -4627,11 +4669,13 @@ var g_pso_argmax : MetalComputePipeline?
 var g_pso_copy_row : MetalComputePipeline?   // zero-copy logits: staging row -> wrapped session storage
 var g_pso_emb : MetalComputePipeline?
 var g_pso_emb16 : MetalComputePipeline?
+var g_pso_emb_k6 : MetalComputePipeline?     // tied-k6 spec chain's embed gather
 var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
 var g_pso_qkvrs32 : MetalComputePipeline?
 var g_pso_w13sw : MetalComputePipeline?
 var g_pso_kq_k4 : MetalComputePipeline?
 var g_pso_kq_k5 : MetalComputePipeline?
+var g_pso_kq_k5c : MetalComputePipeline?   // the select-form nr0=1 twin — n < 3072 / small-d sites
 var g_pso_kq_k6 : MetalComputePipeline?
 var g_pso_kq_mvb2_k4 : MetalComputePipeline?   // batch B=2..8: the kq ext small-batch mv twins
 var g_pso_kq_mvb4_k4 : MetalComputePipeline?
@@ -4728,11 +4772,13 @@ def metal_decode_init : bool {
     g_pso_copy_row = compile_pso(metal_copy_row_msl, metal_copy_row_msl_entry, metal_copy_row_msl_fastmath, ok)
     g_pso_emb = compile_pso(metal_embed_q8_msl, metal_embed_q8_msl_entry, metal_embed_q8_msl_fastmath, ok)
     g_pso_emb16 = compile_pso(metal_embed_q8_s16_msl, metal_embed_q8_s16_msl_entry, metal_embed_q8_s16_msl_fastmath, ok)
+    g_pso_emb_k6 = compile_pso(metal_embed_k6_msl, metal_embed_k6_msl_entry, metal_embed_k6_msl_fastmath, ok)
     g_pso_qkvrs16 = compile_pso(metal_q8_gemv_qkv_rs16_msl, metal_q8_gemv_qkv_rs16_msl_entry, metal_q8_gemv_qkv_rs16_msl_fastmath, ok)
     g_pso_qkvrs32 = compile_pso(metal_q8_gemv_qkv_rs32_msl, metal_q8_gemv_qkv_rs32_msl_entry, metal_q8_gemv_qkv_rs32_msl_fastmath, ok)
     g_pso_w13sw = compile_pso(metal_q8_gemv_w13sw16_msl, metal_q8_gemv_w13sw16_msl_entry, metal_q8_gemv_w13sw16_msl_fastmath, ok)
     g_pso_kq_k4 = compile_pso(metal_kq_gemv_k4_msl, metal_kq_gemv_k4_msl_entry, metal_kq_gemv_k4_msl_fastmath, ok)
     g_pso_kq_k5 = compile_pso(metal_kq_gemv_k5_msl, metal_kq_gemv_k5_msl_entry, metal_kq_gemv_k5_msl_fastmath, ok)
+    g_pso_kq_k5c = compile_pso(metal_kq_gemv_k5c_msl, metal_kq_gemv_k5c_msl_entry, metal_kq_gemv_k5c_msl_fastmath, ok)
     g_pso_kq_k6 = compile_pso(metal_kq_gemv_k6_msl, metal_kq_gemv_k6_msl_entry, metal_kq_gemv_k6_msl_fastmath, ok)
     g_pso_kq_mvb2_k4 = compile_pso(metal_kq_mvb2_k4_msl, metal_kq_mvb2_k4_msl_entry, metal_kq_mvb2_k4_msl_fastmath, ok)
     g_pso_kq_mvb4_k4 = compile_pso(metal_kq_mvb4_k4_msl, metal_kq_mvb4_k4_msl_entry, metal_kq_mvb4_k4_msl_fastmath, ok)
@@ -4807,9 +4853,16 @@ def enc_gemv(enc : MetalComputeEncoder?; s16 : bool; bwq, bws, bx, by, bn, bd : 
 // (kq_upload_quants + kq_upload_scales). k6 binds the scale buffer twice: the trailing packed
 // f16 d plane at byte nsb*16, the 16B sub-scale blocks at 0. Geometry: 64-thread tg, 4 rows.
 def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by, bn, bd : MetalBuffer?; rows, n : int64; yoff : uint64 = 0ul; xoff : uint64 = 0ul) {
+    var groups = (rows + 3l) / 4l
     if (fmt == KqFmt.k6) {
         metal_set_pipeline(enc, g_pso_kq_k6)
         metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
+    } elif (fmt == KqFmt.k5 && (n < 3072l || rows <= 1024l)) {
+        // the select-form nr0=1 twin: wins every d at n < 3072 (gemv lab, 4B round) and the
+        // small-d kv shape (b2r under-occupied); 2 rows/tg instead of b2r's 4
+        metal_set_pipeline(enc, g_pso_kq_k5c)
+        metal_set_buffer(enc, bs, 0ul, 0)
+        groups = (rows + 1l) / 2l
     } else {
         metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_k4 : g_pso_kq_k5)
         metal_set_buffer(enc, bs, 0ul, 0)
@@ -4820,7 +4873,7 @@ def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by, bn, bd 
     metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bd, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), 1u, 1u), uint3(64u, 1u, 1u))
+    metal_dispatch_threadgroups(enc, uint3(uint(groups), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // K-quant small-batch mv (B = 2..8): the kq ext twins — R=4 column groups via grid.y (gcols),
@@ -5046,6 +5099,19 @@ def enc_embed(enc : MetalComputeEncoder?; s16 : bool; bq, bs, btok, bx, bdim : M
     metal_set_buffer(enc, btok, 0ul, 2)
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, bdim, 0ul, 4)
+    metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
+// the tied-k6 spec embed gather: the scale buffer binds twice (f16 d plane @nsb*16 halfwords +
+// sub-scale byte blocks @0), the quant plane once — nsb = the plane's TOTAL superblock count
+def enc_embed_k6(enc : MetalComputeEncoder?; bq, bs, btok, bx, bdim : MetalBuffer?; dim, nsb : int64) {
+    metal_set_pipeline(enc, g_pso_emb_k6)
+    metal_set_buffer(enc, bs, uint64(nsb * 16l), 0)
+    metal_set_buffer(enc, bs, 0ul, 1)
+    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, btok, 0ul, 3)
+    metal_set_buffer(enc, bx, 0ul, 4)
+    metal_set_buffer(enc, bdim, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -5669,6 +5735,7 @@ def metal_kernels_release {
     }
     release_pso(g_pso_kq_k4)
     release_pso(g_pso_kq_k5)
+    release_pso(g_pso_kq_k5c)
     release_pso(g_pso_kq_k6)
     release_pso(g_pso_kq_mvb2_k4)
     release_pso(g_pso_kq_mvb4_k4)
@@ -5747,6 +5814,7 @@ def metal_kernels_release {
         metal_release(g_pso_emb16)
         g_pso_emb16 = null
     }
+    release_pso(g_pso_emb_k6)
     if (g_pso_qkvrs16 != null) {
         metal_release(g_pso_qkvrs16)
         g_pso_qkvrs16 = null

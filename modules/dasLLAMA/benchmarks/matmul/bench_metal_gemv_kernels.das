@@ -3503,9 +3503,12 @@ def private run_lab(b : B?; variants) {
     }
     // pre-built B uniforms for the dynamic-B variant
     var bbufs <- [for (bi in range(5)); upload_u32(dev, uint(1 << bi))]
-    // the llama-3B decode GEMV geometries (n = reduction dim, d = output rows)
+    // the llama-3B decode GEMV geometries (n = reduction dim, d = output rows) + the qwen3-4B
+    // set (dim 2560 / qd 4096 / hidden 9728 — qd != dim splits the q and wo shapes)
     var shapes <- [("q3b", 3072l, 3072l), ("kv3b", 3072l, 1024l), ("qkv3b", 3072l, 5120l), ("w13_3b", 3072l, 8192l),
-                   ("w2_3b", 8192l, 3072l), ("cls3b", 3072l, 128256l)]
+                   ("w2_3b", 8192l, 3072l), ("cls3b", 3072l, 128256l),
+                   ("qkv4b", 2560l, 6144l), ("wo4b", 4096l, 2560l), ("w13_4b", 2560l, 9728l),
+                   ("w2_4b", 9728l, 2560l), ("cls4b", 2560l, 151936l)]
     for (sh in shapes) {
         if (!want("DASMETAL_LAB_SHAPES", sh._0)) {
             continue
