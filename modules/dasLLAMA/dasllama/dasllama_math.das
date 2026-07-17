@@ -1469,6 +1469,7 @@ var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend
 // is_gelu picks GeGLU over SwiGLU (swiglu_oai belongs to biased arches the callers exclude).
 typedef MoeGpuFfnFn = function<(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; nfe : int64; nrows : int64; is_gelu : bool) : void>
 typedef MoeGpuUploadFn = function<(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int) : bool>
+typedef MoeGpuClsFn = function<(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
 
 [unused_argument(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)]
 def private moe_gpu_unset_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; is_gelu : bool) {
@@ -1480,16 +1481,24 @@ def private moe_gpu_unset_upload(wq : uint8 const?; ws : uint8 const?; woff : in
     return false
 }
 
+[unused_argument(yp, woff, xqp, xsp, n, d)]
+def private moe_gpu_unset_cls(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    panic("dasLLAMA: GPU classifier dispatch hit without an installed GPU tier")
+}
+
 var g_moe_gpu_ffn = @@moe_gpu_unset_ffn
 var g_moe_gpu_upload = @@moe_gpu_unset_upload
+var g_moe_gpu_cls = @@moe_gpu_unset_cls
 var g_moe_gpu_installed = false
 var g_moe_gpu_layer_count = 0l         // K = layers offloaded from the END (env-driven, set by the tier)
 var g_moe_gpu_from_layer = 1000000l    // first offloaded layer (n_layers - K, set by the loader)
+var g_moe_gpu_cls_off = -1l            // element offset of the resident classifier plane (loader contract)
 
 //! Install the GPU MoE tier (a GPU backend calls this at [init] when its device probe passes).
-def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn) {
+def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn) {
     g_moe_gpu_ffn = ffn
     g_moe_gpu_upload = upload
+    g_moe_gpu_cls = cls
     g_moe_gpu_installed = true
 }
 
@@ -1508,6 +1517,15 @@ def public set_moe_gpu_from_layer(from_layer : int64) {
 
 def public moe_gpu_layer_on_gpu(l : int64) : bool {
     return g_moe_gpu_installed && l >= g_moe_gpu_from_layer
+}
+
+//! Loader contract: the resident classifier plane's element offset (-1 = none; reset per load).
+def public set_moe_gpu_cls_off(woff : int64) {
+    g_moe_gpu_cls_off = woff
+}
+
+def public moe_gpu_cls_on_gpu(woff : int64) : bool {
+    return g_moe_gpu_installed && woff == g_moe_gpu_cls_off
 }
 
 //! Upload one weight stack ([rows x n] at element offset woff) as the GPU tier's row-major
@@ -1534,6 +1552,16 @@ def public matmul_moe_gpu_ffn(var gout : array<float>; offs1 : array<int64>; off
         invoke(g_moe_gpu_ffn, addr(gout[0]),
             addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,
             addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, nfe, nrows, is_gelu)
+    }
+}
+
+//! Classifier GEMV on the GPU tier — y[d] = W · x over the resident plane at woff (one region
+//! covering the whole vocab). xq/xs is the activation vector in the plane's own quant form —
+//! q8_0 per-32 scales for a q8 plane, Q8_K per-256 for kq (the tier resolves which from the
+//! uploaded stack format).
+def public matmul_moe_gpu_cls(var y : array<float>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_moe_gpu_cls, addr(y[0]), woff, addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
     }
 }
 

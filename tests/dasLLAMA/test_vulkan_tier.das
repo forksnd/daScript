@@ -178,7 +178,7 @@ def private compare_gout(gpu, refv : array<float>) : tuple<maxdiff : float; maxr
 def test_vulkan_moe_ffn_vs_ref(t : T?) {
     t |> run("vulkan MoE FFN tier == CPU reference (decode GEMV + prefill batch arms)") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
             // synthetic stacks: gate/up are (NE*NFE) x N, down is (NE*N) x NFE
             var wq1 : array<int8>
             var ws1 : array<float>
@@ -445,7 +445,7 @@ def private ref_ffn_kq(offs1, offs3, offs2 : array<int64>; nreg : int;
 def test_vulkan_moe_ffn_kq(t : T?) {
     t |> run("vulkan MoE kq tier (k4 gate/up + k5/k6 down) == CPU reference") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
             // k4 gate/up stacks + BOTH down formats in one down stack region set is not a real
             // shape — use two arms sharing the gate/up stacks: down = k6, then down = k5 at a
             // fresh offset (the 35B carries k5 downs on most layers, k6 on the last two)
@@ -521,6 +521,49 @@ def test_vulkan_moe_ffn_kq(t : T?) {
                 delete boffs2
                 delete refboffs2
             }
+
+            // classifier arm (the head offload's dispatch): one whole-plane k6 GEMV — ONE
+            // region covering every row, device meta + pre-recorded cmd. Two passes with
+            // perturbed activations exercise the recorded-resubmit path.
+            let CWOFF = 9000000l
+            let CVOCAB = 512l
+            var wqc : array<uint8>
+            var wsc : array<uint8>
+            fill_kq_stack(3, CVOCAB, KN, 71l, false, wqc, wsc)
+            up_ok = moe_gpu_upload_stack(wqc, wsc, CWOFF, KN, CVOCAB, 3)
+            t |> success(up_ok, "k6 classifier plane uploaded")
+            var wc : array<float>
+            dequant_kq_stack(3, wqc, wsc, CVOCAB, KN, wc)
+            var ylog : array<float>
+            ylog |> resize(int(CVOCAB))
+            let nsbc = int(KN / 256l)
+            for (cpass in range(2)) {
+                fill_acts_kq(xq, xs, 1l)
+                xq[0] = int8(int(xq[0]) + cpass * 3)
+                matmul_moe_gpu_cls(ylog, CWOFF, xq, xs, KN, CVOCAB)
+                var yref : array<float>
+                yref |> resize(int(CVOCAB))
+                for (r in range(int(CVOCAB))) {
+                    var acc = 0.0lf
+                    for (sb in range(nsbc)) {
+                        var dd = 0.0lf
+                        for (j in range(256)) {
+                            dd += double(wc[r * int(KN) + sb * 256 + j]) * double(xq[sb * 256 + j])
+                        }
+                        acc += dd * double(xs[sb])
+                    }
+                    yref[r] = float(acc)
+                }
+                let cc = compare_gout(ylog, yref)
+                t |> success(cc.maxref > 0.0, "cls arm pass {cpass} produced non-trivial outputs")
+                t |> success(cc.maxdiff <= float(REL_TOL) * cc.maxref,
+                    "cls GEMV arm pass {cpass} within tolerance (maxdiff {cc.maxdiff} vs {float(REL_TOL) * cc.maxref} bar, maxref {cc.maxref})")
+                delete yref
+            }
+            delete wqc
+            delete wsc
+            delete wc
+            delete ylog
             delete wq1
             delete ws1
             delete wq3

@@ -1773,6 +1773,7 @@ def private moe_gpu_gather_upload(t : Model; f : KqFmt; woff : int64; n, rows, s
 // resident from the end while the tier's VRAM budget holds; from_layer freezes the resident set.
 def moe_gpu_upload_resident(var t : Model) {
     set_moe_gpu_from_layer(t.config.n_layers)   // nothing resident until an upload lands
+    set_moe_gpu_cls_off(-1l)
     // mx4/biased expert stacks never dispatch on the GPU, so they never upload either
     if (t.quant != QuantMode.q8 || t.config.n_expert <= 0l || moe_gpu_layer_count() <= 0l
             || t.experts_mx4 || t.config.moe_exps_bias) {
@@ -1791,6 +1792,15 @@ def moe_gpu_upload_resident(var t : Model) {
     var from_l = layers
     var wq : array<uint8>
     var ws : array<uint8>
+    // classifier plane first — the board's best ms-per-GB region (one whole-vocab GEMV serves
+    // every token). One slice: the repack groups the plane globally, tail rows disk-order.
+    // DASLLAMA_GPU_CLS=0 keeps it on the CPU (A/B lever).
+    let cls_fmt = t.config.shared_weights ? t.emb_fmt : t.wcls_fmt
+    let cls_servable = cls_fmt == KqFmt.q8 ? (t.cls_q8 || !t.config.shared_weights) : moe_gpu_fmt_kq(cls_fmt)
+    if (cls_servable && get_env_variable("DASLLAMA_GPU_CLS") != "0"
+            && moe_gpu_gather_upload(t, cls_fmt, t.wcls_off, dim, t.config.vocab_size, t.config.vocab_size, mr, kgroup, wbias, wq, ws)) {
+        set_moe_gpu_cls_off(t.wcls_off)
+    }
     for (i in range64(want)) {
         let l = layers - 1l - i
         let f1 = fmt_at(t.we1_fmt, l)
@@ -1819,8 +1829,9 @@ def moe_gpu_upload_resident(var t : Model) {
     delete wq
     delete ws
     set_moe_gpu_from_layer(from_l)
-    if (from_l < layers) {
-        to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: expert stacks of layers [{from_l}..{layers}) resident, {get_time_usec(ts_gpu) / 1000} ms\n")
+    if (from_l < layers || moe_gpu_cls_on_gpu(t.wcls_off)) {
+        let cls_note = moe_gpu_cls_on_gpu(t.wcls_off) ? "classifier + " : ""
+        to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: {cls_note}expert stacks of layers [{from_l}..{layers}) resident, {get_time_usec(ts_gpu) / 1000} ms\n")
     }
 }
 
@@ -7296,6 +7307,31 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
     }
 }
 
+// The classifier matmul y = wcls · xb: through the GPU tier's resident plane when the loader
+// uploaded it (one whole-vocab GEMV; the activation quantizes to the plane's own form), else
+// the CPU path for the classifier's format.
+def private mm_cls(var y : array<float>; t : Model; x : array<float>; var xq : array<int8>; var xs : array<float>; var xbs : array<int>; n, d : int64) {
+    let cls_fmt = t.config.shared_weights ? t.emb_fmt : t.wcls_fmt
+    let tied_f32 = t.config.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
+    if (moe_gpu_cls_on_gpu(t.wcls_off)) {
+        if (cls_fmt == KqFmt.q8) {
+            quantize_q8_0_into(x, n, xq, xs, 0l, 0l)
+        } else {
+            quantize_q8_k_into(x, n, xq, xs, xbs, 0l, 0l, 0l)
+        }
+        matmul_moe_gpu_cls(y, t.wcls_off, xq, xs, n, d)
+    } elif (tied_f32) {
+        // tied weights (fp32/q4_0 loads): the classifier IS the fp32 embedding table
+        mm_fblob(y, t, t.tok_emb_off, x, n, d)
+    } elif (cls_fmt != KqFmt.q8) {
+        // K-quant classifier (tied plane copy or untied kq output.weight)
+        mm_kq(y, t, cls_fmt, t.wcls_off, x, xq, xs, xbs, n, d)
+    } else {
+        // untied — or the tied classifier's Q8 transcode (the exact quants llama.cpp matmuls)
+        mm(y, t, t.wcls_off, x, xq, xs, n, d)
+    }
+}
+
 // Can the classifier run as the fused matmul+softcap team chain? Q8 or repacked-kq wcls (the
 // tied-f32 load takes mm_fblob and can't), team mode + a backend row core, 32-aligned vocab,
 // and worth threading.
@@ -7430,20 +7466,11 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
-    if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
+    if (c.final_logit_softcap > 0.0 && !tied_f32 && !moe_gpu_cls_on_gpu(t.wcls_off) && fused_cls_ok(t)) {
         // Gemma2/E-series: soft-cap fused into the classifier chunks (Q8 or repacked-kq wcls)
         cls_softcap_chain(t, s, c.final_logit_softcap)
     } else {
-        if (tied_f32) {
-            // tied weights (fp32/q4_0 loads): the classifier IS the fp32 embedding table
-            mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
-        } elif (cls_fmt != KqFmt.q8) {
-            // K-quant classifier (tied plane copy or untied kq output.weight)
-            mm_kq(s.logits, t, cls_fmt, t.wcls_off, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
-        } else {
-            // untied — or the tied classifier's Q8 transcode (the exact quants llama.cpp matmuls)
-            mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
-        }
+        mm_cls(s.logits, t, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
         if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
             softcap4(s.logits, c.vocab_size, c.final_logit_softcap)
         }
@@ -7508,15 +7535,7 @@ def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bo
     rms_at(s.xb, t, t.mtp_headnorm_off >= 0l ? t.mtp_headnorm_off : t.rms_final_off, s.x, dim)
     copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)   // the head's own h_nextn — recursive drafting handoff
     s.mtp_h_pos1 = 0l   // NOT a trunk hidden: the warm's seam row must not consume it
-    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
-    let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
-    if (tied_f32) {
-        mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
-    } elif (cls_fmt != KqFmt.q8) {
-        mm_kq(s.logits, t, cls_fmt, t.wcls_off, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
-    } else {
-        mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
-    }
+    mm_cls(s.logits, t, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
 }
 
 //! Snapshot / restore the deltanet recurrent state (conv history + S + dn_pos) around a
@@ -7547,15 +7566,7 @@ def private mtp_verify_row0(t : Model; var s : Session) {
     let c = t.config
     let dim = c.dim
     rms_at(s.xb, t, t.rms_final_off, s.x_b, 0l, dim)
-    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
-    let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
-    if (tied_f32) {
-        mm_fblob(s.mtp_logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
-    } elif (cls_fmt != KqFmt.q8) {
-        mm_kq(s.mtp_logits, t, cls_fmt, t.wcls_off, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
-    } else {
-        mm(s.mtp_logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
-    }
+    mm_cls(s.mtp_logits, t, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
     // mirror the plain classifier tail exactly — `truth` is the invariance contract's load-bearing
     // edge, so it must match plain decode BY CONSTRUCTION (inert on qwen35: no softcap, no suppress)
     if (c.final_logit_softcap > 0.0) {
@@ -10328,16 +10339,10 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
-    if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
+    if (c.final_logit_softcap > 0.0 && !tied_f32 && !moe_gpu_cls_on_gpu(t.wcls_off) && fused_cls_ok(t)) {
         cls_softcap_chain(t, s, c.final_logit_softcap)
     } else {
-        if (tied_f32) {
-            mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
-        } elif (cls_fmt != KqFmt.q8) {
-            mm_kq(s.logits, t, cls_fmt, t.wcls_off, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
-        } else {
-            mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
-        }
+        mm_cls(s.logits, t, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
         if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
             softcap4(s.logits, c.vocab_size, c.final_logit_softcap)
         }

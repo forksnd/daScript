@@ -197,42 +197,41 @@ def q8_moe_batch {
 }
 
 // ===== the FFN mid-chain kernels =====
-// The act/requant steps between the gate+up and down GEMMs, so the whole MoE FFN is one submit
-// and the hidden activations never cross PCIe. Only the globals a kernel references are emitted
-// into its SPIR-V, so binding 3 doubles as a float view (vk_up) here while the GEMMs see uints.
-// vk_meta (per FFN dispatch): [0] = element count, [1] = gelu flag, [2] = 32-block count.
+// ONE fused act+requant step between the gate+up and down GEMMs, so the whole MoE FFN is one
+// submit with a single mid-chain barrier and the hidden activations never cross PCIe. Only the
+// globals a kernel references are emitted into its SPIR-V, so binding 0 doubles as a float view
+// here (vk_upf, the up plane) while the GEMMs see it as uint weights; vk_xq/vk_xs (3/4) are the
+// requant OUTPUT planes in this set. vk_meta (per FFN dispatch): [0] = element count, [1] =
+// gelu flag, [2] = 32-block/superblock count.
+//
+// The act value is recomputed for the quant pass instead of staged (same expression, same f32
+// ops — identical bits both times); vs the old separate act kernel this drops one dispatch, one
+// barrier, and the activated plane's write+re-read. Act formulas mirror the CPU swiglu/geglu
+// cores; exp/tanh precision differs from libm (the parity bar is token-identical, not
+// bit-identical). Requant mirrors quantize_q8_0_into_ptr / quantize_q8_k_into_ptr: per-block
+// |x| amax -> d = amax/127 -> q = round(x/d); GPU round() may split rounding-halfway cases
+// differently — same parity bar. Q8_K block sums are NOT stored — the kq GEMMs recompute them
+// via sdot4 vs 0x01010101 on activation words they load anyway.
 
-var @ssbo @binding = 3 vk_up : array<float>
+var @ssbo @binding = 0 vk_upf : array<float>
 
-// elementwise g = act(g) * u over the gate/up planes (g in vk_y, u in vk_up). Same formulas as
-// the CPU swiglu/geglu cores; exp/tanh precision differs from libm (the parity bar is
-// token-identical, not bit-identical).
-[compute_shader(local_size_x=256, name="q8_moe_act_spv")]
-def q8_moe_act {
-    let i = gl_GlobalInvocationID.x
-    if (i < vk_meta[0u]) {
-        let v = vk_y[i]
-        let u = vk_up[i]
-        if (vk_meta[1u] != 0u) {
-            let kg = 0.7978845608028654   // sqrt(2/pi), the CPU geglu tanh-approx constant
-            vk_y[i] = (0.5 * v * (1.0 + tanh(kg * (v + 0.044715 * v * v * v)))) * u
-        } else {
-            vk_y[i] = (v / (1.0 + exp(-v))) * u
-        }
-    }
-}
+// g = act(g) * u — the SwiGLU/GeGLU elementwise core (gelu taken as uint: the emitter's
+// scalar params are numeric)
+def private act_mul(v, u : float; gelu : uint) : float => (
+    gelu != 0u ? (0.5 * v * (1.0 + tanh(0.7978845608028654 * (v + 0.044715 * v * v * v)))) * u
+        : (v / (1.0 + exp(-v))) * u)
 
-// q8_0 requant of the activated hidden rows (vk_y floats -> vk_xq quant words + vk_xs scales),
-// one thread per 32-block, mirroring quantize_q8_0_into_ptr: |x| amax -> d = amax/127 ->
-// q = round(x/d). GPU round() may split rounding-halfway cases differently — same parity bar.
-[compute_shader(local_size_x=256, name="q8_moe_requant_spv")]
-def q8_moe_requant {
+// fused act + q8_0 requant of the hidden rows (gate floats in vk_y, up in vk_upf -> vk_xq
+// quant words + vk_xs per-32 scales), one thread per 32-block
+[compute_shader(local_size_x=256, name="q8_moe_actrq_spv")]
+def q8_moe_actrq {
     let b = gl_GlobalInvocationID.x
     if (b < vk_meta[2u]) {
         let base = b * 32u
+        let gelu = vk_meta[1u]
         var amax = 0.0
         for (i in range(32)) {
-            amax = max(amax, abs(vk_y[base + uint(i)]))
+            amax = max(amax, abs(act_mul(vk_y[base + uint(i)], vk_upf[base + uint(i)], gelu)))
         }
         let d = amax / 127.0
         let id = d != 0.0 ? 1.0 / d : 0.0
@@ -241,7 +240,7 @@ def q8_moe_requant {
             let wb = base + uint(w) * 4u
             var word = 0u
             for (j in range(4)) {
-                let q = int(round(vk_y[wb + uint(j)] * id))
+                let q = int(round(act_mul(vk_y[wb + uint(j)], vk_upf[wb + uint(j)], gelu) * id))
                 word = word | ((uint(q) & 0xFF) << (uint(j) * 8u))
             }
             vk_xq[b * 8u + uint(w)] = word
@@ -249,18 +248,16 @@ def q8_moe_requant {
     }
 }
 
-// Q8_K requant twin for the K-quant chains (mirrors quantize_q8_k_into_ptr): one thread per
-// 256-weight superblock — per-256 amax -> d = amax/127 -> round(x/d); scale plane is per
-// superblock. Block sums are NOT stored — the kq GEMMs recompute them via sdot4 vs 0x01010101
-// on activation words they load anyway. vk_meta[2] = superblock count for these chains.
-[compute_shader(local_size_x=256, name="q8k_moe_requant_spv")]
-def q8k_moe_requant {
+// the Q8_K twin for the K-quant chains: one thread per 256-weight superblock, per-256 scale
+[compute_shader(local_size_x=256, name="q8k_moe_actrq_spv")]
+def q8k_moe_actrq {
     let b = gl_GlobalInvocationID.x
     if (b < vk_meta[2u]) {
         let base = b * 256u
+        let gelu = vk_meta[1u]
         var amax = 0.0
         for (i in range(256)) {
-            amax = max(amax, abs(vk_y[base + uint(i)]))
+            amax = max(amax, abs(act_mul(vk_y[base + uint(i)], vk_upf[base + uint(i)], gelu)))
         }
         let d = amax / 127.0
         let id = d != 0.0 ? 1.0 / d : 0.0
@@ -269,7 +266,7 @@ def q8k_moe_requant {
             let wb = base + uint(w) * 4u
             var word = 0u
             for (j in range(4)) {
-                let q = int(round(vk_y[wb + uint(j)] * id))
+                let q = int(round(act_mul(vk_y[wb + uint(j)], vk_upf[wb + uint(j)], gelu) * id))
                 word = word | ((uint(q) & 0xFF) << (uint(j) * 8u))
             }
             vk_xq[b * 64u + uint(w)] = word
@@ -445,7 +442,16 @@ def kq_moe_gemv_k6 {
 
 // ===== device state (process-lifetime; never finalized by design) =====
 
-let private VRAM_BUDGET = 5_500_000_000l   // resident-weight cap: under the measured ~6.5GB WDDM paging cliff
+let private WEIGHT_CAP = 4_200_000_000l    // default resident-weight cap. The WDDM cliff is TOTAL
+                                           // commit (~6.5GiB of 8GB measured: q8-era K=8 at 4.7GB
+                                           // weights + 1.7GB desktop thrashed nonlinearly), and other
+                                           // processes are INVISIBLE to the Vulkan budget query (NV
+                                           // reports 7.6GB "budget" while nvidia-smi shows 2.6GB in
+                                           // use by others) — so the default stays conservative and
+                                           // DASLLAMA_GPU_VRAM_MB overrides it for bigger cards
+let private VRAM_RESERVE = 805_306_368l    // headroom below the queried heap budget when it clamps
+                                           // the cap down: the tier's own scratch (~210MB batch
+                                           // planes) + eviction slack
 let private STAGING_BYTES = 268_435_456l   // one upload chunk (largest single memcpy)
 let private XQ_BYTES = 1_048_576l          // per-stack activation quants capacity
 let private XS_BYTES = 262_144l            // ... their scales
@@ -462,6 +468,7 @@ let private BATCH_CHUNK_ROWS = 8_192l      // dispatch row-window cap (bounds y 
 let private BATCH_HQ_BYTES = 33_554_432l   // device requantized-hidden quants (the down GEMM's activations)
 let private BATCH_HS_BYTES = 8_388_608l    // ... its scale plane
 let private FFN_META_BYTES = 64l           // act/requant params (element count, gelu flag, block count)
+let private CLS_META_BYTES = 64l           // classifier GEMV params (one region, filled once)
 
 struct private HostBuf {
     buf : uint64       // VkBuffer
@@ -491,14 +498,20 @@ struct private VkStack {
     batch_y : uint64         // which shared y plane batch_set binds (role-fixed per stack)
     batch_xq : uint64        // which activation-quant plane it binds (gate/up: gathered x; down: hq)
     batch_made : bool
+    // classifier dispatch state (lazy — set up on the first cls GEMV against this stack)
+    cls_set : VkDescriptorSet
+    cls_meta_dev : uint64    // device meta — vocab-row dispatches run ~150K subgroups, each
+                             // reading params; host-visible meta would be uncached PCIe reads
+    cls_cmd : VkCommandBuffer
+    cls_made : bool
 }
 
-// pre-recorded decode-form FFN chain per (gate, up, down) stack triple: GEMV pair, act, requant,
-// down GEMV, y DMA — refreshed per token via the stacks' host-visible metas, resubmitted as-is
+// pre-recorded decode-form FFN chain per (gate, up, down) stack triple: GEMV pair, fused
+// act+requant, down GEMV, y DMA — refreshed per token via the stacks' host-visible metas,
+// resubmitted as-is
 struct private FfnCmd {
     cmd : VkCommandBuffer
-    act_set : VkDescriptorSet     // gate y_dev (rw) + up y_dev + ffn meta
-    rq_set : VkDescriptorSet      // gate y_dev -> hq/hs device planes
+    actrq_set : VkDescriptorSet   // gate y_dev + up y_dev (vk_upf) -> hq/hs device planes
     down_set : VkDescriptorSet    // down stack planes + hq/hs as activations + its y_dev
     nrows : int64                 // row count cmd was recorded with
 }
@@ -515,15 +528,15 @@ struct private GpuState {
     pipe_layout : PipelineLayout
     pipeline : Pipeline
     batch_pipeline : Pipeline   // prefill batched-GEMM kernel (same set/pipe layout)
-    act_pipeline : Pipeline     // elementwise act(g)*u over the gate/up planes
-    rq_pipeline : Pipeline      // q8_0 requant of the activated hidden rows
+    actrq_pipeline : Pipeline   // fused act(g)*u + q8_0 requant of the hidden rows
     gemv_k4 : Pipeline          // native K-quant GEMVs (per-format decode kernels)
     gemv_k5 : Pipeline
     gemv_k6 : Pipeline
-    rq_k_pipeline : Pipeline    // Q8_K requant twin (per-256 scale) for the kq chains
+    actrq_k_pipeline : Pipeline // fused act + Q8_K requant twin (per-256 scale) for the kq chains
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
+    weight_budget : int64    // resident-weight cap — queried heap budget minus reserve, or VRAM_BUDGET
     @do_not_delete stacks : array<VkStack>
     ffn_cmds : table<int64; FfnCmd>   // (gate, up, down stack idx triple) -> decode FFN chain
     resident_bytes : int64
@@ -543,8 +556,7 @@ struct private GpuState {
     batch_y2_dev : uint64    // up output plane (the fused pair's second write target)
     batch_y1 : HostBuf       // host-cached readback staging for batch_y1_dev
     batch_y2 : HostBuf       // ... and batch_y2_dev (idle since the FFN fold — kept for debug taps)
-    batch_act_set : VkDescriptorSet   // batch twins of FfnCmd's act/requant sets (y1/y2 planes)
-    batch_rq_set : VkDescriptorSet
+    batch_actrq_set : VkDescriptorSet   // batch twin of FfnCmd's fused act+requant set (y1/y2 planes)
     batch_cmd : VkCommandBuffer   // one reusable batch cmd buffer, re-recorded per submit
     batch_ready : bool
 }
@@ -646,6 +658,39 @@ def private vk_moe_init : bool {
     g_gpu.queue = get_device_queue(g_gpu.device, g_gpu.fam, 0u)
     let sg = subgroup_properties(g_gpu.phys).subgroupSize
     g_gpu.rows_per_wg = int64((WG_X + sg - 1u) / sg)   // = gl_NumSubgroups for our 1D workgroup
+    // resident-weight cap: the conservative default (see WEIGHT_CAP), an explicit
+    // DASLLAMA_GPU_VRAM_MB override winning outright, and the queried heap budget clamping DOWN
+    // only (trustworthy as an upper bound — small cards; NOT as free-VRAM, see WEIGHT_CAP).
+    // Physical-device-level query — the extension only needs to be advertised, not enabled.
+    g_gpu.weight_budget = WEIGHT_CAP
+    let vram_override = has_env_variable("DASLLAMA_GPU_VRAM_MB")
+    if (vram_override) {
+        let mbv = int64(to_int(get_env_variable("DASLLAMA_GPU_VRAM_MB")))
+        if (mbv > 0l) {
+            g_gpu.weight_budget = mbv * 1_000_000l
+        }
+    }
+    if (device_extension_available(g_gpu.phys, "VK_EXT_memory_budget")) {
+        var mb = VkPhysicalDeviceMemoryBudgetPropertiesEXT()   // sType pre-filled by the ctor
+        var mp2 = VkPhysicalDeviceMemoryProperties2()
+        unsafe {
+            mp2.pNext = addr<void?>(mb)
+        }
+        vkGetPhysicalDeviceMemoryProperties2(g_gpu.phys, mp2)
+        var best = -1
+        for (i in range(int(mp2.memoryProperties.memoryHeapCount))) {
+            if (mp2.memoryProperties.memoryHeaps[i].flags.device_local
+                    && (best < 0 || mb.heapBudget[i] > mb.heapBudget[best])) {
+                best = i
+            }
+        }
+        if (best >= 0 && mb.heapBudget[best] > 0ul) {
+            if (!vram_override) {
+                g_gpu.weight_budget = clamp(int64(mb.heapBudget[best]) - VRAM_RESERVE, 0l, g_gpu.weight_budget)
+            }
+            to_log(LOG_INFO, "dasLLAMA vulkan tier: device heap budget {int64(mb.heapBudget[best]) / 1000000l} MB (used {int64(mb.heapUsage[best]) / 1000000l}), weight cap {g_gpu.weight_budget / 1000000l} MB\n")
+        }
+    }
     var pci : CommandPoolCreateInfo
     pci.queueFamilyIndex = g_gpu.fam
     pci.flags.reset_command_buffer = true   // per-stack buffers re-record if a shape ever changes
@@ -675,18 +720,16 @@ def private vk_moe_init : bool {
     g_gpu.pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, shader)
     var bshader <- create_shader_module(g_gpu.device, q8_moe_batch_spv)   // same 6-binding layout
     g_gpu.batch_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bshader)
-    var ashader <- create_shader_module(g_gpu.device, q8_moe_act_spv)
-    g_gpu.act_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, ashader)
-    var rshader <- create_shader_module(g_gpu.device, q8_moe_requant_spv)
-    g_gpu.rq_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rshader)
+    var ashader <- create_shader_module(g_gpu.device, q8_moe_actrq_spv)
+    g_gpu.actrq_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, ashader)
     var k4shader <- create_shader_module(g_gpu.device, kq_moe_gemv_k4_spv)
     g_gpu.gemv_k4 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, k4shader)
     var k5shader <- create_shader_module(g_gpu.device, kq_moe_gemv_k5_spv)
     g_gpu.gemv_k5 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, k5shader)
     var k6shader <- create_shader_module(g_gpu.device, kq_moe_gemv_k6_spv)
     g_gpu.gemv_k6 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, k6shader)
-    var rkshader <- create_shader_module(g_gpu.device, q8k_moe_requant_spv)
-    g_gpu.rq_k_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rkshader)
+    var rkshader <- create_shader_module(g_gpu.device, q8k_moe_actrq_spv)
+    g_gpu.actrq_k_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rkshader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -751,7 +794,7 @@ def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : 
     let nsb = rows * (n / 256l)
     let wqbytes = fmt == 0 ? rows * n : nsb * (fmt == 1 ? 128l : (fmt == 2 ? 160l : 192l))
     let wsbytes = fmt == 0 ? rows * (n / 32l) * 2l : nsb * 20l
-    if (g_gpu.resident_bytes + wqbytes + wsbytes > VRAM_BUDGET) {
+    if (g_gpu.resident_bytes + wqbytes + wsbytes > g_gpu.weight_budget) {
         to_log(LOG_INFO, "dasLLAMA vulkan tier: VRAM budget reached at {g_gpu.resident_bytes} bytes\n")
         return false
     }
@@ -933,23 +976,16 @@ def private ensure_batch_state {
     g_gpu.batch_y1 = make_host_buf(BATCH_Y_BYTES, true, [cached = true])
     g_gpu.batch_y2 = make_host_buf(BATCH_Y_BYTES, true, [cached = true])
     g_gpu.batch_cmd = alloc_cmd()
-    g_gpu.batch_act_set = alloc_desc_set()
-    g_gpu.batch_rq_set = alloc_desc_set()
+    g_gpu.batch_actrq_set = alloc_desc_set()
     var writes : array<WriteDescriptorSet>
-    // act: gate plane (rw) at 5, up plane (float view) at 3, params at 2; 0/1/4 unused fillers
-    write_buf_desc(writes, g_gpu.batch_act_set, 0u, g_gpu.batch_xq_dev, BATCH_XQ_BYTES)
-    write_buf_desc(writes, g_gpu.batch_act_set, 1u, g_gpu.batch_xs_dev, BATCH_XS_BYTES)
-    write_buf_desc(writes, g_gpu.batch_act_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
-    write_buf_desc(writes, g_gpu.batch_act_set, 3u, g_gpu.batch_y2_dev, BATCH_Y_BYTES)
-    write_buf_desc(writes, g_gpu.batch_act_set, 4u, g_gpu.batch_xs_dev, BATCH_XS_BYTES)
-    write_buf_desc(writes, g_gpu.batch_act_set, 5u, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
-    // requant: hidden floats at 5 -> hq/hs planes at 3/4
-    write_buf_desc(writes, g_gpu.batch_rq_set, 0u, g_gpu.batch_xq_dev, BATCH_XQ_BYTES)
-    write_buf_desc(writes, g_gpu.batch_rq_set, 1u, g_gpu.batch_xs_dev, BATCH_XS_BYTES)
-    write_buf_desc(writes, g_gpu.batch_rq_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
-    write_buf_desc(writes, g_gpu.batch_rq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
-    write_buf_desc(writes, g_gpu.batch_rq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
-    write_buf_desc(writes, g_gpu.batch_rq_set, 5u, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
+    // fused act+requant: gate floats at 5, up floats at 0 (vk_upf) -> hq/hs planes at 3/4;
+    // params at 2; 1 unused filler
+    write_buf_desc(writes, g_gpu.batch_actrq_set, 0u, g_gpu.batch_y2_dev, BATCH_Y_BYTES)
+    write_buf_desc(writes, g_gpu.batch_actrq_set, 1u, g_gpu.batch_xs_dev, BATCH_XS_BYTES)
+    write_buf_desc(writes, g_gpu.batch_actrq_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+    write_buf_desc(writes, g_gpu.batch_actrq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, g_gpu.batch_actrq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
+    write_buf_desc(writes, g_gpu.batch_actrq_set, 5u, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
     let no_copies : array<CopyDescriptorSet>
     update_descriptor_sets(g_gpu.device, writes, no_copies)
     g_gpu.resident_bytes += BATCH_XQ_BYTES + BATCH_XS_BYTES
@@ -1094,8 +1130,8 @@ def private cmd_copy_whole(raw : VkCommandBuffer; src, dst : uint64; bytes : int
 
 // one reusable cmd buffer, re-recorded per submit — prefill submits are few and multi-ms, so
 // recording cost is noise (unlike decode's per-token pre-recorded buffers). The chain per chunk:
-// meta staging copies, gate+up GEMMs, act, requant, down GEMM, gout DMA — one barrier per seam,
-// the hidden planes never leave the device.
+// meta staging copies, gate+up GEMMs, fused act+requant, down GEMM, gout DMA — one barrier per
+// seam, the hidden planes never leave the device.
 def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, nfe, gout_bytes : int64) {
     let raw = g_gpu.batch_cmd
     let rf : VkCommandBufferResetFlags
@@ -1111,11 +1147,8 @@ def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, 
     cmd_bind_dispatch(raw, g_gpu.stacks[s1].batch_set, nwg_gu)
     cmd_bind_dispatch(raw, g_gpu.stacks[s3].batch_set, nwg_gu)
     comp_barrier(raw)
-    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.act_pipeline, VkPipelineBindPoint.COMPUTE)
-    cmd_bind_dispatch(raw, g_gpu.batch_act_set, uint((rows * nfe + 255l) / 256l))
-    comp_barrier(raw)
-    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.rq_pipeline, VkPipelineBindPoint.COMPUTE)
-    cmd_bind_dispatch(raw, g_gpu.batch_rq_set, uint((rows * nfe / 32l + 255l) / 256l))
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.actrq_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.batch_actrq_set, uint((rows * nfe / 32l + 255l) / 256l))
     comp_barrier(raw)
     cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_pipeline, VkPipelineBindPoint.COMPUTE)
     cmd_bind_dispatch(raw, g_gpu.stacks[s2].batch_set, nwg_dn)
@@ -1156,29 +1189,23 @@ def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : i
 
 // ===== decode dispatch (the FFN's GEMV arm) =====
 
-// pre-record (or refresh on a row-count change) the triple's chain: gate+up GEMV pair, act,
-// requant, down GEMV, y DMA. Per token only the stacks' host-visible metas, the activation
+// pre-record (or refresh on a row-count change) the triple's chain: gate+up GEMV pair, fused
+// act+requant, down GEMV, y DMA. Per token only the stacks' host-visible metas, the activation
 // image, and the ffn params staging change — the recorded buffer resubmits as-is.
 def private ffn_cmd_for(s1, s3, s2 : int; nrows, n, nfe : int64) : VkCommandBuffer {
     let key = (int64(s1) * int64(MAX_STACKS) + int64(s3)) * int64(MAX_STACKS) + int64(s2)
     if (!key_exists(g_gpu.ffn_cmds, key)) {
-        var fc = FfnCmd(cmd = alloc_cmd(), act_set = alloc_desc_set(), rq_set = alloc_desc_set(),
+        var fc = FfnCmd(cmd = alloc_cmd(), actrq_set = alloc_desc_set(),
                         down_set = alloc_desc_set(), nrows = 0l)
         var writes : array<WriteDescriptorSet>
-        // act: gate y (rw) at 5, up y (float view) at 3, params at 2; 0/1/4 unused fillers
-        write_buf_desc(writes, fc.act_set, 0u, g_gpu.stacks[s1].wqbuf, g_gpu.stacks[s1].wqbytes)
-        write_buf_desc(writes, fc.act_set, 1u, g_gpu.stacks[s1].wsbuf, g_gpu.stacks[s1].wsbytes)
-        write_buf_desc(writes, fc.act_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
-        write_buf_desc(writes, fc.act_set, 3u, g_gpu.stacks[s3].y_dev, Y_BYTES)
-        write_buf_desc(writes, fc.act_set, 4u, g_gpu.stacks[s1].xs.buf, XS_BYTES)
-        write_buf_desc(writes, fc.act_set, 5u, g_gpu.stacks[s1].y_dev, Y_BYTES)
-        // requant: hidden floats at 5 -> hq/hs planes at 3/4
-        write_buf_desc(writes, fc.rq_set, 0u, g_gpu.stacks[s1].wqbuf, g_gpu.stacks[s1].wqbytes)
-        write_buf_desc(writes, fc.rq_set, 1u, g_gpu.stacks[s1].wsbuf, g_gpu.stacks[s1].wsbytes)
-        write_buf_desc(writes, fc.rq_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
-        write_buf_desc(writes, fc.rq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
-        write_buf_desc(writes, fc.rq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
-        write_buf_desc(writes, fc.rq_set, 5u, g_gpu.stacks[s1].y_dev, Y_BYTES)
+        // fused act+requant: gate floats at 5, up floats at 0 (vk_upf) -> hq/hs planes at 3/4;
+        // params at 2; 1 unused filler
+        write_buf_desc(writes, fc.actrq_set, 0u, g_gpu.stacks[s3].y_dev, Y_BYTES)
+        write_buf_desc(writes, fc.actrq_set, 1u, g_gpu.stacks[s1].wsbuf, g_gpu.stacks[s1].wsbytes)
+        write_buf_desc(writes, fc.actrq_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+        write_buf_desc(writes, fc.actrq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+        write_buf_desc(writes, fc.actrq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
+        write_buf_desc(writes, fc.actrq_set, 5u, g_gpu.stacks[s1].y_dev, Y_BYTES)
         // down: its own planes + host-visible meta, hq/hs as the activation image, its y_dev
         write_buf_desc(writes, fc.down_set, 0u, g_gpu.stacks[s2].wqbuf, g_gpu.stacks[s2].wqbytes)
         write_buf_desc(writes, fc.down_set, 1u, g_gpu.stacks[s2].wsbuf, g_gpu.stacks[s2].wsbytes)
@@ -1209,20 +1236,17 @@ def private ffn_cmd_for(s1, s3, s2 : int; nrows, n, nfe : int64) : VkCommandBuff
         }
         cmd_bind_dispatch(raw, g_gpu.stacks[s3].raw_set, ggu)
         comp_barrier(raw)
-        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.act_pipeline, VkPipelineBindPoint.COMPUTE)
-        cmd_bind_dispatch(raw, fc.act_set, uint((nrows * nfe + 255l) / 256l))
-        comp_barrier(raw)
         // the requant form follows the DOWN stack — its GEMV is the consumer of hq/hs
         let dkq = g_gpu.stacks[s2].fmt != 0
-        cmd_bind_pipeline(vk_value_to_boost(raw), dkq ? g_gpu.rq_k_pipeline : g_gpu.rq_pipeline, VkPipelineBindPoint.COMPUTE)
-        cmd_bind_dispatch(raw, fc.rq_set, uint((nrows * nfe / (dkq ? 256l : 32l) + 255l) / 256l))
+        cmd_bind_pipeline(vk_value_to_boost(raw), dkq ? g_gpu.actrq_k_pipeline : g_gpu.actrq_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, fc.actrq_set, uint((nrows * nfe / (dkq ? 256l : 32l) + 255l) / 256l))
         comp_barrier(raw)
         bind_gemv_pipe(raw, g_gpu.stacks[s2].fmt)
         cmd_bind_dispatch(raw, fc.down_set, uint((nrows * n + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
         batch_barrier(raw, false)
         cmd_copy_whole(raw, g_gpu.stacks[s2].y_dev, g_gpu.stacks[s2].y.buf, nrows * n * 4l)
         vk_check(vkEndCommandBuffer(raw), null)
-        g_gpu.ffn_cmds[key] = FfnCmd(cmd = fc.cmd, act_set = fc.act_set, rq_set = fc.rq_set,
+        g_gpu.ffn_cmds[key] = FfnCmd(cmd = fc.cmd, actrq_set = fc.actrq_set,
             down_set = fc.down_set, nrows = nrows)
     }
     return fc.cmd
@@ -1266,6 +1290,65 @@ def vk_moe_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; o
         vk_moe_ffn_gemv(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)
     } else {
         vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)
+    }
+}
+
+// ===== classifier dispatch (the head GEMV) =====
+
+// One-time dispatch state for a resident classifier plane: the meta never changes (ONE region
+// covering the whole plane, activations at image row 0), so it uploads device-local once and
+// the command buffer records once — per token only the activation refresh and the submit remain.
+def private ensure_cls(si : int; woff, n, d : int64) {
+    if (g_gpu.stacks[si].cls_made) {
+        return
+    }
+    let unit = g_gpu.stacks[si].fmt != 0 ? 256l : 32l
+    let rel = woff - g_gpu.stacks[si].base
+    assert(rel % unit == 0l, "dasLLAMA vulkan tier: unaligned classifier plane offset")
+    unsafe {
+        var mp = reinterpret<uint?>(g_gpu.staging.mapped)
+        mp[0] = uint(n)
+        mp[1] = uint(d)
+        mp[2] = 1u
+        mp[3] = 0u
+        mp[4] = uint(rel / unit)
+        mp[5] = 0u
+    }
+    g_gpu.stacks[si].cls_meta_dev = make_device_buf(CLS_META_BYTES)
+    staged_upload(g_gpu.stacks[si].cls_meta_dev, 0l, CLS_META_BYTES)
+    g_gpu.stacks[si].cls_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    write_buf_desc(writes, g_gpu.stacks[si].cls_set, 0u, g_gpu.stacks[si].wqbuf, g_gpu.stacks[si].wqbytes)
+    write_buf_desc(writes, g_gpu.stacks[si].cls_set, 1u, g_gpu.stacks[si].wsbuf, g_gpu.stacks[si].wsbytes)
+    write_buf_desc(writes, g_gpu.stacks[si].cls_set, 2u, g_gpu.stacks[si].cls_meta_dev, CLS_META_BYTES)
+    write_buf_desc(writes, g_gpu.stacks[si].cls_set, 3u, g_gpu.stacks[si].xq.buf, XQ_BYTES)
+    write_buf_desc(writes, g_gpu.stacks[si].cls_set, 4u, g_gpu.stacks[si].xs.buf, XS_BYTES)
+    write_buf_desc(writes, g_gpu.stacks[si].cls_set, 5u, g_gpu.stacks[si].y_dev, Y_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    var raw = alloc_cmd()
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    bind_gemv_pipe(raw, g_gpu.stacks[si].fmt)
+    cmd_bind_dispatch(raw, g_gpu.stacks[si].cls_set, uint((d + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+    batch_barrier(raw, false)
+    cmd_copy_whole(raw, g_gpu.stacks[si].y_dev, g_gpu.stacks[si].y.buf, d * 4l)
+    vk_check(vkEndCommandBuffer(raw), null)
+    g_gpu.stacks[si].cls_cmd = raw
+    g_gpu.stacks[si].cls_made = true
+}
+
+//! MoeGpuClsFn: the classifier GEMV — y[d] = W · x over the resident plane at woff, activation
+//! in the plane's own quant form (Q8_0 per-32 / Q8_K per-256), result DMA'd to the host-cached
+//! staging in the same submit.
+def vk_moe_cls(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let si = find_stack(woff)
+    assert(d * 4l <= Y_BYTES, "dasLLAMA vulkan tier: classifier vocab exceeds output capacity")
+    ensure_cls(si, woff, n, d)
+    fill_stack_acts(si, xqp, xsp, n)
+    submit_wait(g_gpu.stacks[si].cls_cmd)
+    unsafe {
+        memcpy(reinterpret<void?>(yp), g_gpu.stacks[si].y.mapped, int(d * 4l))
     }
 }
 
@@ -1324,7 +1407,7 @@ def dasllama_math_vulkan_register() {
         let layers = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_LAYERS")))
         if (layers > 0l && vulkan_backend_available()) {
             set_moe_gpu_layer_count(layers)
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
         }
     }
 }
