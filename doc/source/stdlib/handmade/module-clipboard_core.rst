@@ -7,7 +7,7 @@ wrapper rather than the internal ``clipboard_core`` module:
 
 .. code-block:: das
 
-    require daslib/clipboard
+    require clipboard/clipboard
 
     [export]
     def main() {

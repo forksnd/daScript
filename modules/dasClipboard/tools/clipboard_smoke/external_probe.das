@@ -1,7 +1,7 @@
 options gen2
 options indenting = 4
 
-require daslib/clipboard
+require clipboard/clipboard
 require daslib/clargs
 
 let DAS_MARKER = "daScript → .NET clipboard smoke — 文書"

@@ -1,7 +1,7 @@
 options gen2
 options indenting = 4
 
-require daslib/clipboard
+require clipboard/clipboard
 
 let PROBE_MARKER = "daScript clipboard smoke — Привет 日本語 👩‍💻"
 

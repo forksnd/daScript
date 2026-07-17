@@ -6,7 +6,7 @@ options auto_inline_functions = false
 options _no_tune = true   // documentation compile — no [tune_policy] auto-tune / restart guards
 
 require daslib/fio
-require daslib/clipboard
+require clipboard/clipboard
 require daslib/rtti
 require daslib/ast
 require math

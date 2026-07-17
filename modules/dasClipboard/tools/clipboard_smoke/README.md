@@ -6,7 +6,7 @@ under `/tests`, are not discovered by `dastest`, and must not run in regular CI.
 Run the native supported-subset roundtrip explicitly from the repository root:
 
 ```powershell
-.\bin\Release\daslang.exe tools\clipboard_smoke\native_roundtrip.das
+.\bin\Release\daslang.exe modules\dasClipboard\tools\clipboard_smoke\native_roundtrip.das
 ```
 
 The probe offers plain UTF-8 text, Markdown, an HTML fragment, a URI list, and
@@ -25,7 +25,7 @@ directions and guards restoration in `finally`, including when a daScript child
 fails:
 
 ```powershell
-.\tools\clipboard_smoke\external_consumers.ps1
+.\modules\dasClipboard\tools\clipboard_smoke\external_consumers.ps1
 ```
 
 It eagerly asks WinForms and raw Win32 code to consume daScript's plain text,

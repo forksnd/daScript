@@ -1,7 +1,6 @@
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_interop.h"
-#include "daScript/daScriptModule.h"
-#include "daScript/simulate/aot_builtin_clipboard.h"
+#include "aot_builtin_clipboard.h"
 #include "clip.h"
 
 #include <algorithm>
@@ -682,10 +681,12 @@ namespace das {
         }
 
         ModuleAotType aotRequire(TextWriter & tw) const override {
-            tw << "#include \"daScript/simulate/aot_builtin_clipboard.h\"\n";
+            tw << "#include \"../modules/dasClipboard/src/aot_builtin_clipboard.h\"\n";
             return ModuleAotType::cpp;
         }
     };
+
+    REGISTER_DYN_MODULE(Module_Clipboard, Module_Clipboard);
 
 }
 

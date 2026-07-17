@@ -2,7 +2,7 @@ options gen2
 options indenting = 4
 
 require dastest/testing_boost public
-require daslib/clipboard
+require clipboard/clipboard
 require strings
 
 def private equal_bytes(a, b : array<uint8> const) : bool {
@@ -175,4 +175,22 @@ def test_clipboard_content_validation(t : T?) {
                "valid padded RGBA8 image is accepted")
 
     clipboard_dispose_content(content)
+}
+
+[test]
+def test_clipboard_native_capabilities_are_coherent(t : T?) {
+    let capabilities = clipboard_capabilities()
+    let has_base = (capabilities.read_text || capabilities.write_text
+                 || capabilities.clear || capabilities.synchronous)
+    t |> success(!has_base || (capabilities.read_text && capabilities.write_text
+              && capabilities.clear && capabilities.synchronous),
+                 "native text operations and synchronous semantics are one capability set")
+    t |> success(capabilities.read_rich_text == capabilities.write_rich_text,
+                 "rich-text read and write support are symmetric")
+    t |> success(capabilities.read_image == capabilities.write_image,
+                 "image read and write support are symmetric")
+    t |> success(!capabilities.read_rich_text || has_base,
+                 "rich-text support implies the native base transport")
+    t |> success(!capabilities.read_image || has_base,
+                 "image support implies the native base transport")
 }

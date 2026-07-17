@@ -35,7 +35,6 @@ namespace das
     NEED_MODULE(Module_Debugger); \
     NEED_MODULE(Module_Jit); \
     NEED_MODULE(Module_FIO); \
-    NEED_MODULE(Module_Clipboard); \
     NEED_MODULE(Module_DASBIND); \
     NEED_MODULE(Module_Network); \
     NEED_FUSION;
@@ -79,7 +78,6 @@ namespace das
     DECLARE_MODULE(Module_Debugger); \
     DECLARE_MODULE(Module_Jit); \
     DECLARE_MODULE(Module_FIO); \
-    DECLARE_MODULE(Module_Clipboard); \
     DECLARE_MODULE(Module_DASBIND); \
     DECLARE_MODULE(Module_Network); \
     DECLARE_FUSION
@@ -93,7 +91,6 @@ namespace das
     PULL_MODULE(Module_Debugger); \
     PULL_MODULE(Module_Jit); \
     PULL_MODULE(Module_FIO); \
-    PULL_MODULE(Module_Clipboard); \
     PULL_MODULE(Module_DASBIND); \
     PULL_MODULE(Module_Network); \
     PULL_FUSION
