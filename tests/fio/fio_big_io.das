@@ -15,6 +15,13 @@ require daslib/fio
 let BIG = int64(0x80000000) + 65536l   // just past the int32 wrap
 let PROBE_STEP = int64(0x2000000)      // spot-check every 32 MiB — full compare would double the cost
 
+// portable probe path: temp_directory + path_join (cwd as a last resort — never a bare "/name")
+def private big_io_path(name : string) : string {
+    var terr : string
+    let tmp = temp_directory(terr)
+    return path_join(empty(tmp) ? "." : tmp, name)
+}
+
 [test]
 def test_big_write_read(t : T?) {
     if (get_env_variable("DAS_BIG_IO") != "1") {
@@ -22,8 +29,7 @@ def test_big_write_read(t : T?) {
         return
     }
     t |> run("long_fwrite/long_fread past 2 GiB") @@(t : T?) {
-        var terr : string
-        let path = "{temp_directory(terr)}/das_big_io_test.bin"
+        let path = big_io_path("das_big_io_test.bin")
         var buf : array<uint8>
         buf |> resize(BIG)
         for (k in range64(0l, BIG / PROBE_STEP)) {
@@ -51,8 +57,7 @@ def test_big_write_read(t : T?) {
         remove(path)
     }
     t |> run("int32 fwrite/fread panic past 2 GiB") @@(t : T?) {
-        var terr : string
-        let path = "{temp_directory(terr)}/das_big_io_panic.bin"
+        let path = big_io_path("das_big_io_panic.bin")
         var buf : array<uint8>
         buf |> resize(BIG)
         var wrote_panicked = false
@@ -79,8 +84,7 @@ def test_big_write_read(t : T?) {
         remove(path)
     }
     t |> run("fseek/ftell past 2 GiB") @@(t : T?) {
-        var terr : string
-        let path = "{temp_directory(terr)}/das_big_io_seek.bin"
+        let path = big_io_path("das_big_io_seek.bin")
         let pos = int64(0xC0000000)   // 3 GiB — sparse on every filesystem we test on
         fopen(path, "wb") $(f) {
             t |> success(f != null)

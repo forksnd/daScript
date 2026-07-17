@@ -154,8 +154,9 @@ def test_image_mechanics(t : T?) {
         if (!arm_on(t, "mechanics")) {
             return
         }
-        let tmp = empty(get_env_variable("TMPDIR")) ? "/tmp" : get_env_variable("TMPDIR")
-        let path = path_join(tmp, "dasllama_img_probe_{ref_time_ticks()}.dlim")
+        var terr : string
+        let tmp = temp_directory(terr)   // portable (no /tmp on Windows); cwd as a last resort
+        let path = path_join(empty(tmp) ? "." : tmp, "dasllama_img_probe_{ref_time_ticks()}.dlim")
         var p <- make_probe()
         t |> success(save_image(p, path, "img-probe"), "save")
         t |> success(stat(path).is_valid, "file exists")
