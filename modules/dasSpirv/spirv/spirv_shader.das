@@ -132,6 +132,12 @@ class SpirvShader : AstFunctionAnnotation {
         local_size.x = args |> find_arg("local_size_x") ?as tInt ?? 1
         local_size.y = args |> find_arg("local_size_y") ?as tInt ?? 1
         local_size.z = args |> find_arg("local_size_z") ?as tInt ?? 1
+        // local_size_*_id = N makes that workgroup axis a specialization constant (SpecId = N,
+        // default = the local_size_* value); -1 (absent) keeps the axis a plain literal.
+        var local_size_ids : int3
+        local_size_ids.x = args |> find_arg("local_size_x_id") ?as tInt ?? -1
+        local_size_ids.y = args |> find_arg("local_size_y_id") ?as tInt ?? -1
+        local_size_ids.z = args |> find_arg("local_size_z_id") ?as tInt ?? -1
         var err : array<string>
         // Mesh-shader output configuration (max_vertices / max_primitives / output_topology). Only the
         // mesh stage carries these; other stages keep the defaults, which generate_spirv ignores. The
@@ -159,7 +165,7 @@ class SpirvShader : AstFunctionAnnotation {
         var glob <- find_variable(compiling_module(), argName)
         if (glob != null && glob.init == null && glob.name == argName) {
             var refl : SpirvReflection
-            var words <- generate_spirv(func, err, shader_stage(), local_size, mesh_cfg, refl)
+            var words <- generate_spirv(func, err, shader_stage(), local_size, local_size_ids, mesh_cfg, refl)
             if (err |> empty()) {
                 glob.init = build_uint_array_literal(words, func.at)
                 // Fill the companion reflection global in the same fixup (gated on the blob's

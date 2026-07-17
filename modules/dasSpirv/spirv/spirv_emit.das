@@ -103,11 +103,16 @@ struct EmitCtx {
     sampled_image_nu_cap : bool                 // OpCapability SampledImageArrayNonUniformIndexing already emitted (NonUniform-indexed sampler descriptor array)
     mesh_shading_cap : bool                     // OpCapability MeshShadingEXT + OpExtension "SPV_EXT_mesh_shader" already emitted (mesh / task stages)
     ray_tracing_cap : bool                      // OpCapability RayTracingKHR + OpExtension "SPV_KHR_ray_tracing" already emitted (raygen / miss / closest-hit stages)
+    group_nonuniform_cap : bool                 // OpCapability GroupNonUniform already emitted (subgroup builtins, subgroupElect)
+    group_nonuniform_arith_cap : bool           // OpCapability GroupNonUniformArithmetic already emitted (subgroupAdd/Min/Max)
+    group_nonuniform_shuffle_cap : bool         // OpCapability GroupNonUniformShuffle already emitted (subgroupShuffleXor)
+    group_nonuniform_ballot_cap : bool          // OpCapability GroupNonUniformBallot already emitted (subgroupBroadcastFirst)
     mesh_max_vertices : int                     // mesh-output array sizing (from MeshOutputConfig): gl_MeshVerticesEXT length
     mesh_max_primitives : int                   // mesh-output array sizing: gl_PrimitiveTriangleIndicesEXT length
     mesh_topology : MeshOutputTopology          // declared output topology; the index-array builtin must match it (triangles -> gl_PrimitiveTriangleIndicesEXT)
     task_payload_id : uint                      // the @task_payload TaskPayloadWorkgroupEXT variable id (0 = none); EmitMeshTasksEXT appends it as the 4th operand
     nonuniform_ids : table<uint>                // set of result ids that carry the NonUniform decoration (nonuniformEXT marker + cascade through OpAccessChain / OpLoad on descriptor arrays)
+    spec_ids      : table<uint>                 // SpecId decorations already used (@constant_id globals + local_size_*_id axes) -> duplicate ids rejected
     user_funcs    : table<uint64; UserFunc>     // intptr(Function) -> emittable user-defined shader function
     user_order    : array<uint64>               // user_funcs keys in stable emission order (collect_dependencies order)
     call_temps    : table<uint64; CallTemp>     // intptr(ref-arg Expression) -> its copy-in/out Function-storage temp
@@ -167,6 +172,7 @@ def finalize(var c : EmitCtx) {
     delete c.user_order
     delete c.call_temps
     delete c.nonuniform_ids
+    delete c.spec_ids
 }
 
 // ===== builtin name -> SpvBuiltIn + storage class + the stage it's legal in =====
@@ -181,6 +187,12 @@ def private builtin_info(name : string) : tuple<ok : bool; bi : SpvBuiltIn; stor
     if (name == "gl_WorkGroupID") return (ok = true, bi = SpvBuiltIn.WorkgroupId, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
     if (name == "gl_NumWorkGroups") return (ok = true, bi = SpvBuiltIn.NumWorkgroups, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
     if (name == "gl_LocalInvocationIndex") return (ok = true, bi = SpvBuiltIn.LocalInvocationIndex, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
+    // subgroup (GroupNonUniform capability, pulled at classification; req=Compute rides the same
+    // workgroup-stage relaxation as the grid builtins, so mesh/task see them too)
+    if (name == "gl_SubgroupSize") return (ok = true, bi = SpvBuiltIn.SubgroupSize, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
+    if (name == "gl_SubgroupInvocationID") return (ok = true, bi = SpvBuiltIn.SubgroupLocalInvocationId, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
+    if (name == "gl_NumSubgroups") return (ok = true, bi = SpvBuiltIn.NumSubgroups, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
+    if (name == "gl_SubgroupID") return (ok = true, bi = SpvBuiltIn.SubgroupId, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
     // vertex
     if (name == "gl_Position") return (ok = true, bi = SpvBuiltIn.Position, storage = SpvStorageClass.Output, req = ShaderStage.Vertex)
     if (name == "gl_PointSize") return (ok = true, bi = SpvBuiltIn.PointSize, storage = SpvStorageClass.Output, req = ShaderStage.Vertex)
@@ -575,6 +587,12 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         if (bi.bi == SpvBuiltIn.PrimitiveId && stage == ShaderStage.Fragment) {
             ensure_per_primitive(m, ctx)
             emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.Flat))
+        }
+        // The subgroup builtins are the GroupNonUniform feature's data plane, not part of the base
+        // Shader capability.
+        if (bi.bi == SpvBuiltIn.SubgroupSize || bi.bi == SpvBuiltIn.SubgroupLocalInvocationId ||
+                bi.bi == SpvBuiltIn.NumSubgroups || bi.bi == SpvBuiltIn.SubgroupId) {
+            ensure_group_nonuniform(m, ctx)
         }
         return
     }
@@ -1060,6 +1078,88 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         // interface pass appends these (they are not Input/Output, so the <= 1.3 rule never applies)
         return
     }
+    // specialization constant: a module-scope 32-bit scalar with `@constant_id = N`. Emitted as a
+    // fresh OpSpecConstant -- NEVER through the const pool: two spec constants with equal defaults
+    // must stay distinct ids, and a spec constant must not alias the plain OpConstant of its default
+    // -- plus OpDecorate SpecId. References resolve like a folded constant (is_constant/const_id);
+    // the host overrides the default at pipeline-create time via VkSpecializationInfo.
+    if (v.annotation |> find_arg("constant_id") is tInt) {
+        let cid = v.annotation |> find_arg("constant_id") ?as tInt ?? 0
+        if (cid < 0) {
+            errors |> push("spec constant '{vname}': @constant_id must be non-negative (got {cid})")
+            return
+        }
+        if (v._type == null || (v._type.baseType != Type.tUInt && v._type.baseType != Type.tInt &&
+                                v._type.baseType != Type.tFloat && v._type.baseType != Type.tBool)) {
+            errors |> push("spec constant '{vname}' must be a 32-bit scalar (uint, int, float, or bool)")
+            return
+        }
+        if (key_exists(ctx.spec_ids, uint(cid))) {
+            errors |> push("spec constant '{vname}': duplicate @constant_id {cid}")
+            return
+        }
+        var ie = v.init
+        let r2v = ie ?as ExprRef2Value
+        if (r2v != null) {
+            ie = r2v.subexpr
+        }
+        var has_default = false
+        var bits = 0u
+        var bool_default = false
+        if (ie != null) {
+            let cu = ie ?as ExprConstUInt
+            let ci = ie ?as ExprConstInt
+            let cf = ie ?as ExprConstFloat
+            let cb = ie ?as ExprConstBool
+            if (cu != null) {
+                bits = cu.value
+                has_default = true
+            } elif (ci != null) {
+                bits = uint(ci.value)
+                has_default = true
+            } elif (cf != null) {
+                bits = unsafe(reinterpret<uint>(cf.value))
+                has_default = true
+            } elif (cb != null) {
+                bool_default = cb.value
+                has_default = true
+            }
+            // depending on fold state `-3` can arrive as ExprOp1("-", const) rather than a folded
+            // negative literal (same shape emit_const handles) — fold it here so both parse states
+            // produce the same default bits
+            if (!has_default) {
+                let neg = ie ?as ExprOp1
+                if (neg != null && "{neg.op}" == "-") {
+                    let ir2v = neg.subexpr ?as ExprRef2Value
+                    let sub = ir2v != null ? ir2v.subexpr : neg.subexpr
+                    let nci = sub ?as ExprConstInt
+                    let ncf = sub ?as ExprConstFloat
+                    if (nci != null) {
+                        bits = uint(-nci.value)
+                        has_default = true
+                    } elif (ncf != null) {
+                        bits = unsafe(reinterpret<uint>(-ncf.value))
+                        has_default = true
+                    }
+                }
+            }
+        }
+        if (!has_default) {
+            errors |> push("spec constant '{vname}' needs a literal scalar initializer (its default value)")
+            return
+        }
+        let tid = emit_type(m, v._type)
+        let sid = alloc_id(m)
+        if (v._type.baseType == Type.tBool) {
+            emit(m, SEC_TYPES, bool_default ? SpvOp.SpecConstantTrue : SpvOp.SpecConstantFalse, tid, sid)
+        } else {
+            emit(m, SEC_TYPES, SpvOp.SpecConstant, tid, sid, bits)
+        }
+        emit(m, SEC_DECOR, SpvOp.Decorate, sid, uint(SpvDecoration.SpecId), uint(cid))
+        ctx.spec_ids |> insert(uint(cid))
+        ctx.globals |> insert(intptr(v), GlobalInfo(value_type = tid, is_constant = true, const_id = sid))
+        return
+    }
     // module-scope constant: an immutable `let X = <const-expr>` referenced by the shader body. Fold the
     // initializer to an OpConstant and resolve references straight to it (no OpVariable / OpLoad), so a
     // shader can hoist view rectangles, iteration counts, etc. to module scope and share them with the
@@ -1133,6 +1233,20 @@ def private atomic_info(name : string; cls : int) : tuple<ok : bool; op : SpvOp;
     if (name == "atomicExchange") return (ok = true, op = SpvOp.AtomicExchange, compswap = false)
     if (name == "atomicCompSwap") return (ok = true, op = SpvOp.AtomicCompareExchange, compswap = true)
     return (ok = false, op = SpvOp.AtomicIAdd, compswap = false)
+}
+
+// ===== subgroup call name + operand class -> SPIR-V opcode =====
+// kind: 0 = reduce (scope id, GroupOperation LITERAL, value), 1 = shuffle-xor (scope id, value,
+// mask), 2 = broadcast-first (scope id, value), 3 = elect (scope id only). cls picks the F/I
+// opcode (and S/U for min/max) exactly like atomic_info / glsl_ext_op.
+def private subgroup_info(name : string; cls : int) : tuple<ok : bool; op : SpvOp; kind : int> {
+    if (name == "subgroupAdd") return (ok = true, op = cls == 2 ? SpvOp.GroupNonUniformFAdd : SpvOp.GroupNonUniformIAdd, kind = 0)
+    if (name == "subgroupMin") return (ok = true, op = cls == 2 ? SpvOp.GroupNonUniformFMin : (cls == 1 ? SpvOp.GroupNonUniformUMin : SpvOp.GroupNonUniformSMin), kind = 0)
+    if (name == "subgroupMax") return (ok = true, op = cls == 2 ? SpvOp.GroupNonUniformFMax : (cls == 1 ? SpvOp.GroupNonUniformUMax : SpvOp.GroupNonUniformSMax), kind = 0)
+    if (name == "subgroupShuffleXor") return (ok = true, op = SpvOp.GroupNonUniformShuffleXor, kind = 1)
+    if (name == "subgroupBroadcastFirst") return (ok = true, op = SpvOp.GroupNonUniformBroadcastFirst, kind = 2)
+    if (name == "subgroupElect") return (ok = true, op = SpvOp.GroupNonUniformElect, kind = 3)
+    return (ok = false, op = SpvOp.GroupNonUniformIAdd, kind = -1)
 }
 
 // ===== arithmetic opcode selection =====
@@ -1329,6 +1443,39 @@ def private ensure_draw_parameters(var m : SpirvModule; var ctx : EmitCtx) {
     if (ctx.draw_parameters_cap) return
     emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.DrawParameters))
     ctx.draw_parameters_cap = true
+}
+
+// Subgroup builtins + subgroupElect require the GroupNonUniform capability -- core in SPIR-V 1.3,
+// cap only, no extension. Emit-once + ctx-flag dedupe.
+def private ensure_group_nonuniform(var m : SpirvModule; var ctx : EmitCtx) {
+    if (ctx.group_nonuniform_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.GroupNonUniform))
+    ctx.group_nonuniform_cap = true
+}
+
+// The subgroup reduce family (subgroupAdd/Min/Max) additionally requires GroupNonUniformArithmetic.
+def private ensure_group_nonuniform_arithmetic(var m : SpirvModule; var ctx : EmitCtx) {
+    ensure_group_nonuniform(m, ctx)
+    if (ctx.group_nonuniform_arith_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.GroupNonUniformArithmetic))
+    ctx.group_nonuniform_arith_cap = true
+}
+
+// subgroupShuffleXor requires GroupNonUniformShuffle.
+def private ensure_group_nonuniform_shuffle(var m : SpirvModule; var ctx : EmitCtx) {
+    ensure_group_nonuniform(m, ctx)
+    if (ctx.group_nonuniform_shuffle_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.GroupNonUniformShuffle))
+    ctx.group_nonuniform_shuffle_cap = true
+}
+
+// subgroupBroadcastFirst requires GroupNonUniformBallot -- the spec groups it with the ballot
+// family, NOT shuffle.
+def private ensure_group_nonuniform_ballot(var m : SpirvModule; var ctx : EmitCtx) {
+    ensure_group_nonuniform(m, ctx)
+    if (ctx.group_nonuniform_ballot_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.GroupNonUniformBallot))
+    ctx.group_nonuniform_ballot_cap = true
 }
 
 // Descriptor indexing (Vulkan VK_EXT_descriptor_indexing): nonuniformEXT() emits the NonUniform
@@ -1931,6 +2078,14 @@ class SpirvEmit : AstVisitor {
         // message rather than the generic "internal: not an lvalue".
         if (e is ExprSwizzle) {
             errs |> push("cannot assign through a swizzle — write-swizzle (e.g. `v.xy = …`) is not supported; assign the whole vector instead")
+            return (id = 0u, pty = 0u)
+        }
+        // a module-scope constant (`let` fold or @constant_id spec constant) used as a write target:
+        // constants have no OpVariable, so there is no pointer to store through. Name the actual
+        // mistake instead of the generic internal message.
+        let wg = global_var_of(e)
+        if (wg != null && (ctx.globals?[intptr(wg)] ?? GlobalInfo()).is_constant) {
+            errs |> push("cannot assign to '{wg.name}' — module-scope constants (incl. @constant_id spec constants) are read-only in a shader")
             return (id = 0u, pty = 0u)
         }
         errs |> push("internal: {e.__rtti} is not an lvalue")
@@ -2846,6 +3001,57 @@ class SpirvEmit : AstVisitor {
                 var ops <- [rt, res, p.id, sc_id, sem_id, val]
                 emit_n(bm, SEC_FUNCS, ainfo.op, ops)
                 delete ops
+            }
+            e2id[k] = res
+            return expr
+        }
+        // subgroup ops: cross-lane cooperation at Subgroup scope (SPIR-V 1.3 GroupNonUniform*).
+        // The Execution scope is an ID operand (a constant uint, Subgroup = 3); the reduce family
+        // additionally takes the GroupOperation as a LITERAL word (Reduce = 0), not an id. Compute-only
+        // like barrier(). Each kind pulls its own capability (reduce -> Arithmetic, shuffleXor ->
+        // Shuffle, broadcastFirst -> Ballot, elect -> base GroupNonUniform).
+        let scls = empty(expr.arguments) ? -1 : scalar_class(expr.arguments[0]._type.baseType)
+        let sginfo = subgroup_info(name, scls)
+        if (sginfo.ok) {
+            if (ctx.stage != ShaderStage.Compute) {
+                errs |> push("{name} is only valid in a compute shader")
+                return expr
+            }
+            let nargs = sginfo.kind == 3 ? 0 : (sginfo.kind == 1 ? 2 : 1)
+            if (length(expr.arguments) != nargs) {
+                errs |> push("{name} expects {nargs} argument(s)")
+                return expr
+            }
+            if (sginfo.kind != 3 && scls != 0 && scls != 1 && scls != 2) {
+                errs |> push("{name}: operand must be a float, int, or uint scalar")
+                return expr
+            }
+            let scope_id = const_uint(bm, uint(SpvScope.Subgroup))
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            if (sginfo.kind == 0) {
+                ensure_group_nonuniform_arithmetic(bm, *ctx)
+                let val = value_of(expr.arguments[0])
+                if (val == 0u) return expr
+                var ops <- [rt, res, scope_id, uint(SpvGroupOperation.Reduce), val]
+                emit_n(bm, SEC_FUNCS, sginfo.op, ops)
+                delete ops
+            } elif (sginfo.kind == 1) {
+                ensure_group_nonuniform_shuffle(bm, *ctx)
+                let val = value_of(expr.arguments[0])
+                let mask = value_of(expr.arguments[1])
+                if (val == 0u || mask == 0u) return expr
+                var ops <- [rt, res, scope_id, val, mask]
+                emit_n(bm, SEC_FUNCS, sginfo.op, ops)
+                delete ops
+            } elif (sginfo.kind == 2) {
+                ensure_group_nonuniform_ballot(bm, *ctx)
+                let val = value_of(expr.arguments[0])
+                if (val == 0u) return expr
+                emit(bm, SEC_FUNCS, sginfo.op, rt, res, scope_id, val)
+            } else {
+                ensure_group_nonuniform(bm, *ctx)
+                emit(bm, SEC_FUNCS, sginfo.op, rt, res, scope_id)
             }
             e2id[k] = res
             return expr
@@ -4015,7 +4221,7 @@ def private execution_model(stage : ShaderStage) : SpvExecutionModel {
 }
 
 [macro_function]
-def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderStage; local_size : int3; mesh_config : MeshOutputConfig; var reflection : SpirvReflection) : array<uint> {
+def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderStage; local_size : int3; local_size_ids : int3; mesh_config : MeshOutputConfig; var reflection : SpirvReflection) : array<uint> {
     var m = make_module()
     var ctx : EmitCtx
     ctx.stage = stage
@@ -4109,6 +4315,38 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
         var em <- [id_main, uint(SpvExecutionMode.LocalSize), lx, ly, lz]
         emit_n(m, SEC_EXECMODE, SpvOp.ExecutionMode, em)
         delete em
+        // A local_size_*_id annotation arg makes that workgroup axis specializable: an
+        // OpSpecConstantComposite uint3 decorated BuiltIn WorkgroupSize, each constituent an
+        // OpSpecConstant (SpecId = the axis id, default = the LocalSize value) or the pooled
+        // OpConstant default for id-less axes. Per SPIR-V 2.16.2 the WorkgroupSize builtin takes
+        // precedence over the LocalSize execution mode (kept above -- glslang parity). WorkgroupSize
+        // is deprecated only at SPIR-V >= 1.6 (LocalSizeId), fine at our 1.3 header.
+        if (local_size_ids.x >= 0 || local_size_ids.y >= 0 || local_size_ids.z >= 0) {
+            let t_u32 = type_int(m, 32u, 0u)
+            var axis_ids : array<uint>
+            for (aid, adefault in fixed_array(local_size_ids.x, local_size_ids.y, local_size_ids.z), fixed_array(lx, ly, lz)) {
+                if (aid >= 0) {
+                    if (key_exists(ctx.spec_ids, uint(aid))) {
+                        errors |> push("local_size_*_id {aid} duplicates another SpecId in this shader")
+                    }
+                    ctx.spec_ids |> insert(uint(aid))
+                    let sid = alloc_id(m)
+                    emit(m, SEC_TYPES, SpvOp.SpecConstant, t_u32, sid, adefault)
+                    emit(m, SEC_DECOR, SpvOp.Decorate, sid, uint(SpvDecoration.SpecId), uint(aid))
+                    axis_ids |> push(sid)
+                } else {
+                    axis_ids |> push(const_uint(m, adefault))
+                }
+            }
+            let t_uv3 = type_vector(m, t_u32, 3)
+            let wgs_id = alloc_id(m)
+            var wo <- [t_uv3, wgs_id]
+            wo |> push_from(axis_ids)
+            emit_n(m, SEC_TYPES, SpvOp.SpecConstantComposite, wo)
+            delete wo
+            delete axis_ids
+            emit(m, SEC_DECOR, SpvOp.Decorate, wgs_id, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.WorkgroupSize))
+        }
     }
     if (stage == ShaderStage.Mesh) {
         // OutputVertices / OutputPrimitivesEXT counts + the output topology come from the [mesh_shader]
