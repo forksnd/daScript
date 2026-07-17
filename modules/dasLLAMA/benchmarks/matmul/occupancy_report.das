@@ -47,5 +47,17 @@ def main {
         check(dev, "swiglu", metal_swiglu_msl, metal_swiglu_msl_entry, metal_swiglu_msl_fastmath)
         check(dev, "add", metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath)
         check(dev, "rope", metal_rope_msl, metal_rope_msl_entry, metal_rope_msl_fastmath)
+        check(dev, "kq_mulmm_k4", metal_kq_mulmm_k4_msl, metal_kq_mulmm_k4_msl_entry, metal_kq_mulmm_k4_msl_fastmath)
+        check(dev, "kq_mulmm_k5", metal_kq_mulmm_k5_msl, metal_kq_mulmm_k5_msl_entry, metal_kq_mulmm_k5_msl_fastmath)
+        check(dev, "kq_mulmm_k6", metal_kq_mulmm_k6_msl, metal_kq_mulmm_k6_msl_entry, metal_kq_mulmm_k6_msl_fastmath)
+        check(dev, "kq_gemv_k4", metal_kq_gemv_k4_msl, metal_kq_gemv_k4_msl_entry, metal_kq_gemv_k4_msl_fastmath)
+        check(dev, "kq_gemv_k5", metal_kq_gemv_k5_msl, metal_kq_gemv_k5_msl_entry, metal_kq_gemv_k5_msl_fastmath)
+        check(dev, "kq_gemv_k6", metal_kq_gemv_k6_msl, metal_kq_gemv_k6_msl_entry, metal_kq_gemv_k6_msl_fastmath)
+        check(dev, "kq_mvb2_k4", metal_kq_mvb2_k4_msl, metal_kq_mvb2_k4_msl_entry, metal_kq_mvb2_k4_msl_fastmath)
+        check(dev, "kq_mvb4_k4", metal_kq_mvb4_k4_msl, metal_kq_mvb4_k4_msl_entry, metal_kq_mvb4_k4_msl_fastmath)
+        check(dev, "kq_mvb2_k5", metal_kq_mvb2_k5_msl, metal_kq_mvb2_k5_msl_entry, metal_kq_mvb2_k5_msl_fastmath)
+        check(dev, "kq_mvb4_k5", metal_kq_mvb4_k5_msl, metal_kq_mvb4_k5_msl_entry, metal_kq_mvb4_k5_msl_fastmath)
+        check(dev, "kq_mvb2_k6", metal_kq_mvb2_k6_msl, metal_kq_mvb2_k6_msl_entry, metal_kq_mvb2_k6_msl_fastmath)
+        check(dev, "kq_mvb4_k6", metal_kq_mvb4_k6_msl, metal_kq_mvb4_k6_msl_entry, metal_kq_mvb4_k6_msl_fastmath)
     }
 }

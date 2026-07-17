@@ -465,6 +465,7 @@ class MetalKqMulMmK6 {
             let scw = si < 8u ? (si < 4u ? sv.x : sv.y) : (si < 12u ? sv.z : sv.w)
             let s6 = float(((int(scw >> ((si & 3u) * 8u)) & 255) ^ 128) - 128)
             let dsc = float(kdh[blk]) * s6
+            let dmn = dsc * 32.0   // -32 folded to the fma form (k4's dmn shape)
             let qb = blk * 48u + half6 * 16u + (gg & 1u) * 8u + il0 * 4u
             let hb = blk * 48u + 32u + half6 * 8u + il0 * 4u
             let nsh = (gg / 2u) * 4u
@@ -472,9 +473,12 @@ class MetalKqMulMmK6 {
             for [unroll_full] (k in range(4)) {
                 let u = kqu[qb + uint(k)]
                 let hu = kqu[hb + uint(k)]
+                // all 4 bytes composed at once — cross-byte bleed of the uint-wide shifts is
+                // masked off; per element only shift+mask+fma remain
+                let qv = ((u >> nsh) & 0x0F0F0F0F) | (((hu >> hsh) & 0x03030303) << 4u)
                 for [unroll_full] (c in range(4)) {
-                    let q = ((u >> (8u * uint(c) + nsh)) & 15u) | (((hu >> (8u * uint(c) + hsh)) & 3u) << 4u)
-                    va[k * 4 + c] = float16(dsc * (float(q) - 32.0))
+                    let q = (qv >> (8u * uint(c))) & 255u
+                    va[k * 4 + c] = float16(dsc * float(q) - dmn)
                 }
             }
             barrier()
@@ -1019,7 +1023,7 @@ class MetalKqMvB4K4 {
 class MetalKqMvB2K6 {
     @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
     @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
-    @ssbo @binding = 2 kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
+    @ssbo @binding = 2 kqu : array<uint>    // k6 quant plane, uint view (ql at 48*blk, qh at 48*blk+32)
     @ssbo @binding = 3 x : array<float4>
     @ssbo @binding = 4 y : array<float>
     @uniform @binding = 5 ndim : uint
@@ -1035,12 +1039,10 @@ class MetalKqMvB2K6 {
         let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
         let nb = ndim / 256u
         let s = tx / 2u
-        let o = (tx % 2u) * 16u
-        let bsel = (s % 2u) * 32u
+        let o4 = (tx % 2u) * 4u             // 16B offset within the slot, in uints
+        let qoff = (s % 2u) * 8u + o4       // ql uint offset within the 128-half's 16 uints
         let shr = s < 2u ? 0u : 4u
-        let hmask = 0x03u << (2u * s)
-        let lsh = s == 0u ? 4u : (s == 1u ? 2u : 0u)
-        let rsh = s == 3u ? 2u : 0u
+        let hsh = 2u * s
         let nb4 = ndim / 4u
         var sumf : float[2]
         var sb = 0u
@@ -1049,21 +1051,24 @@ class MetalKqMvB2K6 {
             let dd = float(kdh[blk])
             for [unroll_full] (ch in range(2)) {
                 let ip = uint(ch)
-                let ql0 = blk * 192u + ip * 64u + o
-                let qh0 = blk * 192u + 128u + ip * 32u + o
-                let g = ip * 8u + s * 2u + o / 16u
+                let qb = blk * 48u + ip * 16u + qoff
+                let hb = blk * 48u + 32u + ip * 8u + o4
+                let g = ip * 8u + s * 2u + (tx % 2u)
                 let sc = float((int(kscb[blk * 16u + g]) ^ 128) - 128)
                 let dl = dd * sc
                 let ml = dl * 32.0
                 var w : float[16]
-                for [unroll_full] (l in range(16)) {
-                    let qj = uint(l)
-                    let h = uint(kqb[qh0 + qj])
-                    let hv = ((h & hmask) << lsh) >> rsh
-                    let q6 = ((uint(kqb[ql0 + bsel + qj]) >> shr) & 0x0Fu) | hv
-                    w[l] = float(q6) * dl - ml
+                // 4+4 uint loads per chunk (the byte-view form was 32 scattered byte loads);
+                // the slot's lsh/rsh dance is identically ((h >> 2s) & 3) << 4, vectorized
+                for [unroll_full] (u in range(4)) {
+                    let qu = kqu[qb + uint(u)]
+                    let hu = kqu[hb + uint(u)]
+                    let qv = ((qu >> shr) & 0x0F0F0F0F) | (((hu >> hsh) & 0x03030303) << 4u)
+                    for [unroll_full] (e in range(4)) {
+                        w[4 * u + e] = float((qv >> (8u * uint(e))) & 255u) * dl - ml
+                    }
                 }
-                let cx4 = sb * 64u + ip * 32u + s * 8u + o / 4u
+                let cx4 = sb * 64u + ip * 32u + s * 8u + o4
                 for [unroll_full] (b in range(2)) {
                     let xb4 = uint(b) * nb4 + cx4
                     var acc = 0.0
@@ -1091,7 +1096,7 @@ class MetalKqMvB2K6 {
 class MetalKqMvB4K6 {
     @ssbo @binding = 0 kdh : array<float16>
     @ssbo @binding = 1 kscb : array<uint8>
-    @ssbo @binding = 2 kqb : array<uint8>
+    @ssbo @binding = 2 kqu : array<uint>
     @ssbo @binding = 3 x : array<float4>
     @ssbo @binding = 4 y : array<float>
     @uniform @binding = 5 ndim : uint
@@ -1108,12 +1113,10 @@ class MetalKqMvB4K6 {
         let colbase = gl_WorkGroupID.y * 4u
         let nb = ndim / 256u
         let s = tx / 2u
-        let o = (tx % 2u) * 16u
-        let bsel = (s % 2u) * 32u
+        let o4 = (tx % 2u) * 4u
+        let qoff = (s % 2u) * 8u + o4
         let shr = s < 2u ? 0u : 4u
-        let hmask = 0x03u << (2u * s)
-        let lsh = s == 0u ? 4u : (s == 1u ? 2u : 0u)
-        let rsh = s == 3u ? 2u : 0u
+        let hsh = 2u * s
         let nb4 = ndim / 4u
         var sumf : float[4]
         var sb = 0u
@@ -1122,21 +1125,22 @@ class MetalKqMvB4K6 {
             let dd = float(kdh[blk])
             for [unroll_full] (ch in range(2)) {
                 let ip = uint(ch)
-                let ql0 = blk * 192u + ip * 64u + o
-                let qh0 = blk * 192u + 128u + ip * 32u + o
-                let g = ip * 8u + s * 2u + o / 16u
+                let qb = blk * 48u + ip * 16u + qoff
+                let hb = blk * 48u + 32u + ip * 8u + o4
+                let g = ip * 8u + s * 2u + (tx % 2u)
                 let sc = float((int(kscb[blk * 16u + g]) ^ 128) - 128)
                 let dl = dd * sc
                 let ml = dl * 32.0
                 var w : float[16]
-                for [unroll_full] (l in range(16)) {
-                    let qj = uint(l)
-                    let h = uint(kqb[qh0 + qj])
-                    let hv = ((h & hmask) << lsh) >> rsh
-                    let q6 = ((uint(kqb[ql0 + bsel + qj]) >> shr) & 0x0Fu) | hv
-                    w[l] = float(q6) * dl - ml
+                for [unroll_full] (u in range(4)) {
+                    let qu = kqu[qb + uint(u)]
+                    let hu = kqu[hb + uint(u)]
+                    let qv = ((qu >> shr) & 0x0F0F0F0F) | (((hu >> hsh) & 0x03030303) << 4u)
+                    for [unroll_full] (e in range(4)) {
+                        w[4 * u + e] = float((qv >> (8u * uint(e))) & 255u) * dl - ml
+                    }
                 }
-                let cx4 = sb * 64u + ip * 32u + s * 8u + o / 4u
+                let cx4 = sb * 64u + ip * 32u + s * 8u + o4
                 for [unroll_full] (b in range(4)) {
                     let xb4 = (colbase + uint(b)) * nb4 + cx4
                     var acc = 0.0
