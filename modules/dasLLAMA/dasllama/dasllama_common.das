@@ -10,6 +10,7 @@ require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 
 require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
 require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public  // re-export ONLY llvm_tune (not math_gen's whole public surface — its jobque_boost would flood requirers with ambiguities): the auto-policy pass and tune_status reach every app that requires this module
 require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
+require ?vulkan dasllama/dasllama_math_vulkan  // nolint:STYLE030 — [init]-only: registers "vulkan" (the GPU tier; stage-0 skeleton, kernels land with the offload rail). STRICT guard: the C++ vulkan module is linked only where the dasVulkan package is installed, so CI lanes without it never compile the Vulkan driver
 require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
 require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id plane strides
@@ -2649,6 +2650,33 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         }
         delete scratch
         to_log(LOG_INFO, "dasLLAMA: load stage weights: {get_time_usec(ts_stage) / 1000} ms\n")
+        // GPU MoE tier: upload the offloaded layers' expert stacks BEFORE repack/wscale-convert —
+        // the device copies must be row-major with fp32 scales; the CPU planes are then free to
+        // interleave/convert underneath (prefill and the non-offloaded layers keep using them).
+        if (mode == QuantMode.q8 && t.config.n_expert > 0l && moe_gpu_layer_count() > 0l) {
+            let ts_gpu = ref_time_ticks()
+            let want = min(moe_gpu_layer_count(), layers)
+            let ne = t.config.n_expert
+            let nfe = t.config.n_ff_exp
+            var from_l = layers   // nothing resident until an upload lands
+            for (i in range64(want)) {
+                let l = layers - 1l - i
+                if (fmt_at(t.we1_fmt, l) != KqFmt.q8 || fmt_at(t.we2_fmt, l) != KqFmt.q8 || fmt_at(t.we3_fmt, l) != KqFmt.q8) {
+                    break   // v1 offloads plain-q8 stacks only; the resident set stays contiguous
+                }
+                var ok = moe_gpu_upload_stack(t.qblob, t.qscales, t.we1_offs[l], dim, ne * nfe)
+                ok = ok && moe_gpu_upload_stack(t.qblob, t.qscales, t.we3_offs[l], dim, ne * nfe)
+                ok = ok && moe_gpu_upload_stack(t.qblob, t.qscales, t.we2_offs[l], nfe, ne * dim)
+                if (!ok) {
+                    break   // VRAM budget hit — this and lower layers stay on CPU (partial-layer buffers idle)
+                }
+                from_l = l
+            }
+            set_moe_gpu_from_layer(from_l)
+            if (from_l < layers) {
+                to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: expert stacks of layers [{from_l}..{layers}) resident, {get_time_usec(ts_gpu) / 1000} ms\n")
+            }
+        }
         ts_stage = ref_time_ticks()
         // arm64: switch to the laneq backend and repack the just-loaded Q8 weights into its interleaved
         // layout. Returns false off-ARM (portable stays, weights stay row-major).
@@ -6460,6 +6488,9 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         let f1 = fmt_at(t.we1_fmt, l)
         let f2 = fmt_at(t.we2_fmt, l)
         let f3 = fmt_at(t.we3_fmt, l)
+        // GPU MoE tier: plain-q8 unbiased stacks of offloaded layers dispatch on the GPU (the
+        // loader uploaded them row-major pre-repack; offs resolve against those device copies)
+        let gpu_moe = !biased && !t.experts_mx4 && moe_gpu_layer_on_gpu(l)
         for (j in range64(k)) {
             let e = l * ne + s.moe_idx[j]
             s.moe_offs[j * 2l] = t.we1_offs[l] + s.moe_idx[j] * ege
@@ -6476,6 +6507,8 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             }
         } elif (biased) {
             mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
+        } elif (gpu_moe) {
+            matmul_q8q8_moe_gpu(s.moe_gu, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
         } else {
             mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
         }
@@ -6495,6 +6528,8 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             }
         } elif (biased) {
             mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
+        } elif (gpu_moe) {
+            matmul_q8q8_moe_gpu(s.moe_gu2, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
         } else {
             mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
         }
@@ -6524,6 +6559,8 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             }
         } elif (biased) {
             mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, s.moe_boffs, k, s.moe_dq, s.moe_ds, nfe, dim)
+        } elif (gpu_moe) {
+            matmul_q8q8_moe_gpu(s.moe_dn, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
         } else {
             mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
         }

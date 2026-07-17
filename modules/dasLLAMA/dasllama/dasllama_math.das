@@ -1450,6 +1450,76 @@ var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is 
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend is selected
 
+// ===== MoE GPU tier (per-layer expert offload) =====
+// A GPU tier (dasllama_math_vulkan) installs a region-list GEMV override plus a weight-stack
+// upload hook; the loader and moe_experts_apply route layers >= g_moe_gpu_from_layer through
+// them. Hooks live HERE (not in dasllama_common) so the engine never names a GPU symbol — the
+// dasVulkan package is optional. The GEMV override resolves weight regions purely by element
+// offset (the same offs values the loader uploaded), so it needs no host plane pointers — the
+// CPU planes are free to repack/f16-convert underneath after the upload.
+typedef MoeGpuGroupNFn = function<(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+typedef MoeGpuUploadFn = function<(wp : int8 const?; sp : float const?; woff : int64; n : int64; rows : int64) : bool>
+
+[unused_argument(yp, offs, nregions, xqp, xsp, n, d)]
+def private moe_gpu_unset_groupn(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    panic("dasLLAMA: MoE GPU dispatch hit without an installed GPU tier")
+}
+
+[unused_argument(wp, sp, woff, n, rows)]
+def private moe_gpu_unset_upload(wp : int8 const?; sp : float const?; woff : int64; n : int64; rows : int64) : bool {
+    return false
+}
+
+var g_moe_gpu_groupn = @@moe_gpu_unset_groupn
+var g_moe_gpu_upload = @@moe_gpu_unset_upload
+var g_moe_gpu_installed = false
+var g_moe_gpu_layer_count = 0l         // K = layers offloaded from the END (env-driven, set by the tier)
+var g_moe_gpu_from_layer = 1000000l    // first offloaded layer (n_layers - K, set by the loader)
+
+//! Install the GPU MoE tier (a GPU backend calls this at [init] when its device probe passes).
+def public install_moe_gpu_tier(groupn : MoeGpuGroupNFn; upload : MoeGpuUploadFn) {
+    g_moe_gpu_groupn = groupn
+    g_moe_gpu_upload = upload
+    g_moe_gpu_installed = true
+}
+
+def public set_moe_gpu_layer_count(k : int64) {
+    g_moe_gpu_layer_count = k
+}
+
+def public moe_gpu_layer_count : int64 {
+    return g_moe_gpu_installed ? g_moe_gpu_layer_count : 0l
+}
+
+//! Loader contract: called once per load after the resident set is known (layers - K .. layers).
+def public set_moe_gpu_from_layer(from_layer : int64) {
+    g_moe_gpu_from_layer = from_layer
+}
+
+def public moe_gpu_layer_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && l >= g_moe_gpu_from_layer
+}
+
+//! Upload one row-major fp32-scale Q8 weight stack region to the GPU; false = tier absent or VRAM budget hit.
+def public moe_gpu_upload_stack(wq : array<int8> | #; ws : array<float> | #; woff : int64; n, rows : int64) : bool {
+    if (!g_moe_gpu_installed) {
+        return false
+    }
+    unsafe {
+        return invoke(g_moe_gpu_upload, addr<int8 const?>(wq[0]), addr<float const?>(ws[0]), woff, n, rows)
+    }
+}
+
+//! Region-list GEMV on the GPU tier — the MoE dispatch twin of matmul_q8q8_groupn for offloaded layers.
+def public matmul_q8q8_moe_gpu(var y : array<float>; offs : array<int64>; nregions : int64;
+                               xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_moe_gpu_groupn, addr(y[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
+    }
+}
+
 var g_kernel_backends : table<string; KernelBackend>
 var g_active_backend = ""           // name of the active backend ("" = the unset stub)
 var g_active_priority = -1          // priority of the active row-major default (auto-activate compare)
