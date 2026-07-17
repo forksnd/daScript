@@ -187,6 +187,15 @@ def public pack32(v : ubyte4) : uint {
     return unsafe(reinterpret<uint>(v))
 }
 
+// ===== packed integer dot product (VK_KHR_shader_integer_dot_product) =====
+// sdot4 dots two uints as 4+4 SIGNED int8 lanes (dp4a). Lowers to OpSDot with the
+// PackedVectorFormat4x8Bit literal; real CPU body, so CPU == GPU exactly.
+def public sdot4(a, b : uint) : int {
+    let av = int4(unpack8(int(a)))
+    let bv = int4(unpack8(int(b)))
+    return av.x * bv.x + av.y * bv.y + av.z * bv.z + av.w * bv.w
+}
+
 // ===== mesh + task shader minimum intrinsics (VK_EXT_mesh_shader) =====
 // SetMeshOutputsEXT(vertex_count, primitive_count): the mesh-shader prologue. The SPV_EXT_mesh_shader
 // spec requires this call once per workgroup at workgroup-uniform control flow BEFORE any access to

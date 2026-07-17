@@ -17,7 +17,7 @@ require daslib/fio
 // image alike); the MoE dispatches then route those layers' whole expert FFN chain
 // (gate+up GEMMs -> act -> q8 requant -> down) through vk_moe_ffn — decode row counts on the
 // GEMV kernel, prefill batches on the tiled GEMM. Needs 8/16-bit SSBO storage + compute
-// subgroups (probed; absent = tier off, CPU fallback).
+// subgroups + shaderIntegerDotProduct (probed; any absent = tier off, CPU fallback).
 //
 // Submission model (v2): every stack carries its own descriptor set + host meta/xq/xs/y buffers,
 // so descriptors are written ONCE at upload and command buffers are PRE-RECORDED (per stack, plus
@@ -35,8 +35,8 @@ require daslib/fio
 // interleaved block layout byte-loads at stride 34 across the warp and measured ~21GB/s on the
 // 3060 Ti (~1.2ms per dispatch — the real cost behind stage-1a's "1.35ms/dispatch"). Here 8
 // lanes cooperate per 32-weight block (lane = one 4-byte word), so every warp load is 128
-// CONSECUTIVE bytes — one transaction. The block's integer dot stays exact via a 3-step
-// shuffleXor fold across the 8 lanes; lane 0 of each cluster applies the f16*f32 scales.
+// CONSECUTIVE bytes — one transaction. The block's integer dot stays exact — sdot4 (dp4a) per
+// word, then a 3-step shuffleXor fold across the 8 lanes; lane 0 applies the f16*f32 scales.
 // Params ride in vk_meta (NOT push constants — the generated pusher drops small trailing
 // scalars, dasVulkan ROADMAP): [0]=n [1]=d [2]=nregions [3]=pad, then (rel_wblock, xblock)
 // uint pairs per region — 32-weight BLOCK offsets (weight blocks relative to the resident
@@ -71,9 +71,7 @@ def q8_moe_groupn {
             let b = bi0 + my_boff
             var idot = 0
             if (b < nb) {
-                let w4 = int4(unpack8(int(vk_wq[(wb0 + b) * 8u + my_word])))
-                let x4 = int4(unpack8(int(vk_xq[(xb0 + b) * 8u + my_word])))
-                idot = w4.x * x4.x + w4.y * x4.y + w4.z * x4.z + w4.w * x4.w
+                idot = sdot4(vk_wq[(wb0 + b) * 8u + my_word], vk_xq[(xb0 + b) * 8u + my_word])
             }
             idot += subgroupShuffleXor(idot, 1u)
             idot += subgroupShuffleXor(idot, 2u)
@@ -164,15 +162,11 @@ def q8_moe_batch {
         var i3 = 0
         for (j in range(8)) {
             let ju = uint(j)
-            let xw = int4(unpack8(int(bt_xw[grp * 8u + ju])))
-            let w0 = int4(unpack8(int(bt_ww[(wi0 + 0u) * 9u + ju])))
-            let w1 = int4(unpack8(int(bt_ww[(wi0 + 1u) * 9u + ju])))
-            let w2 = int4(unpack8(int(bt_ww[(wi0 + 2u) * 9u + ju])))
-            let w3 = int4(unpack8(int(bt_ww[(wi0 + 3u) * 9u + ju])))
-            i0 += w0.x * xw.x + w0.y * xw.y + w0.z * xw.z + w0.w * xw.w
-            i1 += w1.x * xw.x + w1.y * xw.y + w1.z * xw.z + w1.w * xw.w
-            i2 += w2.x * xw.x + w2.y * xw.y + w2.z * xw.z + w2.w * xw.w
-            i3 += w3.x * xw.x + w3.y * xw.y + w3.z * xw.z + w3.w * xw.w
+            let xw = bt_xw[grp * 8u + ju]
+            i0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
+            i1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
+            i2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
+            i3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
         }
         let xscl = bt_xs[grp]
         f0 += float(i0) * bt_ws[wi0] * xscl
@@ -438,12 +432,13 @@ def private vk_moe_init : bool {
     g_gpu.instance <- create_instance("dasLLAMA vulkan tier", make_api_version(1u, 3u, 0u))
     volkLoadInstance(boost_value_to_vk(g_gpu.instance))
     g_gpu.phys = select_physical_device(g_gpu.instance)
-    if (!storage_8_16_supported(g_gpu.phys) || !subgroup_compute_ops_supported(g_gpu.phys)) {
-        to_log(LOG_ERROR, "dasLLAMA vulkan tier: device lacks 8/16-bit SSBO storage or compute subgroup ops — tier disabled\n")
+    if (!storage_8_16_supported(g_gpu.phys) || !subgroup_compute_ops_supported(g_gpu.phys)
+            || !integer_dot_product_supported(g_gpu.phys)) {
+        to_log(LOG_ERROR, "dasLLAMA vulkan tier: device lacks 8/16-bit SSBO storage, compute subgroup ops, or shaderIntegerDotProduct — tier disabled\n")
         return false
     }
     g_gpu.fam = select_graphics_queue_family(g_gpu.phys)
-    g_gpu.device <- create_device_storage_8_16(g_gpu.phys, g_gpu.fam)
+    g_gpu.device <- create_device_storage_8_16_int_dot(g_gpu.phys, g_gpu.fam)
     volkLoadDevice(dev_raw())
     g_gpu.queue = get_device_queue(g_gpu.device, g_gpu.fam, 0u)
     let sg = subgroup_properties(g_gpu.phys).subgroupSize
