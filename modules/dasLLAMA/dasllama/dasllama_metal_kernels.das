@@ -4556,6 +4556,10 @@ var g_pso_w13sw : MetalComputePipeline?
 var g_pso_kq_k4 : MetalComputePipeline?
 var g_pso_kq_k5 : MetalComputePipeline?
 var g_pso_kq_k6 : MetalComputePipeline?
+var g_pso_kq_mvb2_k4 : MetalComputePipeline?   // batch B=2..8: the kq ext small-batch mv twins
+var g_pso_kq_mvb4_k4 : MetalComputePipeline?
+var g_pso_kq_mvb2_k6 : MetalComputePipeline?
+var g_pso_kq_mvb4_k6 : MetalComputePipeline?
 var g_pso_kq_mm_b4 : MetalComputePipeline?   // batch B>=9: the prefill-owned kq mul_mm twins
 var g_pso_kq_mm_b5 : MetalComputePipeline?
 var g_pso_kq_mm_b6 : MetalComputePipeline?     // fused W1|W3+swiglu (s16 path)
@@ -4649,6 +4653,10 @@ def metal_decode_init : bool {
     g_pso_kq_k4 = compile_pso(metal_kq_gemv_k4_msl, metal_kq_gemv_k4_msl_entry, metal_kq_gemv_k4_msl_fastmath, ok)
     g_pso_kq_k5 = compile_pso(metal_kq_gemv_k5_msl, metal_kq_gemv_k5_msl_entry, metal_kq_gemv_k5_msl_fastmath, ok)
     g_pso_kq_k6 = compile_pso(metal_kq_gemv_k6_msl, metal_kq_gemv_k6_msl_entry, metal_kq_gemv_k6_msl_fastmath, ok)
+    g_pso_kq_mvb2_k4 = compile_pso(metal_kq_mvb2_k4_msl, metal_kq_mvb2_k4_msl_entry, metal_kq_mvb2_k4_msl_fastmath, ok)
+    g_pso_kq_mvb4_k4 = compile_pso(metal_kq_mvb4_k4_msl, metal_kq_mvb4_k4_msl_entry, metal_kq_mvb4_k4_msl_fastmath, ok)
+    g_pso_kq_mvb2_k6 = compile_pso(metal_kq_mvb2_k6_msl, metal_kq_mvb2_k6_msl_entry, metal_kq_mvb2_k6_msl_fastmath, ok)
+    g_pso_kq_mvb4_k6 = compile_pso(metal_kq_mvb4_k6_msl, metal_kq_mvb4_k6_msl_entry, metal_kq_mvb4_k6_msl_fastmath, ok)
     g_pso_kq_mm_b4 = compile_pso(metal_kq_mulmm_k4_msl, metal_kq_mulmm_k4_msl_entry, metal_kq_mulmm_k4_msl_fastmath, ok)
     g_pso_kq_mm_b5 = compile_pso(metal_kq_mulmm_k5_msl, metal_kq_mulmm_k5_msl_entry, metal_kq_mulmm_k5_msl_fastmath, ok)
     g_pso_kq_mm_b6 = compile_pso(metal_kq_mulmm_k6_msl, metal_kq_mulmm_k6_msl_entry, metal_kq_mulmm_k6_msl_fastmath, ok)
@@ -4730,6 +4738,32 @@ def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by, bn, bd 
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bd, 0ul, 6)
     metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
+// K-quant small-batch mv (B = 2..8): the kq ext twins — R=4 column groups via grid.y (gcols),
+// R=2 via the B2 PSO at exactly two live columns. y binds at the site's column byte offset;
+// bys = the y ROW-stride uniform; bnr = live columns (stores gate). k5 has no twin yet —
+// callers keep the per-stream loop for it.
+def enc_kq_mvb(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by : MetalBuffer?; yoff : uint64;
+               bn, bd, bys, bnr : MetalBuffer?; rows, n, nlive : int64) {
+    let two = nlive == 2l
+    if (fmt == KqFmt.k6) {
+        metal_set_pipeline(enc, two ? g_pso_kq_mvb2_k6 : g_pso_kq_mvb4_k6)
+        metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
+    } else {
+        metal_set_pipeline(enc, two ? g_pso_kq_mvb2_k4 : g_pso_kq_mvb4_k4)
+        metal_set_buffer(enc, bs, 0ul, 0)
+    }
+    metal_set_buffer(enc, bs, 0ul, 1)
+    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, bx, 0ul, 3)
+    metal_set_buffer(enc, by, yoff, 4)
+    metal_set_buffer(enc, bn, 0ul, 5)
+    metal_set_buffer(enc, bd, 0ul, 6)
+    metal_set_buffer(enc, bys, 0ul, 7)
+    metal_set_buffer(enc, bnr, 0ul, 8)
+    let gcols = two ? 1l : (nlive + 3l) / 4l
+    metal_dispatch_threadgroups(enc, uint3(uint((rows + 7l) / 8l), uint(gcols), 1u), uint3(64u, 1u, 1u))
 }
 
 // the batched kq GEMM (B >= 9): the prefill-owned kq mul_mm twins over the padded x panel —
@@ -5508,6 +5542,10 @@ def metal_kernels_release {
     release_pso(g_pso_kq_k4)
     release_pso(g_pso_kq_k5)
     release_pso(g_pso_kq_k6)
+    release_pso(g_pso_kq_mvb2_k4)
+    release_pso(g_pso_kq_mvb4_k4)
+    release_pso(g_pso_kq_mvb2_k6)
+    release_pso(g_pso_kq_mvb4_k6)
     release_pso(g_pso_kq_mm_b4)
     release_pso(g_pso_kq_mm_b5)
     release_pso(g_pso_kq_mm_b6)
