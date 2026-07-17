@@ -151,11 +151,10 @@ def private enc_kq_site_b(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; wo
         enc_kq_gemm_mm_b(enc, fmt, bq, bs, bx, by, uint64(ycol * 4l), bn, bys, mp, rows, n)
         return
     }
-    // B = 2..8: the ext small-batch twins (k4/k6) — one weight pass per R-column group instead
+    // B = 2..8: the ext small-batch twins (k4/k5/k6) — one weight pass per R-column group instead
     // of B per-stream passes (-25..-40% at the 3B sites, gemv lab round 2). The kernel derives
     // the x column stride from the n uniform — every site passes xstride == n (asserted below).
-    // k5 keeps the per-stream loop until its twin lands (Q5_K_M profiling).
-    if (nrows >= 2l && fmt != KqFmt.k5 && bnr != null) {
+    if (nrows >= 2l && bnr != null) {
         assert(xstride == n)
         enc_kq_mvb(enc, fmt, bq, bs, bx, by, uint64(ycol * 4l), bn, bd, bys, bnr, rows, n, nrows)
         return
