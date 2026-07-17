@@ -413,7 +413,9 @@ def save_image(var t; path : string; tag : string = "") : bool {
         delete meta
     }
     if (!ok) {
-        remove(tmp_path)
+        if (!remove(tmp_path)) {
+            to_log(LOG_WARNING, "dasLLAMA image: orphaned tmp '{tmp_path}' could not be removed — clean it up by hand\n")
+        }
         return false
     }
     if (rename(tmp_path, path)) {
@@ -423,7 +425,9 @@ def save_image(var t; path : string; tag : string = "") : bool {
     // brief missing-file window only costs a concurrent reader a regenerate
     remove(path)
     if (!rename(tmp_path, path)) {
-        remove(tmp_path)
+        if (!remove(tmp_path)) {
+            to_log(LOG_WARNING, "dasLLAMA image: orphaned tmp '{tmp_path}' could not be removed — clean it up by hand\n")
+        }
         return false
     }
     return true
