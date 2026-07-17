@@ -78,7 +78,7 @@ B=1 was 0.90x pre-chase (59.9): the b2r k5 GEMV loses ~10% to the select-form b1
 fused H-form rope-store (round 2) adds the last point.
 B=2 1.46x = the k5 ext twin vs lcpp's weakest K-quant mul_mv, same as the 3B board.
 
-## Board summary (post chase round 1)
+## Board summary (post chase rounds 1+2)
 
 Batch B=2..16 GREEN across every format (17 of 18 cells; B=2 leads 1.28-1.46x); pp512 at
 the line (0.98-1.00x). **B=1 after chase rounds 1+2: 1.09 / 0.95 / 1.00 / 1.02** (was
@@ -90,7 +90,6 @@ the line (0.98-1.00x). **B=1 after chase rounds 1+2: 1.09 / 0.95 / 1.00 / 1.02**
 2. **k5 per-site variant pick**: the select-form b1c (gemv-lab winner at every n=2560
    shape, -9..-11% vs b2r and under the lcpp wall) is production for n < 3072 / small-d
    sites; b2r keeps n >= 3072. Q5 gpu/step 15.87 -> 14.84ms.
-
 3. **The fused H-form rope-store** (round 2, the former ledger item): on QK-norm x f16
    mirrors, bias + per-head RMS + rope + store run as ONE head-cooperative dispatch —
    the prepass dispatch and its q/k round trip disappear (+~1% on Q4/Q5/Q6; other KV
