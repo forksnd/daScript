@@ -1344,6 +1344,65 @@ class MetalRope {
     }
 }
 
+// Additive per-row bias (x[r*n + i] += b[i]) — the QKV bias epilogue for the prefill panels
+// (decode folds it into rope-store; prefill is GEMM-bound, so a plain elementwise pass is free).
+class MetalAddBiasRows {
+    @ssbo @binding = 0 x : array<float>     // [nrows x n], updated in place (bound at the panel offset)
+    @ssbo @binding = 1 b : array<float>     // [n]
+    @uniform @binding = 2 n : uint
+    @uniform @binding = 3 total : uint      // nrows * n — grid guard
+
+    [metal_kernel(name="metal_add_bias_rows_msl")]
+    def metal_add_bias_rows {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= total) {
+            return
+        }
+        x[gid] += b[gid % n]
+    }
+}
+
+// Per-head RMSNorm on the Q/K projections before rope (qwen3-line QK-norm): one threadgroup =
+// hs threads per (head, row) — nq q heads then the k heads; q head h at row*rstride + h*hs, k
+// head h at row*rstride + koffe + h*hs; weight w[(k ? woffe : 0) + j]. The decode drivers cover
+// q+k in ONE grid over the fused QKV buffer (koffe = qd, woffe = hs on a [qnorm | knorm] cat
+// plane); prefill dispatches its separate q/k panels with per-plane w binds. rmsnorm's exact
+// math: w * (x * 1/sqrt(sum/hs + eps)). Fusing this into rope-store is a ledger item.
+class MetalQkNorm {
+    @ssbo @binding = 0 x : array<float>     // bound at the panel offset; normalized in place
+    @ssbo @binding = 1 w : array<float>
+    @uniform @binding = 2 nq : uint         // q-head threadgroups before the k heads
+    @uniform @binding = 3 koffe : uint      // k region's element offset within a row
+    @uniform @binding = 4 rstride : uint    // row stride (qkvd / qd / kv_dim)
+    @uniform @binding = 5 hs : uint         // head size == the threadgroup width
+    @uniform @binding = 6 woffe : uint      // k plane's element offset in w
+    @uniform @binding = 7 eps : float
+    @workgroup part : float[4]
+
+    [metal_kernel(name="metal_qk_norm_msl")]
+    def metal_qk_norm {
+        let tgid = gl_WorkGroupID.x
+        let lid = gl_LocalInvocationID.x
+        let isK = tgid >= nq
+        let h = isK ? tgid - nq : tgid
+        let base = gl_WorkGroupID.y * rstride + (isK ? koffe : 0u) + h * hs
+        let v = x[base + lid]
+        let s1 = simd_sum(v * v)
+        if (gl_SubgroupInvocationID == 0u) {
+            part[gl_SubgroupID] = s1
+        }
+        barrier()
+        var total = 0.0
+        var sg = 0u
+        while (sg < gl_NumSubgroups) {
+            total += part[sg]
+            sg++
+        }
+        let inv = 1.0 / sqrt(total / float(hs) + eps)
+        x[base + lid] = w[(isK ? woffe : 0u) + lid] * (v * inv)
+    }
+}
+
 // The dispatch-fusion set (21 -> 15 dispatches/layer — ew cost on M1 is launch gaps, not
 // bandwidth): metal_add_rms_quant fuses add+rmsnorm+quantize in one pass (dim <= 3072 gates it);
 // metal_swiglu_quant recomputes silu on the quant pass instead of buffering; metal_rope_qk fuses both rope dispatches.
@@ -1978,7 +2037,7 @@ var private g_pf_regions : table<uint64; MetalBuffer?>    // base address -> res
 var private g_pf_pool : MetalBufferPool
 var private g_pf_upool : MetalBufferPool     // UNTRACKED pool: uniforms + rope tables (GPU-read-only)
 // what the prefill kernels implement beyond the base llama dense block — grows wave by wave
-let PF_NEEDS_OK = MetalNeed.neox
+let PF_NEEDS_OK = MetalNeed.neox | MetalNeed.qkv_bias | MetalNeed.qk_norm | MetalNeed.qd_neq_dim
 
 var private g_min_npos = 64l
 var private g_max_npos = 2048l          // naive-attention P footprint cap: heads x npos^2 floats
@@ -1988,6 +2047,8 @@ var private g_pso_gemm64 : MetalComputePipeline?
 var private g_pso_quant : MetalComputePipeline?
 var private g_pf_pso_rms : MetalComputePipeline?
 var private g_pso_rope : MetalComputePipeline?
+var private g_pso_addbias : MetalComputePipeline?
+var private g_pso_qknorm : MetalComputePipeline?
 var private g_pso_qk : MetalComputePipeline?
 var private g_pso_softmax : MetalComputePipeline?
 var private g_pso_av : MetalComputePipeline?
@@ -2082,6 +2143,14 @@ def public metal_prefill_shutdown {
     if (g_pso_rope != null) {
         metal_release(g_pso_rope)
         g_pso_rope = null
+    }
+    if (g_pso_addbias != null) {
+        metal_release(g_pso_addbias)
+        g_pso_addbias = null
+    }
+    if (g_pso_qknorm != null) {
+        metal_release(g_pso_qknorm)
+        g_pso_qknorm = null
     }
     if (g_pso_qk != null) {
         metal_release(g_pso_qk)
@@ -2183,6 +2252,8 @@ def private metal_prefill_init : bool {
     g_pso_quant = pf_compile_pso(metal_q8_quant_msl, metal_q8_quant_msl_entry, metal_q8_quant_msl_fastmath, ok)
     g_pf_pso_rms = pf_compile_pso(metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, ok)
     g_pso_rope = pf_compile_pso(metal_rope_msl, metal_rope_msl_entry, metal_rope_msl_fastmath, ok)
+    g_pso_addbias = pf_compile_pso(metal_add_bias_rows_msl, metal_add_bias_rows_msl_entry, metal_add_bias_rows_msl_fastmath, ok)
+    g_pso_qknorm = pf_compile_pso(metal_qk_norm_msl, metal_qk_norm_msl_entry, metal_qk_norm_msl_fastmath, ok)
     g_pso_qk = pf_compile_pso(metal_attn_qk_msl, metal_attn_qk_msl_entry, metal_attn_qk_msl_fastmath, ok)
     g_pso_softmax = pf_compile_pso(metal_attn_softmax_msl, metal_attn_softmax_msl_entry, metal_attn_softmax_msl_fastmath, ok)
     g_pso_av = pf_compile_pso(metal_attn_av_msl, metal_attn_av_msl_entry, metal_attn_av_msl_fastmath, ok)
@@ -2441,6 +2512,29 @@ def private pf_enc_gemv(enc : MetalComputeEncoder?; s16 : bool; bwq, bws, bx, by
     metal_set_buffer(enc, bn, 0ul, 4)
     metal_set_buffer(enc, bd, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint((d + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
+}
+
+def private enc_add_bias_rows(enc : MetalComputeEncoder?; bx, bb, bn, btotal : MetalBuffer?; total : int64; off : uint64 = 0ul) {
+    metal_set_pipeline(enc, g_pso_addbias)
+    metal_set_buffer(enc, bx, off, 0)
+    metal_set_buffer(enc, bb, 0ul, 1)
+    metal_set_buffer(enc, bn, 0ul, 2)
+    metal_set_buffer(enc, btotal, 0ul, 3)
+    metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
+def private enc_qk_norm_pf(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps : MetalBuffer?; ntg, nrows, hs : int64; off : uint64 = 0ul) {
+    metal_set_pipeline(enc, g_pso_qknorm)
+    metal_set_threadgroup_memory_length(enc, metal_qk_norm_msl_tgmem, 0)
+    metal_set_buffer(enc, bx, off, 0)
+    metal_set_buffer(enc, bw, 0ul, 1)
+    metal_set_buffer(enc, bnq, 0ul, 2)
+    metal_set_buffer(enc, bkoffe, 0ul, 3)
+    metal_set_buffer(enc, brstride, 0ul, 4)
+    metal_set_buffer(enc, bhs, 0ul, 5)
+    metal_set_buffer(enc, bwoffe, 0ul, 6)
+    metal_set_buffer(enc, beps, 0ul, 7)
+    metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(hs), 1u, 1u))
 }
 
 def private enc_rope(enc : MetalComputeEncoder?; bv, bcos, bsin, bn, bhs, bnpairs, bneox : MetalBuffer?; npairs : int64; off : uint64 = 0ul) {
@@ -2725,6 +2819,12 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     var u_npairs_q = pf_uniform_u32(uint(npos * qd / 2l))
     var u_npairs_k = pf_uniform_u32(uint(npos * kv_dim / 2l))
     var u_neox = pf_uniform_u32(c.rope_neox ? 1u : 0u)
+    let has_bias = c.attn_qkv_bias
+    var u_totq = has_bias ? pf_uniform_u32(uint(npos * qd)) : null
+    var u_totkv = has_bias ? pf_uniform_u32(uint(npos * kv_dim)) : null
+    let has_qkn = c.qk_norm
+    var u_nh_pf = has_qkn ? pf_uniform_u32(uint(n_heads)) : null
+    var u_zero = has_qkn ? pf_uniform_u32(0u) : null
     var u_total_dim = pf_uniform_u32(uint(npos * dim))
     var u_total_h = pf_uniform_u32(uint(npos * hidden))
     var u_scale = pf_uniform_f32(scale)
@@ -2838,6 +2938,23 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         enc_gemm(enc, bwk, bwk_s, bxq, bxs, bks[l], u_dim, u_kvd, mp, kv_dim, koff)
                         enc_gemm(enc, bwv, bwv_s, bxq, bxs, bvs[l], u_dim, u_kvd, mp, kv_dim, koff)
                     }
+                }
+                if (has_bias && g_pf_skip != "ew" && g_pf_skip != "nongemm") {
+                    // QKV bias before rope — chunk rows only (existing rows stored biased+roped)
+                    var bbq = pf_upload_region(addr < void? >(t.bq[l * qd]), uint64(qd * 4l))
+                    var bbk = pf_upload_region(addr < void? >(t.bk[l * kv_dim]), uint64(kv_dim * 4l))
+                    var bbv = pf_upload_region(addr < void? >(t.bv[l * kv_dim]), uint64(kv_dim * 4l))
+                    enc_add_bias_rows(enc, bq, bbq, u_qd, u_totq, npos * qd)
+                    enc_add_bias_rows(enc, bks[l], bbk, u_kvd, u_totkv, npos * kv_dim, koff)
+                    enc_add_bias_rows(enc, bvs[l], bbv, u_kvd, u_totkv, npos * kv_dim, koff)
+                }
+                if (has_qkn && g_pf_skip != "ew" && g_pf_skip != "nongemm") {
+                    // per-head QK-norm before rope — the chunk's q panel and its new K rows
+                    var bqw = pf_upload_region(addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(head_size * 4l))
+                    var bkw = pf_upload_region(addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(head_size * 4l))
+                    enc_qk_norm_pf(enc, bq, bqw, u_nh_pf, u_qd, u_qd, u_hs, u_hs, u_eps, n_heads, npos, head_size)
+                    enc_qk_norm_pf(enc, bks[l], bkw, u_zero, u_zero, u_kvd, u_hs, u_zero, u_eps,
+                        n_heads / kv_mul, npos, head_size, koff)
                 }
                 if (g_pf_skip != "ew" && g_pf_skip != "nongemm") {
                     if (fused) {
@@ -3097,6 +3214,14 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     pool_release(g_pf_upool, u_npairs_q, 4ul)
     pool_release(g_pf_upool, u_npairs_k, 4ul)
     pool_release(g_pf_upool, u_neox, 4ul)
+    if (has_bias) {
+        pool_release(g_pf_upool, u_totq, 4ul)
+        pool_release(g_pf_upool, u_totkv, 4ul)
+    }
+    if (has_qkn) {
+        pool_release(g_pf_upool, u_nh_pf, 4ul)
+        pool_release(g_pf_upool, u_zero, 4ul)
+    }
     pool_release(g_pf_upool, u_total_dim, 4ul)
     pool_release(g_pf_upool, u_total_h, 4ul)
     pool_release(g_pf_upool, u_scale, 4ul)

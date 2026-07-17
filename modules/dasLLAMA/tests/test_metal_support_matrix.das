@@ -550,12 +550,24 @@ def test_metal_family_matrix(t : T?) {
             let prior_backend = active_kernel_backend()
             pin_kernel_backend("portable")
             set_wscale_f16(false)
+            // qwen3 = NEOX + QK-norm + qd != dim (0.6B: dim 1024, qd 2048) — ENGAGE since the
+            // wave A norm prepass; the tq4 row proves the tq4 rope-store's NEOX partner (pow2 hs)
             family_cells(t, path_join(models_dir(), "Qwen3-0.6B-Q8_0.gguf"), "qwen3",
                 "qwen3-0.6b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim,
-                "need_qk_norm")
+                "", KVDtype.tq4)
+            // qwen2 = NEOX + QKV bias — ENGAGE since the wave A bias epilogue; two carriers
+            // cover the hs-64 and hs-128 bias geometries (the 0.5B also proves q8_0-KV bias)
             family_cells(t, path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf"), "qwen2",
                 "qwen2.5-0.5b/q8/f16", MetalNeed.neox | MetalNeed.qkv_bias,
-                "need_qkv_bias")
+                "", KVDtype.q8_0)
+            family_cells(t, path_join(models_dir(), "Qwen2.5-1.5B-Instruct-Q8_0.gguf"), "qwen2",
+                "qwen2.5-1.5b/q8/f16", MetalNeed.neox | MetalNeed.qkv_bias,
+                "")
+            set_wscale_f16(true)   // the s16 row drives the fused qkv_rs NEOX+bias epilogue
+            family_cells(t, path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf"), "qwen2",
+                "qwen2.5-0.5b/q8/s16", MetalNeed.neox | MetalNeed.qkv_bias,
+                "")
+            set_wscale_f16(false)
             // phi3 = NEOX only — ENGAGE since the wave A rope twins; the Q4 row also proves the
             // q8_0-KV rope-store's NEOX block loop, the Q8/s16 row the fused qkv_rs NEOX mapping
             family_cells(t, path_join(models_dir(), "Phi-3.5-mini-instruct-Q4_K_M.gguf"), "phi3",
