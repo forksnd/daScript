@@ -38,6 +38,9 @@ static void register_builtin_modules_impl() {
     if (!Module::require("fio_core")) {
         NEED_MODULE(Module_FIO);
     }
+    if (!Module::require("clipboard_core")) {
+        NEED_MODULE(Module_Clipboard);
+    }
     if (!Module::require("dasbind")) {
         NEED_MODULE(Module_DASBIND);
     }

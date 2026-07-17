@@ -862,12 +862,42 @@ include/daScript/ast/ast_policy_types.h
 list(SORT AST_SRC)
 SOURCE_GROUP_FILES("ast" AST_SRC)
 
+# Clipboard is a core service, but the native desktop implementation is
+# platform-specific.  `clip` v1.15 is vendored under 3rdparty/clip (MIT) and
+# built text-only.  Linux/X11 is enabled when XCB development files are
+# available; Wayland-only, Emscripten, and other targets retain the same API
+# and report `unsupported` at runtime rather than using clip's process-local
+# fallback as a fake system clipboard.
+set(DAS_CLIPBOARD_NATIVE_SUPPORTED 0)
+set(DAS_CLIPBOARD_PLATFORM_SOURCE 3rdparty/clip/clip_none.cpp)
+set(DAS_CLIPBOARD_USE_XCB OFF)
+if(WIN32)
+    set(DAS_CLIPBOARD_NATIVE_SUPPORTED 1)
+    set(DAS_CLIPBOARD_PLATFORM_SOURCE 3rdparty/clip/clip_win.cpp)
+elseif(APPLE)
+    enable_language(OBJCXX)
+    set(DAS_CLIPBOARD_NATIVE_SUPPORTED 1)
+    set(DAS_CLIPBOARD_PLATFORM_SOURCE 3rdparty/clip/clip_osx.mm)
+elseif(UNIX AND NOT EMSCRIPTEN)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(DAS_CLIPBOARD_XCB QUIET IMPORTED_TARGET xcb)
+    endif()
+    if(DAS_CLIPBOARD_XCB_FOUND)
+        set(DAS_CLIPBOARD_NATIVE_SUPPORTED 1)
+        set(DAS_CLIPBOARD_USE_XCB ON)
+        set(DAS_CLIPBOARD_PLATFORM_SOURCE 3rdparty/clip/clip_x11.cpp)
+    endif()
+endif()
+
 SET(BUILTIN_SRC
 include/daScript/builtin/ast_gen.inc
 include/daScript/builtin/debugapi_gen.inc
+include/daScript/simulate/aot_builtin_clipboard.h
 
 src/builtin/module_builtin.h
 src/builtin/module_builtin.cpp
+src/builtin/module_builtin_clipboard.cpp
 src/builtin/module_builtin_misc_types.cpp
 src/builtin/module_builtin_runtime.cpp
 src/builtin/module_builtin_runtime_sort.cpp
@@ -889,6 +919,8 @@ src/builtin/module_builtin_dasbind.cpp
 src/builtin/module_builtin_debugger.cpp
 src/builtin/module_builtin_jobque.cpp
 src/builtin/module_file_access.cpp
+3rdparty/clip/clip.cpp
+${DAS_CLIPBOARD_PLATFORM_SOURCE}
 )
 list(SORT BUILTIN_SRC)
 SOURCE_GROUP_FILES("module builtin" BUILTIN_SRC)
@@ -1232,6 +1264,24 @@ SETUP_LIBDASCRIPT(libDaScriptDyn_runtime ON ON LIBDASCRIPT_RUNTIME_SRC DAS_EXPOR
 
 SETUP_LIBDASCRIPT(libDaScript OFF OFF LIBDASCRIPT_COMPILER_SRC DAS_CC_EXPORTS)
 SETUP_LIBDASCRIPT(libDaScriptDyn ON OFF LIBDASCRIPT_COMPILER_SRC DAS_CC_EXPORTS)
+
+foreach(DAS_CLIPBOARD_TARGET libDaScript_runtime libDaScriptDyn_runtime)
+    target_include_directories(${DAS_CLIPBOARD_TARGET} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/clip)
+    target_compile_definitions(${DAS_CLIPBOARD_TARGET} PRIVATE
+        CLIP_ENABLE_IMAGE=0
+        CLIP_ENABLE_LIST_FORMATS=0
+        DAS_CLIPBOARD_NATIVE_SUPPORTED=${DAS_CLIPBOARD_NATIVE_SUPPORTED})
+    if(DAS_CLIPBOARD_USE_XCB)
+        target_compile_definitions(${DAS_CLIPBOARD_TARGET} PRIVATE HAVE_XCB_XLIB_H=1)
+        target_link_libraries(${DAS_CLIPBOARD_TARGET} PkgConfig::DAS_CLIPBOARD_XCB Threads::Threads)
+    elseif(APPLE)
+        find_library(DAS_CLIPBOARD_COCOA_LIBRARY Cocoa REQUIRED)
+        target_link_libraries(${DAS_CLIPBOARD_TARGET} ${DAS_CLIPBOARD_COCOA_LIBRARY})
+    elseif(WIN32)
+        target_link_libraries(${DAS_CLIPBOARD_TARGET} user32)
+    endif()
+endforeach()
 
 # Make both compiler libraries wait for the single parser_generated target so
 # the bison/flex custom commands run exactly once per build (see definition

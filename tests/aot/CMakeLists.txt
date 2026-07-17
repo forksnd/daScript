@@ -326,6 +326,7 @@ FILE(GLOB AOT_DYNAMIC_CAST_RTTI_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_D
 
 # AOT for fio test files
 FILE(GLOB AOT_FIO_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/fio/*.das")
+FILE(GLOB AOT_CLIPBOARD_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/clipboard/*.das")
 
 # AOT for flatten test files
 FILE(GLOB AOT_FLATTEN_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/flatten/*.das")
@@ -809,6 +810,10 @@ add_custom_target(test_aot_fio)
 SET(FIO_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_FIO_FILES}" FIO_AOT_GENERATED_SRC test_aot_fio daslang)
 
+add_custom_target(test_aot_clipboard)
+SET(CLIPBOARD_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_CLIPBOARD_FILES}" CLIPBOARD_AOT_GENERATED_SRC test_aot_clipboard daslang)
+
 add_custom_target(test_aot_flatten)
 SET(FLATTEN_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_FLATTEN_FILES}" FLATTEN_AOT_GENERATED_SRC test_aot_flatten daslang)
@@ -1082,6 +1087,7 @@ SOURCE_GROUP_FILES("aot generated" LIVE_HOST_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" LIVE_HOST_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DYNAMIC_CAST_RTTI_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" FIO_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" CLIPBOARD_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" FLATTEN_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" FS_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" FUNCTIONAL_AOT_GENERATED_SRC)
@@ -1178,6 +1184,7 @@ add_executable(test_aot EXCLUDE_FROM_ALL ${DAS_DASCRIPT_MAIN_SRC}
     ${LIVE_HOST_MODULES_AOT_GENERATED_SRC}
     ${DYNAMIC_CAST_RTTI_AOT_GENERATED_SRC}
     ${FIO_AOT_GENERATED_SRC}
+    ${CLIPBOARD_AOT_GENERATED_SRC}
     ${FLATTEN_AOT_GENERATED_SRC}
     ${FS_AOT_GENERATED_SRC}
     ${FUNCTIONAL_AOT_GENERATED_SRC}
@@ -1258,7 +1265,7 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_class_boost
     test_aot_data_walker test_aot_debug
     test_aot_debug_agent test_aot_daspeg test_aot_dasgltf test_aot_dasllama test_aot_decs test_aot_live_host test_aot_live_host_modules test_aot_dynamic_cast_rtti
-    test_aot_fio test_aot_fs test_aot_functional
+    test_aot_clipboard test_aot_fio test_aot_fs test_aot_functional
     test_aot_gc
     test_aot_handle_types test_aot_hash_map
     test_aot_interfaces

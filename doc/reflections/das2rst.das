@@ -6,6 +6,7 @@ options auto_inline_functions = false
 options _no_tune = true   // documentation compile — no [tune_policy] auto-tune / restart guards
 
 require daslib/fio
+require daslib/clipboard
 require daslib/rtti
 require daslib/ast
 require math
@@ -223,6 +224,15 @@ def document_module_fio(_root : string) {
         group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path)$%%)
     )
     documents("File input output library", mod, "fio.rst", groups)
+}
+
+def document_module_clipboard(_root : string) {
+    var mod = [get_module("clipboard_core"), find_module("clipboard")]
+    var groups <- array<DocGroup>(
+        hide_group(group_by_regex("Internal clipboard functions", mod, %regex~^_clipboard_%%)),
+        group_by_regex("UTF-8 system clipboard", mod, %regex~^clipboard_%%)
+    )
+    documents("System clipboard", mod, "clipboard.rst", groups)
 }
 
 def document_module_random(_root : string) {
@@ -1784,6 +1794,7 @@ def main {
     document_module_builtin(root)
     document_module_math(root)
     document_module_fio(root)
+    document_module_clipboard(root)
     document_module_network(root)
     document_module_dashv(root)
     document_module_openai(root)
