@@ -1454,26 +1454,29 @@ var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend
 // A GPU tier (dasllama_math_vulkan) installs a fused MoE FFN override plus a weight-stack
 // upload hook; the loader and the MoE dispatches route layers >= g_moe_gpu_from_layer through
 // them. Hooks live HERE (not in dasllama_common) so the engine never names a GPU symbol — the
-// dasVulkan package is optional. Weights cross as row-major planes (int8 quants + f16 halfword
-// scales) gathered from the PREPARED planes by the loader (moe_gpu_upload_resident), so the
-// tier never sees a CPU plane layout. The FFN override resolves weight regions purely by
-// element offset (the same offs values the loader uploaded), so it needs no host plane pointers.
+// dasVulkan package is optional. Weights cross as row-major planes gathered from the PREPARED
+// planes by the loader (moe_gpu_upload_resident) — q8 stacks as int8 quants + f16 halfword
+// scales, native K-quant stacks (fmt = int(KqFmt), k4/k5/k6) as superblock quant payloads +
+// decoded 20B scale rows — so the tier never sees a CPU plane layout. The FFN override resolves
+// weight regions purely by element offset (the same offs values the loader uploaded), so it
+// needs no host plane pointers.
 //
 // offs1/offs3/offs2 are gate/up/down region TRIPLES (weight element offset, first row, row
 // count — the three lists share row ranges, which partition [0, nrows)); x is the row-major
-// gathered activation image (nrows x n quants + per-32 scales). The whole
+// gathered activation image — nrows x n quants + per-32 scales (q8 stacks) or the Q8_K form,
+// per-256 scales (kq stacks; the tier resolves which from the uploaded stack format). The whole
 // gate+up -> act -> requant -> down chain runs device-side; gout returns nrows x n floats.
 // is_gelu picks GeGLU over SwiGLU (swiglu_oai belongs to biased arches the callers exclude).
 typedef MoeGpuFfnFn = function<(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; nfe : int64; nrows : int64; is_gelu : bool) : void>
-typedef MoeGpuUploadFn = function<(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64) : bool>
+typedef MoeGpuUploadFn = function<(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int) : bool>
 
 [unused_argument(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)]
 def private moe_gpu_unset_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; is_gelu : bool) {
     panic("dasLLAMA: MoE GPU FFN dispatch hit without an installed GPU tier")
 }
 
-[unused_argument(wq, ws, woff, n, rows)]
-def private moe_gpu_unset_upload(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64) : bool {
+[unused_argument(wq, ws, woff, n, rows, fmt)]
+def private moe_gpu_unset_upload(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int) : bool {
     return false
 }
 
@@ -1507,22 +1510,26 @@ def public moe_gpu_layer_on_gpu(l : int64) : bool {
     return g_moe_gpu_installed && l >= g_moe_gpu_from_layer
 }
 
-//! Upload one Q8 weight stack ([rows x n] at element offset woff) as the GPU tier's row-major
-//! planes — int8 quants + f16 halfword scales; false = tier absent or VRAM budget hit.
-def public moe_gpu_upload_stack(wq : array<uint8> | #; ws : array<uint8> | #; woff : int64; n, rows : int64) : bool {
+//! Upload one weight stack ([rows x n] at element offset woff) as the GPU tier's row-major
+//! planes — q8 (fmt 0): int8 quants + f16 halfword scales; native K-quant (fmt = int(KqFmt)
+//! k4/k5/k6): superblock quant payloads + decoded 20B scale rows. false = tier absent or VRAM
+//! budget hit.
+def public moe_gpu_upload_stack(wq : array<uint8> | #; ws : array<uint8> | #; woff : int64; n, rows : int64; fmt : int) : bool {
     if (!g_moe_gpu_installed) {
         return false
     }
     unsafe {
-        return invoke(g_moe_gpu_upload, addr<uint8 const?>(wq[0]), addr<uint8 const?>(ws[0]), woff, n, rows)
+        return invoke(g_moe_gpu_upload, addr<uint8 const?>(wq[0]), addr<uint8 const?>(ws[0]), woff, n, rows, fmt)
     }
 }
 
 //! Fused MoE FFN on the GPU tier — the whole gate+up -> act -> requant -> down chain of the
 //! routed experts in one device-side dispatch chain (decode row counts and prefill batches
-//! alike; the tier chunks internally, so any nrows serves). gout is nrows x n floats.
-def public matmul_q8q8_moe_gpu_ffn(var gout : array<float>; offs1 : array<int64>; offs3 : array<int64>; offs2 : array<int64>;
-                                   nregions : int64; xq : array<int8>; xs : array<float>; n, nfe, nrows : int64; is_gelu : bool) {
+//! alike; the tier chunks internally, so any nrows serves). gout is nrows x n floats. xq/xs is
+//! the gathered activation image in the layer's own form — q8_0 per-32 scales for q8 stacks,
+//! Q8_K per-256 for kq stacks (the tier resolves which from the uploaded stack format).
+def public matmul_moe_gpu_ffn(var gout : array<float>; offs1 : array<int64>; offs3 : array<int64>; offs2 : array<int64>;
+                              nregions : int64; xq : array<int8>; xs : array<float>; n, nfe, nrows : int64; is_gelu : bool) {
     unsafe {
         invoke(g_moe_gpu_ffn, addr(gout[0]),
             addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,

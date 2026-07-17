@@ -12,12 +12,15 @@ require math
 require daslib/fio
 
 // dasLLAMA Vulkan GPU tier — per-layer MoE expert-stack offload. The loader gathers offloaded
-// layers' PREPARED q8 planes into row-major device planes (int8 quant words + f16 scales) and
-// hands them to vk_moe_upload_stack (moe_gpu_upload_resident — every load rail, gguf and mapped
-// image alike); the MoE dispatches then route those layers' whole expert FFN chain
-// (gate+up GEMMs -> act -> q8 requant -> down) through vk_moe_ffn — decode row counts on the
-// GEMV kernel, prefill batches on the tiled GEMM. Needs 8/16-bit SSBO storage + compute
-// subgroups + shaderIntegerDotProduct (probed; any absent = tier off, CPU fallback).
+// layers' PREPARED planes into row-major device planes — q8 stacks as int8 quant words + f16
+// scales, native K-quant stacks (k4/k5/k6, fmt-tagged) as superblock quant payloads + decoded
+// 20B scale rows — and hands them to vk_moe_upload_stack (moe_gpu_upload_resident — every load
+// rail, gguf and mapped image alike); the MoE dispatches then route those layers' whole expert
+// FFN chain (gate+up GEMMs -> act -> requant -> down) through vk_moe_ffn — decode row counts on
+// the GEMV kernels, q8 prefill batches on the tiled GEMM (kq batches ride the GEMV path until
+// the kq tile lands). Activations arrive in the layer's own form: Q8_0 per-32 scales for q8
+// stacks, Q8_K per-256 for kq. Needs 8/16-bit SSBO storage + compute subgroups +
+// shaderIntegerDotProduct (probed; any absent = tier off, CPU fallback).
 //
 // Submission model (v2): every stack carries its own descriptor set + host meta/xq/xs/y buffers,
 // so descriptors are written ONCE at upload and command buffers are PRE-RECORDED (per stack, plus
@@ -246,6 +249,200 @@ def q8_moe_requant {
     }
 }
 
+// Q8_K requant twin for the K-quant chains (mirrors quantize_q8_k_into_ptr): one thread per
+// 256-weight superblock — per-256 amax -> d = amax/127 -> round(x/d); scale plane is per
+// superblock. Block sums are NOT stored — the kq GEMMs recompute them via sdot4 vs 0x01010101
+// on activation words they load anyway. vk_meta[2] = superblock count for these chains.
+[compute_shader(local_size_x=256, name="q8k_moe_requant_spv")]
+def q8k_moe_requant {
+    let b = gl_GlobalInvocationID.x
+    if (b < vk_meta[2u]) {
+        let base = b * 256u
+        var amax = 0.0
+        for (i in range(256)) {
+            amax = max(amax, abs(vk_y[base + uint(i)]))
+        }
+        let d = amax / 127.0
+        let id = d != 0.0 ? 1.0 / d : 0.0
+        vk_xs[b] = d
+        for (w in range(64)) {
+            let wb = base + uint(w) * 4u
+            var word = 0u
+            for (j in range(4)) {
+                let q = int(round(vk_y[wb + uint(j)] * id))
+                word = word | ((uint(q) & 0xFF) << (uint(j) * 8u))
+            }
+            vk_xq[b * 64u + uint(w)] = word
+        }
+    }
+}
+
+// ===== the K-quant decode kernels =====
+// Native k4/k5/k6 GEMVs over superblock quant payloads + decoded 20B scale rows, with Q8_K
+// activations (per-256 f32 scales in vk_xs). Same one-subgroup-per-row shape as q8_moe_groupn,
+// but 4 lanes cooperate per 32-block — a lane owns one nibble word pairing weights k / k+16, so
+// both halves land in the SAME block and warp loads stay consecutive. The block dot is exact:
+// nibble-composed quants are in [0, 63], which sdot4 eats as signed bytes; the K-quant min /
+// offset term folds via in-kernel block sums (sdot4 vs 0x01010101 on the activation words the
+// dot already loaded). Scale rows read through the binding-1 UINT view (vk_wsu — the q8 kernels
+// see the same binding as float16), f16 d / dmin decoded by unpackHalf2x16. vk_meta uses
+// SUPERBLOCK units here: [n, d, nrows, 0] then (rel_wsuperblock, xsuperblock) pairs per row.
+
+var @ssbo @binding = 1 vk_wsu : array<uint>
+
+// deposit 4 packed high-bits (one per nibble lane of hb) at bit 4 of each byte lane
+def private k5_dep(hb : uint) : uint => (
+    ((hb & 1u) << 4u) | ((hb & 2u) << 11u) | ((hb & 4u) << 18u) | ((hb & 8u) << 25u))
+
+// Q4_K: w = d*sc*q - dmin*mn*1, q in [0,15] — per 32-block xs*(d*sc*idot - dmin*mn*bsum)
+[compute_shader(local_size_x=64, local_size_x_id=0, name="kq_moe_gemv_k4_spv")]
+def kq_moe_gemv_k4 {
+    let n = vk_meta[0u]
+    let d = vk_meta[1u]
+    let nreg = vk_meta[2u]
+    let rg = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+    if (rg < nreg * d) {
+        let r = rg / d
+        let row = rg % d
+        let nsb = n / 256u
+        let wsb0 = vk_meta[4u + r * 2u] + row * nsb
+        let xsb0 = vk_meta[5u + r * 2u]
+        let lane = gl_SubgroupInvocationID
+        let j = lane % 4u
+        let brel = lane / 4u
+        let bstride = gl_SubgroupSize / 4u
+        let nb = nsb * 8u
+        var acc = 0.0
+        var b0 = 0u
+        while (b0 < nb) {
+            let bb = b0 + brel
+            if (bb < nb) {
+                let sb = bb / 8u
+                let blk = bb % 8u
+                let wsb = wsb0 + sb
+                let w = vk_wq[wsb * 32u + blk * 4u + j]
+                let xw = (xsb0 + sb) * 64u + blk * 8u + j
+                let xlo = vk_xq[xw]
+                let xhi = vk_xq[xw + 4u]
+                let idot = sdot4(w & 0x0F0F0F0F, xlo) + sdot4((w >> 4u) & 0x0F0F0F0F, xhi)
+                let bs = sdot4(xlo, 0x01010101) + sdot4(xhi, 0x01010101)
+                let dm = unpackHalf2x16(vk_wsu[wsb * 5u])
+                let sc = int((vk_wsu[wsb * 5u + 1u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
+                let mn = int((vk_wsu[wsb * 5u + 3u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
+                acc += vk_xs[xsb0 + sb] * (dm.x * float(sc * idot) - dm.y * float(mn * bs))
+            }
+            b0 += bstride
+        }
+        let total = subgroupAdd(acc)
+        if (subgroupElect()) {
+            vk_y[rg] = total
+        }
+    }
+}
+
+// Q5_K: the k4 fold with the 5th bit OR'd in from the 32B qh region (quants in [0, 31])
+[compute_shader(local_size_x=64, local_size_x_id=0, name="kq_moe_gemv_k5_spv")]
+def kq_moe_gemv_k5 {
+    let n = vk_meta[0u]
+    let d = vk_meta[1u]
+    let nreg = vk_meta[2u]
+    let rg = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+    if (rg < nreg * d) {
+        let r = rg / d
+        let row = rg % d
+        let nsb = n / 256u
+        let wsb0 = vk_meta[4u + r * 2u] + row * nsb
+        let xsb0 = vk_meta[5u + r * 2u]
+        let lane = gl_SubgroupInvocationID
+        let j = lane % 4u
+        let brel = lane / 4u
+        let bstride = gl_SubgroupSize / 4u
+        let nb = nsb * 8u
+        var acc = 0.0
+        var b0 = 0u
+        while (b0 < nb) {
+            let bb = b0 + brel
+            if (bb < nb) {
+                let sb = bb / 8u
+                let blk = bb % 8u
+                let wsb = wsb0 + sb
+                let w = vk_wq[wsb * 40u + blk * 4u + j]
+                let hb = (vk_wq[wsb * 40u + 32u + blk] >> (j * 8u)) & 0xFF
+                let xw = (xsb0 + sb) * 64u + blk * 8u + j
+                let xlo = vk_xq[xw]
+                let xhi = vk_xq[xw + 4u]
+                let idot = (sdot4((w & 0x0F0F0F0F) | k5_dep(hb & 0xF), xlo)
+                    + sdot4(((w >> 4u) & 0x0F0F0F0F) | k5_dep(hb >> 4u), xhi))
+                let bs = sdot4(xlo, 0x01010101) + sdot4(xhi, 0x01010101)
+                let dm = unpackHalf2x16(vk_wsu[wsb * 5u])
+                let sc = int((vk_wsu[wsb * 5u + 1u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
+                let mn = int((vk_wsu[wsb * 5u + 3u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
+                acc += vk_xs[xsb0 + sb] * (dm.x * float(sc * idot) - dm.y * float(mn * bs))
+            }
+            b0 += bstride
+        }
+        let total = subgroupAdd(acc)
+        if (subgroupElect()) {
+            vk_y[rg] = total
+        }
+    }
+}
+
+// Q6_K: q = (ql | qh<<4) - 32 with per-16 SIGNED int8 sub-scales — the -32 folds as o = 32*s
+// against the per-16 block sums (the CPU portable-dot formula); lo/hi nibble halves of a block
+// are exactly its two 16-weight sub-scale groups
+[compute_shader(local_size_x=64, local_size_x_id=0, name="kq_moe_gemv_k6_spv")]
+def kq_moe_gemv_k6 {
+    let n = vk_meta[0u]
+    let d = vk_meta[1u]
+    let nreg = vk_meta[2u]
+    let rg = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+    if (rg < nreg * d) {
+        let r = rg / d
+        let row = rg % d
+        let nsb = n / 256u
+        let wsb0 = vk_meta[4u + r * 2u] + row * nsb
+        let xsb0 = vk_meta[5u + r * 2u]
+        let lane = gl_SubgroupInvocationID
+        let j = lane % 4u
+        let brel = lane / 4u
+        let bstride = gl_SubgroupSize / 4u
+        let nb = nsb * 8u
+        var acc = 0.0
+        var b0 = 0u
+        while (b0 < nb) {
+            let bb = b0 + brel
+            if (bb < nb) {
+                let sb = bb / 8u
+                let blk = bb % 8u
+                let wsb = wsb0 + sb
+                let w = vk_wq[wsb * 48u + blk * 4u + j]
+                let qhw = wsb * 48u + 32u + (blk / 4u) * 8u + j
+                let shift = (blk % 4u) * 2u
+                let lo6 = (w & 0x0F0F0F0F) | (((vk_wq[qhw] >> shift) & 0x03030303) << 4u)
+                let hi6 = ((w >> 4u) & 0x0F0F0F0F) | (((vk_wq[qhw + 4u] >> shift) & 0x03030303) << 4u)
+                let xw = (xsb0 + sb) * 64u + blk * 8u + j
+                let xlo = vk_xq[xw]
+                let xhi = vk_xq[xw + 4u]
+                let ilo = sdot4(lo6, xlo)
+                let ihi = sdot4(hi6, xhi)
+                let blo = sdot4(xlo, 0x01010101)
+                let bhi = sdot4(xhi, 0x01010101)
+                let s4 = int4(unpack8(int(vk_wsu[wsb * 5u + blk / 2u])))   // 4 signed sub-scales
+                let slo = (blk % 2u) == 0u ? s4.x : s4.z
+                let shi = (blk % 2u) == 0u ? s4.y : s4.w
+                let dd = unpackHalf2x16(vk_wsu[wsb * 5u + 4u]).x
+                acc += vk_xs[xsb0 + sb] * dd * float(slo * (ilo - 32 * blo) + shi * (ihi - 32 * bhi))
+            }
+            b0 += bstride
+        }
+        let total = subgroupAdd(acc)
+        if (subgroupElect()) {
+            vk_y[rg] = total
+        }
+    }
+}
+
 // ===== device state (process-lifetime; never finalized by design) =====
 
 let private VRAM_BUDGET = 5_500_000_000l   // resident-weight cap: under the measured ~6.5GB WDDM paging cliff
@@ -276,8 +473,10 @@ struct private HostBuf {
 struct private VkStack {
     base : int64             // first weight-element offset covered (into the q8 plane)
     elems : int64            // element count (offs resolve against [base, base+elems))
+    fmt : int                // int(KqFmt): 0 = q8, 1/2/3 = k4/k5/k6 — picks kernels + meta units
+    wqbytes : int64          // quant plane bytes (q8: elems; kq: elems/256 * {128,160,192})
     wqbuf : uint64           // device-local row-major quants (bound as array<uint>)
-    wsbuf : uint64           // device-local f16 scale plane (bound as array<float16>)
+    wsbuf : uint64           // device-local scale plane (q8: f16 halfwords; kq: 20B decoded rows)
     wsbytes : int64
     raw_set : VkDescriptorSet   // this stack's 6 bindings, written once at upload
     meta : HostBuf
@@ -318,6 +517,10 @@ struct private GpuState {
     batch_pipeline : Pipeline   // prefill batched-GEMM kernel (same set/pipe layout)
     act_pipeline : Pipeline     // elementwise act(g)*u over the gate/up planes
     rq_pipeline : Pipeline      // q8_0 requant of the activated hidden rows
+    gemv_k4 : Pipeline          // native K-quant GEMVs (per-format decode kernels)
+    gemv_k5 : Pipeline
+    gemv_k6 : Pipeline
+    rq_k_pipeline : Pipeline    // Q8_K requant twin (per-256 scale) for the kq chains
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
@@ -476,6 +679,14 @@ def private vk_moe_init : bool {
     g_gpu.act_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, ashader)
     var rshader <- create_shader_module(g_gpu.device, q8_moe_requant_spv)
     g_gpu.rq_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rshader)
+    var k4shader <- create_shader_module(g_gpu.device, kq_moe_gemv_k4_spv)
+    g_gpu.gemv_k4 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, k4shader)
+    var k5shader <- create_shader_module(g_gpu.device, kq_moe_gemv_k5_spv)
+    g_gpu.gemv_k5 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, k5shader)
+    var k6shader <- create_shader_module(g_gpu.device, kq_moe_gemv_k6_spv)
+    g_gpu.gemv_k6 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, k6shader)
+    var rkshader <- create_shader_module(g_gpu.device, q8k_moe_requant_spv)
+    g_gpu.rq_k_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rkshader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -529,14 +740,17 @@ def private write_buf_desc(var writes : array<WriteDescriptorSet>; set_ : VkDesc
     writes |> emplace(w)
 }
 
-//! MoeGpuUploadFn: upload one Q8 stack ([rows x n] at element offset woff) from the loader's
-//! gathered row-major planes (int8 quants + f16 halfword scales).
-def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64) : bool {
+//! MoeGpuUploadFn: upload one weight stack ([rows x n] at element offset woff) from the
+//! loader's gathered row-major planes. q8 (fmt 0): int8 quants + f16 halfword scales; native
+//! K-quant (fmt = int(KqFmt) k4/k5/k6): superblock quant payloads + decoded 20B scale rows.
+def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int) : bool {
     if (!vk_moe_init()) {
         return false
     }
-    let wqbytes = rows * n
-    let wsbytes = rows * (n / 32l) * 2l
+    assert(fmt == 0 || n % 256l == 0l, "dasLLAMA vulkan tier: kq stack row length must be a superblock multiple")
+    let nsb = rows * (n / 256l)
+    let wqbytes = fmt == 0 ? rows * n : nsb * (fmt == 1 ? 128l : (fmt == 2 ? 160l : 192l))
+    let wsbytes = fmt == 0 ? rows * (n / 32l) * 2l : nsb * 20l
     if (g_gpu.resident_bytes + wqbytes + wsbytes > VRAM_BUDGET) {
         to_log(LOG_INFO, "dasLLAMA vulkan tier: VRAM budget reached at {g_gpu.resident_bytes} bytes\n")
         return false
@@ -545,7 +759,7 @@ def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : 
         to_log(LOG_INFO, "dasLLAMA vulkan tier: descriptor capacity reached at {length(g_gpu.stacks)} stacks\n")
         return false
     }
-    var st = VkStack(base = woff, elems = rows * n,
+    var st = VkStack(base = woff, elems = rows * n, fmt = fmt, wqbytes = wqbytes,
                      wqbuf = make_device_buf(wqbytes), wsbuf = make_device_buf(wsbytes), wsbytes = wsbytes,
                      raw_set = alloc_desc_set(),
                      meta = make_host_buf(META_BYTES, true), xq = make_host_buf(XQ_BYTES, true),
@@ -598,6 +812,19 @@ def private cmd_bind_dispatch(raw : VkCommandBuffer; var set_ : VkDescriptorSet;
     vkCmdDispatch(raw, groups, 1u, 1u)
 }
 
+// bind the GEMV pipeline for a stack's format (0 = the q8 kernel, 1/2/3 = kq_moe_gemv_k4/5/6)
+def private bind_gemv_pipe(raw : VkCommandBuffer; fmt : int) {
+    if (fmt == 0) {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.pipeline, VkPipelineBindPoint.COMPUTE)
+    } elif (fmt == 1) {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.gemv_k4, VkPipelineBindPoint.COMPUTE)
+    } elif (fmt == 2) {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.gemv_k5, VkPipelineBindPoint.COMPUTE)
+    } else {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.gemv_k6, VkPipelineBindPoint.COMPUTE)
+    }
+}
+
 def private submit_wait(var raw : VkCommandBuffer) {
     var submit = VkSubmitInfo()
     submit.commandBufferCount = 1u
@@ -616,9 +843,11 @@ def private submit_wait(var raw : VkCommandBuffer) {
 
 // refresh a stack's mapped GEMV meta from region triples — one entry per ROW (a cnt > 1 region
 // expands, entry index = its row, so kernel output lands row-major): [n, d, nrows, 0,
-// (rel_wblock, xblock)*] as 32-block offsets; xnb = activation blocks per image row
+// (rel_wblock, xblock)*]. Block units follow the stack's format — 32-weight blocks for q8,
+// 256-weight superblocks for kq; xnb = activation blocks per image row, in the same units
 def private fill_stack_meta_rows(si : int; offs : int64 const?; nregions : int64; n, d, nrows, xnb : int64) {
     assert((4l + nrows * 2l) * 4l <= META_BYTES, "dasLLAMA vulkan tier: FFN meta exceeds capacity")
+    let unit = g_gpu.stacks[si].fmt != 0 ? 256l : 32l
     unsafe {
         var mp = reinterpret<uint?>(g_gpu.stacks[si].meta.mapped)
         mp[0] = uint(n)
@@ -629,9 +858,9 @@ def private fill_stack_meta_rows(si : int; offs : int64 const?; nregions : int64
             let rel = offs[r * 3l] - g_gpu.stacks[si].base
             let row0 = offs[r * 3l + 1l]
             let cnt = offs[r * 3l + 2l]
-            assert(rel % 32l == 0l, "dasLLAMA vulkan tier: unaligned region offset")
+            assert(rel % unit == 0l, "dasLLAMA vulkan tier: unaligned region offset")
             for (i in range64(cnt)) {
-                mp[4l + (row0 + i) * 2l] = uint(rel / 32l)
+                mp[4l + (row0 + i) * 2l] = uint(rel / unit)
                 mp[5l + (row0 + i) * 2l] = uint((row0 + i) * xnb)
             }
         }
@@ -640,9 +869,10 @@ def private fill_stack_meta_rows(si : int; offs : int64 const?; nregions : int64
 
 def private fill_stack_acts(si : int; xqp : int8 const?; xsp : float const?; xq_bytes : int64) {
     assert(xq_bytes <= XQ_BYTES, "dasLLAMA vulkan tier: dispatch exceeds scratch capacity")
+    let unit = g_gpu.stacks[si].fmt != 0 ? 256l : 32l
     unsafe {
         memcpy(g_gpu.stacks[si].xq.mapped, reinterpret<void? -const>(xqp), int(xq_bytes))
-        memcpy(g_gpu.stacks[si].xs.mapped, reinterpret<void? -const>(xsp), int((xq_bytes / 32l) * 4l))
+        memcpy(g_gpu.stacks[si].xs.mapped, reinterpret<void? -const>(xsp), int((xq_bytes / unit) * 4l))
     }
 }
 
@@ -741,7 +971,7 @@ def private ensure_batch_set(si : int; ybuf, xqbuf, xsbuf : uint64; xqbytes, xsb
         g_gpu.stacks[si].batch_made = true
     }
     var writes : array<WriteDescriptorSet>
-    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 0u, g_gpu.stacks[si].wqbuf, g_gpu.stacks[si].elems)
+    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 0u, g_gpu.stacks[si].wqbuf, g_gpu.stacks[si].wqbytes)
     write_buf_desc(writes, g_gpu.stacks[si].batch_set, 1u, g_gpu.stacks[si].wsbuf, g_gpu.stacks[si].wsbytes)
     write_buf_desc(writes, g_gpu.stacks[si].batch_set, 2u, g_gpu.stacks[si].batch_meta_dev, BATCH_META_BYTES)
     write_buf_desc(writes, g_gpu.stacks[si].batch_set, 3u, xqbuf, xqbytes)
@@ -936,21 +1166,21 @@ def private ffn_cmd_for(s1, s3, s2 : int; nrows, n, nfe : int64) : VkCommandBuff
                         down_set = alloc_desc_set(), nrows = 0l)
         var writes : array<WriteDescriptorSet>
         // act: gate y (rw) at 5, up y (float view) at 3, params at 2; 0/1/4 unused fillers
-        write_buf_desc(writes, fc.act_set, 0u, g_gpu.stacks[s1].wqbuf, g_gpu.stacks[s1].elems)
+        write_buf_desc(writes, fc.act_set, 0u, g_gpu.stacks[s1].wqbuf, g_gpu.stacks[s1].wqbytes)
         write_buf_desc(writes, fc.act_set, 1u, g_gpu.stacks[s1].wsbuf, g_gpu.stacks[s1].wsbytes)
         write_buf_desc(writes, fc.act_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
         write_buf_desc(writes, fc.act_set, 3u, g_gpu.stacks[s3].y_dev, Y_BYTES)
         write_buf_desc(writes, fc.act_set, 4u, g_gpu.stacks[s1].xs.buf, XS_BYTES)
         write_buf_desc(writes, fc.act_set, 5u, g_gpu.stacks[s1].y_dev, Y_BYTES)
         // requant: hidden floats at 5 -> hq/hs planes at 3/4
-        write_buf_desc(writes, fc.rq_set, 0u, g_gpu.stacks[s1].wqbuf, g_gpu.stacks[s1].elems)
+        write_buf_desc(writes, fc.rq_set, 0u, g_gpu.stacks[s1].wqbuf, g_gpu.stacks[s1].wqbytes)
         write_buf_desc(writes, fc.rq_set, 1u, g_gpu.stacks[s1].wsbuf, g_gpu.stacks[s1].wsbytes)
         write_buf_desc(writes, fc.rq_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
         write_buf_desc(writes, fc.rq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
         write_buf_desc(writes, fc.rq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
         write_buf_desc(writes, fc.rq_set, 5u, g_gpu.stacks[s1].y_dev, Y_BYTES)
         // down: its own planes + host-visible meta, hq/hs as the activation image, its y_dev
-        write_buf_desc(writes, fc.down_set, 0u, g_gpu.stacks[s2].wqbuf, g_gpu.stacks[s2].elems)
+        write_buf_desc(writes, fc.down_set, 0u, g_gpu.stacks[s2].wqbuf, g_gpu.stacks[s2].wqbytes)
         write_buf_desc(writes, fc.down_set, 1u, g_gpu.stacks[s2].wsbuf, g_gpu.stacks[s2].wsbytes)
         write_buf_desc(writes, fc.down_set, 2u, g_gpu.stacks[s2].meta.buf, META_BYTES)
         write_buf_desc(writes, fc.down_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
@@ -971,18 +1201,23 @@ def private ffn_cmd_for(s1, s3, s2 : int; nrows, n, nfe : int64) : VkCommandBuff
         vk_check(vkBeginCommandBuffer(raw, begin), null)
         cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
         batch_barrier(raw, true)
-        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.pipeline, VkPipelineBindPoint.COMPUTE)
+        bind_gemv_pipe(raw, g_gpu.stacks[s1].fmt)
         let ggu = uint((nrows * nfe + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg)
         cmd_bind_dispatch(raw, g_gpu.stacks[s1].raw_set, ggu)
+        if (g_gpu.stacks[s3].fmt != g_gpu.stacks[s1].fmt) {
+            bind_gemv_pipe(raw, g_gpu.stacks[s3].fmt)
+        }
         cmd_bind_dispatch(raw, g_gpu.stacks[s3].raw_set, ggu)
         comp_barrier(raw)
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.act_pipeline, VkPipelineBindPoint.COMPUTE)
         cmd_bind_dispatch(raw, fc.act_set, uint((nrows * nfe + 255l) / 256l))
         comp_barrier(raw)
-        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.rq_pipeline, VkPipelineBindPoint.COMPUTE)
-        cmd_bind_dispatch(raw, fc.rq_set, uint((nrows * nfe / 32l + 255l) / 256l))
+        // the requant form follows the DOWN stack — its GEMV is the consumer of hq/hs
+        let dkq = g_gpu.stacks[s2].fmt != 0
+        cmd_bind_pipeline(vk_value_to_boost(raw), dkq ? g_gpu.rq_k_pipeline : g_gpu.rq_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, fc.rq_set, uint((nrows * nfe / (dkq ? 256l : 32l) + 255l) / 256l))
         comp_barrier(raw)
-        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.pipeline, VkPipelineBindPoint.COMPUTE)
+        bind_gemv_pipe(raw, g_gpu.stacks[s2].fmt)
         cmd_bind_dispatch(raw, fc.down_set, uint((nrows * n + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
         batch_barrier(raw, false)
         cmd_copy_whole(raw, g_gpu.stacks[s2].y_dev, g_gpu.stacks[s2].y.buf, nrows * n * 4l)
@@ -998,12 +1233,18 @@ def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : in
     let s3 = find_stack(unsafe(offs3[0]))
     let s2 = find_stack(unsafe(offs2[0]))
     assert(nrows * max(nfe, n) * 4l <= Y_BYTES, "dasLLAMA vulkan tier: FFN dispatch exceeds output capacity")
-    fill_stack_meta_rows(s1, offs1, nregions, n, nfe, nrows, n / 32l)
-    fill_stack_meta_rows(s3, offs3, nregions, n, nfe, nrows, n / 32l)
-    fill_stack_meta_rows(s2, offs2, nregions, nfe, n, nrows, nfe / 32l)
+    // the chain's activation form is uniform per layer (Q8_0 or Q8_K) — the upload walk only
+    // admits all-q8 or all-kq stack triples, so kq-ness must agree across the three stacks
+    let kq = g_gpu.stacks[s1].fmt != 0
+    assert((g_gpu.stacks[s3].fmt != 0) == kq && (g_gpu.stacks[s2].fmt != 0) == kq,
+        "dasLLAMA vulkan tier: q8/kq mixed stack triple in one FFN chain")
+    let xunit = kq ? 256l : 32l
+    fill_stack_meta_rows(s1, offs1, nregions, n, nfe, nrows, n / xunit)
+    fill_stack_meta_rows(s3, offs3, nregions, n, nfe, nrows, n / xunit)
+    fill_stack_meta_rows(s2, offs2, nregions, nfe, n, nrows, nfe / xunit)
     fill_stack_acts(s1, xqp, xsp, nrows * n)
     fill_stack_acts(s3, xqp, xsp, nrows * n)
-    fill_ffn_meta(nrows * nfe, nrows * nfe / 32l, is_gelu)
+    fill_ffn_meta(nrows * nfe, nrows * nfe / xunit, is_gelu)
     var cmd = ffn_cmd_for(s1, s3, s2, nrows, n, nfe)
     submit_wait(cmd)
     unsafe {
@@ -1011,14 +1252,17 @@ def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : in
     }
 }
 
-//! MoeGpuFfnFn: the routed experts' whole FFN chain — gate+up region GEMMs, activation, q8
+//! MoeGpuFfnFn: the routed experts' whole FFN chain — gate+up region GEMMs, activation,
 //! requant, down GEMM — as device-side submit chains over the resident stacks; the hidden
 //! activations never cross PCIe. offs are region triples sharing row ranges that partition
 //! [0, nrows); gout returns nrows x n floats. Decode row counts run the GEMV kernels
-//! (pre-recorded per stack triple), batches run the tiled-GEMM chunk loop.
+//! (pre-recorded per stack triple), q8 batches run the tiled-GEMM chunk loop; kq stacks stay on
+//! the GEMV path at any nrows until the kq batch tile lands (the engine's prefill arm keeps kq
+//! batches on the CPU fused path, so only decode row counts arrive here).
 def vk_moe_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; is_gelu : bool) {
     ensure_ffn_state()
-    if (nrows < BATCH_TILE) {
+    let kq = g_gpu.stacks[find_stack(unsafe(offs1[0]))].fmt != 0
+    if (nrows < BATCH_TILE || kq) {
         vk_moe_ffn_gemv(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)
     } else {
         vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)

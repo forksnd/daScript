@@ -499,11 +499,12 @@ struct Model {
     // Native K-quant planes (valid when kquant_native): big weights whose disk type is
     // Q4_K/Q5_K/Q6_K live in per-format plane pairs instead of qblob — quant payloads packed per
     // 256-weight superblock (k4q 128B nibbles; k5q [128B nibbles][32B high-bits]; k6q
-    // [128B ql][64B qh]) plus scale planes (k4s/k5s: f16 (d*sc, dmin*m) pairs per 32-sub-block,
-    // 4B — the load-time unpack of the 6-bit packed sub-scales that keeps llama.cpp ALU-bound;
-    // k6s: the native 16 int8 sub-scales + f16 d, 18B, trivial to widen in-loop). The matching
-    // *_fmt tag says which plane a weight's element offset indexes: quant byte =
-    // (off/256)*{128,160,192}, scale byte = (off/32)*4 for k4/k5, (off/256)*18 for k6.
+    // [128B ql][64B qh]) plus scale planes (k4s/k5s: 20B/superblock — the 16B verbatim disk
+    // scale block [f16 d][f16 dmin][12B 6-bit packed sc/mn] + 4B pad; the grp repack decodes the
+    // 6-bit packing in place to [mr d][mr dmin][8 u8 sc][8 u8 mn] rows, same stride; k6s: the
+    // native 16 int8 sub-scales + f16 d, 18B). The matching *_fmt tag says which plane a
+    // weight's element offset indexes: quant byte = (off/256)*{128,160,192}, scale byte =
+    // (off/256)*20 for k4/k5, (off/256)*18 for k6.
     k4q : array<uint8>
     k4s : array<uint8>
     k5q : array<uint8>
@@ -1600,6 +1601,172 @@ def moe_gpu_gather_stack(t : Model; woff : int64; n, rows, slice_rows : int64; m
     }
 }
 
+// Disk-order K-quant plane accessors for the kq gather's un-repacked/tail rows (source of
+// truth: the private twins beside repack_k4/k5/k6_grp in dasllama_math_gen.das — replicated
+// because math_gen mounts conditionally behind the dasLLVM guard).
+
+// low 4 bits of weight k off a disk-order k4/k5 nibble row (128 bytes per superblock)
+def private kq_disk_nib45(rowq : uint8 const?; k : int64) : uint {
+    let js = k / 64l
+    let rem = k % 64l
+    let b = uint(unsafe(rowq[js * 32l + rem % 32l]))
+    return rem < 32l ? b & 15u : b >> 4u
+}
+
+// the 5th bit of weight k off a disk-order k5 qh row (32 bytes per superblock)
+def private kq_disk_hbit5(rowh : uint8 const?; k : int64) : uint {
+    let js = k / 64l
+    let rem = k % 64l
+    return (uint(unsafe(rowh[rem % 32l])) >> uint(2l * js + (rem < 32l ? 0l : 1l))) & 1u
+}
+
+// low 4 bits of weight k off a disk-order k6 ql row (128 bytes per superblock)
+def private kq_disk_nib6(rowq : uint8 const?; k : int64) : uint {
+    let h = k / 128l
+    let g = (k % 128l) / 32l
+    let b = uint(unsafe(rowq[h * 64l + (g % 2l) * 32l + k % 32l]))
+    return g < 2l ? b & 15u : b >> 4u
+}
+
+// Gather one PREPARED K-quant weight stack into the GPU tier's device planes — quant payloads
+// row-major per superblock in the k/k+16 nibble pairing (k5 keeps its 32B qh, k6 its 64B —
+// both after the 128B nibble region), plus DECODED 20B scale rows: k4/k5 [f16 d][f16 dmin]
+// [8 u8 sc][8 u8 mn], k6 [16 i8 sc][f16 d][2B pad] (18 -> 20 for word alignment). Reads
+// whatever the load prepared: the grp<mr> interleave (repack_k4/k5/k6_grp layouts, per-slice
+// groups + disk-order tails) when repacked, disk-order planes otherwise — one reader serves
+// every rail, and the device bytes are identical either way.
+def moe_gpu_gather_stack_kq(t : Model; fmt : KqFmt; woff : int64; n, rows, slice_rows : int64;
+                            repacked : bool; mr : int64; var wq : array<uint8>; var ws : array<uint8>) {
+    let nsb = n / 256l
+    let qsb = fmt == KqFmt.k4 ? 128l : (fmt == KqFmt.k5 ? 160l : 192l)
+    let dssb = fmt == KqFmt.k6 ? 18l : 20l   // disk/plane scale stride; device rows are 20B for all
+    assert(n % 256l == 0l, "GPU MoE kq gather: row length must be a superblock multiple")
+    assert(rows * nsb * qsb <= 2147483647l, "GPU MoE kq stack exceeds the int32 gather-buffer rail")
+    wq |> resize(int(rows * nsb * qsb))
+    ws |> resize(int(rows * nsb * 20l))
+    let nslices = int(rows / slice_rows)
+    let qrow = nsb * qsb
+    let srow = nsb * dssb
+    let ng = repacked ? slice_rows / mr : 0l
+    unsafe {
+        let sb0 = woff / 256l
+        let qp = (fmt == KqFmt.k4 ? addr<uint8 const?>(t.k4q[sb0 * 128l])
+            : (fmt == KqFmt.k5 ? addr<uint8 const?>(t.k5q[sb0 * 160l]) : addr<uint8 const?>(t.k6q[sb0 * 192l])))
+        let sp = (fmt == KqFmt.k4 ? addr<uint8 const?>(t.k4s[sb0 * 20l])
+            : (fmt == KqFmt.k5 ? addr<uint8 const?>(t.k5s[sb0 * 20l]) : addr<uint8 const?>(t.k6s[sb0 * 18l])))
+        var wqp = addr(wq[0])
+        var wsp = addr(ws[0])
+        let njobs = is_job_que_available() ? min(nslices, 4 * (get_total_hw_jobs() + 1)) : 1
+        maybe_parallel_for(0, nslices, njobs) $(ssb, sse) {
+            unsafe {
+                for (s in range(ssb, sse)) {
+                    let sliceQ = int64(s) * slice_rows * qrow
+                    let sliceS = int64(s) * slice_rows * srow
+                    for (ri in range64(slice_rows)) {
+                        let rr = int64(s) * slice_rows + ri
+                        let grouped = repacked && ri < ng * mr
+                        let g = ri / mr
+                        let r = ri % mr
+                        for (sbi in range64(nsb)) {
+                            var dq = wqp + rr * qrow + sbi * qsb
+                            var dsc = wsp + (rr * nsb + sbi) * 20l
+                            if (grouped) {
+                                let gq = qp + sliceQ + g * mr * qrow + sbi * qsb * mr
+                                let gs = sp + sliceS + g * mr * srow + sbi * dssb * mr
+                                for (m in range64(128l)) {   // nibble region: verbatim per (blk, j, t)
+                                    dq[m] = gq[((m / 4l) * mr + r) * 4l + m % 4l]
+                                }
+                                if (fmt == KqFmt.k5) {
+                                    for (bj in range64(32l)) {
+                                        dq[128l + bj] = gq[128l * mr + bj * mr + r]
+                                    }
+                                } elif (fmt == KqFmt.k6) {
+                                    for (p in range64(64l)) {
+                                        dq[128l + p] = gq[128l * mr + ((p / 4l) * mr + r) * 4l + p % 4l]
+                                    }
+                                }
+                                if (fmt == KqFmt.k6) {
+                                    for (idx in range64(16l)) {
+                                        dsc[idx] = gs[idx * mr + r]
+                                    }
+                                    dsc[16] = gs[16l * mr + 2l * r]
+                                    dsc[17] = gs[16l * mr + 2l * r + 1l]
+                                    dsc[18] = uint8(0)
+                                    dsc[19] = uint8(0)
+                                } else {
+                                    dsc[0] = gs[2l * r]
+                                    dsc[1] = gs[2l * r + 1l]
+                                    dsc[2] = gs[2l * mr + 2l * r]
+                                    dsc[3] = gs[2l * mr + 2l * r + 1l]
+                                    for (blk in range64(8l)) {
+                                        dsc[4l + blk] = gs[4l * mr + blk * mr + r]
+                                        dsc[12l + blk] = gs[12l * mr + blk * mr + r]
+                                    }
+                                }
+                            } else {
+                                let rq = qp + sliceQ + ri * qrow + sbi * qsb
+                                let rs = sp + sliceS + ri * srow + sbi * dssb
+                                for (m in range64(128l)) {   // re-pair disk k/k+32 nibbles to k/k+16
+                                    let k = (m / 16l) * 32l + m % 16l
+                                    let lo = fmt == KqFmt.k6 ? kq_disk_nib6(rq, k) : kq_disk_nib45(rq, k)
+                                    let hi = fmt == KqFmt.k6 ? kq_disk_nib6(rq, k + 16l) : kq_disk_nib45(rq, k + 16l)
+                                    dq[m] = uint8(lo | (hi << 4u))
+                                }
+                                if (fmt == KqFmt.k5) {
+                                    for (bj in range64(32l)) {
+                                        let k = (bj / 4l) * 32l + (bj % 4l) * 4l
+                                        var hb = 0u
+                                        for (tt in range64(4l)) {
+                                            hb |= kq_disk_hbit5(rq + 128l, k + tt) << uint(tt)
+                                            hb |= kq_disk_hbit5(rq + 128l, k + 16l + tt) << uint(4l + tt)
+                                        }
+                                        dq[128l + bj] = uint8(hb)
+                                    }
+                                } elif (fmt == KqFmt.k6) {
+                                    for (p in range64(64l)) {
+                                        dq[128l + p] = rq[128l + p]
+                                    }
+                                }
+                                if (fmt == KqFmt.k6) {
+                                    for (idx in range64(18l)) {
+                                        dsc[idx] = rs[idx]
+                                    }
+                                    dsc[18] = uint8(0)
+                                    dsc[19] = uint8(0)
+                                } else {
+                                    for (idx in range64(4l)) {   // f16 d + f16 dmin verbatim
+                                        dsc[idx] = rs[idx]
+                                    }
+                                    for (blk in range64(8l)) {   // decode the 6-bit sc/mn packing
+                                        let sm = k4_sc_mn(rs + 4l, blk)
+                                        dsc[4l + blk] = uint8(sm.x)
+                                        dsc[12l + blk] = uint8(sm.y)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+def private moe_gpu_fmt_kq(f : KqFmt) : bool => f == KqFmt.k4 || f == KqFmt.k5 || f == KqFmt.k6
+
+// Gather one stack through its format's reader (q8 planes or native kq planes) and hand it to
+// the tier's upload hook with the format tag.
+def private moe_gpu_gather_upload(t : Model; f : KqFmt; woff : int64; n, rows, slice_rows : int64;
+                                  mr, kgroup, wbias : int64; var wq : array<uint8>; var ws : array<uint8>) : bool {
+    if (f == KqFmt.q8) {
+        moe_gpu_gather_stack(t, woff, n, rows, slice_rows, mr, kgroup, wbias, wq, ws)
+    } else {
+        let kmr = t.kq_repacked ? (f == KqFmt.k4 ? t.kq_repack_mr4 : (f == KqFmt.k5 ? t.kq_repack_mr5 : t.kq_repack_mr6)) : 1l
+        moe_gpu_gather_stack_kq(t, f, woff, n, rows, slice_rows, t.kq_repacked, kmr, wq, ws)
+    }
+    return moe_gpu_upload_stack(wq, ws, woff, n, rows, int(f))
+}
+
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
 // the end of every load rail — gguf (post repack/wscale), quantize_weights, and the mapped-image
 // rail — so DASLLAMA_GPU_MOE_LAYERS behaves identically however the model arrived. Layers go
@@ -1626,21 +1793,23 @@ def moe_gpu_upload_resident(var t : Model) {
     var ws : array<uint8>
     for (i in range64(want)) {
         let l = layers - 1l - i
-        // dense-lead layers carry no expert stacks; the tier offloads plain-q8 stacks only —
-        // either way the walk stops so the resident set stays contiguous from the end
-        if (l < t.config.n_layer_dense_lead || t.we1_offs[l] < 0l
-                || fmt_at(t.we1_fmt, l) != KqFmt.q8 || fmt_at(t.we2_fmt, l) != KqFmt.q8 || fmt_at(t.we3_fmt, l) != KqFmt.q8) {
+        let f1 = fmt_at(t.we1_fmt, l)
+        let f2 = fmt_at(t.we2_fmt, l)
+        let f3 = fmt_at(t.we3_fmt, l)
+        let all_q8 = f1 == KqFmt.q8 && f2 == KqFmt.q8 && f3 == KqFmt.q8
+        let all_kq = moe_gpu_fmt_kq(f1) && moe_gpu_fmt_kq(f2) && moe_gpu_fmt_kq(f3)
+        // dense-lead layers carry no expert stacks; the tier offloads plain-q8 or all-K-quant
+        // stack triples (a q8/kq mix would need two activation forms in one chain) — either way
+        // the walk stops so the resident set stays contiguous from the end
+        if (l < t.config.n_layer_dense_lead || t.we1_offs[l] < 0l || !(all_q8 || all_kq)) {
             break
         }
-        moe_gpu_gather_stack(t, t.we1_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)
-        var ok = moe_gpu_upload_stack(wq, ws, t.we1_offs[l], dim, ne * nfe)
+        var ok = moe_gpu_gather_upload(t, f1, t.we1_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)
         if (ok) {
-            moe_gpu_gather_stack(t, t.we3_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)
-            ok = moe_gpu_upload_stack(wq, ws, t.we3_offs[l], dim, ne * nfe)
+            ok = moe_gpu_gather_upload(t, f3, t.we3_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)
         }
         if (ok) {
-            moe_gpu_gather_stack(t, t.we2_offs[l], nfe, ne * dim, dim, mr, kgroup, wbias, wq, ws)
-            ok = moe_gpu_upload_stack(wq, ws, t.we2_offs[l], nfe, ne * dim)
+            ok = moe_gpu_gather_upload(t, f2, t.we2_offs[l], nfe, ne * dim, dim, mr, kgroup, wbias, wq, ws)
         }
         if (!ok) {
             break   // VRAM budget hit — this and lower layers stay on CPU (partial-layer buffers idle)
@@ -6590,8 +6759,8 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         let f1 = fmt_at(t.we1_fmt, l)
         let f2 = fmt_at(t.we2_fmt, l)
         let f3 = fmt_at(t.we3_fmt, l)
-        // GPU MoE tier: plain-q8 unbiased stacks of offloaded layers dispatch on the GPU (the
-        // loader uploaded them row-major pre-repack; offs resolve against those device copies)
+        // GPU MoE tier: unbiased plain-q8 or all-K-quant stacks of offloaded layers dispatch on
+        // the GPU (the loader uploaded them per format; offs resolve against those device copies)
         let gpu_moe = !biased && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai && moe_gpu_layer_on_gpu(l)
         if (gpu_moe) {
             // region triples (slot j = row j) + a k-row gathered image (k copies of the hoisted
@@ -6612,18 +6781,22 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
                 s.moe_offs2 |> push(j)
                 s.moe_offs2 |> push(1l)
             }
-            let nb = dim / 32l
+            // kq layers gather the Q8_K image (per-256 scales, the same hoisted kxq quants the
+            // CPU kq arm dots); q8 layers the Q8_0 one — the tier resolves the form per stack
+            let nb = layer_kq ? dim / 256l : dim / 32l
             s.moe_gxq |> resize(k * dim)
             s.moe_gxs |> resize(k * nb)
             unsafe {
                 var gq = addr(s.moe_gxq[0])
                 var gs = addr(s.moe_gxs[0])
+                let sxq = layer_kq ? addr<void?>(s.kxq[0]) : addr<void?>(s.moe_xq[0])
+                let sxs = layer_kq ? addr<void?>(s.kxs[0]) : addr<void?>(s.moe_xs[0])
                 for (j in range64(k)) {
-                    memcpy(reinterpret<void?>(gq + j * dim), addr<void?>(s.moe_xq[0]), int(dim))
-                    memcpy(reinterpret<void?>(gs + j * nb), addr<void?>(s.moe_xs[0]), int(nb * 4l))
+                    memcpy(reinterpret<void?>(gq + j * dim), sxq, int(dim))
+                    memcpy(reinterpret<void?>(gs + j * nb), sxs, int(nb * 4l))
                 }
             }
-            matmul_q8q8_moe_gpu_ffn(s.moe_dn, s.moe_offs1, s.moe_offs3, s.moe_offs2, k,
+            matmul_moe_gpu_ffn(s.moe_dn, s.moe_offs1, s.moe_offs3, s.moe_offs2, k,
                 s.moe_gxq, s.moe_gxs, dim, nfe, k, c.ffn_act == FfnAct.gelu)
             prof_add("mm_moe", ts_gu)
         } else {
@@ -9412,7 +9585,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         }
         let ts_g1 = ref_time_ticks()
         if (fused_gpu) {   // GPU tier: the whole gate+up/act/requant/down chain runs device-side
-            matmul_q8q8_moe_gpu_ffn(s.moe_gout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
+            matmul_moe_gpu_ffn(s.moe_gout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
                 s.moe_gxq, s.moe_gxs, dim, nfe, nk, c.ffn_act == FfnAct.gelu)
             prof_add("mm_gemm", ts_g1)
         } else {
