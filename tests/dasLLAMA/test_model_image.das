@@ -131,6 +131,25 @@ def private make_probe() : ImgProbe {
     return <- p
 }
 
+def private read_u32_at(t : T?; path : string; at : int64) : uint {
+    var v = 0u
+    let f = fopen(path, "rb")
+    if (f == null) {
+        t |> failure("cannot open {path} for reading")
+        return v
+    }
+    fseek(f, at, seek_set)
+    var b : array<uint8>
+    b |> resize(4)
+    f |> fread(b)
+    for (i in range(4)) {
+        v |= uint(b[i]) << uint(i * 8)
+    }
+    delete b
+    fclose(f)
+    return v
+}
+
 def private patch_u32(t : T?; path : string; at : int64; v : uint) {
     let f = fopen(path, "r+b")
     if (f == null) {
@@ -203,6 +222,11 @@ def test_image_mechanics(t : T?) {
         var m5 = ImgProbe()
         t |> success(load_image(path, m5, "img-probe"), "restored version maps again")
         delete m5
+        let mb = read_u32_at(t, path, 24l)
+        patch_u32(t, path, 24l, mb - 4u)   // truncate the meta tail: the archive under-reads its last field
+        var m5c = ImgProbe()
+        t |> success(!load_image(path, m5c, "img-probe"), "truncated meta blob declines")
+        patch_u32(t, path, 24l, mb)
         patch_u32(t, path, 12l, 7u)   // header now lies about the section count
         var m5b = ImgProbe()
         t |> success(!load_image(path, m5b, "img-probe"), "section-count-lying header declines")

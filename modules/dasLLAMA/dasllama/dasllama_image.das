@@ -526,6 +526,21 @@ def load_image(path : string; var t; tag : string = "") : bool {
     }
     var by_name <- {for (sec in sections); sec.name => sec}
     _::serialize_image_meta(rarch, t)
+    // a truncated/corrupt meta blob reads back as silent zero-progress (MemSerializer sets
+    // lastError, no panic) — decline BEFORE post_load, which would panic on garbage (e.g. an
+    // unreadable arch name), and before any plane borrows
+    if (!meta->OK()) {
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — meta blob is truncated/corrupt ({meta->getLastError()})\n")
+        delete t   // half-deserialized, all owned — nothing is borrowed yet
+        delete meta_blob
+        delete sections
+        delete by_name
+        unsafe {
+            delete meta
+        }
+        unsafe(fmap_close(base, msize))
+        return false
+    }
     _::image_post_load(t)
     var ok = true
     apply(t) $(name : string; var field) {
