@@ -49,8 +49,10 @@ def image_identity(tag : string = "") : string {
 }
 
 // the image path for (gguf, current identity) — knob combos coexist as separate files
+// (the full 64-bit hash keeps that deterministic in practice; the header check would catch
+// a collision loudly, but two identities fighting over one path re-save forever)
 def image_path_for(gguf_path : string; tag : string = "") : string {
-    return "{gguf_path}.{hash(image_identity(tag)) & 0xFFFFFFFFul}.dlim"
+    return "{gguf_path}.{hash(image_identity(tag))}.dlim"
 }
 
 def private pad_to_page(cur : uint64) : uint64 {
