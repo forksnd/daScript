@@ -232,9 +232,11 @@ struct private VkStack {
     meta : HostBuf
     xq : HostBuf
     xs : HostBuf
-    y : HostBuf
+    y : HostBuf              // host-cached readback staging (the same-submit DMA copy lands here)
+    y_dev : uint64           // device-local y the kernel writes — see batch_y1_dev on why
     cmd : VkCommandBuffer    // pre-recorded single dispatch (lazy — needs the region count)
     groups : uint            // workgroup count cmd was recorded with
+    y_bytes : int64          // y DMA size cmd was recorded with
     recorded : bool
     batch_meta : HostBuf     // prefill batch meta STAGING (lazy — first batch dispatch creates it)
     batch_meta_dev : uint64  // device copy the kernel reads — a host-visible meta costs ~26us of
@@ -247,6 +249,7 @@ struct private VkStack {
 struct private PairCmd {
     cmd : VkCommandBuffer    // pre-recorded gate+up double dispatch
     groups : uint
+    y_bytes : int64
 }
 
 struct private GpuState {
@@ -479,7 +482,8 @@ def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : 
                      wqbuf = make_device_buf(wqbytes), wsbuf = make_device_buf(wsbytes), wsbytes = wsbytes,
                      raw_set = alloc_desc_set(),
                      meta = make_host_buf(META_BYTES, true), xq = make_host_buf(XQ_BYTES, true),
-                     xs = make_host_buf(XS_BYTES, true), y = make_host_buf(Y_BYTES, true, [cached = true]))
+                     xs = make_host_buf(XS_BYTES, true), y = make_host_buf(Y_BYTES, false, [cached = true]),
+                     y_dev = make_device_buf(Y_BYTES))
     upload_region(st.wqbuf, wq, wqbytes)
     upload_region(st.wsbuf, ws, wsbytes)
     var writes : array<WriteDescriptorSet>
@@ -488,7 +492,7 @@ def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : 
     write_buf_desc(writes, st.raw_set, 2u, st.meta.buf, META_BYTES)
     write_buf_desc(writes, st.raw_set, 3u, st.xq.buf, XQ_BYTES)
     write_buf_desc(writes, st.raw_set, 4u, st.xs.buf, XS_BYTES)
-    write_buf_desc(writes, st.raw_set, 5u, st.y.buf, Y_BYTES)
+    write_buf_desc(writes, st.raw_set, 5u, st.y_dev, Y_BYTES)
     let no_copies : array<CopyDescriptorSet>
     update_descriptor_sets(g_gpu.device, writes, no_copies)
     g_gpu.stacks |> push(st)
@@ -521,8 +525,9 @@ def private alloc_cmd : VkCommandBuffer {
 }
 
 // record bind+dispatch for one stack (or two back-to-back for the fused gate+up pair — the
-// dispatches write disjoint buffers, so no barrier sits between them)
-def private record_dispatch_cmd(raw : VkCommandBuffer; si1 : int; groups1 : uint; si2 : int; groups2 : uint; pair : bool) {
+// dispatches write disjoint buffers, so no barrier sits between them), then the y DMA tail:
+// one barrier, copy each stack's device y to its host-cached staging
+def private record_dispatch_cmd(raw : VkCommandBuffer; si1 : int; groups1 : uint; si2 : int; groups2 : uint; pair : bool; y_bytes : int64) {
     let begin = VkCommandBufferBeginInfo()
     vk_check(vkBeginCommandBuffer(raw, begin), null)
     cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.pipeline, VkPipelineBindPoint.COMPUTE)
@@ -538,11 +543,16 @@ def private record_dispatch_cmd(raw : VkCommandBuffer; si1 : int; groups1 : uint
         }
         vkCmdDispatch(raw, groups2, 1u, 1u)
     }
+    batch_barrier(raw, false)
+    cmd_copy_whole(raw, g_gpu.stacks[si1].y_dev, g_gpu.stacks[si1].y.buf, y_bytes)
+    if (pair) {
+        cmd_copy_whole(raw, g_gpu.stacks[si2].y_dev, g_gpu.stacks[si2].y.buf, y_bytes)
+    }
     vk_check(vkEndCommandBuffer(raw), null)
 }
 
-def private ensure_stack_cmd(si : int; groups : uint) {
-    if (g_gpu.stacks[si].recorded && g_gpu.stacks[si].groups == groups) {
+def private ensure_stack_cmd(si : int; groups : uint; y_bytes : int64) {
+    if (g_gpu.stacks[si].recorded && g_gpu.stacks[si].groups == groups && g_gpu.stacks[si].y_bytes == y_bytes) {
         return
     }
     if (!g_gpu.stacks[si].recorded) {
@@ -551,26 +561,27 @@ def private ensure_stack_cmd(si : int; groups : uint) {
         let rf : VkCommandBufferResetFlags
         vk_check(vkResetCommandBuffer(g_gpu.stacks[si].cmd, rf), null)
     }
-    record_dispatch_cmd(g_gpu.stacks[si].cmd, si, groups, si, 0u, false)
+    record_dispatch_cmd(g_gpu.stacks[si].cmd, si, groups, si, 0u, false, y_bytes)
     g_gpu.stacks[si].groups = groups
+    g_gpu.stacks[si].y_bytes = y_bytes
     g_gpu.stacks[si].recorded = true
 }
 
-def private pair_cmd_for(si1, si2 : int; groups : uint) : VkCommandBuffer {
+def private pair_cmd_for(si1, si2 : int; groups : uint; y_bytes : int64) : VkCommandBuffer {
     let key = int64(si1) * int64(MAX_STACKS) + int64(si2)
     if (key_exists(g_gpu.pair_cmds, key)) {
         var pc = g_gpu.pair_cmds[key]
-        if (pc.groups != groups) {
+        if (pc.groups != groups || pc.y_bytes != y_bytes) {
             let rf : VkCommandBufferResetFlags
             vk_check(vkResetCommandBuffer(pc.cmd, rf), null)
-            record_dispatch_cmd(pc.cmd, si1, groups, si2, groups, true)
-            g_gpu.pair_cmds[key] = PairCmd(cmd = pc.cmd, groups = groups)
+            record_dispatch_cmd(pc.cmd, si1, groups, si2, groups, true, y_bytes)
+            g_gpu.pair_cmds[key] = PairCmd(cmd = pc.cmd, groups = groups, y_bytes = y_bytes)
         }
         return pc.cmd
     }
     var cmd = alloc_cmd()
-    record_dispatch_cmd(cmd, si1, groups, si2, groups, true)
-    g_gpu.pair_cmds |> insert(key, PairCmd(cmd = cmd, groups = groups))
+    record_dispatch_cmd(cmd, si1, groups, si2, groups, true, y_bytes)
+    g_gpu.pair_cmds |> insert(key, PairCmd(cmd = cmd, groups = groups, y_bytes = y_bytes))
     return cmd
 }
 
@@ -630,7 +641,7 @@ def vk_moe_groupn(var yp : float?; offs : int64 const?; nregions : int64; xqp : 
     let y_bytes = nregions * d * 4l
     assert(y_bytes <= Y_BYTES, "dasLLAMA vulkan tier: dispatch exceeds output capacity")
     let groups = uint((nregions * d + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg)
-    ensure_stack_cmd(si, groups)
+    ensure_stack_cmd(si, groups, y_bytes)
     submit_wait(g_gpu.stacks[si].cmd)
     unsafe {
         memcpy(reinterpret<void?>(yp), g_gpu.stacks[si].y.mapped, int(y_bytes))
@@ -650,7 +661,7 @@ def vk_moe_groupn2(var y1p : float?; var y2p : float?; offs1 : int64 const?; off
     let y_bytes = nregions * d * 4l
     assert(y_bytes <= Y_BYTES, "dasLLAMA vulkan tier: dispatch exceeds output capacity")
     let groups = uint((nregions * d + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg)
-    var pcmd = pair_cmd_for(s1, s2, groups)
+    var pcmd = pair_cmd_for(s1, s2, groups, y_bytes)
     submit_wait(pcmd)
     unsafe {
         memcpy(reinterpret<void?>(y1p), g_gpu.stacks[s1].y.mapped, int(y_bytes))
