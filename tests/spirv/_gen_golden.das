@@ -104,4 +104,6 @@ def main {
     // subgroup ops (GroupNonUniform*) + spec constants (@constant_id / local_size_x_id)
     emit_golden(dir, "subgroup", subgroup_words())
     emit_golden(dir, "specc", specc_words())
+    // 8/16-bit SSBO storage: block_q8_0-mirror struct + half4 elements + unpack8/pack32
+    emit_golden(dir, "q8blk", q8blk_words())
 }

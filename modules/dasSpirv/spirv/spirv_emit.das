@@ -254,17 +254,32 @@ def private is_rt_stage(stage : ShaderStage) : bool {
     return stage == ShaderStage.RayGen || stage == ShaderStage.Miss || stage == ShaderStage.ClosestHit
 }
 
+// Pull the StorageBuffer8/16BitAccess capability for a sub-32-bit member reachable through an
+// @ssbo (std430) layout. std140 blocks never see sub-32 members (compute_block_layout rejects
+// them), so std140 calls are no-ops by construction.
+def private ensure_member_storage_caps(var m : SpirvModule; bt : Type; rules : BlockLayoutRules) {
+    if (rules != BlockLayoutRules.std430) return
+    let w = scalar_width(bt)
+    if (w == 16) {
+        ensure_storage_buffer_16(m)
+    } elif (w == 8) {
+        ensure_storage_buffer_8(m)
+    }
+}
+
 // Build a laid-out interface struct from a daslang struct's fields. Supported member shapes:
-// 32-bit scalar / vector / matrix; fixed-array of scalar / vector / nested struct (std140
-// ArrayStride decoration on the OpTypeArray); nested struct (recursive non-Block OpTypeStruct with
-// its own Offset cascade). `as_block` toggles the Block decoration on the *outer* struct (true for
-// @uniform/@push_constant blocks, false for an SSBO runtime-array element struct); recursively-built
-// nested structs are always emitted non-Block. Returns the OpTypeStruct id plus the std140 size
-// (offset past the last member) and the struct's max-member alignment (which the SSBO caller rounds
-// the struct size up to before using it as the OpTypeRuntimeArray's stride).
-def private build_block_struct(var m : SpirvModule; sname : string; st : Structure?; as_block : bool; var errors : array<string>) : tuple<ok : bool; type_id : uint; size : int; align : int> {
+// scalar / vector / matrix; fixed-array of scalar / vector / nested struct (ArrayStride decoration
+// on the OpTypeArray); nested struct (recursive non-Block OpTypeStruct with its own Offset cascade).
+// `rules` picks the packing: std140 (@uniform / @push_constant — 32-bit members only) or std430
+// (@ssbo element structs — tight strides, 8/16-bit members legal; the matching StorageBuffer8/16BitAccess
+// capability is pulled per member width). `as_block` toggles the Block decoration on the *outer*
+// struct (true for @uniform/@push_constant blocks, false for an SSBO runtime-array element struct);
+// recursively-built nested structs are always emitted non-Block. Returns the OpTypeStruct id plus
+// the laid-out size (offset past the last member) and the struct's max-member alignment (which the
+// SSBO caller rounds the struct size up to before using it as the OpTypeRuntimeArray's stride).
+def private build_block_struct(var m : SpirvModule; sname : string; st : Structure?; as_block : bool; var errors : array<string>; rules : BlockLayoutRules = BlockLayoutRules.std140) : tuple<ok : bool; type_id : uint; size : int; align : int> {
     var fields : array<BlockField>
-    let layout = compute_block_layout(sname, st, fields, errors)
+    let layout = compute_block_layout(sname, st, fields, errors, rules)
     if (!layout.ok) {
         delete fields
         return (ok = false, type_id = 0u, size = 0, align = 0)
@@ -283,13 +298,14 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
             let et = fld._type.firstType
             var elem_type : uint = 0u
             if (et.baseType == Type.tStructure && et.structType != null) {
-                let inner = build_block_struct(m, "{sname}.{f.name}[]", et.structType, false, errors)
+                let inner = build_block_struct(m, "{sname}.{f.name}[]", et.structType, false, errors, rules)
                 if (!inner.ok) {
                     delete members; delete offsets; delete mat_strides; delete fields
                     return (ok = false, type_id = 0u, size = 0, align = 0)
                 }
                 elem_type = inner.type_id
             } else {
+                ensure_member_storage_caps(m, et.baseType, rules)
                 elem_type = emit_type(m, et)
             }
             members |> push(type_array_strided(m, elem_type, f.array_count, f.array_stride))
@@ -299,7 +315,7 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
             continue
         }
         if (f.is_struct) {
-            let inner = build_block_struct(m, "{sname}.{f.name}", fld._type.structType, false, errors)
+            let inner = build_block_struct(m, "{sname}.{f.name}", fld._type.structType, false, errors, rules)
             if (!inner.ok) {
                 delete members; delete offsets; delete mat_strides; delete fields
                 return (ok = false, type_id = 0u, size = 0, align = 0)
@@ -310,6 +326,7 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
             fi++
             continue
         }
+        ensure_member_storage_caps(m, fld._type.baseType, rules)
         members |> push(emit_type(m, fld._type))
         offsets |> push(f.offset)
         // std140 matrix: ColMajor, each column padded to vec4 (MatrixStride 16) — see BlockField docs.
@@ -326,11 +343,11 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
 }
 
 // std430 layout of an SSBO runtime-array element. Returns the element SPIR-V type-id + the
-// ArrayStride. A 32-bit scalar/vector element strides by its std430 base size rounded up to its base
-// alignment (vec3 -> 16, vec2 -> 8, scalar -> 4); a struct element is laid out non-Block and strides
-// by its size rounded to the struct alignment. Matrix and nested-array elements are rejected (wrap a
-// matrix in a struct). std140_size/std140_align are reused: they equal the std430 base size/alignment
-// for these flat scalar/vector kinds (std430 differs only on array/struct padding, handled here).
+// ArrayStride. A scalar/vector element strides by its std430 base size rounded up to its base
+// alignment — width-aware, so 8/16-bit elements pack tight (int8 -> 1, half -> 2, half4 -> 8) and
+// pull the matching StorageBuffer8/16BitAccess capability; a struct element is laid out non-Block
+// under std430 rules and strides by its size rounded to the struct alignment. Matrix and
+// nested-array elements are rejected (wrap a matrix in a struct).
 def private ssbo_element_layout(var m : SpirvModule; sname : string; et : TypeDecl?; var errors : array<string>) : tuple<ok : bool; elem_type : uint; stride : int> {
     if (et == null) {
         errors |> push("ssbo '{sname}' has no element type")
@@ -342,16 +359,18 @@ def private ssbo_element_layout(var m : SpirvModule; sname : string; et : TypeDe
     }
     let bt = et.baseType
     if (bt == Type.tStructure) {
-        let bs = build_block_struct(m, "{sname} element", et.structType, false, errors)
+        let bs = build_block_struct(m, "{sname} element", et.structType, false, errors, BlockLayoutRules.std430)
         if (!bs.ok) return (ok = false, elem_type = 0u, stride = 0)
         return (ok = true, elem_type = bs.type_id, stride = round_up(bs.size, bs.align))
     }
-    // 32-bit scalar or its 2/3/4 vector (scalar_class rejects bool and non-numeric base types;
-    // the width gate keeps 16/8-bit lattice elements out until the storage-caps wave)
-    if (component_count(bt) >= 1 && scalar_class(bt) >= 0 && scalar_width(bt) == 32) {
-        return (ok = true, elem_type = emit_type(m, et), stride = round_up(std140_size(bt), std140_align(bt)))
+    // scalar or 2/3/4 vector, any lattice width (scalar_class rejects bool, non-numeric base
+    // types, and the CPU-only 8/16-lane forms)
+    if (component_count(bt) >= 1 && scalar_class(bt) >= 0) {
+        ensure_member_storage_caps(m, bt, BlockLayoutRules.std430)
+        return (ok = true, elem_type = emit_type(m, et),
+            stride = round_up(block_scalar_size(bt), block_scalar_align(bt, BlockLayoutRules.std430)))
     }
-    errors |> push("ssbo '{sname}' element type {bt} is not supported (a 32-bit scalar, a vector of those, or a struct of those)")
+    errors |> push("ssbo '{sname}' element type {bt} is not supported (an int/uint/float scalar of any lattice width, a 2/3/4-lane vector of those, or a struct of those)")
     return (ok = false, elem_type = 0u, stride = 0)
 }
 
@@ -2604,10 +2623,16 @@ class SpirvEmit : AstVisitor {
         if (storage == SpvStorageClass.TaskPayloadWorkgroupEXT) {
             return emit_type(bm, ft)
         }
+        // The packing rules follow the root global's storage class: an @ssbo member access rebuilds
+        // its member types under std430 (tight, width-aware strides), everything else under std140.
+        // MUST stay in lockstep with build_block_struct — the stride is part of the type-dedup key,
+        // so a rules mismatch here yields a DIFFERENT OpTypeArray than the struct's member type and
+        // the OpAccessChain result type no longer matches (spirv-val failure).
+        let rules = storage == SpvStorageClass.StorageBuffer ? BlockLayoutRules.std430 : BlockLayoutRules.std140
         // matrices come back through emit_type -> type_matrix correctly; only tStructure and
         // tFixedArray need the layout-aware path.
         if (ft.baseType == Type.tStructure && ft.structType != null) {
-            let inner = build_block_struct(bm, sname, ft.structType, false, errs)
+            let inner = build_block_struct(bm, sname, ft.structType, false, errs, rules)
             if (!inner.ok) return 0u
             return inner.type_id
         }
@@ -2616,30 +2641,34 @@ class SpirvEmit : AstVisitor {
             let nelem = ft.fixedDim
             var elem_type : uint = 0u
             if (et.baseType == Type.tStructure && et.structType != null) {
-                let inner = build_block_struct(bm, "{sname}[]", et.structType, false, errs)
+                let inner = build_block_struct(bm, "{sname}[]", et.structType, false, errs, rules)
                 if (!inner.ok) return 0u
                 elem_type = inner.type_id
             } else {
+                ensure_member_storage_caps(bm, et.baseType, rules)
                 elem_type = emit_type(bm, et)
             }
-            // std140 element stride: scalar/vector rounds up to vec4; struct element strides by its
-            // laid-out size rounded to the struct alignment. matrix-of-array is out of PR-G scope.
+            // element stride: scalar/vector rounds up to vec4 under std140 / packs tight under
+            // std430; struct element strides by its laid-out size rounded to the struct alignment.
             // The struct-element probe routes its diagnostics through the visitor's `errs` so a
             // layout failure here surfaces the same detailed message a direct classify_global path
             // would (was a local array that swallowed errors).
             var stride = 0
             if (et.baseType == Type.tStructure && et.structType != null) {
                 var probe : array<BlockField>
-                let pl = compute_block_layout("{sname}[]", et.structType, probe, errs)
+                let pl = compute_block_layout("{sname}[]", et.structType, probe, errs, rules)
                 delete probe
                 if (!pl.ok) return 0u
-                let salign = round_up(pl.align, 16)
+                let salign = rules == BlockLayoutRules.std140 ? round_up(pl.align, 16) : pl.align
                 stride = round_up(pl.size, salign)
             } else {
-                stride = round_up(std140_size(et.baseType), 16)
+                stride = block_array_element_stride(et.baseType, rules)
             }
             return type_array_strided(bm, elem_type, nelem, stride)
         }
+        // a terminal sub-32 member type still needs the storage cap (e.g. reading `blk.d : float16`
+        // directly through an access chain)
+        ensure_member_storage_caps(bm, ft.baseType, rules)
         return emit_type(bm, ft)
     }
 
@@ -3053,6 +3082,22 @@ class SpirvEmit : AstVisitor {
                 ensure_group_nonuniform(bm, *ctx)
                 emit(bm, SEC_FUNCS, sginfo.op, rt, res, scope_id)
             }
+            e2id[k] = res
+            return expr
+        }
+        // unpack8 / pack32: reinterpret one 32-bit scalar as four 8-bit lanes (and back) — a single
+        // OpBitcast; the byte4/ubyte4 type factory pulls the Int8 capability. Widening the unpacked
+        // lanes (`int4(b4)`) rides the existing OpSConvert path, giving sign extension for free.
+        if (name == "unpack8" || name == "pack32") {
+            if (length(expr.arguments) != 1) {
+                errs |> push("{name} expects 1 argument")
+                return expr
+            }
+            let v = value_of(expr.arguments[0])
+            if (v == 0u) return expr
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.Bitcast, rt, res, v)
             e2id[k] = res
             return expr
         }

@@ -346,15 +346,9 @@ def context_specs : array<ContextSpec> {
                 w |> write("    fc_u_out[gi] = fc_u_lat.a.x\n")
                 w |> write("\}\n")
             }),
-        ContextSpec(name = "_fc_lattice_ssbo", rail = "spirv", needle = "element type tHalf4 is not supported",
-            body = build_string() $(var w) {
-                w |> write("var @ssbo @binding = 0 fc_s_lat : array<half4>\n\n")
-                w |> write("[compute_shader(local_size_x=64, name=\"fc_lat_ssbo_spv\")]\n")
-                w |> write("def fc_lat_ssbo_kernel \{\n")
-                w |> write("    let gi = gl_GlobalInvocationID.x\n")
-                w |> write("    fc_s_lat[gi] = fc_s_lat[gi]\n")
-                w |> write("\}\n")
-            }),
+        // _fc_lattice_ssbo was deleted with the 8/16-bit SSBO storage wave: array<half4> SSBO
+        // elements are now legal (std430, StorageBuffer16BitAccess) — positive coverage lives in
+        // tests/spirv/test_storage_8_16.das. @uniform/@push_constant sub-32 stays fail-closed (std140).
         ContextSpec(name = "_fc_lattice_push", rail = "spirv", needle = "field 's': type tShort2 is not supported",
             body = build_string() $(var w) {
                 w |> write("struct FcPushLat \{\n    a : float4\n    s : short2\n\}\n\n")
