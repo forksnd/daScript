@@ -36,12 +36,15 @@ def test_empty_array_io(t : T?) {
             }
         }
         t |> success(wrote, "opened for write")
+        var read_back = false
         fopen(fname, "rb") $(f) {
             if (f != null) {
                 t |> equal(fread(f, none), 0)
                 t |> equal(long_fread(f, none), 0l)
+                read_back = true
             }
         }
+        t |> success(read_back, "opened for read")
         t |> success(remove(fname))
         delete none
     }
