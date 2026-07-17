@@ -873,6 +873,7 @@ set(DAS_CLIPBOARD_NATIVE_SUPPORTED 0)
 set(DAS_CLIPBOARD_IMAGE_SUPPORTED 0)
 set(DAS_CLIPBOARD_CLIP_IMAGE 0)
 set(DAS_CLIPBOARD_PLATFORM_SOURCE 3rdparty/clip/clip_none.cpp)
+set(DAS_CLIPBOARD_IMAGE_SOURCE)
 set(DAS_CLIPBOARD_USE_XCB OFF)
 if(WIN32)
     set(DAS_CLIPBOARD_NATIVE_SUPPORTED 1)
@@ -884,6 +885,7 @@ elseif(APPLE)
     set(DAS_CLIPBOARD_IMAGE_SUPPORTED 1)
     set(DAS_CLIPBOARD_CLIP_IMAGE 1)
     set(DAS_CLIPBOARD_PLATFORM_SOURCE 3rdparty/clip/clip_osx.mm)
+    set(DAS_CLIPBOARD_IMAGE_SOURCE 3rdparty/clip/image.cpp)
 elseif(UNIX AND NOT EMSCRIPTEN)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
@@ -926,6 +928,7 @@ src/builtin/module_builtin_debugger.cpp
 src/builtin/module_builtin_jobque.cpp
 src/builtin/module_file_access.cpp
 3rdparty/clip/clip.cpp
+${DAS_CLIPBOARD_IMAGE_SOURCE}
 ${DAS_CLIPBOARD_PLATFORM_SOURCE}
 )
 list(SORT BUILTIN_SRC)

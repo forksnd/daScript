@@ -6,7 +6,8 @@ This directory contains the text and custom-format clipboard subset of
 
 The upstream MIT license is preserved in `LICENSE.txt`. Examples, tests, and
 build-system files are intentionally omitted. daScript builds this copy with
-`CLIP_ENABLE_LIST_FORMATS=0`. clip image support is enabled on macOS; Windows
+`CLIP_ENABLE_LIST_FORMATS=0`. The upstream `image.cpp` implementation is
+included for macOS image transport. Windows
 uses the core wrapper's direct `CF_DIBV5` rail; and Linux image support remains
 explicitly unavailable until its PNG backend is vendored with the dependency.
 
