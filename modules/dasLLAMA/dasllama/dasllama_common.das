@@ -3007,7 +3007,6 @@ struct Session {
     moe_ao : array<float>       // gemma4 MoE: attn_out held while its two branches read three norms of it (dim; moe_dense_shexp only)
     // decode dispatch-fuse scratch: all k routed experts' projections run as region-list GEMVs
     moe_offs : array<int64>     // packed (weight, activation) element-offset pairs (2 per region)
-    moe_offs_up : array<int64>  // the up stack's pairs, filled beside moe_offs for the fused GPU gate+up submit
     moe_boffs : array<int64>    // per-region fblob bias offsets for the biased groupn forms (k)
     moe_gu : array<float>       // fused gate outputs (k x n_ff_exp)
     moe_gu2 : array<float>      // fused up outputs (k x n_ff_exp)
@@ -3172,7 +3171,6 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
         s.moe_xs |> resize(c.dim / 32l)
         s.moe_dbs |> resize(c.n_expert_used * c.n_ff_exp / 16l)
         s.moe_offs |> resize(2l * c.n_expert_used)
-        s.moe_offs_up |> resize(2l * c.n_expert_used)
         s.moe_boffs |> resize(c.n_expert_used)
         s.moe_gu |> resize(c.n_expert_used * c.n_ff_exp)
         s.moe_gu2 |> resize(c.n_expert_used * c.n_ff_exp)
@@ -6594,34 +6592,60 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         let f3 = fmt_at(t.we3_fmt, l)
         // GPU MoE tier: plain-q8 unbiased stacks of offloaded layers dispatch on the GPU (the
         // loader uploaded them row-major pre-repack; offs resolve against those device copies)
-        let gpu_moe = !biased && !t.experts_mx4 && moe_gpu_layer_on_gpu(l)
-        for (j in range64(k)) {
-            let e = l * ne + s.moe_idx[j]
-            s.moe_offs[j * 2l] = t.we1_offs[l] + s.moe_idx[j] * ege
-            s.moe_offs[j * 2l + 1l] = 0l   // gates share the single hoisted xb image
-            s.moe_boffs[j] = t.web1_off + e * nfe
-        }
-        if (f1 != KqFmt.q8) {   // native K-quant expert stack reads the Q8_K-form scratch (never biased — detect guards that)
-            mm_at_kq_groupn(s.moe_gu, t, f1, s.moe_offs, k, s.kxq, s.kxs, s.kxbs, dim, nfe)
-        } elif (t.experts_mx4) {   // native 4-bit expert weights — half the Q8 traffic
-            if (biased) {
-                mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
-            } else {
-                mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
-            }
-        } elif (biased) {
-            mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
-        } elif (gpu_moe) {
-            // fused gate+up: both stacks read the same hoisted xb image — ONE GPU submit
+        let gpu_moe = !biased && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai && moe_gpu_layer_on_gpu(l)
+        if (gpu_moe) {
+            // region triples (slot j = row j) + a k-row gathered image (k copies of the hoisted
+            // xb quants — a triple region reads and writes its own row); the whole
+            // gate+up/act/requant/down chain then runs device-side straight into moe_dn
+            s.moe_offs1 |> clear(); s.moe_offs1 |> reserve(k * 3l)
+            s.moe_offs3 |> clear(); s.moe_offs3 |> reserve(k * 3l)
+            s.moe_offs2 |> clear(); s.moe_offs2 |> reserve(k * 3l)
             for (j in range64(k)) {
-                s.moe_offs_up[j * 2l] = t.we3_offs[l] + s.moe_idx[j] * ege
-                s.moe_offs_up[j * 2l + 1l] = 0l
+                let base = s.moe_idx[j] * ege
+                s.moe_offs1 |> push(t.we1_offs[l] + base)   // nolint:STYLE012 — loop-append into reused scratch
+                s.moe_offs1 |> push(j)
+                s.moe_offs1 |> push(1l)
+                s.moe_offs3 |> push(t.we3_offs[l] + base)   // nolint:STYLE012 — loop-append into reused scratch
+                s.moe_offs3 |> push(j)
+                s.moe_offs3 |> push(1l)
+                s.moe_offs2 |> push(t.we2_offs[l] + base)   // nolint:STYLE012 — loop-append into reused scratch
+                s.moe_offs2 |> push(j)
+                s.moe_offs2 |> push(1l)
             }
-            matmul_q8q8_moe_gpu2(s.moe_gu, s.moe_gu2, s.moe_offs, s.moe_offs_up, k, s.moe_xq, s.moe_xs, dim, nfe)
+            let nb = dim / 32l
+            s.moe_gxq |> resize(k * dim)
+            s.moe_gxs |> resize(k * nb)
+            unsafe {
+                var gq = addr(s.moe_gxq[0])
+                var gs = addr(s.moe_gxs[0])
+                for (j in range64(k)) {
+                    memcpy(reinterpret<void?>(gq + j * dim), addr<void?>(s.moe_xq[0]), int(dim))
+                    memcpy(reinterpret<void?>(gs + j * nb), addr<void?>(s.moe_xs[0]), int(nb * 4l))
+                }
+            }
+            matmul_q8q8_moe_gpu_ffn(s.moe_dn, s.moe_offs1, s.moe_offs3, s.moe_offs2, k,
+                s.moe_gxq, s.moe_gxs, dim, nfe, k, c.ffn_act == FfnAct.gelu)
+            prof_add("mm_moe", ts_gu)
         } else {
-            mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
-        }
-        if (!gpu_moe) {
+            for (j in range64(k)) {
+                let e = l * ne + s.moe_idx[j]
+                s.moe_offs[j * 2l] = t.we1_offs[l] + s.moe_idx[j] * ege
+                s.moe_offs[j * 2l + 1l] = 0l   // gates share the single hoisted xb image
+                s.moe_boffs[j] = t.web1_off + e * nfe
+            }
+            if (f1 != KqFmt.q8) {   // native K-quant expert stack reads the Q8_K-form scratch (never biased — detect guards that)
+                mm_at_kq_groupn(s.moe_gu, t, f1, s.moe_offs, k, s.kxq, s.kxs, s.kxbs, dim, nfe)
+            } elif (t.experts_mx4) {   // native 4-bit expert weights — half the Q8 traffic
+                if (biased) {
+                    mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
+                } else {
+                    mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+                }
+            } elif (biased) {
+                mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            } else {
+                mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            }
             for (j in range64(k)) {
                 let e = l * ne + s.moe_idx[j]
                 s.moe_offs[j * 2l] = t.we3_offs[l] + s.moe_idx[j] * ege
@@ -6641,39 +6665,37 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             } else {
                 mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
             }
-        }
-        prof_add("mm_moe", ts_gu)
-        let ts_act = ref_time_ticks()
-        gate_batch(s.moe_gu, s.moe_gu2, c.ffn_act, nfe, k)
-        prof_add("act", ts_act)
-        if (f2 != KqFmt.q8) {   // kq v2: the down stack reads Q8_K-form rows
-            requant_rows_q8k_bs(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds, s.moe_dbs)
-        } else {
-            requant_rows_q8(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds)   // books mm_requant
-        }
-        let ts_down = ref_time_ticks()
-        for (j in range64(k)) {
-            let e = l * ne + s.moe_idx[j]
-            s.moe_offs[j * 2l] = t.we2_offs[l] + s.moe_idx[j] * ege
-            s.moe_offs[j * 2l + 1l] = j * nfe   // each down reads its own requantized row
-            s.moe_boffs[j] = t.web2_off + e * dim   // down bias inside the routed weight (ggml_add_id order)
-        }
-        if (f2 != KqFmt.q8) {
-            mm_at_kq_groupn(s.moe_dn, t, f2, s.moe_offs, k, s.moe_dq, s.moe_ds, s.moe_dbs, nfe, dim)
-        } elif (t.experts_mx4) {
-            if (biased) {
-                mm_at_mx4_groupn(s.moe_dn, t, s.moe_offs, s.moe_boffs, k, s.moe_dq, s.moe_ds, nfe, dim)
+            prof_add("mm_moe", ts_gu)
+            let ts_act = ref_time_ticks()
+            gate_batch(s.moe_gu, s.moe_gu2, c.ffn_act, nfe, k)
+            prof_add("act", ts_act)
+            if (f2 != KqFmt.q8) {   // kq v2: the down stack reads Q8_K-form rows
+                requant_rows_q8k_bs(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds, s.moe_dbs)
             } else {
-                mm_at_mx4_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
+                requant_rows_q8(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds)   // books mm_requant
             }
-        } elif (biased) {
-            mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, s.moe_boffs, k, s.moe_dq, s.moe_ds, nfe, dim)
-        } elif (gpu_moe) {
-            matmul_q8q8_moe_gpu(s.moe_dn, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
-        } else {
-            mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
+            let ts_down = ref_time_ticks()
+            for (j in range64(k)) {
+                let e = l * ne + s.moe_idx[j]
+                s.moe_offs[j * 2l] = t.we2_offs[l] + s.moe_idx[j] * ege
+                s.moe_offs[j * 2l + 1l] = j * nfe   // each down reads its own requantized row
+                s.moe_boffs[j] = t.web2_off + e * dim   // down bias inside the routed weight (ggml_add_id order)
+            }
+            if (f2 != KqFmt.q8) {
+                mm_at_kq_groupn(s.moe_dn, t, f2, s.moe_offs, k, s.moe_dq, s.moe_ds, s.moe_dbs, nfe, dim)
+            } elif (t.experts_mx4) {
+                if (biased) {
+                    mm_at_mx4_groupn(s.moe_dn, t, s.moe_offs, s.moe_boffs, k, s.moe_dq, s.moe_ds, nfe, dim)
+                } else {
+                    mm_at_mx4_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
+                }
+            } elif (biased) {
+                mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, s.moe_boffs, k, s.moe_dq, s.moe_ds, nfe, dim)
+            } else {
+                mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
+            }
+            prof_add("mm_moe", ts_down)
         }
-        prof_add("mm_moe", ts_down)
         let ts_red = ref_time_ticks()
         for (j in range64(k)) {   // slot order preserved — the sum is bit-identical
             axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[j * dim])), s.moe_w[j], dim)
@@ -9225,11 +9247,11 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     // kq layers whose three stacks are ALL K-quant (a mixed q8 kind keeps the per-expert loop)
     let fused_kq = (kq_layer && f1 != KqFmt.q8 && f2 != KqFmt.q8 && f3 != KqFmt.q8
         && t.kq_repacked && kernel_backend_has_kq_batch_groupn() && g_moe_fused_expert_gemms)
-    // GPU MoE tier prefill: offloaded plain-q8 unbiased layers run the three batched region-list
-    // GEMMs on the resident device stacks (tiny batches stay on the CPU per-expert loop — two
-    // GPU submits cost more than the whole GEMM there)
-    let fused_gpu = (!kq_layer && !c.moe_exps_bias && !t.experts_mx4 && moe_gpu_layer_on_gpu(l)
-        && moe_gpu_batch_ready() && g_moe_fused_expert_gemms && npos >= 32l)
+    // GPU MoE tier prefill: offloaded plain-q8 unbiased layers run the whole expert FFN chain
+    // (gate+up, act, requant, down) device-side (tiny batches stay on the CPU per-expert loop —
+    // the GPU submits cost more than the whole GEMM there)
+    let fused_gpu = (!kq_layer && !c.moe_exps_bias && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai
+        && moe_gpu_layer_on_gpu(l) && g_moe_fused_expert_gemms && npos >= 32l)
     let fused = (t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms) || fused_kq || fused_gpu
     let grows = fused ? nk : npos
     s.moe_rlog |> resize(npos * ne)
@@ -9389,38 +9411,40 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             nreg++
         }
         let ts_g1 = ref_time_ticks()
-        if (fused_gpu) {   // GPU tier: gate+up regions share row0/cnt and the gathered image — one fused submit
-            matmul_q8q8_moe_gpu_batch2(s.moe_ghb, s.moe_ghb2, s.moe_offs1, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe, nk)
-        } elif (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
-            mm_b_kq_groupn(s.moe_ghb, t, f1, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
-            mm_b_kq_groupn(s.moe_ghb2, t, f3, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
-        } elif (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
-            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, t.fblob, s.moe_boffs1, dim, nfe)
-            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, t.fblob, s.moe_boffs3, dim, nfe)
+        if (fused_gpu) {   // GPU tier: the whole gate+up/act/requant/down chain runs device-side
+            matmul_q8q8_moe_gpu_ffn(s.moe_gout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
+                s.moe_gxq, s.moe_gxs, dim, nfe, nk, c.ffn_act == FfnAct.gelu)
+            prof_add("mm_gemm", ts_g1)
         } else {
-            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
-            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+            if (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
+                mm_b_kq_groupn(s.moe_ghb, t, f1, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
+                mm_b_kq_groupn(s.moe_ghb2, t, f3, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
+            } elif (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
+                matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, t.fblob, s.moe_boffs1, dim, nfe)
+                matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, t.fblob, s.moe_boffs3, dim, nfe)
+            } else {
+                matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+                matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+            }
+            prof_add("mm_gemm", ts_g1)
+            let ts_act = ref_time_ticks()
+            gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, nk)
+            prof_add("act", ts_act)
+            if (fused_kq) {   // kq v2: the down stacks read Q8_K-form rows (+ the per-16 sums the fold consumes)
+                requant_rows_q8k_bs(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs, s.moe_hbs)
+            } else {
+                requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
+            }
+            let ts_g3 = ref_time_ticks()
+            if (fused_kq) {
+                mm_b_kq_groupn(s.moe_gout, t, f2, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim)
+            } elif (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
+                matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, s.moe_boffs2, nfe, dim)
+            } else {
+                matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim)
+            }
+            prof_add("mm_gemm", ts_g3)
         }
-        prof_add("mm_gemm", ts_g1)
-        let ts_act = ref_time_ticks()
-        gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, nk)
-        prof_add("act", ts_act)
-        if (fused_kq) {   // kq v2: the down stacks read Q8_K-form rows (+ the per-16 sums the fold consumes)
-            requant_rows_q8k_bs(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs, s.moe_hbs)
-        } else {
-            requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
-        }
-        let ts_g3 = ref_time_ticks()
-        if (fused_gpu) {
-            matmul_q8q8_moe_gpu_batch(s.moe_gout, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim, nk)
-        } elif (fused_kq) {
-            mm_b_kq_groupn(s.moe_gout, t, f2, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim)
-        } elif (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
-            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, s.moe_boffs2, nfe, dim)
-        } else {
-            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim)
-        }
-        prof_add("mm_gemm", ts_g3)
         // bucket row j -> the (position, slot) grid row for the reduce. Threaded: this is a
         // 2·nk·dim·4B scatter copy (~67MB of traffic at pp512 on the 30B) — serial it was an
         // ~8ms ALL-LANE hole between the down GEMM and the reduce (per-lane trace, dataset W)

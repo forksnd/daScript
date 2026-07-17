@@ -11,12 +11,13 @@ require strings
 require math
 require daslib/fio
 
-// dasLLAMA Vulkan GPU tier — per-layer MoE expert-stack offload: decode GEMV + prefill batch GEMM.
-// The loader gathers offloaded layers' PREPARED q8 planes into row-major device planes (int8
-// quant words + f16 scales) and hands them to vk_moe_upload_stack (moe_gpu_upload_resident —
-// every load rail, gguf and mapped image alike); moe_experts_apply then routes those layers'
-// region-list GEMVs through the tier. Needs 8/16-bit SSBO storage + compute subgroups (probed;
-// absent = tier off, CPU fallback).
+// dasLLAMA Vulkan GPU tier — per-layer MoE expert-stack offload. The loader gathers offloaded
+// layers' PREPARED q8 planes into row-major device planes (int8 quant words + f16 scales) and
+// hands them to vk_moe_upload_stack (moe_gpu_upload_resident — every load rail, gguf and mapped
+// image alike); the MoE dispatches then route those layers' whole expert FFN chain
+// (gate+up GEMMs -> act -> q8 requant -> down) through vk_moe_ffn — decode row counts on the
+// GEMV kernel, prefill batches on the tiled GEMM. Needs 8/16-bit SSBO storage + compute
+// subgroups (probed; absent = tier off, CPU fallback).
 //
 // Submission model (v2): every stack carries its own descriptor set + host meta/xq/xs/y buffers,
 // so descriptors are written ONCE at upload and command buffers are PRE-RECORDED (per stack, plus
@@ -198,6 +199,59 @@ def q8_moe_batch {
     }
 }
 
+// ===== the FFN mid-chain kernels =====
+// The act/requant steps between the gate+up and down GEMMs, so the whole MoE FFN is one submit
+// and the hidden activations never cross PCIe. Only the globals a kernel references are emitted
+// into its SPIR-V, so binding 3 doubles as a float view (vk_up) here while the GEMMs see uints.
+// vk_meta (per FFN dispatch): [0] = element count, [1] = gelu flag, [2] = 32-block count.
+
+var @ssbo @binding = 3 vk_up : array<float>
+
+// elementwise g = act(g) * u over the gate/up planes (g in vk_y, u in vk_up). Same formulas as
+// the CPU swiglu/geglu cores; exp/tanh precision differs from libm (the parity bar is
+// token-identical, not bit-identical).
+[compute_shader(local_size_x=256, name="q8_moe_act_spv")]
+def q8_moe_act {
+    let i = gl_GlobalInvocationID.x
+    if (i < vk_meta[0u]) {
+        let v = vk_y[i]
+        let u = vk_up[i]
+        if (vk_meta[1u] != 0u) {
+            let kg = 0.7978845608028654   // sqrt(2/pi), the CPU geglu tanh-approx constant
+            vk_y[i] = (0.5 * v * (1.0 + tanh(kg * (v + 0.044715 * v * v * v)))) * u
+        } else {
+            vk_y[i] = (v / (1.0 + exp(-v))) * u
+        }
+    }
+}
+
+// q8_0 requant of the activated hidden rows (vk_y floats -> vk_xq quant words + vk_xs scales),
+// one thread per 32-block, mirroring quantize_q8_0_into_ptr: |x| amax -> d = amax/127 ->
+// q = round(x/d). GPU round() may split rounding-halfway cases differently — same parity bar.
+[compute_shader(local_size_x=256, name="q8_moe_requant_spv")]
+def q8_moe_requant {
+    let b = gl_GlobalInvocationID.x
+    if (b < vk_meta[2u]) {
+        let base = b * 32u
+        var amax = 0.0
+        for (i in range(32)) {
+            amax = max(amax, abs(vk_y[base + uint(i)]))
+        }
+        let d = amax / 127.0
+        let id = d != 0.0 ? 1.0 / d : 0.0
+        vk_xs[b] = d
+        for (w in range(8)) {
+            let wb = base + uint(w) * 4u
+            var word = 0u
+            for (j in range(4)) {
+                let q = int(round(vk_y[wb + uint(j)] * id))
+                word = word | ((uint(q) & 0xFF) << (uint(j) * 8u))
+            }
+            vk_xq[b * 8u + uint(w)] = word
+        }
+    }
+}
+
 // ===== device state (process-lifetime; never finalized by design) =====
 
 let private VRAM_BUDGET = 5_500_000_000l   // resident-weight cap: under the measured ~6.5GB WDDM paging cliff
@@ -210,10 +264,13 @@ let private MAX_STACKS = 64                // descriptor pool capacity (VRAM bud
 let private WG_X = 64u                     // kernel workgroup width (spec-const axis 0 can retune it)
 let private BATCH_XQ_BYTES = 33_554_432l   // device-local gathered-activation scratch (chunk cap)
 let private BATCH_XS_BYTES = 8_388_608l    // ... its scale plane
-let private BATCH_Y_BYTES = 67_108_864l    // one host output plane (two exist: gate/single + up)
+let private BATCH_Y_BYTES = 67_108_864l    // one output plane (two exist: gate/single + up)
 let private BATCH_META_BYTES = 262_144l    // per-stack batch params + regions + workgroup map
 let private BATCH_TILE = 32l               // kernel tile edge (rows and cols)
 let private BATCH_CHUNK_ROWS = 8_192l      // dispatch row-window cap (bounds y and the wg map)
+let private BATCH_HQ_BYTES = 33_554_432l   // device requantized-hidden quants (the down GEMM's activations)
+let private BATCH_HS_BYTES = 8_388_608l    // ... its scale plane
+let private FFN_META_BYTES = 64l           // act/requant params (element count, gelu flag, block count)
 
 struct private HostBuf {
     buf : uint64       // VkBuffer
@@ -234,22 +291,23 @@ struct private VkStack {
     xs : HostBuf
     y : HostBuf              // host-cached readback staging (the same-submit DMA copy lands here)
     y_dev : uint64           // device-local y the kernel writes — see batch_y1_dev on why
-    cmd : VkCommandBuffer    // pre-recorded single dispatch (lazy — needs the region count)
-    groups : uint            // workgroup count cmd was recorded with
-    y_bytes : int64          // y DMA size cmd was recorded with
-    recorded : bool
     batch_meta : HostBuf     // prefill batch meta STAGING (lazy — first batch dispatch creates it)
     batch_meta_dev : uint64  // device copy the kernel reads — a host-visible meta costs ~26us of
                              // serialized uncached PCIe reads PER WORKGROUP (measured, 12K wgs/dispatch)
-    batch_set : VkDescriptorSet   // batch bindings: stack planes + shared act scratch + a y plane
+    batch_set : VkDescriptorSet   // batch bindings: stack planes + act-image scratch + a y plane
     batch_y : uint64         // which shared y plane batch_set binds (role-fixed per stack)
+    batch_xq : uint64        // which activation-quant plane it binds (gate/up: gathered x; down: hq)
     batch_made : bool
 }
 
-struct private PairCmd {
-    cmd : VkCommandBuffer    // pre-recorded gate+up double dispatch
-    groups : uint
-    y_bytes : int64
+// pre-recorded decode-form FFN chain per (gate, up, down) stack triple: GEMV pair, act, requant,
+// down GEMV, y DMA — refreshed per token via the stacks' host-visible metas, resubmitted as-is
+struct private FfnCmd {
+    cmd : VkCommandBuffer
+    act_set : VkDescriptorSet     // gate y_dev (rw) + up y_dev + ffn meta
+    rq_set : VkDescriptorSet      // gate y_dev -> hq/hs device planes
+    down_set : VkDescriptorSet    // down stack planes + hq/hs as activations + its y_dev
+    nrows : int64                 // row count cmd was recorded with
 }
 
 struct private GpuState {
@@ -264,22 +322,32 @@ struct private GpuState {
     pipe_layout : PipelineLayout
     pipeline : Pipeline
     batch_pipeline : Pipeline   // prefill batched-GEMM kernel (same set/pipe layout)
+    act_pipeline : Pipeline     // elementwise act(g)*u over the gate/up planes
+    rq_pipeline : Pipeline      // q8_0 requant of the activated hidden rows
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
     @do_not_delete stacks : array<VkStack>
-    pair_cmds : table<int64; PairCmd>   // (gate stack idx, up stack idx) -> fused cmd buffer
+    ffn_cmds : table<int64; FfnCmd>   // (gate, up, down stack idx triple) -> decode FFN chain
     resident_bytes : int64
+    // FFN mid-chain state (lazy — first FFN dispatch creates it)
+    hq_dev : uint64          // device requantized-hidden quants (the down GEMM's activation image)
+    hs_dev : uint64          // ... its scales
+    ffn_meta : HostBuf       // act/requant params staging
+    ffn_meta_dev : uint64
+    ffn_ready : bool
     // prefill batch state (lazy — first batch dispatch creates it; decode-only runs skip it)
     batch_xq_dev : uint64    // device-local gathered-activation quants (chunk window)
     batch_xs_dev : uint64    // ... their scales
     // y is written DEVICE-LOCAL and DMA-copied out in the same submit: shader scatter-stores
     // straight into host-visible memory measured ~100MB/s (~350ms per pp512 down dispatch);
     // the copy engine moves the same bytes in ~2ms
-    batch_y1_dev : uint64    // gate / single output plane (kernel writes)
+    batch_y1_dev : uint64    // gate / single output plane (kernel writes; also the down output)
     batch_y2_dev : uint64    // up output plane (the fused pair's second write target)
     batch_y1 : HostBuf       // host-cached readback staging for batch_y1_dev
-    batch_y2 : HostBuf       // ... and batch_y2_dev
+    batch_y2 : HostBuf       // ... and batch_y2_dev (idle since the FFN fold — kept for debug taps)
+    batch_act_set : VkDescriptorSet   // batch twins of FfnCmd's act/requant sets (y1/y2 planes)
+    batch_rq_set : VkDescriptorSet
     batch_cmd : VkCommandBuffer   // one reusable batch cmd buffer, re-recorded per submit
     batch_ready : bool
 }
@@ -397,8 +465,8 @@ def private vk_moe_init : bool {
     }
     g_gpu.set_layout <- create_descriptor_set_layout(g_gpu.device, dslci)
     var dpci : DescriptorPoolCreateInfo
-    dpci.maxSets = uint(2 * MAX_STACKS)   // one decode set + one lazy batch set per stack
-    var psize = DescriptorPoolSize(type_ = VkDescriptorType.STORAGE_BUFFER, descriptorCount = uint(6 * 2 * MAX_STACKS))
+    dpci.maxSets = uint(4 * MAX_STACKS)   // decode + batch set per stack, 3 per FFN triple, batch act/rq
+    var psize = DescriptorPoolSize(type_ = VkDescriptorType.STORAGE_BUFFER, descriptorCount = uint(6 * 4 * MAX_STACKS))
     dpci.pPoolSizes |> push(psize)
     g_gpu.desc_pool <- create_descriptor_pool(g_gpu.device, dpci)
 
@@ -409,6 +477,10 @@ def private vk_moe_init : bool {
     g_gpu.pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, shader)
     var bshader <- create_shader_module(g_gpu.device, q8_moe_batch_spv)   // same 6-binding layout
     g_gpu.batch_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bshader)
+    var ashader <- create_shader_module(g_gpu.device, q8_moe_act_spv)
+    g_gpu.act_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, ashader)
+    var rshader <- create_shader_module(g_gpu.device, q8_moe_requant_spv)
+    g_gpu.rq_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rshader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -500,7 +572,7 @@ def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : 
     return true
 }
 
-// ===== dispatch (MoeGpuGroupNFn / MoeGpuGroupN2Fn) =====
+// ===== dispatch plumbing =====
 
 def private find_stack(w0 : int64) : int {
     for (i in range(length(g_gpu.stacks))) {
@@ -524,65 +596,11 @@ def private alloc_cmd : VkCommandBuffer {
     return raw
 }
 
-// record bind+dispatch for one stack (or two back-to-back for the fused gate+up pair — the
-// dispatches write disjoint buffers, so no barrier sits between them), then the y DMA tail:
-// one barrier, copy each stack's device y to its host-cached staging
-def private record_dispatch_cmd(raw : VkCommandBuffer; si1 : int; groups1 : uint; si2 : int; groups2 : uint; pair : bool; y_bytes : int64) {
-    let begin = VkCommandBufferBeginInfo()
-    vk_check(vkBeginCommandBuffer(raw, begin), null)
-    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.pipeline, VkPipelineBindPoint.COMPUTE)
-    var s1 = g_gpu.stacks[si1].raw_set
+def private cmd_bind_dispatch(raw : VkCommandBuffer; var set_ : VkDescriptorSet; groups : uint) {
     unsafe {
-        vkCmdBindDescriptorSets(raw, VkPipelineBindPoint.COMPUTE, boost_value_to_vk(g_gpu.pipe_layout), 0u, 1u, addr(s1), 0u, null)
+        vkCmdBindDescriptorSets(raw, VkPipelineBindPoint.COMPUTE, boost_value_to_vk(g_gpu.pipe_layout), 0u, 1u, addr(set_), 0u, null)
     }
-    vkCmdDispatch(raw, groups1, 1u, 1u)
-    if (pair) {
-        var s2 = g_gpu.stacks[si2].raw_set
-        unsafe {
-            vkCmdBindDescriptorSets(raw, VkPipelineBindPoint.COMPUTE, boost_value_to_vk(g_gpu.pipe_layout), 0u, 1u, addr(s2), 0u, null)
-        }
-        vkCmdDispatch(raw, groups2, 1u, 1u)
-    }
-    batch_barrier(raw, false)
-    cmd_copy_whole(raw, g_gpu.stacks[si1].y_dev, g_gpu.stacks[si1].y.buf, y_bytes)
-    if (pair) {
-        cmd_copy_whole(raw, g_gpu.stacks[si2].y_dev, g_gpu.stacks[si2].y.buf, y_bytes)
-    }
-    vk_check(vkEndCommandBuffer(raw), null)
-}
-
-def private ensure_stack_cmd(si : int; groups : uint; y_bytes : int64) {
-    if (g_gpu.stacks[si].recorded && g_gpu.stacks[si].groups == groups && g_gpu.stacks[si].y_bytes == y_bytes) {
-        return
-    }
-    if (!g_gpu.stacks[si].recorded) {
-        g_gpu.stacks[si].cmd = alloc_cmd()
-    } else {
-        let rf : VkCommandBufferResetFlags
-        vk_check(vkResetCommandBuffer(g_gpu.stacks[si].cmd, rf), null)
-    }
-    record_dispatch_cmd(g_gpu.stacks[si].cmd, si, groups, si, 0u, false, y_bytes)
-    g_gpu.stacks[si].groups = groups
-    g_gpu.stacks[si].y_bytes = y_bytes
-    g_gpu.stacks[si].recorded = true
-}
-
-def private pair_cmd_for(si1, si2 : int; groups : uint; y_bytes : int64) : VkCommandBuffer {
-    let key = int64(si1) * int64(MAX_STACKS) + int64(si2)
-    if (key_exists(g_gpu.pair_cmds, key)) {
-        var pc = g_gpu.pair_cmds[key]
-        if (pc.groups != groups || pc.y_bytes != y_bytes) {
-            let rf : VkCommandBufferResetFlags
-            vk_check(vkResetCommandBuffer(pc.cmd, rf), null)
-            record_dispatch_cmd(pc.cmd, si1, groups, si2, groups, true, y_bytes)
-            g_gpu.pair_cmds[key] = PairCmd(cmd = pc.cmd, groups = groups, y_bytes = y_bytes)
-        }
-        return pc.cmd
-    }
-    var cmd = alloc_cmd()
-    record_dispatch_cmd(cmd, si1, groups, si2, groups, true, y_bytes)
-    g_gpu.pair_cmds |> insert(key, PairCmd(cmd = cmd, groups = groups, y_bytes = y_bytes))
-    return cmd
+    vkCmdDispatch(raw, groups, 1u, 1u)
 }
 
 def private submit_wait(var raw : VkCommandBuffer) {
@@ -601,25 +619,27 @@ def private submit_wait(var raw : VkCommandBuffer) {
     }
 }
 
-// refresh a stack's mapped meta table ([n, d, nregions, 0, (rel_wblock, xblock)*] — 32-weight
-// block offsets); returns the highest activation element offset (drives the xq/xs copy sizes)
-def private fill_stack_meta(si : int; offs : int64 const?; nregions : int64; n, d : int64) : int64 {
+// refresh a stack's mapped GEMV meta from region triples — one entry per ROW (a cnt > 1 region
+// expands, entry index = its row, so kernel output lands row-major): [n, d, nrows, 0,
+// (rel_wblock, xblock)*] as 32-block offsets; xnb = activation blocks per image row
+def private fill_stack_meta_rows(si : int; offs : int64 const?; nregions : int64; n, d, nrows, xnb : int64) {
+    assert((4l + nrows * 2l) * 4l <= META_BYTES, "dasLLAMA vulkan tier: FFN meta exceeds capacity")
     unsafe {
         var mp = reinterpret<uint?>(g_gpu.stacks[si].meta.mapped)
         mp[0] = uint(n)
         mp[1] = uint(d)
-        mp[2] = uint(nregions)
+        mp[2] = uint(nrows)
         mp[3] = 0u
-        var amax = 0l
         for (r in range64(nregions)) {
-            let rel = offs[r * 2l] - g_gpu.stacks[si].base
-            let aoff = offs[r * 2l + 1l]
-            assert(rel % 32l == 0l && aoff % 32l == 0l, "dasLLAMA vulkan tier: unaligned region offset")
-            mp[4l + r * 2l] = uint(rel / 32l)
-            mp[5l + r * 2l] = uint(aoff / 32l)
-            amax = max(amax, aoff)
+            let rel = offs[r * 3l] - g_gpu.stacks[si].base
+            let row0 = offs[r * 3l + 1l]
+            let cnt = offs[r * 3l + 2l]
+            assert(rel % 32l == 0l, "dasLLAMA vulkan tier: unaligned region offset")
+            for (i in range64(cnt)) {
+                mp[4l + (row0 + i) * 2l] = uint(rel / 32l)
+                mp[5l + (row0 + i) * 2l] = uint((row0 + i) * xnb)
+            }
         }
-        return amax
     }
 }
 
@@ -631,50 +651,56 @@ def private fill_stack_acts(si : int; xqp : int8 const?; xsp : float const?; xq_
     }
 }
 
-//! MoeGpuGroupNFn: region-list Q8 GEMV over one resident stack. offs as in MatmulQ8Q8GroupNFn —
-//! [2r] absolute weight element offset (resolved against the resident stack), [2r+1] activation
-//! element offset. y is nregions*d floats.
-def vk_moe_groupn(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) {
-    let si = find_stack(unsafe(offs[0]))
-    let amax = fill_stack_meta(si, offs, nregions, n, d)
-    fill_stack_acts(si, xqp, xsp, amax + n)
-    let y_bytes = nregions * d * 4l
-    assert(y_bytes <= Y_BYTES, "dasLLAMA vulkan tier: dispatch exceeds output capacity")
-    let groups = uint((nregions * d + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg)
-    ensure_stack_cmd(si, groups, y_bytes)
-    submit_wait(g_gpu.stacks[si].cmd)
+// ===== the FFN mid-chain state (shared by the decode-GEMV and batch arms) =====
+
+def private ensure_ffn_state {
+    if (g_gpu.ffn_ready) {
+        return
+    }
+    g_gpu.hq_dev = make_device_buf(BATCH_HQ_BYTES)
+    g_gpu.hs_dev = make_device_buf(BATCH_HS_BYTES)
+    g_gpu.ffn_meta = make_host_buf(FFN_META_BYTES, false)   // transfer_src staging
+    g_gpu.ffn_meta_dev = make_device_buf(FFN_META_BYTES)
+    g_gpu.ffn_ready = true
+}
+
+def private fill_ffn_meta(elems, nblocks : int64; is_gelu : bool) {
     unsafe {
-        memcpy(reinterpret<void?>(yp), g_gpu.stacks[si].y.mapped, int(y_bytes))
+        var mp = reinterpret<uint?>(g_gpu.ffn_meta.mapped)
+        mp[0] = uint(elems)
+        mp[1] = is_gelu ? 1u : 0u
+        mp[2] = uint(nblocks)
+        mp[3] = 0u
     }
 }
 
-//! MoeGpuGroupN2Fn: the fused gate+up form — both stacks read the same activation image; one
-//! pre-recorded double-dispatch submit, one fence wait, two readbacks.
-def vk_moe_groupn2(var y1p : float?; var y2p : float?; offs1 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) {
-    let s1 = find_stack(unsafe(offs1[0]))
-    let s2 = find_stack(unsafe(offs2[0]))
-    let a1 = fill_stack_meta(s1, offs1, nregions, n, d)
-    let a2 = fill_stack_meta(s2, offs2, nregions, n, d)
-    let xq_bytes = max(a1, a2) + n
-    fill_stack_acts(s1, xqp, xsp, xq_bytes)
-    fill_stack_acts(s2, xqp, xsp, xq_bytes)
-    let y_bytes = nregions * d * 4l
-    assert(y_bytes <= Y_BYTES, "dasLLAMA vulkan tier: dispatch exceeds output capacity")
-    let groups = uint((nregions * d + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg)
-    var pcmd = pair_cmd_for(s1, s2, groups, y_bytes)
-    submit_wait(pcmd)
-    unsafe {
-        memcpy(reinterpret<void?>(y1p), g_gpu.stacks[s1].y.mapped, int(y_bytes))
-        memcpy(reinterpret<void?>(y2p), g_gpu.stacks[s2].y.mapped, int(y_bytes))
-    }
+// compute -> compute barrier between the chain's kernels (RAW on the y/hidden planes; the
+// write-after-read hazard between requant and the down overwrite of y rides the same
+// execution dependency)
+def private comp_barrier(raw : VkCommandBuffer) {
+    var mb : MemoryBarrier
+    mb.srcAccessMask.shader_write = true
+    mb.dstAccessMask.shader_read = true
+    mb.dstAccessMask.shader_write = true
+    var mbs : array<MemoryBarrier>
+    mbs |> emplace(mb)
+    var sstage : VkPipelineStageFlags
+    sstage.compute_shader = true
+    var dstage : VkPipelineStageFlags
+    dstage.compute_shader = true
+    let dflags : VkDependencyFlags
+    let no_bufb : array<BufferMemoryBarrier>
+    let no_imgb : array<ImageMemoryBarrier>
+    cmd_pipeline_barrier(vk_value_to_boost(raw), sstage, dstage, dflags, mbs, no_bufb, no_imgb)
 }
 
-// ===== prefill batch dispatch (MoeGpuBatchFn / MoeGpuBatch2Fn) =====
+// ===== prefill batch dispatch (the FFN's batched-GEMM arm) =====
 
 def private ensure_batch_state {
     if (g_gpu.batch_ready) {
         return
     }
+    ensure_ffn_state()
     g_gpu.batch_xq_dev = make_device_buf(BATCH_XQ_BYTES)
     g_gpu.batch_xs_dev = make_device_buf(BATCH_XS_BYTES)
     g_gpu.batch_y1_dev = make_device_buf(BATCH_Y_BYTES)
@@ -682,16 +708,35 @@ def private ensure_batch_state {
     g_gpu.batch_y1 = make_host_buf(BATCH_Y_BYTES, true, [cached = true])
     g_gpu.batch_y2 = make_host_buf(BATCH_Y_BYTES, true, [cached = true])
     g_gpu.batch_cmd = alloc_cmd()
+    g_gpu.batch_act_set = alloc_desc_set()
+    g_gpu.batch_rq_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    // act: gate plane (rw) at 5, up plane (float view) at 3, params at 2; 0/1/4 unused fillers
+    write_buf_desc(writes, g_gpu.batch_act_set, 0u, g_gpu.batch_xq_dev, BATCH_XQ_BYTES)
+    write_buf_desc(writes, g_gpu.batch_act_set, 1u, g_gpu.batch_xs_dev, BATCH_XS_BYTES)
+    write_buf_desc(writes, g_gpu.batch_act_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+    write_buf_desc(writes, g_gpu.batch_act_set, 3u, g_gpu.batch_y2_dev, BATCH_Y_BYTES)
+    write_buf_desc(writes, g_gpu.batch_act_set, 4u, g_gpu.batch_xs_dev, BATCH_XS_BYTES)
+    write_buf_desc(writes, g_gpu.batch_act_set, 5u, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
+    // requant: hidden floats at 5 -> hq/hs planes at 3/4
+    write_buf_desc(writes, g_gpu.batch_rq_set, 0u, g_gpu.batch_xq_dev, BATCH_XQ_BYTES)
+    write_buf_desc(writes, g_gpu.batch_rq_set, 1u, g_gpu.batch_xs_dev, BATCH_XS_BYTES)
+    write_buf_desc(writes, g_gpu.batch_rq_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+    write_buf_desc(writes, g_gpu.batch_rq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, g_gpu.batch_rq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
+    write_buf_desc(writes, g_gpu.batch_rq_set, 5u, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
     g_gpu.resident_bytes += BATCH_XQ_BYTES + BATCH_XS_BYTES
     g_gpu.batch_ready = true
     to_log(LOG_INFO, "dasLLAMA vulkan tier: prefill batch tier engaged\n")
 }
 
-// batch bindings differ from decode's: meta is the stack's BATCH table, activations are the
-// shared device-local scratch, y one of the two shared device planes (fixed by the stack's
-// role — gate/down write y1_dev, up y2_dev)
-def private ensure_batch_set(si : int; ybuf : uint64; ybytes : int64) {
-    if (g_gpu.stacks[si].batch_made && g_gpu.stacks[si].batch_y == ybuf) {
+// batch bindings differ from decode's: meta is the stack's BATCH table, activations point at a
+// role-fixed image (gate/up: the gathered x scratch; down: the requantized hidden planes), y one
+// of the two shared device planes (gate/down write y1_dev, up y2_dev)
+def private ensure_batch_set(si : int; ybuf, xqbuf, xsbuf : uint64; xqbytes, xsbytes : int64) {
+    if (g_gpu.stacks[si].batch_made && g_gpu.stacks[si].batch_y == ybuf && g_gpu.stacks[si].batch_xq == xqbuf) {
         return
     }
     if (!g_gpu.stacks[si].batch_made) {
@@ -704,17 +749,21 @@ def private ensure_batch_set(si : int; ybuf : uint64; ybytes : int64) {
     write_buf_desc(writes, g_gpu.stacks[si].batch_set, 0u, g_gpu.stacks[si].wqbuf, g_gpu.stacks[si].elems)
     write_buf_desc(writes, g_gpu.stacks[si].batch_set, 1u, g_gpu.stacks[si].wsbuf, g_gpu.stacks[si].wsbytes)
     write_buf_desc(writes, g_gpu.stacks[si].batch_set, 2u, g_gpu.stacks[si].batch_meta_dev, BATCH_META_BYTES)
-    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 3u, g_gpu.batch_xq_dev, BATCH_XQ_BYTES)
-    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 4u, g_gpu.batch_xs_dev, BATCH_XS_BYTES)
-    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 5u, ybuf, ybytes)
+    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 3u, xqbuf, xqbytes)
+    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 4u, xsbuf, xsbytes)
+    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 5u, ybuf, BATCH_Y_BYTES)
     let no_copies : array<CopyDescriptorSet>
     update_descriptor_sets(g_gpu.device, writes, no_copies)
     g_gpu.stacks[si].batch_y = ybuf
+    g_gpu.stacks[si].batch_xq = xqbuf
 }
 
-def private batch_chunk_rows(n, d : int64) : int64 {
-    var r = min(BATCH_XQ_BYTES / n, BATCH_Y_BYTES / (d * 4l))
-    r = min(r, BATCH_XS_BYTES / ((n / 32l) * 4l))
+// chunk row cap: the gathered x window, both hidden planes, the requant planes, and the down
+// output (which reuses y1) must all fit their buffers
+def private ffn_chunk_rows(n, nfe : int64) : int64 {
+    var r = min(BATCH_XQ_BYTES / n, BATCH_XS_BYTES / ((n / 32l) * 4l))
+    r = min(r, BATCH_Y_BYTES / (max(nfe, n) * 4l))
+    r = min(r, min(BATCH_HQ_BYTES / nfe, BATCH_HS_BYTES / ((nfe / 32l) * 4l)))
     return min(r, BATCH_CHUNK_ROWS)
 }
 
@@ -819,85 +868,165 @@ def private cmd_copy_whole(raw : VkCommandBuffer; src, dst : uint64; bytes : int
 }
 
 // one reusable cmd buffer, re-recorded per submit — prefill submits are few and multi-ms, so
-// recording cost is noise (unlike decode's per-token pre-recorded buffers). The meta staging
-// copies ride at the head of the same submit and the y DMA readbacks at its tail, fenced off
-// the dispatches by one global barrier each.
-def private record_batch_cmd(si1 : int; groups1 : uint; si2 : int; groups2 : uint; pair : bool; ybytes : int64) {
+// recording cost is noise (unlike decode's per-token pre-recorded buffers). The chain per chunk:
+// meta staging copies, gate+up GEMMs, act, requant, down GEMM, gout DMA — one barrier per seam,
+// the hidden planes never leave the device.
+def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, nfe, gout_bytes : int64) {
     let raw = g_gpu.batch_cmd
     let rf : VkCommandBufferResetFlags
     vk_check(vkResetCommandBuffer(raw, rf), null)
     let begin = VkCommandBufferBeginInfo()
     vk_check(vkBeginCommandBuffer(raw, begin), null)
-    cmd_copy_batch_meta(raw, si1)
-    if (pair) {
-        cmd_copy_batch_meta(raw, si2)
-    }
+    cmd_copy_batch_meta(raw, s1)
+    cmd_copy_batch_meta(raw, s3)
+    cmd_copy_batch_meta(raw, s2)
+    cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
     batch_barrier(raw, true)
     cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_pipeline, VkPipelineBindPoint.COMPUTE)
-    var s1 = g_gpu.stacks[si1].batch_set
-    unsafe {
-        vkCmdBindDescriptorSets(raw, VkPipelineBindPoint.COMPUTE, boost_value_to_vk(g_gpu.pipe_layout), 0u, 1u, addr(s1), 0u, null)
-    }
-    vkCmdDispatch(raw, groups1, 1u, 1u)
-    if (pair) {
-        var s2 = g_gpu.stacks[si2].batch_set
-        unsafe {
-            vkCmdBindDescriptorSets(raw, VkPipelineBindPoint.COMPUTE, boost_value_to_vk(g_gpu.pipe_layout), 0u, 1u, addr(s2), 0u, null)
-        }
-        vkCmdDispatch(raw, groups2, 1u, 1u)
-    }
+    cmd_bind_dispatch(raw, g_gpu.stacks[s1].batch_set, nwg_gu)
+    cmd_bind_dispatch(raw, g_gpu.stacks[s3].batch_set, nwg_gu)
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.act_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.batch_act_set, uint((rows * nfe + 255l) / 256l))
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.rq_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.batch_rq_set, uint((rows * nfe / 32l + 255l) / 256l))
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.stacks[s2].batch_set, nwg_dn)
     batch_barrier(raw, false)
-    cmd_copy_whole(raw, g_gpu.batch_y1_dev, g_gpu.batch_y1.buf, ybytes)
-    if (pair) {
-        cmd_copy_whole(raw, g_gpu.batch_y2_dev, g_gpu.batch_y2.buf, ybytes)
-    }
+    cmd_copy_whole(raw, g_gpu.batch_y1_dev, g_gpu.batch_y1.buf, gout_bytes)
     vk_check(vkEndCommandBuffer(raw), null)
 }
 
-//! MoeGpuBatchFn: region-list batched Q8 GEMM over one resident stack. offs are prefill
-//! triples (weight element offset, first bucket row, row count); y rows key by row0.
-def vk_moe_batch(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; nrows : int64) {
-    let si = find_stack(unsafe(offs[0]))
+// the batch arm: chunked over row windows; gate+up share the gathered image and region row
+// ranges, the down GEMM reads the requantized hidden planes and reuses y1 for its output
+def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; is_gelu : bool) {
+    let s1 = find_stack(unsafe(offs1[0]))
+    let s3 = find_stack(unsafe(offs3[0]))
+    let s2 = find_stack(unsafe(offs2[0]))
     ensure_batch_state()
-    ensure_batch_set(si, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
-    let chunk = batch_chunk_rows(n, d)
+    ensure_batch_set(s1, g_gpu.batch_y1_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
+    ensure_batch_set(s3, g_gpu.batch_y2_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
+    ensure_batch_set(s2, g_gpu.batch_y1_dev, g_gpu.hq_dev, g_gpu.hs_dev, BATCH_HQ_BYTES, BATCH_HS_BYTES)
+    let chunk = ffn_chunk_rows(n, nfe)
     var r0 = 0l
     while (r0 < nrows) {
         let r1 = min(r0 + chunk, nrows)
-        let nwg = fill_batch_meta(si, offs, nregions, n, d, r0, r1)
-        upload_batch_acts(xqp, xsp, r0, r1 - r0, n)
-        record_batch_cmd(si, nwg, si, 0u, false, (r1 - r0) * d * 4l)
+        let rows = r1 - r0
+        let nwg1 = fill_batch_meta(s1, offs1, nregions, n, nfe, r0, r1)
+        let nwg3 = fill_batch_meta(s3, offs3, nregions, n, nfe, r0, r1)
+        assert(nwg1 == nwg3, "dasLLAMA vulkan tier: fused batch pair region mismatch")
+        let nwg2 = fill_batch_meta(s2, offs2, nregions, nfe, n, r0, r1)
+        upload_batch_acts(xqp, xsp, r0, rows, n)
+        fill_ffn_meta(rows * nfe, rows * nfe / 32l, is_gelu)
+        record_ffn_batch_cmd(s1, s3, s2, nwg1, nwg2, rows, nfe, rows * n * 4l)
         submit_wait(g_gpu.batch_cmd)
         unsafe {
-            memcpy(reinterpret<void?>(yp + r0 * d), g_gpu.batch_y1.mapped, int((r1 - r0) * d * 4l))
+            memcpy(reinterpret<void?>(goutp + r0 * n), g_gpu.batch_y1.mapped, int(rows * n * 4l))
         }
         r0 = r1
     }
 }
 
-//! MoeGpuBatch2Fn: the fused gate+up batch form — both stacks read the same gathered image and
-//! share region row ranges; one double-dispatch submit per chunk, two readbacks.
-def vk_moe_batch2(var y1p : float?; var y2p : float?; offs1 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; nrows : int64) {
-    let s1 = find_stack(unsafe(offs1[0]))
-    let s2 = find_stack(unsafe(offs2[0]))
-    ensure_batch_state()
-    ensure_batch_set(s1, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
-    ensure_batch_set(s2, g_gpu.batch_y2_dev, BATCH_Y_BYTES)
-    let chunk = batch_chunk_rows(n, d)
-    var r0 = 0l
-    while (r0 < nrows) {
-        let r1 = min(r0 + chunk, nrows)
-        let nwg1 = fill_batch_meta(s1, offs1, nregions, n, d, r0, r1)
-        let nwg2 = fill_batch_meta(s2, offs2, nregions, n, d, r0, r1)
-        assert(nwg1 == nwg2, "dasLLAMA vulkan tier: fused batch pair region mismatch")
-        upload_batch_acts(xqp, xsp, r0, r1 - r0, n)
-        record_batch_cmd(s1, nwg1, s2, nwg2, true, (r1 - r0) * d * 4l)
-        submit_wait(g_gpu.batch_cmd)
-        unsafe {
-            memcpy(reinterpret<void?>(y1p + r0 * d), g_gpu.batch_y1.mapped, int((r1 - r0) * d * 4l))
-            memcpy(reinterpret<void?>(y2p + r0 * d), g_gpu.batch_y2.mapped, int((r1 - r0) * d * 4l))
+// ===== decode dispatch (the FFN's GEMV arm) =====
+
+// pre-record (or refresh on a row-count change) the triple's chain: gate+up GEMV pair, act,
+// requant, down GEMV, y DMA. Per token only the stacks' host-visible metas, the activation
+// image, and the ffn params staging change — the recorded buffer resubmits as-is.
+def private ffn_cmd_for(s1, s3, s2 : int; nrows, n, nfe : int64) : VkCommandBuffer {
+    let key = (int64(s1) * int64(MAX_STACKS) + int64(s3)) * int64(MAX_STACKS) + int64(s2)
+    if (!key_exists(g_gpu.ffn_cmds, key)) {
+        var fc = FfnCmd(cmd = alloc_cmd(), act_set = alloc_desc_set(), rq_set = alloc_desc_set(),
+                        down_set = alloc_desc_set(), nrows = 0l)
+        var writes : array<WriteDescriptorSet>
+        // act: gate y (rw) at 5, up y (float view) at 3, params at 2; 0/1/4 unused fillers
+        write_buf_desc(writes, fc.act_set, 0u, g_gpu.stacks[s1].wqbuf, g_gpu.stacks[s1].elems)
+        write_buf_desc(writes, fc.act_set, 1u, g_gpu.stacks[s1].wsbuf, g_gpu.stacks[s1].wsbytes)
+        write_buf_desc(writes, fc.act_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+        write_buf_desc(writes, fc.act_set, 3u, g_gpu.stacks[s3].y_dev, Y_BYTES)
+        write_buf_desc(writes, fc.act_set, 4u, g_gpu.stacks[s1].xs.buf, XS_BYTES)
+        write_buf_desc(writes, fc.act_set, 5u, g_gpu.stacks[s1].y_dev, Y_BYTES)
+        // requant: hidden floats at 5 -> hq/hs planes at 3/4
+        write_buf_desc(writes, fc.rq_set, 0u, g_gpu.stacks[s1].wqbuf, g_gpu.stacks[s1].elems)
+        write_buf_desc(writes, fc.rq_set, 1u, g_gpu.stacks[s1].wsbuf, g_gpu.stacks[s1].wsbytes)
+        write_buf_desc(writes, fc.rq_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+        write_buf_desc(writes, fc.rq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+        write_buf_desc(writes, fc.rq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
+        write_buf_desc(writes, fc.rq_set, 5u, g_gpu.stacks[s1].y_dev, Y_BYTES)
+        // down: its own planes + host-visible meta, hq/hs as the activation image, its y_dev
+        write_buf_desc(writes, fc.down_set, 0u, g_gpu.stacks[s2].wqbuf, g_gpu.stacks[s2].elems)
+        write_buf_desc(writes, fc.down_set, 1u, g_gpu.stacks[s2].wsbuf, g_gpu.stacks[s2].wsbytes)
+        write_buf_desc(writes, fc.down_set, 2u, g_gpu.stacks[s2].meta.buf, META_BYTES)
+        write_buf_desc(writes, fc.down_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+        write_buf_desc(writes, fc.down_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
+        write_buf_desc(writes, fc.down_set, 5u, g_gpu.stacks[s2].y_dev, Y_BYTES)
+        let no_copies : array<CopyDescriptorSet>
+        update_descriptor_sets(g_gpu.device, writes, no_copies)
+        g_gpu.ffn_cmds |> insert(key, fc)
+    }
+    var fc = g_gpu.ffn_cmds[key]
+    if (fc.nrows != nrows) {
+        if (fc.nrows != 0l) {
+            let rf : VkCommandBufferResetFlags
+            vk_check(vkResetCommandBuffer(fc.cmd, rf), null)
         }
-        r0 = r1
+        let raw = fc.cmd
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+        batch_barrier(raw, true)
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.pipeline, VkPipelineBindPoint.COMPUTE)
+        let ggu = uint((nrows * nfe + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg)
+        cmd_bind_dispatch(raw, g_gpu.stacks[s1].raw_set, ggu)
+        cmd_bind_dispatch(raw, g_gpu.stacks[s3].raw_set, ggu)
+        comp_barrier(raw)
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.act_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, fc.act_set, uint((nrows * nfe + 255l) / 256l))
+        comp_barrier(raw)
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.rq_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, fc.rq_set, uint((nrows * nfe / 32l + 255l) / 256l))
+        comp_barrier(raw)
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, fc.down_set, uint((nrows * n + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+        batch_barrier(raw, false)
+        cmd_copy_whole(raw, g_gpu.stacks[s2].y_dev, g_gpu.stacks[s2].y.buf, nrows * n * 4l)
+        vk_check(vkEndCommandBuffer(raw), null)
+        g_gpu.ffn_cmds[key] = FfnCmd(cmd = fc.cmd, act_set = fc.act_set, rq_set = fc.rq_set,
+            down_set = fc.down_set, nrows = nrows)
+    }
+    return fc.cmd
+}
+
+def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; is_gelu : bool) {
+    let s1 = find_stack(unsafe(offs1[0]))
+    let s3 = find_stack(unsafe(offs3[0]))
+    let s2 = find_stack(unsafe(offs2[0]))
+    assert(nrows * max(nfe, n) * 4l <= Y_BYTES, "dasLLAMA vulkan tier: FFN dispatch exceeds output capacity")
+    fill_stack_meta_rows(s1, offs1, nregions, n, nfe, nrows, n / 32l)
+    fill_stack_meta_rows(s3, offs3, nregions, n, nfe, nrows, n / 32l)
+    fill_stack_meta_rows(s2, offs2, nregions, nfe, n, nrows, nfe / 32l)
+    fill_stack_acts(s1, xqp, xsp, nrows * n)
+    fill_stack_acts(s3, xqp, xsp, nrows * n)
+    fill_ffn_meta(nrows * nfe, nrows * nfe / 32l, is_gelu)
+    var cmd = ffn_cmd_for(s1, s3, s2, nrows, n, nfe)
+    submit_wait(cmd)
+    unsafe {
+        memcpy(reinterpret<void?>(goutp), g_gpu.stacks[s2].y.mapped, int(nrows * n * 4l))
+    }
+}
+
+//! MoeGpuFfnFn: the routed experts' whole FFN chain — gate+up region GEMMs, activation, q8
+//! requant, down GEMM — as device-side submit chains over the resident stacks; the hidden
+//! activations never cross PCIe. offs are region triples sharing row ranges that partition
+//! [0, nrows); gout returns nrows x n floats. Decode row counts run the GEMV kernels
+//! (pre-recorded per stack triple), batches run the tiled-GEMM chunk loop.
+def vk_moe_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; is_gelu : bool) {
+    ensure_ffn_state()
+    if (nrows < BATCH_TILE) {
+        vk_moe_ffn_gemv(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)
+    } else {
+        vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)
     }
 }
 
@@ -956,8 +1085,7 @@ def dasllama_math_vulkan_register() {
         let layers = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_LAYERS")))
         if (layers > 0l && vulkan_backend_available()) {
             set_moe_gpu_layer_count(layers)
-            install_moe_gpu_tier(@@vk_moe_groupn, @@vk_moe_groupn2, @@vk_moe_upload_stack)
-            install_moe_gpu_batch_tier(@@vk_moe_batch, @@vk_moe_batch2)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack)
         }
     }
 }
