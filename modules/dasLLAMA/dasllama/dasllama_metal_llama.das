@@ -224,6 +224,7 @@ struct private StepRes {
     u_nblk : MetalBuffer?  // kv_dim/32 — the block-codec kernels' row-width uniform (q8_0 only)
     u_neox : MetalBuffer?  // rope pairing mode (0 = NORM adjacent, 1 = NEOX j/j+half)
     u_hasb : MetalBuffer?  // QKV bias present (the rope-store/qkv_rs epilogue reads the bias plane)
+    u_hasn : MetalBuffer?  // QK-norm present (the fused H-form rope-store's reduce gate)
     bytes_x : uint64
     bytes_q : uint64
     bytes_xb : uint64      // max(dim, qd) — bxb holds dim-wide norm outs AND the qd-wide attention out
@@ -280,6 +281,7 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     r.u_eps = uniform_f32(c.norm_eps)
     r.u_neox = uniform_u32(c.rope_neox ? 1u : 0u)
     r.u_hasb = uniform_u32(c.attn_qkv_bias ? 1u : 0u)
+    r.u_hasn = uniform_u32(c.qk_norm ? 1u : 0u)
     if (r.kdt == KVDtype.q8_0 || r.kdt == KVDtype.tq4) {
         r.u_nblk = uniform_u32(uint(kv_dim / 32l))
     }
@@ -404,8 +406,9 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     enc_site_gemv(enc, t, r.s16, fv, t.wv_offs[l], kv_dim, dim, r.bxb, r.bqkv, r.u_dim, r.u_kvd, uint64((qd + kv_dim) * 4l))
                 }
             }
-            if (c.qk_norm && g_skip != "ew") {
-                // per-head QK RMSNorm on the fused QKV buffer, before rope (qwen3)
+            if (c.qk_norm && g_skip != "ew" && !f16v) {
+                // per-head QK RMSNorm on the fused QKV buffer, before rope (qwen3) — the f16
+                // mirror rides the fused H-form rope-store below instead of this prepass
                 var bqkw = upload_region_cat3(
                     addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(head_size * 4l),
                     addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(head_size * 4l), null, 0ul)
@@ -423,6 +426,16 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                         r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
                         r.bcos, r.bsin, r.u_qd, r.u_hs, r.u_nh, r.u_kvm, r.u_neox, bbias, r.u_hasb,
                         n_heads + 2l * (kv_dim / head_size), head_size)
+                } elif (c.qk_norm && f16v) {
+                    // QK-norm x f16 mirror: bias + per-head RMS + rope + store fold into ONE
+                    // head-cooperative dispatch (no prepass, no flat rope-store)
+                    var bqkw = upload_region_cat3(
+                        addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(head_size * 4l),
+                        addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(head_size * 4l), null, 0ul)
+                    enc_rope_store_h16(enc, r.bqkv, uint64((qd + kv_dim) * 4l), g_arena, g_arena,
+                        r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
+                        r.bcos, r.bsin, bqkw, bbias, r.u_qd, r.u_hs, r.u_nh, r.u_kvm, r.u_neox,
+                        r.u_hasb, r.u_hasn, r.u_eps, n_heads + 2l * (kv_dim / head_size), head_size)
                 } else {
                     enc_rope_store(enc, f16v, r.bqkv, uint64((qd + kv_dim) * 4l), g_arena, g_arena,
                         r.koff + uint64((l * cap + pos) * rowb), r.voff + uint64((l * cap + pos) * rowb),
@@ -613,6 +626,7 @@ def private release_step(var r : StepRes) {
     pool_release(g_upool, r.u_npall, 4ul)
     pool_release(g_upool, r.u_neox, 4ul)
     pool_release(g_upool, r.u_hasb, 4ul)
+    pool_release(g_upool, r.u_hasn, 4ul)
     pool_release(g_upool, r.u_scale, 4ul)
     pool_release(g_upool, r.u_eps, 4ul)
     r.valid = false

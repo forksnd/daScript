@@ -1561,6 +1561,82 @@ class MetalRopeStoreF16 {
     }
 }
 
+// The head-cooperative fused form (QK-norm models): ONE threadgroup per head (hs threads, the
+// tq4 kernel's shape) folds bias -> per-head RMSNorm -> rope -> f16 store into a single
+// dispatch — the thread-per-pair kernels can't host the head-wide reduction, and the separate
+// norm prepass costs a dispatch gap + a q/k round trip per layer. Grid: nheads q + nkvh k +
+// nkvh v threadgroups. rmsnorm's exact math (w * (x * 1/sqrt(sum/hs + eps))); rope pairs via
+// the tgmem-staged partner (post-norm values).
+class MetalRopeStoreHF16 {
+    @ssbo @binding = 0 qk : array<float>    // q at [0, qd) roped in place, k at [qd, qd + kvd)
+    @ssbo @binding = 1 vs : array<float>    // raw v (the QKV buffer at the v offset)
+    @ssbo @binding = 2 kd : array<float16>  // mirror K row (bound at the (layer, pos) row offset)
+    @ssbo @binding = 3 vd : array<float16>
+    @ssbo @binding = 4 tcos : array<float>  // [head_size/2] this position's rope row
+    @ssbo @binding = 5 tsin : array<float>
+    @ssbo @binding = 6 w : array<float>     // [qnorm | knorm] per-head RMS weights
+    @ssbo @binding = 7 bias : array<float>  // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @uniform @binding = 8 qd : uint
+    @uniform @binding = 9 head_size : uint
+    @uniform @binding = 10 nheads : uint
+    @uniform @binding = 11 kv_mul : uint
+    @uniform @binding = 12 neox : uint
+    @uniform @binding = 13 has_bias : uint
+    @uniform @binding = 14 has_norm : uint
+    @uniform @binding = 15 eps : float
+    @workgroup buf : float[128]
+    @workgroup part : float[4]
+
+    [metal_kernel(name="metal_rope_store_h16_msl")]
+    def metal_rope_store_h16 {
+        let tgid = gl_WorkGroupID.x
+        let lid = gl_LocalInvocationID.x
+        let hs = head_size
+        let half = hs / 2u
+        let nkvh = nheads / kv_mul
+        let kvd = nkvh * hs
+        let isQ = tgid < nheads
+        let isK = !isQ && tgid < nheads + nkvh
+        let hh = isQ ? tgid : (isK ? tgid - nheads : tgid - nheads - nkvh)
+        let base = isQ ? tgid * hs : (isK ? qd + hh * hs : hh * hs)
+        let bbase = isQ ? tgid * hs : (isK ? qd + hh * hs : qd + kvd + hh * hs)
+        var v = (isQ || isK ? qk[base + lid] : vs[base + lid]) + (has_bias != 0u ? bias[bbase + lid] : 0.0)
+        if (isQ || isK) {
+            if (has_norm != 0u) {
+                let s1 = simd_sum(v * v)
+                if (gl_SubgroupInvocationID == 0u) {
+                    part[gl_SubgroupID] = s1
+                }
+                barrier()
+                var total = 0.0
+                var sg = 0u
+                while (sg < gl_NumSubgroups) {
+                    total += part[sg]
+                    sg++
+                }
+                let inv = 1.0 / sqrt(total / float(hs) + eps)
+                v = w[(isK ? hs : 0u) + lid] * (v * inv)
+            }
+            // rope via the tgmem-staged partner (the whole head is resident in this tg)
+            buf[lid] = v
+            barrier()
+            let isHi = neox != 0u ? lid >= half : (lid & 1u) != 0u
+            let j = neox != 0u ? (isHi ? lid - half : lid) : lid / 2u
+            let fcr = tcos[j]
+            let fci = tsin[j]
+            let other = buf[neox != 0u ? (isHi ? lid - half : lid + half) : (lid ^ 1u)]
+            v = isHi ? other * fci + v * fcr : v * fcr - other * fci
+        }
+        if (isQ) {
+            qk[base + lid] = v
+        } elif (isK) {
+            kd[hh * hs + lid] = float16(min(max(v, -65504.0), 65504.0))   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
+        } else {
+            vd[hh * hs + lid] = float16(min(max(v, -65504.0), 65504.0))   // nolint:STYLE019
+        }
+    }
+}
+
 // f32-mirror twin — straight stores, no clamp.
 class MetalRopeStoreF32 {
     @ssbo @binding = 0 qk : array<float>
@@ -4659,6 +4735,7 @@ var g_pso_attnp_q8 : MetalComputePipeline?
 var g_pso_attnp_tq4 : MetalComputePipeline?
 var g_pso_attncomb : MetalComputePipeline?
 var g_pso_rpst16 : MetalComputePipeline?
+var g_pso_rpst_h16 : MetalComputePipeline?  // head-cooperative fused bias+norm+rope+store (QK-norm models)
 var g_pso_rpst32 : MetalComputePipeline?
 var g_pso_rpst_q8 : MetalComputePipeline?   // per-32-block quantizing store
 var g_pso_rpst_tq4 : MetalComputePipeline?  // threadgroup-per-head FWHT + quantizing store
@@ -4763,6 +4840,7 @@ def metal_decode_init : bool {
     g_pso_attn_tq4 = compile_pso(metal_sq_attn_tq4_msl, metal_sq_attn_tq4_msl_entry, metal_sq_attn_tq4_msl_fastmath, ok)
     g_pso_attnp_tq4 = compile_pso(metal_sq_attn_part_tq4_msl, metal_sq_attn_part_tq4_msl_entry, metal_sq_attn_part_tq4_msl_fastmath, ok)
     g_pso_rpst16 = compile_pso(metal_rope_store16_msl, metal_rope_store16_msl_entry, metal_rope_store16_msl_fastmath, ok)
+    g_pso_rpst_h16 = compile_pso(metal_rope_store_h16_msl, metal_rope_store_h16_msl_entry, metal_rope_store_h16_msl_fastmath, ok)
     g_pso_rpst32 = compile_pso(metal_rope_store32_msl, metal_rope_store32_msl_entry, metal_rope_store32_msl_fastmath, ok)
     g_pso_rpst_q8 = compile_pso(metal_rope_store_q8_msl, metal_rope_store_q8_msl_entry, metal_rope_store_q8_msl_fastmath, ok)
     g_pso_rpst_tq4 = compile_pso(metal_rope_store_tq4_msl, metal_rope_store_tq4_msl_entry, metal_rope_store_tq4_msl_fastmath, ok)
@@ -4956,6 +5034,33 @@ def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; 
     metal_set_buffer(enc, bbias, 0ul, 11)
     metal_set_buffer(enc, bhasb, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
+// the head-cooperative fused rope-store (QK-norm models, f16 mirror): grid = nheads + 2*nkvh
+// threadgroups of head_size threads
+def enc_rope_store_h16(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : uint64;
+                       kmb, vmb : MetalBuffer?; koff, voff : uint64;
+                       bcos, bsin, bqkw, bbias, bqd, bhs, bnh, bkvm, bneox, bhasb, bhasn, beps : MetalBuffer?;
+                       ntg, head_size : int64) {
+    metal_set_pipeline(enc, g_pso_rpst_h16)
+    metal_set_threadgroup_memory_length(enc, metal_rope_store_h16_msl_tgmem, 0)
+    metal_set_buffer(enc, bqkv, 0ul, 0)
+    metal_set_buffer(enc, bqkv, vsoff, 1)
+    metal_set_buffer(enc, kmb, koff, 2)
+    metal_set_buffer(enc, vmb, voff, 3)
+    metal_set_buffer(enc, bcos, 0ul, 4)
+    metal_set_buffer(enc, bsin, 0ul, 5)
+    metal_set_buffer(enc, bqkw, 0ul, 6)
+    metal_set_buffer(enc, bbias, 0ul, 7)
+    metal_set_buffer(enc, bqd, 0ul, 8)
+    metal_set_buffer(enc, bhs, 0ul, 9)
+    metal_set_buffer(enc, bnh, 0ul, 10)
+    metal_set_buffer(enc, bkvm, 0ul, 11)
+    metal_set_buffer(enc, bneox, 0ul, 12)
+    metal_set_buffer(enc, bhasb, 0ul, 13)
+    metal_set_buffer(enc, bhasn, 0ul, 14)
+    metal_set_buffer(enc, beps, 0ul, 15)
+    metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // The tq4 rotation signs, uploaded once at max head size (smaller heads read a prefix — the
@@ -5794,6 +5899,7 @@ def metal_kernels_release {
         metal_release(g_pso_rpst16)
         g_pso_rpst16 = null
     }
+    release_pso(g_pso_rpst_h16)
     if (g_pso_rpst32 != null) {
         metal_release(g_pso_rpst32)
         g_pso_rpst32 = null

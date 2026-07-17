@@ -21,7 +21,7 @@ separate greedy `--bmax 1` run, no pipe) + `prefill_perf.das` N=512 row (prefill
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 914.3 | 929.2 | 0.98x |
-| tg128 B=1 | 88.4 | 82.1 | **1.08x** |
+| tg128 B=1 | 89.2 | 82.1 | **1.09x** |
 | tg128 B=2 | 122.2 | 89.2 | **1.37x** |
 | tg128 B=4 | 151.5 | 127.7 | **1.19x** |
 | tg128 B=8 | 163.0 | 152.2 | **1.07x** |
@@ -49,7 +49,7 @@ same signature: the batched-B1 form beats the sequential loop on the same forwar
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 918.3 | 916.3 | **1.00x** |
-| tg128 B=1 | 77.5 | 78.2 | 0.99x |
+| tg128 B=1 | 78.2 | 78.2 | **1.00x** |
 | tg128 B=2 | 106.9 | 83.7 | **1.28x** |
 | tg128 B=4 | 142.0 | 124.2 | **1.14x** |
 | tg128 B=8 | 153.6 | 137.6 | **1.12x** |
@@ -58,14 +58,15 @@ same signature: the batched-B1 form beats the sequential loop on the same forwar
 B=1 was 0.85x pre-chase (greedy 66.6): the tied-k6 classifier gated the spec chain OFF, so
 every greedy step paid the ~1ms CPU tail PLUS the 607KB logits scan's DRAM contention right
 at the k6 stream's bandwidth wall. The kq spec chain (chase round 1) closed it to 0.99x —
-at the line, gpu/step 12.8ms vs lcpp's ~12.6.
+the fused H-form rope-store (chase round 2: bias+norm+rope+store in ONE
+head-cooperative dispatch on f16 mirrors) closed the last point to a dead tie.
 
 ### Q5_K_M (k5-dominant, k6 mixed in)
 
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 820.1 | 831.2 | 0.99x |
-| tg128 B=1 | 67.0 | 66.5 | **1.01x** |
+| tg128 B=1 | 67.5 | 66.5 | **1.02x** |
 | tg128 B=2 | 104.3 | 71.2 | **1.46x** |
 | tg128 B=4 | 142.3 | 120.5 | **1.18x** |
 | tg128 B=8 | 154.3 | 143.0 | **1.08x** |
@@ -73,14 +74,15 @@ at the line, gpu/step 12.8ms vs lcpp's ~12.6.
 
 B=1 was 0.90x pre-chase (59.9): the b2r k5 GEMV loses ~10% to the select-form b1c at the
 4B's n=2560 sites (gemv lab, every d: qkv/w13/cls) — production now picks b1c at n < 3072
-/ small-d sites (gpu/step 15.87 -> 14.84ms), and the kq spec chain hides the CPU tail.
+/ small-d sites (gpu/step 15.87 -> 14.84ms), the kq spec chain hides the CPU tail, and the
+fused H-form rope-store (round 2) adds the last point.
 B=2 1.46x = the k5 ext twin vs lcpp's weakest K-quant mul_mv, same as the 3B board.
 
 ## Board summary (post chase round 1)
 
 Batch B=2..16 GREEN across every format (17 of 18 cells; B=2 leads 1.28-1.46x); pp512 at
-the line (0.98-1.00x). **B=1 after chase round 1: 1.08 / 0.95 / 0.99 / 1.01** (was
-1.00 / 0.95 / 0.85 / 0.90). The round's two levers:
+the line (0.98-1.00x). **B=1 after chase rounds 1+2: 1.09 / 0.95 / 1.00 / 1.02** (was
+1.00 / 0.95 / 0.85 / 0.90). The levers:
 1. **The kq spec chain** (the 3B arc's parked ledger item, now shipped): tied-k6
    classifiers ride the GPU argmax + a MetalEmbedK6 winner-row gather, so greedy B=1 chains
    on the GPU exactly like cls_q8 — the ~1ms/step CPU tail AND the 607KB logits-scan DRAM
@@ -89,10 +91,14 @@ the line (0.98-1.00x). **B=1 after chase round 1: 1.08 / 0.95 / 0.99 / 1.01** (w
    shape, -9..-11% vs b2r and under the lcpp wall) is production for n < 3072 / small-d
    sites; b2r keeps n >= 3072. Q5 gpu/step 15.87 -> 14.84ms.
 
-Remaining, both pre-existing classes:
+3. **The fused H-form rope-store** (round 2, the former ledger item): on QK-norm x f16
+   mirrors, bias + per-head RMS + rope + store run as ONE head-cooperative dispatch —
+   the prepass dispatch and its q/k round trip disappear (+~1% on Q4/Q5/Q6; other KV
+   codecs keep prepass + flat).
+
+Remaining, pre-existing class:
 - **Q8_0 B=1 0.95x** — the sequential-phase anomaly the merged 3B board carries at 0.97
-  (same signature: batched-B1 form 0.97 beats the sequential loop; spec already on; the q8
-  GEMVs measure 320-412 wGB/s at the 4B shapes = healthy). The parked per-32-step bucket
-  diagnostic is the named next step.
-- The QK-norm prepass (~1% of B=1) on every qwen3 decode cell — the fused rope-store
-  H-form in the API_REWORK ledger recovers it.
+  (same signature: the batched-B1 form 0.98 beats the sequential loop on the same
+  forward(); spec on, q8 GEMVs measure 320-412 wGB/s at 4B shapes = healthy, s32 A/B
+  slower, H-form neutral here). The parked per-32-step bucket diagnostic is the named
+  next step.
