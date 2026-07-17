@@ -93,8 +93,10 @@ def fsave(f : file; buf : auto(BufType) const) {
         let len = int(len64)
         let dfh = df_header(magic = df_magic, size = len)
         r1 = _builtin_write(f, dfh, typeinfo sizeof(type<df_header>))
-        unsafe {
-            r2 = _builtin_write(f, addr(data[0]), len)
+        if (len > 0) {   // addr(data[0]) on an empty payload is out of bounds
+            unsafe {
+                r2 = _builtin_write(f, addr(data[0]), len)
+            }
         }
     }
     if (r1 < 0) return r1

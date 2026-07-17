@@ -504,6 +504,19 @@ def load_image(path : string; var t; tag : string = "") : bool {
     var rarch = Archive(reading = true, stream = meta)
     var sections : array<ImgSection>
     rarch |> serialize(sections)
+    // the header count must agree with the meta blob's own section list — a disagreement
+    // means header/meta corruption, and silently-absent sections would leave planes EMPTY
+    // (indistinguishable from legitimately-empty ones)
+    if (length(sections) != nsections) {
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — header says {nsections} sections, meta carries {length(sections)}\n")
+        delete sections
+        delete meta_blob
+        unsafe {
+            delete meta
+        }
+        unsafe(fmap_close(base, msize))
+        return false
+    }
     var by_name <- {for (sec in sections); sec.name => sec}
     _::serialize_image_meta(rarch, t)
     _::image_post_load(t)
@@ -531,7 +544,7 @@ def load_image(path : string; var t; tag : string = "") : bool {
     unsafe {
         delete meta
     }
-    if (!ok || nsections < 0) {
+    if (!ok) {
         // a malformed section table: forget whatever was borrowed (the finalizer), THEN unmap —
         // image_map was never set, so the finalizer alone would leak the mapping
         delete t

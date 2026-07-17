@@ -197,6 +197,10 @@ def test_image_mechanics(t : T?) {
         var m5 = ImgProbe()
         t |> success(load_image(path, m5, "img-probe"), "restored version maps again")
         delete m5
+        patch_u32(t, path, 12l, 7u)   // header now lies about the section count
+        var m5b = ImgProbe()
+        t |> success(!load_image(path, m5b, "img-probe"), "section-count-lying header declines")
+        patch_u32(t, path, 12l, 3u)   // the probe's true count: plane_f, plane_b, nested.blob
         patch_u32(t, path, 32l, 0x1u)   // header now lies about the file size
         var m6 = ImgProbe()
         t |> success(!load_image(path, m6, "img-probe"), "size-lying header declines")
