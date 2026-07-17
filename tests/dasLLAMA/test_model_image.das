@@ -226,6 +226,9 @@ def test_image_mechanics(t : T?) {
         patch_u32(t, path, 24l, mb - 4u)   // truncate the meta tail: the archive under-reads its last field
         var m5c = ImgProbe()
         t |> success(!load_image(path, m5c, "img-probe"), "truncated meta blob declines")
+        patch_u32(t, path, 24l, 0u)   // an empty meta blob is malformed, not an OOB addr
+        var m5d = ImgProbe()
+        t |> success(!load_image(path, m5d, "img-probe"), "zero-size meta blob declines")
         patch_u32(t, path, 24l, mb)
         patch_u32(t, path, 12l, 7u)   // header now lies about the section count
         var m5b = ImgProbe()

@@ -495,8 +495,9 @@ def load_image(path : string; var t; tag : string = "") : bool {
     let meta_bytes = read_u64(bp, 24l)
     let file_bytes = read_u64(bp, 32l)
     // bytes-first ordering keeps meta_off + meta_bytes wrap-free; the INT_MAX cap bounds the
-    // int() casts the copy below takes (real meta blobs are a few MB)
-    if (file_bytes != msize || meta_bytes > msize || meta_off > msize - meta_bytes || meta_bytes > uint64(INT_MAX)) {
+    // int() casts the copy below takes (real meta blobs are a few MB, never empty — the
+    // section table always rides there, and addr(meta_blob[0]) needs a nonzero resize)
+    if (file_bytes != msize || meta_bytes == 0ul || meta_bytes > msize || meta_off > msize - meta_bytes || meta_bytes > uint64(INT_MAX)) {
         to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — header says {file_bytes} bytes / meta {meta_off}+{meta_bytes}, mapped {msize}\n")
         unsafe(fmap_close(base, msize))
         return false
