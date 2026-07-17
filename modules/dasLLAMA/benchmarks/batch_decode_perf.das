@@ -214,6 +214,15 @@ def main() {
                 metal_decode_stage_reset()   // per-B stage attribution (the report below)
             }
             let seq_tps = run_sequential(t, cfg.kv, nb, p, n)
+            static_if (typeinfo builtin_module_exists(das_metal)) {
+                // phase-split stage attribution: land the sequential phase's counters before the
+                // batched loop reuses the driver (the 3.5% seq-vs-batched-B1 split diagnostic)
+                if (metal_decode_stats().decodes > 0l) {
+                    print("  [stage split: sequential phase]\n")
+                    metal_decode_stage_report()
+                    metal_decode_stage_reset()
+                }
+            }
             let doTrace = nb == bmax && !empty(trace)
             if (doTrace) {
                 jobque_trace_start(1 << 21)
@@ -234,7 +243,8 @@ def main() {
             print("B={nb}: sequential {seq_tps} tok/s | batched {bat_tps} tok/s ({speedup}x) | per-stream {stream_tps} tok/s\n")
             static_if (typeinfo builtin_module_exists(das_metal)) {
                 if (metal_batch_decode_stats().steps > 0l || metal_decode_stats().decodes > 0l) {
-                    metal_decode_stage_report()   // this B's sequential (single-stream) + batched stage split
+                    print("  [stage split: batched phase]\n")
+                    metal_decode_stage_report()   // the batched phase only (sequential landed above)
                 }
             }
             nb *= 2l
