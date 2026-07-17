@@ -2,10 +2,11 @@ options gen2
 options indenting = 4
 
 // The ONLY sanctioned way to run the dasLLAMA Metal suites (see tests/dasLLAMA/CLAUDE.md).
-// Enforces the iteration discipline that keeps suite walls honest: exactly ONE of --arm
-// (filtered iteration, minutes) or --full (the pre-commit gate: every arm + the large-tier
-// models, run ONCE after batching fixes). Every run's COMPLETE output lands in a log file
-// whose path is printed — never pipe suite output through a grep at capture time.
+// Enforces the iteration discipline that keeps suite walls honest: --arm (filtered iteration,
+// minutes) scoped to the arms a change can actually affect. --full is REFUSED while the Metal
+// build-out is in progress — a whole-zoo pass buys soak time, not coverage; narrow the scope.
+// Every run's COMPLETE output lands in a log file whose path is printed — never pipe suite
+// output through a grep at capture time.
 
 require daslib/clargs
 require daslib/fio
@@ -19,7 +20,7 @@ struct RunArgs {
     arm : string
 
     @clarg_short = "f"
-    @clarg_doc = "The pre-commit gate: every arm + large-tier models (DASLLAMA_PARITY_FULL=1), raised dastest timeout. Run ONCE after batching fixes"
+    @clarg_doc = "REFUSED while the Metal build-out is in progress — narrow the scope with --arm instead"
     full : bool
 
     @clarg_short = "s"
@@ -105,6 +106,10 @@ def main() : int {
     }
     if (cfg.full == !empty(cfg.arm)) {   // both set, or neither
         to_log(LOG_ERROR, "pass exactly ONE of --arm <filter> (iteration) or --full (the pre-commit gate)\n")
+        return 2
+    }
+    if (cfg.full) {
+        to_log(LOG_ERROR, "please narrow the scope to the correct set of gates, metal is not fully implemented yet\n")
         return 2
     }
     var files <- suite_files(cfg.suite)
