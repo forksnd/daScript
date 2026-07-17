@@ -25,6 +25,24 @@ decode=metal, backend=portable, mirror 3072MB, batch pipe on) + `prefill_perf.da
 
 B=2..8 ride the kq ext small-batch mv twins (one weight pass per 4-column group — the round-2
 gemv-lab winners; the round-1 per-stream form lost B=4/8 at 0.91x/0.75x). B>=9 = the kq mul_mm
-twins. OPEN RED CELL: pp512 at 0.99x (-1.3%, stable across runs) — the kq prefill mul_mm
-A-stage is the remaining chase before Q4_K_M is fully green. lcpp's B=1 batched-bench row is
-93.3 (its batch machinery costs ~8% vs llama-bench's 101.5 single loop); das beats both.
+twins. pp512 at 0.99x (-1.3%, stable): APPROVED DEFERRAL — revisit after the format roster.
+lcpp's B=1 batched-bench row is 93.3 (its batch machinery costs ~8% vs llama-bench's 101.5
+single loop); das beats both.
+
+### Q8_0 (q8 repack, s16 scale plane — the load default)
+
+| shape | das tok/s | lcpp tok/s | das/lcpp |
+| :--- | ---: | ---: | ---: |
+| pp512 | 1380.5 | 1395.9 | 0.99x |
+| tg128 B=1 | 71.9 | 86.4 | **0.83x RED** |
+| tg128 B=2 | 140.4 | 127.9 | **1.10x** |
+| tg128 B=4 | 232.9 | 218.7 | **1.07x** |
+| tg128 B=8 | 250.4 | 252.7 | 0.99x |
+| tg128 B=16 | 401.2 | 362.7 | **1.11x** |
+
+OPEN RED CELLS: tg128 B=1 at 0.83x — and the tell: das's OWN batched path at B=1 does 79.9
+(both pipe modes), beating the dedicated single-stream driver's 71.9-72.9. The single-stream
+rail is leaving ~10% on the table on q8 specifically (Q4_K_M shows no such split: 108.4 both
+forms). Under diagnosis. B=8 at 0.99x (-0.9%) — the emission-arc soft cell, improved from
+0.94x but still a hair short; candidate fix = the ext-form twin with the q8 A-stage replacing
+mv8 at B=5..8. pp512 0.99x (-1.1%) — same class as the Q4_K_M deferral.
