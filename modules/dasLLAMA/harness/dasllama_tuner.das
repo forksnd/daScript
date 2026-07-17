@@ -14,6 +14,9 @@ require math
 // A child failure is reported but does not abort the other half — the completeness check
 // upstream names whatever ends up missing.
 
+// The default is the roughly one-minute 20-round full-grid / 80-round finalist budget.
+// Append `-- --tune-fast` for progressive 4/8 screening and a 20-round cap;
+// `daspkg release --tune-fast` forwards the same flag here.
 // Both halves take real measurements (the confirm gate is a full prefill), so they must run
 // under the box measurement regime — 16 cores with affinity on the big-SMT x64 boxes, not the
 // fresh-que default (all cores): a crown confirmed at the wrong width ships the wrong kernel.
@@ -33,9 +36,20 @@ def private regime_env_prefix() : string {
     return pfx
 }
 
-def private run_half(name : string) : bool {
+def private tune_fast_requested() : bool {
+    for (arg in get_command_line_arguments()) {
+        if (arg == "--tune-fast" || arg == "-tune-fast") {
+            return true
+        }
+    }
+    return false
+}
+
+def private run_half(name : string; fast : bool) : bool {
+    let t0 = ref_time_ticks()
     let pfx = regime_env_prefix()
-    let cmd = "{pfx}\"{get_das_exe()}\" -jit \"{path_join(get_this_module_dir(), name)}\" -dasroot \"{get_das_root()}\" 2>&1"
+    let user_args = fast ? " -- --tune-fast" : ""
+    let cmd = "{pfx}\"{get_das_exe()}\" -jit \"{path_join(get_this_module_dir(), name)}\" -dasroot \"{get_das_root()}\"{user_args} 2>&1"
     // cmd.exe strips the first and last quote of a line that starts with a quote — wrap in a
     // sacrificial outer pair on windows UNLESS the env prefix already leads (the daspkg popen trap)
     let full = get_platform_name() == "windows" && empty(pfx) ? "\"{cmd}\"" : cmd
@@ -51,6 +65,8 @@ def private run_half(name : string) : bool {
             }
         }
     }
+    let elapsed_ms = get_time_usec(t0) / 1000
+    print("dasllama_tuner: {name} finished in {elapsed_ms} ms (rc={rc})\n")
     if (rc != 0) {
         print("dasllama_tuner: {name} FAILED (rc={rc})\n")
     }
@@ -59,8 +75,12 @@ def private run_half(name : string) : bool {
 
 [export]
 def main : int {
+    let t0 = ref_time_ticks()
+    let fast = tune_fast_requested()
     print("dasllama_tuner: sidecar = {get_env_variable("DAS_TUNE_MANIFEST")}\n")
-    let ok1 = run_half("gen_tune_probe.das")
-    let ok2 = run_half("tune_kernels.das")
+    print("dasllama_tuner: mode = {fast ? "FAST (progressive 4/8 screening / 20 max)" : "default (20 screening / 80 max)"}\n")
+    let ok1 = run_half("gen_tune_probe.das", fast)
+    let ok2 = run_half("tune_kernels.das", fast)
+    print("dasllama_tuner: total {get_time_usec(t0) / 1000} ms\n")
     return ok1 && ok2 ? 0 : 1
 }

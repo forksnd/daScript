@@ -38,7 +38,7 @@ daslang utils/daspkg/main.das -- install --global dasImgui
 | `build` | Build all C/C++ packages (cmake) |
 | `check` | Verify installed packages are present |
 | `doctor` | Check environment (git, cmake, gh) |
-| `release [--out <dir>]` | Bundle project as a redistributable standalone |
+| `release [--out <dir>] [--tune-fast]` | Bundle project as a redistributable standalone; tuning defaults to 20/80, with an opt-in quick 4/8/20 pass |
 | `introduce [url]` | Submit a package to the index via PR |
 | `withdraw <name>` | Remove a package from the index via PR |
 
@@ -56,6 +56,7 @@ All package commands accept `--global` / `-g` to operate on global modules.
 | `--json` | Machine-readable JSON output (`search`, `list`, `check`) |
 | `--branch <name>`, `-b <name>` | Install from a git branch (e.g. `master`) instead of a tag |
 | `--out <path>` | Output directory for `release` (default: current directory) |
+| `--tune-fast` | During `release`, tune with progressive 4/8-round screening and a 20-round cap instead of the default 20/80 budget |
 
 ## Global modules
 
@@ -112,7 +113,18 @@ def dependencies(version : string) {
 def build() {
     cmake_build()       // or: custom_build("make all"), or: no_build()
 }
+
+[export]
+def release() {
+    release_main("main.das")
+    release_include("assets/**")                 // release-owned; refreshed every time
+    release_include_if_missing("app.toml")       // user-owned after initialization
+}
 ```
+
+Use `release_include_if_missing` for editable deployment files. They are copied only when absent,
+excluded from `.daspkg_release.manifest`, and preserved even when upgrading from an older manifest
+that previously treated the same path as release-owned.
 
 All functions except `package()` are optional. A repo without `.das_package` gets a "dumb clone" — no version resolution, no deps, no build.
 

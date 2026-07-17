@@ -133,6 +133,7 @@ struct ReleaseSpec {
     main_script : string                //!< path to project's main .das (relative to root)
     wasm_main_script : string           //!< entry for `daspkg release wasm` when it differs from main_script (e.g. a live_stub variant); falls back to main_script
     include_globs : array<string>       //!< asset globs to ship
+    include_if_missing_globs : array<string> //!< mutable starter files to copy only when absent; never release-owned or overwritten
     exclude_globs : array<string>       //!< asset globs to skip
     forced_modules : array<string>      //!< force-include shared module by das_name (auto-detection misses media-only or runtime-loaded packages)
     native_dlls : array<string>         //!< native shared libraries to ship next to this package's .shared_module (e.g. "glfw3.dll" / "libglfw.so.3.4"); resolved against <das_root>/bin/ (Windows) or <das_root>/lib/ (POSIX)
@@ -164,6 +165,14 @@ def release_wasm_main(script : string) {
 
 def release_include(pattern : string) {
     _release_spec.include_globs |> push(pattern)
+}
+
+//! Ship starter content only when the destination does not already exist.
+//! Unlike `release_include`, these files are deliberately omitted from the
+//! release manifest, so later releases neither delete nor overwrite the
+//! deployed copy. Use this for editable configs and other user-owned files.
+def release_include_if_missing(pattern : string) {
+    _release_spec.include_if_missing_globs |> push(pattern)
 }
 
 def release_exclude(pattern : string) {

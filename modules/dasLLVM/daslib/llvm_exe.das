@@ -779,6 +779,7 @@ struct private TuneScopeDep {
     manifest : string               //!< the app tune sidecar the winners live in
     tuner : string                  //!< tuner harness path ("" = none declared)
     complete : bool                 //!< every [tune] kernel of this scope has a fresh sidecar entry
+    fallbacks : string              //!< fallback stamps selected by this same compile/host
 }
 
 struct private ReleaseDeps {
@@ -897,7 +898,7 @@ def private write_release_deps(prog : Program?) {
     deps.tune_scopes |> reserve(length(tstat))
     for (ts in tstat) {
         deps.tune_scopes |> push(TuneScopeDep(name = ts.name, manifest = ts.manifest,
-            tuner = ts.tuner, complete = ts.complete))
+            tuner = ts.tuner, complete = ts.complete, fallbacks = ts.fallbacks))
     }
     delete tstat
     let dst_path = cfg.list_shared_modules

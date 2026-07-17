@@ -173,8 +173,9 @@ Telegram Desktop produces more pages; use `--include-last-page` only after the e
 bin/daslang utils/daspkg/main.das -- release --root examples/telegram/dictation --out <staging>
 ```
 
-The release contains a standalone executable, runtime DLLs, required shared modules, and the config
-template. Preserve deployed `dictation.toml` and `cadmus.db` when re-releasing.
+The release contains a standalone executable, runtime DLLs, required shared modules, and initializes
+the config template only when `dictation.toml` is absent. Re-releasing preserves the deployed
+`dictation.toml`; `cadmus.db` is not release-owned and is preserved as well.
 
 For a supervised deployment, use the watchdog shipped by the dasllama-server release to run the
 released bot without an HTTP health probe. It records process memory, shows a Windows notification

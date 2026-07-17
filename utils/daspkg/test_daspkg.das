@@ -194,6 +194,14 @@ def test_parse_args(t : T?) {
         t |> equal(parsed.command ?? "", "list")
         t |> success(parsed.command_arg |> is_none)
     }
+    t |> run("release with fast tuning") @(t : T?) {
+        var r <- parse_args(type<DaspkgArgs>, ["release", "--out", "E:/", "--tune-fast"])
+        t |> success(r |> is_ok, "parse succeeds")
+        let parsed <- r |> move_unwrap
+        t |> equal(parsed.command ?? "", "release")
+        t |> equal(parsed.out, "E:/")
+        t |> success(parsed.tune_fast)
+    }
     t |> run("no command") @(t : T?) {
         let empty_args : array<string>
         var r <- parse_args(type<DaspkgArgs>, empty_args)
@@ -1694,6 +1702,8 @@ def test_run_das_package_release(t : T?) {
         tt |> equal(2, length(info.include_globs))
         tt |> equal("*.png", info.include_globs[0])
         tt |> equal("data/**/*.json", info.include_globs[1])
+        tt |> equal(1, length(info.include_if_missing_globs))
+        tt |> equal("config/*.toml", info.include_if_missing_globs[0])
         tt |> equal(1, length(info.exclude_globs))
         tt |> equal("data/internal/**", info.exclude_globs[0])
         tt |> equal(2, length(info.forced_modules))
@@ -1726,10 +1736,13 @@ def test_cmd_release_pure_daslang(t : T?) {
             fwrite(f, "options gen2\n[export]\ndef main() \{\n    print(\"hello\\n\")\n\}\n")
         }
         fopen("{tmp_root}/.das_package", "wb") $(f) {
-            fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"smoke\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n    release_include(\"*.txt\")\n\}\n")
+            fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"smoke\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n    release_include(\"*.txt\")\n    release_include_if_missing(\"config.toml\")\n\}\n")
         }
         fopen("{tmp_root}/data.txt", "wb") $(f) {
             fwrite(f, "asset")
+        }
+        fopen("{tmp_root}/config.toml", "wb") $(f) {
+            fwrite(f, "value = \"template\"\n")
         }
 
         let rc = cmd_release(tmp_root, out_dir)
@@ -1738,7 +1751,28 @@ def test_cmd_release_pure_daslang(t : T?) {
         let artifacts = bundle_artifacts_dir(out_dir, "smoke")
         tt |> success(fexist(exe_path), "exe shipped at {exe_path}")
         tt |> success(fexist(path_join(artifacts, "data.txt")), "asset shipped")
+        let deployed_config = path_join(artifacts, "config.toml")
+        tt |> equal("value = \"template\"\n", fread(deployed_config), "starter config shipped on first release")
         tt |> success(!fexist(path_join(artifacts, "smoke.o")), ".o build artifact dropped")
+
+        fopen(deployed_config, "wb") $(f) {
+            fwrite(f, "value = \"user-edited\"\n")
+        }
+        // Simulate upgrading from the old release_include("config.toml")
+        // behavior: the previous manifest still claims ownership. The new
+        // if-missing declaration must protect the deployed edit during that
+        // one-time migration cleanup.
+        let old_manifest = path_join(artifacts, ".daspkg_release.manifest")
+        fopen(old_manifest, "ab") $(f) {
+            fwrite(f, "config.toml\n")
+        }
+        let rc2 = cmd_release(tmp_root, out_dir)
+        tt |> equal(0, rc2, "second cmd_release returns 0")
+        tt |> equal("value = \"user-edited\"\n", fread(deployed_config),
+            "release_include_if_missing preserves deployed edits")
+        let manifest = fread(old_manifest)
+        tt |> success(find(manifest, "config.toml") < 0,
+            "user-owned starter config is omitted from release manifest")
 
         force_rmdir(tmp_root)
         force_rmdir(out_dir)

@@ -17,5 +17,5 @@ def dependencies(version : string) {
 def release() {
     release_main("main.das")
     release_name("dictation-bot")
-    release_include("dictation.toml")   // ship the config template next to the exe
+    release_include_if_missing("dictation.toml") // initialize once; preserve deployed edits on upgrades
 }
