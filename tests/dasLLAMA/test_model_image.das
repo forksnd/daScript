@@ -213,6 +213,25 @@ def test_image_mechanics(t : T?) {
         var m7 = ImgProbe()
         t |> success(!load_image(path, m7, "img-probe"), "absent file declines")
         delete p
+
+        // an OWNED array that merely holds a lock has the same lock/magic signature as a
+        // borrowed view — forget must refuse it loudly (silently "forgetting" leaks storage)
+        var owned : array<float>
+        owned |> resize(4)
+        var caught = false
+        for (x in owned) {
+            feint("{x}")
+            try {
+                unsafe {
+                    _builtin_forget_temp_array(owned)
+                }
+            } recover {
+                caught = true
+            }
+            break
+        }
+        t |> success(caught, "forget on an owned locked array is a loud error")
+        delete owned
     }
 }
 

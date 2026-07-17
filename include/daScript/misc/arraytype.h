@@ -168,6 +168,7 @@ namespace das {
                 bool hopeless : 1;          // needs to be deleted without fuss (exceptions)
                 bool forego_lock_check : 1; // don't need to check if elements are locked
                 bool tableNoHash : 1;       // Table only: key type stores no per-slot hash (non-string) - see tableHashSlotBytes
+                bool borrowed : 1;          // a mark_locked view over foreign storage (fmap/temp_array) — array_forget_locked requires it, so an owned array that merely holds a lock can never be "forgotten" (leaked)
             };
             uint32_t flags;
         };

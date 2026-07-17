@@ -14,6 +14,7 @@ namespace das
         arr.size = arr.capacity = capacity;
         arr.lock = 1;
         arr.magic = DAS_ARRAY_MAGIC;
+        arr.borrowed = true;
     }
 
     void array_mark_locked ( Array & arr, void * data, uint64_t size, uint64_t capacity ) {
@@ -22,18 +23,22 @@ namespace das
         arr.capacity = capacity;
         arr.lock = 1;
         arr.magic = DAS_ARRAY_MAGIC;
+        arr.borrowed = true;
     }
 
     // the inverse of array_mark_locked for views that outlive a temp scope: reset the view
     // WITHOUT freeing the storage (it belongs to a file mapping / another allocator). false =
-    // not a mark_locked view (untouched) — callers turn that into a runtime error.
+    // not a mark_locked view (untouched) — callers turn that into a runtime error. The
+    // borrowed bit is the discriminator: an OWNED array that merely holds a lock has the same
+    // lock/magic signature, and "forgetting" it would leak its storage.
     bool array_forget_locked ( Array & arr ) {
-        if ( arr.lock != 1 || arr.magic != DAS_ARRAY_MAGIC ) return false;
+        if ( arr.lock != 1 || arr.magic != DAS_ARRAY_MAGIC || !arr.borrowed ) return false;
         arr.data = nullptr;
         arr.size = 0;
         arr.capacity = 0;
         arr.lock = 0;
         arr.magic = 0;
+        arr.borrowed = false;
         return true;
     }
 

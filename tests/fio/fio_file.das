@@ -23,8 +23,9 @@ def operator ==(a, b : array<uint8> implicit) {
 [test]
 def test_empty_array_io(t : T?) {
     t |> run("fwrite/fread of an empty array is a 0-byte no-op, not an OOB addr") @(t : T?) {
-        let tmp = empty(get_env_variable("TMPDIR")) ? "/tmp" : get_env_variable("TMPDIR")
-        let fname = "{tmp}/fio_empty_io_{ref_time_ticks()}.bin"
+        var terr : string
+        let tmp = temp_directory(terr)   // portable (no /tmp on Windows); cwd as a last resort
+        let fname = path_join(empty(tmp) ? "." : tmp, "fio_empty_io_{ref_time_ticks()}.bin")
         var none : array<int>
         var wrote = false
         fopen(fname, "wb") $(f) {
