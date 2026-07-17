@@ -205,8 +205,11 @@ def main() {
         // warm both code paths (JIT + kernel dispatch) AND ramp the GPU to sustained clocks
         // before any timed window — a 2-step warmup leaves the first timed phase ~3% slow and
         // the second phase wins on position alone (the phase-order artifact, DASLLAMA_BENCH_SWAP
-        // proved it: the winner flips with the order). 48 decode steps ~ 0.6s GPU-busy = ramped.
-        let _w1 = run_sequential(t, cfg.kv, 1l, 8l, 48l)
+        // proved it: the winner flips with the order). 48 steps (~0.6s) was STILL short — the
+        // n=512 control put the residual at 1.1% with sequential rising toward batched, and
+        // warmth persists ACROSS PROCESSES (position-1 numbers track the box's recent GPU
+        // history). 256 steps ~ 3s GPU-busy makes the first timed phase start ramped.
+        let _w1 = run_sequential(t, cfg.kv, 1l, 8l, 256l)
         let _w2 = run_batched(t, cfg.kv, 2l, 8l, 2l)
         // DASLLAMA_BATCH_TRACE=<path> saves a per-lane jobque trace of the LARGEST-B batched run
         // (the lane-timeline viewer's input; same rig as decode_prof --trace)
