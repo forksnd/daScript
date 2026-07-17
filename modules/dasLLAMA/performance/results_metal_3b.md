@@ -16,14 +16,15 @@ decode=metal, backend=portable, mirror 3072MB, batch pipe on) + `prefill_perf.da
 
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
-| pp512 | 1198.3 | 1213.5 | 0.99x |
-| tg128 B=1 | 108.2 | 101.5 | **1.07x** |
-| tg128 B=2 | 140.1 | 112.8 | **1.24x** |
-| tg128 B=4 | 151.8 | 167.1 | 0.91x |
-| tg128 B=8 | 150.5 | 200.3 | 0.75x |
-| tg128 B=16 | 324.1 | 315.7 | **1.03x** |
+| pp512 | 1197.9 | 1213.5 | 0.99x |
+| tg128 B=1 | 108.6 | 101.5 | **1.07x** |
+| tg128 B=2 | 146.1 | 112.8 | **1.30x** |
+| tg128 B=4 | 188.3 | 167.1 | **1.13x** |
+| tg128 B=8 | 204.7 | 200.3 | **1.02x** |
+| tg128 B=16 | 323.1 | 315.7 | **1.02x** |
 
-Known gap: B=4/B=8 ride the M2.1 interim per-stream kq GEMVs (B separate B1 weight passes per
-site — no scaling B=2→8); the kq mul_mm twins take over at B>=9 and win again. lcpp's B=1
-batched-bench row is 93.3 (its batch machinery costs ~8% vs llama-bench's 101.5 single loop);
-das --fixed-token twin beats both.
+B=2..8 ride the kq ext small-batch mv twins (one weight pass per 4-column group — the round-2
+gemv-lab winners; the round-1 per-stream form lost B=4/8 at 0.91x/0.75x). B>=9 = the kq mul_mm
+twins. OPEN RED CELL: pp512 at 0.99x (-1.3%, stable across runs) — the kq prefill mul_mm
+A-stage is the remaining chase before Q4_K_M is fully green. lcpp's B=1 batched-bench row is
+93.3 (its batch machinery costs ~8% vs llama-bench's 101.5 single loop); das beats both.
