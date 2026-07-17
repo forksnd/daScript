@@ -84,6 +84,16 @@ def public component_count(bt : Type) : int {
     return 0
 }
 
+// ===== interface-block layout rules =====
+//! Which GLSL packing rules a block layout follows. std140 (@uniform / @push_constant): array
+//! elements and nested structs round up to 16 bytes, members are 32-bit only. std430 (@ssbo):
+//! tight width-aware packing — no 16-byte flooring, and 8/16-bit members are legal (the SPIR-V
+//! emitter pulls the matching StorageBuffer8/16BitAccess capabilities).
+enum public BlockLayoutRules {
+    std140
+    std430
+}
+
 // ===== std140 layout for a UBO interface block =====
 // std140 base alignment: scalar -> 4, vec2 -> 8, vec3/vec4 -> 16. The base *size* of a vec3 is 12
 // (only its alignment is 16), so a scalar can pack into the trailing 4 bytes after a vec3.
@@ -98,6 +108,21 @@ def public std140_align(bt : Type) : int {
 
 def public std140_size(bt : Type) : int {
     return component_count(bt) * 4
+}
+
+// Width-aware base size / alignment — the std430 generalization of std140_size/std140_align
+// (identical values for 32-bit types). Size = lanes x bytes-per-lane; alignment = scalar -> 1 lane,
+// vec2 -> 2 lanes, vec3/vec4 -> 4 lanes, scaled by the lane width (half3 -> size 6, align 8;
+// byte4 -> size 4, align 4; int8 -> size 1, align 1).
+def public block_scalar_size(bt : Type) : int {
+    return component_count(bt) * (scalar_width(bt) / 8)
+}
+
+def public block_scalar_align(bt : Type; rules : BlockLayoutRules) : int {
+    if (rules == BlockLayoutRules.std140) return std140_align(bt)
+    let cc = component_count(bt)
+    let lanes = cc == 1 ? 1 : (cc == 2 ? 2 : 4)
+    return lanes * (scalar_width(bt) / 8)
 }
 
 def public round_up(off, a : int) : int {
@@ -132,12 +157,15 @@ struct public BlockField {
     is_composite      : bool   //!< convenience flag — true when is_array OR is_struct (host bind macros can't write this with a flat overload)
 }
 
-// std140 element stride for a fixed-array element type. Scalars/vectors round up to vec4 (16 bytes);
-// nested-struct elements take their std140 struct-size rounded up to the struct alignment (which is
-// already a multiple of 16 by std140's struct rule). Matrix elements and nested-array elements are
-// out of PR-G scope and rejected by the caller before reaching here.
-def private std140_array_element_stride(bt : Type) : int {
-    return round_up(std140_size(bt), 16)
+// Array element stride for a fixed-array element type. std140: scalars/vectors round up to vec4
+// (16 bytes). std430: tight — the element's base size rounded to its base alignment. Nested-struct
+// elements take their laid-out struct size rounded to the struct alignment (handled by the caller).
+// Matrix elements and nested-array elements are rejected by the caller before reaching here.
+// Public: the SPIR-V emitter's member-access path (field_pointee_type) rebuilds array member types
+// and must compute the identical stride.
+def public block_array_element_stride(bt : Type; rules : BlockLayoutRules) : int {
+    if (rules == BlockLayoutRules.std140) return round_up(std140_size(bt), 16)
+    return round_up(block_scalar_size(bt), block_scalar_align(bt, rules))
 }
 
 //! Compute the std140 layout of one interface block. Pure: takes a Structure?, fills `fields` with
@@ -150,9 +178,11 @@ def private std140_array_element_stride(bt : Type) : int {
 //! (std140 ArrayStride = element-size rounded to 16); fixed-array of nested struct (ArrayStride =
 //! laid-out struct size rounded to struct alignment). Out of scope (clean rejection): matrix-of-array,
 //! array-of-array, runtime arrays (use `@ssbo` for those).
+//! `rules` picks the packing (defaults to std140 — every pre-existing caller keeps its layout):
+//! std430 packs arrays/nested structs tight and admits 8/16-bit members.
 //! [macro_function]: callable from a backend's bind-gen macro at compile time, mirrors generate_spirv.
 [macro_function]
-def public compute_block_layout(sname : string; st : Structure?; var fields : array<BlockField>; var errors : array<string>) : tuple<ok : bool; size : int; align : int> {
+def public compute_block_layout(sname : string; st : Structure?; var fields : array<BlockField>; var errors : array<string>; rules : BlockLayoutRules = BlockLayoutRules.std140) : tuple<ok : bool; size : int; align : int> {
     fields |> clear
     if (st == null || empty(st.fields)) {
         errors |> push("interface block '{sname}' must be a struct with at least one field")
@@ -177,13 +207,13 @@ def public compute_block_layout(sname : string; st : Structure?; var fields : ar
         // Structure?). is_composite=true signals "no flat write_field overload exists".
         if (fld._type != null && fld._type.baseType == Type.tStructure && fld._type.structType != null) {
             var inner : array<BlockField>
-            let inner_layout = compute_block_layout("{sname}.{fld.name}", fld._type.structType, inner, errors)
+            let inner_layout = compute_block_layout("{sname}.{fld.name}", fld._type.structType, inner, errors, rules)
             delete inner
             if (!inner_layout.ok) {
                 fields |> clear
                 return (ok = false, size = 0, align = 0)
             }
-            let struct_align = round_up(inner_layout.align, 16)
+            let struct_align = rules == BlockLayoutRules.std140 ? round_up(inner_layout.align, 16) : inner_layout.align
             off = round_up(off, struct_align)
             let struct_size = round_up(inner_layout.size, struct_align)
             fields |> emplace(BlockField(name := string(fld.name), offset = off, size = struct_size,
@@ -209,32 +239,33 @@ def public compute_block_layout(sname : string; st : Structure?; var fields : ar
             // scalar / vector element
             if (et.baseType != Type.tStructure && et.baseType != Type.tFixedArray && !matrix_info(et).ok) {
                 let ebt = et.baseType
-                if (scalar_class(ebt) < 0 || scalar_width(ebt) != 32) {
+                if (scalar_class(ebt) < 0 || (rules == BlockLayoutRules.std140 && scalar_width(ebt) != 32)) {
                     errors |> push("interface block '{sname}' field '{fld.name}': array element type {ebt} is not supported (only 32-bit int/uint/float scalars, their vectors, or nested structs of those)")
                     fields |> clear
                     return (ok = false, size = 0, align = 0)
                 }
-                let stride = std140_array_element_stride(ebt)
-                off = round_up(off, 16)        // std140 array base alignment is 16
+                let stride = block_array_element_stride(ebt, rules)
+                let abase = rules == BlockLayoutRules.std140 ? 16 : block_scalar_align(ebt, rules)
+                off = round_up(off, abase)     // std140 array base alignment is 16; std430 = element alignment
                 let total = stride * nelem
                 fields |> emplace(BlockField(name := string(fld.name), offset = off, size = total,
                     is_matrix = false, matrix_width = 0, matrix_cols = 0,
                     is_array = true, array_count = nelem, array_stride = stride,
                     is_struct = false, is_composite = true))
                 off += total
-                max_align = max(max_align, 16)
+                max_align = max(max_align, abase)
                 continue
             }
             // array-of-struct element
             if (et.baseType == Type.tStructure && et.structType != null) {
                 var inner : array<BlockField>
-                let inner_layout = compute_block_layout("{sname}.{fld.name}[]", et.structType, inner, errors)
+                let inner_layout = compute_block_layout("{sname}.{fld.name}[]", et.structType, inner, errors, rules)
                 delete inner
                 if (!inner_layout.ok) {
                     fields |> clear
                     return (ok = false, size = 0, align = 0)
                 }
-                let struct_align = round_up(inner_layout.align, 16)
+                let struct_align = rules == BlockLayoutRules.std140 ? round_up(inner_layout.align, 16) : inner_layout.align
                 let stride = round_up(inner_layout.size, struct_align)
                 off = round_up(off, struct_align)
                 let total = stride * nelem
@@ -252,16 +283,16 @@ def public compute_block_layout(sname : string; st : Structure?; var fields : ar
         }
         // terminal scalar / vector field
         let fbt = fld._type.baseType
-        if (scalar_class(fbt) < 0 || scalar_width(fbt) != 32) {
+        if (scalar_class(fbt) < 0 || (rules == BlockLayoutRules.std140 && scalar_width(fbt) != 32)) {
             errors |> push("interface block '{sname}' field '{fld.name}': type {fbt} is not supported (only 32-bit int/uint/float scalars, their vectors, matrices, fixed-arrays of those, and nested structs of those; bool has no physical interface-block layout in Vulkan)")
             fields |> clear
             return (ok = false, size = 0, align = 0)
         }
-        let falign = std140_align(fbt)
+        let falign = block_scalar_align(fbt, rules)
         off = round_up(off, falign)
-        fields |> emplace(BlockField(name := string(fld.name), offset = off, size = std140_size(fbt),
+        fields |> emplace(BlockField(name := string(fld.name), offset = off, size = block_scalar_size(fbt),
             is_matrix = false, matrix_width = 0, matrix_cols = 0))
-        off += std140_size(fbt)
+        off += block_scalar_size(fbt)
         max_align = max(max_align, falign)
     }
     return (ok = true, size = off, align = max_align)

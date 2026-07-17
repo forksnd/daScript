@@ -1859,3 +1859,42 @@ def specc_kernel {
 def public specc_words : array<uint> {
     return clone_to_move(specc_spv)
 }
+
+// ===== 8/16-bit SSBO storage: the llama.cpp block_q8_0 mirror (f16 scale + int8[32] quants —
+// ArrayStride 34, member Offsets 0/2, qs element stride 1 under std430), a half4 element array
+// (stride 8), and the unpack8/pack32 OpBitcast pack intrinsics with OpSConvert sign-extended
+// widening. Zero NEW opcodes — the StorageBuffer8/16BitAccess capabilities + the
+// SPV_KHR_8bit_storage extension ride the declared Capability/Extension opcodes. =====
+def public storage816_emitter_opcodes : table<uint> {
+    return <- spec_emitter_opcodes()
+}
+
+struct BlockQ8 {
+    d  : float16
+    qs : int8[32]
+}
+
+var @ssbo @binding = 0 q8_blocks : array<BlockQ8>
+var @ssbo @binding = 1 q8_packed : array<uint>
+var @ssbo @binding = 2 q8_y : array<float>
+var @ssbo @binding = 3 q8_h4 : array<half4>
+
+[compute_shader(local_size_x=64, name="q8blk_spv"), marker(no_coverage)]
+def q8blk_kernel {
+    let gi = gl_GlobalInvocationID.x
+    var acc = 0.0
+    var i = 0u
+    while (i < 32u) {
+        acc += float(int(q8_blocks[gi].qs[i]))
+        i++
+    }
+    let b4 = unpack8(int(q8_packed[gi]))
+    let w = int4(b4)
+    let hp = q8_h4[gi]
+    q8_y[gi] = (acc * float(q8_blocks[gi].d) + float(w.x + w.y + w.z + w.w)
+        + float(hp.x) + float(pack32(b4)))
+}
+
+def public q8blk_words : array<uint> {
+    return clone_to_move(q8blk_spv)
+}

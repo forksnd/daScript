@@ -164,6 +164,29 @@ var gl_SubgroupID           : uint      // BuiltIn SubgroupId (Input) — this s
 [unused_argument(value), sideeffects] def public subgroupBroadcastFirst(value : uint) : uint { return value }
 [sideeffects] def public subgroupElect() : bool { return true }
 
+// ===== 8-bit pack/unpack (GL_EXT_shader_explicit_arithmetic_types_int8 spellings) =====
+// unpack8 reinterprets one 32-bit scalar as four 8-bit lanes (input signedness picks the byte4 /
+// ubyte4 result — das cannot overload on return type, same trick the GLSL extension uses);
+// pack32 is the inverse. Lowers to a single OpBitcast. The q8 idiom: `unpack8(pack)` then widen
+// via `int4(b4)` (OpSConvert) — sign extension for free, replacing manual shift-pair dances.
+// Real CPU bodies (byte4/ubyte4 are bit-layout-identical to the packed 32-bit scalar, lane 0 low),
+// so CPU == GPU exactly, like packHalf2x16.
+def public unpack8(x : int) : byte4 {
+    return unsafe(reinterpret<byte4>(x))
+}
+
+def public unpack8(x : uint) : ubyte4 {
+    return unsafe(reinterpret<ubyte4>(x))
+}
+
+def public pack32(v : byte4) : int {
+    return unsafe(reinterpret<int>(v))
+}
+
+def public pack32(v : ubyte4) : uint {
+    return unsafe(reinterpret<uint>(v))
+}
+
 // ===== mesh + task shader minimum intrinsics (VK_EXT_mesh_shader) =====
 // SetMeshOutputsEXT(vertex_count, primitive_count): the mesh-shader prologue. The SPV_EXT_mesh_shader
 // spec requires this call once per workgroup at workgroup-uniform control flow BEFORE any access to

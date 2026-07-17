@@ -48,7 +48,6 @@ def test_conf_rejects_spirv(t : T?) {
         check_rejects(t, "_fc_conf_ubyte8", "is CPU-only")
         check_rejects(t, "_fc_conf_ubyte16", "is CPU-only")
         check_rejects(t, "_fc_lattice_ubo", "field 'h': type tHalf4 is not supported")
-        check_rejects(t, "_fc_lattice_ssbo", "element type tHalf4 is not supported")
         check_rejects(t, "_fc_lattice_push", "field 's': type tShort2 is not supported")
     }
 }

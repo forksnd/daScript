@@ -164,6 +164,26 @@ def private ensure_width_cap(var m : SpirvModule; is_float : bool; width : uint)
     m.type_pool |> insert(key, 1u)
 }
 
+// 8/16-bit SSBO members additionally require the STORAGE capability (the width cap above only
+// licenses the type/arithmetic). StorageBuffer16BitAccess is core in SPIR-V 1.3 (cap only);
+// StorageBuffer8BitAccess needs OpExtension "SPV_KHR_8bit_storage" at our 1.3 header (core at
+// 1.5). Deduped through the type pool like ensure_width_cap so the layout code can pull them
+// without an EmitCtx.
+def public ensure_storage_buffer_16(var m : SpirvModule) {
+    return if ((m.type_pool?["cap_sb16"] ?? 0u) != 0u)
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.StorageBuffer16BitAccess))
+    m.type_pool |> insert("cap_sb16", 1u)
+}
+
+def public ensure_storage_buffer_8(var m : SpirvModule) {
+    return if ((m.type_pool?["cap_sb8"] ?? 0u) != 0u)
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.StorageBuffer8BitAccess))
+    var nm <- string_words("SPV_KHR_8bit_storage")
+    emit_n(m, SEC_EXT, SpvOp.Extension, nm)
+    delete nm
+    m.type_pool |> insert("cap_sb8", 1u)
+}
+
 def public type_int(var m : SpirvModule; width, signedness : uint) : uint {
     let key = "i{width}_{signedness}"
     let ex = m.type_pool?[key] ?? 0u
