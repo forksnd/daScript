@@ -11,9 +11,11 @@ require imgui/imgui_markdown_view
 require imgui/imgui_text_source_view
 require imgui/imgui_theme_daslang
 require daslib/clargs
+require daslib/command_line
 require daslib/fio
 require daslib/json
 require daslib/json_boost
+require daslib/module_path
 require daslib/safe_addr
 require daslib/stringify
 require daslib/utf8_utils
@@ -150,6 +152,21 @@ def private open_file_dialog() {
             "Text and Markdown|md;markdown;txt;rst;das|Markdown|md;markdown|All files|"),
         mode = FileDialogMode.open,
         max_selection = 1))
+}
+
+def private launch_viewer(path : string) : bool {
+    var args : array<string>
+    if (is_standalone_exe()) {
+        let process_args <- get_command_line_arguments()
+        if (empty(process_args)) return false
+        args |> push(process_args[0])
+    } else {
+        args |> push(get_das_exe())
+        args |> push(path_join(get_this_module_dir(), "main.das"))
+        args |> push("--")
+    }
+    args |> push(path)
+    return unsafe(spawn_argv(args))
 }
 
 def private setup_default_layout(dock_id : uint) {
@@ -451,7 +468,12 @@ def update() {
 
     let dialog_result = file_dialog_draw()
     if (dialog_result == FileDialogResult.confirmed) {
-        let _ = load_path(file_dialog_selected_path())
+        let selected_path = file_dialog_selected_path()
+        if (launch_viewer(selected_path)) {
+            g_status = "Opened in a new window: {selected_path}"
+        } else {
+            g_status = "Could not open a new viewer window: {selected_path}"
+        }
     } elif (dialog_result == FileDialogResult.cancelled) {
         g_status = "Open cancelled."
     }

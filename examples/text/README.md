@@ -19,3 +19,6 @@ cell-aligned across combining text, CJK, and color emoji: é · 中文 · 👩�
 The main document window is dockable. Zoom is a fixed 5% step from 50–300% at
 the bottom-right, and Ctrl+mouse-wheel adjusts it while the document is hovered.
 On macOS, the usual Command key is used in place of Ctrl.
+
+**File / Open...** and Ctrl+O launch the selected document in a new viewer
+window, leaving the current document and its view state intact.
