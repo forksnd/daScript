@@ -8,6 +8,7 @@ require imgui/imgui_file_dialog
 require imgui/imgui_fonts
 require imgui/imgui_icons
 require imgui/imgui_markdown_view
+require imgui/imgui_text_source_view
 require imgui/imgui_theme_daslang
 require daslib/clargs
 require daslib/fio
@@ -45,11 +46,17 @@ struct TextViewerZoomArgs {
     percent : int
 }
 
+struct TextViewerSourceRangeArgs {
+    text : string
+}
+
 var private g_fonts = FontRoleSet()
 var private g_font_sources : array<string>
 var private g_document = MdDocument()
 var private g_markdown_view = MarkdownViewState()
-var private g_source : string
+var private g_source_document = TextSourceDocument()
+var private g_source_view = TextSourceViewState()
+var private g_source_result = TextSourceViewResult()
 var private g_path : string
 var private g_status = "Open a UTF-8 text or Markdown file."
 var private g_mode = TextViewMode.markdown
@@ -75,29 +82,26 @@ def private set_mode(mode : TextViewMode) {
     if (g_mode == mode) return
     g_mode = mode
     markdown_view_clear_selection(g_markdown_view)
+    text_source_view_clear_selection(g_source_view)
 }
 
 def private release_document() {
     markdown_view_invalidate(g_markdown_view)
     delete g_document.nodes
     g_document = MdDocument()
+    text_source_view_invalidate(g_source_view)
+    text_source_document_dispose(g_source_document)
 }
 
 def private install_source(path, source : string) {
+    let next_revision = g_document_revision + 1
     var next_document <- md_parse(source)
+    var next_source_document <- markdown_source_document(source, next_revision)
     release_document()
     g_document <- next_document
-    g_source := source
+    g_source_document <- next_source_document
     g_path := path
-    g_document_revision++
-
-    // The read-only ImGui text widget still uses a mutable backing buffer.
-    // Replace it explicitly on every load so a formerly huge file does not
-    // leave a huge abandoned buffer resident for the rest of the session.
-    delete PLAIN_TEXT.buffer
-    PLAIN_TEXT.capacity = max(length(g_source) + 1, 256)
-    PLAIN_TEXT.pending_value := g_source
-    PLAIN_TEXT.has_pending = true
+    g_document_revision = next_revision
 
     if (g_mode_override == int(TextViewMode.markdown)) {
         g_mode = TextViewMode.markdown
@@ -107,7 +111,7 @@ def private install_source(path, source : string) {
         g_mode = markdown_path(path) ? TextViewMode.markdown : TextViewMode.plain_text
     }
     g_status = (g_document.ok
-        ? "Loaded {length(g_source)} UTF-8 bytes."
+        ? "Loaded {length(g_source_document.source)} UTF-8 bytes."
         : g_document.error)
 }
 
@@ -234,7 +238,7 @@ def private draw_document() {
           (text = "document content",
            size = float2(0.0f, -footer_height),
            child_flags = ImGuiChildFlags.None,
-           window_flags = ImGuiWindowFlags.None)) {
+           window_flags = ImGuiWindowFlags.HorizontalScrollbar)) {
         if (g_mode == TextViewMode.markdown) {
             var style = MarkdownViewStyle(
                 fonts = g_fonts,
@@ -243,13 +247,13 @@ def private draw_document() {
             let _ = markdown_view("text viewer", g_document, g_markdown_view,
                                   style, g_document_revision)
         } else {
-            let font_size = g_fonts.size_px * float(g_zoom_percent) / 100.0f
-            with_font(g_fonts.monospace, font_size) {
-                input_text_multiline(PLAIN_TEXT,
-                    (text = "##plain text",
-                     size = GetContentRegionAvail(),
-                     flags = ImGuiInputTextFlags.ReadOnly))
-            }
+            var source_style = TextSourceViewStyle(
+                fonts = g_fonts,
+                zoom = float(g_zoom_percent) / 100.0f,
+                wrap = false,
+                write_system_clipboard = !harness_is_headless())
+            g_source_result <- text_source_view("text source", g_source_document,
+                                                g_source_view, source_style)
         }
     }
 
@@ -310,12 +314,74 @@ def text_viewer_state(_input : JsonValue?) : JsonValue? {
     return JV((
         ok = g_document.ok,
         path = g_path,
-        byte_count = length(g_source),
+        byte_count = length(g_source_document.source),
         mode = mode_name(),
         zoom_percent = g_zoom_percent,
         document_revision = g_document_revision,
         render_revision = g_markdown_view.render_revision,
+        source_render_revision = g_source_view.render_revision,
+        source_layout_hits = g_source_view.layout_hits,
+        source_layout_misses = g_source_view.layout_misses,
+        source_marker_count = g_source_document.marker_count,
+        source_cell_count = length(g_source_view.cells),
+        source_selection_revision = g_source_view.selection_revision,
+        source_selection_commit_revision = g_source_view.selection_commit_revision,
+        source_selection_dragging = g_source_view.selection_dragging,
+        source_selection_start = g_source_result.selection.source.start_byte,
+        source_selection_end = g_source_result.selection.source.end_byte,
+        source_selection_has_markers = g_source_result.selection.styles.has_markers,
         status = g_status))
+}
+
+[live_command(description = "Find source text and inspect its exact cell-aligned screen range.")]
+def text_viewer_source_range(input : JsonValue?) : JsonValue? {
+    let args = from_JV(input, type<TextViewerSourceRangeArgs>)
+    let start_byte = find(g_source_document.source, args.text)
+    if (start_byte < 0) {
+        return JV((ok = false, error = "source text not found", text = args.text))
+    }
+    let end_byte = start_byte + length(args.text)
+    var found = false
+    var all_markers = true
+    var columns = 0
+    var matched_cells = 0
+    var marker_cells = 0
+    var first_cell_start = -1
+    var last_cell_end = -1
+    var rect = float4()
+    for (cell in g_source_view.cells) {
+        if (cell.source.end_byte <= start_byte || cell.source.start_byte >= end_byte) continue
+        let screen = float4(
+            g_source_view.screen_origin.x + cell.rect.x,
+            g_source_view.screen_origin.y + cell.rect.y,
+            g_source_view.screen_origin.x + cell.rect.z,
+            g_source_view.screen_origin.y + cell.rect.w)
+        if (!found) {
+            rect = screen
+            found = true
+        } else {
+            rect.x = min(rect.x, screen.x)
+            rect.y = min(rect.y, screen.y)
+            rect.z = max(rect.z, screen.z)
+            rect.w = max(rect.w, screen.w)
+        }
+        columns += cell.columns
+        matched_cells++
+        marker_cells += cell.style_id == 1 ? 1 : 0
+        if (first_cell_start < 0) {
+            first_cell_start = cell.source.start_byte
+        }
+        last_cell_end = cell.source.end_byte
+        all_markers = all_markers && cell.style_id == 1
+    }
+    return JV((ok = found, text = args.text,
+        source_start = start_byte, source_end = end_byte,
+        columns = columns, matched_cells = matched_cells,
+        marker_cells = marker_cells, first_cell_start = first_cell_start,
+        last_cell_end = last_cell_end,
+        all_markers = found && all_markers,
+        cell_width = g_source_view.key.cell_width,
+        x0 = rect.x, y0 = rect.y, x1 = rect.z, y1 = rect.w))
 }
 
 [live_command(description = "Open a UTF-8 file in the text viewer.")]
@@ -396,9 +462,8 @@ def update() {
 [export]
 def shutdown() {
     markdown_view_dispose(g_markdown_view)
+    text_source_view_dispose(g_source_view)
     release_document()
-    delete PLAIN_TEXT.buffer
-    PLAIN_TEXT = InputTextState()
     harness_shutdown()
     delete g_font_sources
 }
