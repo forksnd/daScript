@@ -209,7 +209,14 @@ def main() {
         // n=512 control put the residual at 1.1% with sequential rising toward batched, and
         // warmth persists ACROSS PROCESSES (position-1 numbers track the box's recent GPU
         // history). 256 steps ~ 3s GPU-busy makes the first timed phase start ramped.
-        let _w1 = run_sequential(t, cfg.kv, 1l, 8l, 256l)
+        // Sessions are seq_len rows (capped to p + n + 8 above) with NO overflow guard, so the
+        // warmup loops fresh short streams instead of decoding one stream past its KV slab.
+        let wbudget = t.config.seq_len - 8l
+        var wleft = 256l
+        while (wleft > 0l) {
+            let _w1 = run_sequential(t, cfg.kv, 1l, 8l, min(wbudget, wleft))
+            wleft -= wbudget
+        }
         let _w2 = run_batched(t, cfg.kv, 2l, 8l, 2l)
         // DASLLAMA_BATCH_TRACE=<path> saves a per-lane jobque trace of the LARGEST-B batched run
         // (the lane-timeline viewer's input; same rig as decode_prof --trace)
