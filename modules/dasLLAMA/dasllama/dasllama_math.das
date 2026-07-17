@@ -1542,6 +1542,59 @@ def public matmul_q8q8_moe_gpu2(var y1 : array<float>; var y2 : array<float>; of
     }
 }
 
+// The prefill twin: region-list batched GEMM over the same resident stacks. offs are the fused
+// prefill TRIPLES (weight element offset, first bucket row, row count — stride 3, row ranges
+// partition [0, nrows)); x is the gathered bucket-ordered activation image, y rows key by the
+// region's own row0. The tier chunks internally, so any nrows serves.
+typedef MoeGpuBatchFn = function<(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; nrows : int64) : void>
+typedef MoeGpuBatch2Fn = function<(var y1p : float?; var y2p : float?; offs1 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; nrows : int64) : void>
+
+[unused_argument(yp, offs, nregions, xqp, xsp, n, d, nrows)]
+def private moe_gpu_unset_batch(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d, nrows : int64) {
+    panic("dasLLAMA: MoE GPU batch dispatch hit without an installed GPU batch tier")
+}
+
+[unused_argument(y1p, y2p, offs1, offs2, nregions, xqp, xsp, n, d, nrows)]
+def private moe_gpu_unset_batch2(var y1p : float?; var y2p : float?; offs1 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d, nrows : int64) {
+    panic("dasLLAMA: MoE GPU batch pair dispatch hit without an installed GPU batch tier")
+}
+
+var g_moe_gpu_batch = @@moe_gpu_unset_batch
+var g_moe_gpu_batch2 = @@moe_gpu_unset_batch2
+var g_moe_gpu_batch_installed = false
+
+//! Install the GPU MoE prefill (batched GEMM) tier — optional alongside install_moe_gpu_tier.
+def public install_moe_gpu_batch_tier(batch : MoeGpuBatchFn; batch2 : MoeGpuBatch2Fn) {
+    g_moe_gpu_batch = batch
+    g_moe_gpu_batch2 = batch2
+    g_moe_gpu_batch_installed = true
+}
+
+def public moe_gpu_batch_ready : bool {
+    return g_moe_gpu_batch_installed
+}
+
+//! Region-list batched GEMM on the GPU tier — the MoE prefill twin of matmul_q8q8_moe_gpu.
+def public matmul_q8q8_moe_gpu_batch(var y : array<float>; offs : array<int64>; nregions : int64;
+                                     xq : array<int8>; xs : array<float>; n, d, nrows : int64) {
+    unsafe {
+        invoke(g_moe_gpu_batch, addr(y[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, nrows)
+    }
+}
+
+//! Fused gate+up batched GEMM on the GPU tier — both stacks read the same gathered activation
+//! image; the regions share row0/cnt (distinct weight offsets and outputs).
+def public matmul_q8q8_moe_gpu_batch2(var y1 : array<float>; var y2 : array<float>; offs1 : array<int64>; offs2 : array<int64>;
+                                      nregions : int64; xq : array<int8>; xs : array<float>; n, d, nrows : int64) {
+    unsafe {
+        invoke(g_moe_gpu_batch2, addr(y1[0]), addr(y2[0]),
+            addr<int64 const?>(offs1[0]), addr<int64 const?>(offs2[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, nrows)
+    }
+}
+
 var g_kernel_backends : table<string; KernelBackend>
 var g_active_backend = ""           // name of the active backend ("" = the unset stub)
 var g_active_priority = -1          // priority of the active row-major default (auto-activate compare)

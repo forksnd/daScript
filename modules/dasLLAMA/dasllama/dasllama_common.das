@@ -9225,7 +9225,12 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     // kq layers whose three stacks are ALL K-quant (a mixed q8 kind keeps the per-expert loop)
     let fused_kq = (kq_layer && f1 != KqFmt.q8 && f2 != KqFmt.q8 && f3 != KqFmt.q8
         && t.kq_repacked && kernel_backend_has_kq_batch_groupn() && g_moe_fused_expert_gemms)
-    let fused = (t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms) || fused_kq
+    // GPU MoE tier prefill: offloaded plain-q8 unbiased layers run the three batched region-list
+    // GEMMs on the resident device stacks (tiny batches stay on the CPU per-expert loop — two
+    // GPU submits cost more than the whole GEMM there)
+    let fused_gpu = (!kq_layer && !c.moe_exps_bias && !t.experts_mx4 && moe_gpu_layer_on_gpu(l)
+        && moe_gpu_batch_ready() && g_moe_fused_expert_gemms && npos >= 32l)
+    let fused = (t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms) || fused_kq || fused_gpu
     let grows = fused ? nk : npos
     s.moe_rlog |> resize(npos * ne)
     s.moe_idx_b |> resize(nk)
@@ -9384,7 +9389,9 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             nreg++
         }
         let ts_g1 = ref_time_ticks()
-        if (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
+        if (fused_gpu) {   // GPU tier: gate+up regions share row0/cnt and the gathered image — one fused submit
+            matmul_q8q8_moe_gpu_batch2(s.moe_ghb, s.moe_ghb2, s.moe_offs1, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe, nk)
+        } elif (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
             mm_b_kq_groupn(s.moe_ghb, t, f1, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
             mm_b_kq_groupn(s.moe_ghb2, t, f3, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
         } elif (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
@@ -9404,7 +9411,9 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
         }
         let ts_g3 = ref_time_ticks()
-        if (fused_kq) {
+        if (fused_gpu) {
+            matmul_q8q8_moe_gpu_batch(s.moe_gout, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim, nk)
+        } elif (fused_kq) {
             mm_b_kq_groupn(s.moe_gout, t, f2, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim)
         } elif (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
             matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, s.moe_boffs2, nfe, dim)
