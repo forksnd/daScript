@@ -2,7 +2,7 @@ options gen2
 options stack = 65536   // dasLLAMA program-root convention (options stack does not unify up from libs)
 options _jit_fast_math = true   // ggml-parity FP laxity — same rail as decode_prof / perf
 
-require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration
+require dasllama/dasllama   // nolint:STYLE029 — the facade: arch [init] registrations + load_model's prepared-image (.dlim) cache
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + pin_kernel_backend (engine-level, not re-exported)
 require ?das_metal dasllama/dasllama_metal_llama  // nolint:STYLE030 — per-stage report on the GPU rail (Apple builds only)
 require daslib/jobque_boost
@@ -193,7 +193,7 @@ def main() {
         }
     }
     print("loading {cfg.model}\n")
-    var t <- load_gguf(cfg.model, cfg.quant)
+    var t <- load_model(cfg.model, cfg.quant)   // facade: maps the prepared .dlim image when present
     t.config.seq_len = min(t.config.seq_len, p + n + 8l)   // cap the per-session KV allocation
     let c = t.config
     print("config: dim={c.dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size} moe={c.moe}\n")
