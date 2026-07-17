@@ -38,7 +38,7 @@ namespace das
         arr.capacity = 0;
         arr.lock = 0;
         arr.magic = 0;
-        arr.borrowed = false;
+        arr.flags = 0;  // the whole word (incl. borrowed) — back to the fresh-empty-array state
         return true;
     }
 
