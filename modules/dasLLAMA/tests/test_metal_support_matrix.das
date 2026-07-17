@@ -477,3 +477,64 @@ def test_metal_support_matrix(t : T?) {
         }
     }
 }
+
+[unused_argument(t, path, family, tag, expect_needs, want)]   // off-Apple the gated body is empty
+def private family_cells(t : T?; path, family, tag : string; expect_needs : MetalNeed; want : string) {
+    // one family's row: pin the metal_needs derivation bits, then the three path cells — each
+    // asserts ENGAGE ("") or DECLINE with the named need_* reason. Wave stages flip these.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, family) || !arm_on(t, "fam-{family}") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let derived = metal_needs(tr)
+        t |> success((uint(derived) & uint(expect_needs)) == uint(expect_needs),
+            "{tag}: metal_needs derives {expect_needs} (got {derived})")
+        matrix_cell(t, tr, KVDtype.f16, tag, want, want, want)
+        delete tr
+    }
+}
+
+// The family axis (family waves A): each non-llama dense family loads its small carrier and
+// asserts per-path ENGAGE/DECLINE with the exact need_* reason — the descriptor refactor's
+// living expectation table. mistral3 (empty config = the llama shape) has no <= 35B fixture;
+// its coverage is the derivation pins on the families above plus the llama cells.
+[test]
+def test_metal_family_matrix(t : T?) {
+    t |> run("Metal family matrix: per-family needs derivation + path cells") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            if (!jit_enabled()) {
+                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+                return
+            }
+            var dev = metal_create_system_default_device()
+            if (dev == null) {
+                feint("no Metal device; family matrix skipped\n")
+                return
+            }
+            metal_release(dev)
+            let prior_wscale = get_wscale_f16()
+            let prior_backend = active_kernel_backend()
+            pin_kernel_backend("portable")
+            set_wscale_f16(false)
+            family_cells(t, path_join(models_dir(), "Qwen3-0.6B-Q8_0.gguf"), "qwen3",
+                "qwen3-0.6b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim,
+                "need_qk_norm")
+            family_cells(t, path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf"), "qwen2",
+                "qwen2.5-0.5b/q8/f16", MetalNeed.neox | MetalNeed.qkv_bias,
+                "need_qkv_bias")
+            family_cells(t, path_join(models_dir(), "Phi-3.5-mini-instruct-Q4_K_M.gguf"), "phi3",
+                "phi3.5-mini/k4/f16", MetalNeed.neox,
+                "need_neox")
+            metal_decode_shutdown()
+            metal_prefill_shutdown()
+            t |> equal(metal_live_object_count(), 0l)
+            clear_kernel_backend_pin()
+            select_kernel_backend(prior_backend)
+            set_wscale_f16(prior_wscale)
+        } else {
+            feint("das_metal is not built on this platform; nothing to assert\n")
+        }
+    }
+}

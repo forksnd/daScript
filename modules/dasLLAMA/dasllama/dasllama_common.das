@@ -380,6 +380,9 @@ struct ArchBlocks {
     // batched-decode worker applies. An arch registering custom attention sets this false and
     // eval_batch falls back to per-row forward().
     attn_is_std : bool = true
+    // Metal gate: the FFN is the plain dense gated pair (ffn_dense_*). Block sets that route
+    // experts (or MAY, per file — gemma4) set this false and the GPU drivers decline `graph`.
+    ffn_is_dense : bool = true
 }
 
 //! The whole model. `fblob` holds the fp32 embedding + norm weights; the big 2D weights live in
@@ -10928,14 +10931,16 @@ def std_blocks() : ArchBlocks {
 //! prefill). Arches whose configure sets `moe` register these instead of std_blocks.
 def moe_blocks() : ArchBlocks {
     return ArchBlocks(attn_decode = @@attention_std_decode, ffn_decode = @@ffn_moe_decode,
-                      attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_moe_prefill)
+                      attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_moe_prefill,
+                      ffn_is_dense = false)
 }
 
 //! gemma4's block set: standard attention + a FFN that dispatches per file — dense (12B/31B) or the
 //! parallel dense-shared + routed MoE (26B-A4B) by expert count, so ONE gemma4 registration covers both.
 def gemma4_blocks() : ArchBlocks {
     return ArchBlocks(attn_decode = @@attention_std_decode, ffn_decode = @@ffn_gemma4_decode,
-                      attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_gemma4_prefill)
+                      attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_gemma4_prefill,
+                      ffn_is_dense = false)
 }
 
 //! qwen35's block set: the hybrid Gated-DeltaNet / gated-attention dispatch + the dense FFN.
@@ -10952,5 +10957,5 @@ def qwen35_blocks() : ArchBlocks {
 def qwen35moe_blocks() : ArchBlocks {
     return ArchBlocks(attn_decode = @@attention_qwen35_decode, ffn_decode = @@ffn_moe_decode,
                       attn_prefill = @@attention_qwen35_prefill, ffn_prefill = @@ffn_moe_prefill,
-                      attn_is_std = false)
+                      attn_is_std = false, ffn_is_dense = false)
 }

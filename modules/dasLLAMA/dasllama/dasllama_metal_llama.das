@@ -53,15 +53,21 @@ def public metal_decode_shutdown {
     metal_common_release()
 }
 
-def private decode_shape_decline(t : Model) : MetalDecodeDecline {
+// what each decode path's kernels implement beyond the base llama dense block — grows wave by wave
+let DECODE_NEEDS_OK = default<MetalNeed>   // single-stream decode
+let BATCH_NEEDS_OK = default<MetalNeed>    // batched decode
+
+def private decode_shape_decline(t : Model; needs_ok : MetalNeed) : MetalDecodeDecline {
     if (t.quant != QuantMode.q8) {
         return MetalDecodeDecline.quant_mode
     }
     if (!kq_load_gpu_supported(t)) {   // a fmt without a GPU kernel (the q4_0 QAT tier, ...) must not dispatch
         return MetalDecodeDecline.kquant_native
     }
-    if (t.arch != "llama") {
-        return MetalDecodeDecline.arch
+    // the drivers encode the std dense stack; the block set declares the graph shape
+    // (attn_is_std / ffn_is_dense) — MoE, recurrent, and custom-attention arches decline here
+    if (!t.blocks.attn_is_std || !t.blocks.ffn_is_dense) {
+        return MetalDecodeDecline.graph
     }
     if (kernel_backend_needs_repack(active_kernel_backend())) {
         return MetalDecodeDecline.backend_repack
@@ -69,18 +75,16 @@ def private decode_shape_decline(t : Model) : MetalDecodeDecline {
     if (!get_rope_table_mode()) {
         return MetalDecodeDecline.rope_mode
     }
-    let c = t.config
-    if ((c.rope_neox || c.attn_qkv_bias || c.qk_norm || c.v_norm || c.pre_post_norm) ||
-            (c.layer_out_scale || c.attn_sinks || c.attn_logit_softcap > 0.0 || c.sliding_window > 0l) ||
-            (c.ffn_act != FfnAct.silu || c.attn_scale > 0.0)) {
-        return MetalDecodeDecline.config
+    if (metal_missing_needs(t, needs_ok) != default<MetalNeed>) {
+        return MetalDecodeDecline.feature
     }
+    let c = t.config
     let head_size = c.head_size
-    let qd = c.n_heads * head_size
     let kv_dim = layer_kv_dim(c, 0l)
     let hidden = layer_hidden(t, 0l)
     // head_size == the attention threadgroup width: whole simdgroups only, red[] holds <= 4
-    if ((qd != c.dim || (head_size % 32l) != 0l || head_size > 128l) ||
+    // (qd needs no own %32 clause: n_heads * head_size with head_size % 32 == 0)
+    if (((head_size % 32l) != 0l || head_size > 128l) ||
             ((c.dim % 32l) != 0l || (kv_dim % 32l) != 0l || (hidden % 32l) != 0l)) {
         return MetalDecodeDecline.shape
     }
@@ -105,7 +109,7 @@ def private decode_decline(t : Model; s : Session; pos : int64) : MetalDecodeDec
     if (s.uid == 0ul) {
         return MetalDecodeDecline.no_uid
     }
-    let shape = decode_shape_decline(t)
+    let shape = decode_shape_decline(t, DECODE_NEEDS_OK)
     if (shape != MetalDecodeDecline.none) {
         return shape
     }
@@ -213,6 +217,7 @@ struct private StepRes {
     u_nblk : MetalBuffer?  // kv_dim/32 — the block-codec kernels' row-width uniform (q8_0 only)
     bytes_x : uint64
     bytes_q : uint64
+    bytes_xb : uint64      // max(dim, qd) — bxb holds dim-wide norm outs AND the qd-wide attention out
     bytes_qkv : uint64
     bytes_h2 : uint64
     bytes_tab : uint64
@@ -239,11 +244,12 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     var r = StepRes(valid = true, pos = pos, uid = s.uid,
         kdt = s.kv_dtype_k, s16 = t.wscale_f16,
         koff = koff, voff = voff, cap = cap, arena_epoch = g_arena_epoch,
-        bytes_x = uint64(dim * 4l), bytes_q = uint64(qd * 4l), bytes_qkv = uint64(qkvd * 4l),
+        bytes_x = uint64(dim * 4l), bytes_q = uint64(qd * 4l), bytes_xb = uint64(max(dim, qd) * 4l),
+        bytes_qkv = uint64(qkvd * 4l),
         bytes_h2 = uint64(h2 * 4l), bytes_tab = uint64((head_size / 2l) * 4l),
         bytes_log = uint64(c.vocab_size * 4l))
     r.bx = pool_acquire(g_pool, g_dev, r.bytes_x)
-    r.bxb = pool_acquire(g_pool, g_dev, r.bytes_q)   // rms out AND attention out (qd == dim gated)
+    r.bxb = pool_acquire(g_pool, g_dev, r.bytes_xb)   // rms out (dim) AND attention out (qd)
     r.bxb2 = pool_acquire(g_pool, g_dev, r.bytes_x)
     r.bqkv = pool_acquire(g_pool, g_dev, r.bytes_qkv)   // q | roped-in-place q, k, raw v
     r.bh12 = pool_acquire(g_pool, g_dev, r.bytes_h2)    // w1 gate | swiglu in place, w3 up
@@ -269,9 +275,11 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     // logits-on-GPU (default ON, DASLLAMA_METAL_LOGITS=0 pins the CPU classifier) mirrors the prefill gates
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
-    // q8 AND K-quant classifiers serve (the kq plane GEMVs — W4); only the tied-fp32 table stays CPU
+    // q8 AND K-quant classifiers serve (the kq plane GEMVs — W4); only the tied-fp32 table stays
+    // CPU. n_layer_nextn: forward()'s early return on GPU logits would skip the CPU-side mtp_h
+    // stash an MTP draft head reads — those models keep the CPU classifier
     r.gpu_logits = (!g_logits_cpu && get_env_variable("DASLLAMA_METAL_LOGITS") != "0" && empty(g_skip) &&
-        !tied_f32 && c.final_logit_softcap <= 0.0 &&
+        !tied_f32 && c.final_logit_softcap <= 0.0 && c.n_layer_nextn == 0l &&
         empty(t.suppress) && t.wcls_off >= 0l)
     if (r.gpu_logits) {
         r.bxf = pool_acquire(g_pool, g_dev, r.bytes_x)
@@ -533,7 +541,7 @@ def private release_step(var r : StepRes) {
         pool_release(g_pool, r.btok, 64ul)
     }
     pool_release(g_pool, r.bx, r.bytes_x)
-    pool_release(g_pool, r.bxb, r.bytes_q)
+    pool_release(g_pool, r.bxb, r.bytes_xb)
     pool_release(g_pool, r.bxb2, r.bytes_x)
     pool_release(g_pool, r.bqkv, r.bytes_qkv)
     pool_release(g_pool, r.bh12, r.bytes_h2)
@@ -662,7 +670,11 @@ def metal_decode_forward(t : Model; var s : Session; token, pos : int64) : bool 
     }
     if (why != MetalDecodeDecline.none) {
         discard_pre()   // the sequence diverged from the prediction
-        decline(why)
+        if (why == MetalDecodeDecline.feature) {
+            decline(why, metal_missing_needs(t, DECODE_NEEDS_OK))
+        } else {
+            decline(why)
+        }
         return false
     }
     if (!(g_pre.valid && g_pre.uid == s.uid && g_pre.pos == pos &&
@@ -788,7 +800,7 @@ def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : arra
             }
         }
     }
-    let shape = decode_shape_decline(t)
+    let shape = decode_shape_decline(t, BATCH_NEEDS_OK)
     if (shape != MetalDecodeDecline.none) {
         return shape
     }
@@ -825,7 +837,11 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     if (why != MetalDecodeDecline.none) {
         finish_pending_step()   // the CPU fallback needs the in-flight step's KV/logits landed first
         g_lp_err = false
-        batch_decline(why)
+        if (why == MetalDecodeDecline.feature) {
+            batch_decline(why, metal_missing_needs(t, BATCH_NEEDS_OK))
+        } else {
+            batch_decline(why)
+        }
         return false
     }
     // a parked single-stream pre-step may reference a batch row's mirror slice — retire it first
@@ -983,12 +999,13 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
     let gpu_logits = (!g_logits_cpu && get_env_variable("DASLLAMA_METAL_LOGITS") != "0" && empty(g_skip) &&
-        !tied_f32 && c.final_logit_softcap <= 0.0 && empty(t.suppress) && t.wcls_off >= 0l &&
+        !tied_f32 && c.final_logit_softcap <= 0.0 && c.n_layer_nextn == 0l &&
+        empty(t.suppress) && t.wcls_off >= 0l &&
         (cls_fmt != KqFmt.q8 || !use_gemm || (c.vocab_size % (use_mm ? 64l : 32l)) == 0l))
     // pooled per-step buffers (mp rows: the fixed-B forms read their full B, the GEMM its M pad —
     // stale pad rows only ever land in pad outputs, which nothing reads back)
     let bytes_x = uint64(mp * dim * 4l)
-    let bytes_xb = uint64(mp * qd * 4l)
+    let bytes_xb = uint64(mp * max(dim, qd) * 4l)   // dim-wide norm outs AND the qd-wide attention out
     let bytes_qkv = uint64(mp * qkvd * 4l)
     let bytes_h = uint64(mp * hidden * 4l)
     let bytes_tab = uint64(nrows * half * 4l)

@@ -27,7 +27,7 @@ struct RunArgs {
     @clarg_doc = "Suite: decode | prefill | matrix | kernels | image | all (default all)"
     suite : string = "all"
 
-    @clarg_doc = "Family filter — comma-separated family tokens (llama, gemma, ultravox, whisper, voxtral); only blocks of these model families run (model-free blocks always run); sets DASLLAMA_TEST_FAMILY"
+    @clarg_doc = "Family filter — comma-separated family tokens (llama, qwen2, qwen3, phi3, gemma, ultravox, whisper, voxtral); only blocks of these model families run (model-free blocks always run); sets DASLLAMA_TEST_FAMILY"
     family : string
 
     @clarg_short = "n"

@@ -41,7 +41,8 @@ never mask a red.
 Arm names — decode parity: `arm1-basic arm2-hybrid arm3-step arm4-paged arm5-rewind
 arm6-churn arm7-q8kv arm7b-tq4kv arm8-s16 arm9-reload arm10-kq arm11-depth arm12-dim`,
 batch test: `batch` (whole test), `batchB7-partd`, `batchB8-kq`. Prefill parity: `base s16
-kq cont dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b`. The
+kq cont dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b` + the
+family matrix `fam-qwen3 fam-qwen2 fam-phi3` (needs-derivation pins + per-path cells). The
 `kernels` suite (test_metal_prefill_kernels — model-less kernel units, ~80s) has no arms;
 remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
@@ -54,8 +55,9 @@ carrier, model-free, runs in CI) `smol tower whisper voxtral`; the voxtral arm r
 model blocks tagged with a listed family run — `family_on(t, name)` in
 `_model_tier.das`, EXACT token match, loud `t |> skip` like the arm filter. Model-free blocks
 (the `kernels` suite, the image `mechanics` arm) carry no tag and always run. Family tokens
-today: `llama` (all four metal suites + the image smol arm), `gemma`, `ultravox`, `whisper`,
-`voxtral` (image suite arms). When profiling one family across formats, gate each round with
+today: `llama` (all four metal suites + the image smol arm), `qwen2`, `qwen3`, `phi3` (the
+support-matrix family cells), `gemma`, `ultravox`, `whisper`, `voxtral` (image suite arms).
+When profiling one family across formats, gate each round with
 `--arm <arms> --family <fam>` instead of the whole zoo. Tag every NEW model-loading block
 with its family or it silently joins every family's gate.
 

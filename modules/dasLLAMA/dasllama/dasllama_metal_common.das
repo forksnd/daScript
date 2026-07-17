@@ -40,10 +40,15 @@ enum MetalDecodeDecline {
     none                // supported — the step runs on the GPU
     quant_mode          // weights not loaded under QuantMode.q8
     kquant_native       // per-tensor K-quant planes: not readable as qblob offsets (kernels = W4)
-    arch                // not the llama family graph
+    arch                // RETIRED (family waves A): the arch-name check is gone — non-std block
+                        // sets decline `graph`, feature-flag configs decline `feature` per bit
     backend_repack      // repack backend: interleaved weight layout unreadable by the GPU kernels
     rope_mode           // rope tables off
-    config              // feature-flag config the kernels don't implement (neox/bias/qk-norm/softcap/...)
+    config              // RETIRED (family waves A): split into `feature` + the per-need
+                        // `need_*` keys in the declines-by-reason table
+    graph               // block set is not the std dense stack (MoE / recurrent / custom attn)
+    feature             // the model needs layer-stack features this path's kernels don't
+                        // implement — each missing bit records a `need_*` key alongside
     shape               // head/dim alignment outside the kernel grids
     layers              // per-layer non-uniformity (kv_dim/head_size/hidden/sliding/missing wv)
     kv_dtype            // session KV codec not uniform f16/f32 (the mirror moves raw row bytes)
@@ -56,6 +61,79 @@ enum MetalDecodeDecline {
     device              // metal_decode_init failed (no device / PSO build failure)
     mirror              // the mirror arena cannot hold the KV slice
     gpu_error           // dispatch failed at execution time
+}
+
+//! Layer-stack features a model's graph needs beyond the base llama dense block — ONE derivation
+//! (`metal_needs`) feeds every GPU gate; each path (single decode / batch decode / prefill) holds
+//! its own implemented-set mask and declines `feature` on the difference, recording a `need_*`
+//! key per missing bit. Flags the drivers implement move into the path masks wave by wave.
+bitfield MetalNeed {
+    neox            // NEOX rope pairing (j, j+hs/2) — qwen2/qwen3/phi3/gemma/gptoss
+    qkv_bias        // additive bias on the Q/K/V projections — qwen2/glm4moe/gptoss
+    qk_norm         // per-head RMSNorm on Q/K before rope — qwen3/gemma3+/qwen35
+    v_norm          // weightless per-head RMSNorm on V — gemma4
+    partial_rope    // rope_dim < head_size rotates only the first rope_dim dims — qwen35/glm4moe
+    q_gated         // 2x-wide Q, out ⊙ σ(gate) before wo — qwen35
+    attn_scale      // attention-score scale override (not 1/sqrt(hs)) — gemma4
+    softcap         // attention-logit soft cap — gemma2
+    sliding         // sliding-window attention span — gemma2/3/4, gptoss
+    sinks           // per-head sink logit in the softmax denominator — gptoss
+    out_bias        // additive bias on the attention output projection — gptoss
+    pre_post_norm   // extra post-attention / post-FFN norms — gemma2/3/4
+    out_scale       // per-layer scalar on the layer output — gemma4
+    geglu           // GeGLU FFN activation (gelu, not silu) — gemma2/3/4
+    ple             // per-layer embeddings — gemma4 E-series
+    qd_neq_dim      // n_heads*head_size != dim (query width differs from the residual) — qwen3
+}
+
+//! The feature set model `t` needs from a resident GPU driver — derived from the loaded config
+//! (per-file truth: loader-detected flags included). Graph-shape needs (MoE routing, recurrent
+//! layers, custom attention) are NOT bits here — the block set declares those (`attn_is_std` /
+//! `ffn_is_dense`) and the gates decline `graph` before consulting the feature mask.
+def metal_needs(t : Model) : MetalNeed {
+    let c = t.config
+    var n : MetalNeed
+    n.neox = c.rope_neox
+    n.qkv_bias = c.attn_qkv_bias
+    n.qk_norm = c.qk_norm
+    n.v_norm = c.v_norm
+    n.partial_rope = c.rope_dim > 0l && c.rope_dim != c.head_size
+    n.q_gated = c.q_gated
+    n.attn_scale = c.attn_scale > 0.0
+    n.softcap = c.attn_logit_softcap > 0.0
+    n.sliding = c.sliding_window > 0l
+    n.sinks = c.attn_sinks
+    n.out_bias = c.attn_out_bias
+    n.pre_post_norm = c.pre_post_norm
+    n.out_scale = c.layer_out_scale
+    n.geglu = c.ffn_act != FfnAct.silu
+    n.ple = c.n_embd_per_layer > 0l
+    n.qd_neq_dim = c.n_heads * c.head_size != c.dim
+    return n
+}
+
+def metal_missing_needs(t : Model; ok : MetalNeed) : MetalNeed {
+    return metal_needs(t) & ~ok
+}
+
+// one `need_*` key per missing bit — the support-matrix cells assert these names as strings
+def record_needs(var tab : table<string; int64>; missing : MetalNeed) {
+    if (missing.neox) { tab["need_neox"]++ }
+    if (missing.qkv_bias) { tab["need_qkv_bias"]++ }
+    if (missing.qk_norm) { tab["need_qk_norm"]++ }
+    if (missing.v_norm) { tab["need_v_norm"]++ }
+    if (missing.partial_rope) { tab["need_partial_rope"]++ }
+    if (missing.q_gated) { tab["need_q_gated"]++ }
+    if (missing.attn_scale) { tab["need_attn_scale"]++ }
+    if (missing.softcap) { tab["need_softcap"]++ }
+    if (missing.sliding) { tab["need_sliding"]++ }
+    if (missing.sinks) { tab["need_sinks"]++ }
+    if (missing.out_bias) { tab["need_out_bias"]++ }
+    if (missing.pre_post_norm) { tab["need_pre_post_norm"]++ }
+    if (missing.out_scale) { tab["need_out_scale"]++ }
+    if (missing.geglu) { tab["need_geglu"]++ }
+    if (missing.ple) { tab["need_ple"]++ }
+    if (missing.qd_neq_dim) { tab["need_qd_neq_dim"]++ }
 }
 
 var g_dev : MetalDevice?
@@ -190,10 +268,25 @@ def decline(why : MetalDecodeDecline) {
     require_or_panic("decode", "{why}")
 }
 
+// the `feature` flavor: records a need_* key per missing bit, and the required-mode panic names them
+def decline(why : MetalDecodeDecline; missing : MetalNeed) {
+    g_declines++
+    g_declines_by_reason["{why}"]++
+    record_needs(g_declines_by_reason, missing)
+    require_or_panic("decode", "{why} {missing}")
+}
+
 def batch_decline(why : MetalDecodeDecline) {
     g_batch_declines++
     g_batch_declines_by_reason["{why}"]++
     require_or_panic("batch decode", "{why}")
+}
+
+def batch_decline(why : MetalDecodeDecline; missing : MetalNeed) {
+    g_batch_declines++
+    g_batch_declines_by_reason["{why}"]++
+    record_needs(g_batch_declines_by_reason, missing)
+    require_or_panic("batch decode", "{why} {missing}")
 }
 
 //! (gpu decode steps served, declines to the CPU path) since load — diagnostics / tests.
@@ -1145,9 +1238,14 @@ enum MetalPrefillDecline {
     quant_mode          // weights not loaded under QuantMode.q8
     kquant_native       // per-tensor K-quant planes: not readable as qblob offsets (kernels = W4)
     wscale_f16          // f16 scale plane (the load DEFAULT) — GPU prefill needs the s16 path (W2)
-    arch                // not the llama family graph
+    arch                // RETIRED (family waves A): the arch-name check is gone — non-std block
+                        // sets decline `graph`, feature-flag configs decline `feature` per bit
     backend_repack      // repack backend: interleaved weight layout unreadable by the GEMM kernel
-    config              // feature-flag config the kernels don't implement (neox/bias/qk-norm/softcap/...)
+    config              // RETIRED (family waves A): split into `feature` + the per-need
+                        // `need_*` keys in the declines-by-reason table
+    graph               // block set is not the std dense stack (MoE / recurrent / custom attn)
+    feature             // the model needs layer-stack features this path's kernels don't
+                        // implement — each missing bit records a `need_*` key alongside
     shape               // head/dim alignment outside the kernel grids
     layers              // per-layer non-uniformity (kv_dim/head_size/hidden/sliding/missing wv)
     rope_rows           // the window's rope table not built
@@ -1164,6 +1262,13 @@ def decline(why : MetalPrefillDecline) {
     if (why != MetalPrefillDecline.npos_window) {   // the one POLICY decline — see require_or_panic
         require_or_panic("prefill", "{why}")
     }
+}
+
+def decline(why : MetalPrefillDecline; missing : MetalNeed) {
+    g_prefill_declines++
+    g_prefill_declines_by_reason["{why}"]++
+    record_needs(g_prefill_declines_by_reason, missing)
+    require_or_panic("prefill", "{why} {missing}")
 }
 
 //! Declines-by-reason since load — reason name -> count (the first failing gate clause per

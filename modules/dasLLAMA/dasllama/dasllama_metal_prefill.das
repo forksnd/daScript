@@ -1972,6 +1972,9 @@ var private g_pf_failed = false
 var private g_pf_regions : table<uint64; MetalBuffer?>    // base address -> resident weight/scale/norm region
 var private g_pf_pool : MetalBufferPool
 var private g_pf_upool : MetalBufferPool     // UNTRACKED pool: uniforms + rope tables (GPU-read-only)
+// what the prefill kernels implement beyond the base llama dense block — grows wave by wave
+let PF_NEEDS_OK = default<MetalNeed>
+
 var private g_min_npos = 64l
 var private g_max_npos = 2048l          // naive-attention P footprint cap: heads x npos^2 floats
 var private g_prefills = 0l
@@ -2241,9 +2244,8 @@ def private pf_uniform_f32(v : float) : MetalBuffer? {
     return buf
 }
 
-// only the llama-family std shape is wired (Llama-3.2 class — 1B hs=64 and 3B hs=128 both
-// serve) — anything else declines to the CPU loop. Returns the FIRST failing clause; .none =
-// supported.
+// the std dense stack + PF_NEEDS_OK features are wired — anything else declines to the CPU
+// loop. Returns the FIRST failing clause; .none = supported.
 [unused_argument(start_pos)]   // start_pos > 0 (a continuation chunk) is served (M2.5): the
 // existing rows gather into the K/V panels and the causal diagonal shifts by qoff — the gate
 // keeps the argument so future clauses can window it
@@ -2276,25 +2278,25 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
             return MetalPrefillDecline.wscale_f16
         }
     }
-    if (t.arch != "llama") {
-        return MetalPrefillDecline.arch
+    // the drivers encode the std dense stack; the block set declares the graph shape
+    // (attn_is_std / ffn_is_dense) — MoE, recurrent, and custom-attention arches decline here
+    if (!t.blocks.attn_is_std || !t.blocks.ffn_is_dense) {
+        return MetalPrefillDecline.graph
     }
     // the GEMM kernel reads ROW-MAJOR Q8 weights — a repack backend's interleaved layout is unreadable here
     if (kernel_backend_needs_repack(active_kernel_backend())) {
         return MetalPrefillDecline.backend_repack
     }
-    let c = t.config
-    if ((c.rope_neox || c.attn_qkv_bias || c.qk_norm || c.v_norm || c.pre_post_norm) ||
-            (c.layer_out_scale || c.attn_sinks || c.attn_logit_softcap > 0.0 || c.sliding_window > 0l) ||
-            (c.ffn_act != FfnAct.silu || c.attn_scale > 0.0)) {
-        return MetalPrefillDecline.config
+    if (metal_missing_needs(t, PF_NEEDS_OK) != default<MetalNeed>) {
+        return MetalPrefillDecline.feature
     }
+    let c = t.config
     let head_size = c.head_size
-    let qd = c.n_heads * head_size
     let kv_dim = layer_kv_dim(c, 0l)
     let hidden = layer_hidden(t, 0l)
     // head_size % 32: the AV kernel grids d in 32-blocks; the QK kernel k-slabs any size
-    if ((qd != c.dim || (head_size % 32l) != 0l) ||
+    // (qd needs no own %32 clause: n_heads * head_size with head_size % 32 == 0)
+    if (((head_size % 32l) != 0l) ||
             ((c.dim % 32l) != 0l || (kv_dim % 32l) != 0l || (hidden % 32l) != 0l)) {
         return MetalPrefillDecline.shape
     }
@@ -2607,7 +2609,11 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
         why = MetalPrefillDecline.device
     }
     if (why != MetalPrefillDecline.none) {
-        decline(why)
+        if (why == MetalPrefillDecline.feature) {
+            decline(why, metal_missing_needs(t, PF_NEEDS_OK))
+        } else {
+            decline(why)
+        }
         return false
     }
     let ts_all = ref_time_ticks()
@@ -2633,6 +2639,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     // past npos are never read by the norm/rope/attention/elementwise kernels, and stale bytes in
     // the requant image only ever land in pad output rows: C-block rows are independent)
     let bytes_x = uint64(mp * dim * 4l)
+    let bytes_xb = uint64(mp * max(dim, qd) * 4l)   // dim-wide norm outs AND the qd-wide AV out
     let bytes_q = uint64(mp * qd * 4l)
     let bytes_kv = uint64(nk64 * kv_dim * 4l)
     let bytes_h = uint64(mp * hidden * 4l)
@@ -2641,7 +2648,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     let bytes_att = uint64(n_heads * mp * nk64 * 4l)   // per-head score slabs: mp queries x nk64 keys
     let bytes_tab = uint64(npos * half * 4l)
     var bx = pool_acquire(g_pf_pool, g_pf_dev, bytes_x)
-    var bxb = pool_acquire(g_pf_pool, g_pf_dev, bytes_x)
+    var bxb = pool_acquire(g_pf_pool, g_pf_dev, bytes_xb)
     var bxb2 = pool_acquire(g_pf_pool, g_pf_dev, bytes_x)
     var bq = pool_acquire(g_pf_pool, g_pf_dev, bytes_q)
     var bhb = pool_acquire(g_pf_pool, g_pf_dev, bytes_h)
@@ -2728,7 +2735,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
     let gpu_logits = (!g_pf_logits_cpu && get_env_variable("DASLLAMA_METAL_LOGITS") != "0" && empty(g_pf_skip) &&
-        !tied_f32 && c.final_logit_softcap <= 0.0 &&
+        !tied_f32 && c.final_logit_softcap <= 0.0 && c.n_layer_nextn == 0l &&
         empty(t.suppress) && t.wcls_off >= 0l)
     var bxf = gpu_logits ? pool_acquire(g_pf_pool, g_pf_dev, uint64(dim * 4l)) : null
     var blog = gpu_logits ? pool_acquire(g_pf_pool, g_pf_dev, uint64(c.vocab_size * 4l)) : null
@@ -3041,7 +3048,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     }
     // return the pooled buffers (uniforms too); the weight regions stay resident
     pool_release(g_pf_pool, bx, bytes_x)
-    pool_release(g_pf_pool, bxb, bytes_x)
+    pool_release(g_pf_pool, bxb, bytes_xb)
     pool_release(g_pf_pool, bxb2, bytes_x)
     pool_release(g_pf_pool, bq, bytes_q)
     pool_release(g_pf_pool, bhb, bytes_h)
