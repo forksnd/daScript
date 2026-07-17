@@ -78,16 +78,10 @@ def public clipboard_content_has_data(content : ClipboardContent const) : bool {
 
 def public clipboard_validate_content(content : ClipboardContent const) : ClipboardStatus {
     let f = content.formats
-    if (f.plain_text && !is_utf8_string_valid(content.plain_text)) {
-        return ClipboardStatus.invalid_utf8
-    }
-    if (f.markdown && !is_utf8_string_valid(content.markdown)) {
-        return ClipboardStatus.invalid_utf8
-    }
-    if (f.html && !is_utf8_string_valid(content.html)) {
-        return ClipboardStatus.invalid_utf8
-    }
-    if (f.uri_list && !is_utf8_string_valid(content.uri_list)) {
+    if ((f.plain_text && !is_utf8_string_valid(content.plain_text))
+            || (f.markdown && !is_utf8_string_valid(content.markdown))
+            || (f.html && !is_utf8_string_valid(content.html))
+            || (f.uri_list && !is_utf8_string_valid(content.uri_list))) {
         return ClipboardStatus.invalid_utf8
     }
     if (f.image_rgba8) {
@@ -187,8 +181,7 @@ def public clipboard_get_content(var content : ClipboardContent) : ClipboardStat
     //! Take one native snapshot of every supported representation.
     clipboard_dispose_content(content)
     var raw_formats = 0
-    var raw_status = int(ClipboardStatus.failed)
-    raw_status = _clipboard_get_content(
+    let raw_status = _clipboard_get_content(
         raw_formats,
         content.plain_text, content.markdown, content.html, content.uri_list,
         content.image.rgba8,

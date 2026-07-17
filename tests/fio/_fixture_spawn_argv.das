@@ -18,5 +18,10 @@ def main() {
     while (!fexist(release)) {
         if (get_time_usec(started) > 10000000) return
     }
-    let _ = fwrite(done, "done")
+    // Publish completion with an atomic rename so the parent cannot observe
+    // the event while this process still has the destination file open.
+    let staging = "{done}.tmp"
+    if (!fwrite(staging, "done")) return
+    var error : string
+    let _ = rename(staging, done, error)
 }
