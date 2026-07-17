@@ -26,6 +26,9 @@ struct RunArgs {
     @clarg_doc = "Suite: decode | prefill | matrix | kernels | image | all (default all)"
     suite : string = "all"
 
+    @clarg_doc = "Family filter — comma-separated family tokens (llama, gemma, ultravox, whisper, voxtral); only blocks of these model families run (model-free blocks always run); sets DASLLAMA_TEST_FAMILY"
+    family : string
+
     @clarg_short = "n"
     @clarg_doc = "Repeat count — explicit only (default 1, never best-of-N)"
     nreps : int = 1
@@ -110,7 +113,10 @@ def main() : int {
         return 2
     }
     let tmp = empty(get_env_variable("TMPDIR")) ? "/tmp" : get_env_variable("TMPDIR")
-    let envs = cfg.full ? "DASLLAMA_PARITY_FULL=1" : "DASLLAMA_TEST_ARMS='{cfg.arm}'"
+    var envs = cfg.full ? "DASLLAMA_PARITY_FULL=1" : "DASLLAMA_TEST_ARMS='{cfg.arm}'"
+    if (!empty(cfg.family)) {   // composes with either mode: a family-scoped full gate is the profiling-cadence default
+        envs = "{envs} DASLLAMA_TEST_FAMILY='{cfg.family}'"
+    }
     // the full gate holds the 8B/70B tails — the stock 1200s dastest wall is an arm-mode budget
     let tmo = cfg.full ? 3600 : 1200
     let reps = max(cfg.nreps, 1)

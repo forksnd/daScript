@@ -465,6 +465,7 @@ def private paged_batch_greedy(tr : Model; prompts : array<array<int64>>; page_r
 [test]
 def test_metal_batch_decode_parity(t : T?) {
     t |> run("GPU batched decode == CPU batch control, greedy streams (Llama-3.2-1B Q8)") <| @(t : T?) {
+        if (!family_on(t, "llama")) return
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!jit_enabled()) {
                 t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
@@ -675,6 +676,7 @@ def test_metal_batch_decode_parity(t : T?) {
 [test]
 def test_metal_decode_parity(t : T?) {
     t |> run("GPU-resident decode == CPU control, greedy continuations (Llama-3.2-1B Q8)") <| @(t : T?) {
+        if (!family_on(t, "llama")) return
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!jit_enabled()) {
                 t |> skip("interpreted (dasLLAMA model tests are JIT-only)")

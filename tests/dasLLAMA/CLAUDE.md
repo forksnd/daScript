@@ -9,6 +9,7 @@ to verify one-arm fixes. They are enforcement, not advice.
 ```
 ./bin/daslang -jit tests/dasLLAMA/run.das -- --arm <filter> [--suite decode|prefill|matrix|all]
 ./bin/daslang -jit tests/dasLLAMA/run.das -- --full [--suite ...]
+./bin/daslang -jit tests/dasLLAMA/run.das -- --full --family llama    # a profiling round's gate
 ```
 
 Never invoke `dastest/dastest.das --test tests/dasLLAMA/...` directly for the metal suites.
@@ -45,6 +46,18 @@ remember it exists — kernel uniform/binding changes MUST update its hand-bound
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
 carrier, model-free, runs in CI) `smol tower whisper voxtral`; the voxtral arm re-saves a
 5.4 GB image from cold every run by design (it IS the >2 GiB-plane IO coverage).
+
+## Family filter (profiling cadence)
+
+`--family <tokens>` (env `DASLLAMA_TEST_FAMILY`, comma list) composes with either `--arm` or
+`--full`: only model blocks tagged with a listed family run — `family_on(t, name)` in
+`_model_tier.das`, EXACT token match, loud `t |> skip` like the arm filter. Model-free blocks
+(the `kernels` suite, the image `mechanics` arm) carry no tag and always run. Family tokens
+today: `llama` (all four metal suites + the image smol arm), `gemma`, `ultravox`, `whisper`,
+`voxtral` (image suite arms). When profiling one family across formats, gate each round with
+`--full --family <fam>` instead of the whole zoo — a full multi-family pass is only owed when
+shared machinery (image rail, uploads, drivers) changes. Tag every NEW model-loading block
+with its family or it silently joins every family's gate.
 
 ## Model tiers
 

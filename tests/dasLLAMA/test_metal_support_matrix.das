@@ -205,6 +205,7 @@ def private check_cell(t : T?; cell : string; want : string; served : int64;
 [test]
 def test_metal_support_matrix(t : T?) {
     t |> run("Metal support matrix: weights x wscale x kv x path engage/decline (Llama-3.2-1B)") <| @(t : T?) {
+        if (!family_on(t, "llama")) return
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!jit_enabled()) {
                 t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
