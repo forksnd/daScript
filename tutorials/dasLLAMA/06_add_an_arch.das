@@ -91,7 +91,7 @@ def main() {
     //      file lists and .das_module descriptor
     //   3. validate token-for-token against llama.cpp on a real GGUF before trusting
     //      any output — greedy continuations must match id-for-id
-    //   4. registry-count tests (tests/dasLLAMA/test_arch_registry.das) hardcode the
+    //   4. registry-count tests (modules/dasLLAMA/tests/test_arch_registry.das) hardcode the
     //      architecture count — bump them
 
     print("done\n")

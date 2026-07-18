@@ -1,4 +1,4 @@
-# tests/dasLLAMA — testing discipline
+# modules/dasLLAMA/tests — testing discipline
 
 The Metal suites here are wall-time-expensive (model loads dominate; a full pass holds 40GB
 GGUFs). The rules below exist because one session spent 5.75 of 6 hours re-running full suites
@@ -7,10 +7,10 @@ to verify one-arm fixes. They are enforcement, not advice.
 ## Run suites ONLY through the runner
 
 ```
-./bin/daslang -jit tests/dasLLAMA/run.das -- --arm <filter> [--suite decode|prefill|matrix|all] [--family llama]
+./bin/daslang -jit modules/dasLLAMA/tests/run.das -- --arm <filter> [--suite decode|prefill|matrix|all] [--family llama]
 ```
 
-Never invoke `dastest/dastest.das --test tests/dasLLAMA/...` directly for the metal suites.
+Never invoke `dastest/dastest.das --test modules/dasLLAMA/tests/...` directly for the metal suites.
 `--full` is REFUSED while the Metal build-out is in progress ("please narrow the scope...") —
 scope every gate with `--arm` to the arms the change can actually affect (a whole-zoo pass
 buys soak time, not coverage; e.g. a driver change gates on `--arm arm,batch --suite decode`).

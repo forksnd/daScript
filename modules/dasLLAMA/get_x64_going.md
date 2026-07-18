@@ -23,7 +23,7 @@ Path convention below is the single-config layout (`build/daslang`); on Windows 
 3. **JIT smoke:** run any small script with `-jit`; then the dasLLAMA suite on the portable
    backend:
    ```
-   bin/daslang -jit dastest/dastest.das -- --test tests/dasLLAMA/
+   bin/daslang -jit dastest/dastest.das -- --test modules/dasLLAMA/tests/
    ```
    Model-gated tests self-skip without local GGUFs. **Gate: all green.** This proves the
    three x64-safety layers (portable backend active, scalar fallbacks, wrapper-driven tests)
@@ -138,7 +138,7 @@ actually emitted, not the fallback loop.
 - A/B max-abs-diff vs portable on real shapes (`bench_matmul_laneq.das:53-57` uses `1e-3`;
   expect far tighter if the flush order matches).
 - Token-for-token oracle (step 1's parity run) with the backend active.
-- AOT regression: `bin/test_aot -use-aot dastest/dastest.das -- --test tests/dasLLAMA/`
+- AOT regression: `bin/test_aot -use-aot dastest/dastest.das -- --test modules/dasLLAMA/tests/`
   (compiles the fallback bodies — correctness only, untuned by design).
 
 ## Step 6 — repack backend (only if measured short)

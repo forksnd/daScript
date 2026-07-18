@@ -51,7 +51,7 @@ of `VPDPBUSD` / AVX-512 kernels = here, and they're correct.**
 
 | Check | Result |
 |---|---|
-| `tests/dasLLAMA` suite `-jit` (default backend) | **171/171**, 0 skipped |
+| `modules/dasLLAMA/tests` suite `-jit` (default backend) | **171/171**, 0 skipped |
 | `avx_matrix_probe` interp (fallback bodies) | ALL OK |
 | `avx_matrix_probe` **-jit** (real VNNI/AVX-512), `AVX_MATRIX=1` no force | ALL OK — every tier bit-exact vs donor over n=64/96/2880 (incl. threaded); intrinsic identity 64/64 blocks; z16 vs portable rel<1e-5 |
 | `mx4x64_probe` -jit (shipped mxfp4 tiers) | ALL OK |

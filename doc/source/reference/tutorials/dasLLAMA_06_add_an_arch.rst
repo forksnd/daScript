@@ -87,7 +87,7 @@ MoE-with-sinks):
    CMake AOT file lists and ``.das_module`` descriptor.
 3. Validate token-for-token against llama.cpp on a real GGUF before trusting
    any output — greedy continuations must match id-for-id.
-4. Registry-count tests (``tests/dasLLAMA/test_arch_registry.das``) hardcode
+4. Registry-count tests (``modules/dasLLAMA/tests/test_arch_registry.das``) hardcode
    the architecture count — bump them.
 
 .. seealso::

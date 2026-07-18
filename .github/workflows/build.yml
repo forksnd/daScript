@@ -180,25 +180,8 @@ jobs:
             architecture: 64
             architecture_string: x64
 
-          # RelWithDebInfo only on Windows x64
-          # jit_disabled: skip the JIT test sweep here. JIT on
-          # win64-MSVC stays covered by the Release cell below and by the full
-          # clang JIT sweep in build_windows_mingw — running it on all three
-          # win64 presets just triples the slowest jobs in the matrix.
-          - target: windows
-            architecture: 64
-            cmake_preset: RelWithDebInfo
-            sanitizers: none
-            runner: windows-latest
-            archive_ext: zip
-            build_system: cmake
-            cmake_generator: Ninja
-            release_target: windows
-            release_arch: x86_64
-            architecture_string: x64
-            jit_disabled: 'ON'
-
-          # Debug win64 also skips JIT (same rationale as RelWithDebInfo above).
+          # Debug win64 skips JIT. Win64 MSVC JIT stays covered by Release;
+          # RelWithDebInfo is a separate nightly-only memory/leak diagnostic.
           - target: windows
             architecture: 64
             cmake_preset: Debug
@@ -563,6 +546,105 @@ jobs:
             cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_aot
             ;;
         esac
+
+  ###########################################################
+  build_windows_relwithdebinfo_nightly:
+  ###########################################################
+    # RelWithDebInfo is useful as the leak-enabled Windows diagnostic, but it
+    # duplicates the Release/Debug compile and interpreter coverage on every
+    # PR. Keep it on the canonical nightly and explicit full-workflow runs.
+    needs: pre_job
+    if: >-
+      (github.event_name == 'schedule' && github.repository == 'GaijinEntertainment/daScript')
+      || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: write
+    env:
+      das_llvm_disabled: 'OFF'
+      SCCACHE_GHA_ENABLED: 'false'
+
+    steps:
+    - name: "SCM Checkout"
+      uses: actions/checkout@v4
+
+    - name: "Exclude workspace from Windows Defender"
+      shell: pwsh
+      continue-on-error: true
+      run: |
+        Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction SilentlyContinue
+        foreach ($p in 'daslang.exe','daslang_static.exe','test_aot.exe','cl.exe','link.exe','mt.exe','vctip.exe','mspdbsrv.exe','vcpkg.exe') {
+          Add-MpPreference -ExclusionProcess $p -ErrorAction SilentlyContinue
+        }
+        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+
+    - name: "Install CMake and Ninja"
+      uses: lukka/get-cmake@latest
+
+    - uses: ilammy/setup-nasm@v1
+
+    - name: "Set up MSVC environment"
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: "Cache vcpkg + openssl"
+      uses: actions/cache@v4
+      with:
+        path: vcpkg
+        key: vcpkg-x64-windows-v2
+
+    - name: "Install openssl windows"
+      run: |
+        if [ ! -x vcpkg/vcpkg.exe ] && [ ! -x vcpkg/vcpkg ]; then
+            git clone https://github.com/microsoft/vcpkg && ./vcpkg/bootstrap-vcpkg.sh
+        fi
+        ./vcpkg/vcpkg install openssl:x64-windows --binarycaching
+        echo "VCPKG_ROOT=$(pwd)/vcpkg" >> $GITHUB_ENV
+        rm -rf vcpkg/buildtrees vcpkg/downloads vcpkg/packages
+
+    - uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: "Configure sccache"
+      run: echo "SCCACHE_DIR=${{ runner.temp }}/sccache" >> $GITHUB_ENV
+
+    - name: "Restore sccache objects"
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/sccache
+        key: sccache-windows-64-RelWithDebInfo-none
+
+    - name: "Build: Daslang RelWithDebInfo"
+      run: |
+        set -eux
+        export PATH="/c/Strawberry/perl/bin:$PATH"
+        cmake --no-warn-unused-cli -B./build -G Ninja \
+          -DCMAKE_BUILD_TYPE:STRING=RelWithDebInfo \
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+          -DDAS_LLVM_DISABLED=${{ env.das_llvm_disabled }} \
+          -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+        cmake --build ./build --config RelWithDebInfo --parallel
+
+    - name: "Refresh sccache slot"
+      if: github.ref == 'refs/heads/master'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh cache delete "sccache-windows-64-RelWithDebInfo-none" -R ${{ github.repository }} || true
+
+    - name: "Save sccache objects"
+      if: github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/sccache
+        key: sccache-windows-64-RelWithDebInfo-none
+
+    - name: "Test: interpreter"
+      run: cmake --build ./build --config RelWithDebInfo --target run_tests_interpreter || cmake --build ./build --config RelWithDebInfo --target run_tests_interpreter_isolated
+
+    - name: "Small C++ Tests"
+      run: ctest --test-dir build --build-config RelWithDebInfo -L small --output-on-failure
 
   ###########################################################
   bundle_smoke:

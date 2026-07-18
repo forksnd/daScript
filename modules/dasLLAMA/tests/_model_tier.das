@@ -34,7 +34,7 @@ def parity_full_mode() : bool {
 // Arm filter for the metal suites: DASLLAMA_TEST_ARMS = comma-separated substrings; when set,
 // only arm blocks whose name matches a token run. The skip is LOUD (t |> skip) so a filtered
 // run can never masquerade as full coverage. Unset/empty = every arm runs. Drive through
-// tests/dasLLAMA/run.das — see tests/dasLLAMA/CLAUDE.md.
+// modules/dasLLAMA/tests/run.das — see modules/dasLLAMA/tests/CLAUDE.md.
 def arm_on(t : T?; name : string) : bool {
     let filter = get_env_variable("DASLLAMA_TEST_ARMS")
     if (empty(filter)) {

@@ -279,48 +279,6 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_sql_view_mutations.das | `_sql_update` / `_sql_delete` / `_sql_upsert` against `[sql_view]` types (read-only rejection) | **expect** `40104:8` |
 | failed_sql_view_schema.das | `[sql_view]` field-annotation rejections (PK, UNIQUE, COMPUTED, DEFAULT, initializers, FK, column collisions) | **expect** `30111:9` |
 
-## dasLLAMA/
-
-> **Note:** Model-driven suites self-skip when the fixture models are absent. Run with JIT: `daslang -jit dastest/dastest.das -- --test tests/dasLLAMA/`
-
-| File | Description | Expects errors |
-|---|---|---|
-| test_arch_registry.das | Architecture registry — arch_names/ArchDesc registration, per-arch config dispatch | |
-| test_audio.das | Audio towers — mel/encoder/projector oracles, chat-audio and ASR gates (model-gated) | |
-| test_batch_grid.das | `batch_grid_2d` chunk space — 1-D/fine/wave-aligned grids bit-exact, per-dispatch auto-gate | |
-| test_box_profile.das | box_profile.json runtime knobs — parse, apply, invalid-JSON and missing-backend fallbacks | |
-| test_chat.das | Layer-2 chat engine — templates, roles, streaming respond | |
-| test_dispatch_shaping.das | lanes_for_work boundaries + matmul_chunks/matmul_chunks_gemv shapers (wave alignment, grain floors) | |
-| test_facade.das | The `dasllama` facade surface — load/session/encode/eval/generate/chat (model-gated) | |
-| test_facade_docs.das | Facade doc coverage — public symbols carry `//!` docs | |
-| test_flash.das | Flash-decode attention path vs the reference walk | |
-| test_forward.das | Forward-pass oracles vs frozen fixtures (model-gated) | |
-| test_fused_decode.das | Fused decode chain vs unfused reference | |
-| test_grid.das | Dispatch grid geometry helpers | |
-| test_groupn.das | Group-N GEMM row-group indexing | |
-| test_kernel_backend.das | Q8·Q8 kernel-backend registry — selection, pins, availability fallbacks | |
-| test_kgroup_repack.das | K-group repack layout round-trips | |
-| test_matmul.das | matmul/GEMV kernels (fp32/Q8/Q4) vs reference | |
-| test_matmul_batch.das | Batched (prefill) matmul vs reference — chunking invariance | |
-| test_metal_gemm.das | Metal GPU batch-GEMM donor vs portable CPU kernel — bit-exact on pow2 scales for BOTH kernel dispatch paths (32x32 + 64x64), dot-envelope tolerance on arbitrary scales, small-batch delegation, leak gate (Apple; feints elsewhere) | |
-| test_metal_prefill_kernels.das | Phase-6 resident-prefill kernel set (quant/rmsnorm/rope/swiglu/add/attention trio) vs dasLLAMA CPU twins on-device (Apple; feints elsewhere) | |
-| test_metal_prefill_parity.das | GPU-resident whole-prefill vs CPU control — 40-token greedy continuation token-for-token on the real 1B (model-gated, Apple) | |
-| test_mxfp4.das | MXFP4 dequant + expert matmul kernels | |
-| test_par_indexed.das | `maybe_parallel_for_indexed` contract — exactly-once coverage, slot bound, per-slot checksum across team/fifo/inline arms | |
-| test_parity.das | Frozen token-for-token parity fixtures (model-gated) | |
-| test_prefill.das | Prefill path produces decode-identical logits | |
-| test_quant.das | Q8_0/Q4_0 quantize/dequantize round-trips | |
-| test_rmsnorm.das | rmsnorm kernel vs reference | |
-| test_rope.das | rope kernels (incl. NEOX/scaled) vs reference | |
-| test_sampling.das | Sampler determinism — greedy/top-k/top-p | |
-| test_silu.das | Activation kernels (silu/gelu incl. float4 forms) vs scalar reference | |
-| test_softmax.das | softmax kernels (incl. sink variant) vs reference | |
-| test_tokenizer.das | SPM + BPE tokenizer fixtures and round-trips | |
-| test_tune.das | `[tune]` framework — grid, winner selection, manifest | |
-| test_tuned.das | `[tuned]` loop-hint application | |
-| test_unicode.das | Unicode classification + UTF-8 codec | |
-| test_whisper.das | Whisper family — loaders, fp32 oracle, q8 gates, gelu LUT sweep, transcribe API (model-gated) | |
-
 ## daslib/
 
 | File | Description | Expects errors |
@@ -498,7 +456,8 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 
 ## jit_tests/
 
-50 files testing JIT compilation code generation. None have `expect` directives.
+JIT compilation and code-generation tests. None have `expect` directives. The slower
+`llvm_tune` integration suite lives with its owning module under `modules/dasLLVM/tests/`.
 
 | File | Description | Expects errors |
 |---|---|---|
