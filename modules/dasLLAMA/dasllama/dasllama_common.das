@@ -1778,11 +1778,13 @@ def moe_gpu_upload_resident(var t : Model) {
     set_moe_gpu_cls_off(-1l)
     reset_moe_gpu_dense_offs()
     reset_moe_gpu_dn_layers()
+    reset_moe_gpu_attn_layers()
     // mx4/biased expert stacks never dispatch on the GPU, so they never upload either
     let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
     let dn_want = get_env_variable("DASLLAMA_GPU_DN") == "1"
+    let at_want = get_env_variable("DASLLAMA_GPU_ATTN") == "1"
     if (t.quant != QuantMode.q8 || t.config.n_expert <= 0l
-            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want)
+            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want)
             || t.experts_mx4 || t.config.moe_exps_bias) {
         return
     }
@@ -1893,6 +1895,72 @@ def moe_gpu_upload_resident(var t : Model) {
         }
         if (dn_marked > 0l) {
             to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: deltanet triples of {dn_marked} layers resident\n")
+        }
+    }
+    // attention quads fourth — DASLLAMA_GPU_ATTN=1 opt-in: each servable full-attention layer's
+    // q|gate / k / v / wo planes + the layer mark that routes its whole prefill attention block
+    // through the device chain. Arch/geometry gates mirror the chain's capacity asserts (an
+    // unmarked layer just keeps the CPU path — fail-closed). Layer-ascending; a budget stop
+    // rolls back the partial quad; planes the dense walk already uploaded only need the mark.
+    if (at_want) {
+        let c = t.config
+        // NEOX rope only (partial rotary implies NEOX per the loader); the chain has no bias /
+        // v-norm / sinks / softcap / post-norm arms
+        let arch_ok = (!c.attn_qkv_bias && !c.v_norm && !c.attn_sinks && c.attn_logit_softcap == 0.0
+            && !c.pre_post_norm && !c.attn_out_bias
+            && (c.rope_neox || (c.rope_dim > 0l && c.rope_dim != c.head_size)))
+        var at_marked = 0l
+        var at_stop = false
+        for (l in range64(layers)) {
+            break if (!arch_ok)
+            continue if (layer_is_recurrent(c, l) || layer_is_sliding(c, l) || t.kv_src[l] != l
+                || t.wq_offs[l] < 0l || t.wk_offs[l] < 0l || t.wv_offs[l] < 0l || t.wo_offs[l] < 0l)
+            let hs = layer_head_size(c, l)
+            let kvd = layer_kv_dim(c, l)
+            let qd = c.n_heads * hs
+            let rot = c.rope_dim > 0l ? c.rope_dim : hs
+            let fq = fmt_at(t.wq_fmt, l)
+            let fk = fmt_at(t.wk_fmt, l)
+            let fv = fmt_at(t.wv_fmt, l)
+            let fo = fmt_at(t.wo_fmt, l)
+            // q/k/v share the chain's one activation image — format class must agree; wo is free
+            let kq_cls = fq != KqFmt.q8
+            var fmts_ok = (fk != KqFmt.q8) == kq_cls && (fv != KqFmt.q8) == kq_cls
+            for (f in [fq, fk, fv, fo]) {
+                fmts_ok = fmts_ok && (f == KqFmt.q8 || moe_gpu_fmt_kq(f)) && kq_servable(t, f)
+            }
+            continue if (!fmts_ok || !(hs == 128l || hs == 256l) || qd > 8192l || kvd > 1024l
+                || c.n_heads > 64l || rot % 2l != 0l || rot > hs || kvd % 32l != 0l
+                || qd % (fo != KqFmt.q8 ? 256l : 32l) != 0l || dim % 32l != 0l)
+            var uploads : array<tuple<f : KqFmt; woff : int64; n : int64; rows : int64>>
+            if (!moe_gpu_dense_on_gpu(int(fq), t.wq_offs[l])) {
+                uploads |> push((f = fq, woff = t.wq_offs[l], n = dim, rows = c.q_gated ? 2l * qd : qd))
+            }
+            uploads |> push((f = fk, woff = t.wk_offs[l], n = dim, rows = kvd))
+            uploads |> push((f = fv, woff = t.wv_offs[l], n = dim, rows = kvd))
+            if (!moe_gpu_dense_on_gpu(int(fo), t.wo_offs[l])) {
+                uploads |> push((f = fo, woff = t.wo_offs[l], n = qd, rows = dim))
+            }
+            var got = 0
+            for (u in uploads) {
+                if (!moe_gpu_gather_upload(t, u.f, u.woff, u.n, u.rows, u.rows, mr, kgroup, wbias, wq, ws)) {
+                    at_stop = true
+                    break
+                }
+                got++
+            }
+            delete uploads
+            if (at_stop) {
+                if (got > 0) {
+                    moe_gpu_drop_stacks(got, false)
+                }
+                break
+            }
+            set_moe_gpu_attn_layer(l)
+            at_marked++
+        }
+        if (at_marked > 0l) {
+            to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: attention quads of {at_marked} layers resident\n")
         }
     }
     for (i in range64(want)) {
@@ -8816,8 +8884,93 @@ def private attn_out_suffix(t : Model; var s : Session; l : int64; npos : int64)
     prof_add("act_resid", ts_resid0)
 }
 
+// The GPU arm shared by the std and gated prefill blocks: the whole attention block (q|gate/k/v
+// GEMMs, per-head qk-norm, partial NEOX rope, flash-style causal attention, sigmoid out-gate,
+// wo projection) as one device chain per window — the norm, the activation image, the KV-cache
+// store, and the residual stay CPU. K/V of the batch live device-side (the start_pos == 0 gate);
+// the roped-k / raw-v rows DMA back so kv_store_batch runs the normal cache codec. Numerics are
+// GPU f32 with tile accumulation order — drift-class vs the CPU flash path.
+def private attention_gpu_prefill(t : Model; var s : Session; l : int64; npos : int64; gated : bool) {
+    let c = t.config
+    let dim = c.dim
+    let kv_dim = layer_kv_dim(c, l)
+    let head_size = layer_head_size(c, l)
+    let n_heads = c.n_heads
+    let n_kv_heads = layer_n_kv_heads(c, l)
+    let qd = n_heads * head_size
+    let kv_mul = n_heads / n_kv_heads
+    let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
+    let rot = c.rope_dim > 0l ? c.rope_dim : head_size
+    let fq = fmt_at(t.wq_fmt, l)
+    let kq_cls = fq != KqFmt.q8
+    let ts_norm0 = ref_time_ticks()
+    rms_batch(s.xb_b, s.x_b, t, t.rms_att_off + l * dim, dim, npos)
+    if (kq_cls) {   // the chain's activation image follows the q/k/v stack class
+        s.kxqb |> resize(int(npos * dim))
+        s.kxsb |> resize(int(npos * dim / 256l))
+        s.kxbsb |> resize(int(npos * dim / 16l))
+        requant_rows_q8k_bs(s.xb_b, dim, npos, s.kxqb, s.kxsb, s.kxbsb)
+    } else {
+        requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
+    }
+    if (!g_use_rope_table) {   // the GPU rope consumes table rows — build them (bit-identical values)
+        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, 0l, npos, rot, true)
+    }
+    prof_add("at_norm", ts_norm0)
+    let ts_gpu = ref_time_ticks()
+    unsafe {
+        if (kq_cls) {
+            matmul_moe_gpu_attn(s.xb2_b, s.k_b, s.v_b,
+                t.wq_offs[l], t.wk_offs[l], t.wv_offs[l], t.wo_offs[l],
+                int(fq), int(fmt_at(t.wk_fmt, l)), int(fmt_at(t.wv_fmt, l)), int(fmt_at(t.wo_fmt, l)),
+                s.kxqb, s.kxsb,
+                c.qk_norm ? addr<float const?>(t.fblob[t.rms_q_offs[l]]) : null,
+                c.qk_norm ? addr<float const?>(t.fblob[t.rms_k_offs[l]]) : null,
+                addr<float const?>(s.rope_cos[0]), addr<float const?>(s.rope_sin[0]),
+                npos, dim, qd, kv_dim, head_size, rot, n_heads, kv_mul,
+                scale, c.norm_eps, gated, c.qk_norm)
+        } else {
+            matmul_moe_gpu_attn(s.xb2_b, s.k_b, s.v_b,
+                t.wq_offs[l], t.wk_offs[l], t.wv_offs[l], t.wo_offs[l],
+                int(fq), int(fmt_at(t.wk_fmt, l)), int(fmt_at(t.wv_fmt, l)), int(fmt_at(t.wo_fmt, l)),
+                s.xqb, s.xsb,
+                c.qk_norm ? addr<float const?>(t.fblob[t.rms_q_offs[l]]) : null,
+                c.qk_norm ? addr<float const?>(t.fblob[t.rms_k_offs[l]]) : null,
+                addr<float const?>(s.rope_cos[0]), addr<float const?>(s.rope_sin[0]),
+                npos, dim, qd, kv_dim, head_size, rot, n_heads, kv_mul,
+                scale, c.norm_eps, gated, c.qk_norm)
+        }
+    }
+    prof_add("at_gpu", ts_gpu)
+    // the cache store runs the normal CPU codec off the DMA'd k/v rows
+    let ts_kv = ref_time_ticks()
+    var kcl = kv_layer_kbase(s, l, c.seq_len)
+    var vcl = kv_layer_vbase(s, l, c.seq_len)
+    let store_nrun = kv_runs(s, 0l, npos, s.kv_runs)
+    unsafe {
+        kv_store_batch(kcl, vcl, s.kv_dtype_k, s.kv_dtype_v, s.k_b, s.v_b,
+            addr < KVRun const? >(s.kv_runs[0]), store_nrun, 0l, npos, kv_dim)
+    }
+    prof_add("kv_store", ts_kv)
+    let ts_resid = ref_time_ticks()
+    add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
+    prof_add("at_resid", ts_resid)
+}
+
+// npos >= 32 (a batch worth dispatching), start of sequence only (the chain reads the batch's
+// own K/V device-side), tq4 excluded (the basis change lives in the CPU path), npos within the
+// chain's context capacity
+def private attn_gpu_prefill_ready(s : Session; l : int64; npos : int64; start_pos : int64) : bool {
+    return (npos >= 32l && npos <= 4096l && start_pos == 0l && moe_gpu_attn_on_gpu(l)
+        && s.kv_dtype_k != KVDtype.tq4 && s.kv_dtype_v != KVDtype.tq4)
+}
+
 // attn-norm → batched QKV(+bias) → RoPE → KV-store → prefill attention → out-proj(+post-norm) → residual.
 def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : int64; start_pos : int64) {
+    if (attn_gpu_prefill_ready(s, l, npos, start_pos)) {
+        attention_gpu_prefill(t, s, l, npos, false)   // buckets at_norm / at_gpu / kv_store / at_resid
+        return
+    }
     let c = t.config
     let kv_dim = layer_kv_dim(c, l)
     let head_size = layer_head_size(c, l)
@@ -9277,6 +9430,10 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
 // The batched gated-attention twin of attention_std_prefill: 2x-wide [q|gate], partial rope,
 // sigmoid out-gate before the shared out-proj suffix.
 def private attention_qwen35_gated_prefill(t : Model; var s : Session; l : int64; npos : int64; start_pos : int64) {
+    if (attn_gpu_prefill_ready(s, l, npos, start_pos)) {
+        attention_gpu_prefill(t, s, l, npos, true)   // buckets at_norm / at_gpu / kv_store / at_resid
+        return
+    }
     let c = t.config
     let dim = c.dim
     let kv_dim = layer_kv_dim(c, l)

@@ -1493,6 +1493,25 @@ typedef MoeGpuDnFn = function<(var yp : float?; woq : int64; woz : int64; woo : 
                                var stp : float?; var tailp : float?; histp : float const?;
                                npos : int64; dim : int64; cd : int64; kd : int64; di : int64;
                                nvh : int64; nkh : int64; ds : int64; dconv : int64; eps : float) : void>
+// The whole softmax attention block of one full-attention layer as ONE device chain per window:
+// q(|gate)/k/v GEMMs off the normed-x image, per-head qk-RMSNorm, partial NEOX RoPE off uploaded
+// cos/sin rows, flash-style causal attention (GQA, online softmax), the sigmoid out-gate folded
+// into the attention epilogue (gated arches), requant, and the wo projection. yp gets npos x dim
+// out-proj rows (the residual add stays on the caller); kp/vp get the npos x kv_dim roped-k /
+// raw-v rows — the caller's kv_store_batch source, so the cache codec never enters the tier.
+// Start-of-sequence only (start_pos == 0): attention reads K/V of the batch itself device-side;
+// continuation windows fall back to the CPU path (fail-closed). Weight formats ride per plane
+// ((fmt, offset) stack identity); q/k/v share one activation image so their format class must
+// agree — fo is free (the requant form follows the wo stack, the FFN-down rule).
+typedef MoeGpuAttnFn = function<(var yp : float?; var kp : float?; var vp : float?;
+                                 woq : int64; wok : int64; wov : int64; woo : int64;
+                                 fq : int; fk : int; fv : int; fo : int;
+                                 xqp : int8 const?; xsp : float const?;
+                                 rmsqp : float const?; rmskp : float const?;
+                                 cosp : float const?; sinp : float const?;
+                                 npos : int64; dim : int64; qd : int64; kv_dim : int64;
+                                 hs : int64; rot : int64; n_heads : int64; kv_mul : int64;
+                                 scale : float; eps : float; gated : bool; qknorm : bool) : void>
 
 [unused_argument(goutp, offs1, offs3, offs2, nregions, xqp, xsp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)]
 def private moe_gpu_unset_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
@@ -1528,12 +1547,24 @@ def private moe_gpu_unset_dn(var yp : float?; woq, woz, woo : int64;
     panic("dasLLAMA: GPU deltanet dispatch hit without an installed GPU tier")
 }
 
+[unused_argument(yp, kp, vp, woq, wok, wov, woo, fq, fk, fv, fo, xqp, xsp, rmsqp, rmskp, cosp, sinp, npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul, scale, eps, gated, qknorm)]
+def private moe_gpu_unset_attn(var yp : float?; var kp : float?; var vp : float?;
+                               woq, wok, wov, woo : int64; fq, fk, fv, fo : int;
+                               xqp : int8 const?; xsp : float const?;
+                               rmsqp : float const?; rmskp : float const?;
+                               cosp : float const?; sinp : float const?;
+                               npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul : int64;
+                               scale : float; eps : float; gated : bool; qknorm : bool) {
+    panic("dasLLAMA: GPU attention dispatch hit without an installed GPU tier")
+}
+
 var g_moe_gpu_ffn = @@moe_gpu_unset_ffn
 var g_moe_gpu_upload = @@moe_gpu_unset_upload
 var g_moe_gpu_cls = @@moe_gpu_unset_cls
 var g_moe_gpu_dense = @@moe_gpu_unset_dense
 var g_moe_gpu_drop = @@moe_gpu_unset_drop
 var g_moe_gpu_dn = @@moe_gpu_unset_dn
+var g_moe_gpu_attn = @@moe_gpu_unset_attn
 var g_moe_gpu_installed = false
 var g_moe_gpu_layer_count = 0l         // K = layers offloaded from the END (env-driven, set by the tier)
 var g_moe_gpu_from_layer = 1000000l    // first offloaded layer (n_layers - K, set by the loader)
@@ -1543,15 +1574,18 @@ var g_moe_gpu_dense_offs : table<int64>   // resident dense planes, keyed woff *
 var g_moe_gpu_dense_route = true       // runtime routing gate over the marks (in-process A/B lever)
 var g_moe_gpu_dn_layers : table<int64>    // recurrent layers whose deltanet triple is tier-resident
 var g_moe_gpu_dn_route = true          // runtime routing gate over the deltanet marks (--dn-ab lever)
+var g_moe_gpu_attn_layers : table<int64>  // full-attention layers whose q/k/v/o quad is tier-resident
+var g_moe_gpu_attn_route = true        // runtime routing gate over the attention marks (--attn-ab lever)
 
 //! Install the GPU MoE tier (a GPU backend calls this at [init] when its device probe passes).
-def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn; dense : MoeGpuDenseFn; drop : MoeGpuDropFn; dn : MoeGpuDnFn) {
+def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn; dense : MoeGpuDenseFn; drop : MoeGpuDropFn; dn : MoeGpuDnFn; attn : MoeGpuAttnFn) {
     g_moe_gpu_ffn = ffn
     g_moe_gpu_upload = upload
     g_moe_gpu_cls = cls
     g_moe_gpu_dense = dense
     g_moe_gpu_drop = drop
     g_moe_gpu_dn = dn
+    g_moe_gpu_attn = attn
     g_moe_gpu_installed = true
 }
 
@@ -1633,6 +1667,25 @@ def public set_moe_gpu_dn_route(on : bool) {
     g_moe_gpu_dn_route = on
 }
 
+//! Loader contract: mark one full-attention layer's q/k/v/o plane quad resident on the tier —
+//! the prefill attention block then runs as one device chain. Reset per load.
+def public set_moe_gpu_attn_layer(l : int64) {
+    g_moe_gpu_attn_layers |> insert(l)
+}
+
+def public reset_moe_gpu_attn_layers {
+    g_moe_gpu_attn_layers |> clear()
+}
+
+def public moe_gpu_attn_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_attn_route && key_exists(g_moe_gpu_attn_layers, l)
+}
+
+//! Runtime routing gate over the attention marks (the --attn-ab in-process lever; uploads stay).
+def public set_moe_gpu_attn_route(on : bool) {
+    g_moe_gpu_attn_route = on
+}
+
 //! Upload one weight stack ([rows x n] at element offset woff) as the GPU tier's row-major
 //! planes — q8 (fmt 0): int8 quants + f16 halfword scales; native K-quant (fmt = int(KqFmt)
 //! k4/k5/k6): superblock quant payloads + decoded 20B scale rows. stream = keep in a pinned
@@ -1701,6 +1754,26 @@ def public matmul_moe_gpu_dn(var y : array<float>; woq, woz, woo : int64;
             addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), addr<float const?>(b[0]), addr<float const?>(g[0]),
             convw, wnormp, ap, dtp, stp, addr(tail[0]), histp,
             npos, dim, cd, kd, di, nvh, nkh, ds, dconv, eps)
+    }
+}
+
+//! One full-attention layer's whole softmax attention block on the GPU tier — see MoeGpuAttnFn
+//! for the contract. y gets npos x dim wo rows; k/v get the npos x kv_dim roped-k / raw-v rows
+//! (the caller's kv_store_batch source). cos/sin are npos x rot/2 NEOX rope rows; rms weight
+//! rows may be null when qknorm is off.
+def public matmul_moe_gpu_attn(var y : array<float>; var k : array<float>; var v : array<float>;
+                               woq, wok, wov, woo : int64; fq, fk, fv, fo : int;
+                               xq : array<int8>; xs : array<float>;
+                               rmsqp : float const?; rmskp : float const?;
+                               cosp : float const?; sinp : float const?;
+                               npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul : int64;
+                               scale : float; eps : float; gated : bool; qknorm : bool) {
+    unsafe {
+        invoke(g_moe_gpu_attn, addr(y[0]), addr(k[0]), addr(v[0]),
+            woq, wok, wov, woo, fq, fk, fv, fo,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            rmsqp, rmskp, cosp, sinp,
+            npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul, scale, eps, gated, qknorm)
     }
 }
 

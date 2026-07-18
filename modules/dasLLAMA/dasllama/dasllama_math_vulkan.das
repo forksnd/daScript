@@ -702,6 +702,281 @@ def dn_requant {
     }
 }
 
+// ===== the attention kernels =====
+// The full-attention block between the q/k/v GEMMs and the wo projection: at_prep_q/at_prep_k
+// (deinterleave + per-head qk-RMSNorm + partial NEOX rope, one workgroup per position; k lands
+// at ABSOLUTE batch positions so windows accumulate context) and at_attn (flash-style causal
+// attention — one workgroup per (head, 8-query tile), K/V staged through shared in 32-row tiles,
+// online softmax with the probability tile in shared, the sigmoid out-gate folded into the
+// epilogue). Numerics are f32 with per-tile accumulation order — drift-class vs the CPU flash
+// path (the parity bar is token-identical output, not bit-identical logits).
+//
+// at meta (vk_meta view, uints): [0]=rows (window) [1]=w0 (window base position) [2]=qd
+// [3]=kv_dim [4]=hs [5]=half (rot/2) [6]=n_heads [7]=n_kv_heads [8]=kv_mul [9]=flags (bit0
+// gated, bit1 qk-norm) [10]=o region base (0 — dn_requant/q8k_requant read it) [11]=dpl (hs/32,
+// dims per lane) [12]=ctx (w0+rows) [13]=sin row offset [14]=rmsq offset [15]=rmsk offset
+// [16]=cos row offset (float offsets into the smalls plane) [18]=requant block count.
+// Smalls floats: [0]=eps [1]=attention scale.
+
+var @workgroup at_row : float[8192]   // one position's projection row (qd <= 8192)
+var @workgroup at_hs : float[64]      // per-head inverse rms (n_heads <= 64)
+
+// deinterleave (gated q), per-head RMSNorm, partial NEOX rope of one projection row — the shared
+// core of at_prep_q/at_prep_k. src rows in vk_y (the GEMM's window output, 2x-wide when a gated
+// q), transformed rows out via vk_upf at (obase + p) * d; a gated q also writes the gate half to
+// vk_xqf. Head square-sums run f32 by one thread per head (the CPU rmsnorm sums f32 too).
+def private at_prep_core(d, nh, rms_off, obase, qsrc : uint) {
+    let p = gl_WorkGroupID.x
+    let hs = vk_meta[4u]
+    let half = vk_meta[5u]
+    let flags = vk_meta[9u]
+    let gated = qsrc != 0u ? (flags & 1u) : 0u
+    let qknorm = flags & 2u
+    let cos_off = vk_meta[16u]
+    let sin_off = vk_meta[13u]
+    let eps = vk_xs[0u]
+    let tid = gl_LocalInvocationID.x
+    var i = tid
+    while (i < d) {
+        let h = i / hs
+        let j = i % hs
+        if (gated != 0u) {
+            at_row[i] = vk_y[p * 2u * d + h * 2u * hs + j]
+            vk_xqf[p * d + i] = vk_y[p * 2u * d + h * 2u * hs + hs + j]
+        } else {
+            at_row[i] = vk_y[p * d + i]
+        }
+        i += 256u
+    }
+    barrier()
+    if (qknorm != 0u && tid < nh) {
+        var ss = 0.0
+        var j = 0u
+        while (j < hs) {
+            let v = at_row[tid * hs + j]
+            ss += v * v
+            j++
+        }
+        at_hs[tid] = 1.0 / sqrt(ss / float(hs) + eps)
+    }
+    barrier()
+    i = tid
+    while (i < d) {
+        let h = i / hs
+        let j = i % hs
+        var v = at_row[i]
+        if (qknorm != 0u) {
+            v = vk_xs[rms_off + j] * (v * at_hs[h])
+        }
+        var outv = v
+        if (j < half) {
+            var v1 = at_row[h * hs + j + half]
+            if (qknorm != 0u) {
+                v1 = vk_xs[rms_off + j + half] * (v1 * at_hs[h])
+            }
+            outv = v * vk_xs[cos_off + p * half + j] - v1 * vk_xs[sin_off + p * half + j]
+        } elif (j < 2u * half) {
+            let jj = j - half
+            var v0 = at_row[h * hs + jj]
+            if (qknorm != 0u) {
+                v0 = vk_xs[rms_off + jj] * (v0 * at_hs[h])
+            }
+            outv = v0 * vk_xs[sin_off + p * half + jj] + v * vk_xs[cos_off + p * half + jj]
+        }
+        vk_upf[(obase + p) * d + i] = outv
+        i += 256u
+    }
+}
+
+[compute_shader(local_size_x=256, name="at_prep_q_spv")]
+def at_prep_q {
+    at_prep_core(vk_meta[2u], vk_meta[6u], vk_meta[14u], 0u, 1u)
+}
+
+[compute_shader(local_size_x=256, name="at_prep_k_spv")]
+def at_prep_k {
+    at_prep_core(vk_meta[3u], vk_meta[7u], vk_meta[15u], vk_meta[1u], 0u)
+}
+
+// attention shared: the tile's 8 q rows, one 32-row K/V stage (stride 257 — a lane's strided
+// column reads land 32 lanes on 32 distinct banks), the 8x32 score/probability tile, and the
+// per-row online-softmax state
+var @workgroup fa_q : float[2048]
+var @workgroup fa_kv : float[8224]
+var @workgroup fa_p : float[256]
+var @workgroup fa_m : float[8]
+var @workgroup fa_l : float[8]
+var @workgroup fa_a : float[8]
+
+// flash-style causal attention: one workgroup per (head, 8-query tile), 256 threads = 8 rows x
+// 32 lanes; lane c owns output dims c + 32*jj (strided — keeps the AV shared reads conflict-free).
+// K tiles of 32 stage into shared, scores + online-softmax update, then the V tile REUSES the
+// same staging and the probability tile drives the AV accumulation. The epilogue divides by the
+// row sum, applies the sigmoid out-gate (gated arches), and writes the o row over the gate row
+// (same element, same thread). Q/K/V read at absolute positions gq = w0 + q0 + r.
+[compute_shader(local_size_x=256, name="at_attn_spv")]
+def at_attn {
+    let rows = vk_meta[0u]
+    let w0 = vk_meta[1u]
+    let qd = vk_meta[2u]
+    let kvd = vk_meta[3u]
+    let hs = vk_meta[4u]
+    let kv_mul = vk_meta[8u]
+    let flags = vk_meta[9u]
+    let dpl = vk_meta[11u]
+    let scale = vk_xs[1u]
+    let qtiles = (rows + 7u) / 8u
+    let h = gl_WorkGroupID.x / qtiles
+    let q0 = (gl_WorkGroupID.x % qtiles) * 8u
+    let tid = gl_LocalInvocationID.x
+    let r = tid / 32u
+    let c = tid % 32u
+    let kvh = h / kv_mul
+    var i = tid
+    while (i < 8u * hs) {
+        let qr = q0 + i / hs
+        fa_q[i] = qr < rows ? vk_upf[qr * qd + h * hs + i % hs] : 0.0
+        i += 256u
+    }
+    if (tid < 8u) {
+        fa_m[tid] = -3.0e38
+        fa_l[tid] = 0.0
+    }
+    var o0 = 0.0
+    var o1 = 0.0
+    var o2 = 0.0
+    var o3 = 0.0
+    var o4 = 0.0
+    var o5 = 0.0
+    var o6 = 0.0
+    var o7 = 0.0
+    barrier()
+    let gq = w0 + q0 + r
+    let kend = w0 + min(q0 + 8u, rows)   // causal bound (exclusive) of the tile's last valid row
+    var k0 = 0u
+    while (k0 < kend) {
+        i = tid
+        while (i < 32u * hs) {
+            let kr = k0 + i / hs
+            fa_kv[(i / hs) * 257u + i % hs] = kr < kend ? vk_wsf[kr * kvd + kvh * hs + i % hs] : 0.0
+            i += 256u
+        }
+        barrier()
+        var s = 0.0
+        var j = 0u
+        while (j < hs) {   // 4-wide manual unroll (hs % 32 == 0)
+            s += fa_q[r * hs + j] * fa_kv[c * 257u + j]
+            s += fa_q[r * hs + j + 1u] * fa_kv[c * 257u + j + 1u]
+            s += fa_q[r * hs + j + 2u] * fa_kv[c * 257u + j + 2u]
+            s += fa_q[r * hs + j + 3u] * fa_kv[c * 257u + j + 3u]
+            j += 4u
+        }
+        let gk = k0 + c
+        fa_p[r * 32u + c] = (gk <= gq && q0 + r < rows) ? s * scale : -3.0e38
+        barrier()
+        if (tid < 8u) {   // per-row online-softmax update: max, rescale, exponentiate in place
+            var mt = fa_m[tid]
+            var j2 = 0u
+            while (j2 < 32u) {
+                mt = max(mt, fa_p[tid * 32u + j2])
+                j2++
+            }
+            let alpha = exp(fa_m[tid] - mt)
+            var lsum = 0.0
+            j2 = 0u
+            while (j2 < 32u) {
+                let e = exp(fa_p[tid * 32u + j2] - mt)
+                fa_p[tid * 32u + j2] = e
+                lsum += e
+                j2++
+            }
+            fa_l[tid] = fa_l[tid] * alpha + lsum
+            fa_m[tid] = mt
+            fa_a[tid] = alpha
+        }
+        barrier()
+        let av = fa_a[r]
+        o0 *= av
+        o1 *= av
+        o2 *= av
+        o3 *= av
+        if (dpl > 4u) {
+            o4 *= av
+            o5 *= av
+            o6 *= av
+            o7 *= av
+        }
+        i = tid
+        while (i < 32u * hs) {   // V tile reuses the K staging (all K reads completed above)
+            let kr = k0 + i / hs
+            fa_kv[(i / hs) * 257u + i % hs] = kr < kend ? vk_y[kr * kvd + kvh * hs + i % hs] : 0.0
+            i += 256u
+        }
+        barrier()
+        var c2 = 0u
+        while (c2 < 32u) {
+            let pw = fa_p[r * 32u + c2]
+            let vb = c2 * 257u + c
+            o0 += pw * fa_kv[vb]
+            o1 += pw * fa_kv[vb + 32u]
+            o2 += pw * fa_kv[vb + 64u]
+            o3 += pw * fa_kv[vb + 96u]
+            if (dpl > 4u) {
+                o4 += pw * fa_kv[vb + 128u]
+                o5 += pw * fa_kv[vb + 160u]
+                o6 += pw * fa_kv[vb + 192u]
+                o7 += pw * fa_kv[vb + 224u]
+            }
+            c2++
+        }
+        barrier()
+        k0 += 32u
+    }
+    if (q0 + r < rows) {
+        let inv = 1.0 / fa_l[r]
+        let ob = (q0 + r) * qd + h * hs + c
+        let gated = flags & 1u
+        var jj = 0u
+        while (jj < dpl) {
+            var v = (jj == 0u ? o0 : (jj == 1u ? o1 : (jj == 2u ? o2 : (jj == 3u ? o3
+                : (jj == 4u ? o4 : (jj == 5u ? o5 : (jj == 6u ? o6 : o7))))))) * inv
+            if (gated != 0u) {
+                let g = vk_xqf[ob + jj * 32u]
+                v = v / (1.0 + exp(-g))
+            }
+            vk_xqf[ob + jj * 32u] = v
+            jj++
+        }
+    }
+}
+
+// plain Q8_K requant (no act) — the kq wo GEMM's activation image; input floats at vk_upf base
+// vk_meta[10], one thread per 256-weight superblock ([18] = superblock count). Mirrors
+// quantize_q8_k_into_ptr like q8k_moe_actrq does, minus the act.
+[compute_shader(local_size_x=256, name="q8k_requant_spv")]
+def q8k_requant {
+    let b = gl_GlobalInvocationID.x
+    if (b < vk_meta[18u]) {
+        let base = vk_meta[10u] + b * 256u
+        var amax = 0.0
+        for (i in range(256)) {
+            amax = max(amax, abs(vk_upf[base + uint(i)]))
+        }
+        let d = amax / 127.0
+        let id = d != 0.0 ? 1.0 / d : 0.0
+        vk_xs[b] = d
+        for (w in range(64)) {
+            let wb = base + uint(w) * 4u
+            var word = 0u
+            for (j in range(4)) {
+                let q = int(round(vk_upf[wb + uint(j)] * id))
+                word = word | ((uint(q) & 0xFF) << (uint(j) * 8u))
+            }
+            vk_xq[b * 64u + uint(w)] = word
+        }
+    }
+}
+
 // ===== the K-quant decode kernels =====
 // Native k4/k5/k6 GEMVs over superblock quant payloads + decoded 20B scale rows, with Q8_K
 // activations (per-256 f32 scales in vk_xs). Same one-subgroup-per-row shape as q8_moe_groupn,
@@ -1336,6 +1611,23 @@ let private DN_SM_HIST = DN_SM_DT + DN_MAX_HEADS
 let private DN_SMALLS_BYTES = (DN_SM_HIST + DN_MAX_CD * (DN_MAX_DCONV - 1l) + 64l) * 4l
 let private DN_TAIL_BYTES = DN_MAX_CD * (DN_MAX_DCONV - 1l) * 4l
 
+// attention chain capacities (npos chunks over AT_WINDOW windows; roped K / raw V persist
+// device-side at ABSOLUTE batch positions across windows, so later windows attend the whole
+// batch — the engine arm gates on start_pos == 0). Maxima cover the qwen3 family (hd 128/256,
+// kv_dim 512, qd 4096) — vk_moe_attn asserts them (fail-closed on bigger geometry).
+let private AT_WINDOW = 512l
+let private AT_CTX = 4_096l
+let private AT_MAX_QD = 8_192l
+let private AT_MAX_KV = 1_024l
+let private AT_MAX_HS = 256l
+let private AT_META_BYTES = 128l
+// smalls plane float offsets: [eps, scale] consts, the per-head qk-rms weight rows, then the
+// window's cos/sin rope rows packed contiguously (sin offset = AT_SM_COS + rows*half, meta [13])
+let private AT_SM_RMSQ = 16l
+let private AT_SM_RMSK = AT_SM_RMSQ + AT_MAX_HS
+let private AT_SM_COS = AT_SM_RMSK + AT_MAX_HS
+let private AT_SMALLS_BYTES = (AT_SM_COS + 2l * AT_WINDOW * (AT_MAX_HS / 2l) + 64l) * 4l
+
 struct private HostBuf {
     buf : uint64       // VkBuffer
     mem : uint64       // VkDeviceMemory
@@ -1431,6 +1723,10 @@ struct private GpuState {
     dn_conv_pipeline : Pipeline // deltanet conv + SiLU + q/k L2-norm (one workgroup per position)
     dn_scan_pipeline : Pipeline // deltanet chunked delta-rule scan (one workgroup per v-head)
     dn_rq_pipeline : Pipeline   // plain Q8_0 requant of the scan's o rows (out-proj image)
+    at_prep_q_pipeline : Pipeline   // attention q(|gate) deinterleave + qk-rms + partial rope
+    at_prep_k_pipeline : Pipeline   // attention k rms + rope, written at absolute batch positions
+    at_attn_pipeline : Pipeline     // flash-style causal attention (GQA, online softmax, out-gate)
+    q8k_rq_pipeline : Pipeline      // plain Q8_K requant (the kq wo GEMM's activation image)
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
@@ -1490,6 +1786,22 @@ struct private GpuState {
     dn_scan_set : VkDescriptorSet
     dn_rq_set : VkDescriptorSet
     dn_ready : bool
+    // attention chain state (lazy — first attention dispatch creates it)
+    at_meta : HostBuf             // attention kernel params staging
+    at_meta_dev : uint64
+    at_smalls : HostBuf           // eps/scale/rms rows + the window's cos/sin rope rows
+    at_smalls_dev : uint64
+    at_q_dev : uint64             // the window's normed+roped q rows
+    at_g_dev : uint64             // gate rows in, attention o rows out (same element, same thread)
+    at_k_dev : uint64             // roped k rows at ABSOLUTE batch positions (windows accumulate)
+    at_v_dev : uint64             // raw v rows at absolute positions
+    at_vraw_dev : uint64          // the v GEMM's window-relative output (device-copied into at_v_dev)
+    at_kv_host : HostBuf          // host-cached k/v readback (k at 0, v at AT_WINDOW*AT_MAX_KV floats)
+    at_prep_q_set : VkDescriptorSet
+    at_prep_k_set : VkDescriptorSet
+    at_attn_set : VkDescriptorSet
+    at_rq_set : VkDescriptorSet
+    at_ready : bool
 }
 
 var private g_gpu : GpuState?
@@ -1706,6 +2018,14 @@ def private vk_moe_init : bool {
     g_gpu.dn_scan_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, dsshader)
     var drshader <- create_shader_module(g_gpu.device, dn_requant_spv)
     g_gpu.dn_rq_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, drshader)
+    var apqshader <- create_shader_module(g_gpu.device, at_prep_q_spv)
+    g_gpu.at_prep_q_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, apqshader)
+    var apkshader <- create_shader_module(g_gpu.device, at_prep_k_spv)
+    g_gpu.at_prep_k_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, apkshader)
+    var atshader <- create_shader_module(g_gpu.device, at_attn_spv)
+    g_gpu.at_attn_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, atshader)
+    var qkrshader <- create_shader_module(g_gpu.device, q8k_requant_spv)
+    g_gpu.q8k_rq_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, qkrshader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -2101,7 +2421,7 @@ def private ensure_comb_state {
 // batch bindings differ from decode's: meta is the stack's BATCH table, activations point at a
 // role-fixed image (gate/up: the gathered x scratch; down: the requantized hidden planes), y one
 // of the two shared device planes (gate/down write y1_dev, up y2_dev)
-def private ensure_batch_set(si : int; ybuf, xqbuf, xsbuf : uint64; xqbytes, xsbytes : int64) {
+def private ensure_batch_set(si : int; ybuf, xqbuf, xsbuf : uint64; xqbytes, xsbytes : int64; ybytes : int64 = BATCH_Y_BYTES) {
     if (g_gpu.stacks[si].batch_made && g_gpu.stacks[si].batch_y == ybuf && g_gpu.stacks[si].batch_xq == xqbuf) {
         return
     }
@@ -2117,7 +2437,7 @@ def private ensure_batch_set(si : int; ybuf, xqbuf, xsbuf : uint64; xqbytes, xsb
     write_buf_desc(writes, g_gpu.stacks[si].batch_set, 2u, g_gpu.stacks[si].batch_meta_dev, BATCH_META_BYTES)
     write_buf_desc(writes, g_gpu.stacks[si].batch_set, 3u, xqbuf, xqbytes)
     write_buf_desc(writes, g_gpu.stacks[si].batch_set, 4u, xsbuf, xsbytes)
-    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 5u, ybuf, BATCH_Y_BYTES)
+    write_buf_desc(writes, g_gpu.stacks[si].batch_set, 5u, ybuf, ybytes)
     let no_copies : array<CopyDescriptorSet>
     update_descriptor_sets(g_gpu.device, writes, no_copies)
     g_gpu.stacks[si].batch_y = ybuf
@@ -2661,6 +2981,247 @@ def vk_moe_dn(var yp : float?; woq, woz, woo : int64;
     }
 }
 
+// ===== attention dispatch (the full-attention-layer chain) =====
+
+def private ensure_at_state {
+    if (g_gpu.at_ready) {
+        return
+    }
+    ensure_batch_state()
+    g_gpu.at_meta = make_host_buf(AT_META_BYTES, false)
+    g_gpu.at_meta_dev = make_device_buf(AT_META_BYTES)
+    g_gpu.at_smalls = make_host_buf(AT_SMALLS_BYTES, false)
+    g_gpu.at_smalls_dev = make_device_buf(AT_SMALLS_BYTES)
+    g_gpu.at_q_dev = make_device_buf(AT_WINDOW * AT_MAX_QD * 4l)
+    g_gpu.at_g_dev = make_device_buf(AT_WINDOW * AT_MAX_QD * 4l)
+    g_gpu.at_k_dev = make_device_buf(AT_CTX * AT_MAX_KV * 4l)
+    g_gpu.at_v_dev = make_device_buf(AT_CTX * AT_MAX_KV * 4l)
+    g_gpu.at_vraw_dev = make_device_buf(AT_WINDOW * AT_MAX_KV * 4l)
+    g_gpu.at_kv_host = make_host_buf(2l * AT_WINDOW * AT_MAX_KV * 4l, true, [cached = true])
+    g_gpu.at_prep_q_set = alloc_desc_set()
+    g_gpu.at_prep_k_set = alloc_desc_set()
+    g_gpu.at_attn_set = alloc_desc_set()
+    g_gpu.at_rq_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    // prep-q: q|gate GEMM rows in at 5 (batch y1), q rows out at 0 (vk_upf), gate rows out at 3
+    // (vk_xqf), smalls at 4, params at 2; 1 filler
+    write_buf_desc(writes, g_gpu.at_prep_q_set, 0u, g_gpu.at_q_dev, AT_WINDOW * AT_MAX_QD * 4l)
+    write_buf_desc(writes, g_gpu.at_prep_q_set, 1u, g_gpu.at_meta_dev, AT_META_BYTES)
+    write_buf_desc(writes, g_gpu.at_prep_q_set, 2u, g_gpu.at_meta_dev, AT_META_BYTES)
+    write_buf_desc(writes, g_gpu.at_prep_q_set, 3u, g_gpu.at_g_dev, AT_WINDOW * AT_MAX_QD * 4l)
+    write_buf_desc(writes, g_gpu.at_prep_q_set, 4u, g_gpu.at_smalls_dev, AT_SMALLS_BYTES)
+    write_buf_desc(writes, g_gpu.at_prep_q_set, 5u, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
+    // prep-k: k GEMM rows in at 5 (batch y2), roped k out at 0 at ABSOLUTE positions; the gate
+    // view (3) never fires for a k row — meta filler
+    write_buf_desc(writes, g_gpu.at_prep_k_set, 0u, g_gpu.at_k_dev, AT_CTX * AT_MAX_KV * 4l)
+    write_buf_desc(writes, g_gpu.at_prep_k_set, 1u, g_gpu.at_meta_dev, AT_META_BYTES)
+    write_buf_desc(writes, g_gpu.at_prep_k_set, 2u, g_gpu.at_meta_dev, AT_META_BYTES)
+    write_buf_desc(writes, g_gpu.at_prep_k_set, 3u, g_gpu.at_meta_dev, AT_META_BYTES)
+    write_buf_desc(writes, g_gpu.at_prep_k_set, 4u, g_gpu.at_smalls_dev, AT_SMALLS_BYTES)
+    write_buf_desc(writes, g_gpu.at_prep_k_set, 5u, g_gpu.batch_y2_dev, BATCH_Y_BYTES)
+    // attn: q rows at 0 (vk_upf), k rows at 1 (vk_wsf), gate in / o out at 3 (vk_xqf), smalls
+    // at 4, v rows at 5 (vk_y), params at 2
+    write_buf_desc(writes, g_gpu.at_attn_set, 0u, g_gpu.at_q_dev, AT_WINDOW * AT_MAX_QD * 4l)
+    write_buf_desc(writes, g_gpu.at_attn_set, 1u, g_gpu.at_k_dev, AT_CTX * AT_MAX_KV * 4l)
+    write_buf_desc(writes, g_gpu.at_attn_set, 2u, g_gpu.at_meta_dev, AT_META_BYTES)
+    write_buf_desc(writes, g_gpu.at_attn_set, 3u, g_gpu.at_g_dev, AT_WINDOW * AT_MAX_QD * 4l)
+    write_buf_desc(writes, g_gpu.at_attn_set, 4u, g_gpu.at_smalls_dev, AT_SMALLS_BYTES)
+    write_buf_desc(writes, g_gpu.at_attn_set, 5u, g_gpu.at_v_dev, AT_CTX * AT_MAX_KV * 4l)
+    // requant: o rows in at 0 (vk_upf view of at_g), quant words out at 3 (hq), scales out at 4
+    // (hs) — the wo GEMM's activation image bindings; params at 2; 1/5 fillers
+    write_buf_desc(writes, g_gpu.at_rq_set, 0u, g_gpu.at_g_dev, AT_WINDOW * AT_MAX_QD * 4l)
+    write_buf_desc(writes, g_gpu.at_rq_set, 1u, g_gpu.at_meta_dev, AT_META_BYTES)
+    write_buf_desc(writes, g_gpu.at_rq_set, 2u, g_gpu.at_meta_dev, AT_META_BYTES)
+    write_buf_desc(writes, g_gpu.at_rq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, g_gpu.at_rq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
+    write_buf_desc(writes, g_gpu.at_rq_set, 5u, g_gpu.at_meta_dev, AT_META_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.at_ready = true
+    to_log(LOG_INFO, "dasLLAMA vulkan tier: attention chain engaged\n")
+}
+
+def private fill_at_meta(rows, w0, qd, kv_dim, hs, half, n_heads, n_kv_heads, kv_mul, nblocks : int64; gated, qknorm : bool) {
+    unsafe {
+        var mp = reinterpret<uint?>(g_gpu.at_meta.mapped)
+        mp[0] = uint(rows)
+        mp[1] = uint(w0)
+        mp[2] = uint(qd)
+        mp[3] = uint(kv_dim)
+        mp[4] = uint(hs)
+        mp[5] = uint(half)
+        mp[6] = uint(n_heads)
+        mp[7] = uint(n_kv_heads)
+        mp[8] = uint(kv_mul)
+        mp[9] = uint((gated ? 1 : 0) | (qknorm ? 2 : 0))
+        mp[10] = 0u
+        mp[11] = uint(hs / 32l)
+        mp[12] = uint(w0 + rows)
+        mp[13] = uint(AT_SM_COS + rows * half)
+        mp[14] = uint(AT_SM_RMSQ)
+        mp[15] = uint(AT_SM_RMSK)
+        mp[16] = uint(AT_SM_COS)
+        mp[17] = 0u
+        mp[18] = uint(nblocks)
+    }
+}
+
+// one attention window: acts/meta/smalls staging copies, q|gate + k + v tiles, the prep pair
+// (deinterleave/qk-rms/rope; k lands at absolute positions), v append + k/v host DMA in the
+// transfer window, the flash attention pass, o requant, wo tile, y DMA
+def private record_at_cmd(s_q, s_k, s_v, s_o : int; nwg_q, nwg_k, nwg_v, nwg_o : uint;
+                          rows, w0, qd, kv_dim, dim, n_heads : int64;
+                          axq_bytes, axs_bytes, sm_bytes : int64; o_kq : bool) {
+    let raw = g_gpu.batch_cmd
+    let rf : VkCommandBufferResetFlags
+    vk_check(vkResetCommandBuffer(raw, rf), null)
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    cmd_copy_batch_acts(raw, axq_bytes, axs_bytes)
+    cmd_copy_batch_meta(raw, s_q)
+    cmd_copy_batch_meta(raw, s_k)
+    cmd_copy_batch_meta(raw, s_v)
+    cmd_copy_batch_meta(raw, s_o)
+    cmd_copy_whole(raw, g_gpu.at_meta.buf, g_gpu.at_meta_dev, AT_META_BYTES)
+    cmd_copy_range(raw, g_gpu.at_smalls.buf, 0l, g_gpu.at_smalls_dev, 0l, sm_bytes)
+    batch_barrier(raw, true)
+    bind_batch_pipe(raw, g_gpu.stacks[s_q].fmt)
+    cmd_bind_dispatch(raw, g_gpu.stacks[s_q].batch_set, nwg_q)
+    if (g_gpu.stacks[s_k].fmt != g_gpu.stacks[s_q].fmt) {
+        bind_batch_pipe(raw, g_gpu.stacks[s_k].fmt)
+    }
+    cmd_bind_dispatch(raw, g_gpu.stacks[s_k].batch_set, nwg_k)
+    if (g_gpu.stacks[s_v].fmt != g_gpu.stacks[s_k].fmt) {
+        bind_batch_pipe(raw, g_gpu.stacks[s_v].fmt)
+    }
+    cmd_bind_dispatch(raw, g_gpu.stacks[s_v].batch_set, nwg_v)
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.at_prep_q_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.at_prep_q_set, uint(rows))
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.at_prep_k_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.at_prep_k_set, uint(rows))
+    // transfer window: append the raw v rows at their absolute positions, and DMA the window's
+    // roped k / raw v rows to the host (the caller's kv_store_batch source)
+    batch_barrier(raw, false)
+    cmd_copy_range(raw, g_gpu.at_vraw_dev, 0l, g_gpu.at_v_dev, w0 * kv_dim * 4l, rows * kv_dim * 4l)
+    cmd_copy_range(raw, g_gpu.at_k_dev, w0 * kv_dim * 4l, g_gpu.at_kv_host.buf, 0l, rows * kv_dim * 4l)
+    cmd_copy_range(raw, g_gpu.at_vraw_dev, 0l, g_gpu.at_kv_host.buf, AT_WINDOW * AT_MAX_KV * 4l, rows * kv_dim * 4l)
+    batch_barrier(raw, true)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.at_attn_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.at_attn_set, uint(n_heads * ((rows + 7l) / 8l)))
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), o_kq ? g_gpu.q8k_rq_pipeline : g_gpu.dn_rq_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.at_rq_set, uint((rows * qd / (o_kq ? 256l : 32l) + 255l) / 256l))
+    comp_barrier(raw)
+    bind_batch_pipe(raw, g_gpu.stacks[s_o].fmt)
+    cmd_bind_dispatch(raw, g_gpu.stacks[s_o].batch_set, nwg_o)
+    batch_barrier(raw, false)
+    cmd_copy_whole(raw, g_gpu.batch_y1_dev, g_gpu.batch_y1.buf, rows * dim * 4l)
+    vk_check(vkEndCommandBuffer(raw), null)
+}
+
+//! MoeGpuAttnFn: one full-attention layer's whole softmax attention block as one submit chain
+//! per AT_WINDOW rows — q|gate/k/v GEMMs off the normed-x image, per-head qk-rms + partial NEOX
+//! rope, flash-style causal attention with the sigmoid out-gate folded in, requant (form follows
+//! the wo stack), wo projection. yp gets npos x dim rows; kp/vp the roped-k / raw-v rows for the
+//! caller's cache store. K/V persist device-side at absolute positions, so later windows attend
+//! the whole batch (the engine arm gates on start_pos == 0).
+def vk_moe_attn(var yp : float?; var kp : float?; var vp : float?;
+                woq, wok, wov, woo : int64; fq, fk, fv, fo : int;
+                xqp : int8 const?; xsp : float const?;
+                rmsqp : float const?; rmskp : float const?;
+                cosp : float const?; sinp : float const?;
+                npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul : int64;
+                scale : float; eps : float; gated : bool; qknorm : bool) {
+    let s_q = find_stack(woq, fq)
+    let s_k = find_stack(wok, fk)
+    let s_v = find_stack(wov, fv)
+    let s_o = find_stack(woo, fo)
+    // q/k/v share one activation image, so their format class must agree (the FFN triple rule);
+    // the wo stack is free — the requant form follows it
+    let kq = fq != 0
+    assert((fk != 0) == kq && (fv != 0) == kq,
+        "dasLLAMA vulkan tier: q/k/v stack format class mismatch in one attention chain")
+    let half = rot / 2l
+    let n_kv = kv_dim / hs
+    assert(npos <= AT_CTX && qd <= AT_MAX_QD && kv_dim <= AT_MAX_KV
+           && (hs == 128l || hs == 256l) && half >= 1l && 2l * half <= hs
+           && n_heads * hs == qd && n_kv * hs == kv_dim && n_heads == n_kv * kv_mul
+           && n_heads <= 64l && dim % 32l == 0l && kv_dim % 32l == 0l
+           && qd % (fo != 0 ? 256l : 32l) == 0l
+           && (gated ? 2l : 1l) * qd * AT_WINDOW * 4l <= BATCH_Y_BYTES
+           && qd * AT_WINDOW <= BATCH_HQ_BYTES && npos * dim * 4l <= BATCH_Y_BYTES,
+        "dasLLAMA vulkan tier: attention geometry outside chain capacity")
+    let xunit = kq ? 256l : 32l
+    ensure_batch_state()
+    ensure_at_state()
+    ensure_batch_set(s_q, g_gpu.batch_y1_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
+    ensure_batch_set(s_k, g_gpu.batch_y2_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
+    ensure_batch_set(s_v, g_gpu.at_vraw_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES,
+        [ybytes = AT_WINDOW * AT_MAX_KV * 4l])
+    ensure_batch_set(s_o, g_gpu.batch_y1_dev, g_gpu.hq_dev, g_gpu.hs_dev, BATCH_HQ_BYTES, BATCH_HS_BYTES)
+    unsafe {
+        var sp = reinterpret<float?>(g_gpu.at_smalls.mapped)
+        sp[0] = eps
+        sp[1] = scale
+        if (qknorm) {
+            memcpy(reinterpret<void?>(sp + AT_SM_RMSQ), reinterpret<void? -const>(rmsqp), int(hs * 4l))
+            memcpy(reinterpret<void?>(sp + AT_SM_RMSK), reinterpret<void? -const>(rmskp), int(hs * 4l))
+        }
+    }
+    var q_region = fixed_array(woq, 0l, 0l)
+    var k_region = fixed_array(wok, 0l, 0l)
+    var v_region = fixed_array(wov, 0l, 0l)
+    var o_region = fixed_array(woo, 0l, 0l)
+    var r0 = 0l
+    while (r0 < npos) {
+        let rows = min(AT_WINDOW, npos - r0)
+        let ts0 = ref_time_ticks()
+        q_region[1] = r0
+        q_region[2] = rows
+        k_region[1] = r0
+        k_region[2] = rows
+        v_region[1] = r0
+        v_region[2] = rows
+        o_region[1] = r0
+        o_region[2] = rows
+        var nwg_q = 0u
+        var nwg_k = 0u
+        var nwg_v = 0u
+        var nwg_o = 0u
+        unsafe {
+            nwg_q = fill_batch_meta(s_q, addr(q_region[0]), 1l, dim, gated ? 2l * qd : qd, r0, r0 + rows)
+            nwg_k = fill_batch_meta(s_k, addr(k_region[0]), 1l, dim, kv_dim, r0, r0 + rows)
+            nwg_v = fill_batch_meta(s_v, addr(v_region[0]), 1l, dim, kv_dim, r0, r0 + rows)
+            nwg_o = fill_batch_meta(s_o, addr(o_region[0]), 1l, qd, dim, r0, r0 + rows)
+        }
+        upload_batch_acts(xqp, xsp, r0, rows, dim, xunit)
+        unsafe {
+            var sp = reinterpret<float?>(g_gpu.at_smalls.mapped)
+            par_memcpy(reinterpret<void?>(sp + AT_SM_COS), reinterpret<void? -const>(cosp + r0 * half), rows * half * 4l)
+            par_memcpy(reinterpret<void?>(sp + AT_SM_COS + rows * half), reinterpret<void? -const>(sinp + r0 * half), rows * half * 4l)
+        }
+        fill_at_meta(rows, r0, qd, kv_dim, hs, half, n_heads, n_kv, kv_mul,
+            rows * qd / (fo != 0 ? 256l : 32l), gated, qknorm)
+        let ts1 = ref_time_ticks()
+        record_at_cmd(s_q, s_k, s_v, s_o, nwg_q, nwg_k, nwg_v, nwg_o,
+            rows, r0, qd, kv_dim, dim, n_heads,
+            rows * dim, rows * (dim / xunit) * 4l, (AT_SM_COS + 2l * rows * half) * 4l, fo != 0)
+        submit_wait(g_gpu.batch_cmd)
+        let ts2 = ref_time_ticks()
+        unsafe {
+            par_memcpy(reinterpret<void?>(yp + r0 * dim), g_gpu.batch_y1.mapped, rows * dim * 4l)
+            var kvp8 = reinterpret<uint8?>(g_gpu.at_kv_host.mapped)
+            par_memcpy(reinterpret<void?>(kp + r0 * kv_dim), g_gpu.at_kv_host.mapped, rows * kv_dim * 4l)
+            par_memcpy(reinterpret<void?>(vp + r0 * kv_dim), reinterpret<void?>(kvp8 + AT_WINDOW * AT_MAX_KV * 4l), rows * kv_dim * 4l)
+        }
+        if (vk_prof()) {
+            to_log(LOG_INFO, "vk_attn prep {get_time_usec(ts0) - get_time_usec(ts1)} submit {get_time_usec(ts1) - get_time_usec(ts2)} copy {get_time_usec(ts2)}\n")
+        }
+        r0 += rows
+    }
+}
+
 // ===== decode dispatch (the FFN's GEMV arm) =====
 
 // pre-record (or refresh on a row-count change) the triple's chain: gate+up GEMV pair, fused
@@ -2995,8 +3556,9 @@ def dasllama_math_vulkan_register() {
     let layers = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_LAYERS")))
     let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
     let dn_on = get_env_variable("DASLLAMA_GPU_DN") == "1"
-    if ((layers > 0l || nstream > 0l || dn_on) && vulkan_backend_available()) {
+    let at_on = get_env_variable("DASLLAMA_GPU_ATTN") == "1"
+    if ((layers > 0l || nstream > 0l || dn_on || at_on) && vulkan_backend_available()) {
         set_moe_gpu_layer_count(layers)
-        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn)
+        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
     }
 }

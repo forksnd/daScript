@@ -178,7 +178,7 @@ def private compare_gout(gpu, refv : array<float>) : tuple<maxdiff : float; maxr
 def test_vulkan_moe_ffn_vs_ref(t : T?) {
     t |> run("vulkan MoE FFN tier == CPU reference (decode GEMV + prefill batch arms)") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
             // synthetic stacks: gate/up are (NE*NFE) x N, down is (NE*N) x NFE
             var wq1 : array<int8>
             var ws1 : array<float>
@@ -324,7 +324,7 @@ let SSTRIDE = 100000l   // per-stack offset stride inside the streamed fixture (
 def test_vulkan_moe_ffn_streamed(t : T?) {
     t |> run("vulkan MoE streamed prefill (pinned mirrors, 2 slots) == CPU reference") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
             let ege1 = NFE * N
             let ege2 = N * NFE
             var wq1 : array<array<int8>>
@@ -609,7 +609,7 @@ def private ref_ffn_kq(offs1, offs3, offs2 : array<int64>; nreg : int;
 def test_vulkan_moe_ffn_kq(t : T?) {
     t |> run("vulkan MoE kq tier (k4 gate/up + k5/k6 down) == CPU reference") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
             // k4 gate/up stacks + BOTH down formats in one down stack region set is not a real
             // shape — use two arms sharing the gate/up stacks: down = k6, then down = k5 at a
             // fresh offset (the 35B carries k5 downs on most layers, k6 on the last two)
@@ -756,7 +756,7 @@ let DNR = 40l           // batch rows — one full 32-tile plus an unpadded rema
 def test_vulkan_dense_gemm(t : T?) {
     t |> run("vulkan dense GEMM rail == CPU reference (q8 + k4, one-region batch tiles)") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
             // q8 arm: [DD x N] plane, Q8_0 acts
             var wq : array<int8>
             var ws : array<float>
@@ -1172,7 +1172,7 @@ def private ref_dn_core(qkvy, zy : array<float>; bts, gts, tapsv, wnormv, av, dt
 def test_vulkan_deltanet(t : T?) {
     t |> run("vulkan deltanet chain == CPU reference (chunk-boundary + multi-window arms)") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
             var wqkv : array<int8>
             var wsqkv : array<float>
             var wz : array<int8>
@@ -1308,6 +1308,341 @@ def test_vulkan_deltanet(t : T?) {
             delete wsb
         } else {
             feint("dasVulkan not installed; vulkan deltanet chain untestable here\n")
+        }
+    }
+}
+
+// ===== attention chain arms =====
+// The whole full-attention chain (q|gate/k/v GEMMs -> per-head qk-rms -> partial NEOX rope ->
+// flash-style causal attention with the sigmoid out-gate -> requant -> wo GEMM) vs a CPU mirror
+// of the same math (straight softmax — the online reorder is fp-equivalent within tolerance).
+// Arms: gated partial-rope, ungated full-rope, a k4 wo (the mixed-class Q8_K requant path), and
+// npos = 1100 (multi-window: absolute-position K/V accumulation + cross-window attention).
+
+let ATD = 64l          // model dim
+let ATHS = 128l        // head size (the kernel's dpl=4 shape)
+let ATNH = 4l          // q heads
+let ATNKV = 2l         // kv heads (GQA kv_mul = 2)
+let ATQD = ATNH * ATHS
+let ATKVD = ATNKV * ATHS
+let AT_EPS = 1e-6
+let ATQ_WOFF = 21000000l
+let ATK_WOFF = 22000000l
+let ATV_WOFF = 23000000l
+let ATO_WOFF = 24000000l
+let ATO4_WOFF = 25000000l
+let AT_REL_TOL = 3e-3
+
+// deinterleave (gated) + per-head rms + partial NEOX rope of one projection plane — the CPU
+// mirror of at_prep. rows out d-wide; a gated q also returns the raw gate plane.
+def private ref_at_prep(y : array<float>; rmsw : array<float>; cosr, sinr : array<float>;
+                        npos, d, rot : int64; gated : bool;
+                        var outp : array<float>; var gatep : array<float>) {
+    let half = rot / 2l
+    outp |> resize(int(npos * d))
+    if (gated) {
+        gatep |> resize(int(npos * d))
+    }
+    var row : array<float>
+    row |> resize(int(d))
+    for (p in range64(npos)) {
+        for (i in range64(d)) {
+            let h = i / ATHS
+            let j = i % ATHS
+            if (gated) {
+                row[int(i)] = y[int(p * 2l * d + h * 2l * ATHS + j)]
+                gatep[int(p * d + i)] = y[int(p * 2l * d + h * 2l * ATHS + ATHS + j)]
+            } else {
+                row[int(i)] = y[int(p * d + i)]
+            }
+        }
+        for (h in range64(d / ATHS)) {   // per-head rms (f32 square-sum, the kernel's order)
+            var ss = 0.0
+            for (j in range64(ATHS)) {
+                let v = row[int(h * ATHS + j)]
+                ss += v * v
+            }
+            let scale = 1.0 / sqrt(ss / float(ATHS) + AT_EPS)
+            for (j in range64(ATHS)) {
+                row[int(h * ATHS + j)] = rmsw[int(j)] * (row[int(h * ATHS + j)] * scale)
+            }
+        }
+        for (h in range64(d / ATHS)) {   // NEOX pairs (j, j+half) over the roped span
+            for (j in range64(half)) {
+                let v0 = row[int(h * ATHS + j)]
+                let v1 = row[int(h * ATHS + j + half)]
+                let cr = cosr[int(p * half + j)]
+                let ci = sinr[int(p * half + j)]
+                row[int(h * ATHS + j)] = v0 * cr - v1 * ci
+                row[int(h * ATHS + j + half)] = v0 * ci + v1 * cr
+            }
+        }
+        for (i in range64(d)) {
+            outp[int(p * d + i)] = row[int(i)]
+        }
+    }
+    delete row
+}
+
+// straight-softmax causal attention + out-gate — the CPU mirror of at_attn's online form
+def private ref_at_attn(qp, kp, vp, gatep : array<float>; npos : int64; gated : bool;
+                        var op : array<float>) {
+    let scale = 1.0 / sqrt(float(ATHS))
+    let kv_mul = ATNH / ATNKV
+    op |> resize(int(npos * ATQD))
+    var sc : array<float>
+    sc |> resize(int(npos))
+    for (p in range64(npos)) {
+        for (h in range64(ATNH)) {
+            let kvh = h / kv_mul
+            var mx = -3.0e38
+            for (j in range64(p + 1l)) {
+                var s = 0.0
+                for (dd in range64(ATHS)) {
+                    s += qp[int(p * ATQD + h * ATHS + dd)] * kp[int(j * ATKVD + kvh * ATHS + dd)]
+                }
+                sc[int(j)] = s * scale
+                mx = max(mx, sc[int(j)])
+            }
+            var lsum = 0.0
+            for (j in range64(p + 1l)) {
+                sc[int(j)] = exp(sc[int(j)] - mx)
+                lsum += sc[int(j)]
+            }
+            for (dd in range64(ATHS)) {
+                var acc = 0.0
+                for (j in range64(p + 1l)) {
+                    acc += sc[int(j)] * vp[int(j * ATKVD + kvh * ATHS + dd)]
+                }
+                var v = acc / lsum
+                if (gated) {
+                    let g = gatep[int(p * ATQD + h * ATHS + dd)]
+                    v = v / (1.0 + exp(-g))
+                }
+                op[int(p * ATQD + h * ATHS + dd)] = v
+            }
+        }
+    }
+    delete sc
+}
+
+[test]
+def test_vulkan_attention(t : T?) {
+    t |> run("vulkan attention chain == CPU reference (gated/ungated/kq-wo/multi-window arms)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            var wqg : array<int8>       // gated q|gate plane (2*ATQD rows)
+            var wsqg : array<float>
+            var wqp : array<int8>       // plain q plane (ungated arm)
+            var wsqp : array<float>
+            var wk : array<int8>
+            var wsk : array<float>
+            var wv : array<int8>
+            var wsv : array<float>
+            var wo : array<int8>
+            var wso : array<float>
+            fill_stack(wqg, wsqg, 2l * ATQD, ATD, 51l, true)
+            fill_stack(wqp, wsqp, ATQD, ATD, 53l, true)
+            fill_stack(wk, wsk, ATKVD, ATD, 57l, true)
+            fill_stack(wv, wsv, ATKVD, ATD, 59l, true)
+            fill_stack(wo, wso, ATD, ATQD, 61l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(wqg, wsqg, wqb, wsb)
+            if (!moe_gpu_upload_stack(wqb, wsb, ATQ_WOFF, ATD, 2l * ATQD, 0)) {
+                feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                return
+            }
+            pack_upload(wqp, wsqp, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, ATQ_WOFF + 500000l, ATD, ATQD, 0), "plain q stack uploaded")
+            pack_upload(wk, wsk, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, ATK_WOFF, ATD, ATKVD, 0), "k stack uploaded")
+            pack_upload(wv, wsv, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, ATV_WOFF, ATD, ATKVD, 0), "v stack uploaded")
+            pack_upload(wo, wso, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, ATO_WOFF, ATQD, ATD, 0), "wo stack uploaded")
+            var wo4b : array<uint8>
+            var wso4b : array<uint8>
+            fill_kq_stack(1, ATD, ATQD, 67l, false, wo4b, wso4b)
+            t |> success(moe_gpu_upload_stack(wo4b, wso4b, ATO4_WOFF, ATQD, ATD, 1), "k4 wo stack uploaded")
+            var wo4 : array<float>
+            dequant_kq_stack(1, wo4b, wso4b, ATD, ATQD, wo4)
+            var rmsq : array<float>
+            var rmsk : array<float>
+            rmsq |> resize(int(ATHS))
+            rmsk |> resize(int(ATHS))
+            for (i in range(int(ATHS))) {
+                rmsq[i] = 1.0 + synth_f(int64(i), 71l, 0.3)
+                rmsk[i] = 1.0 + synth_f(int64(i), 73l, 0.3)
+            }
+            // arms: (npos, rot, gated, k4 wo)
+            for (arm in [(npos = 70l, rot = 64l, gated = true, o4 = false),
+                         (npos = 70l, rot = 128l, gated = false, o4 = false),
+                         (npos = 70l, rot = 64l, gated = true, o4 = true),
+                         (npos = 1100l, rot = 64l, gated = true, o4 = false)]) {
+                let npos = arm.npos
+                let rot = arm.rot
+                let half = rot / 2l
+                var xq : array<int8>
+                var xs : array<float>
+                xq |> resize(int(npos * ATD))
+                xs |> resize(int(npos * (ATD / 32l)))
+                for (i in range(int(npos * ATD))) {
+                    xq[i] = int8((int64(i) * 13l + 7l) % 255l - 127l)
+                }
+                for (i in range(int(npos * (ATD / 32l)))) {
+                    xs[i] = pow2_small(int64(i) + 6l)
+                }
+                var cosr : array<float>
+                var sinr : array<float>
+                cosr |> resize(int(npos * half))
+                sinr |> resize(int(npos * half))
+                for (p in range64(npos)) {
+                    for (j in range64(half)) {
+                        let freq = 1.0 / pow(10000.0, float(2l * j) / float(rot))
+                        cosr[int(p * half + j)] = cos(float(p) * freq)
+                        sinr[int(p * half + j)] = sin(float(p) * freq)
+                    }
+                }
+                var y : array<float>
+                var kout : array<float>
+                var vout : array<float>
+                y |> resize(int(npos * ATD))
+                kout |> resize(int(npos * ATKVD))
+                vout |> resize(int(npos * ATKVD))
+                unsafe {
+                    matmul_moe_gpu_attn(y, kout, vout,
+                        arm.gated ? ATQ_WOFF : ATQ_WOFF + 500000l, ATK_WOFF, ATV_WOFF,
+                        arm.o4 ? ATO4_WOFF : ATO_WOFF,
+                        0, 0, 0, arm.o4 ? 1 : 0, xq, xs,
+                        addr<float const?>(rmsq[0]), addr<float const?>(rmsk[0]),
+                        addr<float const?>(cosr[0]), addr<float const?>(sinr[0]),
+                        npos, ATD, ATQD, ATKVD, ATHS, rot, ATNH, ATNH / ATNKV,
+                        1.0 / sqrt(float(ATHS)), float(AT_EPS), arm.gated, true)
+                }
+                // the CPU mirror: GEMMs, prep, attention, requant, wo
+                var qgy : array<float>
+                var ky : array<float>
+                var vy : array<float>
+                if (arm.gated) {
+                    ref_q8_gemm(wqg, wsqg, xq, xs, ATD, 2l * ATQD, npos, qgy)
+                } else {
+                    ref_q8_gemm(wqp, wsqp, xq, xs, ATD, ATQD, npos, qgy)
+                }
+                ref_q8_gemm(wk, wsk, xq, xs, ATD, ATKVD, npos, ky)
+                ref_q8_gemm(wv, wsv, xq, xs, ATD, ATKVD, npos, vy)
+                var qp : array<float>
+                var gatep : array<float>
+                var kp : array<float>
+                var kgate_unused : array<float>
+                ref_at_prep(qgy, rmsq, cosr, sinr, npos, ATQD, rot, arm.gated, qp, gatep)
+                ref_at_prep(ky, rmsk, cosr, sinr, npos, ATKVD, rot, false, kp, kgate_unused)
+                var op : array<float>
+                ref_at_attn(qp, kp, vy, gatep, npos, arm.gated, op)
+                // requant the o rows in the wo stack's form, then the wo GEMM
+                var refy : array<float>
+                if (arm.o4) {
+                    var oq : array<int>
+                    var os : array<float>
+                    oq |> resize(int(npos * ATQD))
+                    os |> resize(int(npos * ATQD / 256l))
+                    for (b in range64(npos * ATQD / 256l)) {
+                        var amax = 0.0
+                        for (j in range64(256l)) {
+                            amax = max(amax, abs(op[int(b * 256l + j)]))
+                        }
+                        let dq = amax / 127.0
+                        let id = dq != 0.0 ? 1.0 / dq : 0.0
+                        os[int(b)] = dq
+                        for (j in range64(256l)) {
+                            oq[int(b * 256l + j)] = int(round(op[int(b * 256l + j)] * id))
+                        }
+                    }
+                    refy |> resize(int(npos * ATD))
+                    let nsbh = int(ATQD / 256l)
+                    for (rw in range(int(npos))) {
+                        for (o in range(int(ATD))) {
+                            var acc = 0.0lf
+                            for (sb in range(nsbh)) {
+                                var dd = 0.0lf
+                                for (j in range(256)) {
+                                    dd += double(wo4[o * int(ATQD) + sb * 256 + j]) * double(oq[rw * int(ATQD) + sb * 256 + j])
+                                }
+                                acc += dd * double(os[rw * nsbh + sb])
+                            }
+                            refy[rw * int(ATD) + o] = float(acc)
+                        }
+                    }
+                    delete oq
+                    delete os
+                } else {
+                    var oq : array<int8>
+                    var os : array<float>
+                    oq |> resize(int(npos * ATQD))
+                    os |> resize(int(npos * ATQD / 32l))
+                    for (b in range64(npos * ATQD / 32l)) {
+                        var amax = 0.0
+                        for (j in range64(32l)) {
+                            amax = max(amax, abs(op[int(b * 32l + j)]))
+                        }
+                        let dq = amax / 127.0
+                        let id = dq != 0.0 ? 1.0 / dq : 0.0
+                        os[int(b)] = dq
+                        for (j in range64(32l)) {
+                            oq[int(b * 32l + j)] = int8(int(round(op[int(b * 32l + j)] * id)))
+                        }
+                    }
+                    ref_q8_gemm(wo, wso, oq, os, ATQD, ATD, npos, refy)
+                    delete oq
+                    delete os
+                }
+                let tag = "npos={npos} rot={rot} gated={arm.gated} o4={arm.o4}"
+                let cy = compare_gout(y, refy)
+                t |> success(cy.maxref > 0.0, "{tag}: chain produced non-trivial outputs")
+                t |> success(cy.maxdiff <= float(AT_REL_TOL) * cy.maxref,
+                    "{tag}: out rows within tolerance (maxdiff {cy.maxdiff} vs {float(AT_REL_TOL) * cy.maxref} bar, maxref {cy.maxref})")
+                let ck = compare_gout(kout, kp)
+                t |> success(ck.maxdiff <= float(AT_REL_TOL) * ck.maxref,
+                    "{tag}: roped k rows within tolerance (maxdiff {ck.maxdiff} vs {float(AT_REL_TOL) * ck.maxref} bar)")
+                let cv = compare_gout(vout, vy)
+                t |> success(cv.maxdiff <= float(AT_REL_TOL) * cv.maxref,
+                    "{tag}: v rows within tolerance (maxdiff {cv.maxdiff} vs {float(AT_REL_TOL) * cv.maxref} bar)")
+                delete xq
+                delete xs
+                delete cosr
+                delete sinr
+                delete y
+                delete kout
+                delete vout
+                delete qgy
+                delete ky
+                delete vy
+                delete qp
+                delete gatep
+                delete kp
+                delete kgate_unused
+                delete op
+                delete refy
+            }
+            delete wqg
+            delete wsqg
+            delete wqp
+            delete wsqp
+            delete wk
+            delete wsk
+            delete wv
+            delete wsv
+            delete wo
+            delete wso
+            delete wqb
+            delete wsb
+            delete wo4b
+            delete wso4b
+            delete wo4
+            delete rmsq
+            delete rmsk
+        } else {
+            feint("dasVulkan not installed; vulkan attention chain untestable here\n")
         }
     }
 }
