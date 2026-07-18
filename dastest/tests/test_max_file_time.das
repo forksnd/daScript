@@ -15,19 +15,11 @@ def passing_fixture() : string {
     return "{dastest_root()}/tests/_fixture_passing.das"
 }
 
-def run_dastest(args : string; var output : string&; var exit_code : int&) {
+def run_dastest(args : array<string>; var output : string&; var exit_code : int&) {
     let exe = get_command_line_arguments()[0]
-    let cmd = "{exe} {dastest_root()}/dastest.das -- --failures-only --test {passing_fixture()} {args}"
-    output = ""
-    unsafe {
-        exit_code = popen(cmd) $(f) {
-            if (f != null) {
-                while (!feof(f)) {
-                    output += fgets(f)
-                }
-            }
-        }
-    }
+    var cmd <- [exe, "{dastest_root()}/dastest.das", "--", "--failures-only", "--test", passing_fixture()]
+    cmd |> push_from(args)
+    exit_code = run_and_capture(cmd, output)
 }
 
 [test]
@@ -35,7 +27,7 @@ def test_max_file_time(tt : T?) {
     tt |> run("a generous file-time limit preserves a passing suite") <| @(t : T?) {
         var output : string
         var exit_code : int
-        run_dastest("--max-file-time 3600", output, exit_code)
+        run_dastest(["--max-file-time", "3600"], output, exit_code)
         t |> equal(exit_code, 0)
         t |> success(output |> contains("3 tests, 3 passed"),
             "expected the passing summary, got:\n{output}")
@@ -46,7 +38,7 @@ def test_max_file_time(tt : T?) {
         // no elapsed-time wait or frame count drives this test.
         var output : string
         var exit_code : int
-        run_dastest("--max-file-time 0.001", output, exit_code)
+        run_dastest(["--max-file-time", "0.001"], output, exit_code)
         t |> success(exit_code != 0, "expected a non-zero exit, got {exit_code}\n{output}")
         t |> success(output |> contains("_fixture_passing.das"),
             "failure should name the slow file, got:\n{output}")
@@ -57,7 +49,7 @@ def test_max_file_time(tt : T?) {
     tt |> run("isolated mode enforces the same per-file limit") <| @(t : T?) {
         var output : string
         var exit_code : int
-        run_dastest("--max-file-time 0.001 --isolated-mode --isolated-mode-threads 1", output, exit_code)
+        run_dastest(["--max-file-time", "0.001", "--isolated-mode", "--isolated-mode-threads", "1"], output, exit_code)
         t |> success(exit_code != 0, "expected a non-zero exit, got {exit_code}\n{output}")
         t |> success(output |> contains("_fixture_passing.das"),
             "isolated failure should name the slow file, got:\n{output}")

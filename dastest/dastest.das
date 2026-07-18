@@ -30,7 +30,7 @@ let private jsonResultPrefix = "##dastest##\n"
 
 struct FileTiming {
     uri : string
-    dt : int     // microseconds
+    dt : int64     // microseconds
 }
 
 struct JsonTestReport {
@@ -41,7 +41,7 @@ struct JsonTestReport {
     errors : int
     skipped : int
     success : bool
-    time_usec : int
+    time_usec : int64
     tests : array<SuiteTestResult>
 }
 
@@ -144,7 +144,7 @@ struct IsolatedResult {
     parsedResult : bool
     status : SuiteResult
     tests : array<SuiteTestResult>
-    fileDt : int
+    fileDt : int64
     err : array<string>
     log : array<string>
 }
@@ -224,7 +224,7 @@ def private run_iso_subprocess(cmd : string; timeoutSec : float; var br : BatchR
                             var r = IsolatedResult(
                                 parsedResult = true,
                                 status = SuiteResult(js),
-                                fileDt = from_JV(obj?["time_usec"] ?? JV(0), type<int>), // nolint:STYLE020 — `?? defV` doesn't typecheck on _object indexing; suite_result.das pattern
+                                fileDt = from_JV(obj?["time_usec"] ?? JV(0), type<int64>), // nolint:STYLE020 — `?? defV` doesn't typecheck on _object indexing; suite_result.das pattern
                                 log <- pending
                             )
                             parse_test_results(js, r.tests)
@@ -496,7 +496,7 @@ def main() : int {
             suite::clear_test_results()
             let t0 = ref_time_ticks()
             let res = suite::test_file(rf, rctx)
-            let dt = get_time_usec(t0)
+            let dt = get_time_nsec(t0) / 1000
             let report = JsonTestReport(
                 file = rf,
                 total = res.total,
@@ -589,7 +589,7 @@ def main() : int {
             let uri = ctx.uriPaths ? file_name_to_uri(file) : file
             let fileTime = ref_time_ticks()
             let status = suite::test_file(file, ctx)
-            let fileDt = get_time_usec(fileTime)
+            let fileDt = get_time_nsec(fileTime) / 1000
             if (status.errors + status.failed == 0) {
                 if (status.total > 0) {
                     log::green("PASS {uri} {time_dt_hr(fileDt)}")
@@ -834,7 +834,7 @@ def private enforce_max_file_time(var res : SuiteResult) {
 def finish_tests(var res : SuiteResult; start_time : int64) : int {
     enforce_max_file_time(res)
     let resCode = res.failed + res.errors
-    let totalDt = get_time_usec(start_time)
+    let totalDt = get_time_nsec(start_time) / 1000
     log::info("\n{to_string(res)}")
     if (resCode == 0 && timingOutliers > 0 && length(fileTimings) > 1) {
         print_timing_outliers()
