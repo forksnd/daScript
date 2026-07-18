@@ -170,6 +170,25 @@ var g_gpu_b_ms = 0.0lf
 var g_sched_b_ms = 0.0lf                     // driver scheduling span (kernelStart..kernelEnd)
 var g_handoff_b_ms = 0.0lf                   // kernelEnd -> GPUStart gap
 
+//! One retired single-stream decode step in the per-step trace (metal_decode_trace_arm) — host
+//! stamps are us on the arm clock; the cb stamps are Metal host-time SECONDS on one shared
+//! timeline across steps (gs - previous step's ge = GPU idle between the two cbs).
+struct MetalDecodeStepTrace {
+    pos : int64
+    mode : int64        // 0 = slow (encode-now), 1 = poked pre-encode, 2 = spec chain
+    commit_us : int64   // host stamp at this step's cb commit (spec: during the PREVIOUS step)
+    finish_us : int64   // host stamp at step retire (wait + readback done)
+    wait_us : int64     // the retire wait: commit-to-drain as the CPU saw it
+    ks : double         // cb kernelStart/EndTime — the driver scheduling span
+    ke : double
+    gs : double         // cb GPUStart/EndTime — the execution window
+    ge : double
+}
+
+var g_step_trace : array<MetalDecodeStepTrace>
+var g_step_trace_cap = 0l
+var g_step_trace_t0 = 0l
+
 // per-session logical KV mirror record (see module header). Mirrors are SLICES of one shared
 // arena buffer (g_arena): the batched kernel reaches every row via a per-row offset table; the
 // single-stream path binds at byte offsets. Fields copyable — slice returns to free list first.
@@ -390,6 +409,23 @@ def public metal_decode_stage_stats() : tuple<steps : int64; setup_us : int64; e
 //! (live KV mirrors, resident mirror bytes) — the churn / LRU-cap gates read this.
 def public metal_decode_mirror_stats() : tuple<mirrors : int64; bytes : uint64> {
     return (mirrors = int64(length(g_mirrors)), bytes = g_mirror_bytes)
+}
+
+//! Arm the per-step single-stream decode trace for the next `cap` retired steps (0 disarms) —
+//! the bimodality diagnostic. Capacity is reserved here; recording stops when full, batch and
+//! prefill steps are never recorded, and a spec mispredict retires TWICE at the same pos
+//! (the wrong-token spec entry, then the slow rerun).
+def public metal_decode_trace_arm(cap : int64) {
+    g_step_trace |> clear()
+    g_step_trace |> reserve(int(cap))
+    g_step_trace_cap = cap
+    g_step_trace_t0 = ref_time_ticks()
+}
+
+//! Move out the recorded per-step trace and disarm.
+def public metal_decode_trace_take() : array<MetalDecodeStepTrace> {
+    g_step_trace_cap = 0l
+    return <- g_step_trace
 }
 
 // " reason=count reason=count" — the declines-by-reason tail of a report line

@@ -199,6 +199,8 @@ struct private StepRes {
     spec : bool           // opened with GPU argmax + embed gather — no CPU poke, runs immediately
     committed : bool      // spec pres commit at encode; poked pres commit at poke time (a cb
                           // parked committed across an idle gap trips the GPU watchdog)
+    trace_mode : int64    // serving path for the step trace (0 slow / 1 poked / 2 spec)
+    t_commit : int64      // trace-clock stamp at this step's cb commit (armed traces only)
     cb : MetalCommandBuffer?
     btok : MetalBuffer?   // the argmax winner (spec steps; read back to verify the prediction)
     koff : uint64         // mirror arena offsets captured at encode time; arena_epoch pins the
@@ -711,6 +713,9 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     if (commit_now) {
         metal_commit(cb)
         r.committed = true
+        if (g_step_trace_cap > 0l) {
+            r.t_commit = int64(get_time_usec(g_step_trace_t0))
+        }
     }
     r.cb = cb
 }
@@ -722,7 +727,8 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
     metal_wait_until_completed(r.cb)
     let err = metal_command_buffer_error(r.cb)
     g_gpu_ms += (metal_command_buffer_gpu_end_time(r.cb) - metal_command_buffer_gpu_start_time(r.cb)) * 1000.0lf
-    g_us_wait += int64(get_time_usec(ts_wait))
+    let wait_us = int64(get_time_usec(ts_wait))
+    g_us_wait += wait_us
     let ok = empty(err)
     if (ok) {
         let ts_rb = ref_time_ticks()
@@ -752,6 +758,15 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
         g_mirrors[s.uid].watermark = r.pos + 1l
         g_us_readback += int64(get_time_usec(ts_rb))
         g_decodes++
+        if (int64(length(g_step_trace)) < g_step_trace_cap) {
+            g_step_trace |> push(MetalDecodeStepTrace(pos = r.pos, mode = r.trace_mode,
+                commit_us = r.t_commit, finish_us = int64(get_time_usec(g_step_trace_t0)),
+                wait_us = wait_us,
+                ks = metal_command_buffer_kernel_start_time(r.cb),
+                ke = metal_command_buffer_kernel_end_time(r.cb),
+                gs = metal_command_buffer_gpu_start_time(r.cb),
+                ge = metal_command_buffer_gpu_end_time(r.cb)))
+        }
     } else {
         to_log(LOG_ERROR, "dasLLAMA metal decode: dispatch failed ({err}) — falling back to the CPU layer loop\n")
         decline(MetalDecodeDecline.gpu_error)
@@ -967,10 +982,14 @@ def metal_decode_forward(t : Model; var s : Session; token, pos : int64) : bool 
     let ts_all = ref_time_ticks()
     var r = g_pre
     g_pre.valid = false
+    r.trace_mode = r.spec ? 2l : 1l
     if (!r.spec) {
         poke_step(s, r)
         metal_commit(r.cb)
         r.committed = true
+        if (g_step_trace_cap > 0l) {
+            r.t_commit = int64(get_time_usec(g_step_trace_t0))
+        }
     }
     g_tick++
     g_mirrors[s.uid].tick = g_tick   // keep the live session hot for the LRU
