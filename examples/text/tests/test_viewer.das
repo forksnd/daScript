@@ -5,6 +5,7 @@ options no_unused_function_arguments = false
 
 require dastest/testing_boost public
 require imgui/imgui_playwright public
+require daslib/fio public
 require daslib/json public
 require daslib/json_boost public
 
@@ -29,9 +30,14 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         let ready = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             initial = viewer_state(app)
             return ((initial?["ok"] ?? false)
-                && (initial?["render_revision"] ?? 0) > 0)
+                && (initial?["render_revision"] ?? 0) > 0
+                && (initial?["window_docked"] ?? false)
+                && (initial?["window_dock_id"] ?? 0) != 0
+                && (initial?["window_dock_id"] ?? 0)
+                    == (initial?["dockspace_id"] ?? -1))
         }
-        t |> success(ready, "welcome Markdown reaches a rendered revision")
+        t |> success(ready,
+                     "welcome Markdown fills the central dockspace as an ordinary window")
         if (!ready) return
 
         let old_revision = initial?["document_revision"] ?? 0
@@ -49,7 +55,8 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         t |> success(file_observed, "loaded Markdown becomes the rendered document")
         if (!file_observed) return
 
-        click(app, "DOCK_ROOT/DOCUMENT_WINDOW/MODE_TOGGLE")
+        let plain_mode = post_command(app, "text_viewer_set_mode", JV((mode = "plain")))
+        t |> success(plain_mode?["ok"] ?? false, "mode command accepts plain text")
         let plain_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             var state = viewer_state(app)
             return ((state?["mode"] ?? "") == "plain"
@@ -115,6 +122,31 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         }
         t |> success(release_observed, "source selection release is acknowledged")
 
+        let input_snapshot = post_command(app, "imgui_snapshot", null)
+        let input_primary = (input_snapshot?["io"]?["config_macos_behaviors"] ?? false) ? "Super" : "Ctrl"
+        let copy_before = viewer_state(app)?["source_selection_copy_revision"] ?? 0
+        post_command(app, "imgui_key_chord", JV((mods = [input_primary], key = "C")))
+        t |> success(wait_for_key_idle(app, 4.0f), "platform-primary copy chord completes")
+        let copy_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return ((state?["source_selection_copy_revision"] ?? 0) > copy_before
+                && (state?["last_command"] ?? "") == "edit.copy")
+        }
+        t |> success(copy_observed,
+                     "copy binding routes through a semantic command into the source view")
+
+        post_command(app, "imgui_key_chord", JV((mods = [input_primary], key = "A")))
+        t |> success(wait_for_key_idle(app, 4.0f),
+                     "platform-primary select-all chord completes")
+        let select_all_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return ((state?["source_selection_start"] ?? -1) == 0
+                && (state?["source_selection_end"] ?? -1) == (state?["byte_count"] ?? -2)
+                && (state?["last_command"] ?? "") == "edit.select_all")
+        }
+        t |> success(select_all_observed,
+                     "select-all binding invokes the component API without embedded keyboard logic")
+
         let zoomed = post_command(app, "text_viewer_set_zoom", JV((percent = 137)))
         t |> equal(zoomed?["zoom_percent"] ?? 0, 135,
                    "zoom command snaps to a five-percent step")
@@ -123,12 +155,173 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         }
         t |> success(zoom_observed, "snapped zoom reaches rendered app state")
 
-        click(app, "DOCK_ROOT/DOCUMENT_WINDOW/MODE_TOGGLE")
+        var before_reset = viewer_state(app)
+        let command_before = before_reset?["command_revision"] ?? 0
+        let zoom_snapshot = post_command(app, "imgui_snapshot", null)
+        let primary_mod = (zoom_snapshot?["io"]?["config_macos_behaviors"] ?? false) ? "Super" : "Ctrl"
+        post_command(app, "imgui_key_chord", JV((mods = [primary_mod], key = "0")))
+        t |> success(wait_for_key_idle(app, 4.0f),
+                     "platform-primary reset chord completes")
+        let reset_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return ((state?["zoom_percent"] ?? 0) == 100
+                && (state?["last_command"] ?? "") == "view.zoom_reset"
+                && (state?["command_revision"] ?? 0) > command_before)
+        }
+        t |> success(reset_observed,
+                     "keyboard binding invokes the semantic zoom-reset command")
+        let rezoomed = post_command(app, "text_viewer_set_zoom", JV((percent = 135)))
+        t |> equal(rezoomed?["zoom_percent"] ?? 0, 135,
+                   "zoom is restored before testing new-document inheritance")
+
+        let markdown_mode = post_command(app, "text_viewer_set_mode", JV((mode = "markdown")))
+        t |> success(markdown_mode?["ok"] ?? false, "mode command accepts Markdown")
         let markdown_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             var state = viewer_state(app)
             return ((state?["mode"] ?? "") == "markdown"
                 && (state?["render_revision"] ?? 0) > 0)
         }
         t |> success(markdown_observed, "bottom mode control returns to Markdown")
+
+        let opened_window = post_command(app, "text_viewer_open_window",
+                                         JV((path = fixture)))
+        t |> success(opened_window?["ok"] ?? false,
+                     "another document opens inside the running viewer")
+        t |> equal(opened_window?["document_count"] ?? 0, 2,
+                   "in-process open adds a second dockable document")
+        t |> equal(opened_window?["zoom_percent"] ?? 0, 135,
+                   "new document inherits the active document zoom")
+        let second_document_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return ((state?["document_count"] ?? 0) == 2
+                && (state?["zoom_percent"] ?? 0) == 135)
+        }
+        t |> success(second_document_observed,
+                     "the viewer retains both documents at inherited zoom")
+
+        let bindings_queued = post_command(app, "text_viewer_command",
+                                           JV((id = "preferences.edit_bindings")))
+        t |> success(bindings_queued?["ok"] ?? false,
+                     "live API invokes the same semantic command surface")
+        let bindings_open = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return ((state?["bindings_editor_open"] ?? false)
+                && (state?["last_command"] ?? "") == "preferences.edit_bindings")
+        }
+        t |> success(bindings_open,
+                     "edit-bindings command opens its UI window")
+
+        close_widget(app, "DOCK_ROOT/g_document_windows[2]")
+        let one_document_left = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            return (viewer_state(app)?["document_count"] ?? -1) == 1
+        }
+        t |> success(one_document_left,
+                     "new document uses the ordinary closable window lifecycle")
+
+        close_widget(app, "DOCK_ROOT/g_document_windows[1]")
+        let all_documents_closed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return (!(state?["ok"] ?? true)
+                && (state?["document_count"] ?? -1) == 0)
+        }
+        t |> success(all_documents_closed,
+                     "closing the initial document leaves an empty dockspace")
     }
+}
+
+[test]
+def test_text_viewer_checkbox_save_reload_roundtrip(t : T?) {
+    var temp_error : string
+    let temp_dir = create_temp_directory("das_text_viewer_roundtrip", temp_error)
+    t |> success(empty(temp_error) && !empty(temp_dir),
+                 "roundtrip test receives a dedicated temporary directory")
+    if (!empty(temp_error) || empty(temp_dir)) return
+    let fixture = path_join(temp_dir, "checkbox.md")
+    let bom = "\xEF\xBB\xBF"
+    let original = bom + "# Tasks\r\n\r\n- [ ] first\r\n- [X] second\n"
+    let expected = bom + "# Tasks\r\n\r\n- [x] first\r\n- [X] second\n"
+    t |> success(fwrite(fixture, original), "mixed-ending BOM fixture is written")
+
+    with_imgui_app(FEATURE) $(app) {
+        let opened = post_command(app, "text_viewer_open", JV((path = fixture)))
+        t |> success(opened?["ok"] ?? false, "checkbox fixture opens")
+
+        var initial : JsonValue?
+        var checkbox : JsonValue?
+        let ready = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            initial = viewer_state(app)
+            checkbox = post_command(app, "text_viewer_checkbox", JV((index = 0)))
+            return ((initial?["ok"] ?? false)
+                && (initial?["checkbox_count"] ?? 0) == 2
+                && (initial?["has_utf8_bom"] ?? false)
+                && !(initial?["dirty"] ?? true)
+                && (checkbox?["ok"] ?? false))
+        }
+        t |> success(ready, "checkbox projection and screen geometry become observable")
+
+        if (ready) {
+            // Command responses are transient live-API values; snapshot the
+            // geometry before issuing any later commands.
+            let checkbox_width_before = ((checkbox?["x1"] ?? 0.0f)
+                - (checkbox?["x0"] ?? 0.0f))
+            let checkbox_height_before = ((checkbox?["y1"] ?? 0.0f)
+                - (checkbox?["y0"] ?? 0.0f))
+            let no_op_save = post_command(app, "text_viewer_save", JV((path = fixture)))
+            t |> success(no_op_save?["ok"] ?? false, "no-op save succeeds")
+            t |> equal(fread(fixture), original,
+                       "no-op app save preserves BOM, spelling, and mixed endings byte-for-byte")
+
+            let old_revision = initial?["document_revision"] ?? 0
+            let old_activation = initial?["control_activation_revision"] ?? 0
+            let x = ((checkbox?["x0"] ?? 0.0f) + (checkbox?["x1"] ?? 0.0f)) * 0.5f
+            let y = ((checkbox?["y0"] ?? 0.0f) + (checkbox?["y1"] ?? 0.0f)) * 0.5f
+            post_command(app, "imgui_mouse_pos", JV((x = x, y = y)))
+            post_command(app, "imgui_mouse_click", JV((button = 0, action = "press")))
+            post_command(app, "imgui_mouse_click", JV((button = 0, action = "release")))
+
+            let toggled = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+                var state = viewer_state(app)
+                var current = post_command(app, "text_viewer_checkbox", JV((index = 0)))
+                return ((state?["document_revision"] ?? 0) == old_revision + 1
+                    && (state?["control_activation_revision"] ?? 0) > old_activation
+                    && (state?["dirty"] ?? false)
+                    && (current?["ok"] ?? false)
+                    && (current?["checked"] ?? false))
+            }
+            t |> success(toggled,
+                         "click emits a control event, edits source, and reparses the projection")
+
+            if (toggled) {
+                let toggled_checkbox = post_command(
+                    app, "text_viewer_checkbox", JV((index = 0)))
+                let width_after = ((toggled_checkbox?["x1"] ?? 0.0f)
+                    - (toggled_checkbox?["x0"] ?? 0.0f))
+                let height_after = ((toggled_checkbox?["y1"] ?? 0.0f)
+                    - (toggled_checkbox?["y0"] ?? 0.0f))
+                t |> equal(width_after, checkbox_width_before,
+                           "checked and unchecked controls reserve identical width")
+                t |> equal(height_after, checkbox_height_before,
+                           "checked and unchecked controls reserve identical height")
+                let saved = post_command(app, "text_viewer_save", JV((path = fixture)))
+                t |> success(saved?["ok"] ?? false, "edited source saves")
+                t |> success(!(saved?["dirty"] ?? true), "successful save advances saved revision")
+                t |> equal(fread(fixture), expected,
+                           "checkbox save changes exactly its marker byte")
+
+                let reloaded = post_command(app, "text_viewer_open", JV((path = fixture)))
+                t |> success(reloaded?["ok"] ?? false, "saved document reloads")
+                let reload_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+                    var state = viewer_state(app)
+                    var current = post_command(app, "text_viewer_checkbox", JV((index = 0)))
+                    return ((state?["has_utf8_bom"] ?? false)
+                        && !(state?["dirty"] ?? true)
+                        && (current?["ok"] ?? false)
+                        && (current?["checked"] ?? false))
+                }
+                t |> success(reload_observed,
+                             "saved checkbox state survives a fresh load/projection roundtrip")
+            }
+        }
+    }
+    rmdir_rec_result(temp_dir)
 }
