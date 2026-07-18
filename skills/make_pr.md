@@ -46,6 +46,14 @@ cmake --build build --config Release -j 64              # full clean build; pass
 
 Orthogonal (and still mandatory): after a rebase that pulls in C++ changes (`src/builtin/*.cpp` etc.), rebuild incrementally before trusting test/AOT results — a stale `bin/test_aot` fails AOT where interp passes.
 
+**Never run complete full preflight with a Debug host.** The full ~12k-file
+interpreter/JIT/AOT matrix is a Release gate; preflight rejects Debug before
+starting it. On Windows, `LNK1104` on `bin/Release/libDaScriptDyn_runtime.dll`
+usually means that worktree's `utils/mcp/main.das` host has the DLL loaded.
+Terminate that MCP host and retry the Release build — its watcher restarts it.
+Do not preserve the host by falling back to Debug; that can waste tens of
+minutes before producing a non-representative result.
+
 ## 1. Lint all changed `.das` files — **zero warnings required**
 
 **Pre-push hook:** the repo ships `.githooks/pre-push`, which blocks any `git push` whose commit's base is **more than 3 merges behind `origin/master`** (the gate catches a branch tested against a long-stale master, not the normal churn of unrelated PRs landing mid-preflight — so a base within 3 merge commits of the tip pushes fine without re-rebasing) or lacks a fresh **full-preflight token**. The token is minted only by a clean, complete full run — `daslang utils/preflight/main.das -- --full` — and is bound to the HEAD sha, so any later commit/amend/rebase makes it stale and you must re-run. One-time enable per clone: `git config core.hooksPath .githooks`. Because runners are no longer free, local preflight *is* the test rig: commit your work, run full preflight, then push (typically one batched PR). `git push --no-verify` is the documented escape for deliberate WIP pushes that you don't intend to turn into a PR. See [.githooks/README.md](../.githooks/README.md). (The lint/format commands below remain useful for debugging a single gate ahead of the full run.)
@@ -248,7 +256,7 @@ Every public function must belong to a named group — otherwise it lands in an 
 ### 4b. First doc generation pass
 
 ```bash
-bin/Release/daslang.exe doc/reflections/das2rst.das
+bin/Release/daslang.exe -documentation doc/reflections/das2rst.das
 ```
 
 If this **panics** with "has less documentation than values", a handmade doc file needs updating. The error message lists the expected field names — find the missing one and add a description line in the correct position in the handmade file (e.g., `doc/source/stdlib/handmade/structure_annotation-rtti-CodeOfPolicies.rst`). Field descriptions are positional — line 1 is the struct description, line 2 is the first field, etc.
@@ -264,7 +272,7 @@ Each stub file contains `// stub` on line 1 and the function signature on line 2
 ### 4d. Second doc generation pass (picks up filled stubs)
 
 ```bash
-bin/Release/daslang.exe doc/reflections/das2rst.das
+bin/Release/daslang.exe -documentation doc/reflections/das2rst.das
 ```
 
 ### 4e. Verify no "Uncategorized"
@@ -275,12 +283,11 @@ grep -c Uncategorized doc/source/stdlib/generated/*.rst | grep -v ':0$'
 
 Must return empty. If not, go back to step 4a and add the missing function to a group.
 
-### 4f. Clean Sphinx build — BOTH builders
+### 4f. Sphinx build — BOTH builders
 
-CI runs `sphinx-build -W` for **latex AND html** — they catch different warning sets (latex chokes on some table/unicode constructs html accepts). MUST delete cache — cached builds hide errors:
+CI runs `sphinx-build -W` for **latex AND html** — they catch different warning sets (latex chokes on some table/unicode constructs html accepts). Delete `doc/sphinx-build` before both builders; preflight's docs gate does this unconditionally so stale doctrees cannot hide warnings.
 
 ```bash
-rm -rf doc/sphinx-build site/doc build/latex
 sphinx-build -W --keep-going -b latex -d doc/sphinx-build doc/source build/latex
 sphinx-build -b html -d doc/sphinx-build doc/source site/doc 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee /tmp/sphinx_out.txt
 tail -3 /tmp/sphinx_out.txt

@@ -1530,6 +1530,7 @@ namespace das
         string      aot_result;                         // Path where to store cpp-result of aot
     // End aot config
         bool        completion = false;                 // this code is being compiled for 'completion' mode
+        /*option*/ bool building_documentation = false; // source/reflection docs: disable build-machine-specific transforms
         bool        lint_check = false;                 // this code is being compiled for lint/style checking
         bool        no_lint = false;                    // skip Program::lint() entirely
         bool        no_init_check = false;              // skip the Module::Initialize() assert, most of the time should be false (except maybe dynamic-module discovery)

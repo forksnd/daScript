@@ -116,7 +116,7 @@ After greenlight:
 1. Edit the code per the agreed verdicts.
 2. **Watch for contradictory comments.** When fixing a bug, scan inline comments that describe the affected surface — they often need updating in the same pass. (If you forget, the next review round will flag it.)
 3. **Re-run the full gates** from Step 1-5 in `skills/make_pr.md`. Yes, full. CI is unforgiving; every amend goes back through the whole matrix.
-4. **`//!` doc-comment changes:** re-run `bin/Release/daslang.exe doc/reflections/das2rst.das`, then a clean Sphinx build (`rm -rf doc/sphinx-build site/doc` first — cached builds hide errors). Generated `doc/source/stdlib/generated/*.rst` are gitignored; Sphinx picks them up at build time.
+4. **`//!` doc-comment changes:** re-run `bin/Release/daslang.exe -documentation doc/reflections/das2rst.das`, delete `doc/sphinx-build`, then run both Sphinx builders. Preflight's docs gate deletes that cache unconditionally so stale doctrees cannot hide warnings. Generated `doc/source/stdlib/generated/*.rst` are gitignored; Sphinx picks them up at build time.
 5. **`git commit --amend --no-edit`** + **`git push --force-with-lease`** (NOT `--force` — protects against racing pushes).
 
 ## 5. Reply to each comment + resolve all threads
