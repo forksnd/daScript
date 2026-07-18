@@ -5928,7 +5928,7 @@ def enc_rope_store_tq4(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
 
 // per-head QK RMSNorm prepass over the fused QKV buffer — one grid covers the q heads then the
 // k heads (koffe = qd, [qnorm | knorm] weight plane at woffe = hs); grid.y = batch rows
-def enc_qk_norm(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps : MetalBuffer?; ntg, nrows, head_size : int64) {
+def enc_qk_norm(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps, bsoffe : MetalBuffer?; ntg, nrows, head_size : int64) {
     metal_set_pipeline(enc, g_pso_qknorm)
     metal_set_threadgroup_memory_length(enc, metal_qk_norm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, 0ul, 0)
@@ -5939,6 +5939,7 @@ def enc_qk_norm(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, 
     metal_set_buffer(enc, bhs, 0ul, 5)
     metal_set_buffer(enc, bwoffe, 0ul, 6)
     metal_set_buffer(enc, beps, 0ul, 7)
+    metal_set_buffer(enc, bsoffe, 0ul, 8)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 

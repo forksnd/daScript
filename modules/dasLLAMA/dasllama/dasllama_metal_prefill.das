@@ -1715,11 +1715,14 @@ class MetalQkNorm {
     @ssbo @binding = 0 x : array<float>     // bound at the panel offset; normalized in place
     @ssbo @binding = 1 w : array<float>
     @uniform @binding = 2 nq : uint         // q-head threadgroups before the k heads
-    @uniform @binding = 3 koffe : uint      // k region's element offset within a row
+    @uniform @binding = 3 koffe : uint      // k region's element offset within a row (the WRITE side)
     @uniform @binding = 4 rstride : uint    // row stride (qkvd / qd / kv_dim)
     @uniform @binding = 5 hs : uint         // head size == the threadgroup width
     @uniform @binding = 6 woffe : uint      // k plane's element offset in w
     @uniform @binding = 7 eps : float
+    @uniform @binding = 8 soffe : uint      // READ offset — == koffe for in-place; the no-wv V
+                                            // fusion reads the pre-norm K slice and writes the v
+                                            // segment (the copy dispatch dissolves into this kernel)
     @workgroup part : float[16]     // one per simdgroup — hs <= 512 (gemma4 global heads)
 
     [metal_kernel(name="metal_qk_norm_msl")]
@@ -1728,8 +1731,9 @@ class MetalQkNorm {
         let lid = gl_LocalInvocationID.x
         let isK = tgid >= nq
         let h = isK ? tgid - nq : tgid
-        let base = gl_WorkGroupID.y * rstride + (isK ? koffe : 0u) + h * hs
-        let v = x[base + lid]
+        let rbase = gl_WorkGroupID.y * rstride + (isK ? soffe : 0u) + h * hs
+        let wbase = gl_WorkGroupID.y * rstride + (isK ? koffe : 0u) + h * hs
+        let v = x[rbase + lid]
         let s1 = simd_sum(v * v)
         if (gl_SubgroupInvocationID == 0u) {
             part[gl_SubgroupID] = s1
@@ -1742,7 +1746,7 @@ class MetalQkNorm {
             sg++
         }
         let inv = 1.0 / sqrt(total / float(hs) + eps)
-        x[base + lid] = w[(isK ? woffe : 0u) + lid] * (v * inv)
+        x[wbase + lid] = w[(isK ? woffe : 0u) + lid] * (v * inv)
     }
 }
 
@@ -3004,7 +3008,7 @@ def private enc_add_bias_rows(enc : MetalComputeEncoder?; bx, bb, bn, btotal : M
     metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
-def private enc_qk_norm_pf(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps : MetalBuffer?; ntg, nrows, hs : int64; off : uint64 = 0ul) {
+def private enc_qk_norm_pf(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps, bsoffe : MetalBuffer?; ntg, nrows, hs : int64; off : uint64 = 0ul) {
     metal_set_pipeline(enc, g_pso_qknorm)
     metal_set_threadgroup_memory_length(enc, metal_qk_norm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, off, 0)
@@ -3015,6 +3019,7 @@ def private enc_qk_norm_pf(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brst
     metal_set_buffer(enc, bhs, 0ul, 5)
     metal_set_buffer(enc, bwoffe, 0ul, 6)
     metal_set_buffer(enc, beps, 0ul, 7)
+    metal_set_buffer(enc, bsoffe, 0ul, 8)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(hs), 1u, 1u))
 }
 
@@ -3526,7 +3531,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         // classes read this one plane (the single-decode lesson)
                         var bones = pf_upload_region(addr < void? >(t.fblob[t.rms_ones_off]), uint64(max_head_size(c) * 4l))
                         enc_qk_norm_pf(enc, bvs[l], bones, u_zero, u_zero, u_kvd_l, u_hs_l, u_zero, u_eps,
-                            kvd_l / hs_l, npos, hs_l, koff)
+                            u_zero, kvd_l / hs_l, npos, hs_l, koff)
                     }
                 }
                 if (has_bias && g_pf_skip != "ew" && g_pf_skip != "nongemm") {
@@ -3544,9 +3549,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     // per-head QK-norm before rope — the chunk's q panel and its new K rows
                     var bqw = pf_upload_region(addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(hs_l * 4l))
                     var bkw = pf_upload_region(addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(hs_l * 4l))
-                    enc_qk_norm_pf(enc, bq, bqw, u_nh_pf, u_qd_l, u_qd_l, u_hs_l, u_hs_l, u_eps, n_heads, npos, hs_l)
+                    enc_qk_norm_pf(enc, bq, bqw, u_nh_pf, u_qd_l, u_qd_l, u_hs_l, u_hs_l, u_eps, u_qd_l, n_heads, npos, hs_l)
                     enc_qk_norm_pf(enc, bks[l], bkw, u_zero, u_zero, u_kvd_l, u_hs_l, u_zero, u_eps,
-                        kvd_l / hs_l, npos, hs_l, koff)
+                        u_zero, kvd_l / hs_l, npos, hs_l, koff)
                 }
                 if (g_pf_skip != "ew" && g_pf_skip != "nongemm") {
                     // sliding layers rope with the swa row pair (dual-rope configs — gemma3/4;

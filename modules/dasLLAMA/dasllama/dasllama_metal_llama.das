@@ -537,10 +537,11 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 }
             }
             if (g_skip != "ew" && (t.wv_offs[l] < 0l || c.v_norm)) {
-                // gemma4 V: no-wv layers copy the PRE-norm/PRE-rope K projection into the v
-                // segment; v_norm then runs the weightless per-head RMS (ones plane) in place —
-                // the CPU mm_qkv order exactly, BEFORE qk_norm touches k
-                if (t.wv_offs[l] < 0l) {
+                // gemma4 V: no-wv layers fill the v segment from the PRE-norm/PRE-rope K
+                // projection — the CPU mm_qkv order exactly, BEFORE qk_norm touches k. With
+                // v_norm the copy FUSES into the ones-RMS (soffe = the k slice, write = the v
+                // segment); a no-wv model without v_norm keeps the plain copy.
+                if (t.wv_offs[l] < 0l && !c.v_norm) {
                     enc_copy_row(enc, r.bqkv, uint64(qd * 4l), r.bqkv, u_kvd_l, kv_dim, uint64((qd + kv_dim) * 4l))
                 }
                 if (c.v_norm) {
@@ -549,7 +550,9 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     // upload starved the hs-512 class (Metal OOB tail reads are ZEROS, halving V)
                     var bones = upload_region(addr < void? >(t.fblob[t.rms_ones_off]), uint64(max_head_size(c) * 4l))
                     enc_qk_norm(enc, r.bqkv, bones, r.u_zero32, het ? r.u_voffe_sw : r.u_voffe,
-                        u_qkvd_l, u_hs_l, r.u_zero32, r.u_eps, kv_dim / head_size, 1l, head_size)
+                        u_qkvd_l, u_hs_l, r.u_zero32, r.u_eps,
+                        t.wv_offs[l] < 0l ? u_qd_l : (het ? r.u_voffe_sw : r.u_voffe),
+                        kv_dim / head_size, 1l, head_size)
                 }
             }
             if (c.qk_norm && g_skip != "ew" && !f16v) {
@@ -559,7 +562,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(head_size * 4l),
                     addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(head_size * 4l), null, 0ul)
                 enc_qk_norm(enc, r.bqkv, bqkw, r.u_nh, u_qd_l, u_qkvd_l, u_hs_l, u_hs_l, r.u_eps,
-                    n_heads + kv_dim / head_size, 1l, head_size)
+                    u_qd_l, n_heads + kv_dim / head_size, 1l, head_size)
             }
             if (g_skip != "ew" && !fused_qkv) {
                 if (r.kdt == KVDtype.q8_0) {
@@ -1558,27 +1561,28 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 }
             }
             if ((!has_wv || c.v_norm) && g_skip != "ew") {
-                // gemma4 V: no-wv layers copy the PRE-norm/PRE-rope K slice into the v segment
-                // (per live row — the strides differ, so one flat copy per row); v_norm then runs
-                // the weightless per-head RMS (ones plane) in place — the CPU mm_qkv order,
-                // BEFORE qk_norm touches k
+                // gemma4 V: no-wv layers fill the v segment from the PRE-norm/PRE-rope K slice
+                // — the CPU mm_qkv order, BEFORE qk_norm touches k. With v_norm the per-row
+                // copies FUSE into the ones-RMS (soffe reads the k slice, the write lands in the
+                // v segment): nrows copy dispatches + the copy->norm barrier both dissolve; the
+                // fused kernel's k-slice READ orders against qk_norm's k WRITE via the existing
+                // bar_dep below (the V-race class — the concurrent encoder orders ONLY via
+                // hazards). A no-wv model without v_norm keeps the plain copies.
                 bar_dep(enc, haz, HZ_BQKV, HZ_BQKV)
-                if (!has_wv) {
+                if (!has_wv && !c.v_norm) {
                     for (i in range64(nrows)) {
                         enc_copy_row(enc, bqkv, uint64((i * qkvd_l + qd_l) * 4l), bqkv, u_kvd_l, kvd_l,
                             uint64((i * qkvd_l + qd_l + kvd_l) * 4l))
                     }
-                    // the copies WRITE the v segment the ones-norm below reads — the concurrent
-                    // encoder orders only via hazards, and racing them corrupted V by 10-20
-                    // (teacher-forced logits Δ15-22 vs the serial encoder's 0.57)
-                    bar_dep(enc, haz, HZ_BQKV, HZ_BQKV)
                 }
                 if (c.v_norm) {
                     // MAX-width ones upload: the region cache is address-keyed and both classes
                     // read this one plane
                     var bones = upload_region(addr < void? >(t.fblob[t.rms_ones_off]), uint64(max_head_size(c) * 4l))
                     enc_qk_norm(enc, bqkv, bones, u_zero32, het ? u_voffe_sw : u_voffe,
-                        u_qkvd_l, u_hs_l, u_zero32, u_eps, kvd_l / hs_l, nrows, hs_l)
+                        u_qkvd_l, u_hs_l, u_zero32, u_eps,
+                        !has_wv ? u_qd_l : (het ? u_voffe_sw : u_voffe),
+                        kvd_l / hs_l, nrows, hs_l)
                 }
             }
             if (c.qk_norm && g_skip != "ew") {
@@ -1588,7 +1592,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(hs_l * 4l), null, 0ul)
                 bar_dep(enc, haz, HZ_BQKV, HZ_BQKV)
                 enc_qk_norm(enc, bqkv, bqkw, u_nh, u_qd_l, u_qkvd_l, u_hs_l, u_hs_l, u_eps,
-                    n_heads + kvd_l / hs_l, nrows, hs_l)
+                    u_qd_l, n_heads + kvd_l / hs_l, nrows, hs_l)
             }
             if (g_skip != "ew") {
                 // rope reads+writes bqkv in place and writes the current KV row into the arena;
