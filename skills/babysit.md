@@ -2,14 +2,31 @@
 
 **Babysit** an open pull request through to merge. Use this skill after the PR already exists; it covers the post-open loop: watching CI, triaging Copilot/human review comments, discussing verdicts with the user, applying fixes, replying, resolving threads, and re-requesting review.
 
+## 0. Non-negotiable review-round invariant
+
+A Copilot round is complete only when all of these are true:
+
+1. Every Copilot comment in the round has an explicit accept/reject reply.
+2. Every corresponding review conversation is resolved, including rejected suggestions.
+3. A fresh query reports zero unresolved review threads. Paginate if GraphQL reports `hasNextPage`; never mistake the first page for the complete set.
+4. Copilot's latest review `commit_id` equals the PR's current `headRefOid`.
+5. That current-tip review produced no new comments.
+
+**Any push invalidates items 4-5.** Re-request Copilot after every push without exception, including formatting, documentation, generated-file, merge-conflict, and CI-only fixes. Do not rely on `review_on_push`.
+
+Never merge with an unresolved thread or with Copilot's latest review targeting an older commit, even when every CI check is green.
+
 ## 1. Watching the PR — the loop
 
 **Iterate against Copilot (~5 min), not the CI matrix (~30 min).** Copilot's review is a free ruleset check that lands in ~5 minutes; the full CI matrix is free too but takes ~30. So the loop is driven by Copilot and you **never sit through a full matrix between rounds**:
 
-1. **Push** a commit.
-2. **Re-request Copilot** — `request_copilot_review` (or the PR's "re-request review" button). You MUST do this manually after *every* push (see the review_on_push note below).
-3. **~5 min later, act on Copilot's review:** triage each comment (Section 3), **surface your verdicts to the user and wait for greenlight**, then fix what's agreed, push, re-request. (Discuss-before-fix is non-negotiable — see Section 3.) Repeat until Copilot is **dry** — a fresh review on your current tip with no new comments and no unresolved threads.
-4. **Only once Copilot is dry, wait for CI green** (~30 min), then merge.
+1. Compare the PR's current `headRefOid` with Copilot's latest review `commit_id`.
+2. If the tip is unreviewed and the prior round has no unresolved threads, **request Copilot review** manually.
+3. **~5 min later, act on Copilot's review:** triage each comment (Section 3) and surface your verdicts. Wait for greenlight before applying any accepted or uncertain suggestion. A round containing only clear rejections can be replied to and resolved without blocking.
+4. If fixes changed the branch, run the gates and push them.
+5. Reply to every comment and resolve every conversation from that completed round. Verify unresolved-thread count = 0.
+6. If step 4 pushed a new tip, re-request Copilot now. If the round was reject-only and produced no push, the existing review already covers the current tip.
+7. Repeat until the invariant in Section 0 holds. **Only then** wait for CI green and merge.
 
 **CI runs the whole time — watch it, but don't block on it:**
 - **Red EARLY (while you're still looping on Copilot) is a win** — a free early signal. Jump on it immediately: fix, push, re-request Copilot (the fix is new code Copilot should see anyway).
@@ -25,11 +42,11 @@ The two heavy Windows toolchain builds (`build_windows_mingw`, `build_windows_cl
 **Status commands per tick:**
 - `gh pr checks <PR>` — CI status (pending / pass / fail), or `gh api repos/<owner>/<repo>/commits/<tip>/check-runs` filtered to `status!="completed"` (pending) and `conclusion` ∈ {`failure`, `cancelled`, `timed_out`, `action_required`} (reds — don't match only `failure`; a cancelled or timed-out lane is red too)
 - `gh api repos/<owner>/<repo>/pulls/<PR>/reviews` — Copilot's latest review; check its `commit_id` matches your tip (confirms it reviewed the latest code, not a stale commit)
-- unresolved threads via GraphQL `reviewThreads(first:50){nodes{isResolved …}}` filtered to `isResolved==false`
+- unresolved threads via GraphQL `reviewThreads(first:100){pageInfo{hasNextPage endCursor} nodes{isResolved …}}`, paginated when needed and filtered to `isResolved==false`
 
 Stop polling and surface as soon as: (a) Copilot left new comments (react), (b) a CI check went red (fix), or (c) CI green AND Copilot dry (ready to merge).
 
-> **Pure-prose tail.** Prose/wording nits are **reject by default** (Section 3) — don't fix them, so the drip never starts. Each reword only hands Copilot a fresh paragraph to nit; it's self-perpetuating. Accept a wording change only when it's way off or factually wrong. (Real example: nightly-CI PR #3237 took 1 functional round then 6 prose rounds that, under this bar, should have been rejected.)
+> **Pure-prose tail.** If a fresh review contains only prose/wording nits, reject them, reply, resolve, and let the PR proceed to merge. Do not edit, push, or start another review cycle. A small related wording cleanup may ride along when the same round already requires a substantive fix, but prose never justifies a push by itself. Factually wrong or materially misleading text is not a nit.
 
 ## 2. CI failure handling
 
@@ -37,11 +54,11 @@ If a check goes red:
 1. Identify the failing job: `gh pr checks <PR>` shows the URL; `gh run view <runID> --log-failed` fetches the log.
 2. Apply the same fix policy as Step 2 in `skills/make_pr.md`: own change → fix it; obvious pre-existing → fix it; non-obvious pre-existing → ask the user.
 3. After the fix, **re-run the gates from Step 1-5 in `skills/make_pr.md`** (lint + interpreted + AOT + Sphinx if `//!` or RST touched + format) — don't trust spot-checks. CI failures often come bundled (a missing format triggers a lint, a removed function triggers an AOT hash mismatch).
-4. Push the fix. CI re-runs automatically. If Copilot was already dry, this is a "red after Copilot" — go **back into the Copilot loop** (Section 1): re-request Copilot on the fix commit and don't merge until it's dry again *and* CI is green. (A trivial CI-only fix — a format tweak with no logic change — can skip the re-request, but when in doubt, re-request; it's free and ~5 min.)
+4. Push the fix. CI re-runs automatically. The push invalidates Copilot-dry state, so go **back into the Copilot loop** (Section 1), re-request Copilot on the fix commit, and don't merge until Copilot is dry again and CI is green. There are no exceptions for trivial or CI-only fixes.
 
 ## 3. Triaging review comments — discuss BEFORE acting
 
-When a review lands (especially Copilot — fast, often verbose), **don't auto-execute**. Pull the comments, classify each one, and surface to the user with a verdict per comment. Only act after the user signs off.
+When a review lands (especially Copilot — fast, often verbose), **don't auto-execute**. Pull the comments, classify each one, and surface to the user with a verdict per comment. Get user sign-off before changing code or text for an accepted/uncertain suggestion; clear rejections need no edit and may be closed immediately.
 
 Fetch the comments:
 ```bash
@@ -49,7 +66,8 @@ gh api repos/<owner>/<repo>/pulls/<PR>/comments | jq '.[] | {id, path, line: (.l
 ```
 
 **Be conservative — default to reject.** Only ACCEPT a comment when it is a **real bug**, a **real issue**, or **factually incorrect** doc/comment text. REJECT everything else:
-- a bug that can never happen, or is very unlikely
+- a failure with no realistic path in shipped use
+- an overflow/resource limit that cannot be reached within plausible hardware and process lifetime
 - an over-defensive guard (protecting a case that can't occur)
 - a suggestion that diverges from how the rest of the repo already does it
 - prose / wording nits — wording has to be **way off or factually wrong** to be worth a change
@@ -58,9 +76,21 @@ Rejecting is the common case, not the exception. Give the user a concise per-com
 
 | Verdict | Means | Action |
 |---|---|---|
-| 🔴 **Real bug / real issue** | a correctness or design problem that can actually occur | accept — probe first, then fix |
+| 🔴 **Real bug / real issue** | reachable in supported use at realistic scale, with meaningful impact | accept — establish the path, then fix |
 | 🟡 **Factually wrong text** | a doc/comment/diagnostic states something untrue (e.g. names `_distinct()` when the public API is `distinct()`) | accept — correct it |
-| ⚪ **Nit / unlikely / over-defensive / against-convention** | wording, style, a can't-happen guard, repo-divergent suggestion | **reject** with a one-line reason |
+| ⚪ **Theoretical / nit / over-defensive / against-convention** | no realistic execution path, wording/style, a can't-happen guard, or repo-divergent suggestion | **reject** with a one-line reason |
+
+### Reality test — require a plausible failure, not mathematical possibility
+
+Before accepting a bug claim, establish all three:
+
+1. **Reachable:** name a shipped caller and an input/state allowed by its contract.
+2. **Plausible scale:** show the threshold fits real hardware, data volume, and process lifetime.
+3. **Meaningful consequence:** identify the incorrect result, crash, corruption, security exposure, or user-visible failure.
+
+Reject when the claim exists only because an integer is technically finite or an impossible state lacks a guard. Example: a 64-bit game-entity counter wrapping only after `2^64` creations is not a real bug on plausible hardware or within the program's lifetime. Do not add saturation, warnings, assertions, or branches for it.
+
+Probability alone is not the test: a rare race, data-loss path, or attacker-controlled input can be real when the reachability chain is concrete. A reasoned proof is enough when reproduction is impractical, but speculative “could theoretically happen” is not.
 
 Real-bug verdicts deserve a probe before declaring fix direction — the obvious fix isn't always the right fix (e.g. aligning the bind-push wasn't enough for the `take(n) |> sum()` bug because the underlying SQL was degenerate; the right answer was compile-time rejection).
 
@@ -72,13 +102,13 @@ no reachable behavior. Hold the line the table already draws:
 - **Over-defensive / can't-happen guards → reject**, even when the guard is one line. Cite why
   the case can't occur (call-site inventory, an upstream guard, a type that makes it
   unrepresentable). Do not add warnings/asserts for states no shipped caller can produce.
-- **Wording/comment nits → reject; don't reword.** Only fix prose that is factually WRONG
-  (claims X, code does Y) — precision upgrades, tone, "clarify this" are not fixes, they're
-  fresh paragraphs for the next round to nit.
+- **Wording/comment nits → reject; don't create a prose-only changeset.** If a substantive fix
+  is already being pushed, a directly related cleanup may ride along. Otherwise resolve the
+  prose threads and land. Only standalone-fix text that is factually wrong or materially misleading.
 - Accepting a marginal comment to "keep the reviewer happy" costs a commit + a full CI matrix +
   a new review round. Rejecting costs one evidence sentence. Reject.
 
-A rejected comment still gets a reply (one-line reason, evidence if the reviewer is wrong) + a resolved thread (Section 5). Surface the verdicts and wait for the user's greenlight before applying — they may reject more ("reject this one too") or defer a fix to a later chunk.
+A rejected comment still gets a reply (one-line reason, evidence if the reviewer is wrong) + a resolved thread (Section 5). Surface the verdicts and wait for the user's greenlight before applying accepted or uncertain suggestions. If every comment is a clear rejection under the rules above, close the round without a new push and continue toward merge.
 
 ## 4. Apply fixes + re-run gates
 
@@ -105,8 +135,9 @@ Reply content should:
 **Resolve** uses GraphQL — REST doesn't expose `resolveReviewThread`. Two-step:
 
 ```bash
-# Get thread node IDs (each thread wraps one or more comments)
-gh api graphql -f query='query { repository(owner:"O", name:"R") { pullRequest(number:N) { reviewThreads(first:30) { nodes { id isResolved comments(first:1) { nodes { databaseId path line } } } } } } }'
+# Get thread node IDs (each thread wraps one or more comments). Inspect
+# pageInfo.hasNextPage and paginate when true.
+gh api graphql -f query='query { repository(owner:"O", name:"R") { pullRequest(number:N) { reviewThreads(first:100) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(first:1) { nodes { databaseId path line } } } } } } }'
 
 # Resolve each
 gh api graphql -f query="mutation { resolveReviewThread(input:{threadId:\"$thread\"}) { thread { id isResolved } } }"
@@ -115,7 +146,7 @@ gh api graphql -f query="mutation { resolveReviewThread(input:{threadId:\"$threa
 **Resolve every thread you replied on** — including rejections (the discussion is closed; the reply explains why). Verify at the end:
 
 ```bash
-gh api graphql -f query='query { repository(owner:"O", name:"R") { pullRequest(number:N) { reviewThreads(first:30) { nodes { id isResolved } } } } }' | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length'
+gh api graphql -f query='query { repository(owner:"O", name:"R") { pullRequest(number:N) { reviewThreads(first:100) { pageInfo { hasNextPage } nodes { id isResolved } } } } }' | jq 'if .data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage then error("paginate review threads") else [.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length end'
 ```
 Expect `0`.
 
@@ -123,10 +154,14 @@ Expect `0`.
 
 **Resolve (and reply to) every prior thread BEFORE re-requesting review.** Re-requesting while old threads are still open leaves the PR ambiguous — you can't tell a stale comment (already addressed, from a superseded commit) from one that still needs action. Resolve first, and any thread that's still open after the next review is unambiguously *new*.
 
-After all replies + resolves + force-push, re-request:
+After all replies + resolves + any push, re-request. **Every push requires a new request; no change is too trivial to review.**
 ```
 mcp__github__request_copilot_review(owner=…, repo=…, pullNumber=…)
 ```
+Record the current `headRefOid` when requesting. When the review arrives, verify its `commit_id` equals that recorded tip. A review on an older SHA does not satisfy the round, even if it arrived after the latest push.
+
+If a round was reject-only and no push occurred, do not request an identical review merely because threads were resolved: Copilot already reviewed the current tip. The mandatory trigger is a changed PR tip.
+
 Copilot reviews the new commit's diff and may flag:
 - Same-class issues you missed elsewhere in the file (it's worth scanning the affected file for each accepted pattern before pushing — saves a round).
 - New issues introduced by the fix itself (e.g. a comment block that contradicts the new behavior — happened in chunk-4 round 2).
@@ -134,7 +169,7 @@ Copilot reviews the new commit's diff and may flag:
 
 ## 7. Loop until both Copilot and humans are done
 
-Each iteration: triage → discuss → fix → gate → amend → force-push → reply → resolve → re-request. Convergence is normal — most PRs need 1-3 rounds. Don't get fatigued; the discipline is what keeps the review-comment vs. force-push history clean.
+Each fix iteration: triage → discuss → fix → gate → amend → force-push → reply → resolve → verify zero unresolved → re-request → verify reviewed tip. Convergence is normal — most PRs need 1-3 rounds. Don't get fatigued; the discipline is what keeps the review-comment vs. force-push history clean.
 
 ## Quick reference
 
@@ -142,9 +177,10 @@ Each iteration: triage → discuss → fix → gate → amend → force-push →
 |---|---|---|
 | Watch PR | `gh pr checks`, `gh api .../comments`, `gh api .../reviews` | Surface as soon as Copilot comments, CI fails, or both CI + Copilot are done |
 | CI fail | `gh pr checks`, `gh run view --log-failed` | Fix own, fix obvious pre-existing, ask about unclear |
-| Triage comments | `gh api .../pulls/<PR>/comments` | **Default reject**; accept only real bugs/issues or factually wrong text. Discuss verdicts with user before acting |
+| Triage comments | `gh api .../pulls/<PR>/comments` | **Default reject**; require realistic reachability, scale, and impact. Prose-only round → resolve and land |
 | Re-run gates | Follow Step 1-5 in `skills/make_pr.md` | Full rerun after every amend |
 | Amend/push | `git commit --amend --no-edit`, `git push --force-with-lease` | Keep squashed branch squashed |
 | Reply | `mcp__github__add_reply_to_pull_request_comment` | Every addressed comment gets a reply |
-| Resolve | `gh api graphql ... resolveReviewThread` | Every addressed thread gets resolved |
-| Re-request | `mcp__github__request_copilot_review` | AFTER replies + resolves + push — never with open prior threads (stale-vs-new becomes ambiguous) |
+| Resolve | `gh api graphql ... resolveReviewThread` | Every addressed thread gets resolved; paginate and verify unresolved = 0 |
+| Re-request | `mcp__github__request_copilot_review` | Mandatory after EVERY push, after prior threads are resolved |
+| Merge gate | Compare latest Copilot `commit_id` to PR `headRefOid` | CI green + matching reviewed tip + zero unresolved threads |

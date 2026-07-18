@@ -331,6 +331,21 @@ Stage, commit, push, and create the PR using GitHub MCP tools or `gh` CLI. Follo
 
 **Squash-from-multi-commit pattern (`git reset --soft master`)**: only safe AFTER step 0 has rebased onto `origin/master`. Otherwise the soft reset collapses the gap between local `master` and origin's into your one commit. If you forgot step 0 and already pushed a leaky PR, the fix is `git fetch origin master && git rebase origin/master && git push --force-with-lease` — git's 3-way merge drops files where your "modification" matches the already-merged content on origin/master.
 
+### 6a. Enter the Copilot review loop
+
+Creating the PR does not complete the workflow. Continue immediately with
+`skills/babysit.md` and enforce its review-round invariant:
+
+1. Request Copilot review for the current PR tip if no Copilot review targets that exact commit.
+2. For every review round, give every Copilot comment an accept/reject reply and resolve every corresponding conversation.
+3. Verify the unresolved-thread count is zero after the round; replying without resolving is incomplete.
+4. After **every push** to the PR branch, re-request Copilot review. This includes formatting, documentation, CI-only, and other supposedly trivial fixes; there are no push exceptions.
+5. Treat Copilot as dry only when its latest review targets the current tip, produced no new comments, and no review threads remain unresolved.
+6. Accept bug claims only when they have a realistic shipped path, plausible scale, and meaningful impact. Reject theoretical overflow/impossible-state guards.
+7. Never create a prose-only review changeset. Reply, resolve, and let the PR land unless the text is factually wrong or materially misleading; minor prose may ride along with an already-required substantive fix.
+
+Never merge solely because CI is green. CI green + Copilot reviewed current tip + zero unresolved conversations is the merge gate.
+
 ## Quick reference
 
 | Step | Tool/Command | Fix policy |
@@ -347,4 +362,7 @@ Stage, commit, push, and create the PR using GitHub MCP tools or `gh` CLI. Follo
 | Format | MCP `format_file` with comma-separated list or glob of changed `.das` files (single call) | Only changed files |
 | `.md` stop | `git diff --name-only origin/master..HEAD \| grep '\.md$'` | If any match: STOP, list changes, ask user to review BEFORE push |
 | PR | GitHub MCP `create_pull_request` or `gh pr create` | — |
-| Babysit | Follow `skills/babysit.md` | One round per Copilot pass; convergence in 1-3 rounds is normal |
+| Copilot round | Reply to every comment, resolve every thread, verify unresolved = 0 | A review round is not complete until all three are done |
+| Push after PR creation | Re-request Copilot review | Mandatory after every push; latest review must target current tip |
+| Review acceptance | Require realistic reachability, scale, and impact | Reject theoretical defensive programming; prose-only round → resolve and land |
+| Babysit | Follow `skills/babysit.md` | Merge only when CI is green and Copilot is dry on current tip |
