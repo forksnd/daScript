@@ -302,6 +302,37 @@ def q8k_moe_actrq {
     }
 }
 
+// ===== the combine kernel =====
+// Routed weighted-sum reduce on the device: one workgroup per output POSITION sums its k slots'
+// down-GEMM rows (w[p*k+j] * row inv[p*k+j], ascending j — the decode accumulation order),
+// accumulating across chunk dispatches (r0 == 0 starts the sum; a position whose bucket rows
+// span chunks contributes only rows in [r0, r1) per pass). Bindings (comb set): 0 = the
+// accumulated npos x n output (vk_upf view), 3 = the grid -> bucket row map (vk_xq view),
+// 4 = the grid-order routing weights (vk_xs view), 5 = the chunk's down rows (batch y1).
+// ffn_meta words [4..7] = n, k, r0, r1.
+[compute_shader(local_size_x=256, name="moe_combine_spv")]
+def moe_combine {
+    let p = gl_WorkGroupID.x
+    let n = vk_meta[4u]
+    let k = vk_meta[5u]
+    let r0 = vk_meta[6u]
+    let r1 = vk_meta[7u]
+    var i = gl_LocalInvocationID.x
+    while (i < n) {
+        var acc = r0 == 0u ? 0.0 : vk_upf[p * n + i]
+        var j = 0u
+        while (j < k) {
+            let jb = vk_xq[p * k + j]
+            if (jb >= r0 && jb < r1) {
+                acc += vk_xs[p * k + j] * vk_y[(jb - r0) * n + i]
+            }
+            j++
+        }
+        vk_upf[p * n + i] = acc
+        i += 256u
+    }
+}
+
 // ===== the K-quant decode kernels =====
 // Native k4/k5/k6 GEMVs over superblock quant payloads + decoded 20B scale rows, with Q8_K
 // activations (per-256 f32 scales in vk_xs). Same one-subgroup-per-row shape as q8_moe_groupn,
@@ -899,6 +930,8 @@ let private BATCH_CHUNK_ROWS = 8_192l      // dispatch row-window cap (bounds y 
 let private BATCH_HQ_BYTES = 33_554_432l   // device requantized-hidden quants (the down GEMM's activations)
 let private BATCH_HS_BYTES = 8_388_608l    // ... its scale plane
 let private FFN_META_BYTES = 64l           // act/requant params (element count, gelu flag, block count)
+                                           // + the combine's [n, k, r0, r1] at words 4..7
+let private COMB_WI_BYTES = 2_097_152l     // combine w / inv plane cap (npos*k grid entries x 4B)
 let private CLS_META_BYTES = 64l           // classifier GEMV params (one region, filled once)
 let private STREAM_RESERVE = 1_100_000_000l  // VRAM reserved out of the weight budget for the two
                                              // streaming slots when DASLLAMA_GPU_MOE_STREAM is on
@@ -996,6 +1029,7 @@ struct private GpuState {
     batch_k4 : Pipeline         // native K-quant prefill tiles (per-format batch kernels)
     batch_k5 : Pipeline
     batch_k6 : Pipeline
+    comb_pipeline : Pipeline    // routed weighted-sum combine (device-side reduce, prefill batches)
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
@@ -1023,6 +1057,14 @@ struct private GpuState {
     batch_actrq_set : VkDescriptorSet   // batch twin of FfnCmd's fused act+requant set (y1/y2 planes)
     batch_cmd : VkCommandBuffer   // one reusable batch cmd buffer, re-recorded per submit
     batch_ready : bool
+    // combined-output state (lazy — first combined prefill dispatch creates it)
+    comb_stage : HostBuf     // staging: routing w plane + grid->bucket map (device copies at first-chunk head)
+    comb_w_dev : uint64
+    comb_inv_dev : uint64
+    comb_y_dev : uint64      // accumulated npos x n output (the combine kernel's cross-chunk accumulator)
+    comb_y : HostBuf         // host-cached readback staging
+    comb_set : VkDescriptorSet
+    comb_ready : bool
     // streamed-prefill state (lazy — first streamed dispatch creates the slots)
     @do_not_delete stream_stacks : array<StreamStack>
     stream_slots : array<StreamSlot>
@@ -1241,6 +1283,8 @@ def private vk_moe_init : bool {
     g_gpu.batch_k5 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bk5shader)
     var bk6shader <- create_shader_module(g_gpu.device, kq_moe_batch_k6_spv)
     g_gpu.batch_k6 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bk6shader)
+    var cshader <- create_shader_module(g_gpu.device, moe_combine_spv)
+    g_gpu.comb_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, cshader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -1266,7 +1310,7 @@ def private upload_region(dst : uint64; src : uint8 const?; total : int64) {
     while (off < total) {
         let chunk = min(total - off, STAGING_BYTES)
         unsafe {
-            memcpy(g_gpu.staging.mapped, reinterpret<void? -const>(src + off), int(chunk))
+            par_memcpy(g_gpu.staging.mapped, reinterpret<void? -const>(src + off), chunk)
         }
         staged_upload(dst, off, chunk)
         off += chunk
@@ -1344,8 +1388,8 @@ def private vk_moe_stream_stack(wq : uint8 const?; ws : uint8 const?; woff : int
     var ss = StreamStack(base = woff, elems = rows * n, fmt = fmt, wqbytes = pb.wq, wsbytes = pb.ws,
                          hwq = make_host_buf(pb.wq, false), hws = make_host_buf(pb.ws, false))
     unsafe {
-        memcpy(ss.hwq.mapped, reinterpret<void? -const>(wq), int(pb.wq))
-        memcpy(ss.hws.mapped, reinterpret<void? -const>(ws), int(pb.ws))
+        par_memcpy(ss.hwq.mapped, reinterpret<void? -const>(wq), pb.wq)
+        par_memcpy(ss.hws.mapped, reinterpret<void? -const>(ws), pb.ws)
     }
     if (length(g_gpu.stream_stacks) % 3 == 2) {   // walk order gate/up/down: this one is a down
         g_gpu.stream_max_dn_wq = max(g_gpu.stream_max_dn_wq, pb.wq)
@@ -1543,13 +1587,17 @@ def private ensure_ffn_state {
     g_gpu.ffn_ready = true
 }
 
-def private fill_ffn_meta(elems, nblocks : int64; is_gelu : bool) {
+def private fill_ffn_meta(elems, nblocks : int64; is_gelu : bool; comb_n : int64 = 0l; comb_k : int64 = 0l; comb_r0 : int64 = 0l; comb_r1 : int64 = 0l) {
     unsafe {
         var mp = reinterpret<uint?>(g_gpu.ffn_meta.mapped)
         mp[0] = uint(elems)
         mp[1] = is_gelu ? 1u : 0u
         mp[2] = uint(nblocks)
         mp[3] = 0u
+        mp[4] = uint(comb_n)
+        mp[5] = uint(comb_k)
+        mp[6] = uint(comb_r0)
+        mp[7] = uint(comb_r1)
     }
 }
 
@@ -1602,6 +1650,31 @@ def private ensure_batch_state {
     g_gpu.resident_bytes += BATCH_XQ_BYTES + BATCH_XS_BYTES
     g_gpu.batch_ready = true
     to_log(LOG_INFO, "dasLLAMA vulkan tier: prefill batch tier engaged\n")
+}
+
+def private ensure_comb_state {
+    if (g_gpu.comb_ready) {
+        return
+    }
+    g_gpu.comb_stage = make_host_buf(2l * COMB_WI_BYTES, false)   // transfer_src staging: w then inv
+    g_gpu.comb_w_dev = make_device_buf(COMB_WI_BYTES)
+    g_gpu.comb_inv_dev = make_device_buf(COMB_WI_BYTES)
+    g_gpu.comb_y_dev = make_device_buf(BATCH_Y_BYTES)
+    g_gpu.comb_y = make_host_buf(BATCH_Y_BYTES, true, [cached = true])
+    g_gpu.comb_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    // combine: accumulated output at 0 (vk_upf), params at 2, grid->bucket map at 3 (vk_xq),
+    // routing weights at 4 (vk_xs), the chunk's down rows at 5; 1 unused filler
+    write_buf_desc(writes, g_gpu.comb_set, 0u, g_gpu.comb_y_dev, BATCH_Y_BYTES)
+    write_buf_desc(writes, g_gpu.comb_set, 1u, g_gpu.comb_w_dev, COMB_WI_BYTES)
+    write_buf_desc(writes, g_gpu.comb_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+    write_buf_desc(writes, g_gpu.comb_set, 3u, g_gpu.comb_inv_dev, COMB_WI_BYTES)
+    write_buf_desc(writes, g_gpu.comb_set, 4u, g_gpu.comb_w_dev, COMB_WI_BYTES)
+    write_buf_desc(writes, g_gpu.comb_set, 5u, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.comb_ready = true
+    to_log(LOG_INFO, "dasLLAMA vulkan tier: device-side moe combine engaged\n")
 }
 
 // batch bindings differ from decode's: meta is the stack's BATCH table, activations point at a
@@ -1769,11 +1842,22 @@ def private cmd_copy_whole(raw : VkCommandBuffer; src, dst : uint64; bytes : int
     cmd_copy_buffer(vk_value_to_boost(raw), nonowning_buf(src), nonowning_buf(dst), regions)
 }
 
+def private cmd_copy_at(raw : VkCommandBuffer; src : uint64; src_off : int64; dst : uint64; bytes : int64) {
+    var regions : array<BufferCopy>
+    regions |> push(BufferCopy(srcOffset = uint64(src_off), dstOffset = 0ul, size = uint64(bytes)))
+    cmd_copy_buffer(vk_value_to_boost(raw), nonowning_buf(src), nonowning_buf(dst), regions)
+}
+
 // one reusable cmd buffer, re-recorded per submit — prefill submits are few and multi-ms, so
 // recording cost is noise (unlike decode's per-token pre-recorded buffers). The chain per chunk:
-// meta staging copies, gate+up GEMMs, fused act+requant, down GEMM, gout DMA — one barrier per
-// seam, the hidden planes never leave the device.
-def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, nfe, gout_bytes : int64; axq_bytes, axs_bytes : int64) {
+// meta staging copies, gate+up GEMMs, fused act+requant, down GEMM, then either the gout DMA
+// (comb_npos == 0) or the combine dispatch (comb_npos > 0: the down rows stay device-side and
+// accumulate into comb_y_dev; only the LAST chunk appends the k-fold-smaller combined DMA —
+// the first chunk's head also stages the routing w / inv planes) — one barrier per seam, the
+// hidden planes never leave the device.
+def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, nfe, gout_bytes : int64; axq_bytes, axs_bytes : int64;
+                                 comb_npos : uint = 0u; comb_first : bool = false; comb_last : bool = false;
+                                 comb_wi_bytes : int64 = 0l; comb_y_bytes : int64 = 0l) {
     let raw = g_gpu.batch_cmd
     let rf : VkCommandBufferResetFlags
     vk_check(vkResetCommandBuffer(raw, rf), null)
@@ -1784,6 +1868,10 @@ def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, 
     cmd_copy_batch_meta(raw, s3)
     cmd_copy_batch_meta(raw, s2)
     cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+    if (comb_npos > 0u && comb_first) {
+        cmd_copy_whole(raw, g_gpu.comb_stage.buf, g_gpu.comb_w_dev, comb_wi_bytes)
+        cmd_copy_at(raw, g_gpu.comb_stage.buf, COMB_WI_BYTES, g_gpu.comb_inv_dev, comb_wi_bytes)
+    }
     batch_barrier(raw, true)
     bind_batch_pipe(raw, g_gpu.stacks[s1].fmt)
     cmd_bind_dispatch(raw, g_gpu.stacks[s1].batch_set, nwg_gu)
@@ -1799,14 +1887,26 @@ def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, 
     comp_barrier(raw)
     bind_batch_pipe(raw, g_gpu.stacks[s2].fmt)
     cmd_bind_dispatch(raw, g_gpu.stacks[s2].batch_set, nwg_dn)
-    batch_barrier(raw, false)
-    cmd_copy_whole(raw, g_gpu.batch_y1_dev, g_gpu.batch_y1.buf, gout_bytes)
+    if (comb_npos > 0u) {
+        comp_barrier(raw)
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.comb_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, g_gpu.comb_set, comb_npos)
+        if (comb_last) {
+            batch_barrier(raw, false)
+            cmd_copy_whole(raw, g_gpu.comb_y_dev, g_gpu.comb_y.buf, comb_y_bytes)
+        }
+    } else {
+        batch_barrier(raw, false)
+        cmd_copy_whole(raw, g_gpu.batch_y1_dev, g_gpu.batch_y1.buf, gout_bytes)
+    }
     vk_check(vkEndCommandBuffer(raw), null)
 }
 
 // the batch arm: chunked over row windows; gate+up share the gathered image and region row
-// ranges, the down GEMM reads the requantized hidden planes and reuses y1 for its output
-def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+// ranges, the down GEMM reads the requantized hidden planes and reuses y1 for its output.
+// npos > 0: the combine kernel folds each chunk's down rows into comb_y_dev (no per-chunk y
+// DMA); the combined npos x n rows read back ONCE after the last chunk
+def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
     let s1 = find_stack(unsafe(offs1[0]), f1)
     let s3 = find_stack(unsafe(offs3[0]), f3)
     let s2 = find_stack(unsafe(offs2[0]), f2)
@@ -1820,6 +1920,20 @@ def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : i
     ensure_batch_set(s1, g_gpu.batch_y1_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
     ensure_batch_set(s3, g_gpu.batch_y2_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
     ensure_batch_set(s2, g_gpu.batch_y1_dev, g_gpu.hq_dev, g_gpu.hs_dev, BATCH_HQ_BYTES, BATCH_HS_BYTES)
+    let comb = npos > 0l
+    var comb_k = 0l
+    if (comb) {
+        ensure_comb_state()
+        comb_k = nrows / npos
+        assert(comb_k * npos == nrows, "dasLLAMA vulkan tier: combined rows must be npos x k")
+        assert(nrows * 4l <= COMB_WI_BYTES && npos * n * 4l <= BATCH_Y_BYTES,
+            "dasLLAMA vulkan tier: combined output exceeds capacity")
+        unsafe {
+            var cp = reinterpret<uint8?>(g_gpu.comb_stage.mapped)
+            par_memcpy(g_gpu.comb_stage.mapped, reinterpret<void? -const>(wp), nrows * 4l)
+            par_memcpy(reinterpret<void?>(cp + COMB_WI_BYTES), reinterpret<void? -const>(invp), nrows * 4l)
+        }
+    }
     let chunk = ffn_chunk_rows(n, nfe, xunit)
     var r0 = 0l
     while (r0 < nrows) {
@@ -1833,18 +1947,27 @@ def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : i
         let ts1 = ref_time_ticks()
         upload_batch_acts(xqp, xsp, r0, rows, n, xunit)
         let ts2 = ref_time_ticks()
-        fill_ffn_meta(rows * nfe, rows * nfe / xunit, is_gelu)
-        record_ffn_batch_cmd(s1, s3, s2, nwg1, nwg2, rows, nfe, rows * n * 4l, rows * n, rows * (n / xunit) * 4l)
+        fill_ffn_meta(rows * nfe, rows * nfe / xunit, is_gelu, comb ? n : 0l, comb_k, r0, r1)
+        record_ffn_batch_cmd(s1, s3, s2, nwg1, nwg2, rows, nfe, rows * n * 4l, rows * n, rows * (n / xunit) * 4l,
+            [comb_npos = comb ? uint(npos) : 0u, comb_first = r0 == 0l, comb_last = r1 == nrows,
+             comb_wi_bytes = nrows * 4l, comb_y_bytes = npos * n * 4l])
         let ts3 = ref_time_ticks()
         submit_wait(g_gpu.batch_cmd)
         let ts4 = ref_time_ticks()
-        unsafe {
-            par_memcpy(reinterpret<void?>(goutp + r0 * n), g_gpu.batch_y1.mapped, rows * n * 4l)
+        if (!comb) {
+            unsafe {
+                par_memcpy(reinterpret<void?>(goutp + r0 * n), g_gpu.batch_y1.mapped, rows * n * 4l)
+            }
         }
         if (vk_prof()) {
             to_log(LOG_INFO, "vk_ffn_batch acts {get_time_usec(ts1) - get_time_usec(ts2)} submit {get_time_usec(ts3) - get_time_usec(ts4)} copy {get_time_usec(ts4)}\n")
         }
         r0 = r1
+    }
+    if (comb) {
+        unsafe {
+            par_memcpy(reinterpret<void?>(goutp), g_gpu.comb_y.mapped, npos * n * 4l)
+        }
     }
 }
 
@@ -1970,6 +2093,8 @@ def private ffn_cmd_for(s1, s3, s2 : int; nrows, n, nfe : int64) : VkCommandBuff
 }
 
 def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+    // decode-form only — the combined (npos > 0) contract is a batch-arm feature; vk_moe_ffn
+    // routes combined calls there (nrows = npos*k >= npos >= BATCH_TILE at the engine gate)
     let s1 = find_stack(unsafe(offs1[0]), f1)
     let s3 = find_stack(unsafe(offs3[0]), f3)
     let s2 = find_stack(unsafe(offs2[0]), f2)
@@ -2064,7 +2189,7 @@ def private copy_stream_group(si, g : int; sync : bool) {
 // prefetch miss), re-base the slot's pseudo-stacks so the normal batch rail resolves them,
 // dispatch, then fire the next runtime layer's prefetch (group g-1 — the loader walk uploads
 // descending, prefill runs ascending)
-def private vk_moe_ffn_streamed(g : int; var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+def private vk_moe_ffn_streamed(g : int; var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
     assert(nrows >= BATCH_TILE, "dasLLAMA vulkan tier: streamed layers serve prefill batches only")
     assert(g_gpu.stream_stacks[g * 3 + 1].fmt == f3 && g_gpu.stream_stacks[g * 3 + 2].fmt == f2,
         "dasLLAMA vulkan tier: streamed group format mismatch")
@@ -2082,7 +2207,7 @@ def private vk_moe_ffn_streamed(g : int; var goutp : float?; offs1 : int64 const
     rebase_pseudo(g_gpu.stream_slots[si].s1, g_gpu.stream_stacks[g * 3])
     rebase_pseudo(g_gpu.stream_slots[si].s3, g_gpu.stream_stacks[g * 3 + 1])
     rebase_pseudo(g_gpu.stream_slots[si].s2, g_gpu.stream_stacks[g * 3 + 2])
-    vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
+    vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)
     if (g > 0 && g_gpu.stream_slots[(g - 1) % 2].group != g - 1) {
         copy_stream_group((g - 1) % 2, g - 1, false)
     }
@@ -2091,11 +2216,13 @@ def private vk_moe_ffn_streamed(g : int; var goutp : float?; offs1 : int64 const
 //! MoeGpuFfnFn: the routed experts' whole FFN chain — gate+up region GEMMs, activation,
 //! requant, down GEMM — as device-side submit chains over the resident stacks; the hidden
 //! activations never cross PCIe. offs are region triples sharing row ranges that partition
-//! [0, nrows); gout returns nrows x n floats. Decode row counts run the GEMV kernels
-//! (pre-recorded per stack triple), batches the tiled-GEMM chunk loop — q8 and native kq
-//! stacks alike, each on its format's kernels. Streamed layers (pinned mirrors) route through
-//! the slot rail; anything else panics (fail-closed — the env gate is the opt-in).
-def vk_moe_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+//! [0, nrows). npos = 0: gout returns nrows x n floats. npos > 0 (prefill batches): the routed
+//! weighted-sum combine ALSO runs device-side (w/inv per the hook contract) and gout returns
+//! npos x n combined rows — the down rows never cross PCIe. Decode row counts run the GEMV
+//! kernels (pre-recorded per stack triple), batches the tiled-GEMM chunk loop — q8 and native
+//! kq stacks alike, each on its format's kernels. Streamed layers (pinned mirrors) route
+//! through the slot rail; anything else panics (fail-closed — the env gate is the opt-in).
+def vk_moe_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
     ensure_ffn_state()
     if (find_stack_idx(unsafe(offs1[0]), f1) < 0) {
         let w0 = unsafe(offs1[0])
@@ -2109,13 +2236,14 @@ def vk_moe_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; o
         if (g < 0) {
             panic("dasLLAMA vulkan tier: dispatch against a region that is neither resident nor streamed (fmt {f1} element offset {w0})")
         }
-        vk_moe_ffn_streamed(g, goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
+        vk_moe_ffn_streamed(g, goutp, offs1, offs3, offs2, nregions, xqp, xsp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)
         return
     }
     if (nrows < BATCH_TILE) {
+        assert(npos == 0l, "dasLLAMA vulkan tier: combined output needs the batch arm")
         vk_moe_ffn_gemv(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
     } else {
-        vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
+        vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)
     }
 }
 

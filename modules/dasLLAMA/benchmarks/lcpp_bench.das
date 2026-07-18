@@ -4,6 +4,7 @@ options _jit_fast_math = true   // ggml-parity FP laxity — matches how llama.c
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + apply_box_profile_runtime (engine-level, not re-exported)
+require dasllama/dasllama_image   // load_model_cached — the .dlim rail, without the full facade's compile weight
 require ../performance/profile_common.das   // profile_threads + affinity_on — the standing per-box methodology
 require daslib/jobque_boost
 require daslib/clargs
@@ -43,6 +44,9 @@ struct Args {
 
     @clarg_doc = "A/B the dense GPU rail in-process: every row runs twice, dense routing OFF then ON. Needs DASLLAMA_GPU_DENSE=1 (uploads + marks); both arms share one process/residency, so cross-run pp drift cancels"
     dense_ab : bool
+
+    @clarg_doc = "A/B the device-side moe combine in-process: every row runs twice, combine OFF then ON (same drift-cancel rationale as --dense-ab; mutually exclusive with it)"
+    comb_ab : bool
 
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
@@ -105,21 +109,32 @@ def main() {
         set_jobque_affinity(2)   // 2 = hard mask, the llama-bench --cpu-strict mirror (mode 1 re-rolls SMT placement)
     }
     apply_box_profile_runtime()   // the tuned per-box stack — what load_model users get
-    print("loading {cfg.model}\n")
-    var t <- load_gguf(cfg.model, cfg.quant)
-    t.config.seq_len = min(t.config.seq_len, max(plen, ngen) + 8l)   // cap the KV allocation
-    let c = t.config
-    print("config: dim={c.dim} layers={c.n_layers} vocab={c.vocab_size} | backend {active_kernel_backend()} (batch {active_batch_backend()}) | t{threads} affinity {pinned ? "hard" : "env/off"} | pp{plen} tg{ngen} x {reps} reps\n")
     if (cfg.dense_ab && !has_env_variable("DASLLAMA_GPU_DENSE")) {
         print("warning: --dense-ab without DASLLAMA_GPU_DENSE=1 — no dense marks, both arms identical\n")
     }
+    print("loading {cfg.model}\n")
     with_job_que() {
         setup_dasllama_jobque_()
+        // load INSIDE the que, on the image rail: the .dlim maps in ms, and the GPU tier's
+        // gather/upload parallelizes over the lanes (que-less it runs single-threaded — at
+        // STREAM=35 that gather was the dominant per-run cost)
+        var t <- load_model_cached(cfg.model, cfg.quant)
+        t.config.seq_len = min(t.config.seq_len, max(plen, ngen) + 8l)   // cap the KV allocation
+        let c = t.config
+        print("config: dim={c.dim} layers={c.n_layers} vocab={c.vocab_size} | backend {active_kernel_backend()} (batch {active_batch_backend()}) | t{threads} affinity {pinned ? "hard" : "env/off"} | pp{plen} tg{ngen} x {reps} reps\n")
         var s <- make_run_state(c)
-        for (arm in range(cfg.dense_ab ? 2 : 1)) {
-            let dtag = cfg.dense_ab ? (arm == 0 ? " dense=off" : " dense=on") : ""
+        if (cfg.dense_ab && cfg.comb_ab) {
+            print("warning: --dense-ab and --comb-ab are mutually exclusive — running --dense-ab only\n")
+        }
+        let ab = cfg.dense_ab || cfg.comb_ab
+        for (arm in range(ab ? 2 : 1)) {
+            var dtag = ""
             if (cfg.dense_ab) {
+                dtag = arm == 0 ? " dense=off" : " dense=on"
                 set_moe_gpu_dense_route(arm != 0)
+            } elif (cfg.comb_ab) {
+                dtag = arm == 0 ? " comb=off" : " comb=on"
+                set_gpu_combine_route(arm != 0)
             }
             if (plen > 0l) {
                 let warm <- build_prompt(plen, 999l)
@@ -151,6 +166,6 @@ def main() {
             }
         }
         delete s
+        delete t
     }
-    delete t
 }

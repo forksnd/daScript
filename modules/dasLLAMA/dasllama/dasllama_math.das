@@ -1465,19 +1465,23 @@ var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend
 // count — the three lists share row ranges, which partition [0, nrows)); x is the row-major
 // gathered activation image — nrows x n quants + per-32 scales (q8 stacks) or the Q8_K form,
 // per-256 scales (kq stacks; the tier resolves which from the uploaded stack format). The whole
-// gate+up -> act -> requant -> down chain runs device-side; gout returns nrows x n floats.
+// gate+up -> act -> requant -> down chain runs device-side. npos = 0: gout returns nrows x n
+// floats (one row per routed bucket row). npos > 0 (prefill batches): the tier ALSO runs the
+// routed weighted-sum combine on the device — wp is the grid-order routing weight plane
+// (npos x k floats), invp the grid -> bucket row map (npos x k uints, nrows = npos * k) — and
+// gout returns npos x n combined rows (the down rows never cross PCIe).
 // is_gelu picks GeGLU over SwiGLU (swiglu_oai belongs to biased arches the callers exclude).
 // f1/f3/f2 (and the cls fmt) ride along because weight element offsets are PER-FORMAT plane
 // spaces (q8 qblob vs the k4/k5/k6 planes) — a bare offset is ambiguous across formats (a k4
 // gate and a k5 down can share the numeric range), so the tier resolves stacks by (fmt, offset).
-typedef MoeGpuFfnFn = function<(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; nfe : int64; nrows : int64; f1 : int; f3 : int; f2 : int; is_gelu : bool) : void>
+typedef MoeGpuFfnFn = function<(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; wp : float const?; invp : uint const?; n : int64; nfe : int64; nrows : int64; npos : int64; f1 : int; f3 : int; f2 : int; is_gelu : bool) : void>
 typedef MoeGpuUploadFn = function<(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int; stream : bool) : bool>
 typedef MoeGpuClsFn = function<(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; fmt : int) : void>
 typedef MoeGpuDenseFn = function<(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; nrows : int64; fmt : int) : void>
 typedef MoeGpuDropFn = function<(n : int; stream : bool) : void>
 
-[unused_argument(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)]
-def private moe_gpu_unset_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+[unused_argument(goutp, offs1, offs3, offs2, nregions, xqp, xsp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)]
+def private moe_gpu_unset_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
     panic("dasLLAMA: MoE GPU FFN dispatch hit without an installed GPU tier")
 }
 
@@ -1608,7 +1612,23 @@ def public matmul_moe_gpu_ffn(var gout : array<float>; offs1 : array<int64>; off
     unsafe {
         invoke(g_moe_gpu_ffn, addr(gout[0]),
             addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,
-            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, nfe, nrows, f1, f3, f2, is_gelu)
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), null, null, n, nfe, nrows, 0l, f1, f3, f2, is_gelu)
+    }
+}
+
+//! The combined prefill form: the routed weighted-sum reduce ALSO runs on the device, so gout
+//! returns npos x n combined rows instead of nrows x n bucket rows (the down rows never cross
+//! PCIe — the readback shrinks k-fold). w is the grid-order routing weight plane (npos x k),
+//! inv the grid -> bucket row map (npos x k, nrows = npos * k). Within a chunk slots accumulate
+//! in ascending slot order (the decode order); a position whose rows span chunks sums chunk-major.
+def public matmul_moe_gpu_ffn_combined(var gout : array<float>; offs1 : array<int64>; offs3 : array<int64>; offs2 : array<int64>;
+                                       nregions : int64; xq : array<int8>; xs : array<float>; w : array<float>; inv : array<uint>;
+                                       n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
+    unsafe {
+        invoke(g_moe_gpu_ffn, addr(gout[0]),
+            addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), addr<float const?>(w[0]), addr<uint const?>(inv[0]),
+            n, nfe, nrows, npos, f1, f3, f2, is_gelu)
     }
 }
 

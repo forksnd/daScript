@@ -235,6 +235,77 @@ def test_vulkan_moe_ffn_vs_ref(t : T?) {
             t |> success(c.maxref > 0.0, "batch arm produced non-trivial outputs")
             t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
                 "prefill batch arm within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+
+            // combined arm: same batch fixture, the routed weighted-sum reduce on the device —
+            // an npos=10 x k=4 grid over the 40 bucket rows via a bijective inv map, judged
+            // against the same combine of the GPU's OWN per-row gout (isolates the combine op)
+            var cw : array<float>
+            var cinv : array<uint>
+            cw |> resize(40)
+            cinv |> resize(40)
+            for (g in range(40)) {
+                cw[g] = 0.5 + 0.01 * float(g)
+                cinv[g] = uint((g * 7 + 3) % 40)
+            }
+            var comb : array<float>
+            comb |> resize(int(10l * N))
+            matmul_moe_gpu_ffn_combined(comb, boffs1, boffs3, boffs2, 2l, xq, xs, cw, cinv, N, NFE, 40l, 10l, 0, 0, 0, false)
+            var combref : array<float>
+            combref |> resize(int(10l * N))
+            for (p in range(10)) {
+                for (i in range(int(N))) {
+                    var acc = 0.0
+                    for (j in range(4)) {
+                        acc += cw[p * 4 + j] * gout[int(cinv[p * 4 + j]) * int(N) + i]
+                    }
+                    combref[p * int(N) + i] = acc
+                }
+            }
+            var cc = compare_gout(comb, combref)
+            t |> success(cc.maxref > 0.0, "combined arm produced non-trivial outputs")
+            t |> success(cc.maxdiff <= float(REL_TOL) * cc.maxref,
+                "combined arm within tolerance (maxdiff {cc.maxdiff} vs {float(REL_TOL) * cc.maxref} bar, maxref {cc.maxref})")
+
+            // two-chunk combined arm: 8200 rows overflow the 8192-row chunk cap, so the combine
+            // accumulates across two dispatches AND region B straddles the chunk boundary; a
+            // position's slots land in both chunks (the cross-chunk r0 > 0 path)
+            let CNK = 8200l
+            fill_acts(xq, xs, CNK)
+            var coffs1 <- make_offs([0l, 2l], [0l, 4096l], [4096l, CNK - 4096l], WOFF1, ege1)
+            var coffs3 <- make_offs([0l, 2l], [0l, 4096l], [4096l, CNK - 4096l], WOFF3, ege1)
+            var coffs2 <- make_offs([0l, 2l], [0l, 4096l], [4096l, CNK - 4096l], WOFF2, ege2)
+            gout |> resize(int(CNK * N))
+            matmul_moe_gpu_ffn(gout, coffs1, coffs3, coffs2, 2l, xq, xs, N, NFE, CNK, 0, 0, 0, false)
+            cw |> resize(int(CNK))
+            cinv |> resize(int(CNK))
+            for (g in range(int(CNK))) {
+                cw[g] = 0.5 + 0.0001 * float(g)
+                cinv[g] = uint((g * 7 + 3) % int(CNK))
+            }
+            let CNP = CNK / 4l
+            comb |> resize(int(CNP * N))
+            matmul_moe_gpu_ffn_combined(comb, coffs1, coffs3, coffs2, 2l, xq, xs, cw, cinv, N, NFE, CNK, CNP, 0, 0, 0, false)
+            combref |> resize(int(CNP * N))
+            for (p in range(int(CNP))) {
+                for (i in range(int(N))) {
+                    var acc = 0.0
+                    for (j in range(4)) {
+                        acc += cw[p * 4 + j] * gout[int(cinv[p * 4 + j]) * int(N) + i]
+                    }
+                    combref[p * int(N) + i] = acc
+                }
+            }
+            cc = compare_gout(comb, combref)
+            t |> success(cc.maxref > 0.0, "two-chunk combined arm produced non-trivial outputs")
+            t |> success(cc.maxdiff <= float(REL_TOL) * cc.maxref,
+                "two-chunk combined arm within tolerance (maxdiff {cc.maxdiff} vs {float(REL_TOL) * cc.maxref} bar, maxref {cc.maxref})")
+            delete cw
+            delete cinv
+            delete comb
+            delete combref
+            delete coffs1
+            delete coffs3
+            delete coffs2
         } else {
             feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
         }

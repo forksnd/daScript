@@ -3306,6 +3306,7 @@ struct Session {
     moe_gl_b : array<float>     // per-position shared-expert sigmoid gates (npos; shexp arches only)
     moe_cnt : array<int64>      // per-expert bucket cursor, run END after the CSR fill (n_expert)
     moe_bkt : array<int64>      // (position*k + slot) entries grouped by expert (npos x k)
+    moe_inv : array<uint>       // grid -> bucket row map (bkt's inverse; GPU combine arm only)
     moe_gxq : array<int8>       // one bucket's gathered activation quants (npos x dim)
     moe_gxs : array<float>      // one bucket's gathered activation scales (npos x dim/32)
     moe_gxbs : array<int>       // ... and their per-16 sums (npos x dim/16; kq-expert layers only)
@@ -9520,6 +9521,26 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
 // are the one exception — grouped runs the backend's native mx4 batch kernel, or the Q8 batch GEMM
 // off an exact expansion, while the per-position path runs the mx4 GEMV, so the two may differ by
 // kernel summation order, like a kernel perm change; the counting fixtures absorb that by design.)
+
+var private g_gpu_combine = true
+var private g_gpu_combine_probed = false
+
+def private gpu_combine_on : bool {
+    if (!g_gpu_combine_probed) {
+        g_gpu_combine_probed = true
+        g_gpu_combine = get_env_variable("DASLLAMA_GPU_COMBINE") != "0"
+    }
+    return g_gpu_combine
+}
+
+//! Runtime routing gate over the device-side routed combine (overrides the
+//! ``DASLLAMA_GPU_COMBINE`` env probe) — the in-process A/B lever: both arms share one
+//! process, one residency, one paging weather, so the measured delta is the combine alone.
+def set_gpu_combine_route(on : bool) {
+    g_gpu_combine_probed = true
+    g_gpu_combine = on
+}
+
 def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
     let dim = c.dim
@@ -9549,6 +9570,9 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     // there.
     let fused_gpu = (!c.moe_exps_bias && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai
         && (moe_gpu_layer_on_gpu(l) || moe_gpu_layer_streamed(l)) && g_moe_fused_expert_gemms && npos >= 32l)
+    // device-side routed combine rides fused_gpu; DASLLAMA_GPU_COMBINE=0 = the per-row-gout
+    // fallback (park + CPU reduce) — the A/B lever and the escape hatch
+    let gpu_comb = fused_gpu && gpu_combine_on()
     let fused = (t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms) || fused_kq || fused_gpu
     let grows = fused ? nk : npos
     s.moe_rlog |> resize(npos * ne)
@@ -9709,7 +9733,18 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             nreg++
         }
         let ts_g1 = ref_time_ticks()
-        if (fused_gpu) {   // GPU tier: the whole gate+up/act/requant/down chain runs device-side
+        if (gpu_comb) {   // GPU tier: gate+up/act/requant/down AND the routed weighted-sum combine
+            // run device-side — gout comes back as npos combined rows (into eout's head; gout
+            // itself stays free for the shexp batch), the 33MB-class bucket-row readback and the
+            // park scatter both disappear
+            s.moe_inv |> resize(nk)
+            for (j in range64(nk)) {
+                s.moe_inv[s.moe_bkt[j]] = uint(j)
+            }
+            matmul_moe_gpu_ffn_combined(s.moe_eout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
+                s.moe_gxq, s.moe_gxs, s.moe_w_b, s.moe_inv, dim, nfe, nk, npos, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
+            prof_add("mm_gemm", ts_g1)
+        } elif (fused_gpu) {   // combine off: per-row gout + the park/CPU-reduce path below
             matmul_moe_gpu_ffn(s.moe_gout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
                 s.moe_gxq, s.moe_gxs, dim, nfe, nk, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
             prof_add("mm_gemm", ts_g1)
@@ -9745,23 +9780,26 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         }
         // bucket row j -> the (position, slot) grid row for the reduce. Threaded: this is a
         // 2·nk·dim·4B scatter copy (~67MB of traffic at pp512 on the 30B) — serial it was an
-        // ~8ms ALL-LANE hole between the down GEMM and the reduce (per-lane trace, dataset W)
-        trace_tag(TRACE_TAG_PARK)
-        let ts_park = ref_time_ticks()
-        unsafe {
-            let gp = addr < float const? >(s.moe_gout[0])
-            var ep = addr(s.moe_eout[0])
-            let bp = addr < int64 const? >(s.moe_bkt[0])
-            maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(nk), get_dispatch_lanes()) $(rb, re) {
-                unsafe {
-                    for (j in range(rb, re)) {
-                        let jj = int64(j)
-                        copy_floats(ep + bp[jj] * dim, gp + jj * dim, dim)
+        // ~8ms ALL-LANE hole between the down GEMM and the reduce (per-lane trace, dataset W).
+        // The GPU combine arm skips it — its reduce already landed in eout's first npos rows
+        if (!gpu_comb) {
+            trace_tag(TRACE_TAG_PARK)
+            let ts_park = ref_time_ticks()
+            unsafe {
+                let gp = addr < float const? >(s.moe_gout[0])
+                var ep = addr(s.moe_eout[0])
+                let bp = addr < int64 const? >(s.moe_bkt[0])
+                maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(nk), get_dispatch_lanes()) $(rb, re) {
+                    unsafe {
+                        for (j in range(rb, re)) {
+                            let jj = int64(j)
+                            copy_floats(ep + bp[jj] * dim, gp + jj * dim, dim)
+                        }
                     }
                 }
             }
+            prof_add("moe_park", ts_park)
         }
-        prof_add("moe_park", ts_park)
     }
 
     // 3. one batched GEMM chain per touched expert over its gathered rows; raw down-projection
@@ -9868,7 +9906,8 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     // 5. ordered reduce into xb2_b: per position, the k weighted routed outputs in slot order, then
     //    the shared expert — exactly the decode accumulation order, so the sum is bit-identical.
     //    Plain mul+add loops (NOT axpy — its fused-FMA kernel would perturb the low bits); rows are
-    //    disjoint so threading never changes the result.
+    //    disjoint so threading never changes the result. The GPU combine arm already holds the
+    //    weighted sum in eout's first npos rows — only the shexp add remains.
     trace_tag(TRACE_TAG_PARK)
     let ts_red = ref_time_ticks()
     unsafe {
@@ -9882,14 +9921,21 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
                 for (p in range(rb, re)) {
                     let pp = int64(p)
                     var arow = ap + pp * dim
-                    for (i in range64(dim)) {
-                        arow[i] = 0.0
-                    }
-                    for (j in range64(k)) {
-                        let w = wp[pp * k + j]
-                        let er = ep + (pp * k + j) * dim
+                    if (gpu_comb) {
+                        let cr = ep + pp * dim
                         for (i in range64(dim)) {
-                            arow[i] += w * er[i]
+                            arow[i] = cr[i]
+                        }
+                    } else {
+                        for (i in range64(dim)) {
+                            arow[i] = 0.0
+                        }
+                        for (j in range64(k)) {
+                            let w = wp[pp * k + j]
+                            let er = ep + (pp * k + j) * dim
+                            for (i in range64(dim)) {
+                                arow[i] += w * er[i]
+                            }
                         }
                     }
                     if (sp != null) {
