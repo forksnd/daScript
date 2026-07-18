@@ -9077,7 +9077,9 @@ def private deltanet_prefill_chunked(t : Model; var s : Session; l : int64; npos
     let nvh = c.ssm_dt_rank
     let nkh = c.ssm_n_group
     let ds = c.ssm_d_state
+    let ts_conv = ref_time_ticks()
     dn_conv_batch(t, s, l, npos)
+    prof_add("dn_conv", ts_conv)
     var conv0 : float const?
     var bp0 : float const?
     var gp0 : float const?
@@ -9102,6 +9104,7 @@ def private deltanet_prefill_chunked(t : Model; var s : Session; l : int64; npos
     }
     let wssz = dn_cws_head_size(c)
     let vec = g_act_vec   // read on the caller, captured — fork workers must not read globals
+    let ts_scan = ref_time_ticks()
     maybe_parallel_for(0, int(nvh), min(int(nvh), get_dispatch_lanes())) $(rb, re) {
         unsafe {
             for (hh in range(rb, re)) {
@@ -9114,6 +9117,7 @@ def private deltanet_prefill_chunked(t : Model; var s : Session; l : int64; npos
             }
         }
     }
+    prof_add("dn_scan", ts_scan)
 }
 
 // qwen35 deltanet prefill: batched projections, then the inherently sequential per-token core
@@ -9127,7 +9131,7 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
     let nvh = c.ssm_dt_rank
     let ts_norm0 = ref_time_ticks()
     rms_batch(s.xb_b, s.x_b, t, t.rms_att_off + l * dim, dim, npos)
-    prof_add("norm", ts_norm0)
+    prof_add("dn_norm", ts_norm0)
     let ts_qkv = ref_time_ticks()
     mm_b_f(s, s.dn_qkv_b, t, KqFmt.q8, t.dnqkv_offs[l], s.xb_b, dim, cd, npos)
     mm_b_f(s, s.dn_z_b, t, KqFmt.q8, t.dngate_offs[l], s.xb_b, dim, di, npos)
@@ -9138,11 +9142,11 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
         mm_b_f(s, s.dn_beta_b, t, KqFmt.q8, t.dnbeta_offs[l], s.xb_b, dim, nvh, npos)
         mm_b_f(s, s.dn_g_b, t, KqFmt.q8, t.dnalpha_offs[l], s.xb_b, dim, nvh, npos)
     }
-    prof_add("mm_qkv", ts_qkv)
-    let ts_attn = ref_time_ticks()
+    prof_add("dn_mm_in", ts_qkv)
     if (g_dn_prefill_mode == DnPrefillMode.chunked && npos > 1l) {   // single rows: recurrent is cheaper
-        deltanet_prefill_chunked(t, s, l, npos)
+        deltanet_prefill_chunked(t, s, l, npos)   // buckets dn_conv + dn_scan inside
     } else {
+        let ts_core = ref_time_ticks()
         unsafe {
             let qkvp = addr < float const? >(s.dn_qkv_b[0])
             var zp = addr(s.dn_z_b[0])
@@ -9153,14 +9157,14 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
                 dn_token_core(t, s, l, qkvp + p * cd, zp + p * di, bp + p * nvh, gp + p * nvh, op + p * di)
             }
         }
+        prof_add("dn_core", ts_core)
     }
-    prof_add("attn", ts_attn)
     let ts_wo = ref_time_ticks()
     mm_b_f(s, s.xb2_b, t, KqFmt.q8, t.dnout_offs[l], s.dn_o_b, di, dim, npos)
-    prof_add("mm_wo", ts_wo)
+    prof_add("dn_mm_out", ts_wo)
     let ts_resid = ref_time_ticks()
     add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
-    prof_add("act_resid", ts_resid)
+    prof_add("dn_resid", ts_resid)
 }
 
 // The batched gated-attention twin of attention_std_prefill: 2x-wide [q|gate], partial rope,
@@ -9743,11 +9747,11 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             }
             matmul_moe_gpu_ffn_combined(s.moe_eout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
                 s.moe_gxq, s.moe_gxs, s.moe_w_b, s.moe_inv, dim, nfe, nk, npos, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
-            prof_add("mm_gemm", ts_g1)
+            prof_add("moe_gpu", ts_g1)
         } elif (fused_gpu) {   // combine off: per-row gout + the park/CPU-reduce path below
             matmul_moe_gpu_ffn(s.moe_gout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
                 s.moe_gxq, s.moe_gxs, dim, nfe, nk, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
-            prof_add("mm_gemm", ts_g1)
+            prof_add("moe_gpu", ts_g1)
         } else {
             if (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
                 mm_b_kq_groupn(s.moe_ghb, t, f1, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
