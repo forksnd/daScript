@@ -1757,14 +1757,15 @@ def private moe_gpu_fmt_kq(f : KqFmt) : bool => f == KqFmt.k4 || f == KqFmt.k5 |
 // Gather one stack through its format's reader (q8 planes or native kq planes) and hand it to
 // the tier's upload hook with the format tag.
 def private moe_gpu_gather_upload(t : Model; f : KqFmt; woff : int64; n, rows, slice_rows : int64;
-                                  mr, kgroup, wbias : int64; var wq : array<uint8>; var ws : array<uint8>) : bool {
+                                  mr, kgroup, wbias : int64; var wq : array<uint8>; var ws : array<uint8>;
+                                  stream : bool = false) : bool {
     if (f == KqFmt.q8) {
         moe_gpu_gather_stack(t, woff, n, rows, slice_rows, mr, kgroup, wbias, wq, ws)
     } else {
         let kmr = t.kq_repacked ? (f == KqFmt.k4 ? t.kq_repack_mr4 : (f == KqFmt.k5 ? t.kq_repack_mr5 : t.kq_repack_mr6)) : 1l
         moe_gpu_gather_stack_kq(t, f, woff, n, rows, slice_rows, t.kq_repacked, kmr, wq, ws)
     }
-    return moe_gpu_upload_stack(wq, ws, woff, n, rows, int(f))
+    return moe_gpu_upload_stack(wq, ws, woff, n, rows, int(f), stream)
 }
 
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
@@ -1773,9 +1774,12 @@ def private moe_gpu_gather_upload(t : Model; f : KqFmt; woff : int64; n, rows, s
 // resident from the end while the tier's VRAM budget holds; from_layer freezes the resident set.
 def moe_gpu_upload_resident(var t : Model) {
     set_moe_gpu_from_layer(t.config.n_layers)   // nothing resident until an upload lands
+    set_moe_gpu_stream_from(t.config.n_layers)
     set_moe_gpu_cls_off(-1l)
     // mx4/biased expert stacks never dispatch on the GPU, so they never upload either
-    if (t.quant != QuantMode.q8 || t.config.n_expert <= 0l || moe_gpu_layer_count() <= 0l
+    let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
+    if (t.quant != QuantMode.q8 || t.config.n_expert <= 0l
+            || (moe_gpu_layer_count() <= 0l && nstream <= 0l)
             || t.experts_mx4 || t.config.moe_exps_bias) {
         return
     }
@@ -1826,12 +1830,44 @@ def moe_gpu_upload_resident(var t : Model) {
         }
         from_l = l
     }
+    // streamed tail: DASLLAMA_GPU_MOE_STREAM=N marks the next N layers below the resident set
+    // for prefill streaming — device-layout planes gathered into pinned host mirrors the tier
+    // DMAs per prefill. CPU planes stay (decode runs them); the walk is contiguous descending
+    // (the tier links each layer's prefetch to the previously uploaded one)
+    var sfrom = from_l
+    for (i in range64(max(nstream, 0l))) {
+        let l = from_l - 1l - i
+        if (l < t.config.n_layer_dense_lead || t.we1_offs[l] < 0l) {
+            break
+        }
+        let f1 = fmt_at(t.we1_fmt, l)
+        let f2 = fmt_at(t.we2_fmt, l)
+        let f3 = fmt_at(t.we3_fmt, l)
+        let all_q8 = f1 == KqFmt.q8 && f2 == KqFmt.q8 && f3 == KqFmt.q8
+        let all_kq = moe_gpu_fmt_kq(f1) && moe_gpu_fmt_kq(f2) && moe_gpu_fmt_kq(f3)
+        if (!(all_q8 || all_kq)) {
+            break
+        }
+        var ok = moe_gpu_gather_upload(t, f1, t.we1_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws, [stream = true])
+        if (ok) {
+            ok = moe_gpu_gather_upload(t, f3, t.we3_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws, [stream = true])
+        }
+        if (ok) {
+            ok = moe_gpu_gather_upload(t, f2, t.we2_offs[l], nfe, ne * dim, dim, mr, kgroup, wbias, wq, ws, [stream = true])
+        }
+        if (!ok) {
+            break   // pinned-mirror budget hit — this and lower layers stay CPU-only
+        }
+        sfrom = l
+    }
     delete wq
     delete ws
     set_moe_gpu_from_layer(from_l)
+    set_moe_gpu_stream_from(sfrom)
     if (from_l < layers || moe_gpu_cls_on_gpu(t.wcls_off)) {
         let cls_note = moe_gpu_cls_on_gpu(t.wcls_off) ? "classifier + " : ""
-        to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: {cls_note}expert stacks of layers [{from_l}..{layers}) resident, {get_time_usec(ts_gpu) / 1000} ms\n")
+        let stream_note = sfrom < from_l ? ", [{sfrom}..{from_l}) streamed" : ""
+        to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: {cls_note}expert stacks of layers [{from_l}..{layers}) resident{stream_note}, {get_time_usec(ts_gpu) / 1000} ms\n")
     }
 }
 
@@ -6812,7 +6848,7 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
                 }
             }
             matmul_moe_gpu_ffn(s.moe_dn, s.moe_offs1, s.moe_offs3, s.moe_offs2, k,
-                s.moe_gxq, s.moe_gxs, dim, nfe, k, c.ffn_act == FfnAct.gelu)
+                s.moe_gxq, s.moe_gxs, dim, nfe, k, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
             prof_add("mm_moe", ts_gu)
         } else {
             for (j in range64(k)) {
@@ -7323,7 +7359,7 @@ def private mm_cls(var y : array<float>; t : Model; x : array<float>; var xq : a
         } else {
             quantize_q8_k_into(x, n, xq, xs, xbs, 0l, 0l, 0l)
         }
-        matmul_moe_gpu_cls(y, t.wcls_off, xq, xs, n, d)
+        matmul_moe_gpu_cls(y, t.wcls_off, xq, xs, n, d, int(cls_fmt))
     } elif (tied_f32) {
         // tied weights (fp32/q4_0 loads): the classifier IS the fp32 embedding table
         mm_fblob(y, t, t.tok_emb_off, x, n, d)
@@ -9435,11 +9471,14 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     // kq layers whose three stacks are ALL K-quant (a mixed q8 kind keeps the per-expert loop)
     let fused_kq = (kq_layer && f1 != KqFmt.q8 && f2 != KqFmt.q8 && f3 != KqFmt.q8
         && t.kq_repacked && kernel_backend_has_kq_batch_groupn() && g_moe_fused_expert_gemms)
-    // GPU MoE tier prefill: offloaded plain-q8 unbiased layers run the whole expert FFN chain
-    // (gate+up, act, requant, down) device-side (tiny batches stay on the CPU per-expert loop —
-    // the GPU submits cost more than the whole GEMM there)
-    let fused_gpu = (!kq_layer && !c.moe_exps_bias && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai
-        && moe_gpu_layer_on_gpu(l) && g_moe_fused_expert_gemms && npos >= 32l)
+    // GPU MoE tier prefill: offloaded unbiased layers run the whole expert FFN chain (gate+up,
+    // act, requant, down) device-side — plain-q8 and all-K-quant triples alike (residency
+    // implies the loader admitted the format), resident and pinned-mirror STREAMED layers both
+    // (the tier DMA-streams the latter's stacks per prefill; their decode stays CPU). Tiny
+    // batches stay on the CPU per-expert loop — the GPU submits cost more than the whole GEMM
+    // there.
+    let fused_gpu = (!c.moe_exps_bias && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai
+        && (moe_gpu_layer_on_gpu(l) || moe_gpu_layer_streamed(l)) && g_moe_fused_expert_gemms && npos >= 32l)
     let fused = (t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms) || fused_kq || fused_gpu
     let grows = fused ? nk : npos
     s.moe_rlog |> resize(npos * ne)
@@ -9550,7 +9589,8 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     if (fused) {
         trace_tag(TRACE_TAG_MOE)
         let ts_gather = ref_time_ticks()
-        moe_gather_rows(s, 0l, nk, dim, k, moe_kform, moe_kform)
+        // the GPU tile computes activation block sums in-kernel — skip the per-16 sum gather
+        moe_gather_rows(s, 0l, nk, dim, k, moe_kform && !fused_gpu, moe_kform)
         prof_add("moe_gather", ts_gather)
         // region triples (woff, row0, cnt) per touched expert; the three planes share row0/cnt
         s.moe_offs1 |> clear(); s.moe_offs1 |> reserve(ne * 3l)
@@ -9601,7 +9641,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         let ts_g1 = ref_time_ticks()
         if (fused_gpu) {   // GPU tier: the whole gate+up/act/requant/down chain runs device-side
             matmul_moe_gpu_ffn(s.moe_gout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
-                s.moe_gxq, s.moe_gxs, dim, nfe, nk, c.ffn_act == FfnAct.gelu)
+                s.moe_gxq, s.moe_gxs, dim, nfe, nk, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
             prof_add("mm_gemm", ts_g1)
         } else {
             if (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)

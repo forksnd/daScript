@@ -13,8 +13,8 @@ require math
 // moe_gpu_upload_stack / matmul_moe_gpu_ffn). Q8 arms run both dispatch shapes: decode GEMV
 // (nrows < 32) and the tiled prefill batch (nrows >= 32, deliberately unpadded). The kq arms
 // (native K-quant stacks — k4 gate/up with a k5 and a k6 down, the 35B Q4_K_M shapes) drive
-// the per-format GEMV kernels + the Q8_K requant mid-chain at decode and batch row counts
-// (kq batches ride the GEMV path until the kq tile lands). Weight scales are powers of two
+// both shapes too: the per-format GEMV kernels + the Q8_K requant mid-chain at decode row
+// counts, the per-format batch tiles at 40 rows. Weight scales are powers of two
 // (f16-exact), so the only drift left is the GPU's exp() in silu and round-halfway splits in
 // the requant — the compare is relative-tolerance, not bit-exact.
 // The gate/up scale planes are SMALL pow2 (2^-7..2^-9) on purpose: they keep |gate| in the
@@ -215,7 +215,7 @@ def test_vulkan_moe_ffn_vs_ref(t : T?) {
             var offs2 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], WOFF2, ege2)
             var gout : array<float>
             gout |> resize(int(2l * N))
-            matmul_moe_gpu_ffn(gout, offs1, offs3, offs2, 2l, xq, xs, N, NFE, 2l, false)
+            matmul_moe_gpu_ffn(gout, offs1, offs3, offs2, 2l, xq, xs, N, NFE, 2l, 0, 0, 0, false)
             var refv : array<float>
             ref_ffn(offs1, offs3, offs2, 2, wq1, ws1, wq3, ws3, wq2, ws2, xq, xs, 2l, refv)
             var c = compare_gout(gout, refv)
@@ -229,12 +229,105 @@ def test_vulkan_moe_ffn_vs_ref(t : T?) {
             var boffs3 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], WOFF3, ege1)
             var boffs2 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], WOFF2, ege2)
             gout |> resize(int(40l * N))
-            matmul_moe_gpu_ffn(gout, boffs1, boffs3, boffs2, 2l, xq, xs, N, NFE, 40l, false)
+            matmul_moe_gpu_ffn(gout, boffs1, boffs3, boffs2, 2l, xq, xs, N, NFE, 40l, 0, 0, 0, false)
             ref_ffn(boffs1, boffs3, boffs2, 2, wq1, ws1, wq3, ws3, wq2, ws2, xq, xs, 40l, refv)
             c = compare_gout(gout, refv)
             t |> success(c.maxref > 0.0, "batch arm produced non-trivial outputs")
             t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
                 "prefill batch arm within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+        } else {
+            feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
+        }
+    }
+}
+
+// ===== streamed-prefill arm (pinned mirrors + slot rotation) =====
+
+// three q8 "layers" uploaded stream=true in loader order (descending layers => group 0 is the
+// runtime-LAST layer), dispatched in runtime order 2,1,0 then 2 again — covers the cold copy,
+// the unfenced prefetch hit, slot rotation, and an eviction reload, each vs the CPU reference
+let SWOFF = 20000000l
+let SSTRIDE = 100000l   // per-stack offset stride inside the streamed fixture (%32 == 0)
+
+[test]
+def test_vulkan_moe_ffn_streamed(t : T?) {
+    t |> run("vulkan MoE streamed prefill (pinned mirrors, 2 slots) == CPU reference") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
+            let ege1 = NFE * N
+            let ege2 = N * NFE
+            var wq1 : array<array<int8>>
+            var ws1 : array<array<float>>
+            var wq3 : array<array<int8>>
+            var ws3 : array<array<float>>
+            var wq2 : array<array<int8>>
+            var ws2 : array<array<float>>
+            wq1 |> resize(3)
+            ws1 |> resize(3)
+            wq3 |> resize(3)
+            ws3 |> resize(3)
+            wq2 |> resize(3)
+            ws2 |> resize(3)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            var streamed_ok = true
+            for (g in range(3)) {
+                fill_stack(wq1[g], ws1[g], NE * NFE, N, int64(g) * 31l + 2l, true)
+                fill_stack(wq3[g], ws3[g], NE * NFE, N, int64(g) * 31l + 7l, true)
+                fill_stack(wq2[g], ws2[g], NE * N, NFE, int64(g) * 31l + 11l, false)
+                let base = SWOFF + int64(g) * 3l * SSTRIDE
+                pack_upload(wq1[g], ws1[g], wqb, wsb)
+                let ok1 = moe_gpu_upload_stack(wqb, wsb, base, N, NE * NFE, 0, [stream = true])
+                pack_upload(wq3[g], ws3[g], wqb, wsb)
+                let ok3 = moe_gpu_upload_stack(wqb, wsb, base + SSTRIDE, N, NE * NFE, 0, [stream = true])
+                pack_upload(wq2[g], ws2[g], wqb, wsb)
+                let ok2 = moe_gpu_upload_stack(wqb, wsb, base + 2l * SSTRIDE, NFE, NE * N, 0, [stream = true])
+                streamed_ok = streamed_ok && ok1 && ok3 && ok2
+            }
+            if (!streamed_ok) {
+                feint("no Vulkan device (or probe refused the stream uploads); skipping\n")
+                return
+            }
+            var xq : array<int8>
+            var xs : array<float>
+            var gout : array<float>
+            var refv : array<float>
+            for (pass_i in [2, 1, 0, 2]) {   // runtime order + an eviction reload of group 2
+                let g = pass_i
+                let base = SWOFF + int64(g) * 3l * SSTRIDE
+                fill_acts(xq, xs, 40l)
+                var offs1 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], base, ege1)
+                var offs3 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], base + SSTRIDE, ege1)
+                var offs2 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], base + 2l * SSTRIDE, ege2)
+                gout |> resize(int(40l * N))
+                matmul_moe_gpu_ffn(gout, offs1, offs3, offs2, 2l, xq, xs, N, NFE, 40l, 0, 0, 0, false)
+                var roffs1 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], WOFF1, ege1)
+                var roffs3 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], WOFF3, ege1)
+                var roffs2 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], WOFF2, ege2)
+                ref_ffn(roffs1, roffs3, roffs2, 2, wq1[g], ws1[g], wq3[g], ws3[g], wq2[g], ws2[g], xq, xs, 40l, refv)
+                let c = compare_gout(gout, refv)
+                t |> success(c.maxref > 0.0, "streamed group {g} produced non-trivial outputs")
+                t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
+                    "streamed group {g} within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+                delete offs1
+                delete offs3
+                delete offs2
+                delete roffs1
+                delete roffs3
+                delete roffs2
+            }
+            delete wq1
+            delete ws1
+            delete wq3
+            delete ws3
+            delete wq2
+            delete ws2
+            delete wqb
+            delete wsb
+            delete xq
+            delete xs
+            delete gout
+            delete refv
         } else {
             feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
         }
@@ -488,7 +581,7 @@ def test_vulkan_moe_ffn_kq(t : T?) {
                 var offs3 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], KWOFF3, ege1)
                 var offs2 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], dwoff, ege2)
                 gout |> resize(int(2l * KN))
-                matmul_moe_gpu_ffn(gout, offs1, offs3, offs2, 2l, xq, xs, KN, KNFE, 2l, false)
+                matmul_moe_gpu_ffn(gout, offs1, offs3, offs2, 2l, xq, xs, KN, KNFE, 2l, 1, 1, dfmt, false)
                 var refoffs2 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], KWOFF2, ege2)
                 ref_ffn_kq(offs1, offs3, refoffs2, 2, w1, w3, w2, xq, xs, 2l, refv)
                 var c = compare_gout(gout, refv)
@@ -496,13 +589,13 @@ def test_vulkan_moe_ffn_kq(t : T?) {
                 t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
                     "kq decode arm (down k{dfmt == 3 ? 6 : 5}) within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
 
-                // batch row count (rides the GEMV path for kq): 40 rows, 2 regions
+                // batch arm (the kq tile): 40 rows (>= the 32-row tile, unpadded), 2 regions
                 fill_acts_kq(xq, xs, 40l)
                 var boffs1 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], KWOFF1, ege1)
                 var boffs3 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], KWOFF3, ege1)
                 var boffs2 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], dwoff, ege2)
                 gout |> resize(int(40l * KN))
-                matmul_moe_gpu_ffn(gout, boffs1, boffs3, boffs2, 2l, xq, xs, KN, KNFE, 40l, false)
+                matmul_moe_gpu_ffn(gout, boffs1, boffs3, boffs2, 2l, xq, xs, KN, KNFE, 40l, 1, 1, dfmt, false)
                 var refboffs2 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], KWOFF2, ege2)
                 ref_ffn_kq(boffs1, boffs3, refboffs2, 2, w1, w3, w2, xq, xs, 40l, refv)
                 c = compare_gout(gout, refv)
@@ -540,7 +633,7 @@ def test_vulkan_moe_ffn_kq(t : T?) {
             for (cpass in range(2)) {
                 fill_acts_kq(xq, xs, 1l)
                 xq[0] = int8(int(xq[0]) + cpass * 3)
-                matmul_moe_gpu_cls(ylog, CWOFF, xq, xs, KN, CVOCAB)
+                matmul_moe_gpu_cls(ylog, CWOFF, xq, xs, KN, CVOCAB, 3)
                 var yref : array<float>
                 yref |> resize(int(CVOCAB))
                 for (r in range(int(CVOCAB))) {

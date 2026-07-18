@@ -17,10 +17,17 @@ require daslib/fio
 // 20B scale rows — and hands them to vk_moe_upload_stack (moe_gpu_upload_resident — every load
 // rail, gguf and mapped image alike); the MoE dispatches then route those layers' whole expert
 // FFN chain (gate+up GEMMs -> act -> requant -> down) through vk_moe_ffn — decode row counts on
-// the GEMV kernels, q8 prefill batches on the tiled GEMM (kq batches ride the GEMV path until
-// the kq tile lands). Activations arrive in the layer's own form: Q8_0 per-32 scales for q8
+// the GEMV kernels, prefill batches on the per-format tiled GEMMs (q8 and native kq
+// alike). Activations arrive in the layer's own form: Q8_0 per-32 scales for q8
 // stacks, Q8_K per-256 for kq. Needs 8/16-bit SSBO storage + compute subgroups +
 // shaderIntegerDotProduct (probed; any absent = tier off, CPU fallback).
+//
+// STREAMED layers (DASLLAMA_GPU_MOE_STREAM=N, the N layers below the resident set): the loader
+// keeps their device-layout planes in pinned host mirrors; per prefill each layer's stacks DMA
+// into one of two device slots whose pseudo-stacks re-base onto the layer, so the batch rail
+// runs verbatim. After a layer's fenced chain, the NEXT layer's copy submits UNFENCED and rides
+// the GPU-idle window while the CPU runs attention — the following chain's transfer->compute
+// barrier orders it (in-order queue). Decode of streamed layers stays on the CPU planes.
 //
 // Submission model (v2): every stack carries its own descriptor set + host meta/xq/xs/y buffers,
 // so descriptors are written ONCE at upload and command buffers are PRE-RECORDED (per stack, plus
@@ -440,6 +447,349 @@ def kq_moe_gemv_k6 {
     }
 }
 
+// ===== the K-quant batch kernels =====
+// The prefill tile for native k4/k5/k6 stacks — same 32x32 region-list GEMM shape (and meta
+// layout) as q8_moe_batch, but region weight offsets are in SUPERBLOCK units and the staged
+// w tile holds COMPOSED byte quants: the staging thread reads the nibble words (+ qh bits) and
+// writes 8 words per column whose byte lanes are the block's quants in [0, 63] — the compute
+// loop is then the exact q8 tile dot (sdot4 over 8 words), with the K-quant min/offset terms
+// folded per 16-weight half via inline block sums (sdot4 vs 0x01010101 on x words the dot
+// already loads from the tile — 8 threads per row recompute them, cheaper than a staging role
+// on this bandwidth-bound kernel). Per-block scales stage as two decoded floats per column
+// (k4/k5: d*sc and dmin*mn; k6: d*slo and d*shi per 16-half); x scales are Q8_K per-256.
+
+var @workgroup bt_wsb : float[32]    // second per-column scale plane (bt_ws carries the first)
+
+// Q4_K tile: per block acc += xs * (d*sc*idot - dmin*mn*bsum)
+[compute_shader(local_size_x=256, name="kq_moe_batch_k4_spv")]
+def kq_moe_batch_k4 {
+    let n = vk_meta[0u]
+    let d = vk_meta[1u]
+    let rid = vk_meta[vk_meta[3u] + gl_WorkGroupID.x]
+    let rb = 4u + rid * 4u
+    let wsb0 = vk_meta[rb]
+    let row0 = vk_meta[rb + 1u]
+    let cnt = vk_meta[rb + 2u]
+    let tix = gl_WorkGroupID.x - vk_meta[rb + 3u]
+    let wtiles = (d + 31u) / 32u
+    let xt = tix / wtiles
+    let wt = tix % wtiles
+    let nsb = n / 256u
+    let nb = nsb * 8u
+    let tid = gl_LocalInvocationID.x
+    let word = tid % 8u
+    let grp = tid / 8u
+    let xrow = xt * 32u + grp
+    let wcol = wt * 32u + grp
+    let wi0 = (tid % 8u) * 4u
+    var f0 = 0.0
+    var f1 = 0.0
+    var f2 = 0.0
+    var f3 = 0.0
+    var b = 0u
+    while (b < nb) {
+        let sb = b / 8u
+        let blk = b % 8u
+        var xv = 0u
+        if (xrow < cnt) {
+            xv = vk_xq[((row0 + xrow) * nsb + sb) * 64u + blk * 8u + word]
+        }
+        bt_xw[tid] = xv
+        var wv = 0u
+        if (wcol < d) {
+            let wsb = wsb0 + wcol * nsb + sb
+            let raw = vk_wq[wsb * 32u + blk * 4u + (word % 4u)]
+            wv = word < 4u ? raw & 0x0F0F0F0F : (raw >> 4u) & 0x0F0F0F0F
+        }
+        bt_ww[grp * 9u + word] = wv
+        if (tid < 32u) {
+            var xs = 0.0
+            if (xt * 32u + tid < cnt) {
+                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + sb]
+            }
+            bt_xs[tid] = xs
+        } elif (tid < 64u) {
+            let i = tid - 32u
+            var sa = 0.0
+            var sbv = 0.0
+            if (wt * 32u + i < d) {
+                let wsb = wsb0 + (wt * 32u + i) * nsb + sb
+                let dm = unpackHalf2x16(vk_wsu[wsb * 5u])
+                let sc = int((vk_wsu[wsb * 5u + 1u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
+                let mn = int((vk_wsu[wsb * 5u + 3u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
+                sa = dm.x * float(sc)
+                sbv = dm.y * float(mn)
+            }
+            bt_ws[i] = sa
+            bt_wsb[i] = sbv
+        }
+        barrier()
+        var i0 = 0
+        var i1 = 0
+        var i2 = 0
+        var i3 = 0
+        var bs = 0
+        for (j in range(8)) {
+            let ju = uint(j)
+            let xw = bt_xw[grp * 8u + ju]
+            bs += sdot4(xw, 0x01010101)
+            i0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
+            i1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
+            i2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
+            i3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
+        }
+        let xscl = bt_xs[grp]
+        f0 += xscl * (bt_ws[wi0] * float(i0) - bt_wsb[wi0] * float(bs))
+        f1 += xscl * (bt_ws[wi0 + 1u] * float(i1) - bt_wsb[wi0 + 1u] * float(bs))
+        f2 += xscl * (bt_ws[wi0 + 2u] * float(i2) - bt_wsb[wi0 + 2u] * float(bs))
+        f3 += xscl * (bt_ws[wi0 + 3u] * float(i3) - bt_wsb[wi0 + 3u] * float(bs))
+        barrier()
+        b++
+    }
+    if (xrow < cnt) {
+        let yb = (row0 + xrow) * d + wt * 32u + wi0
+        if (wt * 32u + wi0 < d) {
+            vk_y[yb] = f0
+        }
+        if (wt * 32u + wi0 + 1u < d) {
+            vk_y[yb + 1u] = f1
+        }
+        if (wt * 32u + wi0 + 2u < d) {
+            vk_y[yb + 2u] = f2
+        }
+        if (wt * 32u + wi0 + 3u < d) {
+            vk_y[yb + 3u] = f3
+        }
+    }
+}
+
+// Q5_K tile: the k4 compose with the 5th bit OR'd in from the qh region
+[compute_shader(local_size_x=256, name="kq_moe_batch_k5_spv")]
+def kq_moe_batch_k5 {
+    let n = vk_meta[0u]
+    let d = vk_meta[1u]
+    let rid = vk_meta[vk_meta[3u] + gl_WorkGroupID.x]
+    let rb = 4u + rid * 4u
+    let wsb0 = vk_meta[rb]
+    let row0 = vk_meta[rb + 1u]
+    let cnt = vk_meta[rb + 2u]
+    let tix = gl_WorkGroupID.x - vk_meta[rb + 3u]
+    let wtiles = (d + 31u) / 32u
+    let xt = tix / wtiles
+    let wt = tix % wtiles
+    let nsb = n / 256u
+    let nb = nsb * 8u
+    let tid = gl_LocalInvocationID.x
+    let word = tid % 8u
+    let grp = tid / 8u
+    let xrow = xt * 32u + grp
+    let wcol = wt * 32u + grp
+    let wi0 = (tid % 8u) * 4u
+    var f0 = 0.0
+    var f1 = 0.0
+    var f2 = 0.0
+    var f3 = 0.0
+    var b = 0u
+    while (b < nb) {
+        let sb = b / 8u
+        let blk = b % 8u
+        var xv = 0u
+        if (xrow < cnt) {
+            xv = vk_xq[((row0 + xrow) * nsb + sb) * 64u + blk * 8u + word]
+        }
+        bt_xw[tid] = xv
+        var wv = 0u
+        if (wcol < d) {
+            let wsb = wsb0 + wcol * nsb + sb
+            let raw = vk_wq[wsb * 40u + blk * 4u + (word % 4u)]
+            let hb = (vk_wq[wsb * 40u + 32u + blk] >> ((word % 4u) * 8u)) & 0xFF
+            wv = (word < 4u ? (raw & 0x0F0F0F0F) | k5_dep(hb & 0xF)
+                : ((raw >> 4u) & 0x0F0F0F0F) | k5_dep(hb >> 4u))
+        }
+        bt_ww[grp * 9u + word] = wv
+        if (tid < 32u) {
+            var xs = 0.0
+            if (xt * 32u + tid < cnt) {
+                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + sb]
+            }
+            bt_xs[tid] = xs
+        } elif (tid < 64u) {
+            let i = tid - 32u
+            var sa = 0.0
+            var sbv = 0.0
+            if (wt * 32u + i < d) {
+                let wsb = wsb0 + (wt * 32u + i) * nsb + sb
+                let dm = unpackHalf2x16(vk_wsu[wsb * 5u])
+                let sc = int((vk_wsu[wsb * 5u + 1u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
+                let mn = int((vk_wsu[wsb * 5u + 3u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
+                sa = dm.x * float(sc)
+                sbv = dm.y * float(mn)
+            }
+            bt_ws[i] = sa
+            bt_wsb[i] = sbv
+        }
+        barrier()
+        var i0 = 0
+        var i1 = 0
+        var i2 = 0
+        var i3 = 0
+        var bs = 0
+        for (j in range(8)) {
+            let ju = uint(j)
+            let xw = bt_xw[grp * 8u + ju]
+            bs += sdot4(xw, 0x01010101)
+            i0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
+            i1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
+            i2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
+            i3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
+        }
+        let xscl = bt_xs[grp]
+        f0 += xscl * (bt_ws[wi0] * float(i0) - bt_wsb[wi0] * float(bs))
+        f1 += xscl * (bt_ws[wi0 + 1u] * float(i1) - bt_wsb[wi0 + 1u] * float(bs))
+        f2 += xscl * (bt_ws[wi0 + 2u] * float(i2) - bt_wsb[wi0 + 2u] * float(bs))
+        f3 += xscl * (bt_ws[wi0 + 3u] * float(i3) - bt_wsb[wi0 + 3u] * float(bs))
+        barrier()
+        b++
+    }
+    if (xrow < cnt) {
+        let yb = (row0 + xrow) * d + wt * 32u + wi0
+        if (wt * 32u + wi0 < d) {
+            vk_y[yb] = f0
+        }
+        if (wt * 32u + wi0 + 1u < d) {
+            vk_y[yb + 1u] = f1
+        }
+        if (wt * 32u + wi0 + 2u < d) {
+            vk_y[yb + 2u] = f2
+        }
+        if (wt * 32u + wi0 + 3u < d) {
+            vk_y[yb + 3u] = f3
+        }
+    }
+}
+
+// Q6_K tile: composed 6-bit quants in [0, 63], the -32 folded per 16-half as slo/shi vs the
+// half's block sum — the lo/hi word split (j 0..3 / 4..7) IS the sub-scale split
+[compute_shader(local_size_x=256, name="kq_moe_batch_k6_spv")]
+def kq_moe_batch_k6 {
+    let n = vk_meta[0u]
+    let d = vk_meta[1u]
+    let rid = vk_meta[vk_meta[3u] + gl_WorkGroupID.x]
+    let rb = 4u + rid * 4u
+    let wsb0 = vk_meta[rb]
+    let row0 = vk_meta[rb + 1u]
+    let cnt = vk_meta[rb + 2u]
+    let tix = gl_WorkGroupID.x - vk_meta[rb + 3u]
+    let wtiles = (d + 31u) / 32u
+    let xt = tix / wtiles
+    let wt = tix % wtiles
+    let nsb = n / 256u
+    let nb = nsb * 8u
+    let tid = gl_LocalInvocationID.x
+    let word = tid % 8u
+    let grp = tid / 8u
+    let xrow = xt * 32u + grp
+    let wcol = wt * 32u + grp
+    let wi0 = (tid % 8u) * 4u
+    var f0 = 0.0
+    var f1 = 0.0
+    var f2 = 0.0
+    var f3 = 0.0
+    var b = 0u
+    while (b < nb) {
+        let sb = b / 8u
+        let blk = b % 8u
+        var xv = 0u
+        if (xrow < cnt) {
+            xv = vk_xq[((row0 + xrow) * nsb + sb) * 64u + blk * 8u + word]
+        }
+        bt_xw[tid] = xv
+        var wv = 0u
+        if (wcol < d) {
+            let wsb = wsb0 + wcol * nsb + sb
+            let raw = vk_wq[wsb * 48u + blk * 4u + (word % 4u)]
+            let qh = vk_wq[wsb * 48u + 32u + (blk / 4u) * 8u + word]   // j and j+4 qh words adjoin
+            let shift = (blk % 4u) * 2u
+            wv = (word < 4u ? (raw & 0x0F0F0F0F) | (((qh >> shift) & 0x03030303) << 4u)
+                : ((raw >> 4u) & 0x0F0F0F0F) | (((qh >> shift) & 0x03030303) << 4u))
+        }
+        bt_ww[grp * 9u + word] = wv
+        if (tid < 32u) {
+            var xs = 0.0
+            if (xt * 32u + tid < cnt) {
+                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + sb]
+            }
+            bt_xs[tid] = xs
+        } elif (tid < 64u) {
+            let i = tid - 32u
+            var sa = 0.0
+            var sbv = 0.0
+            if (wt * 32u + i < d) {
+                let wsb = wsb0 + (wt * 32u + i) * nsb + sb
+                let s4 = int4(unpack8(int(vk_wsu[wsb * 5u + blk / 2u])))
+                let slo = (blk % 2u) == 0u ? s4.x : s4.z
+                let shi = (blk % 2u) == 0u ? s4.y : s4.w
+                let dd = unpackHalf2x16(vk_wsu[wsb * 5u + 4u]).x
+                sa = dd * float(slo)
+                sbv = dd * float(shi)
+            }
+            bt_ws[i] = sa
+            bt_wsb[i] = sbv
+        }
+        barrier()
+        var l0 = 0
+        var l1 = 0
+        var l2 = 0
+        var l3 = 0
+        var blo = 0
+        for (j in range(4)) {
+            let ju = uint(j)
+            let xw = bt_xw[grp * 8u + ju]
+            blo += sdot4(xw, 0x01010101)
+            l0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
+            l1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
+            l2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
+            l3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
+        }
+        var h0 = 0
+        var h1 = 0
+        var h2 = 0
+        var h3 = 0
+        var bhi = 0
+        for (j in range(4)) {
+            let ju = uint(j) + 4u
+            let xw = bt_xw[grp * 8u + ju]
+            bhi += sdot4(xw, 0x01010101)
+            h0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
+            h1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
+            h2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
+            h3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
+        }
+        let xscl = bt_xs[grp]
+        f0 += xscl * (bt_ws[wi0] * float(l0 - 32 * blo) + bt_wsb[wi0] * float(h0 - 32 * bhi))
+        f1 += xscl * (bt_ws[wi0 + 1u] * float(l1 - 32 * blo) + bt_wsb[wi0 + 1u] * float(h1 - 32 * bhi))
+        f2 += xscl * (bt_ws[wi0 + 2u] * float(l2 - 32 * blo) + bt_wsb[wi0 + 2u] * float(h2 - 32 * bhi))
+        f3 += xscl * (bt_ws[wi0 + 3u] * float(l3 - 32 * blo) + bt_wsb[wi0 + 3u] * float(h3 - 32 * bhi))
+        barrier()
+        b++
+    }
+    if (xrow < cnt) {
+        let yb = (row0 + xrow) * d + wt * 32u + wi0
+        if (wt * 32u + wi0 < d) {
+            vk_y[yb] = f0
+        }
+        if (wt * 32u + wi0 + 1u < d) {
+            vk_y[yb + 1u] = f1
+        }
+        if (wt * 32u + wi0 + 2u < d) {
+            vk_y[yb + 2u] = f2
+        }
+        if (wt * 32u + wi0 + 3u < d) {
+            vk_y[yb + 3u] = f3
+        }
+    }
+}
+
 // ===== device state (process-lifetime; never finalized by design) =====
 
 let private WEIGHT_CAP = 4_200_000_000l    // default resident-weight cap. The WDDM cliff is TOTAL
@@ -469,6 +819,9 @@ let private BATCH_HQ_BYTES = 33_554_432l   // device requantized-hidden quants (
 let private BATCH_HS_BYTES = 8_388_608l    // ... its scale plane
 let private FFN_META_BYTES = 64l           // act/requant params (element count, gelu flag, block count)
 let private CLS_META_BYTES = 64l           // classifier GEMV params (one region, filled once)
+let private STREAM_RESERVE = 900_000_000l  // VRAM reserved out of the weight budget for the two
+                                           // streaming slots when DASLLAMA_GPU_MOE_STREAM is on
+                                           // (35B kq worst case: 2 x ~400MB slot + slack)
 
 struct private HostBuf {
     buf : uint64       // VkBuffer
@@ -506,6 +859,28 @@ struct private VkStack {
     cls_made : bool
 }
 
+// one pinned-host-mirror weight stack of a STREAMED layer (device-layout planes kept in
+// host-visible memory, DMA'd into a slot per prefill). Stacks arrive gate/up/down per layer
+// (loader walk order, descending layers) — group g = stacks [3g, 3g+3), runtime-next = g-1.
+struct private StreamStack {
+    base : int64
+    elems : int64
+    fmt : int
+    wqbytes : int64
+    wsbytes : int64
+    hwq : HostBuf            // pinned mirror, quant plane (transfer_src)
+    hws : HostBuf            // ... scale plane
+}
+
+// one streaming slot: 3 pseudo-stacks (entries in g_gpu.stacks whose plane buffers are the
+// slot's device scratch, re-based per layer so find_stack + the whole batch rail work verbatim)
+struct private StreamSlot {
+    group : int              // stream group currently resident in the slot (-1 = empty)
+    s1 : int                 // pseudo-stack indices: gate / up / down
+    s3 : int
+    s2 : int
+}
+
 // pre-recorded decode-form FFN chain per (gate, up, down) stack triple: GEMV pair, fused
 // act+requant, down GEMV, y DMA — refreshed per token via the stacks' host-visible metas,
 // resubmitted as-is
@@ -533,6 +908,9 @@ struct private GpuState {
     gemv_k5 : Pipeline
     gemv_k6 : Pipeline
     actrq_k_pipeline : Pipeline // fused act + Q8_K requant twin (per-256 scale) for the kq chains
+    batch_k4 : Pipeline         // native K-quant prefill tiles (per-format batch kernels)
+    batch_k5 : Pipeline
+    batch_k6 : Pipeline
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
@@ -559,10 +937,30 @@ struct private GpuState {
     batch_actrq_set : VkDescriptorSet   // batch twin of FfnCmd's fused act+requant set (y1/y2 planes)
     batch_cmd : VkCommandBuffer   // one reusable batch cmd buffer, re-recorded per submit
     batch_ready : bool
+    // streamed-prefill state (lazy — first streamed dispatch creates the slots)
+    @do_not_delete stream_stacks : array<StreamStack>
+    stream_slots : array<StreamSlot>
+    stream_cmd : VkCommandBuffer  // reusable plane-copy cmd (safe: a fenced chain wait always
+                                  // intervenes between two recordings — see copy_stream_group)
+    stream_max_gu_wq : int64      // per-plane capacity maxima across streamed stacks
+    stream_max_gu_ws : int64
+    stream_max_dn_wq : int64
+    stream_max_dn_ws : int64
+    stream_ready : bool
 }
 
 var private g_gpu : GpuState?
 var private g_init_failed = false
+var private g_vk_prof = false      // DASLLAMA_GPU_PROF=1: per-piece batch-chain timing to log
+var private g_vk_prof_probed = false
+
+def private vk_prof : bool {
+    if (!g_vk_prof_probed) {
+        g_vk_prof_probed = true
+        g_vk_prof = get_env_variable("DASLLAMA_GPU_PROF") == "1"
+    }
+    return g_vk_prof
+}
 
 def private dev_raw : VkDevice {
     return boost_value_to_vk(g_gpu.device)
@@ -691,6 +1089,9 @@ def private vk_moe_init : bool {
             to_log(LOG_INFO, "dasLLAMA vulkan tier: device heap budget {int64(mb.heapBudget[best]) / 1000000l} MB (used {int64(mb.heapUsage[best]) / 1000000l}), weight cap {g_gpu.weight_budget / 1000000l} MB\n")
         }
     }
+    if (to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")) > 0) {
+        g_gpu.weight_budget = max(g_gpu.weight_budget - STREAM_RESERVE, 0l)   // room for the 2 slots
+    }
     var pci : CommandPoolCreateInfo
     pci.queueFamilyIndex = g_gpu.fam
     pci.flags.reset_command_buffer = true   // per-stack buffers re-record if a shape ever changes
@@ -730,6 +1131,12 @@ def private vk_moe_init : bool {
     g_gpu.gemv_k6 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, k6shader)
     var rkshader <- create_shader_module(g_gpu.device, q8k_moe_actrq_spv)
     g_gpu.actrq_k_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rkshader)
+    var bk4shader <- create_shader_module(g_gpu.device, kq_moe_batch_k4_spv)
+    g_gpu.batch_k4 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bk4shader)
+    var bk5shader <- create_shader_module(g_gpu.device, kq_moe_batch_k5_spv)
+    g_gpu.batch_k5 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bk5shader)
+    var bk6shader <- create_shader_module(g_gpu.device, kq_moe_batch_k6_spv)
+    g_gpu.batch_k6 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bk6shader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -783,17 +1190,73 @@ def private write_buf_desc(var writes : array<WriteDescriptorSet>; set_ : VkDesc
     writes |> emplace(w)
 }
 
-//! MoeGpuUploadFn: upload one weight stack ([rows x n] at element offset woff) from the
-//! loader's gathered row-major planes. q8 (fmt 0): int8 quants + f16 halfword scales; native
-//! K-quant (fmt = int(KqFmt) k4/k5/k6): superblock quant payloads + decoded 20B scale rows.
-def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int) : bool {
-    if (!vk_moe_init()) {
-        return false
-    }
+// weight plane byte sizes for one [rows x n] stack in the tier's device layout
+def private stack_plane_bytes(n, rows : int64; fmt : int) : tuple<wq : int64; ws : int64> {
     assert(fmt == 0 || n % 256l == 0l, "dasLLAMA vulkan tier: kq stack row length must be a superblock multiple")
     let nsb = rows * (n / 256l)
     let wqbytes = fmt == 0 ? rows * n : nsb * (fmt == 1 ? 128l : (fmt == 2 ? 160l : 192l))
     let wsbytes = fmt == 0 ? rows * (n / 32l) * 2l : nsb * 20l
+    return (wq = wqbytes, ws = wsbytes)
+}
+
+// build a VkStack shell (plane buffers of the given capacity + per-stack host bufs + the
+// written GEMV descriptor set). Resident stacks pass their exact plane sizes; streaming
+// pseudo-stacks pass slot capacities and a base of -1 (re-based per layer).
+def private make_stack_shell(base, elems : int64; fmt : int; wqcap, wscap : int64) : int {
+    var st = VkStack(base = base, elems = elems, fmt = fmt, wqbytes = wqcap,
+                     wqbuf = make_device_buf(wqcap), wsbuf = make_device_buf(wscap), wsbytes = wscap,
+                     raw_set = alloc_desc_set(),
+                     meta = make_host_buf(META_BYTES, true), xq = make_host_buf(XQ_BYTES, true),
+                     xs = make_host_buf(XS_BYTES, true), y = make_host_buf(Y_BYTES, false, [cached = true]),
+                     y_dev = make_device_buf(Y_BYTES))
+    var writes : array<WriteDescriptorSet>
+    write_buf_desc(writes, st.raw_set, 0u, st.wqbuf, wqcap)
+    write_buf_desc(writes, st.raw_set, 1u, st.wsbuf, wscap)
+    write_buf_desc(writes, st.raw_set, 2u, st.meta.buf, META_BYTES)
+    write_buf_desc(writes, st.raw_set, 3u, st.xq.buf, XQ_BYTES)
+    write_buf_desc(writes, st.raw_set, 4u, st.xs.buf, XS_BYTES)
+    write_buf_desc(writes, st.raw_set, 5u, st.y_dev, Y_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.stacks |> push(st)
+    return length(g_gpu.stacks) - 1
+}
+
+// stream arm: keep the gathered device-layout planes in a pinned host mirror (host-visible
+// memory the copy engine DMA-streams into a slot per prefill). No VRAM spent here.
+def private vk_moe_stream_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n, rows : int64; fmt : int) : bool {
+    let pb = stack_plane_bytes(n, rows, fmt)
+    var ss = StreamStack(base = woff, elems = rows * n, fmt = fmt, wqbytes = pb.wq, wsbytes = pb.ws,
+                         hwq = make_host_buf(pb.wq, false), hws = make_host_buf(pb.ws, false))
+    unsafe {
+        memcpy(ss.hwq.mapped, reinterpret<void? -const>(wq), int(pb.wq))
+        memcpy(ss.hws.mapped, reinterpret<void? -const>(ws), int(pb.ws))
+    }
+    if (length(g_gpu.stream_stacks) % 3 == 2) {   // walk order gate/up/down: this one is a down
+        g_gpu.stream_max_dn_wq = max(g_gpu.stream_max_dn_wq, pb.wq)
+        g_gpu.stream_max_dn_ws = max(g_gpu.stream_max_dn_ws, pb.ws)
+    } else {
+        g_gpu.stream_max_gu_wq = max(g_gpu.stream_max_gu_wq, pb.wq)
+        g_gpu.stream_max_gu_ws = max(g_gpu.stream_max_gu_ws, pb.ws)
+    }
+    g_gpu.stream_stacks |> emplace(ss)
+    return true
+}
+
+//! MoeGpuUploadFn: upload one weight stack ([rows x n] at element offset woff) from the
+//! loader's gathered row-major planes. q8 (fmt 0): int8 quants + f16 halfword scales; native
+//! K-quant (fmt = int(KqFmt) k4/k5/k6): superblock quant payloads + decoded 20B scale rows.
+//! stream = pinned host mirror for per-prefill DMA streaming instead of resident VRAM.
+def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int; stream : bool) : bool {
+    if (!vk_moe_init()) {
+        return false
+    }
+    if (stream) {
+        return vk_moe_stream_stack(wq, ws, woff, n, rows, fmt)
+    }
+    let pb = stack_plane_bytes(n, rows, fmt)
+    let wqbytes = pb.wq
+    let wsbytes = pb.ws
     if (g_gpu.resident_bytes + wqbytes + wsbytes > g_gpu.weight_budget) {
         to_log(LOG_INFO, "dasLLAMA vulkan tier: VRAM budget reached at {g_gpu.resident_bytes} bytes\n")
         return false
@@ -802,38 +1265,33 @@ def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : 
         to_log(LOG_INFO, "dasLLAMA vulkan tier: descriptor capacity reached at {length(g_gpu.stacks)} stacks\n")
         return false
     }
-    var st = VkStack(base = woff, elems = rows * n, fmt = fmt, wqbytes = wqbytes,
-                     wqbuf = make_device_buf(wqbytes), wsbuf = make_device_buf(wsbytes), wsbytes = wsbytes,
-                     raw_set = alloc_desc_set(),
-                     meta = make_host_buf(META_BYTES, true), xq = make_host_buf(XQ_BYTES, true),
-                     xs = make_host_buf(XS_BYTES, true), y = make_host_buf(Y_BYTES, false, [cached = true]),
-                     y_dev = make_device_buf(Y_BYTES))
-    upload_region(st.wqbuf, wq, wqbytes)
-    upload_region(st.wsbuf, ws, wsbytes)
-    var writes : array<WriteDescriptorSet>
-    write_buf_desc(writes, st.raw_set, 0u, st.wqbuf, wqbytes)
-    write_buf_desc(writes, st.raw_set, 1u, st.wsbuf, wsbytes)
-    write_buf_desc(writes, st.raw_set, 2u, st.meta.buf, META_BYTES)
-    write_buf_desc(writes, st.raw_set, 3u, st.xq.buf, XQ_BYTES)
-    write_buf_desc(writes, st.raw_set, 4u, st.xs.buf, XS_BYTES)
-    write_buf_desc(writes, st.raw_set, 5u, st.y_dev, Y_BYTES)
-    let no_copies : array<CopyDescriptorSet>
-    update_descriptor_sets(g_gpu.device, writes, no_copies)
-    g_gpu.stacks |> push(st)
+    let si = make_stack_shell(woff, rows * n, fmt, wqbytes, wsbytes)
+    upload_region(g_gpu.stacks[si].wqbuf, wq, wqbytes)
+    upload_region(g_gpu.stacks[si].wsbuf, ws, wsbytes)
     g_gpu.resident_bytes += wqbytes + wsbytes
     return true
 }
 
 // ===== dispatch plumbing =====
 
-def private find_stack(w0 : int64) : int {
+// stack resolution is by (format, offset) — weight element offsets live in PER-FORMAT plane
+// spaces (q8 qblob vs the k4/k5/k6 planes), so a bare offset is ambiguous across formats (a k4
+// gate and a k5 down can share the numeric range); within one format's space ranges are disjoint
+def private find_stack_idx(w0 : int64; fmt : int) : int {
     for (i in range(length(g_gpu.stacks))) {
-        if (w0 >= g_gpu.stacks[i].base && w0 < g_gpu.stacks[i].base + g_gpu.stacks[i].elems) {
+        if (g_gpu.stacks[i].fmt == fmt && w0 >= g_gpu.stacks[i].base && w0 < g_gpu.stacks[i].base + g_gpu.stacks[i].elems) {
             return i
         }
     }
-    panic("dasLLAMA vulkan tier: dispatch against a non-resident weight region")
     return -1
+}
+
+def private find_stack(w0 : int64; fmt : int) : int {
+    let i = find_stack_idx(w0, fmt)
+    if (i < 0) {
+        panic("dasLLAMA vulkan tier: dispatch against a non-resident weight region (fmt {fmt} element offset {w0})")
+    }
+    return i
 }
 
 def private alloc_cmd : VkCommandBuffer {
@@ -865,6 +1323,19 @@ def private bind_gemv_pipe(raw : VkCommandBuffer; fmt : int) {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.gemv_k5, VkPipelineBindPoint.COMPUTE)
     } else {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.gemv_k6, VkPipelineBindPoint.COMPUTE)
+    }
+}
+
+// ... and the batch-tile twin (0 = q8_moe_batch, 1/2/3 = kq_moe_batch_k4/5/6)
+def private bind_batch_pipe(raw : VkCommandBuffer; fmt : int) {
+    if (fmt == 0) {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_pipeline, VkPipelineBindPoint.COMPUTE)
+    } elif (fmt == 1) {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_k4, VkPipelineBindPoint.COMPUTE)
+    } elif (fmt == 2) {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_k5, VkPipelineBindPoint.COMPUTE)
+    } else {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_k6, VkPipelineBindPoint.COMPUTE)
     }
 }
 
@@ -1020,23 +1491,24 @@ def private ensure_batch_set(si : int; ybuf, xqbuf, xsbuf : uint64; xqbytes, xsb
 }
 
 // chunk row cap: the gathered x window, both hidden planes, the requant planes, and the down
-// output (which reuses y1) must all fit their buffers
-def private ffn_chunk_rows(n, nfe : int64) : int64 {
-    var r = min(BATCH_XQ_BYTES / n, BATCH_XS_BYTES / ((n / 32l) * 4l))
+// output (which reuses y1) must all fit their buffers. xunit = the activation scale block size
+// (32 for Q8_0 chains, 256 for Q8_K)
+def private ffn_chunk_rows(n, nfe, xunit : int64) : int64 {
+    var r = min(BATCH_XQ_BYTES / n, BATCH_XS_BYTES / ((n / xunit) * 4l))
     r = min(r, BATCH_Y_BYTES / (max(nfe, n) * 4l))
-    r = min(r, min(BATCH_HQ_BYTES / nfe, BATCH_HS_BYTES / ((nfe / 32l) * 4l)))
+    r = min(r, min(BATCH_HQ_BYTES / nfe, BATCH_HS_BYTES / ((nfe / xunit) * 4l)))
     return min(r, BATCH_CHUNK_ROWS)
 }
 
 // stage the chunk's activation rows [r0, r0+rows) into the device-local scratch (the kernel
 // re-reads x ~(d/32) times — host-visible would cross PCIe every pass)
-def private upload_batch_acts(xqp : int8 const?; xsp : float const?; r0, rows, n : int64) {
+def private upload_batch_acts(xqp : int8 const?; xsp : float const?; r0, rows, n, xunit : int64) {
     let xq_bytes = rows * n
-    let xs_bytes = rows * (n / 32l) * 4l
+    let xs_bytes = rows * (n / xunit) * 4l
     unsafe {
         var sp = reinterpret<uint8?>(g_gpu.staging.mapped)
         memcpy(g_gpu.staging.mapped, reinterpret<void? -const>(xqp + r0 * n), int(xq_bytes))
-        memcpy(reinterpret<void?>(sp + BATCH_XQ_BYTES), reinterpret<void? -const>(xsp + r0 * (n / 32l)), int(xs_bytes))
+        memcpy(reinterpret<void?>(sp + BATCH_XQ_BYTES), reinterpret<void? -const>(xsp + r0 * (n / xunit)), int(xs_bytes))
     }
     run_cmd_sync(g_gpu.device, g_gpu.pool, g_gpu.queue) $(cmd) {
         var qregions : array<BufferCopy>
@@ -1049,9 +1521,11 @@ def private upload_batch_acts(xqp : int8 const?; xsp : float const?; r0, rows, n
 }
 
 // build the chunk's meta table: regions clipped to the row window [r0, r1) (row0 re-based to the
-// window), then the per-workgroup region map. Returns the workgroup count.
+// window), then the per-workgroup region map. Weight offsets follow the stack's format units —
+// 32-weight blocks for q8, superblocks for kq. Returns the workgroup count.
 def private fill_batch_meta(si : int; offs : int64 const?; nregions : int64; n, d : int64; r0, r1 : int64) : uint {
     let wtiles = (d + BATCH_TILE - 1l) / BATCH_TILE
+    let unit = g_gpu.stacks[si].fmt != 0 ? 256l : 32l
     unsafe {
         var mp = reinterpret<uint?>(g_gpu.stacks[si].batch_meta.mapped)
         var nrc = 0l
@@ -1078,9 +1552,9 @@ def private fill_batch_meta(si : int; offs : int64 const?; nregions : int64; n, 
                 continue
             }
             let rel = offs[r * 3l] - g_gpu.stacks[si].base
-            assert(rel % 32l == 0l, "dasLLAMA vulkan tier: unaligned batch region weight offset")
+            assert(rel % unit == 0l, "dasLLAMA vulkan tier: unaligned batch region weight offset")
             let mb = 4l + ri * 4l
-            mp[mb] = uint(rel / 32l)
+            mp[mb] = uint(rel / unit)
             mp[mb + 1l] = uint(rb0 - r0)
             mp[mb + 2l] = uint(rb1 - rb0)
             mp[mb + 3l] = uint(wg)
@@ -1143,14 +1617,19 @@ def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, 
     cmd_copy_batch_meta(raw, s2)
     cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
     batch_barrier(raw, true)
-    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_pipeline, VkPipelineBindPoint.COMPUTE)
+    bind_batch_pipe(raw, g_gpu.stacks[s1].fmt)
     cmd_bind_dispatch(raw, g_gpu.stacks[s1].batch_set, nwg_gu)
+    if (g_gpu.stacks[s3].fmt != g_gpu.stacks[s1].fmt) {
+        bind_batch_pipe(raw, g_gpu.stacks[s3].fmt)
+    }
     cmd_bind_dispatch(raw, g_gpu.stacks[s3].batch_set, nwg_gu)
     comp_barrier(raw)
-    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.actrq_pipeline, VkPipelineBindPoint.COMPUTE)
-    cmd_bind_dispatch(raw, g_gpu.batch_actrq_set, uint((rows * nfe / 32l + 255l) / 256l))
+    // the requant form follows the DOWN stack — its GEMM is the consumer of hq/hs
+    let dkq = g_gpu.stacks[s2].fmt != 0
+    cmd_bind_pipeline(vk_value_to_boost(raw), dkq ? g_gpu.actrq_k_pipeline : g_gpu.actrq_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.batch_actrq_set, uint((rows * nfe / (dkq ? 256l : 32l) + 255l) / 256l))
     comp_barrier(raw)
-    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_pipeline, VkPipelineBindPoint.COMPUTE)
+    bind_batch_pipe(raw, g_gpu.stacks[s2].fmt)
     cmd_bind_dispatch(raw, g_gpu.stacks[s2].batch_set, nwg_dn)
     batch_barrier(raw, false)
     cmd_copy_whole(raw, g_gpu.batch_y1_dev, g_gpu.batch_y1.buf, gout_bytes)
@@ -1159,29 +1638,43 @@ def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, 
 
 // the batch arm: chunked over row windows; gate+up share the gathered image and region row
 // ranges, the down GEMM reads the requantized hidden planes and reuses y1 for its output
-def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; is_gelu : bool) {
-    let s1 = find_stack(unsafe(offs1[0]))
-    let s3 = find_stack(unsafe(offs3[0]))
-    let s2 = find_stack(unsafe(offs2[0]))
+def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+    let s1 = find_stack(unsafe(offs1[0]), f1)
+    let s3 = find_stack(unsafe(offs3[0]), f3)
+    let s2 = find_stack(unsafe(offs2[0]), f2)
+    // the chain's activation form is uniform per layer (Q8_0 or Q8_K) — the upload walk only
+    // admits all-q8 or all-kq stack triples, so kq-ness must agree across the three stacks
+    let kq = f1 != 0
+    assert((f3 != 0) == kq && (f2 != 0) == kq,
+        "dasLLAMA vulkan tier: q8/kq mixed stack triple in one FFN chain")
+    let xunit = kq ? 256l : 32l
     ensure_batch_state()
     ensure_batch_set(s1, g_gpu.batch_y1_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
     ensure_batch_set(s3, g_gpu.batch_y2_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
     ensure_batch_set(s2, g_gpu.batch_y1_dev, g_gpu.hq_dev, g_gpu.hs_dev, BATCH_HQ_BYTES, BATCH_HS_BYTES)
-    let chunk = ffn_chunk_rows(n, nfe)
+    let chunk = ffn_chunk_rows(n, nfe, xunit)
     var r0 = 0l
     while (r0 < nrows) {
         let r1 = min(r0 + chunk, nrows)
         let rows = r1 - r0
+        let ts0 = ref_time_ticks()
         let nwg1 = fill_batch_meta(s1, offs1, nregions, n, nfe, r0, r1)
         let nwg3 = fill_batch_meta(s3, offs3, nregions, n, nfe, r0, r1)
         assert(nwg1 == nwg3, "dasLLAMA vulkan tier: fused batch pair region mismatch")
         let nwg2 = fill_batch_meta(s2, offs2, nregions, nfe, n, r0, r1)
-        upload_batch_acts(xqp, xsp, r0, rows, n)
-        fill_ffn_meta(rows * nfe, rows * nfe / 32l, is_gelu)
+        let ts1 = ref_time_ticks()
+        upload_batch_acts(xqp, xsp, r0, rows, n, xunit)
+        let ts2 = ref_time_ticks()
+        fill_ffn_meta(rows * nfe, rows * nfe / xunit, is_gelu)
         record_ffn_batch_cmd(s1, s3, s2, nwg1, nwg2, rows, nfe, rows * n * 4l)
+        let ts3 = ref_time_ticks()
         submit_wait(g_gpu.batch_cmd)
+        let ts4 = ref_time_ticks()
         unsafe {
             memcpy(reinterpret<void?>(goutp + r0 * n), g_gpu.batch_y1.mapped, int(rows * n * 4l))
+        }
+        if (vk_prof()) {
+            to_log(LOG_INFO, "vk_ffn_batch acts {get_time_usec(ts1) - get_time_usec(ts2)} submit {get_time_usec(ts3) - get_time_usec(ts4)} copy {get_time_usec(ts4)}\n")
         }
         r0 = r1
     }
@@ -1252,15 +1745,15 @@ def private ffn_cmd_for(s1, s3, s2 : int; nrows, n, nfe : int64) : VkCommandBuff
     return fc.cmd
 }
 
-def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; is_gelu : bool) {
-    let s1 = find_stack(unsafe(offs1[0]))
-    let s3 = find_stack(unsafe(offs3[0]))
-    let s2 = find_stack(unsafe(offs2[0]))
+def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+    let s1 = find_stack(unsafe(offs1[0]), f1)
+    let s3 = find_stack(unsafe(offs3[0]), f3)
+    let s2 = find_stack(unsafe(offs2[0]), f2)
     assert(nrows * max(nfe, n) * 4l <= Y_BYTES, "dasLLAMA vulkan tier: FFN dispatch exceeds output capacity")
     // the chain's activation form is uniform per layer (Q8_0 or Q8_K) — the upload walk only
     // admits all-q8 or all-kq stack triples, so kq-ness must agree across the three stacks
-    let kq = g_gpu.stacks[s1].fmt != 0
-    assert((g_gpu.stacks[s3].fmt != 0) == kq && (g_gpu.stacks[s2].fmt != 0) == kq,
+    let kq = f1 != 0
+    assert((f3 != 0) == kq && (f2 != 0) == kq,
         "dasLLAMA vulkan tier: q8/kq mixed stack triple in one FFN chain")
     let xunit = kq ? 256l : 32l
     fill_stack_meta_rows(s1, offs1, nregions, n, nfe, nrows, n / xunit)
@@ -1276,20 +1769,122 @@ def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : in
     }
 }
 
+// ===== streamed-prefill dispatch (pinned-mirror layers) =====
+
+def private ensure_stream_slots {
+    if (g_gpu.stream_ready) {
+        return
+    }
+    ensure_batch_state()
+    g_gpu.stream_cmd = alloc_cmd()
+    g_gpu.stream_slots |> reserve(2)
+    for (_slot in range(2)) {
+        let s1 = make_stack_shell(-1l, 0l, 0, g_gpu.stream_max_gu_wq, g_gpu.stream_max_gu_ws)
+        let s3 = make_stack_shell(-1l, 0l, 0, g_gpu.stream_max_gu_wq, g_gpu.stream_max_gu_ws)
+        let s2 = make_stack_shell(-1l, 0l, 0, g_gpu.stream_max_dn_wq, g_gpu.stream_max_dn_ws)
+        g_gpu.stream_slots |> push(StreamSlot(group = -1, s1 = s1, s3 = s3, s2 = s2))
+    }
+    g_gpu.stream_ready = true
+    to_log(LOG_INFO, "dasLLAMA vulkan tier: streamed prefill engaged ({length(g_gpu.stream_stacks) / 3} layers, slot {2l * (g_gpu.stream_max_gu_wq + g_gpu.stream_max_gu_ws) + g_gpu.stream_max_dn_wq + g_gpu.stream_max_dn_ws} bytes x 2)\n")
+}
+
+// re-base one slot pseudo-stack onto a stream stack (descriptors stay — the slot buffers are
+// the same; only the meta-resolution identity and the kernel choice follow the layer)
+def private rebase_pseudo(si : int; ss : StreamStack const) {
+    g_gpu.stacks[si].base = ss.base
+    g_gpu.stacks[si].elems = ss.elems
+    g_gpu.stacks[si].fmt = ss.fmt
+}
+
+// DMA group g's six planes from the pinned mirrors into slot si. sync submits fenced and
+// waits; async submits UNFENCED — the prefetch rides the GPU-idle window while the CPU runs
+// the next layers' attention, and the next chain submit's transfer->compute barrier orders it
+// (in-order queue). One shared cmd buffer is safe: a fenced chain wait always intervenes
+// between two copy recordings, so the prior copy has retired off the queue.
+def private copy_stream_group(si, g : int; sync : bool) {
+    let slot = g_gpu.stream_slots[si]
+    var raw = g_gpu.stream_cmd
+    let rf : VkCommandBufferResetFlags
+    vk_check(vkResetCommandBuffer(raw, rf), null)
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    for (k in range(3)) {
+        let sk = g * 3 + k
+        let psi = k == 0 ? slot.s1 : (k == 1 ? slot.s3 : slot.s2)
+        cmd_copy_whole(raw, g_gpu.stream_stacks[sk].hwq.buf, g_gpu.stacks[psi].wqbuf, g_gpu.stream_stacks[sk].wqbytes)
+        cmd_copy_whole(raw, g_gpu.stream_stacks[sk].hws.buf, g_gpu.stacks[psi].wsbuf, g_gpu.stream_stacks[sk].wsbytes)
+    }
+    vk_check(vkEndCommandBuffer(raw), null)
+    if (sync) {
+        submit_wait(raw)
+    } else {
+        var submit = VkSubmitInfo()
+        submit.commandBufferCount = 1u
+        let nofence : VkFence
+        unsafe {
+            submit.pCommandBuffers = addr(raw)
+            vk_check(vkQueueSubmit(g_gpu.queue, 1u, addr(submit), nofence), null)
+        }
+    }
+    g_gpu.stream_slots[si].group = g
+}
+
+// run one streamed layer's prefill chain: ensure its planes sit in a slot (cold-copy on a
+// prefetch miss), re-base the slot's pseudo-stacks so the normal batch rail resolves them,
+// dispatch, then fire the next runtime layer's prefetch (group g-1 — the loader walk uploads
+// descending, prefill runs ascending)
+def private vk_moe_ffn_streamed(g : int; var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+    assert(nrows >= BATCH_TILE, "dasLLAMA vulkan tier: streamed layers serve prefill batches only")
+    assert(g_gpu.stream_stacks[g * 3 + 1].fmt == f3 && g_gpu.stream_stacks[g * 3 + 2].fmt == f2,
+        "dasLLAMA vulkan tier: streamed group format mismatch")
+    ensure_stream_slots()
+    var si = -1
+    for (i in range(2)) {
+        if (g_gpu.stream_slots[i].group == g) {
+            si = i
+        }
+    }
+    if (si < 0) {
+        si = g % 2
+        copy_stream_group(si, g, true)
+    }
+    rebase_pseudo(g_gpu.stream_slots[si].s1, g_gpu.stream_stacks[g * 3])
+    rebase_pseudo(g_gpu.stream_slots[si].s3, g_gpu.stream_stacks[g * 3 + 1])
+    rebase_pseudo(g_gpu.stream_slots[si].s2, g_gpu.stream_stacks[g * 3 + 2])
+    vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
+    if (g > 0 && g_gpu.stream_slots[(g - 1) % 2].group != g - 1) {
+        copy_stream_group((g - 1) % 2, g - 1, false)
+    }
+}
+
 //! MoeGpuFfnFn: the routed experts' whole FFN chain — gate+up region GEMMs, activation,
 //! requant, down GEMM — as device-side submit chains over the resident stacks; the hidden
 //! activations never cross PCIe. offs are region triples sharing row ranges that partition
 //! [0, nrows); gout returns nrows x n floats. Decode row counts run the GEMV kernels
-//! (pre-recorded per stack triple), q8 batches run the tiled-GEMM chunk loop; kq stacks stay on
-//! the GEMV path at any nrows until the kq batch tile lands (the engine's prefill arm keeps kq
-//! batches on the CPU fused path, so only decode row counts arrive here).
-def vk_moe_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; is_gelu : bool) {
+//! (pre-recorded per stack triple), batches the tiled-GEMM chunk loop — q8 and native kq
+//! stacks alike, each on its format's kernels. Streamed layers (pinned mirrors) route through
+//! the slot rail; anything else panics (fail-closed — the env gate is the opt-in).
+def vk_moe_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
     ensure_ffn_state()
-    let kq = g_gpu.stacks[find_stack(unsafe(offs1[0]))].fmt != 0
-    if (nrows < BATCH_TILE || kq) {
-        vk_moe_ffn_gemv(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)
+    if (find_stack_idx(unsafe(offs1[0]), f1) < 0) {
+        let w0 = unsafe(offs1[0])
+        var g = -1
+        for (i in range(length(g_gpu.stream_stacks) / 3)) {
+            if (g_gpu.stream_stacks[i * 3].fmt == f1 && w0 >= g_gpu.stream_stacks[i * 3].base
+                    && w0 < g_gpu.stream_stacks[i * 3].base + g_gpu.stream_stacks[i * 3].elems) {
+                g = i
+            }
+        }
+        if (g < 0) {
+            panic("dasLLAMA vulkan tier: dispatch against a region that is neither resident nor streamed (fmt {f1} element offset {w0})")
+        }
+        vk_moe_ffn_streamed(g, goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
+        return
+    }
+    if (nrows < BATCH_TILE) {
+        vk_moe_ffn_gemv(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
     } else {
-        vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, is_gelu)
+        vk_moe_ffn_batch(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
     }
 }
 
@@ -1341,8 +1936,8 @@ def private ensure_cls(si : int; woff, n, d : int64) {
 //! MoeGpuClsFn: the classifier GEMV — y[d] = W · x over the resident plane at woff, activation
 //! in the plane's own quant form (Q8_0 per-32 / Q8_K per-256), result DMA'd to the host-cached
 //! staging in the same submit.
-def vk_moe_cls(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
-    let si = find_stack(woff)
+def vk_moe_cls(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n, d : int64; fmt : int) {
+    let si = find_stack(woff, fmt)
     assert(d * 4l <= Y_BYTES, "dasLLAMA vulkan tier: classifier vocab exceeds output capacity")
     ensure_cls(si, woff, n, d)
     fill_stack_acts(si, xqp, xsp, n)
@@ -1403,11 +1998,10 @@ def dasllama_math_vulkan_register() {
     register_kernel_backend(KernelBackend(name = "vulkan", mm = @@vulkan_no_gemv, batch = @@vulkan_no_batch,
         group3 = @@vulkan_no_group3, repack = @@vulkan_repack_noop,
         needs_repack = false, priority = -1, available = @@vulkan_backend_available))
-    if (has_env_variable("DASLLAMA_GPU_MOE_LAYERS")) {
-        let layers = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_LAYERS")))
-        if (layers > 0l && vulkan_backend_available()) {
-            set_moe_gpu_layer_count(layers)
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
-        }
+    let layers = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_LAYERS")))
+    let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
+    if ((layers > 0l || nstream > 0l) && vulkan_backend_available()) {
+        set_moe_gpu_layer_count(layers)
+        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
     }
 }
