@@ -201,6 +201,7 @@ def private load_truth(path : string; var feeds : array<int64>; var logits : arr
 
 [export]
 def main() : int {
+    allow_cpu_prefill()   // both halves prefill the streams on the CPU by design (truth + replay)
     if (!jit_enabled()) {
         print("This probe is JIT-only — run with: daslang -jit <file>\n")
         return 1

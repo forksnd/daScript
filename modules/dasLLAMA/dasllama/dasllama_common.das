@@ -300,6 +300,28 @@ def has_prefill_override(name : string) : bool {
     return key_exists(g_prefill_overrides, name)
 }
 
+// CPU batched prefill above this length on a Metal-capable build is a measurement hazard, not a
+// serving path — days of profiling time went to tools silently CPU-prefilling. forward_prefill_body
+// PANICS there unless the caller declares CPU intent (the API below or DASLLAMA_CPU_PREFILL=1).
+let CPU_PREFILL_PANIC_NPOS = 32l
+
+var private g_cpu_prefill_allowed = -1   // -1 = read DASLLAMA_CPU_PREFILL on first check
+
+//! Declare that this process runs CPU prefill ON PURPOSE (CPU truth mints, CPU boards,
+//! CPU-correctness tests) — disarms the Metal-capable-build panic on batched prefills longer
+//! than ``CPU_PREFILL_PANIC_NPOS`` tokens. The ``DASLLAMA_CPU_PREFILL=1`` env is the
+//! no-recompile equivalent (the test rail exports it).
+def allow_cpu_prefill(on : bool = true) {
+    g_cpu_prefill_allowed = on ? 1 : 0
+}
+
+def private cpu_prefill_allowed : bool {
+    if (g_cpu_prefill_allowed < 0) {
+        g_cpu_prefill_allowed = get_env_variable("DASLLAMA_CPU_PREFILL") == "1" ? 1 : 0
+    }
+    return g_cpu_prefill_allowed == 1
+}
+
 def has_decode_override(name : string) : bool {
     return key_exists(g_decode_overrides, name)
 }
@@ -9984,11 +10006,11 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
 
 def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64) {
     let c = t.config
-    if (t.quant == QuantMode.q4_0 || npos <= 0l) {
-        for (p in range64(npos)) {
-            forward(t, s, tokens[p], start_pos + p)
-        }
+    if (npos <= 0l) {
         return
+    }
+    if (t.quant == QuantMode.q4_0) {
+        panic("forward_prefill: q4_0 mode has no batched prefill path (use q8 or fp32)")
     }
     let ts_alloc = ref_time_ticks()
     kv_ensure(s, start_pos + npos)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
@@ -10226,6 +10248,11 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
         stack_done = invoke(g_prefill_override, t, s, npos, start_pos)
     }
     if (!stack_done) {
+        // Metal-capable build about to chew a real prompt on the CPU stack: this is the silent
+        // profiling-time sink, not a serving path — fail loud unless CPU intent was declared
+        if (npos > CPU_PREFILL_PANIC_NPOS && has_prefill_override("metal") && !cpu_prefill_allowed()) {
+            panic("dasLLAMA: CPU batched prefill of {npos} tokens on a Metal-capable build (override `{g_prefill_override_name}` {empty(g_prefill_override_name) ? "not selected" : "declined"}) — select the metal prefill (set_metal_mode / DASLLAMA_PIN_PREFILL=metal), or declare CPU intent: allow_cpu_prefill() / DASLLAMA_CPU_PREFILL=1")
+        }
         for (l in range64(c.n_layers)) {
             trace_marker("layer", int(l))   // unit boundary for the timeline viewer (no-op untraced)
             trace_tag(TRACE_TAG_ATTN_STD)   // per-lane trace: color the prefill attention section

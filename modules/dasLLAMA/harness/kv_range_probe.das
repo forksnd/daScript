@@ -70,6 +70,7 @@ def private report_layer(l : int64; tag : string; r : Range) {
 
 [export]
 def main() {
+    allow_cpu_prefill()   // CPU harness by intent — disarm the Metal-build tripwire
     if (!jit_enabled()) {
         print("This probe is JIT-only — run with: daslang -jit <file>\n")
         return

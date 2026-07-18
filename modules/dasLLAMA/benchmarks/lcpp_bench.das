@@ -84,6 +84,7 @@ def private report(tag : string; tps : array<double>) {
 
 [export]
 def main() {
+    allow_cpu_prefill()   // CPU-protocol bench by intent — disarm the Metal-build tripwire
     if (!jit_enabled()) {
         print("This benchmark is JIT-only — run with: daslang -jit <file>\n")
         return

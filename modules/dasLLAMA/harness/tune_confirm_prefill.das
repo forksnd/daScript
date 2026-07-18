@@ -27,6 +27,7 @@ let PP_REPS = 3
 // inside a confirm arm (each arm burned a full hidden tune before this)
 [export, tune_policy(missing = "fallback")]
 def main {
+    allow_cpu_prefill()   // CPU prefill tuning by definition — disarm the Metal-build tripwire
     if (!jit_enabled()) {
         print("CONFIRM_PP: FAIL (run with -jit)\n")
         return

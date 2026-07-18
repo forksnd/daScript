@@ -4,6 +4,11 @@ options persistent_heap   // + explicit deletes below: each test frees its model
 
 require dastest/testing_boost public
 require dasllama/dasllama   // the public facade — engine + arch registrations (incl. forward_mtp / generate_mtp_greedy)
+
+[init]
+def private allow_cpu_prefill_intent() {
+    allow_cpu_prefill()   // CPU-correctness test — prefills on the CPU by design
+}
 require dasllama/dasllama_math   // parallel_argmax (engine-level, not re-exported by the facade)
 require daslib/jobque_boost
 require daslib/fio

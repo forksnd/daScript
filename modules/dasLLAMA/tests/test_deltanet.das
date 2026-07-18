@@ -4,6 +4,11 @@ options persistent_heap   // + explicit deletes below: the model/sessions free b
 
 require dastest/testing_boost public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
+
+[init]
+def private allow_cpu_prefill_intent() {
+    allow_cpu_prefill()   // CPU-correctness test — prefills on the CPU by design
+}
 require daslib/jobque_boost
 require daslib/fio
 require dasllama/dasllama_math  // setup_dasllama_jobque_ (the engine-standard jobque config)
