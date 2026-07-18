@@ -91,7 +91,9 @@ class MetalSqAttnF16 {
             s = simd_sum(s)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -229,7 +231,9 @@ class MetalSqAttnF32 {
             s = simd_sum(s)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -373,7 +377,9 @@ class MetalSqAttnQ8 {
             s = simd_sum(s * d)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -527,7 +533,9 @@ class MetalSqAttnTq4 {
             s = simd_sum(s * d)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -675,7 +683,9 @@ class MetalSqAttnPartF16 {
             s = simd_sum(s)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -841,7 +851,9 @@ class MetalSqAttnPartF32 {
             s = simd_sum(s)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -1012,7 +1024,9 @@ class MetalSqAttnPartQ8 {
             s = simd_sum(s * d)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -1194,7 +1208,9 @@ class MetalSqAttnPartTq4 {
             s = simd_sum(s * d)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -2924,7 +2940,9 @@ class MetalSqAttnBF16 {
             s = simd_sum(s)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -3066,7 +3084,9 @@ class MetalSqAttnBF32 {
             s = simd_sum(s)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -3219,7 +3239,9 @@ class MetalSqAttnBQ8 {
             s = simd_sum(s * d)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -3380,7 +3402,9 @@ class MetalSqAttnBTq4 {
             s = simd_sum(s * d)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -3531,7 +3555,9 @@ class MetalSqAttnPartBF16 {
             s = simd_sum(s)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -3703,7 +3729,9 @@ class MetalSqAttnPartBF32 {
             s = simd_sum(s)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -3885,7 +3913,9 @@ class MetalSqAttnPartBQ8 {
             s = simd_sum(s * d)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -4075,7 +4105,9 @@ class MetalSqAttnPartBTq4 {
             s = simd_sum(s * d)
             if (sl == 0u) {
                 let sc = s * scale
-                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }

@@ -1756,7 +1756,7 @@ class MetalAttnSoftmax {
         var j = jlo + lid
         while (j < cnt) {
             let sr = att[rowbase + j]
-            m = max(m, softcap > 0.0 ? softcap * tanh(min(max(sr / softcap, -40.0), 40.0)) : sr)   // nolint:STYLE019
+            m = max(m, softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sr * 2.0 / softcap))) : sr)
             j += nthreads
         }
         m = max(m, simd_shuffle_xor(m, 16u))
@@ -1783,7 +1783,7 @@ class MetalAttnSoftmax {
         j = jlo + lid
         while (j < cnt) {
             let sr = att[rowbase + j]
-            let ev = exp((softcap > 0.0 ? softcap * tanh(min(max(sr / softcap, -40.0), 40.0)) : sr) - rowmax)   // nolint:STYLE019
+            let ev = exp((softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sr * 2.0 / softcap))) : sr) - rowmax)
             att[rowbase + j] = ev
             sum += ev
             j += nthreads
@@ -2129,9 +2129,10 @@ class MetalGeglu {
             return
         }
         let vv = g[gid]
-        // Metal tanh(|x| > ~44) is NaN (exp-form INF/INF) — clamp; tanh(+-40) == +-1 exactly in f32
+        // tanh via the exp identity (the CPU geglu4's form) — Metal tanh NaNs past ~44,
+        // while exp saturates: exp(INF) -> denom INF -> the term is 0
         let a = 0.7978845608028654 * (vv + 0.044715 * vv * vv * vv)
-        g[gid] = 0.5 * vv * (1.0 + tanh(min(max(a, -40.0), 40.0))) * u[gid]   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
+        g[gid] = 0.5 * vv * (2.0 - 2.0 / (1.0 + exp(2.0 * a))) * u[gid]
     }
 }
 
@@ -2164,7 +2165,8 @@ class MetalSoftcapRow {
         if (gid >= total) {
             return
         }
-        x[gid] = cap * tanh(min(max(x[gid] / cap, -40.0), 40.0))   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+        // tanh via the exp identity (the CPU softcap4's form; Metal tanh NaNs past ~44)
+        x[gid] = cap * (1.0 - 2.0 / (1.0 + exp(x[gid] * 2.0 / cap)))
     }
 }
 
