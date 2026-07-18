@@ -5,6 +5,7 @@ options no_unused_function_arguments = false
 
 require dastest/testing_boost public
 require imgui/imgui_playwright public
+require daslib/fio public
 require daslib/json public
 require daslib/json_boost public
 
@@ -143,4 +144,101 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         t |> success(second_document_observed,
                      "the viewer retains both documents without spawning another app")
     }
+}
+
+[test]
+def test_text_viewer_checkbox_save_reload_roundtrip(t : T?) {
+    var temp_error : string
+    let temp_dir = create_temp_directory("das_text_viewer_roundtrip", temp_error)
+    t |> success(empty(temp_error) && !empty(temp_dir),
+                 "roundtrip test receives a dedicated temporary directory")
+    if (!empty(temp_error) || empty(temp_dir)) return
+    let fixture = path_join(temp_dir, "checkbox.md")
+    let bom = "\xEF\xBB\xBF"
+    let original = bom + "# Tasks\r\n\r\n- [ ] first\r\n- [X] second\n"
+    let expected = bom + "# Tasks\r\n\r\n- [x] first\r\n- [X] second\n"
+    t |> success(fwrite(fixture, original), "mixed-ending BOM fixture is written")
+
+    with_imgui_app(FEATURE) $(app) {
+        let opened = post_command(app, "text_viewer_open", JV((path = fixture)))
+        t |> success(opened?["ok"] ?? false, "checkbox fixture opens")
+
+        var initial : JsonValue?
+        var checkbox : JsonValue?
+        let ready = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            initial = viewer_state(app)
+            checkbox = post_command(app, "text_viewer_checkbox", JV((index = 0)))
+            return ((initial?["ok"] ?? false)
+                && (initial?["checkbox_count"] ?? 0) == 2
+                && (initial?["has_utf8_bom"] ?? false)
+                && !(initial?["dirty"] ?? true)
+                && (checkbox?["ok"] ?? false))
+        }
+        t |> success(ready, "checkbox projection and screen geometry become observable")
+
+        if (ready) {
+            // Command responses are transient live-API values; snapshot the
+            // geometry before issuing any later commands.
+            let checkbox_width_before = (checkbox?["x1"] ?? 0.0f)
+                - (checkbox?["x0"] ?? 0.0f)
+            let checkbox_height_before = (checkbox?["y1"] ?? 0.0f)
+                - (checkbox?["y0"] ?? 0.0f)
+            let no_op_save = post_command(app, "text_viewer_save", JV((path = fixture)))
+            t |> success(no_op_save?["ok"] ?? false, "no-op save succeeds")
+            t |> equal(fread(fixture), original,
+                       "no-op app save preserves BOM, spelling, and mixed endings byte-for-byte")
+
+            let old_revision = initial?["document_revision"] ?? 0
+            let old_activation = initial?["control_activation_revision"] ?? 0
+            let x = ((checkbox?["x0"] ?? 0.0f) + (checkbox?["x1"] ?? 0.0f)) * 0.5f
+            let y = ((checkbox?["y0"] ?? 0.0f) + (checkbox?["y1"] ?? 0.0f)) * 0.5f
+            post_command(app, "imgui_mouse_pos", JV((x = x, y = y)))
+            post_command(app, "imgui_mouse_click", JV((button = 0, action = "press")))
+            post_command(app, "imgui_mouse_click", JV((button = 0, action = "release")))
+
+            let toggled = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+                var state = viewer_state(app)
+                var current = post_command(app, "text_viewer_checkbox", JV((index = 0)))
+                return ((state?["document_revision"] ?? 0) == old_revision + 1
+                    && (state?["control_activation_revision"] ?? 0) > old_activation
+                    && (state?["dirty"] ?? false)
+                    && (current?["ok"] ?? false)
+                    && (current?["checked"] ?? false))
+            }
+            t |> success(toggled,
+                         "click emits a control event, edits source, and reparses the projection")
+
+            if (toggled) {
+                let toggled_checkbox = post_command(
+                    app, "text_viewer_checkbox", JV((index = 0)))
+                let width_after = (toggled_checkbox?["x1"] ?? 0.0f)
+                    - (toggled_checkbox?["x0"] ?? 0.0f)
+                let height_after = (toggled_checkbox?["y1"] ?? 0.0f)
+                    - (toggled_checkbox?["y0"] ?? 0.0f)
+                t |> equal(width_after, checkbox_width_before,
+                           "checked and unchecked controls reserve identical width")
+                t |> equal(height_after, checkbox_height_before,
+                           "checked and unchecked controls reserve identical height")
+                let saved = post_command(app, "text_viewer_save", JV((path = fixture)))
+                t |> success(saved?["ok"] ?? false, "edited source saves")
+                t |> success(!(saved?["dirty"] ?? true), "successful save advances saved revision")
+                t |> equal(fread(fixture), expected,
+                           "checkbox save changes exactly its marker byte")
+
+                let reloaded = post_command(app, "text_viewer_open", JV((path = fixture)))
+                t |> success(reloaded?["ok"] ?? false, "saved document reloads")
+                let reload_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+                    var state = viewer_state(app)
+                    var current = post_command(app, "text_viewer_checkbox", JV((index = 0)))
+                    return ((state?["has_utf8_bom"] ?? false)
+                        && !(state?["dirty"] ?? true)
+                        && (current?["ok"] ?? false)
+                        && (current?["checked"] ?? false))
+                }
+                t |> success(reload_observed,
+                             "saved checkbox state survives a fresh load/projection roundtrip")
+            }
+        }
+    }
+    rmdir_rec_result(temp_dir)
 }

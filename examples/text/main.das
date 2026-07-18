@@ -8,6 +8,7 @@ require imgui/imgui_file_dialog
 require imgui/imgui_fonts
 require imgui/imgui_icons
 require imgui/imgui_markdown_view
+require imgui/imgui_document_model
 require imgui/imgui_text_source_view
 require imgui/imgui_theme_daslang
 require daslib/clargs
@@ -36,6 +37,12 @@ enum TextViewMode {
     plain_text
 }
 
+enum ViewerFileDialogAction {
+    none
+    open
+    save_as
+}
+
 struct TextViewerOpenArgs {
     path : string
 }
@@ -52,19 +59,23 @@ struct TextViewerSourceRangeArgs {
     text : string
 }
 
+struct TextViewerCheckboxArgs {
+    index : int = 0
+}
+
 struct TextViewerDocument {
     id : int
     pending_dock : bool = true
-    document : MdDocument = MdDocument()
+    source : TextDocumentSource = TextDocumentSource()
+    document : RichDocument = RichDocument()
+    projection : RichDocumentProjection = RichDocumentProjection()
     markdown_view : MarkdownViewState = MarkdownViewState()
     source_document : TextSourceDocument = TextSourceDocument()
     source_view : TextSourceViewState = TextSourceViewState()
     source_result : TextSourceViewResult = TextSourceViewResult()
-    path : string
     status : string = "Open a UTF-8 text or Markdown file."
     mode : TextViewMode = TextViewMode.markdown
     mode_override : int = -1
-    document_revision : int = 0
     zoom_step : int = 20       // 10..60 maps to 50%..300% in exact 5% steps
 }
 
@@ -82,6 +93,9 @@ var private g_reload_clicks = 0
 var private g_quit_clicks = 0
 var private g_markdown_clicks = 0
 var private g_plain_clicks = 0
+var private g_save_clicks = 0
+var private g_save_as_clicks = 0
+var private g_file_dialog_action = ViewerFileDialogAction.none
 
 def private mode_name(doc : TextViewerDocument const) : string {
     return doc.mode == TextViewMode.markdown ? "markdown" : "plain"
@@ -115,7 +129,8 @@ def private set_mode(var doc : TextViewerDocument; mode : TextViewMode) {
 def private release_document_content(var doc : TextViewerDocument) {
     markdown_view_invalidate(doc.markdown_view)
     delete doc.document.nodes
-    doc.document = MdDocument()
+    doc.document = RichDocument()
+    rich_document_projection_dispose(doc.projection)
     text_source_view_invalidate(doc.source_view)
     text_source_document_dispose(doc.source_document)
 }
@@ -126,26 +141,49 @@ def private dispose_document(var doc : TextViewerDocument) {
     release_document_content(doc)
 }
 
-def private install_source(var viewer : TextViewerDocument; path, source : string) {
-    let next_revision = viewer.document_revision + 1
-    var next_document <- md_parse(source)
-    var next_source_document <- markdown_source_document(source, next_revision)
+def private install_document(var viewer : TextViewerDocument;
+                             var next_source : TextDocumentSource) {
+    var next_document <- md_parse(next_source.text)
+    var next_projection <- md_rich_projection(next_document, next_source.revision)
+    var next_source_document <- markdown_source_document(
+        next_source.text, next_source.revision)
     release_document_content(viewer)
+    viewer.source <- next_source
     viewer.document <- next_document
+    viewer.projection <- next_projection
     viewer.source_document <- next_source_document
-    viewer.path := path
-    viewer.document_revision = next_revision
 
     if (viewer.mode_override == int(TextViewMode.markdown)) {
         viewer.mode = TextViewMode.markdown
     } elif (viewer.mode_override == int(TextViewMode.plain_text)) {
         viewer.mode = TextViewMode.plain_text
     } else {
-        viewer.mode = markdown_path(path) ? TextViewMode.markdown : TextViewMode.plain_text
+        viewer.mode = markdown_path(viewer.source.path) ? TextViewMode.markdown : TextViewMode.plain_text
     }
     viewer.status = (viewer.document.ok
-        ? "Loaded {length(viewer.source_document.source)} UTF-8 bytes."
+        ? "Loaded {length(text_document_bytes(viewer.source))} UTF-8 bytes."
         : viewer.document.error)
+}
+
+def private rebuild_projection(var viewer : TextViewerDocument) {
+    var next_document <- md_parse(viewer.source.text)
+    var next_projection <- md_rich_projection(next_document, viewer.source.revision)
+    var next_source_document <- markdown_source_document(
+        viewer.source.text, viewer.source.revision)
+    release_document_content(viewer)
+    viewer.document <- next_document
+    viewer.projection <- next_projection
+    viewer.source_document <- next_source_document
+}
+
+def private install_source_text(var viewer : TextViewerDocument;
+                                path, text : string) : bool {
+    var next_source = TextDocumentSource()
+    let status = text_document_install_text(
+        next_source, text, path, viewer.source.revision + 1)
+    if (status != TextDocumentStatus.ok) return false
+    install_document(viewer, next_source)
+    return true
 }
 
 def private load_path(var viewer : TextViewerDocument; path : string) : bool {
@@ -162,15 +200,60 @@ def private load_path(var viewer : TextViewerDocument; path : string) : bool {
         viewer.status = "Path is not a regular file: {path}"
         return false
     }
-    var source = fread(path)
-    if (!is_utf8_string_valid(source)) {
+    let bytes = fread(path)
+    var next_source = TextDocumentSource()
+    let source_status = text_document_install_bytes(
+        next_source, bytes, path, viewer.source.revision + 1)
+    if (source_status != TextDocumentStatus.ok) {
         viewer.status = "File is not valid UTF-8: {path}"
         return false
     }
-    if (length(source) >= 3 && contains_utf8_bom(source)) {
-        source = slice(source, 3)
+    install_document(viewer, next_source)
+    return true
+}
+
+def private save_path(var viewer : TextViewerDocument; path : string) : bool {
+    if (empty(path)) {
+        viewer.status = "No save path was provided."
+        return false
     }
-    install_source(viewer, path, source)
+    if (!fwrite(path, text_document_bytes(viewer.source))) {
+        viewer.status = "Could not save: {path}"
+        return false
+    }
+    text_document_mark_saved(viewer.source, path)
+    viewer.status = "Saved {length(text_document_bytes(viewer.source))} UTF-8 bytes."
+    return true
+}
+
+def private apply_control_event(var viewer : TextViewerDocument;
+                                event : RichControlEvent const) : bool {
+    let action <- md_control_action(viewer.document, viewer.projection, event)
+    if (!action.valid) {
+        viewer.status = "Checkbox action was rejected ({int(action.status)})."
+        return false
+    }
+    var old_anchor := viewer.markdown_view.selection_anchor
+    var old_focus := viewer.markdown_view.selection_focus
+    let changed <- text_document_apply_edit(viewer.source, action.edit)
+    if (!changed.applied) {
+        viewer.status = "Checkbox edit was rejected ({int(changed.status)})."
+        return false
+    }
+    rebuild_projection(viewer)
+    if (old_anchor.valid && old_anchor.inline_node >= 0
+            && old_anchor.inline_node < length(viewer.document.nodes)) {
+        old_anchor.source_byte = text_position_after_edit(
+            old_anchor.source_byte, action.edit, TextPositionBias.before)
+        viewer.markdown_view.selection_anchor = old_anchor
+    }
+    if (old_focus.valid && old_focus.inline_node >= 0
+            && old_focus.inline_node < length(viewer.document.nodes)) {
+        old_focus.source_byte = text_position_after_edit(
+            old_focus.source_byte, action.edit, TextPositionBias.after)
+        viewer.markdown_view.selection_focus = old_focus
+    }
+    viewer.status = "Modified."
     return true
 }
 
@@ -184,7 +267,7 @@ Open a UTF-8 file from **File / Open...**, or pass its path on the command line.
 - Switch modes at any time with **View** or the buttons below.
 - Use the bottom-right slider or Ctrl+mouse-wheel to zoom.
 %%
-    install_source(viewer, "", welcome)
+    let _ = install_source_text(viewer, "", welcome)
     viewer.mode = TextViewMode.markdown
     viewer.status = "No file selected."
 }
@@ -215,9 +298,10 @@ def private add_document(path : string; mode_override : int = -1;
 def private open_file_dialog() {
     let active = active_document_index()
     var start_dir : string
-    if (active >= 0 && !empty(g_documents[active].path)) {
-        start_dir = dir_name(g_documents[active].path)
+    if (active >= 0 && !empty(g_documents[active].source.path)) {
+        start_dir = dir_name(g_documents[active].source.path)
     }
+    g_file_dialog_action = ViewerFileDialogAction.open
     file_dialog_open(FileDialogConfig(
         title = "Open text or Markdown",
         start_dir = start_dir,
@@ -225,6 +309,32 @@ def private open_file_dialog() {
             "Text and Markdown|md;markdown;txt;rst;das|Markdown|md;markdown|All files|"),
         mode = FileDialogMode.open,
         max_selection = 1))
+}
+
+def private save_file_dialog() {
+    let active = active_document_index()
+    if (active < 0) return
+    let path = g_documents[active].source.path
+    g_file_dialog_action = ViewerFileDialogAction.save_as
+    file_dialog_open(FileDialogConfig(
+        title = "Save text or Markdown",
+        start_dir = empty(path) ? "" : dir_name(path),
+        default_name = empty(path) ? "document.md" : base_name(path),
+        filters <- file_filters(
+            "Markdown|md;markdown|Text|txt;rst;das|All files|"),
+        mode = FileDialogMode.save,
+        max_selection = 1))
+}
+
+def private save_active_document(bool_save_as : bool = false) : bool {
+    let active = active_document_index()
+    if (active < 0) return false
+    let path = g_documents[active].source.path
+    if (bool_save_as || empty(path)) {
+        save_file_dialog()
+        return false
+    }
+    return save_path(g_documents[active], path)
 }
 
 def private setup_default_layout(dock_id : uint) {
@@ -255,8 +365,13 @@ def private draw_menu_bar() {
     main_menu_bar(MAIN_MENU) {
         menu(FILE_MENU, (text = "File", enabled = true)) {
             menu_label(FILE_OPEN, (text = "Open...", shortcut = "Ctrl+O"))
+            menu_label(FILE_SAVE, (text = "Save", shortcut = "Ctrl+S",
+                                   enabled = has_active))
+            menu_label(FILE_SAVE_AS, (text = "Save As...", shortcut = "Ctrl+Shift+S",
+                                      enabled = has_active))
             menu_label(FILE_RELOAD, (text = "Reload", shortcut = "Ctrl+R",
-                                     enabled = has_active && !empty(g_documents[active].path)))
+                                     enabled = has_active
+                                         && !empty(g_documents[active].source.path)))
             separator(FILE_SEPARATOR)
             menu_label(FILE_QUIT, (text = "Quit", shortcut = "Ctrl+Q"))
         }
@@ -268,9 +383,11 @@ def private draw_menu_bar() {
                                    selected = has_active &&
                                        g_documents[active].mode == TextViewMode.plain_text))
         }
-        if (has_active && !empty(g_documents[active].path)) {
+        if (has_active && !empty(g_documents[active].source.path)) {
             separator(MENU_PATH_SEPARATOR)
-            text_disabled(MENU_PATH, (text = g_documents[active].path))
+            let dirty = text_document_dirty(g_documents[active].source)
+            text_disabled(MENU_PATH, (text = (dirty ? "* " : "")
+                + g_documents[active].source.path))
         }
     }
 
@@ -278,10 +395,18 @@ def private draw_menu_bar() {
         g_open_clicks = FILE_OPEN.click_count
         open_file_dialog()
     }
+    if (FILE_SAVE.click_count > g_save_clicks) {
+        g_save_clicks = FILE_SAVE.click_count
+        let _ = save_active_document()
+    }
+    if (FILE_SAVE_AS.click_count > g_save_as_clicks) {
+        g_save_as_clicks = FILE_SAVE_AS.click_count
+        let _ = save_active_document(true)
+    }
     if (FILE_RELOAD.click_count > g_reload_clicks) {
         g_reload_clicks = FILE_RELOAD.click_count
-        if (has_active && !empty(g_documents[active].path)) {
-            let path = g_documents[active].path
+        if (has_active && !empty(g_documents[active].source.path)) {
+            let path = g_documents[active].source.path
             let _ = load_path(g_documents[active], path)
         }
     }
@@ -311,8 +436,12 @@ def private draw_document(var doc : TextViewerDocument) {
                 fonts = g_fonts,
                 zoom = float(zoom_percent(doc)) / 100.0f,
                 write_system_clipboard = !harness_is_headless())
-            let _ = markdown_view("text viewer", doc.document, doc.markdown_view,
-                                  style, doc.document_revision)
+            let view_result <- rich_document_view(
+                "text viewer", doc.document, doc.markdown_view,
+                style, doc.source.revision)
+            if (view_result.control_event.active) {
+                let _ = apply_control_event(doc, view_result.control_event)
+            }
         } else {
             var source_style = TextSourceViewStyle(
                 fonts = g_fonts,
@@ -361,6 +490,9 @@ def private handle_global_shortcuts() {
     if (command_down && IsKeyPressed(ImGuiKey.O, false)) {
         open_file_dialog()
     }
+    if (command_down && IsKeyPressed(ImGuiKey.S, false)) {
+        let _ = save_active_document(io.KeyShift)
+    }
     if (command_down && IsKeyPressed(ImGuiKey.Q, false)) {
         request_exit()
     }
@@ -370,8 +502,9 @@ def private handle_document_shortcuts(var doc : TextViewerDocument) {
     let io & = unsafe(GetIO())
     let command_down = io.ConfigMacOSXBehaviors ? io.KeySuper : io.KeyCtrl
     if (IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows)
-        && command_down && IsKeyPressed(ImGuiKey.R, false) && !empty(doc.path)) {
-        let path = doc.path
+        && command_down && IsKeyPressed(ImGuiKey.R, false)
+        && !empty(doc.source.path)) {
+        let path = doc.source.path
         let _ = load_path(doc, path)
     }
     if (IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows) && command_down) {
@@ -402,7 +535,7 @@ def private draw_additional_document(var doc : TextViewerDocument; dock_id : uin
         }
         doc.pending_dock = false
     }
-    let visible_title = empty(doc.path) ? "Text viewer" : base_name(doc.path)
+    let visible_title = empty(doc.source.path) ? "Text viewer" : base_name(doc.source.path)
     let title = "{visible_title}##text_document_{doc.id}"
     dock_window(g_document_windows[doc.id],
                 (text = title, closable = true,
@@ -441,12 +574,18 @@ def text_viewer_state(_input : JsonValue?) : JsonValue? {
         ok = doc.document.ok,
         document_count = length(g_documents),
         active_document_id = doc.id,
-        path = doc.path,
-        byte_count = length(doc.source_document.source),
+        path = doc.source.path,
+        byte_count = length(text_document_bytes(doc.source)),
         mode = mode_name(doc),
         zoom_percent = zoom_percent(doc),
         zoom_step = doc.zoom_step,
-        document_revision = doc.document_revision,
+        document_revision = doc.source.revision,
+        saved_revision = doc.source.saved_revision,
+        dirty = text_document_dirty(doc.source),
+        has_utf8_bom = doc.source.has_utf8_bom,
+        checkbox_count = length(doc.projection.controls),
+        control_activation_revision = doc.markdown_view.control_activation_revision,
+        activated_control_id = doc.markdown_view.activated_control_id,
         render_revision = doc.markdown_view.render_revision,
         source_render_revision = doc.source_view.render_revision,
         source_layout_hits = doc.source_view.layout_hits,
@@ -468,7 +607,7 @@ def text_viewer_source_range(input : JsonValue?) : JsonValue? {
     if (active < 0) return JV((ok = false, error = "no document is open"))
     var doc & = unsafe(g_documents[active])
     let args = from_JV(input, type<TextViewerSourceRangeArgs>)
-    let start_byte = find(doc.source_document.source, args.text)
+    let start_byte = find(doc.source.text, args.text)
     if (start_byte < 0) {
         return JV((ok = false, error = "source text not found", text = args.text))
     }
@@ -523,15 +662,15 @@ def text_viewer_open(input : JsonValue?) : JsonValue? {
     if (active < 0) {
         let ok = add_document(args.path)
         let created = active_document_index()
-        return JV((ok = ok, path = created >= 0 ? g_documents[created].path : "",
+        return JV((ok = ok, path = created >= 0 ? g_documents[created].source.path : "",
                    status = created >= 0 ? g_documents[created].status : g_last_open_error,
                    document_revision = created >= 0
-                       ? g_documents[created].document_revision : 0))
+                       ? g_documents[created].source.revision : 0))
     }
     let ok = load_path(g_documents[active], args.path)
-    return JV((ok = ok, path = g_documents[active].path,
+    return JV((ok = ok, path = g_documents[active].source.path,
                status = g_documents[active].status,
-               document_revision = g_documents[active].document_revision))
+               document_revision = g_documents[active].source.revision))
 }
 
 [live_command(description = "Open a UTF-8 file as another docked document.")]
@@ -541,9 +680,45 @@ def text_viewer_open_window(input : JsonValue?) : JsonValue? {
     let active = active_document_index()
     return JV((ok = ok, document_count = length(g_documents),
                active_document_id = active >= 0 ? g_documents[active].id : 0,
-               path = active >= 0 ? g_documents[active].path : "",
+               path = active >= 0 ? g_documents[active].source.path : "",
                status = ok && active >= 0
                    ? g_documents[active].status : g_last_open_error))
+}
+
+[live_command(description = "Inspect one rendered Markdown checkbox and its screen bounds.")]
+def text_viewer_checkbox(input : JsonValue?) : JsonValue? {
+    let active = active_document_index()
+    if (active < 0) return JV((ok = false, error = "no document is open"))
+    let args = from_JV(input, type<TextViewerCheckboxArgs>)
+    var doc & = unsafe(g_documents[active])
+    if (args.index < 0 || args.index >= length(doc.projection.controls)) {
+        return JV((ok = false, error = "checkbox index is out of range"))
+    }
+    let control = doc.projection.controls[args.index]
+    if (control.payload < 0 || control.payload >= length(doc.markdown_view.nodes)) {
+        return JV((ok = false, error = "checkbox has not been laid out"))
+    }
+    let cache & = unsafe(doc.markdown_view.nodes[control.payload])
+    return JV((ok = cache.control_screen_valid,
+        index = args.index, control_id = control.id, checked = control.checked,
+        source_start = control.source.start_byte, source_end = control.source.end_byte,
+        document_revision = doc.source.revision,
+        x0 = cache.control_screen_rect.x, y0 = cache.control_screen_rect.y,
+        x1 = cache.control_screen_rect.z, y1 = cache.control_screen_rect.w))
+}
+
+[live_command(description = "Save the active document exactly; optional path performs Save As.")]
+def text_viewer_save(input : JsonValue?) : JsonValue? {
+    let active = active_document_index()
+    if (active < 0) return JV((ok = false, error = "no document is open"))
+    let args = from_JV(input, type<TextViewerOpenArgs>)
+    let path = empty(args.path) ? g_documents[active].source.path : args.path
+    let ok = save_path(g_documents[active], path)
+    return JV((ok = ok, path = g_documents[active].source.path,
+               dirty = text_document_dirty(g_documents[active].source),
+               document_revision = g_documents[active].source.revision,
+               saved_revision = g_documents[active].source.saved_revision,
+               status = g_documents[active].status))
 }
 
 [live_command(description = "Switch between markdown and plain text modes.")]
@@ -607,12 +782,21 @@ def update() {
     let dialog_result = file_dialog_draw()
     if (dialog_result == FileDialogResult.confirmed) {
         let selected_path = file_dialog_selected_path()
-        let _ = add_document(selected_path)
+        if (g_file_dialog_action == ViewerFileDialogAction.save_as) {
+            let active = active_document_index()
+            if (active >= 0) {
+                let _ = save_path(g_documents[active], selected_path)
+            }
+        } else {
+            let _ = add_document(selected_path)
+        }
+        g_file_dialog_action = ViewerFileDialogAction.none
     } elif (dialog_result == FileDialogResult.cancelled) {
         let active = active_document_index()
         if (active >= 0) {
             g_documents[active].status = "Open cancelled."
         }
+        g_file_dialog_action = ViewerFileDialogAction.none
     }
 
     remove_closed_documents()
