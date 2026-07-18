@@ -49,13 +49,27 @@ def private has(lines : array<string>; needle : string) : bool {
 
 [test]
 def test_llvm_tune_scope_policy(t : T?) {
+    let args <- get_command_line_arguments()  // locked view — do not delete
+    let bin = args[0]
+
+    // Documentation is a host policy, so it is visible while required modules
+    // compile: no manifests, fallback stamps, status init, or tune policy.
+    let docsClient = "{get_this_module_dir()}/llvm_tune_scope_client_docs.das"
+    let docsSidecar = "{get_this_module_dir()}/llvm_tune_scope_client_docs.tune.json"
+    remove(docsSidecar)
+    var ldocs : array<string>
+    t |> equal(spawn_child("{tune_env("error")}\"{bin}\" -documentation \"{docsClient}\"", ldocs), 0)
+    t |> success(!(ldocs |> has("llvm_tune:")))
+    t |> success(!(ldocs |> has("untuned")))
+    t |> success(ldocs |> has("RESULT 5"))
+    t |> success(!fexist(docsSidecar))
+    delete ldocs
+
     if (!jit_enabled()) {
         // the auto flow's RESULT fingerprint needs the generator tier; children need -jit too
         t |> success(true)
         return
     }
-    let args <- get_command_line_arguments()  // locked view — do not delete
-    let bin = args[0]
     let client = "{get_this_module_dir()}/llvm_tune_scope_client.das"
     let sidecar = "{get_this_module_dir()}/llvm_tune_scope_client.tune.json"
     remove(sidecar)

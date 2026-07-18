@@ -19,7 +19,7 @@ The stdlib docs live in `doc/source/stdlib/` and are generated from `//!` doc-co
 ### Key documentation tools
 
 - `doc/reflections/gen_module_examples.py` — generates/updates all 86 module-*.rst files with descriptions and compilable examples (31 modules have examples)
-- Validate: `bin/Release/daslang.exe doc/reflections/das2rst.das` (exit code 0 = success)
+- Validate: `bin/Release/daslang.exe -documentation doc/reflections/das2rst.das` (exit code 0 = success)
 
 ### Function grouping in generated docs
 
@@ -27,7 +27,7 @@ Functions in each module's RST are organized into named groups (e.g. "Compilatio
 
 1. Add the function name to the appropriate `group_by_regex` call in the module's `document_module_*` function in `das2rst.das`
 2. Create or update the handmade doc file in `doc/source/stdlib/handmade/` (replace `// stub` with a description)
-3. Regenerate: `bin/Release/daslang.exe doc/reflections/das2rst.das`
+3. Regenerate: `bin/Release/daslang.exe -documentation doc/reflections/das2rst.das`
 4. Verify no "Uncategorized" section remains: search for `Uncategorized` in the generated `doc/source/stdlib/*.rst`
 
 #### `regex_match` is start-anchored — use `.*` prefix
@@ -53,7 +53,7 @@ group_by_regex("Type conversion operators", mod, r_type_conv)
 1. Add `example="""..."""` to the `reg()` call in `gen_module_examples.py`
 2. Test it: run the snippet through `bin/Release/daslang` to confirm it compiles and runs
 3. Regenerate: `python doc/reflections/gen_module_examples.py`
-4. Validate: `bin/Release/daslang.exe doc/reflections/das2rst.das`
+4. Validate: `bin/Release/daslang.exe -documentation doc/reflections/das2rst.das`
 
 ### Checking for `// stub` files (REQUIRED after regeneration)
 
@@ -68,7 +68,7 @@ To fix a stub:
 1. Open the stub file (e.g., `function-strings_boost-capitalize-0x1747f4e995e14ba9.rst`)
 2. The second line contains the function signature — use it to locate the source
 3. Replace the **entire file content** with a plain-text description (1–2 sentences, no RST directives). For bitfield typedefs, use one line per flag (first line = type description, subsequent = per-flag descriptions)
-4. Regenerate: `bin/Release/daslang.exe doc/reflections/das2rst.das`
+4. Regenerate: `bin/Release/daslang.exe -documentation doc/reflections/das2rst.das`
 5. Verify: `Select-String -Path "doc\source\stdlib\*.rst" -Pattern "// stub"` should return 0 matches
 
 ### Handmade files are for C++ builtin modules ONLY — daslang modules use `//!`
@@ -159,15 +159,17 @@ After creating or modifying any RST files, stdlib documentation, or `daslib/*.da
 
 1. **Regenerate stdlib docs** (if `daslib/*.das` files or `doc/reflections/das2rst.das` were changed):
    ```
-   bin/Release/daslang.exe doc/reflections/das2rst.das
+   bin/Release/daslang.exe -documentation doc/reflections/das2rst.das
    ```
 
-2. **Clean Sphinx build** — MUST delete cache; cached builds hide errors:
+2. **Sphinx build** — preserve the local doctree cache for normal iteration:
    ```
-   rm -rf doc/sphinx-build site/doc
    sphinx-build -b html -d doc/sphinx-build doc/source site/doc 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee /tmp/sphinx_out.txt
    ```
-   Use `sphinx-build` from PATH. If unavailable, install with `pip install sphinx` (or `python -m pip install sphinx`). The repo `.venv/` is not maintained — don't rely on it.
+   Delete `doc/sphinx-build` before both builders; preflight's docs gate does
+   this unconditionally so stale doctrees cannot hide warnings. Use `sphinx-build`
+   from PATH. If unavailable, install with `pip install sphinx` (or
+   `python -m pip install sphinx`). The repo `.venv/` is not maintained — don't rely on it.
 
 3. **Verify no new errors or warnings**: Strip ANSI codes and check the build output:
    ```
@@ -189,11 +191,11 @@ After creating or modifying any RST files, stdlib documentation, or `daslib/*.da
 
 **Full checklist when adding new public functions:**
 1. Add the function name to the correct `group_by_regex` in `das2rst.das` (prevents "Uncategorized")
-2. `bin/Release/daslang.exe doc/reflections/das2rst.das` — generates RST and creates stub doc files
+2. `bin/Release/daslang.exe -documentation doc/reflections/das2rst.das` — generates RST and creates stub doc files
 3. Check for stubs: `grep -rl "// stub" doc/source/stdlib/handmade/` — fill in descriptions
-4. Regenerate: `bin/Release/daslang.exe doc/reflections/das2rst.das` (picks up filled stubs)
+4. Regenerate: `bin/Release/daslang.exe -documentation doc/reflections/das2rst.das` (picks up filled stubs)
 5. Verify no "Uncategorized": `grep -c Uncategorized doc/source/stdlib/generated/*.rst | grep -v ':0$'`
-6. Clean Sphinx build (step 2 above) — verify `build succeeded.` with no new warnings
+6. Run the Sphinx build (step 2 above) — verify `build succeeded.` with no new warnings
 
 **Documenting external modules (under `modules/`):**
 - C++ modules (e.g. `stbimage`, `raster`): use `get_module("name")` in `das2rst.das` — documented via handmade files only

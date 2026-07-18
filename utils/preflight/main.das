@@ -24,6 +24,8 @@ require daslib/strings_boost
 require strings
 require ../common/parallel_workers.das
 require ../common/git_signature.das
+require ../../dastest/worker_policy.das
+require config
 
 
 [CommandLineArgs]
@@ -53,6 +55,15 @@ struct Config {
     @clarg_short = "j"
     @clarg_doc = "Parallel width for the C++ syntax pass; 0 = hardware threads"
     jobs : int
+
+    @clarg_doc = "Per-user preflight TOML (default: platform config directory)"
+    config_file : string
+
+    @clarg_doc = "JIT isolated workers; -1 = config/default, 0 = automatic, positive = explicit"
+    jit_jobs : int = -1
+
+    @clarg_doc = "JIT per-file wall-time guard in seconds; -1 = config/default, 0 = disabled"
+    jit_max_file_time : float = -1.0
 
     @clarg_doc = "Stop at the first failing gate"
     fail_fast : bool
@@ -96,6 +107,8 @@ struct PreflightCtx {
     changed_cpp : array<string>
     changed_hdr : int
     jobs : int
+    jit_jobs : int
+    jit_max_file_time : float
     verbose : bool
 }
 
@@ -525,14 +538,18 @@ def docs_skip_all(reason : string; var results : array<GateResult>&) {
 def gate_docs(ctx : PreflightCtx; var results : array<GateResult>&) {
     var t0 = ref_time_ticks()
     // gate 1: das2rst runs clean (positional handmade-doc validation)
-    let r1 = run_argv([ctx.daslang, "doc/reflections/das2rst.das"])
+    let r1 = run_argv([ctx.daslang, "-documentation", "doc/reflections/das2rst.das"])
     if (r1.rc != 0 && find(r1.out, "missing prerequisite") >= 0) {
         docs_skip_all("daslang lacks HV/PUGIXML — rebuild with -DDAS_HV_DISABLED=OFF -DDAS_PUGIXML_DISABLED=OFF", results)
         return
     }
-    results |> emplace(GateResult(name = "docs/das2rst", status = r1.rc == 0 ? GateStatus.Pass : GateStatus.Fail,
+    let tuned_docs = find(r1.out, "llvm_tune:") >= 0
+    let das2rst_ok = r1.rc == 0 && !tuned_docs
+    results |> emplace(GateResult(name = "docs/das2rst", status = das2rst_ok ? GateStatus.Pass : GateStatus.Fail,
         seconds = seconds_since(t0),
-        detail = r1.rc == 0 ? "" : "handmade-doc validation panic — fix and re-run; CI stops at the FIRST panic, more may follow",
+        detail = (das2rst_ok ? "" : (tuned_docs
+            ? "documentation compile entered llvm_tune — keep -documentation/is_building_documentation wired"
+            : "handmade-doc validation panic — fix and re-run; CI stops at the FIRST panic, more may follow")),
         output = r1.out))
 
     // gate 2: no `// stub` in handmade docs
@@ -745,7 +762,10 @@ def gate_tests_jit(ctx : PreflightCtx) : GateResult {
     // Isolated-parallel like CI's run_tests_jit (~3x faster than sequential, identical
     // pass/fail set; workers mint the dll cache themselves). Timeout matches CI's 1800.
     return run_test_gate("tests-jit",
-        [ctx.daslang, "dastest/dastest.das", "-jit", "--", "--jit-opt-level=3", "--failures-only", "--max-file-time", "30", "--isolated-mode", "--batch", "4", "--timeout", "1800", "--test", "tests"],
+        [ctx.daslang, "dastest/dastest.das", "-jit", "--", "--jit-opt-level=3", "--failures-only",
+            "--max-file-time", "{ctx.jit_max_file_time}", "--isolated-mode",
+            "--isolated-mode-threads", "{ctx.jit_jobs}", "--batch", "4",
+            "--timeout", "1800", "--test", "tests"],
         "JIT suite failures")
 }
 
@@ -986,13 +1006,52 @@ def main() : int {
         return 1
     }
 
-    var ctx = PreflightCtx(base = cfg.base, jobs = cfg.jobs, verbose = cfg.verbose)
+    if (cfg.jit_jobs < -1) {
+        to_log(LOG_ERROR, "--jit-jobs must be -1 (config/default), 0 (automatic), or positive\n")
+        return 1
+    }
+    if (!valid_jit_max_file_time_override(cfg.jit_max_file_time)) {
+        to_log(LOG_ERROR, "--jit-max-file-time must be -1 (config/default) or non-negative\n")
+        return 1
+    }
+
+    let settings_path = empty(cfg.config_file) ? default_preflight_config_path() : cfg.config_file
+    var settings_error : string
+    let settings = load_preflight_settings(settings_path, settings_error)
+    if (!empty(settings_error)) {
+        to_log(LOG_ERROR, "invalid preflight config {settings_path}: {settings_error}\n")
+        return 1
+    }
+    let automatic_jit_jobs = default_jit_isolated_threads(get_total_hw_threads())
+    let configured_jit_jobs = settings.jit_threads > 0 ? settings.jit_threads : automatic_jit_jobs
+    let jit_jobs = (cfg.jit_jobs < 0
+        ? configured_jit_jobs
+        : (cfg.jit_jobs == 0 ? automatic_jit_jobs : cfg.jit_jobs))
+    let jit_max_file_time = (cfg.jit_max_file_time < 0.0
+        ? settings.jit_max_file_time
+        : cfg.jit_max_file_time)
+
+    var ctx = PreflightCtx(base = cfg.base, jobs = cfg.jobs,
+                           jit_jobs = jit_jobs,
+                           jit_max_file_time = jit_max_file_time,
+                           verbose = cfg.verbose)
     ctx.daslang = find_daslang(cfg.daslang_bin)
     if (empty(ctx.daslang)) {
         to_log(LOG_ERROR, "daslang binary not found — build it (cmake --build build --target daslang) or pass --daslang / set DASLANG\n")
         return 1
     }
     ctx.config = detect_build_config(ctx.daslang)
+    // A complete pre-push run executes every interpreter/JIT/AOT file. Debug
+    // is useful for focused diagnosis, but turns that matrix into a tens-of-
+    // minutes trap and does not represent CI performance. Subset runs remain
+    // available with --only/--skip when Debug coverage is intentional.
+    if (cfg.full && empty(cfg.only) && empty(cfg.skip) && ctx.config != "Release") {
+        to_log(LOG_ERROR,
+            "full preflight requires a Release daslang; got {ctx.config} at {ctx.daslang}\n" +
+            "rebuild Release first (on Windows, stop a locking utils/mcp/main.das host; its watcher restarts it)\n")
+        clear_preflight_token()
+        return 1
+    }
     if (fexist(path_join(cfg.build_dir, "CMakeCache.txt"))) {
         ctx.build_dir = cfg.build_dir
         ctx.multi_config = is_multi_config(cfg.build_dir)
@@ -1006,6 +1065,8 @@ def main() : int {
     let n_das = length(ctx.changed_das)
     let n_cpp = length(ctx.changed_cpp)
     to_log(LOG_INFO, "preflight: {tier} tier; daslang={ctx.daslang}; base={cfg.base}; {n_das} das / {n_cpp} cpp changed\n")
+    let settings_label = fexist(settings_path) ? settings_path : "built-in defaults"
+    to_log(LOG_INFO, "preflight: JIT workers={ctx.jit_jobs}; max-file-time={ctx.jit_max_file_time}s; settings={settings_label}\n")
 
     var results : array<GateResult>
     let t_all = ref_time_ticks()

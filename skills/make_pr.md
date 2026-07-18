@@ -46,6 +46,14 @@ cmake --build build --config Release -j 64              # full clean build; pass
 
 Orthogonal (and still mandatory): after a rebase that pulls in C++ changes (`src/builtin/*.cpp` etc.), rebuild incrementally before trusting test/AOT results — a stale `bin/test_aot` fails AOT where interp passes.
 
+**Never run complete full preflight with a Debug host.** The full ~12k-file
+interpreter/JIT/AOT matrix is a Release gate; preflight rejects Debug before
+starting it. On Windows, `LNK1104` on `bin/Release/libDaScriptDyn_runtime.dll`
+usually means that worktree's `utils/mcp/main.das` host has the DLL loaded.
+Terminate that MCP host and retry the Release build — its watcher restarts it.
+Do not preserve the host by falling back to Debug; that can waste tens of
+minutes before producing a non-representative result.
+
 ## 1. Lint all changed `.das` files — **zero warnings required**
 
 **Pre-push hook:** the repo ships `.githooks/pre-push`, which blocks any `git push` whose commit's base is **more than 3 merges behind `origin/master`** (the gate catches a branch tested against a long-stale master, not the normal churn of unrelated PRs landing mid-preflight — so a base within 3 merge commits of the tip pushes fine without re-rebasing) or lacks a fresh **full-preflight token**. The token is minted only by a clean, complete full run — `daslang utils/preflight/main.das -- --full` — and is bound to the HEAD sha, so any later commit/amend/rebase makes it stale and you must re-run. One-time enable per clone: `git config core.hooksPath .githooks`. Because runners are no longer free, local preflight *is* the test rig: commit your work, run full preflight, then push (typically one batched PR). `git push --no-verify` is the documented escape for deliberate WIP pushes that you don't intend to turn into a PR. See [.githooks/README.md](../.githooks/README.md). (The lint/format commands below remain useful for debugging a single gate ahead of the full run.)
@@ -248,7 +256,7 @@ Every public function must belong to a named group — otherwise it lands in an 
 ### 4b. First doc generation pass
 
 ```bash
-bin/Release/daslang.exe doc/reflections/das2rst.das
+bin/Release/daslang.exe -documentation doc/reflections/das2rst.das
 ```
 
 If this **panics** with "has less documentation than values", a handmade doc file needs updating. The error message lists the expected field names — find the missing one and add a description line in the correct position in the handmade file (e.g., `doc/source/stdlib/handmade/structure_annotation-rtti-CodeOfPolicies.rst`). Field descriptions are positional — line 1 is the struct description, line 2 is the first field, etc.
@@ -264,7 +272,7 @@ Each stub file contains `// stub` on line 1 and the function signature on line 2
 ### 4d. Second doc generation pass (picks up filled stubs)
 
 ```bash
-bin/Release/daslang.exe doc/reflections/das2rst.das
+bin/Release/daslang.exe -documentation doc/reflections/das2rst.das
 ```
 
 ### 4e. Verify no "Uncategorized"
@@ -275,12 +283,11 @@ grep -c Uncategorized doc/source/stdlib/generated/*.rst | grep -v ':0$'
 
 Must return empty. If not, go back to step 4a and add the missing function to a group.
 
-### 4f. Clean Sphinx build — BOTH builders
+### 4f. Sphinx build — BOTH builders
 
-CI runs `sphinx-build -W` for **latex AND html** — they catch different warning sets (latex chokes on some table/unicode constructs html accepts). MUST delete cache — cached builds hide errors:
+CI runs `sphinx-build -W` for **latex AND html** — they catch different warning sets (latex chokes on some table/unicode constructs html accepts). Delete `doc/sphinx-build` before both builders; preflight's docs gate does this unconditionally so stale doctrees cannot hide warnings.
 
 ```bash
-rm -rf doc/sphinx-build site/doc build/latex
 sphinx-build -W --keep-going -b latex -d doc/sphinx-build doc/source build/latex
 sphinx-build -b html -d doc/sphinx-build doc/source site/doc 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee /tmp/sphinx_out.txt
 tail -3 /tmp/sphinx_out.txt
@@ -331,6 +338,21 @@ Stage, commit, push, and create the PR using GitHub MCP tools or `gh` CLI. Follo
 
 **Squash-from-multi-commit pattern (`git reset --soft master`)**: only safe AFTER step 0 has rebased onto `origin/master`. Otherwise the soft reset collapses the gap between local `master` and origin's into your one commit. If you forgot step 0 and already pushed a leaky PR, the fix is `git fetch origin master && git rebase origin/master && git push --force-with-lease` — git's 3-way merge drops files where your "modification" matches the already-merged content on origin/master.
 
+### 6a. Enter the Copilot review loop
+
+Creating the PR does not complete the workflow. Continue immediately with
+`skills/babysit.md` and enforce its review-round invariant:
+
+1. Request Copilot review for the current PR tip if no Copilot review targets that exact commit.
+2. For every review round, give every Copilot comment an accept/reject reply and resolve every corresponding conversation.
+3. Verify the unresolved-thread count is zero after the round; replying without resolving is incomplete.
+4. After **every push** to the PR branch, re-request Copilot review. This includes formatting, documentation, CI-only, and other supposedly trivial fixes; there are no push exceptions.
+5. Treat Copilot as dry only when its latest review targets the current tip, produced no new comments, and no review threads remain unresolved.
+6. Accept bug claims only when they have a realistic shipped path, plausible scale, and meaningful impact. Reject theoretical overflow/impossible-state guards.
+7. Never create a prose-only review changeset. Reply, resolve, and let the PR land unless the text is factually wrong or materially misleading; minor prose may ride along with an already-required substantive fix.
+
+Never merge solely because CI is green. CI green + Copilot reviewed current tip + zero unresolved conversations is the merge gate.
+
 ## Quick reference
 
 | Step | Tool/Command | Fix policy |
@@ -347,4 +369,7 @@ Stage, commit, push, and create the PR using GitHub MCP tools or `gh` CLI. Follo
 | Format | MCP `format_file` with comma-separated list or glob of changed `.das` files (single call) | Only changed files |
 | `.md` stop | `git diff --name-only origin/master..HEAD \| grep '\.md$'` | If any match: STOP, list changes, ask user to review BEFORE push |
 | PR | GitHub MCP `create_pull_request` or `gh pr create` | — |
-| Babysit | Follow `skills/babysit.md` | One round per Copilot pass; convergence in 1-3 rounds is normal |
+| Copilot round | Reply to every comment, resolve every thread, verify unresolved = 0 | A review round is not complete until all three are done |
+| Push after PR creation | Re-request Copilot review | Mandatory after every push; latest review must target current tip |
+| Review acceptance | Require realistic reachability, scale, and impact | Reject theoretical defensive programming; prose-only round → resolve and land |
+| Babysit | Follow `skills/babysit.md` | Merge only when CI is green and Copilot is dry on current tip |
