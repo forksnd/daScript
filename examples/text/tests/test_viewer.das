@@ -130,5 +130,17 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
                 && (state?["render_revision"] ?? 0) > 0)
         }
         t |> success(markdown_observed, "bottom mode control returns to Markdown")
+
+        let opened_window = post_command(app, "text_viewer_open_window",
+                                         JV((path = fixture)))
+        t |> success(opened_window?["ok"] ?? false,
+                     "another document opens inside the running viewer")
+        t |> equal(opened_window?["document_count"] ?? 0, 2,
+                   "in-process open adds a second dockable document")
+        let second_document_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            return (viewer_state(app)?["document_count"] ?? 0) == 2
+        }
+        t |> success(second_document_observed,
+                     "the viewer retains both documents without spawning another app")
     }
 }
