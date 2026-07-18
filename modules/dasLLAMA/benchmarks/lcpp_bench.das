@@ -41,6 +41,9 @@ struct Args {
     @clarg_doc = "Weight quant mode (default: q8)"
     quant : QuantMode = QuantMode.q8
 
+    @clarg_doc = "A/B the dense GPU rail in-process: every row runs twice, dense routing OFF then ON. Needs DASLLAMA_GPU_DENSE=1 (uploads + marks); both arms share one process/residency, so cross-run pp drift cancels"
+    dense_ab : bool
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -107,36 +110,45 @@ def main() {
     t.config.seq_len = min(t.config.seq_len, max(plen, ngen) + 8l)   // cap the KV allocation
     let c = t.config
     print("config: dim={c.dim} layers={c.n_layers} vocab={c.vocab_size} | backend {active_kernel_backend()} (batch {active_batch_backend()}) | t{threads} affinity {pinned ? "hard" : "env/off"} | pp{plen} tg{ngen} x {reps} reps\n")
+    if (cfg.dense_ab && !has_env_variable("DASLLAMA_GPU_DENSE")) {
+        print("warning: --dense-ab without DASLLAMA_GPU_DENSE=1 — no dense marks, both arms identical\n")
+    }
     with_job_que() {
         setup_dasllama_jobque_()
         var s <- make_run_state(c)
-        if (plen > 0l) {
-            let warm <- build_prompt(plen, 999l)
-            forward_prefill(t, s, warm, plen, 0l)   // warmup — untimed full-size run, as llama-bench does
-            var tps : array<double>
-            for (rep in range(reps)) {
-                let prompt <- build_prompt(plen, int64(rep))
-                let t0 = ref_time_ticks()
-                forward_prefill(t, s, prompt, plen, 0l)
-                let us = get_time_usec(t0)
-                tps |> push(double(plen) * 1.0e6lf / double(us))
+        for (arm in range(cfg.dense_ab ? 2 : 1)) {
+            let dtag = cfg.dense_ab ? (arm == 0 ? " dense=off" : " dense=on") : ""
+            if (cfg.dense_ab) {
+                set_moe_gpu_dense_route(arm != 0)
             }
-            report("pp{plen}", tps)
-            delete tps
-        }
-        if (ngen > 0l) {
-            forward(t, s, synth_id(0l, 999l), 0l)   // warmup — one untimed token, llama-bench's test_gen(ctx, 1)
-            var tps : array<double>
-            for (rep in range(reps)) {
-                let t0 = ref_time_ticks()
-                for (i in range64(ngen)) {
-                    forward(t, s, synth_id(i, int64(rep)), i)
+            if (plen > 0l) {
+                let warm <- build_prompt(plen, 999l)
+                forward_prefill(t, s, warm, plen, 0l)   // warmup — untimed full-size run, as llama-bench does
+                var tps : array<double>
+                for (rep in range(reps)) {
+                    let prompt <- build_prompt(plen, int64(rep))
+                    let t0 = ref_time_ticks()
+                    forward_prefill(t, s, prompt, plen, 0l)
+                    let us = get_time_usec(t0)
+                    tps |> push(double(plen) * 1.0e6lf / double(us))
                 }
-                let us = get_time_usec(t0)
-                tps |> push(double(ngen) * 1.0e6lf / double(us))
+                report("pp{plen}{dtag}", tps)
+                delete tps
             }
-            report("tg{ngen}", tps)
-            delete tps
+            if (ngen > 0l) {
+                forward(t, s, synth_id(0l, 999l), 0l)   // warmup — one untimed token, llama-bench's test_gen(ctx, 1)
+                var tps : array<double>
+                for (rep in range(reps)) {
+                    let t0 = ref_time_ticks()
+                    for (i in range64(ngen)) {
+                        forward(t, s, synth_id(i, int64(rep)), i)
+                    }
+                    let us = get_time_usec(t0)
+                    tps |> push(double(ngen) * 1.0e6lf / double(us))
+                }
+                report("tg{ngen}{dtag}", tps)
+                delete tps
+            }
         }
         delete s
     }

@@ -1512,6 +1512,7 @@ var g_moe_gpu_from_layer = 1000000l    // first offloaded layer (n_layers - K, s
 var g_moe_gpu_cls_off = -1l            // element offset of the resident classifier plane (loader contract)
 var g_moe_gpu_stream_from = 1000000l   // first STREAMED layer (streamed range = [stream_from, from_layer))
 var g_moe_gpu_dense_offs : table<int64>   // resident dense planes, keyed woff * 8 + fmt (per-format offset spaces)
+var g_moe_gpu_dense_route = true       // runtime routing gate over the marks (in-process A/B lever)
 
 //! Install the GPU MoE tier (a GPU backend calls this at [init] when its device probe passes).
 def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn; dense : MoeGpuDenseFn; drop : MoeGpuDropFn) {
@@ -1572,7 +1573,14 @@ def public reset_moe_gpu_dense_offs {
 }
 
 def public moe_gpu_dense_on_gpu(fmt : int; woff : int64) : bool {
-    return g_moe_gpu_installed && key_exists(g_moe_gpu_dense_offs, woff * 8l + int64(fmt))
+    return g_moe_gpu_installed && g_moe_gpu_dense_route && key_exists(g_moe_gpu_dense_offs, woff * 8l + int64(fmt))
+}
+
+//! Runtime routing gate over the dense marks: uploads stay resident, only the funnels' routing
+//! flips. The in-process A/B lever — both arms share one process, one residency, one budget
+//! knee, so the measured delta is the dense rail alone (cross-run pp drift measured ±12).
+def public set_moe_gpu_dense_route(on : bool) {
+    g_moe_gpu_dense_route = on
 }
 
 //! Upload one weight stack ([rows x n] at element offset woff) as the GPU tier's row-major

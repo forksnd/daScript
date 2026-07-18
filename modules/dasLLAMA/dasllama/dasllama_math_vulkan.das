@@ -3,6 +3,7 @@ options gen2
 module dasllama_math_vulkan shared public
 
 require dasllama/dasllama_math
+require dasllama/dasllama_par
 require vulkan
 require vulkan/vulkan_boost
 require spirv/spirv_shader
@@ -103,17 +104,24 @@ def q8_moe_groupn {
 // 32-row x 32-col output tile of one region, staging both operand tiles through @workgroup
 // shared memory so weight rows stream from VRAM once per 32 activation rows (a GEMV-style loop
 // would re-stream the whole expert stack once per activation row — ~6GB per dispatch at pp512).
-// Same exact int block dots + fp32 block-order accumulation as the decode kernel. vk_meta:
+// K advances 8 blocks (256 weights) per barrier pair — one block per pair serialized the whole
+// kernel on the load->barrier->compute->barrier cadence (2 loads in flight/thread, 128 barriers
+// per 2048-K pass); at 8 deep each thread issues 8+ staging loads back-to-back and barriers drop
+// 8x. Same exact int block dots + fp32 block-order accumulation as the decode kernel. vk_meta:
 // [0]=n [1]=d [2]=nregions [3]=map_off, per region (rel_wblock, row0, cnt, wg_base) quads,
 // then the per-workgroup region map at map_off (workgroup id -> region index — no search).
 // Activations read from device-local scratch (bindings 3/4 rebind) — a host-visible image
 // re-read ~(d/32) times would cross PCIe every pass.
 
-var @workgroup bt_xw : uint[256]     // x tile: 32 rows x 8 words (one 32-weight block per row)
-var @workgroup bt_ww : uint[288]     // w tile: 32 cols x 8 words, stride 9 — stride 8 lands all
-                                     // 8 lanes of a warp on 4 banks (8-way conflict on the hot read)
-var @workgroup bt_xs : float[32]
-var @workgroup bt_ws : float[32]
+var @workgroup bt_xw4 : uint4[544]   // x tile: 32 rows x 16 uint4 chunks (8 blocks deep), stride 17
+                                     // in v4 units — vectorized so the hot loop issues 1 shared load
+                                     // per 4 sdot4 (scalar tiles were LSU-throughput-bound at 1:1)
+var @workgroup bt_ww4 : uint4[544]   // w tile: 32 cols x 16 chunks, stride 17. A thread's 4 output
+                                     // cols are word+{0,8,16,24} (NOT word*4+c: with 16B elements a
+                                     // 4-col-contiguous warp lands 8 lanes on 2 banks; stride-8 cols
+                                     // put the 8 lanes on 8 distinct banks every access phase)
+var @workgroup bt_xs : float[256]    // x scales per (block, row); kq kernels use [row] only (per-256)
+var @workgroup bt_ws : float[256]    // w scales per (block, col)
 
 [compute_shader(local_size_x=256, name="q8_moe_batch_spv")]
 def q8_moe_batch {
@@ -129,76 +137,89 @@ def q8_moe_batch {
     let xt = tix / wtiles
     let wt = tix % wtiles
     let nbb = n / 32u
+    let nsteps = (nbb + 7u) / 8u     // q8 K need not be superblock-aligned (nfe 1408 = 44 blocks)
     let tid = gl_LocalInvocationID.x
     let word = tid % 8u
-    let grp = tid / 8u               // 0..31: the x row AND w col this thread stages / computes
+    let grp = tid / 8u               // 0..31: the x row AND w col this thread stages
     let xrow = xt * 32u + grp
     let wcol = wt * 32u + grp
-    let wi0 = (tid % 8u) * 4u        // first of the 4 w cols this thread accumulates
+    let slane = tid % 32u            // scale staging: this thread covers (block sblk, lane slane)
+    let sblk = tid / 32u
     var f0 = 0.0
     var f1 = 0.0
     var f2 = 0.0
     var f3 = 0.0
-    var b = 0u
-    while (b < nbb) {
-        var xv = 0u
-        if (xrow < cnt) {
-            xv = vk_xq[((row0 + xrow) * nbb + b) * 8u + word]
-        }
-        bt_xw[tid] = xv
-        var wv = 0u
-        if (wcol < d) {
-            wv = vk_wq[(wblk0 + wcol * nbb + b) * 8u + word]
-        }
-        bt_ww[grp * 9u + word] = wv
-        if (tid < 32u) {
-            var xs = 0.0
-            if (xt * 32u + tid < cnt) {
-                xs = vk_xs[(row0 + xt * 32u + tid) * nbb + b]
+    var s = 0u
+    while (s < nsteps) {
+        let b0 = s * 8u
+        for (ki in range(2)) {       // this thread stages v4 chunks word and word+8 of its row/col
+            let k = word + uint(ki) * 8u
+            let bu = k / 2u
+            let h = (k % 2u) * 4u
+            var xv = uint4(0u)
+            if (xrow < cnt && b0 + bu < nbb) {
+                let xb4 = ((row0 + xrow) * nbb + b0 + bu) * 8u + h
+                xv = uint4(vk_xq[xb4], vk_xq[xb4 + 1u], vk_xq[xb4 + 2u], vk_xq[xb4 + 3u])
             }
-            bt_xs[tid] = xs
-        } elif (tid < 64u) {
-            let i = tid - 32u
-            var ws = 0.0
-            if (wt * 32u + i < d) {
-                ws = float(vk_ws[wblk0 + (wt * 32u + i) * nbb + b])
+            bt_xw4[grp * 17u + k] = xv
+            var wv = uint4(0u)
+            if (wcol < d && b0 + bu < nbb) {
+                let wb4 = (wblk0 + wcol * nbb + b0 + bu) * 8u + h
+                wv = uint4(vk_wq[wb4], vk_wq[wb4 + 1u], vk_wq[wb4 + 2u], vk_wq[wb4 + 3u])
             }
-            bt_ws[i] = ws
+            bt_ww4[grp * 17u + k] = wv
+        }
+        var xs = 0.0
+        if (xt * 32u + slane < cnt && b0 + sblk < nbb) {
+            xs = vk_xs[(row0 + xt * 32u + slane) * nbb + b0 + sblk]
+        }
+        bt_xs[sblk * 32u + slane] = xs
+        var ws = 0.0
+        if (wt * 32u + slane < d && b0 + sblk < nbb) {
+            ws = float(vk_ws[wblk0 + (wt * 32u + slane) * nbb + b0 + sblk])
+        }
+        bt_ws[sblk * 32u + slane] = ws
+        barrier()
+        for (bb in range(8)) {       // zero-filled tail blocks contribute 0 (ws = xs = 0)
+            let bu = uint(bb)
+            var i0 = 0
+            var i1 = 0
+            var i2 = 0
+            var i3 = 0
+            for (kk in range(2)) {
+                let k = bu * 2u + uint(kk)
+                let xw = bt_xw4[grp * 17u + k]
+                let wv0 = bt_ww4[word * 17u + k]
+                let wv1 = bt_ww4[(word + 8u) * 17u + k]
+                let wv2 = bt_ww4[(word + 16u) * 17u + k]
+                let wv3 = bt_ww4[(word + 24u) * 17u + k]
+                i0 += sdot4(wv0.x, xw.x) + sdot4(wv0.y, xw.y) + sdot4(wv0.z, xw.z) + sdot4(wv0.w, xw.w)
+                i1 += sdot4(wv1.x, xw.x) + sdot4(wv1.y, xw.y) + sdot4(wv1.z, xw.z) + sdot4(wv1.w, xw.w)
+                i2 += sdot4(wv2.x, xw.x) + sdot4(wv2.y, xw.y) + sdot4(wv2.z, xw.z) + sdot4(wv2.w, xw.w)
+                i3 += sdot4(wv3.x, xw.x) + sdot4(wv3.y, xw.y) + sdot4(wv3.z, xw.z) + sdot4(wv3.w, xw.w)
+            }
+            let xscl = bt_xs[bu * 32u + grp]
+            f0 += float(i0) * bt_ws[bu * 32u + word] * xscl
+            f1 += float(i1) * bt_ws[bu * 32u + word + 8u] * xscl
+            f2 += float(i2) * bt_ws[bu * 32u + word + 16u] * xscl
+            f3 += float(i3) * bt_ws[bu * 32u + word + 24u] * xscl
         }
         barrier()
-        var i0 = 0
-        var i1 = 0
-        var i2 = 0
-        var i3 = 0
-        for (j in range(8)) {
-            let ju = uint(j)
-            let xw = bt_xw[grp * 8u + ju]
-            i0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
-            i1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
-            i2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
-            i3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
-        }
-        let xscl = bt_xs[grp]
-        f0 += float(i0) * bt_ws[wi0] * xscl
-        f1 += float(i1) * bt_ws[wi0 + 1u] * xscl
-        f2 += float(i2) * bt_ws[wi0 + 2u] * xscl
-        f3 += float(i3) * bt_ws[wi0 + 3u] * xscl
-        barrier()
-        b++
+        s++
     }
     if (xrow < cnt) {
-        let yb = (row0 + xrow) * d + wt * 32u + wi0
-        if (wt * 32u + wi0 < d) {
+        let yb = (row0 + xrow) * d + wt * 32u + word
+        if (wt * 32u + word < d) {
             vk_y[yb] = f0
         }
-        if (wt * 32u + wi0 + 1u < d) {
-            vk_y[yb + 1u] = f1
+        if (wt * 32u + word + 8u < d) {
+            vk_y[yb + 8u] = f1
         }
-        if (wt * 32u + wi0 + 2u < d) {
-            vk_y[yb + 2u] = f2
+        if (wt * 32u + word + 16u < d) {
+            vk_y[yb + 16u] = f2
         }
-        if (wt * 32u + wi0 + 3u < d) {
-            vk_y[yb + 3u] = f3
+        if (wt * 32u + word + 24u < d) {
+            vk_y[yb + 24u] = f3
         }
     }
 }
@@ -457,8 +478,10 @@ def kq_moe_gemv_k6 {
 // already loads from the tile — 8 threads per row recompute them, cheaper than a staging role
 // on this bandwidth-bound kernel). Per-block scales stage as two decoded floats per column
 // (k4/k5: d*sc and dmin*mn; k6: d*slo and d*shi per 16-half); x scales are Q8_K per-256.
+// K advances one whole superblock (8 blocks) per barrier pair — step index == superblock index,
+// so the per-column scale words are step-local and every staging thread decodes one (col, blk).
 
-var @workgroup bt_wsb : float[32]    // second per-column scale plane (bt_ws carries the first)
+var @workgroup bt_wsb : float[256]   // second per-(block, col) scale plane (bt_ws carries the first)
 
 // Q4_K tile: per block acc += xs * (d*sc*idot - dmin*mn*bsum)
 [compute_shader(local_size_x=256, name="kq_moe_batch_k4_spv")]
@@ -475,90 +498,108 @@ def kq_moe_batch_k4 {
     let xt = tix / wtiles
     let wt = tix % wtiles
     let nsb = n / 256u
-    let nb = nsb * 8u
     let tid = gl_LocalInvocationID.x
     let word = tid % 8u
     let grp = tid / 8u
     let xrow = xt * 32u + grp
     let wcol = wt * 32u + grp
-    let wi0 = (tid % 8u) * 4u
+    let slane = tid % 32u
+    let sblk = tid / 32u
     var f0 = 0.0
     var f1 = 0.0
     var f2 = 0.0
     var f3 = 0.0
-    var b = 0u
-    while (b < nb) {
-        let sb = b / 8u
-        let blk = b % 8u
-        var xv = 0u
-        if (xrow < cnt) {
-            xv = vk_xq[((row0 + xrow) * nsb + sb) * 64u + blk * 8u + word]
+    var s = 0u
+    while (s < nsb) {
+        for (ki in range(2)) {
+            let k = word + uint(ki) * 8u
+            let bu = k / 2u
+            let hh = k % 2u          // 0 = lo-nibble words 0..3 of the block, 1 = hi words 4..7
+            var xv = uint4(0u)
+            if (xrow < cnt) {
+                let xb4 = ((row0 + xrow) * nsb + s) * 64u + bu * 8u + hh * 4u
+                xv = uint4(vk_xq[xb4], vk_xq[xb4 + 1u], vk_xq[xb4 + 2u], vk_xq[xb4 + 3u])
+            }
+            bt_xw4[grp * 17u + k] = xv
+            var wv = uint4(0u)
+            if (wcol < d) {
+                let wsb = wsb0 + wcol * nsb + s
+                let rb4 = wsb * 32u + bu * 4u
+                let r0 = vk_wq[rb4]
+                let r1 = vk_wq[rb4 + 1u]
+                let r2 = vk_wq[rb4 + 2u]
+                let r3 = vk_wq[rb4 + 3u]
+                if (hh == 0u) {
+                    wv = uint4(r0 & 0x0F0F0F0F, r1 & 0x0F0F0F0F, r2 & 0x0F0F0F0F, r3 & 0x0F0F0F0F)
+                } else {
+                    wv = uint4((r0 >> 4u) & 0x0F0F0F0F, (r1 >> 4u) & 0x0F0F0F0F,
+                        (r2 >> 4u) & 0x0F0F0F0F, (r3 >> 4u) & 0x0F0F0F0F)
+                }
+            }
+            bt_ww4[grp * 17u + k] = wv
         }
-        bt_xw[tid] = xv
-        var wv = 0u
-        if (wcol < d) {
-            let wsb = wsb0 + wcol * nsb + sb
-            let raw = vk_wq[wsb * 32u + blk * 4u + (word % 4u)]
-            wv = word < 4u ? raw & 0x0F0F0F0F : (raw >> 4u) & 0x0F0F0F0F
-        }
-        bt_ww[grp * 9u + word] = wv
         if (tid < 32u) {
             var xs = 0.0
             if (xt * 32u + tid < cnt) {
-                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + sb]
+                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + s]
             }
             bt_xs[tid] = xs
-        } elif (tid < 64u) {
-            let i = tid - 32u
-            var sa = 0.0
-            var sbv = 0.0
-            if (wt * 32u + i < d) {
-                let wsb = wsb0 + (wt * 32u + i) * nsb + sb
-                let dm = unpackHalf2x16(vk_wsu[wsb * 5u])
-                let sc = int((vk_wsu[wsb * 5u + 1u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
-                let mn = int((vk_wsu[wsb * 5u + 3u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
-                sa = dm.x * float(sc)
-                sbv = dm.y * float(mn)
-            }
-            bt_ws[i] = sa
-            bt_wsb[i] = sbv
         }
+        var sa = 0.0
+        var sbv = 0.0
+        if (wt * 32u + slane < d) {
+            let wsb = wsb0 + (wt * 32u + slane) * nsb + s
+            let dm = unpackHalf2x16(vk_wsu[wsb * 5u])
+            let sc = int((vk_wsu[wsb * 5u + 1u + sblk / 4u] >> ((sblk % 4u) * 8u)) & 0xFF)
+            let mn = int((vk_wsu[wsb * 5u + 3u + sblk / 4u] >> ((sblk % 4u) * 8u)) & 0xFF)
+            sa = dm.x * float(sc)
+            sbv = dm.y * float(mn)
+        }
+        bt_ws[sblk * 32u + slane] = sa
+        bt_wsb[sblk * 32u + slane] = sbv
         barrier()
-        var i0 = 0
-        var i1 = 0
-        var i2 = 0
-        var i3 = 0
-        var bs = 0
-        for (j in range(8)) {
-            let ju = uint(j)
-            let xw = bt_xw[grp * 8u + ju]
-            bs += sdot4(xw, 0x01010101)
-            i0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
-            i1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
-            i2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
-            i3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
-        }
         let xscl = bt_xs[grp]
-        f0 += xscl * (bt_ws[wi0] * float(i0) - bt_wsb[wi0] * float(bs))
-        f1 += xscl * (bt_ws[wi0 + 1u] * float(i1) - bt_wsb[wi0 + 1u] * float(bs))
-        f2 += xscl * (bt_ws[wi0 + 2u] * float(i2) - bt_wsb[wi0 + 2u] * float(bs))
-        f3 += xscl * (bt_ws[wi0 + 3u] * float(i3) - bt_wsb[wi0 + 3u] * float(bs))
+        for (bb in range(8)) {
+            let bu = uint(bb)
+            var i0 = 0
+            var i1 = 0
+            var i2 = 0
+            var i3 = 0
+            var bs = 0
+            for (kk in range(2)) {
+                let k = bu * 2u + uint(kk)
+                let xw = bt_xw4[grp * 17u + k]
+                let wv0 = bt_ww4[word * 17u + k]
+                let wv1 = bt_ww4[(word + 8u) * 17u + k]
+                let wv2 = bt_ww4[(word + 16u) * 17u + k]
+                let wv3 = bt_ww4[(word + 24u) * 17u + k]
+                bs += sdot4(xw.x, 0x01010101) + sdot4(xw.y, 0x01010101) + sdot4(xw.z, 0x01010101) + sdot4(xw.w, 0x01010101)
+                i0 += sdot4(wv0.x, xw.x) + sdot4(wv0.y, xw.y) + sdot4(wv0.z, xw.z) + sdot4(wv0.w, xw.w)
+                i1 += sdot4(wv1.x, xw.x) + sdot4(wv1.y, xw.y) + sdot4(wv1.z, xw.z) + sdot4(wv1.w, xw.w)
+                i2 += sdot4(wv2.x, xw.x) + sdot4(wv2.y, xw.y) + sdot4(wv2.z, xw.z) + sdot4(wv2.w, xw.w)
+                i3 += sdot4(wv3.x, xw.x) + sdot4(wv3.y, xw.y) + sdot4(wv3.z, xw.z) + sdot4(wv3.w, xw.w)
+            }
+            f0 += xscl * (bt_ws[bu * 32u + word] * float(i0) - bt_wsb[bu * 32u + word] * float(bs))
+            f1 += xscl * (bt_ws[bu * 32u + word + 8u] * float(i1) - bt_wsb[bu * 32u + word + 8u] * float(bs))
+            f2 += xscl * (bt_ws[bu * 32u + word + 16u] * float(i2) - bt_wsb[bu * 32u + word + 16u] * float(bs))
+            f3 += xscl * (bt_ws[bu * 32u + word + 24u] * float(i3) - bt_wsb[bu * 32u + word + 24u] * float(bs))
+        }
         barrier()
-        b++
+        s++
     }
     if (xrow < cnt) {
-        let yb = (row0 + xrow) * d + wt * 32u + wi0
-        if (wt * 32u + wi0 < d) {
+        let yb = (row0 + xrow) * d + wt * 32u + word
+        if (wt * 32u + word < d) {
             vk_y[yb] = f0
         }
-        if (wt * 32u + wi0 + 1u < d) {
-            vk_y[yb + 1u] = f1
+        if (wt * 32u + word + 8u < d) {
+            vk_y[yb + 8u] = f1
         }
-        if (wt * 32u + wi0 + 2u < d) {
-            vk_y[yb + 2u] = f2
+        if (wt * 32u + word + 16u < d) {
+            vk_y[yb + 16u] = f2
         }
-        if (wt * 32u + wi0 + 3u < d) {
-            vk_y[yb + 3u] = f3
+        if (wt * 32u + word + 24u < d) {
+            vk_y[yb + 24u] = f3
         }
     }
 }
@@ -578,92 +619,114 @@ def kq_moe_batch_k5 {
     let xt = tix / wtiles
     let wt = tix % wtiles
     let nsb = n / 256u
-    let nb = nsb * 8u
     let tid = gl_LocalInvocationID.x
     let word = tid % 8u
     let grp = tid / 8u
     let xrow = xt * 32u + grp
     let wcol = wt * 32u + grp
-    let wi0 = (tid % 8u) * 4u
+    let slane = tid % 32u
+    let sblk = tid / 32u
     var f0 = 0.0
     var f1 = 0.0
     var f2 = 0.0
     var f3 = 0.0
-    var b = 0u
-    while (b < nb) {
-        let sb = b / 8u
-        let blk = b % 8u
-        var xv = 0u
-        if (xrow < cnt) {
-            xv = vk_xq[((row0 + xrow) * nsb + sb) * 64u + blk * 8u + word]
+    var s = 0u
+    while (s < nsb) {
+        for (ki in range(2)) {
+            let k = word + uint(ki) * 8u
+            let bu = k / 2u
+            let hh = k % 2u
+            var xv = uint4(0u)
+            if (xrow < cnt) {
+                let xb4 = ((row0 + xrow) * nsb + s) * 64u + bu * 8u + hh * 4u
+                xv = uint4(vk_xq[xb4], vk_xq[xb4 + 1u], vk_xq[xb4 + 2u], vk_xq[xb4 + 3u])
+            }
+            bt_xw4[grp * 17u + k] = xv
+            var wv = uint4(0u)
+            if (wcol < d) {
+                let wsb = wsb0 + wcol * nsb + s
+                let rb4 = wsb * 40u + bu * 4u
+                let r0 = vk_wq[rb4]
+                let r1 = vk_wq[rb4 + 1u]
+                let r2 = vk_wq[rb4 + 2u]
+                let r3 = vk_wq[rb4 + 3u]
+                let hbw = vk_wq[wsb * 40u + 32u + bu]
+                let h0 = hbw & 0xFF
+                let h1 = (hbw >> 8u) & 0xFF
+                let h2 = (hbw >> 16u) & 0xFF
+                let h3 = (hbw >> 24u) & 0xFF
+                if (hh == 0u) {
+                    wv = uint4((r0 & 0x0F0F0F0F) | k5_dep(h0 & 0xF), (r1 & 0x0F0F0F0F) | k5_dep(h1 & 0xF),
+                        (r2 & 0x0F0F0F0F) | k5_dep(h2 & 0xF), (r3 & 0x0F0F0F0F) | k5_dep(h3 & 0xF))
+                } else {
+                    wv = uint4(((r0 >> 4u) & 0x0F0F0F0F) | k5_dep(h0 >> 4u), ((r1 >> 4u) & 0x0F0F0F0F) | k5_dep(h1 >> 4u),
+                        ((r2 >> 4u) & 0x0F0F0F0F) | k5_dep(h2 >> 4u), ((r3 >> 4u) & 0x0F0F0F0F) | k5_dep(h3 >> 4u))
+                }
+            }
+            bt_ww4[grp * 17u + k] = wv
         }
-        bt_xw[tid] = xv
-        var wv = 0u
-        if (wcol < d) {
-            let wsb = wsb0 + wcol * nsb + sb
-            let raw = vk_wq[wsb * 40u + blk * 4u + (word % 4u)]
-            let hb = (vk_wq[wsb * 40u + 32u + blk] >> ((word % 4u) * 8u)) & 0xFF
-            wv = (word < 4u ? (raw & 0x0F0F0F0F) | k5_dep(hb & 0xF)
-                : ((raw >> 4u) & 0x0F0F0F0F) | k5_dep(hb >> 4u))
-        }
-        bt_ww[grp * 9u + word] = wv
         if (tid < 32u) {
             var xs = 0.0
             if (xt * 32u + tid < cnt) {
-                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + sb]
+                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + s]
             }
             bt_xs[tid] = xs
-        } elif (tid < 64u) {
-            let i = tid - 32u
-            var sa = 0.0
-            var sbv = 0.0
-            if (wt * 32u + i < d) {
-                let wsb = wsb0 + (wt * 32u + i) * nsb + sb
-                let dm = unpackHalf2x16(vk_wsu[wsb * 5u])
-                let sc = int((vk_wsu[wsb * 5u + 1u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
-                let mn = int((vk_wsu[wsb * 5u + 3u + blk / 4u] >> ((blk % 4u) * 8u)) & 0xFF)
-                sa = dm.x * float(sc)
-                sbv = dm.y * float(mn)
-            }
-            bt_ws[i] = sa
-            bt_wsb[i] = sbv
         }
+        var sa = 0.0
+        var sbv = 0.0
+        if (wt * 32u + slane < d) {
+            let wsb = wsb0 + (wt * 32u + slane) * nsb + s
+            let dm = unpackHalf2x16(vk_wsu[wsb * 5u])
+            let sc = int((vk_wsu[wsb * 5u + 1u + sblk / 4u] >> ((sblk % 4u) * 8u)) & 0xFF)
+            let mn = int((vk_wsu[wsb * 5u + 3u + sblk / 4u] >> ((sblk % 4u) * 8u)) & 0xFF)
+            sa = dm.x * float(sc)
+            sbv = dm.y * float(mn)
+        }
+        bt_ws[sblk * 32u + slane] = sa
+        bt_wsb[sblk * 32u + slane] = sbv
         barrier()
-        var i0 = 0
-        var i1 = 0
-        var i2 = 0
-        var i3 = 0
-        var bs = 0
-        for (j in range(8)) {
-            let ju = uint(j)
-            let xw = bt_xw[grp * 8u + ju]
-            bs += sdot4(xw, 0x01010101)
-            i0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
-            i1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
-            i2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
-            i3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
-        }
         let xscl = bt_xs[grp]
-        f0 += xscl * (bt_ws[wi0] * float(i0) - bt_wsb[wi0] * float(bs))
-        f1 += xscl * (bt_ws[wi0 + 1u] * float(i1) - bt_wsb[wi0 + 1u] * float(bs))
-        f2 += xscl * (bt_ws[wi0 + 2u] * float(i2) - bt_wsb[wi0 + 2u] * float(bs))
-        f3 += xscl * (bt_ws[wi0 + 3u] * float(i3) - bt_wsb[wi0 + 3u] * float(bs))
+        for (bb in range(8)) {
+            let bu = uint(bb)
+            var i0 = 0
+            var i1 = 0
+            var i2 = 0
+            var i3 = 0
+            var bs = 0
+            for (kk in range(2)) {
+                let k = bu * 2u + uint(kk)
+                let xw = bt_xw4[grp * 17u + k]
+                let wv0 = bt_ww4[word * 17u + k]
+                let wv1 = bt_ww4[(word + 8u) * 17u + k]
+                let wv2 = bt_ww4[(word + 16u) * 17u + k]
+                let wv3 = bt_ww4[(word + 24u) * 17u + k]
+                bs += sdot4(xw.x, 0x01010101) + sdot4(xw.y, 0x01010101) + sdot4(xw.z, 0x01010101) + sdot4(xw.w, 0x01010101)
+                i0 += sdot4(wv0.x, xw.x) + sdot4(wv0.y, xw.y) + sdot4(wv0.z, xw.z) + sdot4(wv0.w, xw.w)
+                i1 += sdot4(wv1.x, xw.x) + sdot4(wv1.y, xw.y) + sdot4(wv1.z, xw.z) + sdot4(wv1.w, xw.w)
+                i2 += sdot4(wv2.x, xw.x) + sdot4(wv2.y, xw.y) + sdot4(wv2.z, xw.z) + sdot4(wv2.w, xw.w)
+                i3 += sdot4(wv3.x, xw.x) + sdot4(wv3.y, xw.y) + sdot4(wv3.z, xw.z) + sdot4(wv3.w, xw.w)
+            }
+            f0 += xscl * (bt_ws[bu * 32u + word] * float(i0) - bt_wsb[bu * 32u + word] * float(bs))
+            f1 += xscl * (bt_ws[bu * 32u + word + 8u] * float(i1) - bt_wsb[bu * 32u + word + 8u] * float(bs))
+            f2 += xscl * (bt_ws[bu * 32u + word + 16u] * float(i2) - bt_wsb[bu * 32u + word + 16u] * float(bs))
+            f3 += xscl * (bt_ws[bu * 32u + word + 24u] * float(i3) - bt_wsb[bu * 32u + word + 24u] * float(bs))
+        }
         barrier()
-        b++
+        s++
     }
     if (xrow < cnt) {
-        let yb = (row0 + xrow) * d + wt * 32u + wi0
-        if (wt * 32u + wi0 < d) {
+        let yb = (row0 + xrow) * d + wt * 32u + word
+        if (wt * 32u + word < d) {
             vk_y[yb] = f0
         }
-        if (wt * 32u + wi0 + 1u < d) {
-            vk_y[yb + 1u] = f1
+        if (wt * 32u + word + 8u < d) {
+            vk_y[yb + 8u] = f1
         }
-        if (wt * 32u + wi0 + 2u < d) {
-            vk_y[yb + 2u] = f2
+        if (wt * 32u + word + 16u < d) {
+            vk_y[yb + 16u] = f2
         }
-        if (wt * 32u + wi0 + 3u < d) {
-            vk_y[yb + 3u] = f3
+        if (wt * 32u + word + 24u < d) {
+            vk_y[yb + 24u] = f3
         }
     }
 }
@@ -684,108 +747,124 @@ def kq_moe_batch_k6 {
     let xt = tix / wtiles
     let wt = tix % wtiles
     let nsb = n / 256u
-    let nb = nsb * 8u
     let tid = gl_LocalInvocationID.x
     let word = tid % 8u
     let grp = tid / 8u
     let xrow = xt * 32u + grp
     let wcol = wt * 32u + grp
-    let wi0 = (tid % 8u) * 4u
+    let slane = tid % 32u
+    let sblk = tid / 32u
     var f0 = 0.0
     var f1 = 0.0
     var f2 = 0.0
     var f3 = 0.0
-    var b = 0u
-    while (b < nb) {
-        let sb = b / 8u
-        let blk = b % 8u
-        var xv = 0u
-        if (xrow < cnt) {
-            xv = vk_xq[((row0 + xrow) * nsb + sb) * 64u + blk * 8u + word]
+    var s = 0u
+    while (s < nsb) {
+        for (ki in range(2)) {
+            let k = word + uint(ki) * 8u
+            let bu = k / 2u
+            let hh = k % 2u
+            var xv = uint4(0u)
+            if (xrow < cnt) {
+                let xb4 = ((row0 + xrow) * nsb + s) * 64u + bu * 8u + hh * 4u
+                xv = uint4(vk_xq[xb4], vk_xq[xb4 + 1u], vk_xq[xb4 + 2u], vk_xq[xb4 + 3u])
+            }
+            bt_xw4[grp * 17u + k] = xv
+            var wv = uint4(0u)
+            if (wcol < d) {
+                let wsb = wsb0 + wcol * nsb + s
+                let rb4 = wsb * 48u + bu * 4u
+                let r0 = vk_wq[rb4]
+                let r1 = vk_wq[rb4 + 1u]
+                let r2 = vk_wq[rb4 + 2u]
+                let r3 = vk_wq[rb4 + 3u]
+                let qb4 = wsb * 48u + 32u + (bu / 4u) * 8u + hh * 4u   // words w and w+4 qh adjoin
+                let q0 = vk_wq[qb4]
+                let q1 = vk_wq[qb4 + 1u]
+                let q2 = vk_wq[qb4 + 2u]
+                let q3 = vk_wq[qb4 + 3u]
+                let shift = (bu % 4u) * 2u
+                if (hh == 0u) {
+                    wv = uint4((r0 & 0x0F0F0F0F) | (((q0 >> shift) & 0x03030303) << 4u),
+                        (r1 & 0x0F0F0F0F) | (((q1 >> shift) & 0x03030303) << 4u),
+                        (r2 & 0x0F0F0F0F) | (((q2 >> shift) & 0x03030303) << 4u),
+                        (r3 & 0x0F0F0F0F) | (((q3 >> shift) & 0x03030303) << 4u))
+                } else {
+                    wv = uint4(((r0 >> 4u) & 0x0F0F0F0F) | (((q0 >> shift) & 0x03030303) << 4u),
+                        ((r1 >> 4u) & 0x0F0F0F0F) | (((q1 >> shift) & 0x03030303) << 4u),
+                        ((r2 >> 4u) & 0x0F0F0F0F) | (((q2 >> shift) & 0x03030303) << 4u),
+                        ((r3 >> 4u) & 0x0F0F0F0F) | (((q3 >> shift) & 0x03030303) << 4u))
+                }
+            }
+            bt_ww4[grp * 17u + k] = wv
         }
-        bt_xw[tid] = xv
-        var wv = 0u
-        if (wcol < d) {
-            let wsb = wsb0 + wcol * nsb + sb
-            let raw = vk_wq[wsb * 48u + blk * 4u + (word % 4u)]
-            let qh = vk_wq[wsb * 48u + 32u + (blk / 4u) * 8u + word]   // j and j+4 qh words adjoin
-            let shift = (blk % 4u) * 2u
-            wv = (word < 4u ? (raw & 0x0F0F0F0F) | (((qh >> shift) & 0x03030303) << 4u)
-                : ((raw >> 4u) & 0x0F0F0F0F) | (((qh >> shift) & 0x03030303) << 4u))
-        }
-        bt_ww[grp * 9u + word] = wv
         if (tid < 32u) {
             var xs = 0.0
             if (xt * 32u + tid < cnt) {
-                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + sb]
+                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + s]
             }
             bt_xs[tid] = xs
-        } elif (tid < 64u) {
-            let i = tid - 32u
-            var sa = 0.0
-            var sbv = 0.0
-            if (wt * 32u + i < d) {
-                let wsb = wsb0 + (wt * 32u + i) * nsb + sb
-                let s4 = int4(unpack8(int(vk_wsu[wsb * 5u + blk / 2u])))
-                let slo = (blk % 2u) == 0u ? s4.x : s4.z
-                let shi = (blk % 2u) == 0u ? s4.y : s4.w
-                let dd = unpackHalf2x16(vk_wsu[wsb * 5u + 4u]).x
-                sa = dd * float(slo)
-                sbv = dd * float(shi)
-            }
-            bt_ws[i] = sa
-            bt_wsb[i] = sbv
         }
+        var sa = 0.0
+        var sbv = 0.0
+        if (wt * 32u + slane < d) {
+            let wsb = wsb0 + (wt * 32u + slane) * nsb + s
+            let s4 = int4(unpack8(int(vk_wsu[wsb * 5u + sblk / 2u])))
+            let slo = (sblk % 2u) == 0u ? s4.x : s4.z
+            let shi = (sblk % 2u) == 0u ? s4.y : s4.w
+            let dd = unpackHalf2x16(vk_wsu[wsb * 5u + 4u]).x
+            sa = dd * float(slo)
+            sbv = dd * float(shi)
+        }
+        bt_ws[sblk * 32u + slane] = sa
+        bt_wsb[sblk * 32u + slane] = sbv
         barrier()
-        var l0 = 0
-        var l1 = 0
-        var l2 = 0
-        var l3 = 0
-        var blo = 0
-        for (j in range(4)) {
-            let ju = uint(j)
-            let xw = bt_xw[grp * 8u + ju]
-            blo += sdot4(xw, 0x01010101)
-            l0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
-            l1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
-            l2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
-            l3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
-        }
-        var h0 = 0
-        var h1 = 0
-        var h2 = 0
-        var h3 = 0
-        var bhi = 0
-        for (j in range(4)) {
-            let ju = uint(j) + 4u
-            let xw = bt_xw[grp * 8u + ju]
-            bhi += sdot4(xw, 0x01010101)
-            h0 += sdot4(bt_ww[(wi0 + 0u) * 9u + ju], xw)
-            h1 += sdot4(bt_ww[(wi0 + 1u) * 9u + ju], xw)
-            h2 += sdot4(bt_ww[(wi0 + 2u) * 9u + ju], xw)
-            h3 += sdot4(bt_ww[(wi0 + 3u) * 9u + ju], xw)
-        }
         let xscl = bt_xs[grp]
-        f0 += xscl * (bt_ws[wi0] * float(l0 - 32 * blo) + bt_wsb[wi0] * float(h0 - 32 * bhi))
-        f1 += xscl * (bt_ws[wi0 + 1u] * float(l1 - 32 * blo) + bt_wsb[wi0 + 1u] * float(h1 - 32 * bhi))
-        f2 += xscl * (bt_ws[wi0 + 2u] * float(l2 - 32 * blo) + bt_wsb[wi0 + 2u] * float(h2 - 32 * bhi))
-        f3 += xscl * (bt_ws[wi0 + 3u] * float(l3 - 32 * blo) + bt_wsb[wi0 + 3u] * float(h3 - 32 * bhi))
+        for (bb in range(8)) {
+            let bu = uint(bb)
+            let kL = bu * 2u
+            let kH = bu * 2u + 1u
+            let xwL = bt_xw4[grp * 17u + kL]
+            let xwH = bt_xw4[grp * 17u + kH]
+            let blo = sdot4(xwL.x, 0x01010101) + sdot4(xwL.y, 0x01010101) + sdot4(xwL.z, 0x01010101) + sdot4(xwL.w, 0x01010101)
+            let bhi = sdot4(xwH.x, 0x01010101) + sdot4(xwH.y, 0x01010101) + sdot4(xwH.z, 0x01010101) + sdot4(xwH.w, 0x01010101)
+            let wL0 = bt_ww4[word * 17u + kL]
+            let wL1 = bt_ww4[(word + 8u) * 17u + kL]
+            let wL2 = bt_ww4[(word + 16u) * 17u + kL]
+            let wL3 = bt_ww4[(word + 24u) * 17u + kL]
+            let wH0 = bt_ww4[word * 17u + kH]
+            let wH1 = bt_ww4[(word + 8u) * 17u + kH]
+            let wH2 = bt_ww4[(word + 16u) * 17u + kH]
+            let wH3 = bt_ww4[(word + 24u) * 17u + kH]
+            let l0 = sdot4(wL0.x, xwL.x) + sdot4(wL0.y, xwL.y) + sdot4(wL0.z, xwL.z) + sdot4(wL0.w, xwL.w)
+            let l1 = sdot4(wL1.x, xwL.x) + sdot4(wL1.y, xwL.y) + sdot4(wL1.z, xwL.z) + sdot4(wL1.w, xwL.w)
+            let l2 = sdot4(wL2.x, xwL.x) + sdot4(wL2.y, xwL.y) + sdot4(wL2.z, xwL.z) + sdot4(wL2.w, xwL.w)
+            let l3 = sdot4(wL3.x, xwL.x) + sdot4(wL3.y, xwL.y) + sdot4(wL3.z, xwL.z) + sdot4(wL3.w, xwL.w)
+            let h0 = sdot4(wH0.x, xwH.x) + sdot4(wH0.y, xwH.y) + sdot4(wH0.z, xwH.z) + sdot4(wH0.w, xwH.w)
+            let h1 = sdot4(wH1.x, xwH.x) + sdot4(wH1.y, xwH.y) + sdot4(wH1.z, xwH.z) + sdot4(wH1.w, xwH.w)
+            let h2 = sdot4(wH2.x, xwH.x) + sdot4(wH2.y, xwH.y) + sdot4(wH2.z, xwH.z) + sdot4(wH2.w, xwH.w)
+            let h3 = sdot4(wH3.x, xwH.x) + sdot4(wH3.y, xwH.y) + sdot4(wH3.z, xwH.z) + sdot4(wH3.w, xwH.w)
+            f0 += xscl * (bt_ws[bu * 32u + word] * float(l0 - 32 * blo) + bt_wsb[bu * 32u + word] * float(h0 - 32 * bhi))
+            f1 += xscl * (bt_ws[bu * 32u + word + 8u] * float(l1 - 32 * blo) + bt_wsb[bu * 32u + word + 8u] * float(h1 - 32 * bhi))
+            f2 += xscl * (bt_ws[bu * 32u + word + 16u] * float(l2 - 32 * blo) + bt_wsb[bu * 32u + word + 16u] * float(h2 - 32 * bhi))
+            f3 += xscl * (bt_ws[bu * 32u + word + 24u] * float(l3 - 32 * blo) + bt_wsb[bu * 32u + word + 24u] * float(h3 - 32 * bhi))
+        }
         barrier()
-        b++
+        s++
     }
     if (xrow < cnt) {
-        let yb = (row0 + xrow) * d + wt * 32u + wi0
-        if (wt * 32u + wi0 < d) {
+        let yb = (row0 + xrow) * d + wt * 32u + word
+        if (wt * 32u + word < d) {
             vk_y[yb] = f0
         }
-        if (wt * 32u + wi0 + 1u < d) {
-            vk_y[yb + 1u] = f1
+        if (wt * 32u + word + 8u < d) {
+            vk_y[yb + 8u] = f1
         }
-        if (wt * 32u + wi0 + 2u < d) {
-            vk_y[yb + 2u] = f2
+        if (wt * 32u + word + 16u < d) {
+            vk_y[yb + 16u] = f2
         }
-        if (wt * 32u + wi0 + 3u < d) {
-            vk_y[yb + 3u] = f3
+        if (wt * 32u + word + 24u < d) {
+            vk_y[yb + 24u] = f3
         }
     }
 }
@@ -1561,24 +1640,51 @@ def private ffn_chunk_rows(n, nfe, xunit : int64) : int64 {
     return min(r, BATCH_CHUNK_ROWS)
 }
 
-// stage the chunk's activation rows [r0, r0+rows) into the device-local scratch (the kernel
-// re-reads x ~(d/32) times — host-visible would cross PCIe every pass)
+// parallel host memcpy — the batch chain moves 8-34MB per hop and a single lane runs ~14GB/s
+// while the box's DRAM feeds 3-4x that; jobque lanes are idle while the GPU owns the layer
+let private PAR_COPY_CHUNK = 2_097_152l
+
+def private par_memcpy(dst : void?; src : void?; bytes : int64) {
+    if (bytes < PAR_COPY_CHUNK * 2l || !is_job_que_available()) {
+        unsafe {
+            memcpy(dst, src, int(bytes))
+        }
+        return
+    }
+    let nch = int((bytes + PAR_COPY_CHUNK - 1l) / PAR_COPY_CHUNK)
+    var d8 = unsafe(reinterpret<uint8?>(dst))
+    var s8 = unsafe(reinterpret<uint8?>(src))
+    maybe_parallel_for(0, nch, nch) $(cb, ce) {
+        unsafe {
+            for (c in range(cb, ce)) {
+                let off = int64(c) * PAR_COPY_CHUNK
+                memcpy(reinterpret<void?>(d8 + off), reinterpret<void?>(s8 + off), int(min(PAR_COPY_CHUNK, bytes - off)))
+            }
+        }
+    }
+}
+
+// stage the chunk's activation rows [r0, r0+rows) into the staging window (xq at 0, xs at
+// BATCH_XQ_BYTES); the staging->device copies ride the HEAD of the chain submit — a separate
+// synchronous copy submit here measured a full extra round trip per chunk
 def private upload_batch_acts(xqp : int8 const?; xsp : float const?; r0, rows, n, xunit : int64) {
     let xq_bytes = rows * n
     let xs_bytes = rows * (n / xunit) * 4l
     unsafe {
         var sp = reinterpret<uint8?>(g_gpu.staging.mapped)
-        memcpy(g_gpu.staging.mapped, reinterpret<void? -const>(xqp + r0 * n), int(xq_bytes))
-        memcpy(reinterpret<void?>(sp + BATCH_XQ_BYTES), reinterpret<void? -const>(xsp + r0 * (n / xunit)), int(xs_bytes))
+        par_memcpy(g_gpu.staging.mapped, reinterpret<void? -const>(xqp + r0 * n), xq_bytes)
+        par_memcpy(reinterpret<void?>(sp + BATCH_XQ_BYTES), reinterpret<void? -const>(xsp + r0 * (n / xunit)), xs_bytes)
     }
-    run_cmd_sync(g_gpu.device, g_gpu.pool, g_gpu.queue) $(cmd) {
-        var qregions : array<BufferCopy>
-        qregions |> push(BufferCopy(srcOffset = 0ul, dstOffset = 0ul, size = uint64(xq_bytes)))
-        cmd_copy_buffer(cmd, nonowning_buf(g_gpu.staging.buf), nonowning_buf(g_gpu.batch_xq_dev), qregions)
-        var sregions : array<BufferCopy>
-        sregions |> push(BufferCopy(srcOffset = uint64(BATCH_XQ_BYTES), dstOffset = 0ul, size = uint64(xs_bytes)))
-        cmd_copy_buffer(cmd, nonowning_buf(g_gpu.staging.buf), nonowning_buf(g_gpu.batch_xs_dev), sregions)
-    }
+}
+
+// the chain-head acts copies the fold above defers to record time
+def private cmd_copy_batch_acts(raw : VkCommandBuffer; xq_bytes, xs_bytes : int64) {
+    var qregions : array<BufferCopy>
+    qregions |> push(BufferCopy(srcOffset = 0ul, dstOffset = 0ul, size = uint64(xq_bytes)))
+    cmd_copy_buffer(vk_value_to_boost(raw), nonowning_buf(g_gpu.staging.buf), nonowning_buf(g_gpu.batch_xq_dev), qregions)
+    var sregions : array<BufferCopy>
+    sregions |> push(BufferCopy(srcOffset = uint64(BATCH_XQ_BYTES), dstOffset = 0ul, size = uint64(xs_bytes)))
+    cmd_copy_buffer(vk_value_to_boost(raw), nonowning_buf(g_gpu.staging.buf), nonowning_buf(g_gpu.batch_xs_dev), sregions)
 }
 
 // build the chunk's meta table: regions clipped to the row window [r0, r1) (row0 re-based to the
@@ -1667,12 +1773,13 @@ def private cmd_copy_whole(raw : VkCommandBuffer; src, dst : uint64; bytes : int
 // recording cost is noise (unlike decode's per-token pre-recorded buffers). The chain per chunk:
 // meta staging copies, gate+up GEMMs, fused act+requant, down GEMM, gout DMA — one barrier per
 // seam, the hidden planes never leave the device.
-def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, nfe, gout_bytes : int64) {
+def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, nfe, gout_bytes : int64; axq_bytes, axs_bytes : int64) {
     let raw = g_gpu.batch_cmd
     let rf : VkCommandBufferResetFlags
     vk_check(vkResetCommandBuffer(raw, rf), null)
     let begin = VkCommandBufferBeginInfo()
     vk_check(vkBeginCommandBuffer(raw, begin), null)
+    cmd_copy_batch_acts(raw, axq_bytes, axs_bytes)
     cmd_copy_batch_meta(raw, s1)
     cmd_copy_batch_meta(raw, s3)
     cmd_copy_batch_meta(raw, s2)
@@ -1727,12 +1834,12 @@ def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : i
         upload_batch_acts(xqp, xsp, r0, rows, n, xunit)
         let ts2 = ref_time_ticks()
         fill_ffn_meta(rows * nfe, rows * nfe / xunit, is_gelu)
-        record_ffn_batch_cmd(s1, s3, s2, nwg1, nwg2, rows, nfe, rows * n * 4l)
+        record_ffn_batch_cmd(s1, s3, s2, nwg1, nwg2, rows, nfe, rows * n * 4l, rows * n, rows * (n / xunit) * 4l)
         let ts3 = ref_time_ticks()
         submit_wait(g_gpu.batch_cmd)
         let ts4 = ref_time_ticks()
         unsafe {
-            memcpy(reinterpret<void?>(goutp + r0 * n), g_gpu.batch_y1.mapped, int(rows * n * 4l))
+            par_memcpy(reinterpret<void?>(goutp + r0 * n), g_gpu.batch_y1.mapped, rows * n * 4l)
         }
         if (vk_prof()) {
             to_log(LOG_INFO, "vk_ffn_batch acts {get_time_usec(ts1) - get_time_usec(ts2)} submit {get_time_usec(ts3) - get_time_usec(ts4)} copy {get_time_usec(ts4)}\n")
@@ -1741,13 +1848,15 @@ def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : i
     }
 }
 
-// one dense chunk: meta staging copy, one tile GEMM over the single whole-plane region, y DMA
-def private record_dense_cmd(si : int; nwg : uint; y_bytes : int64) {
+// one dense chunk: acts + meta staging copies, one tile GEMM over the single whole-plane
+// region, y DMA
+def private record_dense_cmd(si : int; nwg : uint; y_bytes : int64; axq_bytes, axs_bytes : int64) {
     let raw = g_gpu.batch_cmd
     let rf : VkCommandBufferResetFlags
     vk_check(vkResetCommandBuffer(raw, rf), null)
     let begin = VkCommandBufferBeginInfo()
     vk_check(vkBeginCommandBuffer(raw, begin), null)
+    cmd_copy_batch_acts(raw, axq_bytes, axs_bytes)
     cmd_copy_batch_meta(raw, si)
     batch_barrier(raw, true)
     bind_batch_pipe(raw, g_gpu.stacks[si].fmt)
@@ -1781,12 +1890,12 @@ def vk_moe_dense(var yp : float?; woff : int64; xqp : int8 const?; xsp : float c
         let ts1 = ref_time_ticks()
         upload_batch_acts(xqp, xsp, r0, rows, n, xunit)
         let ts2 = ref_time_ticks()
-        record_dense_cmd(si, nwg, rows * d * 4l)
+        record_dense_cmd(si, nwg, rows * d * 4l, rows * n, rows * (n / xunit) * 4l)
         let ts3 = ref_time_ticks()
         submit_wait(g_gpu.batch_cmd)
         let ts4 = ref_time_ticks()
         unsafe {
-            memcpy(reinterpret<void?>(yp + r0 * d), g_gpu.batch_y1.mapped, int(rows * d * 4l))
+            par_memcpy(reinterpret<void?>(yp + r0 * d), g_gpu.batch_y1.mapped, rows * d * 4l)
         }
         if (vk_prof()) {
             to_log(LOG_INFO, "vk_dense acts {get_time_usec(ts1) - get_time_usec(ts2)} submit {get_time_usec(ts3) - get_time_usec(ts4)} copy {get_time_usec(ts4)}\n")
