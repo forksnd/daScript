@@ -313,7 +313,7 @@ and injects an `[init]` so the runtime write API targets the same file. The two 
 Known edges: constant-arg call sites compiled before a late re-stamp may stay on the
 reference tier (bit-exact by contract; pointer-shaped kernels unaffected), and in
 multi-program processes a shared library module keeps the stamps of the first program that
-compiled it. Round-trip test: `tests/jit_tests/llvm_tune_manifest.das` (temp-copied client,
+compiled it. Round-trip test: `modules/dasLLVM/tests/llvm_tune_manifest.das` (temp-copied client,
 declaration-driven write → re-stamp → k2 tier observed).
 Framework worked example: `llvm_code_selftest::add_plus_k` (emits `a+b+k` from the perm arg +
 a `decline=true` rail); suite test `tests/jit_tests/llvm_code`/`llvm_tune`; CLI gates green
@@ -371,7 +371,7 @@ registered generators are name-keyed and inert for programs that never `[llvm_co
 them. `typeinfo builtin_module_exists` additionally sees promoted (shared das) modules now,
 so the `static_if` guard around the registration call works for das contributors. Tests:
 `tests/language/optional_require.das` (+ fixture) pins the resolvability fallback and the
-das-module `builtin_module_exists`; `tests/jit_tests/llvm_tune_modes.das` spawns a child
+das-module `builtin_module_exists`; `modules/dasLLVM/tests/llvm_tune_modes.das` spawns a child
 daslang with `DAS_TUNE_MODE=test` and asserts every grid row's runtime value (5/5/6/7/5);
 `cant_tune_bad_grids.das` pins all six `[tune]` validation errors.
 

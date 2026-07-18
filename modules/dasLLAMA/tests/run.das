@@ -1,7 +1,7 @@
 options gen2
 options indenting = 4
 
-// The ONLY sanctioned way to run the dasLLAMA Metal suites (see tests/dasLLAMA/CLAUDE.md).
+// The ONLY sanctioned way to run the dasLLAMA Metal suites (see modules/dasLLAMA/tests/CLAUDE.md).
 // Enforces the iteration discipline that keeps suite walls honest: --arm (filtered iteration,
 // minutes) scoped to the arms a change can actually affect. --full is REFUSED while the Metal
 // build-out is in progress — a whole-zoo pass buys soak time, not coverage; narrow the scope.
@@ -45,21 +45,21 @@ struct RunArgs {
 
 def private suite_files(name : string) : array<string> {
     if (name == "decode") {
-        return <- [ "tests/dasLLAMA/test_metal_decode_parity.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_decode_parity.das" ]
     } elif (name == "prefill") {
-        return <- [ "tests/dasLLAMA/test_metal_prefill_parity.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_prefill_parity.das" ]
     } elif (name == "matrix") {
-        return <- [ "tests/dasLLAMA/test_metal_support_matrix.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_support_matrix.das" ]
     } elif (name == "kernels") {
-        return <- [ "tests/dasLLAMA/test_metal_prefill_kernels.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_prefill_kernels.das" ]
     } elif (name == "image") {
-        return <- [ "tests/dasLLAMA/test_model_image.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_model_image.das" ]
     } elif (name == "all") {
-        return <- [ "tests/dasLLAMA/test_metal_decode_parity.das",
-                    "tests/dasLLAMA/test_metal_prefill_parity.das",
-                    "tests/dasLLAMA/test_metal_support_matrix.das",
-                    "tests/dasLLAMA/test_metal_prefill_kernels.das",
-                    "tests/dasLLAMA/test_model_image.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_decode_parity.das",
+                    "modules/dasLLAMA/tests/test_metal_prefill_parity.das",
+                    "modules/dasLLAMA/tests/test_metal_support_matrix.das",
+                    "modules/dasLLAMA/tests/test_metal_prefill_kernels.das",
+                    "modules/dasLLAMA/tests/test_model_image.das" ]
     }
     var none : array<string>
     return <- none
@@ -96,12 +96,12 @@ def main() : int {
     var r <- parse_args(type<RunArgs>)
     if (r |> is_err) {
         to_log(LOG_ERROR, "error: {r |> unwrap_err}\n\n")
-        print_help(get_command_info(type<RunArgs>), "tests/dasLLAMA/run.das")
+        print_help(get_command_info(type<RunArgs>), "modules/dasLLAMA/tests/run.das")
         return 2
     }
     let cfg <- r |> move_unwrap
     if (cfg.help) {
-        print_help(get_command_info(type<RunArgs>), "tests/dasLLAMA/run.das")
+        print_help(get_command_info(type<RunArgs>), "modules/dasLLAMA/tests/run.das")
         return 0
     }
     if (cfg.full == !empty(cfg.arm)) {   // both set, or neither

@@ -21,7 +21,7 @@ require _model_tier
 // arms compare a gguf-backed load against a mapped image load of the same file — token-exact
 // for text models, element-exact planes for towers, transcript-exact for whisper. The
 // voxtral-mini arm is the designated >2 GiB-plane coverage (its q8 image is 5.4 GB), so it
-// re-saves the image from cold on every run by design. Drive through tests/dasLLAMA/run.das
+// re-saves the image from cold on every run by design. Drive through modules/dasLLAMA/tests/run.das
 // (--suite image); model arms follow the suite's presence/tier gates.
 
 def private whisper_dir() : string {

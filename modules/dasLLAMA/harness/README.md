@@ -47,13 +47,13 @@ bin/daslang -jit modules/dasLLAMA/harness/parity.das -- \
   -m <model.gguf> -n 40 --quant q8 --ids 1,9038,2501,263,931
 ```
 
-Frozen fixtures (prompt IDs + reference GEN_IDS) live with the suite in `tests/dasLLAMA/test_parity.das`
+Frozen fixtures (prompt IDs + reference GEN_IDS) live with the suite in `modules/dasLLAMA/tests/test_parity.das`
 so the parity gate runs without llama.cpp/the oracle at test time. The GGUF models themselves are
 gitignored, so each case skips cleanly when its model is absent (a real local regression, a no-op in
 CI). **Run model tests with the JIT** — interpreted is far too slow for any real model:
 
 ```sh
-bin/daslang -jit dastest/dastest.das -- --test tests/dasLLAMA/test_parity.das
+bin/daslang -jit dastest/dastest.das -- --test modules/dasLLAMA/tests/test_parity.das
 ```
 
 ## Sliding-window attention (Gemma2) — long-context check

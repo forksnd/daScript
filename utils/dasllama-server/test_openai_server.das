@@ -15,7 +15,7 @@ require math                                            // sqrt
 // context — so the model loads INSIDE that thread, since g_model is a per-context module global),
 // then drive /v1/models, /v1/embeddings and /v1/chat/completions over the real dashv HTTP client.
 // Model-gated + JIT-only, so it's a real regression locally and a clean skip in CI (no GGUF).
-// Lives here (not tests/dasLLAMA/) because a require path can't contain the '-' in "dasllama-server":
+// Lives here (not modules/dasLLAMA/tests/) because a require path can't contain the '-' in "dasllama-server":
 // a require_module_name is NAME tokens joined by / . % .. — so hyphenated-dir tools keep tests in-dir
 // and require the sibling module by BARE name (same convention as detect-dupe / find-dupe / mcp).
 

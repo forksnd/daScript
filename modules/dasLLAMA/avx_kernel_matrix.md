@@ -100,7 +100,7 @@ source so a pin-A/B isolates the dot alone).
   - Shapes: (n=64,d=8,ntok=4,R=5), (n=96 — odd nb, exercises z16/dequant64 odd-block tails —
     d=10 → d%4 row tails, ntok=3, R=4), (n=2880,d=20,ntok=5,R=3 — grp4x2 + TB + threaded).
 - Default-off contract: no env → `backends: [portable, x64-avx2, x64-avx2-ps, x64-avx2-acc8,
-  x64-avx2-repack]` — matrix invisible. Suite `tests/dasLLAMA` 171/171 under `-jit`.
+  x64-avx2-repack]` — matrix invisible. Suite `modules/dasLLAMA/tests` 171/171 under `-jit`.
 - Forced-feature disasm (dumpbin on the force-keyed DLL): VEX `vpdpbusd ymm` + EVEX ymm16 form,
   `vpdpbusd zmm`, `vpmaddubsw/vpmaddwd zmm`, `vpshufb zmm` + `vbroadcasti32x4` LUT broadcast,
   `vpmovb2m`+`vpsubb zmm{k1}` sign trick, zmm float tail (`vcvtdq2ps`/`vmulps`/`vaddps`) with
@@ -153,7 +153,7 @@ tiers. Verify first: `cpu_supports` probe (all five names + `avx2`/`fma`).
   AOT-compile; suite here was interp+JIT only).
 - `README` module-tree line if the doc set changed; `x64_arch.md` matrix rows/section already
   landed (this doc is the detail).
-- Probe not CI-wired (same status as the other harness probes; `tests/dasLLAMA` covers the
+- Probe not CI-wired (same status as the other harness probes; `modules/dasLLAMA/tests` covers the
   default-off contract implicitly).
 - Standard arc-PR checklist: rebase onto origin/master (make_pr step 0), full preflight token,
   lint exact CI changed-set with absolute paths, dupe check.

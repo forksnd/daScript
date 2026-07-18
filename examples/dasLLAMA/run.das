@@ -11,7 +11,7 @@ require math
 // Greedy text completion over any GGUF model, with throughput stats. Collapses the old
 // run/gguf_run/llama3_run trio into one path: load_model auto-selects the arch + tokenizer, encode
 // the prompt, stream the greedy continuation, and print prefill / generation tok/s. Token-for-token
-// oracle validation lives in the test suite (tests/dasLLAMA/test_forward.das + test_parity.das).
+// oracle validation lives in the test suite (modules/dasLLAMA/tests/test_forward.das + test_parity.das).
 //
 //   bin/daslang -jit examples/dasLLAMA/run.das -- <model.gguf>
 

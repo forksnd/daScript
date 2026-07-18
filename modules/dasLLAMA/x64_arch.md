@@ -24,7 +24,7 @@ NEON files, register at `[init]`, never edit the core.
 
 - **Always `-jit`.** dasLLAMA perf work is JIT-tier only; interpreted runs are orders of
   magnitude too slow and loop hints/intrinsics don't exist there. Test command:
-  `bin/daslang -jit dastest/dastest.das -- --test tests/dasLLAMA/`. (The MCP `run_test` tool is
+  `bin/daslang -jit dastest/dastest.das -- --test modules/dasLLAMA/tests/`. (The MCP `run_test` tool is
   interpreted — don't use it for model runs.)
 - **Correctness before speed, token-for-token.** The engine is validated against external
   oracles (llama2.c + llama.cpp `simple_ids`, see `README.md` "How to verify a new model").
@@ -35,7 +35,7 @@ NEON files, register at `[init]`, never edit the core.
   non-bit-exact default — it will pass on the machine it was frozen on and flip elsewhere.
 - **AOT is correct-but-untuned by design.** The AOT C++ emitter (`daslib/aot_cpp.das`) drops
   loop hints entirely, and intrinsics compile as their portable fallback bodies. The AOT gate
-  (`bin/test_aot -use-aot dastest/dastest.das -- --test tests/dasLLAMA/`) is a compile+link+run
+  (`bin/test_aot -use-aot dastest/dastest.das -- --test modules/dasLLAMA/tests/`) is a compile+link+run
   regression check, never a tuning test.
 
 ---
@@ -112,7 +112,7 @@ the core dispatch changes when a backend is added.**
 
 `pin_kernel_backend(name)` (:397) forces a named backend for A/B (unknown name = warn + keep
 current, never wedge); `clear_kernel_backend_pin()`, `active_kernel_backend()`,
-`kernel_backend_names()` complete the API. `tests/dasLLAMA/test_kernel_backend.das` covers all
+`kernel_backend_names()` complete the API. `modules/dasLLAMA/tests/test_kernel_backend.das` covers all
 of it.
 
 **Backends today:**

@@ -26,7 +26,7 @@ require dasllama/dasllama_metal_common   // decline enums/tables + the shared bl
 // Reductions ride simd_sum / a max butterfly over simd_shuffle_xor with hardcoded masks 16..1 —
 // Apple-GPU simdgroups are width 32 (asserted at driver init). Kernels with barriers/simd ops are
 // NOT sequentially CPU-replayable; their oracles are the dasLLAMA CPU functions themselves
-// (tests/dasLLAMA/test_metal_prefill_kernels.das).
+// (modules/dasLLAMA/tests/test_metal_prefill_kernels.das).
 
 // One thread per 32-element block of one activation row: amax -> d = amax/127 -> q = round(x*id).
 // Grid covers ntok*(n/32) blocks (uniform nblk guards the ceil-padded dispatch); pad rows of the

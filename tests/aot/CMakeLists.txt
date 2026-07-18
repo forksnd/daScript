@@ -95,7 +95,7 @@ FILE(GLOB AOT_DASPEG_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tes
 FILE(GLOB AOT_DASGLTF_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasGLTF/*.das")
 
 # AOT for dasLLAMA test files
-FILE(GLOB AOT_DASLLAMA_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasLLAMA/*.das")
+FILE(GLOB AOT_DASLLAMA_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "modules/dasLLAMA/tests/*.das")
 # _*.das are shared fixture modules (AOT'd via AOT_DASLLAMA_MODULE_FILES below), not scripts
 list(FILTER AOT_DASLLAMA_FILES EXCLUDE REGEX "/_")
 
@@ -103,7 +103,7 @@ list(FILTER AOT_DASLLAMA_FILES EXCLUDE REGEX "/_")
 # shared-module functions get one canonical AOT registration matching the runtime).
 # Leaf modules first so cross-module deps resolve.
 SET(AOT_DASLLAMA_MODULE_FILES
-    tests/dasLLAMA/_model_tier.das
+    modules/dasLLAMA/tests/_model_tier.das
     modules/dasLLVM/daslib/aarch64_neon.das
     modules/dasLLVM/daslib/x64_avx.das
     modules/dasLLVM/daslib/f16_cvt.das
