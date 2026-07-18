@@ -327,7 +327,7 @@ def private add_document(path : string; mode_override : int = -1;
 
 def private open_file_dialog() {
     let active = active_document_index()
-    var start_dir : string
+    var start_dir = ""
     if (active >= 0 && !empty(g_documents[active].source.path)) {
         start_dir = dir_name(g_documents[active].source.path)
     }
@@ -389,6 +389,10 @@ def private parse_command_line() {
 }
 
 def private define_commands() {
+    // ImGuiKey's digit enumerators cannot be named directly in daslang because
+    // `.0` parses as a float literal. ImGui keeps the digit row immediately
+    // before A, so derive the key for Ctrl+0 from that stable enum sequence.
+    let key_0 = unsafe(reinterpret<ImGuiKey>(int(ImGuiKey.A) - 10))
     g_commands.config_path = command_default_config_path("text-viewer")
     command_define(g_commands, CommandDefinition(
         id = CMD_FILE_OPEN, title = "Open...", category = "File",
@@ -430,8 +434,7 @@ def private define_commands() {
     command_define(g_commands, CommandDefinition(
         id = CMD_VIEW_ZOOM_RESET, title = "Reset Zoom", category = "View",
         scope = CommandScope.document),
-        command_binding(CMD_VIEW_ZOOM_RESET,
-                        unsafe(reinterpret<ImGuiKey>(int(ImGuiKey.A) - 10)), primary = true,
+        command_binding(CMD_VIEW_ZOOM_RESET, key_0, primary = true,
                         scope = CommandScope.document))
     command_define(g_commands, CommandDefinition(
         id = CMD_EDIT_COPY, title = "Copy", category = "Edit",
@@ -1032,7 +1035,9 @@ def update() {
     } elif (dialog_result == FileDialogResult.cancelled) {
         let active = active_document_index()
         if (active >= 0) {
-            g_documents[active].status = "Open cancelled."
+            g_documents[active].status = (g_file_dialog_action == ViewerFileDialogAction.save_as
+                    ? "Save As cancelled."
+                    : "Open cancelled.")
         }
         g_file_dialog_action = ViewerFileDialogAction.none
     }
