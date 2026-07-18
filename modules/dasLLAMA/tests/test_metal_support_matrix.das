@@ -52,7 +52,7 @@ require _model_tier
 // (neox+softcap+sliding+pre_post_norm+geglu, hs 256 — wave B stage 1) + gemma3 (dual-theta
 // per-layer rope — stage 2), each row token-parity-proven on all three paths. gemma4-12B
 // (stage 3: two attention classes, hs 512, V-from-K, v_norm, out_scale, suppress) serves
-// SINGLE decode token-exact; batch/prefill decline need_v_norm until stages 3c/3d. mistral3
+// single decode + prefill token-exact; batch declines need_v_norm until stage 3d. mistral3
 // (empty config = the llama shape) serves by construction; no <= 35B mistral3-arch GGUF
 // exists to validate against, so its real-model row waits on a fixture. MoE/deltanet = C-D.
 
@@ -489,13 +489,63 @@ def test_metal_support_matrix(t : T?) {
     }
 }
 
-[unused_argument(t, path, family, tag, expect_needs, want, kv2)]   // off-Apple the gated body is empty
+[unused_argument(t, tr, tag, tol)]   // off-Apple the gated body is empty
+def private cont_logits_cell(t : T?; tr : Model; tag : string; tol : float) {
+    // continuation-prefill NUMERIC parity: CPU-prefill a head, GPU-prefill the tail chunk
+    // (start_pos > 0), compare last-position logits against the all-CPU truth within `tol`.
+    // Pins the panel-overrun class (the K/V GEMMs write mp FULL M-tile rows at the start_pos
+    // row offset; short-sized panels silently corrupted pool neighbors — 16-31 logits off on
+    // the qd != dim families, allocation-order-lucky zero on llama). Tolerance, not tokens:
+    // near-tie greedy picks legitimately flip under GPU reduction-order noise.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        let c = tr.config
+        let vocab = c.vocab_size
+        let full <- encode(tr, "The old lighthouse keeper watched the storm roll in from the", true, false)
+        let n = int64(length(full))
+        var head : array<int64>
+        var tail : array<int64>
+        head |> reserve(int(n - 2l))
+        for (i in range64(n - 2l)) {
+            head |> push(full[i])
+        }
+        tail |> push(full[n - 2l])
+        tail |> push(full[n - 1l])
+        var served = 0l
+        var d = 0.0
+        with_job_que() {
+            setup_dasllama_jobque()
+            var sc = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            eval_(tr, sc, full)
+            var sb = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            eval_(tr, sb, head)
+            let pf0 = metal_prefill_stats().prefills
+            select_prefill_override("metal")
+            set_metal_prefill_min_npos(1l)
+            eval_(tr, sb, tail)
+            set_metal_prefill_min_npos(64l)
+            select_prefill_override("")
+            served = metal_prefill_stats().prefills - pf0
+            for (i in range64(vocab)) {
+                d = max(d, abs(sb.logits[i] - sc.logits[i]))
+            }
+            delete sb
+            delete sc
+        }
+        t |> success(served > 0l, "{tag}: continuation prefill ENGAGED ({served} served)")
+        t |> success(d < tol, "{tag}: continuation-prefill logits within {tol} of CPU (measured {d})")
+        delete head
+        delete tail
+    }
+}
+
+[unused_argument(t, path, family, tag, expect_needs, want, kv2, cont_tol)]   // off-Apple the gated body is empty
 def private family_cells(t : T?; path, family, tag : string; expect_needs : MetalNeed; want : string;
-                         kv2 : KVDtype = KVDtype.f16) {
+                         kv2 : KVDtype = KVDtype.f16; cont_tol : float = 0.0) {
     // one family's row: pin the metal_needs derivation bits, then the three path cells — each
     // asserts ENGAGE ("") or DECLINE with the named need_* reason. Wave stages flip these.
     // An ENGAGE row ("" cells) ALSO proves token parity: a metal-overrides generate must equal
-    // the CPU truth. kv2 != f16 adds a second cell row on that KV codec (its rope-store twin).
+    // the CPU truth. kv2 != f16 adds a second cell row on that KV codec (its rope-store twin);
+    // cont_tol > 0 adds the continuation-prefill numeric cell (cont_logits_cell).
     static_if (typeinfo builtin_module_exists(das_metal)) {
         if (!family_on(t, family) || !arm_on(t, "fam-{family}") || !model_available(t, path)) {
             return
@@ -534,6 +584,9 @@ def private family_cells(t : T?; path, family, tag : string; expect_needs : Meta
                 "{tag}: metal-overrides generate matches the CPU truth token-for-token")
             delete cpu_ids
             delete gpu_ids
+        }
+        if (want == "" && cont_tol > 0.0) {
+            cont_logits_cell(t, tr, tag, cont_tol)
         }
         delete tr
     }
@@ -592,10 +645,17 @@ def private gemma2_window_row(t : T?; path : string) {
 
 [unused_argument(t, path)]   // off-Apple the gated body is empty
 def private gemma4_hetero_row(t : T?; path : string) {
-    // the stage-3 heterogeneous row: needs-derivation pin, per-path cells (decode ENGAGE,
-    // batch/prefill DECLINE need_v_norm), and a decode-only token-parity generate (CPU prefill
-    // feeds the GPU decode — the per-class geometry, V-from-K, v_norm, out_scale, dual-theta
-    // p-RoPE and the suppress+softcap gpu-logits tail all sit on the proven path)
+    // the stage-3 heterogeneous row: needs-derivation pin, per-path cells (prefill + decode
+    // ENGAGE, batch DECLINES need_v_norm until 3d), a FREEFORM decode-only token-parity
+    // generate, a counting both-paths generate, and the continuation-prefill numeric cell —
+    // the per-class geometry, V-from-K, v_norm, out_scale, dual-theta p-RoPE and the
+    // suppress+softcap gpu-logits tail all sit on the proven paths. The both-paths generate is
+    // COUNTING on purpose: gemma4's 48-layer big-magnitude stack amplifies GPU reduction-order
+    // noise to ~1-5 logits (CPU truth is thread-count-stable; the proven decode driver shows
+    // the same scale), so a freeform first token can sit on a sub-noise near-tie and flip
+    // without any driver bug — counting margins dwarf the noise, and real corruption (the
+    // 16-31-logit panel-overrun class) still breaks it. The decode-only freeform arm stays:
+    // regression-proven stable over 24 tokens on this prompt.
     static_if (typeinfo builtin_module_exists(das_metal)) {
         if (!family_on(t, "gemma4") || !arm_on(t, "fam-gemma4") || !model_available(t, path)) {
             return
@@ -608,27 +668,51 @@ def private gemma4_hetero_row(t : T?; path : string) {
             MetalNeed.qd_neq_dim)
         t |> success((uint(derived) & uint(want_bits)) == uint(want_bits),
             "gemma4-12b/k4: metal_needs derives {want_bits} (got {derived})")
-        matrix_cell(t, tr, KVDtype.f16, "gemma4-12b/k4/f16", "need_v_norm", "", "need_v_norm")
-        let prompt <- encode(tr, counting_prompt(1, 30), true, false)
+        matrix_cell(t, tr, KVDtype.f16, "gemma4-12b/k4/f16", "", "", "need_v_norm")
+        let prompt <- encode(tr, "The old lighthouse keeper watched the storm roll in from the", true, false)
+        let count_prompt <- encode(tr, counting_prompt(1, 30), true, false)
         var cpu_ids : array<int64>
         var gpu_ids : array<int64>
+        var cpu_cnt_ids : array<int64>
+        var both_ids : array<int64>
+        var served_pf = 0l
         with_job_que() {
             setup_dasllama_jobque()
             var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
-            let ids <- generate(tr, s, prompt, length(prompt) + 8)
+            let ids <- generate(tr, s, prompt, length(prompt) + 24)
             cpu_ids := ids
             delete s
+            var sc = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let idsc <- generate(tr, sc, count_prompt, length(count_prompt) + 8)
+            cpu_cnt_ids := idsc
+            delete sc
             select_decode_override("metal")
             var s2 = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
-            let ids2 <- generate(tr, s2, prompt, length(prompt) + 8)
+            let ids2 <- generate(tr, s2, prompt, length(prompt) + 24)
             gpu_ids := ids2
             delete s2
+            let pf0 = metal_prefill_stats().prefills
+            select_prefill_override("metal")
+            set_metal_prefill_min_npos(1l)
+            var s3 = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids3 <- generate(tr, s3, count_prompt, length(count_prompt) + 8)
+            both_ids := ids3
+            delete s3
+            set_metal_prefill_min_npos(64l)
+            select_prefill_override("")
             select_decode_override("")
+            served_pf = metal_prefill_stats().prefills - pf0
         }
         t |> success(same(cpu_ids, gpu_ids),
             "gemma4-12b/k4: metal-decode generate matches the CPU truth token-for-token")
+        t |> success(served_pf > 0l, "gemma4-12b/k4: the hetero prefill ENGAGED ({served_pf} served)")
+        t |> success(same(cpu_cnt_ids, both_ids),
+            "gemma4-12b/k4: metal prefill+decode generate matches the CPU truth token-for-token")
+        cont_logits_cell(t, tr, "gemma4-12b/k4", 8.0)
         delete cpu_ids
         delete gpu_ids
+        delete cpu_cnt_ids
+        delete both_ids
         delete tr
     }
 }
@@ -659,7 +743,7 @@ def test_metal_family_matrix(t : T?) {
             // wave A norm prepass; the tq4 row proves the tq4 rope-store's NEOX partner (pow2 hs)
             family_cells(t, path_join(models_dir(), "Qwen3-0.6B-Q8_0.gguf"), "qwen3",
                 "qwen3-0.6b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim,
-                "", KVDtype.tq4)
+                "", KVDtype.tq4, 4.0)
             // the wave's showcase model: k4/k6 mixed sites x qk_norm x qd != dim at 4B scale
             family_cells(t, path_join(models_dir(), "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"), "qwen3",
                 "qwen3-4b/k4/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim,
@@ -694,7 +778,7 @@ def test_metal_family_matrix(t : T?) {
             family_cells(t, path_join(models_dir(), "gemma-2-2b-it-Q4_K_M.gguf"), "gemma2",
                 "gemma2-2b/k4/f16", MetalNeed.neox | MetalNeed.softcap | MetalNeed.sliding |
                     MetalNeed.pre_post_norm | MetalNeed.geglu,
-                "", KVDtype.q8_0)
+                "", KVDtype.q8_0, 4.0)
             set_wscale_f16(true)
             family_cells(t, path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf"), "gemma2",
                 "gemma2-2b/q8/s16", MetalNeed.neox | MetalNeed.softcap | MetalNeed.sliding |
@@ -715,7 +799,7 @@ def test_metal_family_matrix(t : T?) {
             family_cells(t, path_join(models_dir(), "gemma-3-1b-it-Q8_0.gguf"), "gemma3",
                 "gemma3-1b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding |
                     MetalNeed.pre_post_norm | MetalNeed.geglu | MetalNeed.qd_neq_dim,
-                "", KVDtype.q8_0)
+                "", KVDtype.q8_0, 4.0)
             family_cells(t, path_join(models_dir(), "gemma-3-4b-it-Q8_0.gguf"), "gemma3",
                 "gemma3-4b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding |
                     MetalNeed.pre_post_norm | MetalNeed.geglu | MetalNeed.qd_neq_dim,
@@ -723,7 +807,7 @@ def test_metal_family_matrix(t : T?) {
             // gemma4-12B (stage 3): the heterogeneous line — two attention classes (sliding
             // 16q/8kv/256, global 16q/1kv/512 MQA), V-from-K on global layers, v_norm,
             // out_scale on the whole layer output, unit attn scale, final softcap + suppress.
-            // SINGLE decode serves; batch + prefill decline need_v_norm until stages 3c/3d.
+            // Single decode + prefill serve; batch declines need_v_norm until stage 3d.
             // 7.4GB > the 6GiB tier — runs under DASLLAMA_PARITY_FULL=1 (like the 8B rows).
             gemma4_hetero_row(t, path_join(models_dir(), "gemma-4-12B-it-Q4_K_M.gguf"))
             metal_decode_shutdown()

@@ -443,6 +443,20 @@ def test_metal_prefill_kernels(t : T?) {
                 unsafe {
                     delete addbufs
                 }
+                // flat copy (the gemma4 V-from-K panel copy): y = x, bit-exact
+                var pso_cp = pipeline_from_source(dev, metal_pf_copy_msl, metal_pf_copy_msl_entry, metal_pf_copy_msl_fastmath, err)
+                t |> success(pso_cp != null, "pf_copy pipeline: {err}")
+                var bcp = buf_upload(dev, su)   // pre-filled — fully overwritten by the copy
+                var cpbufs <- [bcp, bsg, btot]
+                let cpran = run_compute_1d(queue, pso_cp, cpbufs, uint(total), 64u, err)
+                t |> success(cpran, "pf_copy dispatch: {err}")
+                t |> equal(buf_mismatch_exact(bcp, add_want), 0)
+                cpbufs |> clear()
+                unsafe {
+                    delete cpbufs
+                }
+                metal_release(bcp)
+                metal_release(pso_cp)
                 metal_release(bsg)
                 metal_release(bsu)
                 metal_release(btot)

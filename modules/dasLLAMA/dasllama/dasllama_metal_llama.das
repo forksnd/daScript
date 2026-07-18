@@ -546,7 +546,10 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     enc_copy_row(enc, r.bqkv, uint64(qd * 4l), r.bqkv, u_kvd_l, kv_dim, uint64((qd + kv_dim) * 4l))
                 }
                 if (c.v_norm) {
-                    var bones = upload_region(addr < void? >(t.fblob[t.rms_ones_off]), uint64(head_size * 4l))
+                    // MAX-width upload: the region cache is address-keyed, and gemma4's two
+                    // classes read this one plane at different widths — a per-layer-width first
+                    // upload starved the hs-512 class (Metal OOB tail reads are ZEROS, halving V)
+                    var bones = upload_region(addr < void? >(t.fblob[t.rms_ones_off]), uint64(max_head_size(c) * 4l))
                     enc_qk_norm(enc, r.bqkv, bones, r.u_zero32, het ? r.u_voffe_sw : r.u_voffe,
                         u_qkvd_l, u_hs_l, r.u_zero32, r.u_eps, kv_dim / head_size, 1l, head_size)
                 }

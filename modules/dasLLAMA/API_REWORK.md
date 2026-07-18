@@ -378,6 +378,10 @@ what it costs today and what the fix would change.
   single-decode + prefill past the window; the batch part/comb twins share the masked-kernel
   code but no batch test drives depth > window. Add one when a batch harness with deep
   per-row contexts exists.
+  (6) *Prefill V-from-K is two dispatches* (stage 3c, 2026-07-18) — the no-wv layers run a flat
+  panel copy (MetalPfCopy) then the ones-plane MetalQkNorm in place (+2 dispatches on gemma4's
+  8 global layers). Fix: a read-K-write-V weightless-RMS variant (the CPU fuses the copy into
+  rms_batch). Suppress adds one tiny classifier-tail dispatch — not worth fusing.
 
 - **Embeddings path (spotted building `/v1/embeddings`, 2026-07-06).** Two small items, neither
   chased: (1) `embed_forward` takes approach A — reuse `forward_prefill` then re-norm every
