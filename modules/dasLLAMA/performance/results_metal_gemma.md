@@ -24,7 +24,9 @@ Greedy B=1 rows include the spec chain + the GPU embed-scale gather (every gemma
 spec-capable since the escale uniform landed). gemma4 rows measured 2026-07-18 AFTER the
 batch V-copy/v_norm race fix + the hetero mul_mv un-gate (80fab16b6); small-model batch
 rows are 2026-07-17 (that code is untouched by both fixes), their greedy B=1 rows
-re-measured post-embed-scale.
+re-measured post-embed-scale. gemma4 K-quant B=8 rows re-measured 2026-07-18 with the
+single-pass kq b8 twins (`DASLLAMA_METAL_KQ_B8`, cd88fd1ea; metal-mode rail — GPU prefill;
+decode cells are prefill-method-independent).
 
 ### gemma2-2b Q4_K_M (native kq planes)
 
@@ -95,7 +97,7 @@ B=2/4/16 red (-4..-5%) rides the same per-step tail at small B.
 | tg128 B=1 | 32.7 | 29.0 | **1.13x** |
 | tg128 B=2 | 41.9 | 31.2 | **1.34x** |
 | tg128 B=4 | 49.0 | 51.2 | 0.96x |
-| tg128 B=8 | 52.3 | 53.5 | 0.98x |
+| tg128 B=8 | 57.1 | 53.5 | **1.07x** |
 | tg128 B=16 | 91.6 | 100.5 | 0.91x |
 
 The daily-driver headline: +13% single-stream greedy (the spec chain + GPU embed-scale
@@ -110,7 +112,7 @@ the batch loop runs per-class uniform twins every layer.
 | tg128 B=1 | 23.3 | 22.5 | **1.04x** |
 | tg128 B=2 | 36.0 | 23.9 | **1.51x** |
 | tg128 B=4 | 45.9 | 48.3 | 0.95x |
-| tg128 B=8 | 48.6 | 49.7 | 0.98x |
+| tg128 B=8 | 53.8 | 49.7 | **1.08x** |
 | tg128 B=16 | 85.0 | 93.0 | 0.91x |
 
 B=2 1.51x is the board's widest win: lcpp's K-quant ext kernels only batch from B=4
@@ -124,7 +126,7 @@ B=2 1.51x is the board's widest win: lcpp's K-quant ext kernels only batch from 
 | tg128 B=1 | 22.4 | 27.7 | **0.81x RED** |
 | tg128 B=2 | 42.0 | 29.8 | **1.41x** |
 | tg128 B=4 | 46.1 | 49.6 | 0.93x |
-| tg128 B=8 | 48.5 | 50.6 | 0.96x |
+| tg128 B=8 | 56.3 | 50.6 | **1.11x** |
 | tg128 B=16 | 86.6 | 98.4 | 0.88x |
 
 The B=1 red is greedy-specific and NEW information: the fixed-token sequential twin runs
@@ -154,10 +156,14 @@ kernels from B=2, highest bytes/weight), so this column's denominator is the har
 ## Reading the board
 
 Prefill 0.96-1.02x everywhere, and the gemma4-12B daily driver serves at +13% greedy
-single-stream (Q4) with B=2 wins of 1.34-1.51x across the K-quants. The remaining reds
-are structural and each has a named owner: the Q8 sequential/dispatch-tail class
-(gemma2-q8 0.89, gemma3-4b 0.91, gemma4-q8 0.81 — the ~4.6 ms/step elementwise tail;
-one combined deep-dive), the B>=5 GEMM tier without split-K under hetero (gemma4
-B=8/16, all formats mildly, Q8 hardest), the ALU-bound interim kq batch kernels
-(gemma4 K-quants B=4-8 at 0.93-0.98 — the fused-B kq rework is the biggest single
-lever), and the new Q6-greedy spec inversion (open item; spec-off recovers 0.95x).
+single-stream (Q4) with B=2 wins of 1.34-1.51x and B=8 wins of 1.07-1.11x across the
+K-quants (the single-pass kq b8 twins — ONE weight stream instead of two column-group
+passes; the kernel lab could not see this win at SLC-resident shapes, only the in-graph
+A/B could). The remaining reds are structural and each has a named owner: the Q8
+sequential/dispatch-tail class (gemma2-q8 0.89, gemma3-4b 0.91, gemma4-q8 0.81 — the
+~4.6 ms/step elementwise tail; one combined deep-dive), the B=16 GEMM tier without
+split-K under hetero (all formats, Q8 hardest — Q8 B=8 rides the same tier), the
+K-quant B=4 cells (0.93-0.96 — the round-3 kernel lab REFUTED further kq-GEMV headroom
+at B=4: issue-bound at the wall; the recoverable gap is the shared per-step overhead,
+the V-copy barrier + elementwise tail), and the Q6-greedy spec inversion (open item;
+spec-off recovers 0.95x).
