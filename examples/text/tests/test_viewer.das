@@ -30,9 +30,14 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         let ready = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             initial = viewer_state(app)
             return ((initial?["ok"] ?? false)
-                && (initial?["render_revision"] ?? 0) > 0)
+                && (initial?["render_revision"] ?? 0) > 0
+                && (initial?["window_docked"] ?? false)
+                && (initial?["window_dock_id"] ?? 0) != 0
+                && (initial?["window_dock_id"] ?? 0)
+                    == (initial?["dockspace_id"] ?? -1))
         }
-        t |> success(ready, "welcome Markdown reaches a rendered revision")
+        t |> success(ready,
+                     "welcome Markdown fills the central dockspace as an ordinary window")
         if (!ready) return
 
         let old_revision = initial?["document_revision"] ?? 0
@@ -50,7 +55,8 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         t |> success(file_observed, "loaded Markdown becomes the rendered document")
         if (!file_observed) return
 
-        click(app, "DOCK_ROOT/DOCUMENT_WINDOW/MODE_TOGGLE")
+        let plain_mode = post_command(app, "text_viewer_set_mode", JV((mode = "plain")))
+        t |> success(plain_mode?["ok"] ?? false, "mode command accepts plain text")
         let plain_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             var state = viewer_state(app)
             return ((state?["mode"] ?? "") == "plain"
@@ -116,6 +122,31 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         }
         t |> success(release_observed, "source selection release is acknowledged")
 
+        let input_snapshot = post_command(app, "imgui_snapshot", null)
+        let input_primary = (input_snapshot?["io"]?["config_macos_behaviors"] ?? false) ? "Super" : "Ctrl"
+        let copy_before = viewer_state(app)?["source_selection_copy_revision"] ?? 0
+        post_command(app, "imgui_key_chord", JV((mods = [input_primary], key = "C")))
+        t |> success(wait_for_key_idle(app, 4.0f), "platform-primary copy chord completes")
+        let copy_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return ((state?["source_selection_copy_revision"] ?? 0) > copy_before
+                && (state?["last_command"] ?? "") == "edit.copy")
+        }
+        t |> success(copy_observed,
+                     "copy binding routes through a semantic command into the source view")
+
+        post_command(app, "imgui_key_chord", JV((mods = [input_primary], key = "A")))
+        t |> success(wait_for_key_idle(app, 4.0f),
+                     "platform-primary select-all chord completes")
+        let select_all_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return ((state?["source_selection_start"] ?? -1) == 0
+                && (state?["source_selection_end"] ?? -1) == (state?["byte_count"] ?? -2)
+                && (state?["last_command"] ?? "") == "edit.select_all")
+        }
+        t |> success(select_all_observed,
+                     "select-all binding invokes the component API without embedded keyboard logic")
+
         let zoomed = post_command(app, "text_viewer_set_zoom", JV((percent = 137)))
         t |> equal(zoomed?["zoom_percent"] ?? 0, 135,
                    "zoom command snaps to a five-percent step")
@@ -124,7 +155,27 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
         }
         t |> success(zoom_observed, "snapped zoom reaches rendered app state")
 
-        click(app, "DOCK_ROOT/DOCUMENT_WINDOW/MODE_TOGGLE")
+        var before_reset = viewer_state(app)
+        let command_before = before_reset?["command_revision"] ?? 0
+        let zoom_snapshot = post_command(app, "imgui_snapshot", null)
+        let primary_mod = (zoom_snapshot?["io"]?["config_macos_behaviors"] ?? false) ? "Super" : "Ctrl"
+        post_command(app, "imgui_key_chord", JV((mods = [primary_mod], key = "0")))
+        t |> success(wait_for_key_idle(app, 4.0f),
+                     "platform-primary reset chord completes")
+        let reset_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return ((state?["zoom_percent"] ?? 0) == 100
+                && (state?["last_command"] ?? "") == "view.zoom_reset"
+                && (state?["command_revision"] ?? 0) > command_before)
+        }
+        t |> success(reset_observed,
+                     "keyboard binding invokes the semantic zoom-reset command")
+        let rezoomed = post_command(app, "text_viewer_set_zoom", JV((percent = 135)))
+        t |> equal(rezoomed?["zoom_percent"] ?? 0, 135,
+                   "zoom is restored before testing new-document inheritance")
+
+        let markdown_mode = post_command(app, "text_viewer_set_mode", JV((mode = "markdown")))
+        t |> success(markdown_mode?["ok"] ?? false, "mode command accepts Markdown")
         let markdown_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             var state = viewer_state(app)
             return ((state?["mode"] ?? "") == "markdown"
@@ -138,11 +189,43 @@ def test_text_viewer_open_modes_and_zoom(t : T?) {
                      "another document opens inside the running viewer")
         t |> equal(opened_window?["document_count"] ?? 0, 2,
                    "in-process open adds a second dockable document")
+        t |> equal(opened_window?["zoom_percent"] ?? 0, 135,
+                   "new document inherits the active document zoom")
         let second_document_observed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
-            return (viewer_state(app)?["document_count"] ?? 0) == 2
+            var state = viewer_state(app)
+            return ((state?["document_count"] ?? 0) == 2
+                && (state?["zoom_percent"] ?? 0) == 135)
         }
         t |> success(second_document_observed,
-                     "the viewer retains both documents without spawning another app")
+                     "the viewer retains both documents at inherited zoom")
+
+        let bindings_queued = post_command(app, "text_viewer_command",
+                                           JV((id = "preferences.edit_bindings")))
+        t |> success(bindings_queued?["ok"] ?? false,
+                     "live API invokes the same semantic command surface")
+        let bindings_open = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return ((state?["bindings_editor_open"] ?? false)
+                && (state?["last_command"] ?? "") == "preferences.edit_bindings")
+        }
+        t |> success(bindings_open,
+                     "edit-bindings command opens its UI window")
+
+        close_widget(app, "DOCK_ROOT/g_document_windows[2]")
+        let one_document_left = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            return (viewer_state(app)?["document_count"] ?? -1) == 1
+        }
+        t |> success(one_document_left,
+                     "new document uses the ordinary closable window lifecycle")
+
+        close_widget(app, "DOCK_ROOT/g_document_windows[1]")
+        let all_documents_closed = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
+            var state = viewer_state(app)
+            return (!(state?["ok"] ?? true)
+                && (state?["document_count"] ?? -1) == 0)
+        }
+        t |> success(all_documents_closed,
+                     "closing the initial document leaves an empty dockspace")
     }
 }
 

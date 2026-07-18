@@ -7,6 +7,7 @@ require imgui/imgui_harness
 require imgui/imgui_file_dialog
 require imgui/imgui_fonts
 require imgui/imgui_icons
+require imgui/imgui_commands
 require imgui/imgui_markdown_view
 require imgui/imgui_document_model
 require imgui/imgui_text_source_view
@@ -63,6 +64,10 @@ struct TextViewerCheckboxArgs {
     index : int = 0
 }
 
+struct TextViewerCommandArgs {
+    id : string
+}
+
 struct TextViewerDocument {
     id : int
     pending_dock : bool = true
@@ -96,6 +101,30 @@ var private g_plain_clicks = 0
 var private g_save_clicks = 0
 var private g_save_as_clicks = 0
 var private g_file_dialog_action = ViewerFileDialogAction.none
+var private g_commands = CommandRegistry()
+var private g_bindings_editor = CommandBindingsEditorState()
+var private g_last_command : string
+var private g_command_revision = 0
+var private g_edit_copy_clicks = 0
+var private g_edit_select_all_clicks = 0
+var private g_edit_clear_clicks = 0
+var private g_edit_bindings_clicks = 0
+
+let CMD_FILE_OPEN = "file.open"
+let CMD_FILE_SAVE = "file.save"
+let CMD_FILE_SAVE_AS = "file.save_as"
+let CMD_FILE_RELOAD = "file.reload"
+let CMD_APP_QUIT = "app.quit"
+let CMD_VIEW_MARKDOWN = "view.markdown"
+let CMD_VIEW_PLAIN = "view.plain"
+let CMD_VIEW_TOGGLE = "view.toggle_source"
+let CMD_VIEW_ZOOM_IN = "view.zoom_in"
+let CMD_VIEW_ZOOM_OUT = "view.zoom_out"
+let CMD_VIEW_ZOOM_RESET = "view.zoom_reset"
+let CMD_EDIT_COPY = "edit.copy"
+let CMD_EDIT_SELECT_ALL = "edit.select_all"
+let CMD_EDIT_CLEAR_SELECTION = "edit.clear_selection"
+let CMD_EDIT_BINDINGS = "preferences.edit_bindings"
 
 def private mode_name(doc : TextViewerDocument const) : string {
     return doc.mode == TextViewMode.markdown ? "markdown" : "plain"
@@ -274,8 +303,11 @@ Open a UTF-8 file from **File / Open...**, or pass its path on the command line.
 
 def private add_document(path : string; mode_override : int = -1;
                          welcome_on_failure : bool = false) : bool {
+    let active = active_document_index()
+    let inherited_zoom_step = active >= 0 ? g_documents[active].zoom_step : 20
     var viewer = TextViewerDocument(id = g_next_document_id,
-                                    mode_override = mode_override)
+                                    mode_override = mode_override,
+                                    zoom_step = inherited_zoom_step)
     g_next_document_id++
     if (empty(path)) {
         install_welcome_document(viewer)
@@ -342,7 +374,6 @@ def private setup_default_layout(dock_id : uint) {
     DockBuilderAddDockSpaceNode(dock_id, ImGuiDockNodeFlags.None)
     let viewport = GetMainViewport()
     DockBuilderSetNodeSize(dock_id, viewport.Size)
-    DockBuilderDockWindow("Document", dock_id)
     DockBuilderFinish(dock_id)
 }
 
@@ -359,21 +390,192 @@ def private parse_command_line() {
     }
 }
 
+def private define_commands() {
+    g_commands.config_path = command_default_config_path("text-viewer")
+    command_define(g_commands, CommandDefinition(
+        id = CMD_FILE_OPEN, title = "Open...", category = "File",
+        description = "Open a file in a new docked document."),
+        command_binding(CMD_FILE_OPEN, ImGuiKey.O, primary = true))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_FILE_SAVE, title = "Save", category = "File"),
+        command_binding(CMD_FILE_SAVE, ImGuiKey.S, primary = true))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_FILE_SAVE_AS, title = "Save As...", category = "File"),
+        command_binding(CMD_FILE_SAVE_AS, ImGuiKey.S, primary = true, shift = true))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_FILE_RELOAD, title = "Reload", category = "File",
+        scope = CommandScope.document),
+        command_binding(CMD_FILE_RELOAD, ImGuiKey.R, primary = true,
+                        scope = CommandScope.document))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_APP_QUIT, title = "Quit", category = "Application"),
+        command_binding(CMD_APP_QUIT, ImGuiKey.Q, primary = true))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_VIEW_MARKDOWN, title = "Markdown", category = "View",
+        scope = CommandScope.document))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_VIEW_PLAIN, title = "Plain text", category = "View",
+        scope = CommandScope.document))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_VIEW_TOGGLE, title = "Toggle rendered/source", category = "View",
+        scope = CommandScope.document))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_VIEW_ZOOM_IN, title = "Zoom In", category = "View",
+        scope = CommandScope.document),
+        command_binding(CMD_VIEW_ZOOM_IN, ImGuiKey.Equal, primary = true,
+                        scope = CommandScope.document, repeat = true))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_VIEW_ZOOM_OUT, title = "Zoom Out", category = "View",
+        scope = CommandScope.document),
+        command_binding(CMD_VIEW_ZOOM_OUT, ImGuiKey.Minus, primary = true,
+                        scope = CommandScope.document, repeat = true))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_VIEW_ZOOM_RESET, title = "Reset Zoom", category = "View",
+        scope = CommandScope.document),
+        command_binding(CMD_VIEW_ZOOM_RESET,
+                        unsafe(reinterpret<ImGuiKey>(int(ImGuiKey.A) - 10)), primary = true,
+                        scope = CommandScope.document))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_EDIT_COPY, title = "Copy", category = "Edit",
+        scope = CommandScope.component),
+        command_binding(CMD_EDIT_COPY, ImGuiKey.C, primary = true,
+                        scope = CommandScope.component))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_EDIT_SELECT_ALL, title = "Select All", category = "Edit",
+        scope = CommandScope.component),
+        command_binding(CMD_EDIT_SELECT_ALL, ImGuiKey.A, primary = true,
+                        scope = CommandScope.component))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_EDIT_CLEAR_SELECTION, title = "Clear Selection", category = "Edit",
+        scope = CommandScope.component))
+    command_define(g_commands, CommandDefinition(
+        id = CMD_EDIT_BINDINGS, title = "Edit Bindings...", category = "Preferences"))
+    if (!harness_is_headless() && fexist(g_commands.config_path)) {
+        let _ = command_load_bindings(g_commands)
+    }
+}
+
+def private document_has_selection(doc : TextViewerDocument const) : bool {
+    if (doc.mode == TextViewMode.markdown) {
+        return (doc.markdown_view.selection_anchor.valid
+            && doc.markdown_view.selection_focus.valid
+            && doc.markdown_view.selection_anchor.source_byte != doc.markdown_view.selection_focus.source_byte)
+    }
+    let selection = text_source_view_selection(doc.source_view)
+    return selection.start_byte >= 0 && selection.end_byte > selection.start_byte
+}
+
+def private update_command_state() {
+    let active = active_document_index()
+    let has_active = active >= 0
+    let has_path = has_active && !empty(g_documents[active].source.path)
+    let has_selection = has_active && document_has_selection(g_documents[active])
+    command_set_enabled(g_commands, CMD_FILE_SAVE, has_active)
+    command_set_enabled(g_commands, CMD_FILE_SAVE_AS, has_active)
+    command_set_enabled(g_commands, CMD_FILE_RELOAD, has_path)
+    command_set_enabled(g_commands, CMD_VIEW_MARKDOWN, has_active)
+    command_set_enabled(g_commands, CMD_VIEW_PLAIN, has_active)
+    command_set_enabled(g_commands, CMD_VIEW_TOGGLE, has_active)
+    command_set_enabled(g_commands, CMD_VIEW_ZOOM_IN, has_active)
+    command_set_enabled(g_commands, CMD_VIEW_ZOOM_OUT, has_active)
+    command_set_enabled(g_commands, CMD_VIEW_ZOOM_RESET, has_active)
+    command_set_enabled(g_commands, CMD_EDIT_COPY, has_selection)
+    command_set_enabled(g_commands, CMD_EDIT_SELECT_ALL, has_active)
+    command_set_enabled(g_commands, CMD_EDIT_CLEAR_SELECTION, has_selection)
+    command_set_selected(g_commands, CMD_VIEW_MARKDOWN,
+        has_active && g_documents[active].mode == TextViewMode.markdown)
+    command_set_selected(g_commands, CMD_VIEW_PLAIN,
+        has_active && g_documents[active].mode == TextViewMode.plain_text)
+}
+
+def private dispatch_commands() {
+    var invocation = CommandInvocation()
+    while (command_take(g_commands, invocation)) {
+        g_last_command := invocation.command_id
+        g_command_revision++
+        let active = active_document_index()
+        if (invocation.command_id == CMD_FILE_OPEN) {
+            open_file_dialog()
+        } elif (invocation.command_id == CMD_FILE_SAVE) {
+            let _ = save_active_document()
+        } elif (invocation.command_id == CMD_FILE_SAVE_AS) {
+            let _ = save_active_document(true)
+        } elif (invocation.command_id == CMD_FILE_RELOAD && active >= 0
+                && !empty(g_documents[active].source.path)) {
+            let path = g_documents[active].source.path
+            let _ = load_path(g_documents[active], path)
+        } elif (invocation.command_id == CMD_APP_QUIT) {
+            request_exit()
+        } elif (invocation.command_id == CMD_VIEW_MARKDOWN && active >= 0) {
+            set_mode(g_documents[active], TextViewMode.markdown)
+        } elif (invocation.command_id == CMD_VIEW_PLAIN && active >= 0) {
+            set_mode(g_documents[active], TextViewMode.plain_text)
+        } elif (invocation.command_id == CMD_VIEW_TOGGLE && active >= 0) {
+            set_mode(g_documents[active], g_documents[active].mode == TextViewMode.markdown
+                ? TextViewMode.plain_text : TextViewMode.markdown)
+        } elif (invocation.command_id == CMD_VIEW_ZOOM_IN && active >= 0) {
+            g_documents[active].zoom_step = min(g_documents[active].zoom_step + 1, 60)
+        } elif (invocation.command_id == CMD_VIEW_ZOOM_OUT && active >= 0) {
+            g_documents[active].zoom_step = max(g_documents[active].zoom_step - 1, 10)
+        } elif (invocation.command_id == CMD_VIEW_ZOOM_RESET && active >= 0) {
+            set_zoom_percent(g_documents[active], 100)
+        } elif (invocation.command_id == CMD_EDIT_COPY && active >= 0) {
+            if (g_documents[active].mode == TextViewMode.markdown) {
+                markdown_view_request_copy(g_documents[active].markdown_view)
+            } else {
+                text_source_view_request_copy(g_documents[active].source_view)
+            }
+        } elif (invocation.command_id == CMD_EDIT_SELECT_ALL && active >= 0) {
+            if (g_documents[active].mode == TextViewMode.markdown) {
+                let _ = markdown_view_select_all(g_documents[active].markdown_view)
+            } else {
+                text_source_view_select_all(g_documents[active].source_document,
+                                            g_documents[active].source_view)
+            }
+        } elif (invocation.command_id == CMD_EDIT_CLEAR_SELECTION && active >= 0) {
+            if (g_documents[active].mode == TextViewMode.markdown) {
+                markdown_view_clear_selection(g_documents[active].markdown_view)
+            } else {
+                text_source_view_clear_selection(g_documents[active].source_view)
+            }
+        } elif (invocation.command_id == CMD_EDIT_BINDINGS) {
+            g_bindings_editor.open = true
+        }
+    }
+}
+
 def private draw_menu_bar() {
     let active = active_document_index()
     let has_active = active >= 0
     main_menu_bar(MAIN_MENU) {
         menu(FILE_MENU, (text = "File", enabled = true)) {
-            menu_label(FILE_OPEN, (text = "Open...", shortcut = "Ctrl+O"))
-            menu_label(FILE_SAVE, (text = "Save", shortcut = "Ctrl+S",
+            menu_label(FILE_OPEN, (text = "Open...",
+                                   shortcut = command_shortcut_text(g_commands, CMD_FILE_OPEN)))
+            menu_label(FILE_SAVE, (text = "Save",
+                                   shortcut = command_shortcut_text(g_commands, CMD_FILE_SAVE),
                                    enabled = has_active))
-            menu_label(FILE_SAVE_AS, (text = "Save As...", shortcut = "Ctrl+Shift+S",
+            menu_label(FILE_SAVE_AS, (text = "Save As...",
+                                      shortcut = command_shortcut_text(g_commands, CMD_FILE_SAVE_AS),
                                       enabled = has_active))
-            menu_label(FILE_RELOAD, (text = "Reload", shortcut = "Ctrl+R",
+            menu_label(FILE_RELOAD, (text = "Reload",
+                                     shortcut = command_shortcut_text(g_commands, CMD_FILE_RELOAD),
                                      enabled = has_active
                                          && !empty(g_documents[active].source.path)))
             separator(FILE_SEPARATOR)
-            menu_label(FILE_QUIT, (text = "Quit", shortcut = "Ctrl+Q"))
+            menu_label(FILE_QUIT, (text = "Quit",
+                                   shortcut = command_shortcut_text(g_commands, CMD_APP_QUIT)))
+        }
+        menu(EDIT_MENU, (text = "Edit", enabled = true)) {
+            menu_label(EDIT_COPY, (text = "Copy",
+                shortcut = command_shortcut_text(g_commands, CMD_EDIT_COPY),
+                enabled = command_enabled(g_commands, CMD_EDIT_COPY)))
+            menu_label(EDIT_SELECT_ALL, (text = "Select All",
+                shortcut = command_shortcut_text(g_commands, CMD_EDIT_SELECT_ALL),
+                enabled = has_active))
+            menu_label(EDIT_CLEAR_SELECTION, (text = "Clear Selection", shortcut = "",
+                enabled = command_enabled(g_commands, CMD_EDIT_CLEAR_SELECTION)))
+            separator(EDIT_SEPARATOR)
+            menu_label(EDIT_BINDINGS, (text = "Edit Bindings...", shortcut = ""))
         }
         menu(VIEW_MENU, (text = "View", enabled = true)) {
             menu_label(VIEW_MARKDOWN, (text = "Markdown", shortcut = "",
@@ -397,18 +599,15 @@ def private draw_menu_bar() {
     }
     if (FILE_SAVE.click_count > g_save_clicks) {
         g_save_clicks = FILE_SAVE.click_count
-        let _ = save_active_document()
+        let _ = command_invoke(g_commands, CMD_FILE_SAVE, CommandSource.menu)
     }
     if (FILE_SAVE_AS.click_count > g_save_as_clicks) {
         g_save_as_clicks = FILE_SAVE_AS.click_count
-        let _ = save_active_document(true)
+        let _ = command_invoke(g_commands, CMD_FILE_SAVE_AS, CommandSource.menu)
     }
     if (FILE_RELOAD.click_count > g_reload_clicks) {
         g_reload_clicks = FILE_RELOAD.click_count
-        if (has_active && !empty(g_documents[active].source.path)) {
-            let path = g_documents[active].source.path
-            let _ = load_path(g_documents[active], path)
-        }
+        let _ = command_invoke(g_commands, CMD_FILE_RELOAD, CommandSource.menu)
     }
     if (FILE_QUIT.click_count > g_quit_clicks) {
         g_quit_clicks = FILE_QUIT.click_count
@@ -416,11 +615,27 @@ def private draw_menu_bar() {
     }
     if (VIEW_MARKDOWN.click_count > g_markdown_clicks) {
         g_markdown_clicks = VIEW_MARKDOWN.click_count
-        if (has_active) set_mode(g_documents[active], TextViewMode.markdown)
+        let _ = command_invoke(g_commands, CMD_VIEW_MARKDOWN, CommandSource.menu)
     }
     if (VIEW_PLAIN.click_count > g_plain_clicks) {
         g_plain_clicks = VIEW_PLAIN.click_count
-        if (has_active) set_mode(g_documents[active], TextViewMode.plain_text)
+        let _ = command_invoke(g_commands, CMD_VIEW_PLAIN, CommandSource.menu)
+    }
+    if (EDIT_COPY.click_count > g_edit_copy_clicks) {
+        g_edit_copy_clicks = EDIT_COPY.click_count
+        let _ = command_invoke(g_commands, CMD_EDIT_COPY, CommandSource.menu)
+    }
+    if (EDIT_SELECT_ALL.click_count > g_edit_select_all_clicks) {
+        g_edit_select_all_clicks = EDIT_SELECT_ALL.click_count
+        let _ = command_invoke(g_commands, CMD_EDIT_SELECT_ALL, CommandSource.menu)
+    }
+    if (EDIT_CLEAR_SELECTION.click_count > g_edit_clear_clicks) {
+        g_edit_clear_clicks = EDIT_CLEAR_SELECTION.click_count
+        let _ = command_invoke(g_commands, CMD_EDIT_CLEAR_SELECTION, CommandSource.menu)
+    }
+    if (EDIT_BINDINGS.click_count > g_edit_bindings_clicks) {
+        g_edit_bindings_clicks = EDIT_BINDINGS.click_count
+        let _ = command_invoke(g_commands, CMD_EDIT_BINDINGS, CommandSource.menu)
     }
 }
 
@@ -458,7 +673,8 @@ def private draw_document(var doc : TextViewerDocument) {
             (glyph = rendered ? "edit" : "visible",
              tip = rendered ? "Show Markdown source" : "Render Markdown",
              size = 18.0f, weight = 1.0f))) {
-        set_mode(doc, rendered ? TextViewMode.plain_text : TextViewMode.markdown)
+        let _ = command_invoke(g_commands, CMD_VIEW_TOGGLE,
+                               CommandSource.toolbar, "{doc.id}")
     }
     same_line()
     text_disabled(MODE_LABEL,
@@ -480,55 +696,32 @@ def private draw_document(var doc : TextViewerDocument) {
     text_disabled(ZOOM_VALUE, (text = "{zoom_percent(doc)}%"))
     same_line()
     if (small_button(ZOOM_RESET, (text = "100%"))) {
-        set_zoom_percent(doc, 100)
+        let _ = command_invoke(g_commands, CMD_VIEW_ZOOM_RESET,
+                               CommandSource.toolbar, "{doc.id}")
     }
 }
 
 def private handle_global_shortcuts() {
-    let io & = unsafe(GetIO())
-    let command_down = io.ConfigMacOSXBehaviors ? io.KeySuper : io.KeyCtrl
-    if (command_down && IsKeyPressed(ImGuiKey.O, false)) {
-        open_file_dialog()
-    }
-    if (command_down && IsKeyPressed(ImGuiKey.S, false)) {
-        let _ = save_active_document(io.KeyShift)
-    }
-    if (command_down && IsKeyPressed(ImGuiKey.Q, false)) {
-        request_exit()
-    }
+    command_poll_scope(g_commands, CommandScope.application)
 }
 
 def private handle_document_shortcuts(var doc : TextViewerDocument) {
     let io & = unsafe(GetIO())
+    command_poll_scope(g_commands, CommandScope.document, "{doc.id}")
+    command_poll_scope(g_commands, CommandScope.component, "{doc.id}")
     let command_down = io.ConfigMacOSXBehaviors ? io.KeySuper : io.KeyCtrl
-    if (IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows)
-        && command_down && IsKeyPressed(ImGuiKey.R, false)
-        && !empty(doc.source.path)) {
-        let path = doc.source.path
-        let _ = load_path(doc, path)
-    }
     if (IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows) && command_down) {
         if (io.MouseWheel > 0.0f) {
-            doc.zoom_step = min(doc.zoom_step + 1, 60)
+            let _ = command_invoke(g_commands, CMD_VIEW_ZOOM_IN,
+                                   CommandSource.programmatic, "{doc.id}")
         } elif (io.MouseWheel < 0.0f) {
-            doc.zoom_step = max(doc.zoom_step - 1, 10)
+            let _ = command_invoke(g_commands, CMD_VIEW_ZOOM_OUT,
+                                   CommandSource.programmatic, "{doc.id}")
         }
     }
 }
 
-def private draw_primary_document(var doc : TextViewerDocument) {
-    dock_window(DOCUMENT_WINDOW,
-                (text = "Document", closable = false,
-                 flags = ImGuiWindowFlags.NoCollapse)) {
-        if (IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows)) {
-            g_active_document_id = doc.id
-        }
-        handle_document_shortcuts(doc)
-        draw_document(doc)
-    }
-}
-
-def private draw_additional_document(var doc : TextViewerDocument; dock_id : uint) {
+def private draw_document_window(var doc : TextViewerDocument; dock_id : uint) {
     if (doc.pending_dock && dock_id != 0u) {
         unsafe {
             g_document_windows[doc.id].pending_dock_to = dock_id
@@ -536,7 +729,9 @@ def private draw_additional_document(var doc : TextViewerDocument; dock_id : uin
         doc.pending_dock = false
     }
     let visible_title = empty(doc.source.path) ? "Text viewer" : base_name(doc.source.path)
-    let title = "{visible_title}##text_document_{doc.id}"
+    // Triple-hash keeps the ImGui window identity stable when a welcome
+    // document is loaded from disk and its visible title becomes a filename.
+    let title = "{visible_title}###text_document_{doc.id}"
     dock_window(g_document_windows[doc.id],
                 (text = title, closable = true,
                  flags = ImGuiWindowFlags.NoCollapse)) {
@@ -549,8 +744,10 @@ def private draw_additional_document(var doc : TextViewerDocument; dock_id : uin
 }
 
 def private remove_closed_documents() {
-    var index = length(g_documents) - 1
-    while (index > 0) {
+    var remaining = length(g_documents)
+    while (remaining > 0) {
+        remaining--
+        let index = remaining
         let id = g_documents[index].id
         if (!g_document_windows[id].open) {
             let removed_active = g_documents[index].id == g_active_document_id
@@ -558,22 +755,27 @@ def private remove_closed_documents() {
             g_documents |> erase(index)
             g_document_windows |> erase(id)
             if (removed_active) {
-                g_active_document_id = g_documents[0].id
+                g_active_document_id = length(g_documents) > 0 ? g_documents[0].id : 0
             }
         }
-        index--
     }
 }
 
 [live_command(description = "Inspect the text viewer without a screenshot.")]
 def text_viewer_state(_input : JsonValue?) : JsonValue? {
     let active = active_document_index()
-    if (active < 0) return JV((ok = false, error = "no document is open"))
+    if (active < 0) return JV((ok = false, error = "no document is open",
+                               document_count = 0, active_document_id = 0))
     var doc & = unsafe(g_documents[active])
+    let window = g_document_windows[doc.id]
     return JV((
         ok = doc.document.ok,
         document_count = length(g_documents),
         active_document_id = doc.id,
+        window_open = window.open,
+        window_docked = window.docked,
+        window_dock_id = window.dock_id,
+        dockspace_id = DOCK_ROOT.dock_id,
         path = doc.source.path,
         byte_count = length(text_document_bytes(doc.source)),
         mode = mode_name(doc),
@@ -598,6 +800,13 @@ def text_viewer_state(_input : JsonValue?) : JsonValue? {
         source_selection_start = doc.source_result.selection.source.start_byte,
         source_selection_end = doc.source_result.selection.source.end_byte,
         source_selection_has_markers = doc.source_result.selection.styles.has_markers,
+        markdown_selection_copy_revision = doc.markdown_view.selection_copy_revision,
+        source_selection_copy_revision = doc.source_view.selection_copy_revision,
+        command_revision = g_command_revision,
+        last_command = g_last_command,
+        bindings_editor_open = g_bindings_editor.open,
+        bindings_config_path = g_commands.config_path,
+        bindings_revision = g_commands.revision,
         status = doc.status))
 }
 
@@ -681,6 +890,7 @@ def text_viewer_open_window(input : JsonValue?) : JsonValue? {
     return JV((ok = ok, document_count = length(g_documents),
                active_document_id = active >= 0 ? g_documents[active].id : 0,
                path = active >= 0 ? g_documents[active].source.path : "",
+               zoom_percent = active >= 0 ? zoom_percent(g_documents[active]) : 0,
                status = ok && active >= 0
                    ? g_documents[active].status : g_last_open_error))
 }
@@ -746,6 +956,33 @@ def text_viewer_set_zoom(input : JsonValue?) : JsonValue? {
     return JV((ok = true, zoom_percent = zoom_percent(g_documents[active])))
 }
 
+[live_command(description = "Invoke a semantic viewer command by stable ID.")]
+def text_viewer_command(input : JsonValue?) : JsonValue? {
+    let args = from_JV(input, type<TextViewerCommandArgs>)
+    let queued = command_invoke(g_commands, args.id, CommandSource.live_api)
+    return JV((ok = queued, id = args.id, command_revision = g_command_revision))
+}
+
+[live_command(description = "Inspect semantic commands and current bindings.")]
+def text_viewer_commands(_input : JsonValue?) : JsonValue? {
+    var definitions : array<JsonValue?>
+    for (definition in g_commands.definitions) {
+        definitions |> push(JV((
+            id = definition.id,
+            title = definition.title,
+            category = definition.category,
+            scope = int(definition.scope),
+            enabled = definition.enabled,
+            selected = definition.selected,
+            shortcut = command_shortcut_text(g_commands, definition.id))))
+    }
+    return JV((ok = true, revision = g_commands.revision,
+               saved_revision = g_commands.saved_revision,
+               config_path = g_commands.config_path,
+               status = g_commands.status,
+               commands = JV(definitions)))
+}
+
 [export]
 def init() {
     harness_init("daScript text viewer", 1100, 780)
@@ -754,6 +991,7 @@ def init() {
     g_fonts = load_unicode_font_roles(18.0f, g_font_sources)
     apply_daslang_theme(GetStyle())
     parse_command_line()
+    define_commands()
     let _ = add_document(g_initial_path, g_initial_mode_override, true)
 }
 
@@ -762,6 +1000,8 @@ def update() {
     if (!harness_begin_frame()) return
     harness_new_frame()
 
+    command_begin_frame(g_commands)
+    update_command_state()
     draw_menu_bar()
     handle_global_shortcuts()
     dockspace(DOCK_ROOT, (flags = ImGuiDockNodeFlags.PassthruCentralNode)) {
@@ -769,15 +1009,15 @@ def update() {
             setup_default_layout(DOCK_ROOT.dock_id)
             DOCK_ROOT.has_initial_layout = true
         }
-        if (length(g_documents) > 0) {
-            draw_primary_document(g_documents[0])
-        }
-        for (index in range(1, length(g_documents))) {
+        for (index in range(length(g_documents))) {
             unsafe {
-                draw_additional_document(g_documents[index], DOCK_ROOT.dock_id)
+                draw_document_window(g_documents[index], DOCK_ROOT.dock_id)
             }
         }
     }
+
+    command_bindings_editor(g_commands, g_bindings_editor)
+    dispatch_commands()
 
     let dialog_result = file_dialog_draw()
     if (dialog_result == FileDialogResult.confirmed) {
@@ -811,6 +1051,7 @@ def shutdown() {
     }
     delete g_documents
     delete g_document_windows
+    command_registry_dispose(g_commands)
     harness_shutdown()
     delete g_font_sources
 }
