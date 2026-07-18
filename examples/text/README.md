@@ -36,3 +36,8 @@ Select All, and Clear Selection operations without owning fixed keyboard keys.
 GFM task-list checkboxes are the first editing operation. Clicking one changes
 only the marker byte, reparses the rich projection, marks the source dirty, and
 persists through Save/reload without normalizing the rest of the file.
+
+The application owns its presentation policy. `FontRoleSet` supplies faces and
+the base size, `MarkdownTypography` supplies relative heading/code sizes, and
+each document supplies its zoom. The viewer therefore hard-codes sensible
+typography without adding those implementation details to user preferences.

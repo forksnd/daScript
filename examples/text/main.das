@@ -649,6 +649,9 @@ def private draw_document(var doc : TextViewerDocument) {
         if (doc.mode == TextViewMode.markdown) {
             var style = MarkdownViewStyle(
                 fonts = g_fonts,
+                typography = MarkdownTypography(
+                    inline_code_scale = 0.84f,
+                    code_block_scale = 0.90f),
                 zoom = float(zoom_percent(doc)) / 100.0f,
                 write_system_clipboard = !harness_is_headless())
             let view_result <- rich_document_view(
