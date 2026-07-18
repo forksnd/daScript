@@ -807,7 +807,9 @@ let private XQ_BYTES = 1_048_576l          // per-stack activation quants capaci
 let private XS_BYTES = 262_144l            // ... their scales
 let private Y_BYTES = 1_048_576l           // per-stack output capacity
 let private META_BYTES = 4_096l            // params + region table
-let private MAX_STACKS = 64                // descriptor pool capacity (VRAM budget caps far lower)
+let private MAX_STACKS = 224               // descriptor pool capacity (dense attention planes add
+                                           // ~130 small stacks on top of experts+cls; VRAM budget
+                                           // still caps the heavy ones far lower)
 let private WG_X = 64u                     // kernel workgroup width (spec-const axis 0 can retune it)
 let private BATCH_XQ_BYTES = 33_554_432l   // device-local gathered-activation scratch (chunk cap)
 let private BATCH_XS_BYTES = 8_388_608l    // ... its scale plane
@@ -819,9 +821,10 @@ let private BATCH_HQ_BYTES = 33_554_432l   // device requantized-hidden quants (
 let private BATCH_HS_BYTES = 8_388_608l    // ... its scale plane
 let private FFN_META_BYTES = 64l           // act/requant params (element count, gelu flag, block count)
 let private CLS_META_BYTES = 64l           // classifier GEMV params (one region, filled once)
-let private STREAM_RESERVE = 900_000_000l  // VRAM reserved out of the weight budget for the two
-                                           // streaming slots when DASLLAMA_GPU_MOE_STREAM is on
-                                           // (35B kq worst case: 2 x ~400MB slot + slack)
+let private STREAM_RESERVE = 1_100_000_000l  // VRAM reserved out of the weight budget for the two
+                                             // streaming slots when DASLLAMA_GPU_MOE_STREAM is on
+                                             // (35B kq measured: 2 x 532.7MB slots = 1065MB;
+                                             // ensure_stream_slots asserts actual <= reserve)
 
 struct private HostBuf {
     buf : uint64       // VkBuffer
@@ -838,12 +841,15 @@ struct private VkStack {
     wqbuf : uint64           // device-local row-major quants (bound as array<uint>)
     wsbuf : uint64           // device-local scale plane (q8: f16 halfwords; kq: 20B decoded rows)
     wsbytes : int64
-    raw_set : VkDescriptorSet   // this stack's 6 bindings, written once at upload
+    // decode/GEMV dispatch state (lazy — first GEMV or cls use creates it; dense-GEMM stacks
+    // never do, saving ~2.3MB host + 1MB device per stack across the ~130 dense planes)
+    raw_set : VkDescriptorSet   // this stack's 6 bindings, written on first GEMV use
     meta : HostBuf
     xq : HostBuf
     xs : HostBuf
     y : HostBuf              // host-cached readback staging (the same-submit DMA copy lands here)
     y_dev : uint64           // device-local y the kernel writes — see batch_y1_dev on why
+    gemv_made : bool
     batch_meta : HostBuf     // prefill batch meta STAGING (lazy — first batch dispatch creates it)
     batch_meta_dev : uint64  // device copy the kernel reads — a host-visible meta costs ~26us of
                              // serialized uncached PCIe reads PER WORKGROUP (measured, 12K wgs/dispatch)
@@ -918,6 +924,7 @@ struct private GpuState {
     @do_not_delete stacks : array<VkStack>
     ffn_cmds : table<int64; FfnCmd>   // (gate, up, down stack idx triple) -> decode FFN chain
     resident_bytes : int64
+    dev_mem : table<uint64; uint64>   // device buffer -> its VkDeviceMemory (rollback destroy needs it)
     // FFN mid-chain state (lazy — first FFN dispatch creates it)
     hq_dev : uint64          // device requantized-hidden quants (the down GEMM's activation image)
     hs_dev : uint64          // ... its scales
@@ -1020,7 +1027,25 @@ def private make_device_buf(bytes : int64) : uint64 {
                                  memoryTypeIndex = find_memory_type(g_gpu.phys, req.memoryTypeBits, want))
     var m <- allocate_memory(g_gpu.device, mai)
     bind_buffer_memory(g_gpu.device, b, m, 0ul)
+    g_gpu.dev_mem |> insert(b._vk, m._vk)
     return b._vk
+}
+
+def private destroy_device_buf(h : uint64) {
+    unsafe {
+        vkDestroyBuffer(dev_raw(), reinterpret<VkBuffer>(h), null)
+        if (key_exists(g_gpu.dev_mem, h)) {
+            vkFreeMemory(dev_raw(), reinterpret<VkDeviceMemory>(g_gpu.dev_mem[h]), null)
+            g_gpu.dev_mem |> erase(h)
+        }
+    }
+}
+
+def private destroy_host_buf(hb : HostBuf) {   // vkFreeMemory implicitly unmaps
+    unsafe {
+        vkDestroyBuffer(dev_raw(), reinterpret<VkBuffer>(hb.buf), null)
+        vkFreeMemory(dev_raw(), reinterpret<VkDeviceMemory>(hb.mem), null)
+    }
 }
 
 def private nonowning_buf(h : uint64) : Buffer {
@@ -1199,27 +1224,38 @@ def private stack_plane_bytes(n, rows : int64; fmt : int) : tuple<wq : int64; ws
     return (wq = wqbytes, ws = wsbytes)
 }
 
-// build a VkStack shell (plane buffers of the given capacity + per-stack host bufs + the
-// written GEMV descriptor set). Resident stacks pass their exact plane sizes; streaming
-// pseudo-stacks pass slot capacities and a base of -1 (re-based per layer).
+// build a VkStack shell (weight plane buffers only — the GEMV/cls scratch is lazy, see
+// ensure_gemv_scratch). Resident stacks pass their exact plane sizes; streaming pseudo-stacks
+// pass slot capacities and a base of -1 (re-based per layer).
 def private make_stack_shell(base, elems : int64; fmt : int; wqcap, wscap : int64) : int {
     var st = VkStack(base = base, elems = elems, fmt = fmt, wqbytes = wqcap,
-                     wqbuf = make_device_buf(wqcap), wsbuf = make_device_buf(wscap), wsbytes = wscap,
-                     raw_set = alloc_desc_set(),
-                     meta = make_host_buf(META_BYTES, true), xq = make_host_buf(XQ_BYTES, true),
-                     xs = make_host_buf(XS_BYTES, true), y = make_host_buf(Y_BYTES, false, [cached = true]),
-                     y_dev = make_device_buf(Y_BYTES))
-    var writes : array<WriteDescriptorSet>
-    write_buf_desc(writes, st.raw_set, 0u, st.wqbuf, wqcap)
-    write_buf_desc(writes, st.raw_set, 1u, st.wsbuf, wscap)
-    write_buf_desc(writes, st.raw_set, 2u, st.meta.buf, META_BYTES)
-    write_buf_desc(writes, st.raw_set, 3u, st.xq.buf, XQ_BYTES)
-    write_buf_desc(writes, st.raw_set, 4u, st.xs.buf, XS_BYTES)
-    write_buf_desc(writes, st.raw_set, 5u, st.y_dev, Y_BYTES)
-    let no_copies : array<CopyDescriptorSet>
-    update_descriptor_sets(g_gpu.device, writes, no_copies)
+                     wqbuf = make_device_buf(wqcap), wsbuf = make_device_buf(wscap), wsbytes = wscap)
     g_gpu.stacks |> push(st)
     return length(g_gpu.stacks) - 1
+}
+
+// decode/GEMV scratch for one stack (per-stack host bufs + the written 6-binding set). Lazy:
+// only stacks that actually serve GEMV or cls dispatches pay for it — dense-GEMM planes never do.
+def private ensure_gemv_scratch(si : int) {
+    if (g_gpu.stacks[si].gemv_made) {
+        return
+    }
+    g_gpu.stacks[si].raw_set = alloc_desc_set()
+    g_gpu.stacks[si].meta = make_host_buf(META_BYTES, true)
+    g_gpu.stacks[si].xq = make_host_buf(XQ_BYTES, true)
+    g_gpu.stacks[si].xs = make_host_buf(XS_BYTES, true)
+    g_gpu.stacks[si].y = make_host_buf(Y_BYTES, false, [cached = true])
+    g_gpu.stacks[si].y_dev = make_device_buf(Y_BYTES)
+    var writes : array<WriteDescriptorSet>
+    write_buf_desc(writes, g_gpu.stacks[si].raw_set, 0u, g_gpu.stacks[si].wqbuf, g_gpu.stacks[si].wqbytes)
+    write_buf_desc(writes, g_gpu.stacks[si].raw_set, 1u, g_gpu.stacks[si].wsbuf, g_gpu.stacks[si].wsbytes)
+    write_buf_desc(writes, g_gpu.stacks[si].raw_set, 2u, g_gpu.stacks[si].meta.buf, META_BYTES)
+    write_buf_desc(writes, g_gpu.stacks[si].raw_set, 3u, g_gpu.stacks[si].xq.buf, XQ_BYTES)
+    write_buf_desc(writes, g_gpu.stacks[si].raw_set, 4u, g_gpu.stacks[si].xs.buf, XS_BYTES)
+    write_buf_desc(writes, g_gpu.stacks[si].raw_set, 5u, g_gpu.stacks[si].y_dev, Y_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.stacks[si].gemv_made = true
 }
 
 // stream arm: keep the gathered device-layout planes in a pinned host mirror (host-visible
@@ -1270,6 +1306,31 @@ def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : 
     upload_region(g_gpu.stacks[si].wsbuf, ws, wsbytes)
     g_gpu.resident_bytes += wqbytes + wsbytes
     return true
+}
+
+//! MoeGpuDropFn: roll back the last n uploads (a partial layer triple the budget cut mid-way).
+//! Resident: pop the stacks, free their plane buffers, refund the budget; stream: pop the
+//! pinned mirrors (slot capacity maxima stay — conservatively oversized slots are harmless).
+//! Contract: only freshly-uploaded stacks (no dispatch state yet) may be dropped.
+def vk_moe_drop_stacks(n : int; stream : bool) {
+    if (stream) {
+        for (_i in range(n)) {
+            let k = length(g_gpu.stream_stacks) - 1
+            destroy_host_buf(g_gpu.stream_stacks[k].hwq)
+            destroy_host_buf(g_gpu.stream_stacks[k].hws)
+            g_gpu.stream_stacks |> resize(k)
+        }
+        return
+    }
+    for (_i in range(n)) {
+        let k = length(g_gpu.stacks) - 1
+        assert(!g_gpu.stacks[k].gemv_made && !g_gpu.stacks[k].batch_made && !g_gpu.stacks[k].cls_made,
+            "dasLLAMA vulkan tier: dropping a stack with live dispatch state")
+        g_gpu.resident_bytes -= g_gpu.stacks[k].wqbytes + g_gpu.stacks[k].wsbytes
+        destroy_device_buf(g_gpu.stacks[k].wqbuf)
+        destroy_device_buf(g_gpu.stacks[k].wsbuf)
+        g_gpu.stacks |> resize(k)
+    }
 }
 
 // ===== dispatch plumbing =====
@@ -1680,6 +1741,60 @@ def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : i
     }
 }
 
+// one dense chunk: meta staging copy, one tile GEMM over the single whole-plane region, y DMA
+def private record_dense_cmd(si : int; nwg : uint; y_bytes : int64) {
+    let raw = g_gpu.batch_cmd
+    let rf : VkCommandBufferResetFlags
+    vk_check(vkResetCommandBuffer(raw, rf), null)
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    cmd_copy_batch_meta(raw, si)
+    batch_barrier(raw, true)
+    bind_batch_pipe(raw, g_gpu.stacks[si].fmt)
+    cmd_bind_dispatch(raw, g_gpu.stacks[si].batch_set, nwg)
+    batch_barrier(raw, false)
+    cmd_copy_whole(raw, g_gpu.batch_y1_dev, g_gpu.batch_y1.buf, y_bytes)
+    vk_check(vkEndCommandBuffer(raw), null)
+}
+
+//! MoeGpuDenseFn: dense batched GEMM — y [nrows x d] = X · Wᵀ over the resident plane
+//! ([d x n] at element offset woff), a one-region ride on the batch tile rail. Chunked like
+//! the FFN arm; activations arrive pre-quantized in the plane's own form.
+def vk_moe_dense(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n, d, nrows : int64; fmt : int) {
+    let si = find_stack(woff, fmt)
+    let xunit = fmt != 0 ? 256l : 32l
+    ensure_batch_state()
+    ensure_batch_set(si, g_gpu.batch_y1_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
+    var chunk = min(BATCH_XQ_BYTES / n, BATCH_XS_BYTES / ((n / xunit) * 4l))
+    chunk = min(chunk, BATCH_Y_BYTES / (d * 4l))
+    chunk = min(chunk, BATCH_CHUNK_ROWS)
+    var region = fixed_array(woff, 0l, nrows)
+    var r0 = 0l
+    while (r0 < nrows) {
+        let r1 = min(r0 + chunk, nrows)
+        let rows = r1 - r0
+        let ts0 = ref_time_ticks()
+        var nwg = 0u
+        unsafe {
+            nwg = fill_batch_meta(si, addr(region[0]), 1l, n, d, r0, r1)
+        }
+        let ts1 = ref_time_ticks()
+        upload_batch_acts(xqp, xsp, r0, rows, n, xunit)
+        let ts2 = ref_time_ticks()
+        record_dense_cmd(si, nwg, rows * d * 4l)
+        let ts3 = ref_time_ticks()
+        submit_wait(g_gpu.batch_cmd)
+        let ts4 = ref_time_ticks()
+        unsafe {
+            memcpy(reinterpret<void?>(yp + r0 * d), g_gpu.batch_y1.mapped, int(rows * d * 4l))
+        }
+        if (vk_prof()) {
+            to_log(LOG_INFO, "vk_dense acts {get_time_usec(ts1) - get_time_usec(ts2)} submit {get_time_usec(ts3) - get_time_usec(ts4)} copy {get_time_usec(ts4)}\n")
+        }
+        r0 = r1
+    }
+}
+
 // ===== decode dispatch (the FFN's GEMV arm) =====
 
 // pre-record (or refresh on a row-count change) the triple's chain: gate+up GEMV pair, fused
@@ -1756,6 +1871,9 @@ def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : in
     assert((f3 != 0) == kq && (f2 != 0) == kq,
         "dasLLAMA vulkan tier: q8/kq mixed stack triple in one FFN chain")
     let xunit = kq ? 256l : 32l
+    ensure_gemv_scratch(s1)
+    ensure_gemv_scratch(s3)
+    ensure_gemv_scratch(s2)
     fill_stack_meta_rows(s1, offs1, nregions, n, nfe, nrows, n / xunit)
     fill_stack_meta_rows(s3, offs3, nregions, n, nfe, nrows, n / xunit)
     fill_stack_meta_rows(s2, offs2, nregions, nfe, n, nrows, nfe / xunit)
@@ -1785,7 +1903,11 @@ def private ensure_stream_slots {
         g_gpu.stream_slots |> push(StreamSlot(group = -1, s1 = s1, s3 = s3, s2 = s2))
     }
     g_gpu.stream_ready = true
-    to_log(LOG_INFO, "dasLLAMA vulkan tier: streamed prefill engaged ({length(g_gpu.stream_stacks) / 3} layers, slot {2l * (g_gpu.stream_max_gu_wq + g_gpu.stream_max_gu_ws) + g_gpu.stream_max_dn_wq + g_gpu.stream_max_dn_ws} bytes x 2)\n")
+    let slot_bytes = 2l * (g_gpu.stream_max_gu_wq + g_gpu.stream_max_gu_ws) + g_gpu.stream_max_dn_wq + g_gpu.stream_max_dn_ws
+    // the reserve was carved out of the weight budget at init — a lie here silently overcommits
+    // past the WDDM paging cliff
+    assert(2l * slot_bytes <= STREAM_RESERVE, "dasLLAMA vulkan tier: stream slots exceed STREAM_RESERVE")
+    to_log(LOG_INFO, "dasLLAMA vulkan tier: streamed prefill engaged ({length(g_gpu.stream_stacks) / 3} layers, slot {slot_bytes} bytes x 2)\n")
 }
 
 // re-base one slot pseudo-stack onto a stream stack (descriptors stay — the slot buffers are
@@ -1897,6 +2019,7 @@ def private ensure_cls(si : int; woff, n, d : int64) {
     if (g_gpu.stacks[si].cls_made) {
         return
     }
+    ensure_gemv_scratch(si)
     let unit = g_gpu.stacks[si].fmt != 0 ? 256l : 32l
     let rel = woff - g_gpu.stacks[si].base
     assert(rel % unit == 0l, "dasLLAMA vulkan tier: unaligned classifier plane offset")
@@ -2002,6 +2125,6 @@ def dasllama_math_vulkan_register() {
     let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
     if ((layers > 0l || nstream > 0l) && vulkan_backend_available()) {
         set_moe_gpu_layer_count(layers)
-        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
+        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks)
     }
 }

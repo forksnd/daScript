@@ -178,7 +178,7 @@ def private compare_gout(gpu, refv : array<float>) : tuple<maxdiff : float; maxr
 def test_vulkan_moe_ffn_vs_ref(t : T?) {
     t |> run("vulkan MoE FFN tier == CPU reference (decode GEMV + prefill batch arms)") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks)
             // synthetic stacks: gate/up are (NE*NFE) x N, down is (NE*N) x NFE
             var wq1 : array<int8>
             var ws1 : array<float>
@@ -253,7 +253,7 @@ let SSTRIDE = 100000l   // per-stack offset stride inside the streamed fixture (
 def test_vulkan_moe_ffn_streamed(t : T?) {
     t |> run("vulkan MoE streamed prefill (pinned mirrors, 2 slots) == CPU reference") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks)
             let ege1 = NFE * N
             let ege2 = N * NFE
             var wq1 : array<array<int8>>
@@ -538,7 +538,7 @@ def private ref_ffn_kq(offs1, offs3, offs2 : array<int64>; nreg : int;
 def test_vulkan_moe_ffn_kq(t : T?) {
     t |> run("vulkan MoE kq tier (k4 gate/up + k5/k6 down) == CPU reference") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks)
             // k4 gate/up stacks + BOTH down formats in one down stack region set is not a real
             // shape — use two arms sharing the gate/up stacks: down = k6, then down = k5 at a
             // fresh offset (the 35B carries k5 downs on most layers, k6 on the last two)
@@ -667,6 +667,158 @@ def test_vulkan_moe_ffn_kq(t : T?) {
             delete xs
             delete gout
             delete refv
+        } else {
+            feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
+        }
+    }
+}
+
+// ===== dense-GEMM rail arms (one-region ride on the batch tiles) =====
+
+let DWOFF = 30000000l   // q8 dense plane base (q8 offset space, clear of WOFF*/SWOFF)
+let KDWOFF = 31000000l  // k4 dense plane base (kq offset space, clear of KWOFF*)
+let DROP_WOFF = 32000000l   // drop-arm scratch plane (q8 space)
+let DD = 160l           // dense output dim (%32)
+let DNR = 40l           // batch rows — one full 32-tile plus an unpadded remainder
+
+[test]
+def test_vulkan_dense_gemm(t : T?) {
+    t |> run("vulkan dense GEMM rail == CPU reference (q8 + k4, one-region batch tiles)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks)
+            // q8 arm: [DD x N] plane, Q8_0 acts
+            var wq : array<int8>
+            var ws : array<float>
+            fill_stack(wq, ws, DD, N, 17l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(wq, ws, wqb, wsb)
+            if (!moe_gpu_upload_stack(wqb, wsb, DWOFF, N, DD, 0)) {
+                feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                return
+            }
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, DNR)
+            var y : array<float>
+            y |> resize(int(DNR * DD))
+            matmul_gpu_dense(y, DWOFF, xq, xs, N, DD, DNR, 0)
+            var refy : array<float>
+            refy |> resize(int(DNR * DD))
+            let nb = int(N / 32l)
+            for (r in range(int(DNR))) {
+                for (c in range(int(DD))) {
+                    var acc = 0.0lf
+                    for (b in range(nb)) {
+                        var id = 0
+                        for (k in range(32)) {
+                            id += int(xq[r * int(N) + b * 32 + k]) * int(wq[c * int(N) + b * 32 + k])
+                        }
+                        acc += double(ws[c * nb + b]) * double(xs[r * nb + b]) * double(id)
+                    }
+                    refy[r * int(DD) + c] = float(acc)
+                }
+            }
+            let c1 = compare_gout(y, refy)
+            t |> success(c1.maxdiff <= float(REL_TOL) * c1.maxref,
+                "dense q8 arm within tolerance (maxdiff {c1.maxdiff} vs {float(REL_TOL) * c1.maxref} bar, maxref {c1.maxref})")
+            // k4 arm: [DD x KN] plane, Q8_K acts through the same one-region rail
+            var kwqb : array<uint8>
+            var kwsb : array<uint8>
+            fill_kq_stack(1, DD, KN, 23l, false, kwqb, kwsb)
+            if (!moe_gpu_upload_stack(kwqb, kwsb, KDWOFF, KN, DD, 1)) {
+                feint("kq dense upload refused (budget); skipping the k4 arm\n")
+                return
+            }
+            var w : array<float>
+            dequant_kq_stack(1, kwqb, kwsb, DD, KN, w)
+            var kxq : array<int8>
+            var kxs : array<float>
+            fill_acts_kq(kxq, kxs, DNR)
+            var ky : array<float>
+            ky |> resize(int(DNR * DD))
+            matmul_gpu_dense(ky, KDWOFF, kxq, kxs, KN, DD, DNR, 1)
+            var krefy : array<float>
+            krefy |> resize(int(DNR * DD))
+            let nsb = int(KN / 256l)
+            for (r in range(int(DNR))) {
+                for (c in range(int(DD))) {
+                    var acc = 0.0lf
+                    for (sb in range(nsb)) {
+                        var dd = 0.0lf
+                        for (j in range(256)) {
+                            dd += double(w[c * int(KN) + sb * 256 + j]) * double(kxq[r * int(KN) + sb * 256 + j])
+                        }
+                        acc += dd * double(kxs[r * nsb + sb])
+                    }
+                    krefy[r * int(DD) + c] = float(acc)
+                }
+            }
+            let c2 = compare_gout(ky, krefy)
+            t |> success(c2.maxdiff <= float(REL_TOL) * c2.maxref,
+                "dense k4 arm within tolerance (maxdiff {c2.maxdiff} vs {float(REL_TOL) * c2.maxref} bar, maxref {c2.maxref})")
+            // drop arm: roll back a fresh upload (the partial-triple path), then prove the
+            // registry survived — the earlier q8 stack still serves, and the dropped offset
+            // re-uploads and serves (buffer free + budget refund didn't corrupt anything)
+            var wq3 : array<int8>
+            var ws3 : array<float>
+            fill_stack(wq3, ws3, DD, N, 29l, false)
+            var wqb3 : array<uint8>
+            var wsb3 : array<uint8>
+            pack_upload(wq3, ws3, wqb3, wsb3)
+            t |> success(moe_gpu_upload_stack(wqb3, wsb3, DROP_WOFF, N, DD, 0), "doomed upload lands")
+            moe_gpu_drop_stacks(1, false)
+            t |> success(moe_gpu_upload_stack(wqb3, wsb3, DROP_WOFF, N, DD, 0, [stream = true]), "stream mirror lands")
+            moe_gpu_drop_stacks(1, true)
+            y |> resize(0)
+            y |> resize(int(DNR * DD))
+            matmul_gpu_dense(y, DWOFF, xq, xs, N, DD, DNR, 0)
+            let c3 = compare_gout(y, refy)
+            t |> success(c3.maxdiff <= float(REL_TOL) * c3.maxref,
+                "q8 stack still serves after a later stack dropped (maxdiff {c3.maxdiff})")
+            t |> success(moe_gpu_upload_stack(wqb3, wsb3, DROP_WOFF, N, DD, 0), "dropped offset re-uploads")
+            var y3 : array<float>
+            y3 |> resize(int(DNR * DD))
+            matmul_gpu_dense(y3, DROP_WOFF, xq, xs, N, DD, DNR, 0)
+            var refy3 : array<float>
+            refy3 |> resize(int(DNR * DD))
+            for (r in range(int(DNR))) {
+                for (c in range(int(DD))) {
+                    var acc = 0.0lf
+                    for (b in range(nb)) {
+                        var id = 0
+                        for (k in range(32)) {
+                            id += int(xq[r * int(N) + b * 32 + k]) * int(wq3[c * int(N) + b * 32 + k])
+                        }
+                        acc += double(ws3[c * nb + b]) * double(xs[r * nb + b]) * double(id)
+                    }
+                    refy3[r * int(DD) + c] = float(acc)
+                }
+            }
+            let c4 = compare_gout(y3, refy3)
+            t |> success(c4.maxdiff <= float(REL_TOL) * c4.maxref,
+                "re-uploaded stack serves after drop (maxdiff {c4.maxdiff})")
+            delete wq3
+            delete ws3
+            delete wqb3
+            delete wsb3
+            delete y3
+            delete refy3
+            delete wq
+            delete ws
+            delete wqb
+            delete wsb
+            delete xq
+            delete xs
+            delete y
+            delete refy
+            delete kwqb
+            delete kwsb
+            delete w
+            delete kxq
+            delete kxs
+            delete ky
+            delete krefy
         } else {
             feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
         }

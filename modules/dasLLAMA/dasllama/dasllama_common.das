@@ -1776,6 +1776,7 @@ def moe_gpu_upload_resident(var t : Model) {
     set_moe_gpu_from_layer(t.config.n_layers)   // nothing resident until an upload lands
     set_moe_gpu_stream_from(t.config.n_layers)
     set_moe_gpu_cls_off(-1l)
+    reset_moe_gpu_dense_offs()
     // mx4/biased expert stacks never dispatch on the GPU, so they never upload either
     let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
     if (t.quant != QuantMode.q8 || t.config.n_expert <= 0l
@@ -1805,6 +1806,49 @@ def moe_gpu_upload_resident(var t : Model) {
             && moe_gpu_gather_upload(t, cls_fmt, t.wcls_off, dim, t.config.vocab_size, t.config.vocab_size, mr, kgroup, wbias, wq, ws)) {
         set_moe_gpu_cls_off(t.wcls_off)
     }
+    // dense (attention-side) planes second — DASLLAMA_GPU_DENSE=1 opt-in. Arch-agnostic: the
+    // prefill batch funnels (mm_b / mm_b_kq) route any marked (fmt, offset), recurrent layers
+    // carry the deltanet triple, attention layers the q/o pair (k/v stay CPU — small, and their
+    // outputs feed rope/kv-store immediately). kq weights need the repacked-load layout the
+    // gather inverts. Layer-ascending; each successful upload marks its plane, a budget stop
+    // ends the walk. Each plane is one whole-matrix slice (the cls pattern).
+    if (get_env_variable("DASLLAMA_GPU_DENSE") == "1") {
+        var dense_marked = 0l
+        var dense_stop = false
+        for (l in range64(layers)) {
+            var uploads : array<tuple<f : KqFmt; woff : int64; n : int64; rows : int64>>
+            if (layer_is_recurrent(t.config, l)) {
+                if (t.dnqkv_offs[l] >= 0l && t.dngate_offs[l] >= 0l && t.dnout_offs[l] >= 0l) {
+                    uploads |> push((f = KqFmt.q8, woff = t.dnqkv_offs[l], n = dim, rows = dn_conv_dim(t.config)))
+                    uploads |> push((f = KqFmt.q8, woff = t.dngate_offs[l], n = dim, rows = t.config.ssm_d_inner))
+                    uploads |> push((f = KqFmt.q8, woff = t.dnout_offs[l], n = t.config.ssm_d_inner, rows = dim))
+                }
+            } else {
+                let qd = layer_qd(t.config, l)
+                let fq = fmt_at(t.wq_fmt, l)
+                let fo = fmt_at(t.wo_fmt, l)
+                if (t.wq_offs[l] >= 0l && t.wo_offs[l] >= 0l
+                        && (fq == KqFmt.q8 || moe_gpu_fmt_kq(fq)) && (fo == KqFmt.q8 || moe_gpu_fmt_kq(fo))
+                        && kq_servable(t, fq) && kq_servable(t, fo)) {
+                    uploads |> push((f = fq, woff = t.wq_offs[l], n = dim, rows = t.config.q_gated ? 2l * qd : qd))
+                    uploads |> push((f = fo, woff = t.wo_offs[l], n = qd, rows = dim))
+                }
+            }
+            for (u in uploads) {
+                if (!moe_gpu_gather_upload(t, u.f, u.woff, u.n, u.rows, u.rows, mr, kgroup, wbias, wq, ws)) {
+                    dense_stop = true   // VRAM budget hit — later planes keep the CPU dense path
+                    break
+                }
+                set_moe_gpu_dense_off(int(u.f), u.woff)
+                dense_marked++
+            }
+            delete uploads
+            break if (dense_stop)
+        }
+        if (dense_marked > 0l) {
+            to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: {dense_marked} dense planes resident\n")
+        }
+    }
     for (i in range64(want)) {
         let l = layers - 1l - i
         let f1 = fmt_at(t.we1_fmt, l)
@@ -1818,15 +1862,24 @@ def moe_gpu_upload_resident(var t : Model) {
         if (l < t.config.n_layer_dense_lead || t.we1_offs[l] < 0l || !(all_q8 || all_kq)) {
             break
         }
-        var ok = moe_gpu_gather_upload(t, f1, t.we1_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)
-        if (ok) {
-            ok = moe_gpu_gather_upload(t, f3, t.we3_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)
+        var got = 0
+        if (moe_gpu_gather_upload(t, f1, t.we1_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)) {
+            got++
         }
-        if (ok) {
-            ok = moe_gpu_gather_upload(t, f2, t.we2_offs[l], nfe, ne * dim, dim, mr, kgroup, wbias, wq, ws)
+        if (got == 1 && moe_gpu_gather_upload(t, f3, t.we3_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)) {
+            got++
         }
-        if (!ok) {
-            break   // VRAM budget hit — this and lower layers stay on CPU (partial-layer buffers idle)
+        if (got == 2 && moe_gpu_gather_upload(t, f2, t.we2_offs[l], nfe, ne * dim, dim, mr, kgroup, wbias, wq, ws)) {
+            got++
+        }
+        if (got < 3) {
+            // VRAM budget hit — this and lower layers stay on CPU. A partial triple MUST roll
+            // back: a dangling gate/up plane hijacks the tier's residency check when this layer
+            // re-enters as streamed (or CPU prefill probes it) — non-resident-region panic
+            if (got > 0) {
+                moe_gpu_drop_stacks(got, false)
+            }
+            break
         }
         from_l = l
     }
@@ -1848,15 +1901,24 @@ def moe_gpu_upload_resident(var t : Model) {
         if (!(all_q8 || all_kq)) {
             break
         }
-        var ok = moe_gpu_gather_upload(t, f1, t.we1_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws, [stream = true])
-        if (ok) {
-            ok = moe_gpu_gather_upload(t, f3, t.we3_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws, [stream = true])
+        var got = 0
+        if (moe_gpu_gather_upload(t, f1, t.we1_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws, [stream = true])) {
+            got++
         }
-        if (ok) {
-            ok = moe_gpu_gather_upload(t, f2, t.we2_offs[l], nfe, ne * dim, dim, mr, kgroup, wbias, wq, ws, [stream = true])
+        if (got == 1 && moe_gpu_gather_upload(t, f3, t.we3_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws, [stream = true])) {
+            got++
         }
-        if (!ok) {
-            break   // pinned-mirror budget hit — this and lower layers stay CPU-only
+        if (got == 2 && moe_gpu_gather_upload(t, f2, t.we2_offs[l], nfe, ne * dim, dim, mr, kgroup, wbias, wq, ws, [stream = true])) {
+            got++
+        }
+        if (got < 3) {
+            // pinned-mirror budget hit — this and lower layers stay CPU-only. Roll back a
+            // partial triple: the stream registry's group arithmetic assumes whole gate/up/down
+            // triples, and a phantom gate would match the group scan at dispatch
+            if (got > 0) {
+                moe_gpu_drop_stacks(got, true)
+            }
+            break
         }
         sfrom = l
     }
@@ -4880,6 +4942,10 @@ def private mm_kq(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x 
 def private mm_b_kq(var s : Session; var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; n, d, npos : int64) {
     if (t.kq_repacked && kernel_backend_has_kq_batch()) {
         requant_rows_q8k_bs(x, n, npos, s.xqb, s.xsb, s.xbsb)   // kq v2: Q8_K-form image
+        if (npos >= 32l && moe_gpu_dense_on_gpu(int(fmt), woff)) {
+            matmul_gpu_dense(y, woff, s.xqb, s.xsb, n, d, npos, int(fmt))   // in-kernel bsums, xbsb unused
+            return
+        }
         let ts_gemm = ref_time_ticks()
         if (fmt == KqFmt.k4) {
             matmul_kq_batch(4, y, t.k4q, t.k4s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
@@ -5124,7 +5190,11 @@ def private mm_b_q8_pre(var y : array<float>; t : Model; woff : int64; xqb : arr
 def private mm_b(var y : array<float>; t : Model; woff : int64; x : array<float>; var xqb : array<int8>; var xsb : array<float>; n, d, npos : int64) {
     if (t.quant == QuantMode.q8) {
         requant_rows_q8(x, n, npos, xqb, xsb)
-        mm_b_q8_pre(y, t, woff, xqb, xsb, n, d, npos)
+        if (npos >= 32l && moe_gpu_dense_on_gpu(int(KqFmt.q8), woff)) {
+            matmul_gpu_dense(y, woff, xqb, xsb, n, d, npos, int(KqFmt.q8))
+        } else {
+            mm_b_q8_pre(y, t, woff, xqb, xsb, n, d, npos)
+        }
     } else {
         matmul_batch(y, t.wblob, woff, x, n, d, npos)
     }
