@@ -17,7 +17,7 @@ def passing_fixture() : string {
 
 def run_dastest(args : array<string>; var output : string&; var exit_code : int&) {
     let exe = get_command_line_arguments()[0]
-    var cmd <- [exe, "{dastest_root()}/dastest.das", "--", "--failures-only", "--test", passing_fixture()]
+    var cmd <- [exe, "-dasroot", get_das_root(), "{dastest_root()}/dastest.das", "--", "--failures-only", "--test", passing_fixture()]
     cmd |> push_from(args)
     exit_code = run_and_capture(cmd, output)
 }
