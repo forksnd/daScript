@@ -42,8 +42,9 @@ Arm names — decode parity: `arm1-basic arm2-hybrid arm3-step arm4-paged arm5-r
 arm6-churn arm7-q8kv arm7b-tq4kv arm8-s16 arm9-reload arm10-kq arm11-depth arm12-dim`,
 batch test: `batch` (whole test), `batchB7-partd`, `batchB8-kq`. Prefill parity: `base s16
 kq cont dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b` + the
-family matrix `fam-qwen3 fam-qwen2 fam-phi3 fam-gemma2 fam-gemma3` (needs-derivation pins +
-per-path cells; fam-gemma2 also carries the sliding-window masking parity row). The
+family matrix `fam-qwen3 fam-qwen2 fam-phi3 fam-gemma2 fam-gemma3 fam-gemma4` (needs-derivation
+pins + per-path cells; fam-gemma2 also carries the sliding-window masking parity row;
+fam-gemma4 is DASLLAMA_PARITY_FULL-gated — 7.4GB). The
 `kernels` suite (test_metal_prefill_kernels — model-less kernel units, ~80s) has no arms;
 remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic

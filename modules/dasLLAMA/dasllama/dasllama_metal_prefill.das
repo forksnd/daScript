@@ -75,8 +75,6 @@ class MetalRmsNorm {
                                             // read before the barrier that precedes any write)
     @uniform @binding = 3 dim : uint
     @uniform @binding = 4 eps : float
-    @uniform @binding = 5 oscale : float    // output scalar (gemma4 layer_out_scale folds into
-                                            // the post-ffn norm; every other site binds 1.0)
     @workgroup partial : float[32]          // one per simdgroup — width-agnostic up to 1024
                                             // threads (prefill dispatches 256, decode 1024)
     @workgroup inv_sh : float
@@ -110,7 +108,7 @@ class MetalRmsNorm {
         let inv = inv_sh
         k = lid
         while (k < dim) {
-            y[row * dim + k] = w[k] * (x[row * dim + k] * inv) * oscale
+            y[row * dim + k] = w[k] * (x[row * dim + k] * inv)
             k += gl_WorkGroupSize.x
         }
     }
@@ -2143,6 +2141,8 @@ class MetalAdd {
     @ssbo @binding = 0 x : array<float>
     @ssbo @binding = 1 y : array<float>
     @uniform @binding = 2 total : uint      // grid guard
+    @uniform @binding = 3 ascale : float    // (x + y) * ascale — gemma4 layer_out_scale scales
+                                            // the WHOLE layer output; every other site binds 1.0
 
     [metal_kernel(name="metal_add_msl")]
     def metal_add {
@@ -2150,7 +2150,7 @@ class MetalAdd {
         if (gid >= total) {
             return
         }
-        x[gid] += y[gid]
+        x[gid] = (x[gid] + y[gid]) * ascale
     }
 }
 
@@ -2672,7 +2672,7 @@ def private enc_quant(enc : MetalComputeEncoder?; bx, bxq, bxs, bn, bnblk : Meta
     metal_dispatch_threadgroups(enc, uint3(uint((nblk + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
-def private pf_enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64; boscale : MetalBuffer? = null) {
+def private pf_enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64) {
     metal_set_pipeline(enc, g_pf_pso_rms)
     metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, 0ul, 0)
@@ -2680,7 +2680,6 @@ def private pf_enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : Meta
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
-    metal_set_buffer(enc, boscale != null ? boscale : g_pf_one, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
@@ -2693,7 +2692,6 @@ def private enc_rms_last(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : u
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
-    metal_set_buffer(enc, g_pf_one, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(256u, 1u, 1u))
 }
 
@@ -2874,11 +2872,12 @@ def private enc_av(enc : MetalComputeEncoder?; batt, bv, bxb, bqd, bkvd, bhs, bk
 }
 
 // swiglu and add share the (a, b, total) elementwise shape
-def private pf_enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba, bb, btot : MetalBuffer?; total : int64) {
+def private pf_enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba, bb, btot : MetalBuffer?; total : int64; bascale : MetalBuffer? = null) {
     metal_set_pipeline(enc, pso)
     metal_set_buffer(enc, ba, 0ul, 0)
     metal_set_buffer(enc, bb, 0ul, 1)
     metal_set_buffer(enc, btot, 0ul, 2)
+    metal_set_buffer(enc, bascale != null ? bascale : g_pf_one, 0ul, 3)   // the add's ascale slot (unused by swiglu/geglu)
     metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 

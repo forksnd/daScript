@@ -1864,6 +1864,8 @@ class MetalAddRms {
     @ssbo @binding = 3 y : array<float>     // [dim] normed out
     @uniform @binding = 4 dim : uint
     @uniform @binding = 5 eps : float
+    @uniform @binding = 6 ascale : float    // (x + a) * ascale — gemma4 layer_out_scale scales
+                                            // the whole layer output; every other site binds 1.0
     @workgroup xrow : float[4096]           // == ADD_RMS_MAX_DIM
     @workgroup partial : float[32]          // one per simdgroup at the 1024-thread dispatch
     @workgroup inv_sh : float
@@ -1874,7 +1876,7 @@ class MetalAddRms {
         var ss = 0.0
         var k = lid
         while (k < dim) {
-            let vv = x[k] + a[k]
+            let vv = (x[k] + a[k]) * ascale
             x[k] = vv
             xrow[k] = vv
             ss += vv * vv
@@ -5811,7 +5813,7 @@ def enc_kq_gemm_mm_b(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by : M
     metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(rows / 64l), 1u), uint3(128u, 1u, 1u))
 }
 
-def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; boscale : MetalBuffer? = null) {
+def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?) {
     metal_set_pipeline(enc, g_pso_rms)
     metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, 0ul, 0)
@@ -5819,7 +5821,6 @@ def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; b
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
-    metal_set_buffer(enc, boscale != null ? boscale : g_one, 0ul, 5)
     // one row, latency-bound — the widest tg shortens the strided-load rounds (1024 max on M1)
     metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
 }
@@ -5998,10 +5999,10 @@ def enc_argmax(enc : MetalComputeEncoder?; blg, btok, bn : MetalBuffer?) {
 
 // zero-copy logits scatter: one staging row (src at its byte offset) into a session's wrapped
 // logits storage — replaces that row's landing memcpy
-def enc_copy_row(enc : MetalComputeEncoder?; bsrc : MetalBuffer?; soff : uint64; bdst, bn : MetalBuffer?; n : int64) {
+def enc_copy_row(enc : MetalComputeEncoder?; bsrc : MetalBuffer?; soff : uint64; bdst, bn : MetalBuffer?; n : int64; doff : uint64 = 0ul) {
     metal_set_pipeline(enc, g_pso_copy_row)
     metal_set_buffer(enc, bsrc, soff, 0)
-    metal_set_buffer(enc, bdst, 0ul, 1)
+    metal_set_buffer(enc, bdst, doff, 1)
     metal_set_buffer(enc, bn, 0ul, 2)
     metal_dispatch_threadgroups(enc, uint3(uint((n + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
@@ -6030,7 +6031,7 @@ def enc_embed_k6(enc : MetalComputeEncoder?; bq, bs, btok, bx, bdim : MetalBuffe
 }
 
 // fused add + rms when dim fits the kernel's row slab, the unfused pair otherwise
-def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; dim : int64) {
+def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; dim : int64; bascale : MetalBuffer? = null) {
     if (dim <= ADD_RMS_MAX_DIM) {
         metal_set_pipeline(enc, g_pso_addrms)
         metal_set_threadgroup_memory_length(enc, metal_add_rms_msl_tgmem, 0)
@@ -6040,9 +6041,10 @@ def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Me
         metal_set_buffer(enc, by, 0ul, 3)
         metal_set_buffer(enc, bdim, 0ul, 4)
         metal_set_buffer(enc, beps, 0ul, 5)
+        metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 6)
         metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
     } else {
-        enc_ew2(enc, g_pso_add, bx, 0ul, ba, 0ul, bdim, dim)
+        enc_ew2(enc, g_pso_add, bx, 0ul, ba, 0ul, bdim, dim, bascale)
         enc_rms(enc, bx, bw, by, bdim, beps)
     }
 }
@@ -6202,11 +6204,12 @@ def enc_softcap_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64
 }
 
 // swiglu and add share the (a, b, total) elementwise shape; offsets serve the fused-buffer binds
-def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalBuffer?; aoff : uint64; bb : MetalBuffer?; boff : uint64; btot : MetalBuffer?; total : int64) {
+def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalBuffer?; aoff : uint64; bb : MetalBuffer?; boff : uint64; btot : MetalBuffer?; total : int64; bascale : MetalBuffer? = null) {
     metal_set_pipeline(enc, pso)
     metal_set_buffer(enc, ba, aoff, 0)
     metal_set_buffer(enc, bb, boff, 1)
     metal_set_buffer(enc, btot, 0ul, 2)
+    metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 3)   // the add's ascale slot (unused by swiglu/geglu)
     metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6662,7 +6665,7 @@ def enc_add_rms_b(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Metal
 }
 
 // batched rmsnorm (the prologue): the prefill rms kernel is width-agnostic — one tg per row
-def enc_rms_b(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64; boscale : MetalBuffer? = null) {
+def enc_rms_b(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64) {
     metal_set_pipeline(enc, g_pso_rms)
     metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, 0ul, 0)
@@ -6670,7 +6673,6 @@ def enc_rms_b(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?;
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
-    metal_set_buffer(enc, boscale != null ? boscale : g_one, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(1024u, 1u, 1u))
 }
 

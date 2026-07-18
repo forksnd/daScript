@@ -1261,6 +1261,11 @@ def rebind_arch_blocks(var t : Model; arch : string) {
     }
     t.arch = arch
     t.blocks = g_arch_registry[arch].blocks
+    if (t.config.moe_optional && !t.config.moe && t.config.n_embd_per_layer == 0l) {
+        // the file-resolved dense flavor of a moe-optional arch (gemma4 12B/31B) — mirror the
+        // load_gguf patch so the GPU drivers' graph gate serves image loads too
+        t.blocks.ffn_is_dense = true
+    }
 }
 
 // The wscale_f16 rail's load-time switch: default ON — free at 16 lanes on the 3990X, +5.4% on
@@ -2515,6 +2520,12 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         if (t.config.moe_optional
                 && gguf_has(m, "{arch}.expert_count") && gguf_int(m, bytes, "{arch}.expert_count") > 0l) {
             t.config.moe = true
+        }
+        if (t.config.moe_optional && !t.config.moe && t.config.n_embd_per_layer == 0l) {
+            // the moe-optional arch registers ffn_is_dense = false for the shared descriptor, but
+            // THIS file resolved dense with no PLE (12B/31B) — its ffn IS the std dense stack
+            // (+ out_scale), so the GPU drivers' graph gate may serve it
+            t.blocks.ffn_is_dense = true
         }
         if (t.config.moe) {
             // MoE geometry from metadata (qwen2moe A2.7B: 60 experts, top-4, 1408-wide experts

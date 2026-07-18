@@ -49,11 +49,12 @@ require _model_tier
 // arch-named — the block set declares the graph (`graph` decline) and metal_needs derives the
 // feature set (`feature` + need_* declines) against per-path implemented masks. Served today:
 // llama + phi3 (neox) + qwen2 (neox+qkv_bias) + qwen3 (neox+qk_norm+qd_neq_dim) + gemma2
-// (neox+softcap+sliding+pre_post_norm+geglu, hs 256 — wave B stage 1), each row
-// token-parity-proven. mistral3 (empty config = the llama shape) serves by construction; no
-// <= 35B mistral3-arch GGUF exists to validate against (Mistral Small 3.x converts as llama),
-// so its real-model row waits on a fixture. gemma3/4 (dual-theta rope, hetero heads) = wave B
-// stages 2-3; MoE/deltanet = waves C-D.
+// (neox+softcap+sliding+pre_post_norm+geglu, hs 256 — wave B stage 1) + gemma3 (dual-theta
+// per-layer rope — stage 2), each row token-parity-proven on all three paths. gemma4-12B
+// (stage 3: two attention classes, hs 512, V-from-K, v_norm, out_scale, suppress) serves
+// SINGLE decode token-exact; batch/prefill decline need_v_norm until stages 3c/3d. mistral3
+// (empty config = the llama shape) serves by construction; no <= 35B mistral3-arch GGUF
+// exists to validate against, so its real-model row waits on a fixture. MoE/deltanet = C-D.
 
 def private counting_prompt(start, last : int) : string {
     return build_string() $(var w) {
@@ -589,6 +590,49 @@ def private gemma2_window_row(t : T?; path : string) {
     }
 }
 
+[unused_argument(t, path)]   // off-Apple the gated body is empty
+def private gemma4_hetero_row(t : T?; path : string) {
+    // the stage-3 heterogeneous row: needs-derivation pin, per-path cells (decode ENGAGE,
+    // batch/prefill DECLINE need_v_norm), and a decode-only token-parity generate (CPU prefill
+    // feeds the GPU decode — the per-class geometry, V-from-K, v_norm, out_scale, dual-theta
+    // p-RoPE and the suppress+softcap gpu-logits tail all sit on the proven path)
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "gemma4") || !arm_on(t, "fam-gemma4") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let derived = metal_needs(tr)
+        let want_bits = (MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding | MetalNeed.pre_post_norm |
+            MetalNeed.geglu | MetalNeed.v_norm | MetalNeed.attn_scale | MetalNeed.out_scale |
+            MetalNeed.qd_neq_dim)
+        t |> success((uint(derived) & uint(want_bits)) == uint(want_bits),
+            "gemma4-12b/k4: metal_needs derives {want_bits} (got {derived})")
+        matrix_cell(t, tr, KVDtype.f16, "gemma4-12b/k4/f16", "need_v_norm", "", "need_v_norm")
+        let prompt <- encode(tr, counting_prompt(1, 30), true, false)
+        var cpu_ids : array<int64>
+        var gpu_ids : array<int64>
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids <- generate(tr, s, prompt, length(prompt) + 8)
+            cpu_ids := ids
+            delete s
+            select_decode_override("metal")
+            var s2 = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids2 <- generate(tr, s2, prompt, length(prompt) + 8)
+            gpu_ids := ids2
+            delete s2
+            select_decode_override("")
+        }
+        t |> success(same(cpu_ids, gpu_ids),
+            "gemma4-12b/k4: metal-decode generate matches the CPU truth token-for-token")
+        delete cpu_ids
+        delete gpu_ids
+        delete tr
+    }
+}
+
 // The family axis (family waves A): each non-llama dense family loads its small carrier and
 // asserts per-path ENGAGE/DECLINE with the exact need_* reason — the descriptor refactor's
 // living expectation table. mistral3 (empty config = the llama shape) has no <= 35B fixture;
@@ -676,6 +720,12 @@ def test_metal_family_matrix(t : T?) {
                 "gemma3-4b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding |
                     MetalNeed.pre_post_norm | MetalNeed.geglu | MetalNeed.qd_neq_dim,
                 "")
+            // gemma4-12B (stage 3): the heterogeneous line — two attention classes (sliding
+            // 16q/8kv/256, global 16q/1kv/512 MQA), V-from-K on global layers, v_norm,
+            // out_scale on the whole layer output, unit attn scale, final softcap + suppress.
+            // SINGLE decode serves; batch + prefill decline need_v_norm until stages 3c/3d.
+            // 7.4GB > the 6GiB tier — runs under DASLLAMA_PARITY_FULL=1 (like the 8B rows).
+            gemma4_hetero_row(t, path_join(models_dir(), "gemma-4-12B-it-Q4_K_M.gguf"))
             metal_decode_shutdown()
             metal_prefill_shutdown()
             t |> equal(metal_live_object_count(), 0l)

@@ -694,19 +694,33 @@ def mirror_evict_to_cap(cap_bytes : uint64; keep : uint64) {
     }
 }
 
+// Hetero-safe per-layer mirror addressing (gemma4's two kv-head classes): every KV codec is
+// linear bytes-per-element for kvd % 32 == 0, so the layout_offsets element prefix scales
+// straight to bytes. Uniform models reduce to the old l * cap * rowb addresses exactly.
+def mirror_row_total(t : Model) : int64 {
+    let c = t.config
+    var tot = 0l
+    for (l in range64(c.n_layers)) {
+        tot += layer_kv_dim(c, l)   // the GPU gate pins kv_src[l] == l, so every layer owns rows
+    }
+    return tot
+}
+
+//! layer l's slab base (bytes) within a mirror K or V plane of cap rows
+def mirror_lbase(t : Model; dt : KVDtype; cap, l : int64) : int64 => cap * kv_row_bytes(dt, t.kv_row_prefix[l])
+
 // the slice mirror_prepare would build for (s, pos): chunked high-water cap (pow2 from 256,
 // never past the session's own seq cap) and the K/V plane sizes
 def private mirror_slice_shape(t : Model; s : Session; pos : int64) : tuple<cap : int64; kbytes : uint64; vbytes : uint64> {
-    let c = t.config
-    let kv_dim = layer_kv_dim(c, 0l)
     let needed = pos + 1l
     var cap = 256l
     while (cap < needed) {
         cap *= 2l
     }
-    cap = clamp(cap, needed, c.seq_len)
-    return (cap = cap, kbytes = uint64(c.n_layers * cap * kv_row_bytes(s.kv_dtype_k, kv_dim)),
-            vbytes = uint64(c.n_layers * cap * kv_row_bytes(s.kv_dtype_v, kv_dim)))
+    cap = clamp(cap, needed, t.config.seq_len)
+    let total = mirror_row_total(t)
+    return (cap = cap, kbytes = uint64(cap * kv_row_bytes(s.kv_dtype_k, total)),
+            vbytes = uint64(cap * kv_row_bytes(s.kv_dtype_v, total)))
 }
 
 def private mirror_ceiling_bytes : uint64 {
@@ -793,9 +807,6 @@ def mirror_defrag(total : uint64) : bool {
 // advances the watermark only after the step + writeback complete. ok=false ⇒ decline to CPU.
 def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; koff : uint64; voff : uint64; cap : int64> {
     let c = t.config
-    let kv_dim = layer_kv_dim(c, 0l)
-    let krow = kv_row_bytes(s.kv_dtype_k, kv_dim)
-    let vrow = kv_row_bytes(s.kv_dtype_v, kv_dim)
     let needed = pos + 1l
     if (key_exists(g_mirrors, s.uid)) {
         // uid is never reused, so dtype can't legitimately change — a mismatch means a stale
@@ -870,15 +881,20 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
             var kdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + koff
             var vdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + voff
             for (l in range64(c.n_layers)) {
+                let kvd_l = layer_kv_dim(c, l)
+                let krow = kv_row_bytes(s.kv_dtype_k, kvd_l)
+                let vrow = kv_row_bytes(s.kv_dtype_v, kvd_l)
+                let klb = mirror_lbase(t, s.kv_dtype_k, cap, l)
+                let vlb = mirror_lbase(t, s.kv_dtype_v, cap, l)
                 let kbase = kv_layer_kbase(s, l, c.seq_len)
                 let vbase = kv_layer_vbase(s, l, c.seq_len)
                 for (r in range64(nrun)) {
                     let j0 = s.kv_runs[r].j0
                     let nrows = s.kv_runs[r].j1 - j0
                     let prow = s.kv_runs[r].row0
-                    memcpy(reinterpret<void?>(kdst + (l * cap + j0) * krow),
+                    memcpy(reinterpret<void?>(kdst + klb + j0 * krow),
                         reinterpret<void?>(kbase + prow * krow), int(nrows * krow))
-                    memcpy(reinterpret<void?>(vdst + (l * cap + j0) * vrow),
+                    memcpy(reinterpret<void?>(vdst + vlb + j0 * vrow),
                         reinterpret<void?>(vbase + prow * vrow), int(nrows * vrow))
                 }
             }
@@ -1009,6 +1025,11 @@ var g_lp_layers = 0l
 var g_lp_seq = 0l
 var g_lp_vocab = 0l
 var g_lp_rowb = 0l
+// hetero (gemma4): per-layer row bytes + slab bases within a mirror plane (uniform models:
+// rowb_l == g_lp_rowb, lbase_l == l * cap * rowb — captured at encode, one array per step)
+var g_lp_lrowb : array<int64>
+var g_lp_lkbase : array<int64>   // per (row i, layer l) flattened i * n_layers + l (caps differ per row)
+var g_lp_lvbase : array<int64>
 var g_lp_prev_gpu_end = 0.0lf   // last finished step's gpu_end — the handoff stat's anchor
 
 // wait + read back + release the pending step; x_b writes back only on the sync CPU-classifier
@@ -1058,12 +1079,13 @@ def finish_pending_step {
                 var sp = g_lp_sessions[i]
                 let pos = g_lp_positions[i]
                 let prow = kv_phys_row(*sp, pos)
-                let cap = g_lp_caps[i]
                 for (l in range64(g_lp_layers)) {
-                    memcpy(reinterpret<void?>(kv_layer_kbase(*sp, l, g_lp_seq) + prow * g_lp_rowb),
-                        reinterpret<void?>(ab + (g_lp_koffs[i] + uint64((l * cap + pos) * g_lp_rowb))), int(g_lp_rowb))
-                    memcpy(reinterpret<void?>(kv_layer_vbase(*sp, l, g_lp_seq) + prow * g_lp_rowb),
-                        reinterpret<void?>(ab + (g_lp_voffs[i] + uint64((l * cap + pos) * g_lp_rowb))), int(g_lp_rowb))
+                    let rowb_l = g_lp_lrowb[l]
+                    let fb = i * g_lp_layers + l
+                    memcpy(reinterpret<void?>(kv_layer_kbase(*sp, l, g_lp_seq) + prow * rowb_l),
+                        reinterpret<void?>(ab + (g_lp_koffs[i] + uint64(g_lp_lkbase[fb] + pos * rowb_l))), int(rowb_l))
+                    memcpy(reinterpret<void?>(kv_layer_vbase(*sp, l, g_lp_seq) + prow * rowb_l),
+                        reinterpret<void?>(ab + (g_lp_voffs[i] + uint64(g_lp_lvbase[fb] + pos * rowb_l))), int(rowb_l))
                 }
                 if (lgp != null) {
                     memcpy(addr < void? >(sp.logits[0]),
