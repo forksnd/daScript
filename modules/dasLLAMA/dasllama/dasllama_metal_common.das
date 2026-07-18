@@ -1024,9 +1024,8 @@ var g_lp_nrows = 0l
 var g_lp_layers = 0l
 var g_lp_seq = 0l
 var g_lp_vocab = 0l
-var g_lp_rowb = 0l
 // hetero (gemma4): per-layer row bytes + slab bases within a mirror plane (uniform models:
-// rowb_l == g_lp_rowb, lbase_l == l * cap * rowb — captured at encode, one array per step)
+// lbase_l == l * cap * rowb_l — captured at encode, one array per step)
 var g_lp_lrowb : array<int64>
 var g_lp_lkbase : array<int64>   // per (row i, layer l) flattened i * n_layers + l (caps differ per row)
 var g_lp_lvbase : array<int64>

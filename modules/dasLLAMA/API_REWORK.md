@@ -382,6 +382,13 @@ what it costs today and what the fix would change.
   panel copy (MetalPfCopy) then the ones-plane MetalQkNorm in place (+2 dispatches on gemma4's
   8 global layers). Fix: a read-K-write-V weightless-RMS variant (the CPU fuses the copy into
   rms_batch). Suppress adds one tiny classifier-tail dispatch — not worth fusing.
+  (7) *Batch mv + split-K rails stand down under hetero* (stage 3d, 2026-07-18) — the mul_mv
+  x-staging strides (u_xs4_*) and the split-K totals (u_skt_*, and the sk sites' u_qd k-dims)
+  bake ONE attention class, so hetero (gemma4) batch rides the cat-GEMV forms at B <= 4 and
+  the planar GEMM without sk at B >= 5. Fix when the gemma4 batch ladder says it matters:
+  per-class xs4/skt twins bound per layer, same shape as the attention uniform picks. The
+  batch V-from-K copy is also nrows tiny enc_copy_row dispatches — a strided-seg copy kernel
+  collapses them to one.
 
 - **Embeddings path (spotted building `/v1/embeddings`, 2026-07-06).** Two small items, neither
   chased: (1) `embed_forward` takes approach A — reuse `forward_prefill` then re-norm every

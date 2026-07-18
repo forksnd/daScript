@@ -1781,6 +1781,7 @@ class MetalEmbedQ8 {
     @ssbo @binding = 2 tok : array<uint>
     @ssbo @binding = 3 xo : array<float>    // [dim] residual input out
     @uniform @binding = 4 dim : uint
+    @uniform @binding = 5 escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere)
 
     [metal_kernel(name="metal_embed_q8_msl")]
     def metal_embed_q8 {
@@ -1789,7 +1790,7 @@ class MetalEmbedQ8 {
             return
         }
         let base = tok[0] * dim + gid
-        xo[gid] = float(q[base]) * sc[base / 32u]
+        xo[gid] = (float(q[base]) * sc[base / 32u]) * escale
     }
 }
 
@@ -1800,6 +1801,7 @@ class MetalEmbedQ8S16 {
     @ssbo @binding = 2 tok : array<uint>
     @ssbo @binding = 3 xo : array<float>
     @uniform @binding = 4 dim : uint
+    @uniform @binding = 5 escale : float
 
     [metal_kernel(name="metal_embed_q8_s16_msl")]
     def metal_embed_q8_s16 {
@@ -1808,7 +1810,7 @@ class MetalEmbedQ8S16 {
             return
         }
         let base = tok[0] * dim + gid
-        xo[gid] = float(q[base]) * float(sc[base / 32u])
+        xo[gid] = (float(q[base]) * float(sc[base / 32u])) * escale
     }
 }
 
@@ -1822,6 +1824,7 @@ class MetalEmbedK6 {
     @ssbo @binding = 3 tok : array<uint>
     @ssbo @binding = 4 xo : array<float>    // [dim] residual input out
     @uniform @binding = 5 dim : uint
+    @uniform @binding = 6 escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere)
 
     [metal_kernel(name="metal_embed_k6_msl")]
     def metal_embed_k6 {
@@ -1850,7 +1853,7 @@ class MetalEmbedK6 {
             qv = (qlb >> 4u) | ((h & 0xC0) >> 2u)
         }
         let sc = float((int(kscb[blk * 16u + ip * 8u + l / 16u + quarter * 2u]) ^ 128) - 128)
-        xo[gid] = float(kdh[blk]) * sc * (float(qv) - 32.0)
+        xo[gid] = (float(kdh[blk]) * sc * (float(qv) - 32.0)) * escale
     }
 }
 
@@ -3065,8 +3068,8 @@ class MetalSqAttnBF16 {
         let nt = gl_WorkGroupSize.x
         let rrow = rt[bb]
         let cnt = rrow.w
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let yoff = bb * (nheads * hs) + h * hs
@@ -3229,8 +3232,8 @@ class MetalSqAttnBF32 {
         let nt = gl_WorkGroupSize.x
         let rrow = rt[bb]
         let cnt = rrow.w
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let yoff = bb * (nheads * hs) + h * hs
@@ -3397,9 +3400,8 @@ class MetalSqAttnBQ8 {
         let nt = gl_WorkGroupSize.x
         let rrow = rt[bb]
         let cnt = rrow.w
-        let rowb = nblk * 34u
-        let kb0b = rrow.x + lay * rrow.z * rowb   // layer slab base, BYTES (even)
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // layer slab base, BYTES (lay = the layer's row-BYTE prefix)
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u                      // ... and HALFWORDS for the scale view
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -3578,9 +3580,8 @@ class MetalSqAttnBTq4 {
         let nt = gl_WorkGroupSize.x
         let rrow = rt[bb]
         let cnt = rrow.w
-        let rowb = nblk * 18u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -3757,8 +3758,8 @@ class MetalSqAttnPartBF16 {
         }
         let lid = gl_LocalInvocationID.x
         let nt = gl_WorkGroupSize.x
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
@@ -3951,8 +3952,8 @@ class MetalSqAttnPartBF32 {
         }
         let lid = gl_LocalInvocationID.x
         let nt = gl_WorkGroupSize.x
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
@@ -4148,9 +4149,8 @@ class MetalSqAttnPartBQ8 {
         }
         let lid = gl_LocalInvocationID.x
         let nt = gl_WorkGroupSize.x
-        let rowb = nblk * 34u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -4358,9 +4358,8 @@ class MetalSqAttnPartBTq4 {
         }
         let lid = gl_LocalInvocationID.x
         let nt = gl_WorkGroupSize.x
-        let rowb = nblk * 18u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -4599,8 +4598,8 @@ class MetalSqAttnDF16 {
             return
         }
         let sl = gl_SubgroupInvocationID
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let kv4 = kv_dim / 4u
@@ -4710,8 +4709,8 @@ class MetalSqAttnDF32 {
             return
         }
         let sl = gl_SubgroupInvocationID
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let kv4 = kv_dim / 4u
@@ -4896,8 +4895,8 @@ class MetalRopeStoreBF16 {
         let fcr = tcos[bb * half + j]
         let fci = tsin[bb * half + j]
         if (isK) {
-            let kdst = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
-            let vdst = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
+            let kdst = rrow.x + lay * rrow.z + (rrow.w - 1u) * kv_dim   // lay = element prefix
+            let vdst = rrow.y + lay * rrow.z + (rrow.w - 1u) * kv_dim
             let v0 = qk[qbase + qd + i] + (has_bias != 0u ? bias[qd + i] : 0.0)
             let v1 = qk[qbase + qd + i2] + (has_bias != 0u ? bias[qd + i2] : 0.0)
             let r0 = v0 * fcr - v1 * fci
@@ -4955,8 +4954,8 @@ class MetalRopeStoreBF32 {
         let fcr = tcos[bb * half + j]
         let fci = tsin[bb * half + j]
         if (isK) {
-            let kdst = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
-            let vdst = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
+            let kdst = rrow.x + lay * rrow.z + (rrow.w - 1u) * kv_dim   // lay = element prefix
+            let vdst = rrow.y + lay * rrow.z + (rrow.w - 1u) * kv_dim
             let v0 = qk[qbase + qd + i] + (has_bias != 0u ? bias[qd + i] : 0.0)
             let v1 = qk[qbase + qd + i2] + (has_bias != 0u ? bias[qd + i2] : 0.0)
             kd[kdst + i] = v0 * fcr - v1 * fci
@@ -5004,9 +5003,8 @@ class MetalSqAttnDQ8 {
             return
         }
         let sl = gl_SubgroupInvocationID
-        let rowb = nblk * 34u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -5197,7 +5195,7 @@ class MetalRopeStoreBQ8 {
         let d = amax / 127.0
         let id = d != 0.0 ? 1.0 / d : 0.0
         if (isV) {
-            let vb0b = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * rowb
+            let vb0b = rrow.y + lay * rrow.z + (rrow.w - 1u) * rowb   // lay = row-byte prefix
             vsh[vb0b / 2u + blk * 17u] = float16(d)
             k = 0u
             while (k < 32u) {
@@ -5205,7 +5203,7 @@ class MetalRopeStoreBQ8 {
                 k++
             }
         } else {
-            let kb0b = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * rowb
+            let kb0b = rrow.x + lay * rrow.z + (rrow.w - 1u) * rowb
             ksh[kb0b / 2u + blk * 17u] = float16(d)
             k = 0u
             while (k < 32u) {
@@ -5247,9 +5245,8 @@ class MetalSqAttnDTq4 {
             return
         }
         let sl = gl_SubgroupInvocationID
-        let rowb = nblk * 18u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -5445,7 +5442,7 @@ class MetalRopeStoreBTq4 {
         let rowb = (kv_dim / 32u) * 18u
         let blk = hh * (hs / 32u) + lid / 32u   // block within the K/V row
         if (isK) {
-            let kb0b = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * rowb
+            let kb0b = rrow.x + lay * rrow.z + (rrow.w - 1u) * rowb   // lay = row-byte prefix
             if (sl == 0u) {
                 ksh[kb0b / 2u + blk * 9u] = float16(d)
             }
@@ -5453,7 +5450,7 @@ class MetalRopeStoreBTq4 {
                 kqb[kb0b + blk * 18u + 2u + (lid % 32u) / 2u] = uint8(uint(qv) | (uint(qother) << 4u))
             }
         } else {
-            let vb0b = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * rowb
+            let vb0b = rrow.y + lay * rrow.z + (rrow.w - 1u) * rowb
             if (sl == 0u) {
                 vsh[vb0b / 2u + blk * 9u] = float16(d)
             }
@@ -5474,6 +5471,8 @@ class MetalAddRmsB {
     @ssbo @binding = 3 y : array<float>     // [B x dim] normed out (y may alias a)
     @uniform @binding = 4 dim : uint
     @uniform @binding = 5 eps : float
+    @uniform @binding = 6 ascale : float    // (x + a) * ascale — gemma4 layer_out_scale scales
+                                            // the WHOLE layer output; every other site binds 1.0
     @workgroup xrow : float[4096]           // == ADD_RMS_MAX_DIM
     @workgroup partial : float[32]
     @workgroup inv_sh : float
@@ -5485,7 +5484,7 @@ class MetalAddRmsB {
         var ss = 0.0
         var k = lid
         while (k < dim) {
-            let vv = x[row * dim + k] + a[row * dim + k]
+            let vv = (x[row * dim + k] + a[row * dim + k]) * ascale
             x[row * dim + k] = vv
             xrow[k] = vv
             ss += vv * vv
@@ -6007,19 +6006,20 @@ def enc_copy_row(enc : MetalComputeEncoder?; bsrc : MetalBuffer?; soff : uint64;
     metal_dispatch_threadgroups(enc, uint3(uint((n + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
-def enc_embed(enc : MetalComputeEncoder?; s16 : bool; bq, bs, btok, bx, bdim : MetalBuffer?; dim : int64) {
+def enc_embed(enc : MetalComputeEncoder?; s16 : bool; bq, bs, btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
     metal_set_pipeline(enc, s16 ? g_pso_emb16 : g_pso_emb)
     metal_set_buffer(enc, bq, 0ul, 0)
     metal_set_buffer(enc, bs, 0ul, 1)
     metal_set_buffer(enc, btok, 0ul, 2)
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, bdim, 0ul, 4)
+    metal_set_buffer(enc, bescale != null ? bescale : g_one, 0ul, 5)   // embed_scale (identity 1.0)
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // the tied-k6 spec embed gather: the scale buffer binds twice (f16 d plane @nsb*16 halfwords +
 // sub-scale byte blocks @0), the quant plane once — nsb = the plane's TOTAL superblock count
-def enc_embed_k6(enc : MetalComputeEncoder?; bq, bs, btok, bx, bdim : MetalBuffer?; dim, nsb : int64) {
+def enc_embed_k6(enc : MetalComputeEncoder?; bq, bs, btok, bx, bdim, bescale : MetalBuffer?; dim, nsb : int64) {
     metal_set_pipeline(enc, g_pso_emb_k6)
     metal_set_buffer(enc, bs, uint64(nsb * 16l), 0)
     metal_set_buffer(enc, bs, 0ul, 1)
@@ -6027,6 +6027,7 @@ def enc_embed_k6(enc : MetalComputeEncoder?; bq, bs, btok, bx, bdim : MetalBuffe
     metal_set_buffer(enc, btok, 0ul, 3)
     metal_set_buffer(enc, bx, 0ul, 4)
     metal_set_buffer(enc, bdim, 0ul, 5)
+    metal_set_buffer(enc, bescale != null ? bescale : g_one, 0ul, 6)   // embed_scale (identity 1.0)
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6652,7 +6653,7 @@ def enc_rope_store_b_q8(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay,
     metal_dispatch_threadgroups(enc, uint3(uint((nthreads + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
 }
 
-def enc_add_rms_b(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; nrows : int64) {
+def enc_add_rms_b(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; nrows : int64; bascale : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_addrmsb)
     metal_set_threadgroup_memory_length(enc, metal_add_rms_b_msl_tgmem, 0)
     metal_set_buffer(enc, bx, 0ul, 0)
@@ -6661,6 +6662,7 @@ def enc_add_rms_b(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Metal
     metal_set_buffer(enc, by, 0ul, 3)
     metal_set_buffer(enc, bdim, 0ul, 4)
     metal_set_buffer(enc, beps, 0ul, 5)
+    metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 6)   // the add's ascale slot
     metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(1024u, 1u, 1u))
 }
 

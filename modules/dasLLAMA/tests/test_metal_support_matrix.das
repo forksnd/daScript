@@ -52,7 +52,7 @@ require _model_tier
 // (neox+softcap+sliding+pre_post_norm+geglu, hs 256 — wave B stage 1) + gemma3 (dual-theta
 // per-layer rope — stage 2), each row token-parity-proven on all three paths. gemma4-12B
 // (stage 3: two attention classes, hs 512, V-from-K, v_norm, out_scale, suppress) serves
-// single decode + prefill token-exact; batch declines need_v_norm until stage 3d. mistral3
+// ALL THREE paths token-exact (stage 3d: per-class batch uniforms + prefix `lay`). mistral3
 // (empty config = the llama shape) serves by construction; no <= 35B mistral3-arch GGUF
 // exists to validate against, so its real-model row waits on a fixture. MoE/deltanet = C-D.
 
@@ -643,11 +643,49 @@ def private gemma2_window_row(t : T?; path : string) {
     }
 }
 
+// two CPU-prefilled streams through `nsteps` greedy eval_batch steps (whatever decode override
+// is selected) — returns the interleaved sampled tokens, the B=2 parity arm's shape
+def private batch_pair_steps(tr : Model; pa, pb : array<int64>; nsteps : int) : array<int64> {
+    let c = tr.config
+    let vocab = c.vocab_size
+    var sa = make_run_state(c, KVDtype.f16, KVDtype.f16)
+    var sb = make_run_state(c, KVDtype.f16, KVDtype.f16)
+    eval_(tr, sa, pa)
+    eval_(tr, sb, pb)
+    var out : array<int64>
+    out |> reserve(2 * (nsteps + 1))
+    var ws <- create_batch_workspace_(tr)
+    var sess : array<Session?>
+    unsafe {
+        sess |> push(addr(sa))
+        sess |> push(addr(sb))
+    }
+    var cur <- [greedy_top(sa.logits, vocab), greedy_top(sb.logits, vocab)]
+    for (_i in range(nsteps)) {
+        out |> push(cur[0])
+        out |> push(cur[1])
+        eval_batch_(tr, ws, sess, cur)
+        cur[0] = greedy_top(sa.logits, vocab)
+        cur[1] = greedy_top(sb.logits, vocab)
+    }
+    out |> push(cur[0])
+    out |> push(cur[1])
+    sess |> clear()   // borrowed handles — delete of array<T?> cascades to the pointees
+    unsafe {
+        delete ws
+        delete sess
+    }
+    delete cur
+    delete sa
+    delete sb
+    return <- out
+}
+
 [unused_argument(t, path)]   // off-Apple the gated body is empty
 def private gemma4_hetero_row(t : T?; path : string) {
-    // the stage-3 heterogeneous row: needs-derivation pin, per-path cells (prefill + decode
-    // ENGAGE, batch DECLINES need_v_norm until 3d), a FREEFORM decode-only token-parity
-    // generate, a counting both-paths generate, and the continuation-prefill numeric cell —
+    // the stage-3 heterogeneous row: needs-derivation pin, per-path cells (all three ENGAGE),
+    // a FREEFORM decode-only token-parity generate, a counting both-paths generate, a B=2
+    // batched-decode parity, and the continuation-prefill numeric cell —
     // the per-class geometry, V-from-K, v_norm, out_scale, dual-theta p-RoPE and the
     // suppress+softcap gpu-logits tail all sit on the proven paths. The both-paths generate is
     // COUNTING on purpose: gemma4's 48-layer big-magnitude stack amplifies GPU reduction-order
@@ -668,14 +706,18 @@ def private gemma4_hetero_row(t : T?; path : string) {
             MetalNeed.qd_neq_dim)
         t |> success((uint(derived) & uint(want_bits)) == uint(want_bits),
             "gemma4-12b/k4: metal_needs derives {want_bits} (got {derived})")
-        matrix_cell(t, tr, KVDtype.f16, "gemma4-12b/k4/f16", "", "", "need_v_norm")
+        matrix_cell(t, tr, KVDtype.f16, "gemma4-12b/k4/f16", "", "", "")
         let prompt <- encode(tr, "The old lighthouse keeper watched the storm roll in from the", true, false)
         let count_prompt <- encode(tr, counting_prompt(1, 30), true, false)
+        let count_prompt2 <- encode(tr, counting_prompt(7, 36), true, false)
         var cpu_ids : array<int64>
         var gpu_ids : array<int64>
         var cpu_cnt_ids : array<int64>
         var both_ids : array<int64>
+        var cpu_bat : array<int64>
+        var gpu_bat : array<int64>
         var served_pf = 0l
+        var served_bat = 0l
         with_job_que() {
             setup_dasllama_jobque()
             var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
@@ -702,17 +744,30 @@ def private gemma4_hetero_row(t : T?; path : string) {
             select_prefill_override("")
             select_decode_override("")
             served_pf = metal_prefill_stats().prefills - pf0
+            // B=2 batched-decode parity (counting margins — see the header note): CPU truth
+            // then the batched metal override, 4 steps per stream over CPU-prefilled state
+            cpu_bat <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)
+            let ba0 = metal_batch_decode_stats().steps
+            select_decode_override("metal")
+            gpu_bat <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)
+            select_decode_override("")
+            served_bat = metal_batch_decode_stats().steps - ba0
         }
         t |> success(same(cpu_ids, gpu_ids),
             "gemma4-12b/k4: metal-decode generate matches the CPU truth token-for-token")
         t |> success(served_pf > 0l, "gemma4-12b/k4: the hetero prefill ENGAGED ({served_pf} served)")
         t |> success(same(cpu_cnt_ids, both_ids),
             "gemma4-12b/k4: metal prefill+decode generate matches the CPU truth token-for-token")
+        t |> success(served_bat > 0l, "gemma4-12b/k4: the hetero batch ENGAGED ({served_bat} served)")
+        t |> success(same(cpu_bat, gpu_bat),
+            "gemma4-12b/k4: B=2 batched decode matches the CPU truth token-for-token")
         cont_logits_cell(t, tr, "gemma4-12b/k4", 8.0)
         delete cpu_ids
         delete gpu_ids
         delete cpu_cnt_ids
         delete both_ids
+        delete cpu_bat
+        delete gpu_bat
         delete tr
     }
 }
@@ -807,7 +862,7 @@ def test_metal_family_matrix(t : T?) {
             // gemma4-12B (stage 3): the heterogeneous line — two attention classes (sliding
             // 16q/8kv/256, global 16q/1kv/512 MQA), V-from-K on global layers, v_norm,
             // out_scale on the whole layer output, unit attn scale, final softcap + suppress.
-            // Single decode + prefill serve; batch declines need_v_norm until stage 3d.
+            // All three paths serve (stage 3d: per-class batch uniforms + the prefix `lay`).
             // 7.4GB > the 6GiB tier — runs under DASLLAMA_PARITY_FULL=1 (like the 8B rows).
             gemma4_hetero_row(t, path_join(models_dir(), "gemma-4-12B-it-Q4_K_M.gguf"))
             metal_decode_shutdown()
