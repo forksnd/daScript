@@ -45,6 +45,9 @@ struct Args {
     @clarg_doc = "CPU-truth cache path prefix — computed and SAVED once, loaded on every rerun (default: no cache)"
     truth : string = ""
 
+    @clarg_doc = "Compute and save the CPU truths, skip the Metal replay — mint truths UNPINNED (fast arm64-gen backend, ~3-5x quicker at 12B); the pinned-portable replay run then loads the cache"
+    truth_only : bool
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -244,6 +247,12 @@ def main() : int {
                 if (!empty(cpath)) {
                     save_truth(cpath, feeds, truth)
                 }
+            }
+            if (cfg.truth_only) {
+                print("B={nb}: truth {cached ? "already cached" : "minted"}\n")
+                delete feeds
+                delete truth
+                continue
             }
             select_decode_override("metal")
             var sink2 : array<int64>
