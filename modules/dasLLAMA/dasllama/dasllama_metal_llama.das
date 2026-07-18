@@ -1300,9 +1300,9 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     let w2_sk = (sk_ok && (hidden / 32l) % 8l == 0l) ? 8l : 0l
     let cls64 = use_gemm && !use_mm && g_bsk && (c.vocab_size % 64l) == 0l
     // the mul_mv rail owns the whole fixed-B path (w13 = two mv dispatches + the ew2 swiglu, so
-    // the x-staged w13sw fusion stands down with it). Hetero stands mv down (the xs4 x-staging
-    // strides bake one class) — fixed-B hetero rides the cat-GEMV forms
-    let mv = g_bmv && !use_gemm && !use_mm && !hetero
+    // the x-staged w13sw fusion stands down with it). Hetero rides it too: the QKV arm carries
+    // the no-wv cat3 stream, and the wo site's x stride (the one per-class xs4) picks its twin
+    let mv = g_bmv && !use_gemm && !use_mm
     let geglu = c.ffn_act != FfnAct.silu    // gemma: gelu gate — the swiglu-fused w13 form stands down
     // fold w1+w3+swiglu into one fused GEMV on the fixed-B path; a knockout run (g_skip) keeps the
     // stages separable so its per-stage attribution stays valid
@@ -1420,6 +1420,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     var u_total_h = uniform_u32(uint(nrows * hidden))
     var u_xs4_dim = mv ? uniform_u32(uint(dim / 4l)) : null
     var u_xs4_qd = mv ? uniform_u32(uint(qd / 4l)) : null
+    var u_xs4_qd_sw = (mv && hetero) ? uniform_u32(uint(qd_sw / 4l)) : null   // the wo x stride's sliding-class twin
     var u_xs4_hid = mv ? uniform_u32(uint(hidden / 4l)) : null
     var u_nrows_mv = (mv && nrows > 2l) ? uniform_u32(uint(min(nrows, 4l))) : null
     var u_nrows_mv2 = (mv && nrows > 4l) ? uniform_u32(uint(nrows - 4l)) : null
@@ -1567,6 +1568,10 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                         enc_copy_row(enc, bqkv, uint64((i * qkvd_l + qd_l) * 4l), bqkv, u_kvd_l, kvd_l,
                             uint64((i * qkvd_l + qd_l + kvd_l) * 4l))
                     }
+                    // the copies WRITE the v segment the ones-norm below reads — the concurrent
+                    // encoder orders only via hazards, and racing them corrupted V by 10-20
+                    // (teacher-forced logits Δ15-22 vs the serial encoder's 0.57)
+                    bar_dep(enc, haz, HZ_BQKV, HZ_BQKV)
                 }
                 if (c.v_norm) {
                     // MAX-width ones upload: the region cache is address-keyed and both classes
@@ -1672,7 +1677,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 } elif (mv) {
                     bar_dep(enc, haz, HZ_BXB, HZ_BXB2)
                     enc_mv_site(enc, blob_of(t, t.wo_offs[l], dim, qd_l), bxb, bxb2,
-                        u_qd_l, u_dim, u_xs4_qd, dim, nrows, uint64(qd_l * 4l), u_nrows_mv, u_nrows_mv2)
+                        u_qd_l, u_dim, het ? u_xs4_qd_sw : u_xs4_qd, dim, nrows, uint64(qd_l * 4l), u_nrows_mv, u_nrows_mv2)
                 } else {
                     var bwo = upload_region(addr < void? >(t.qblob[t.wo_offs[l]]), uint64(dim * qd_l))
                     var bwo_s = upload_scales(t, t.wo_offs[l], dim, qd_l)
@@ -1980,6 +1985,9 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     if (mv) {
         g_lp_upooled |> push((buf = u_xs4_dim, size = 4ul))
         g_lp_upooled |> push((buf = u_xs4_qd, size = 4ul))
+        if (u_xs4_qd_sw != null) {
+            g_lp_upooled |> push((buf = u_xs4_qd_sw, size = 4ul))
+        }
         g_lp_upooled |> push((buf = u_xs4_hid, size = 4ul))
         if (u_nrows_mv != null) {
             g_lp_upooled |> push((buf = u_nrows_mv, size = 4ul))

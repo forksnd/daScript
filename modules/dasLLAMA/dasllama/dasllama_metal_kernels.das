@@ -6263,6 +6263,9 @@ def enc_mv_site(enc : MetalComputeEncoder?; bwblob, bx, by, bn, bd, bxs : MetalB
                 d, nrows : int64; xrowb : uint64; bnr, bnr2 : MetalBuffer?) {
     enc_mv_b(enc, nrows > 2l, bwblob, bx, by, bn, bd, bxs, d, bnr)
     if (nrows > 4l) {
+        // the rows-5..8 dispatch offsets y by 4 * d — valid only while d == the y row stride
+        // (bd). The one d != stride site (the no-wv QKV cat) can't reach here: mv8 gates
+        // dim <= 3072 and no-wv exists only on gemma4 (dim 3840)
         enc_mv_b(enc, true, bwblob, bx, by, bn, bd, bxs, d, bnr2, 4ul * xrowb, uint64(4l * d * 4l))
     }
 }

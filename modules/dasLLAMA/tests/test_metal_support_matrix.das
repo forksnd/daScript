@@ -681,6 +681,120 @@ def private batch_pair_steps(tr : Model; pa, pb : array<int64>; nsteps : int) : 
     return <- out
 }
 
+// B=4 batched steps under TEACHER-FORCED tokens (deterministic synthetic feed, identical on
+// the CPU and GPU passes — no greedy feedback, so a near-tie flip cannot compound), returning
+// the four streams' final-step logits concatenated for a tolerance compare.
+def private batch_quad_forced_logits(tr : Model; pa, pb, pc, pd : array<int64>; nsteps : int) : array<float> {
+    let c = tr.config
+    let vocab = c.vocab_size
+    var sa = make_run_state(c, KVDtype.f16, KVDtype.f16)
+    var sb = make_run_state(c, KVDtype.f16, KVDtype.f16)
+    var sc = make_run_state(c, KVDtype.f16, KVDtype.f16)
+    var sd = make_run_state(c, KVDtype.f16, KVDtype.f16)
+    eval_(tr, sa, pa)
+    eval_(tr, sb, pb)
+    eval_(tr, sc, pc)
+    eval_(tr, sd, pd)
+    var ws <- create_batch_workspace_(tr)
+    var sess : array<Session?>
+    unsafe {
+        sess |> push(addr(sa))
+        sess |> push(addr(sb))
+        sess |> push(addr(sc))
+        sess |> push(addr(sd))
+    }
+    var cur <- [0l, 0l, 0l, 0l]
+    for (st in range(nsteps)) {
+        for (i in range(4)) {
+            cur[i] = 1000l + int64(st) * 7l + int64(i)
+        }
+        eval_batch_(tr, ws, sess, cur)
+    }
+    var out : array<float>
+    out |> reserve(int(vocab) * 4)
+    out |> push_from(sa.logits, sb.logits, sc.logits, sd.logits)
+    sess |> clear()   // borrowed handles — delete of array<T?> cascades to the pointees
+    unsafe {
+        delete ws
+        delete sess
+    }
+    delete cur
+    delete sa
+    delete sb
+    delete sc
+    delete sd
+    return <- out
+}
+
+[unused_argument(t, path)]   // off-Apple the gated body is empty
+def private gemma4_hetero_q8_row(t : T?; path : string) {
+    // the q8-format twin of the hetero row: batched q8 sites ride the fixed-B mul_mv rail
+    // (MetalQ8MvB2/B4 + the no-wv [wq|wk] cat3 stream + the wo xs4 sliding twin) — a kernel
+    // class the k4 row's kq planes never dispatch. Counting generates only (the q8 file's
+    // near-tie landscape differs from k4's, so a freeform arm would ride sub-noise ties):
+    // the single generate covers the single-stream q8 hetero sites, B=2 token parity covers
+    // MvB2, and the B=4 cell is a TEACHER-FORCED LOGITS compare — on this file the counting
+    // continuations themselves hit a step-3 near-tie (the portable and arm64-gen CPU truths
+    // pick different tokens there), so B=4 token equality is not a valid bar; forced feeds +
+    // tolerance still pin the real corruption class. The cont cell gates the q8 prefill panels.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "gemma4") || !arm_on(t, "fam-gemma4") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let count_prompt <- encode(tr, counting_prompt(1, 30), true, false)
+        let count_prompt2 <- encode(tr, counting_prompt(7, 36), true, false)
+        let count_prompt3 <- encode(tr, counting_prompt(3, 41), true, false)
+        let count_prompt4 <- encode(tr, counting_prompt(11, 29), true, false)
+        var cpu_ids : array<int64>
+        var gpu_ids : array<int64>
+        var cpu_b2 : array<int64>
+        var gpu_b2 : array<int64>
+        var served_bat = 0l
+        var d4 = 0.0
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids <- generate(tr, s, count_prompt, length(count_prompt) + 8)
+            cpu_ids := ids
+            delete s
+            select_decode_override("metal")
+            var s2 = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids2 <- generate(tr, s2, count_prompt, length(count_prompt) + 8)
+            gpu_ids := ids2
+            delete s2
+            select_decode_override("")
+            cpu_b2 <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)
+            var cpu_bl <- batch_quad_forced_logits(tr, count_prompt, count_prompt2, count_prompt3, count_prompt4, 4)
+            let ba0 = metal_batch_decode_stats().steps
+            select_decode_override("metal")
+            gpu_b2 <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)
+            var gpu_bl <- batch_quad_forced_logits(tr, count_prompt, count_prompt2, count_prompt3, count_prompt4, 4)
+            select_decode_override("")
+            served_bat = metal_batch_decode_stats().steps - ba0
+            for (i in range(length(cpu_bl))) {
+                d4 = max(d4, abs(cpu_bl[i] - gpu_bl[i]))
+            }
+            delete cpu_bl
+            delete gpu_bl
+        }
+        t |> success(same(cpu_ids, gpu_ids),
+            "gemma4-12b/q8: metal-decode generate matches the CPU truth token-for-token")
+        t |> success(served_bat > 0l, "gemma4-12b/q8: the hetero q8 batch ENGAGED ({served_bat} served)")
+        t |> success(same(cpu_b2, gpu_b2),
+            "gemma4-12b/q8: B=2 batched decode (MvB2) matches the CPU truth token-for-token")
+        t |> success(d4 < 8.0,
+            "gemma4-12b/q8: B=4 forced-feed batched logits (MvB4) within 8 of CPU (measured {d4})")
+        cont_logits_cell(t, tr, "gemma4-12b/q8", 8.0)
+        delete cpu_ids
+        delete gpu_ids
+        delete cpu_b2
+        delete gpu_b2
+        delete tr
+    }
+}
+
 [unused_argument(t, path)]   // off-Apple the gated body is empty
 def private gemma4_hetero_row(t : T?; path : string) {
     // the stage-3 heterogeneous row: needs-derivation pin, per-path cells (all three ENGAGE),
@@ -865,6 +979,9 @@ def test_metal_family_matrix(t : T?) {
             // All three paths serve (stage 3d: per-class batch uniforms + the prefix `lay`).
             // 7.4GB > the 6GiB tier — runs under DASLLAMA_PARITY_FULL=1 (like the 8B rows).
             gemma4_hetero_row(t, path_join(models_dir(), "gemma-4-12B-it-Q4_K_M.gguf"))
+            // the q8 twin drives the hetero fixed-B mul_mv rail (a class the k4 row never
+            // dispatches); 12.5GB — DASLLAMA_PARITY_FULL-gated like the row above
+            gemma4_hetero_q8_row(t, path_join(models_dir(), "gemma-4-12B-it-Q8_0.gguf"))
             metal_decode_shutdown()
             metal_prefill_shutdown()
             t |> equal(metal_live_object_count(), 0l)
