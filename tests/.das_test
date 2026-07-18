@@ -5,6 +5,10 @@ require daslib/rtti
 
 [export, pinvoke]
 def can_visit_folder(folder_name : string; var result : bool?) {
+    if (folder_name == "clipboard") {
+        *result = has_module("clipboard_core")
+        return
+    }
     if (folder_name == "dasHV") {
         *result = has_module("dashv")
         return

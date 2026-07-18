@@ -8,7 +8,7 @@ require daslib/fio
 
 // End-to-end throughput harness — the real metric for "reasonable performance".
 // Run under JIT: bin/daslang -jit modules/dasLLAMA/dasllama_perf.das
-// override the machine-local llama2.c checkout with DASLLAMA_LLAMA2C_DIR (same contract as tests/dasLLAMA)
+// override the machine-local llama2.c checkout with DASLLAMA_LLAMA2C_DIR (same contract as modules/dasLLAMA/tests)
 def private llama2c_dir() : string {
     let env = get_env_variable("DASLLAMA_LLAMA2C_DIR")
     return empty(env) ? "/Users/borisbatkin/Work/llama2.c" : env

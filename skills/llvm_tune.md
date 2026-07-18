@@ -68,7 +68,7 @@ map (sweep it, or record its shipped fallback).
 
 ## Testing
 
-`tests/jit_tests/llvm_tune_scope.das` is the end-to-end pattern: spawn the app as child daslang
+`modules/dasLLVM/tests/llvm_tune_scope.das` is the end-to-end pattern: spawn the app as child daslang
 processes across the policy flavors, use the `llvm_code_selftest::add_plus_k` generator (emits
 `a+b+k`) so the RESULT is a fingerprint of the stamped perm. The tuner is a seconds-fast fake
 that upserts via `tune_manifest_set`. Two scopes sharing the one sidecar prove the upsert

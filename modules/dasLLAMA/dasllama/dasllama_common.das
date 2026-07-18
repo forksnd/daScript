@@ -3338,6 +3338,10 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
     s.k |> resize(kvd)
     s.v |> resize(kvd)
     s.att |> resize(c.n_heads * c.seq_len)   // one row per head — decode attention threads over heads
+    // logits carry page-rounded CAPACITY (length stays vocab_size): the Metal drivers wrap this
+    // storage in a bytesNoCopy MTLBuffer (zero-copy logits), whose length must be a 16KB-page
+    // multiple — the reserve keeps that rounded length inside the array's own allocation
+    s.logits |> reserve(int(((c.vocab_size * 4l + 16383l) & ~16383l) / 4l))
     s.logits |> resize(c.vocab_size)
     if (c.n_expert > 0l) {   // MoE routing scratch
         s.moe_logits |> resize(c.n_expert)

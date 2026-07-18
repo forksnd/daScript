@@ -8,7 +8,8 @@ require strings
 // --jit-compile-only: build + verify + optimize the module, then stop — no DLL written or
 // loaded, no jitted function installed, the program runs interpreted. This is the
 // cross-emission smoke rail (gemm_generator_plan.md slice F); here we pin the host-triple
-// mechanics via a child daslang (argv[0] pattern — see llvm_tune_modes.das).
+// mechanics via a child daslang (argv[0] pattern — see
+// modules/dasLLVM/tests/llvm_tune_modes.das).
 
 [test]
 def test_jit_compile_only(t : T?) {

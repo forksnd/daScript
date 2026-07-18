@@ -307,7 +307,7 @@ as 14 `//!`-documented stubs (`load_model` / `create_session` / `encode` / `deco
   the `//!` block is the FIRST thing *inside* the function body — an above-def `//!` is silently
   discarded (this is why no engine docstring ever extracted; the engine's above-def `//!` remain as
   source comments only).
-- **Drift detector** (`tests/dasLLAMA/test_facade_docs.das`): every facade def has a body-leading
+- **Drift detector** (`modules/dasLLAMA/tests/test_facade_docs.das`): every facade def has a body-leading
   `//!` (and no inert above-def `//!` exists); facade stubs ↔ engine `_` spellings stay 1:1 in both
   directions; the examples stay facade-only. Negative-probed: an undocumented extra stub fails it.
 

@@ -103,6 +103,7 @@ namespace das {
     DAS_API int builtin_popen ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
     DAS_API int builtin_popen_binary ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
     DAS_API int builtin_popen_timeout ( const char * cmd, float timeout_sec, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_spawn_argv ( const Array & args_arr, Context * context, LineInfoArg * at );
     DAS_API int builtin_popen_argv ( const Array & args_arr, float timeout_sec, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
     DAS_API int builtin_popen_argv_pipe ( const Array & args_arr, const TBlock<void,const FILE *,const FILE *> & blk, Context * context, LineInfoArg * at );
     DAS_API char * get_full_file_name ( const char * path, Context * context, LineInfoArg * );

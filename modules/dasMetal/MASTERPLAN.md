@@ -522,7 +522,7 @@ masking, pads are zeroed) registered as a BATCH-ONLY `KernelBackend("metal")` at
 (reachable only via `select_batch_backend`; small-ntok/odd shapes delegate to the portable CPU
 kernel through new `kernel_backend_batch_fn`). Recipe: `DASLLAMA_PIN_BACKEND=arm64-sdot` (the
 donor needs the row-major world) + `DASLLAMA_WSCALE_F16=0` (the override swaps only the f32
-batch slot) + `DASLLAMA_PIN_BATCH_BACKEND=metal`. Gates: `tests/dasLLAMA/test_metal_gemm.das`
+batch slot) + `DASLLAMA_PIN_BATCH_BACKEND=metal`. Gates: `modules/dasLLAMA/tests/test_metal_gemm.das`
 (pow2 scales = BIT-EXACT vs portable — int8 quants and pow2 products are exact in half; arbitrary
 scales = the f16-dequant envelope, bounded 2e-3 × the dot-magnitude sum, NOT |y| — cancellation
 makes |y|-relative bounds dishonest); dasLLAMA suite 368 tests dormant-green; 40/40 greedy
@@ -899,7 +899,7 @@ DISCARDING (`delete` on grow skips the realloc's old-block copy), `resize_no_ini
 zero-fill). Measured (3B pp512, per-bucket profile): alloc 4969us -> 55us; embed +0.2ms
 (absorbs the first-touch page faults); framing TOTAL 5728 -> 1075us. A new `alloc` prof bucket
 makes the cost visible in every profile run. Exotic scratch (ple/deltanet/att_b/fa_*) stays on
-zeroing resize — only the 10 always-fully-written arrays switch. Gate: full tests/dasLLAMA
+zeroing resize — only the 10 always-fully-written arrays switch. Gate: full modules/dasLLAMA/tests
 suite (model oracles token-for-token).
 **NEXT: PR the arc — preflight --full + clean Parsec-off measurement round (announce, wait for go).**
 

@@ -21,7 +21,7 @@ require _model_tier
 // arms compare a gguf-backed load against a mapped image load of the same file — token-exact
 // for text models, element-exact planes for towers, transcript-exact for whisper. The
 // voxtral-mini arm is the designated >2 GiB-plane coverage (its q8 image is 5.4 GB), so it
-// re-saves the image from cold on every run by design. Drive through tests/dasLLAMA/run.das
+// re-saves the image from cold on every run by design. Drive through modules/dasLLAMA/tests/run.das
 // (--suite image); model arms follow the suite's presence/tier gates.
 
 def private whisper_dir() : string {
@@ -343,6 +343,7 @@ def private text_image_roundtrip(t : T?; path : string; n_gen : int) {
 [test]
 def test_model_image_roundtrip(t : T?) {
     t |> run("SmolLM2-135M q8: gguf load vs mapped image, token-for-token") @(t : T?) {
+        if (!family_on(t, "llama")) return
         if (!arm_on(t, "smol")) {
             return
         }
@@ -361,6 +362,7 @@ def test_model_image_roundtrip(t : T?) {
 [test]
 def test_voxtral_mini_image(t : T?) {
     t |> run("voxtral-mini q8: the >2 GiB-plane image round trip") @(t : T?) {
+        if (!family_on(t, "voxtral")) return
         if (!arm_on(t, "voxtral")) {
             return
         }
@@ -381,6 +383,7 @@ def test_voxtral_mini_image(t : T?) {
 [test]
 def test_gemma4_image_roundtrip(t : T?) {
     t |> run("gemma-4-E2B q8: arch-configure fallbacks must not clobber mapped config") @(t : T?) {
+        if (!family_on(t, "gemma")) return
         // gemma4's configure sets gguf-overridable fallbacks (sliding_window, swa_pattern);
         // re-running it on an image load stomped the serialized overrides (caught 2026-07-16:
         // token drift on the mapped E2B while every llama-arch carrier round-tripped clean)
@@ -402,6 +405,7 @@ def test_gemma4_image_roundtrip(t : T?) {
 [test]
 def test_tower_image_roundtrip(t : T?) {
     t |> run("ultravox-1b tower: mapped image planes are element-exact vs gguf") @(t : T?) {
+        if (!family_on(t, "ultravox")) return
         if (!arm_on(t, "tower")) {
             return
         }
@@ -487,6 +491,7 @@ def private whisper_transcribe_text(path : string; samples : array<float>) : tup
 [test]
 def test_whisper_image_roundtrip(t : T?) {
     t |> run("whisper tiny: gguf load vs mapped image, transcript-exact") @(t : T?) {
+        if (!family_on(t, "whisper")) return
         if (!arm_on(t, "whisper")) {
             return
         }

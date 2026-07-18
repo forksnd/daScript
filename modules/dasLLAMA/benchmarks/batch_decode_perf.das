@@ -2,7 +2,7 @@ options gen2
 options stack = 65536   // dasLLAMA program-root convention (options stack does not unify up from libs)
 options _jit_fast_math = true   // ggml-parity FP laxity — same rail as decode_prof / perf
 
-require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration
+require dasllama/dasllama   // nolint:STYLE029 — the facade: arch [init] registrations + load_model's prepared-image (.dlim) cache
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + pin_kernel_backend (engine-level, not re-exported)
 require ?das_metal dasllama/dasllama_metal_llama  // nolint:STYLE030 — per-stage report on the GPU rail (Apple builds only)
 require daslib/jobque_boost
@@ -193,7 +193,7 @@ def main() {
         }
     }
     print("loading {cfg.model}\n")
-    var t <- load_gguf(cfg.model, cfg.quant)
+    var t <- load_model(cfg.model, cfg.quant)   // facade: maps the prepared .dlim image when present
     t.config.seq_len = min(t.config.seq_len, p + n + 8l)   // cap the per-session KV allocation
     let c = t.config
     print("config: dim={c.dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size} moe={c.moe}\n")
@@ -202,8 +202,21 @@ def main() {
     print("prefill {p}, {n} decode steps per stream\n\n")
     with_job_que() {
         setup_dasllama_jobque_()
-        // warm both code paths (JIT + kernel dispatch) before any timed window
-        let _w1 = run_sequential(t, cfg.kv, 1l, 8l, 2l)
+        // warm both code paths (JIT + kernel dispatch) AND ramp the GPU to sustained clocks
+        // before any timed window — a 2-step warmup leaves the first timed phase ~3% slow and
+        // the second phase wins on position alone (the phase-order artifact, DASLLAMA_BENCH_SWAP
+        // proved it: the winner flips with the order). 48 steps (~0.6s) was STILL short — the
+        // n=512 control put the residual at 1.1% with sequential rising toward batched, and
+        // warmth persists ACROSS PROCESSES (position-1 numbers track the box's recent GPU
+        // history). 256 steps ~ 3s GPU-busy makes the first timed phase start ramped.
+        // Sessions are seq_len rows (capped to p + n + 8 above) with NO overflow guard, so the
+        // warmup loops fresh short streams instead of decoding one stream past its KV slab.
+        let wbudget = t.config.seq_len - 8l
+        var wleft = 256l
+        while (wleft > 0l) {
+            let _w1 = run_sequential(t, cfg.kv, 1l, 8l, min(wbudget, wleft))
+            wleft -= wbudget
+        }
         let _w2 = run_batched(t, cfg.kv, 2l, 8l, 2l)
         // DASLLAMA_BATCH_TRACE=<path> saves a per-lane jobque trace of the LARGEST-B batched run
         // (the lane-timeline viewer's input; same rig as decode_prof --trace)
@@ -213,13 +226,29 @@ def main() {
             static_if (typeinfo builtin_module_exists(das_metal)) {
                 metal_decode_stage_reset()   // per-B stage attribution (the report below)
             }
+            // DASLLAMA_BENCH_SWAP=1 runs batched BEFORE sequential — the order-artifact control
+            // (identical per-token code at B=1: eval_batch's B==1 fallback calls forward())
+            let swap = get_env_variable("DASLLAMA_BENCH_SWAP") == "1"
+            var bat_pre = 0.0lf
+            if (swap) {
+                bat_pre = run_batched(t, cfg.kv, nb, p, n)
+            }
             let seq_tps = run_sequential(t, cfg.kv, nb, p, n)
+            static_if (typeinfo builtin_module_exists(das_metal)) {
+                // phase-split stage attribution: land the sequential phase's counters before the
+                // batched loop reuses the driver (the 3.5% seq-vs-batched-B1 split diagnostic)
+                if (metal_decode_stats().decodes > 0l) {
+                    print("  [stage split: sequential phase]\n")
+                    metal_decode_stage_report()
+                    metal_decode_stage_reset()
+                }
+            }
             let doTrace = nb == bmax && !empty(trace)
             if (doTrace) {
                 jobque_trace_start(1 << 21)
                 set_trace_tags(true)
             }
-            let bat_tps = run_batched(t, cfg.kv, nb, p, n)
+            let bat_tps = swap ? bat_pre : run_batched(t, cfg.kv, nb, p, n)
             if (doTrace) {
                 set_trace_tags(false)
                 jobque_trace_stop()
@@ -234,7 +263,8 @@ def main() {
             print("B={nb}: sequential {seq_tps} tok/s | batched {bat_tps} tok/s ({speedup}x) | per-stream {stream_tps} tok/s\n")
             static_if (typeinfo builtin_module_exists(das_metal)) {
                 if (metal_batch_decode_stats().steps > 0l || metal_decode_stats().decodes > 0l) {
-                    metal_decode_stage_report()   // this B's sequential (single-stream) + batched stage split
+                    print("  [stage split: batched phase]\n")
+                    metal_decode_stage_report()   // the batched phase only (sequential landed above)
                 }
             }
             nb *= 2l

@@ -92,6 +92,7 @@ def private continuation(t : Model; prompt : array<int64>; n_gen : int) : array<
 [test]
 def test_metal_prefill_parity(t : T?) {
     t |> run("GPU-resident prefill == CPU control, 40-token greedy continuation (Llama-3.2-1B Q8)") <| @(t : T?) {
+        if (!family_on(t, "llama")) return
         static_if (typeinfo builtin_module_exists(das_metal)) {
             if (!jit_enabled()) {
                 t |> skip("interpreted (dasLLAMA model tests are JIT-only)")

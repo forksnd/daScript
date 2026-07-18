@@ -2,7 +2,7 @@ options gen2
 options stack = 65536   // dasLLAMA program-root convention (options stack does not unify up from libs)
 options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
-require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
+require dasllama/dasllama   // nolint:STYLE029 — the facade: arch [init] registrations + load_model's prepared-image (.dlim) cache
 require daslib/jobque_boost
 require daslib/fio
 require strings
@@ -67,7 +67,7 @@ def main {
         }
     }
     print("loading {path}\n")
-    var t <- load_gguf(path, QuantMode.q8)
+    var t <- load_model(path, QuantMode.q8)   // facade: maps the prepared .dlim image when present
     t.config.seq_len = min(t.config.seq_len, 8192l)   // cap KV cache (Llama-3 context length is 131072)
     let c = t.config
     print("config: dim={c.dim} hidden={c.hidden_dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size}\n")

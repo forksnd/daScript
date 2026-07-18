@@ -34,7 +34,7 @@ def parity_full_mode() : bool {
 // Arm filter for the metal suites: DASLLAMA_TEST_ARMS = comma-separated substrings; when set,
 // only arm blocks whose name matches a token run. The skip is LOUD (t |> skip) so a filtered
 // run can never masquerade as full coverage. Unset/empty = every arm runs. Drive through
-// tests/dasLLAMA/run.das — see tests/dasLLAMA/CLAUDE.md.
+// modules/dasLLAMA/tests/run.das — see modules/dasLLAMA/tests/CLAUDE.md.
 def arm_on(t : T?; name : string) : bool {
     let filter = get_env_variable("DASLLAMA_TEST_ARMS")
     if (empty(filter)) {
@@ -47,6 +47,26 @@ def arm_on(t : T?; name : string) : bool {
         }
     }
     t |> skip("arm '{name}' filtered out (DASLLAMA_TEST_ARMS={filter})")
+    return false
+}
+
+// Family filter for the model-loading suites: DASLLAMA_TEST_FAMILY = comma-separated family
+// tokens (llama, gemma, ultravox, whisper, voxtral) matched EXACTLY — not substrings, so
+// "llama" can never accidentally select a non-llama block. When set, only blocks tagged with a
+// listed family run; model-free blocks (kernel units, the image mechanics arm) carry no tag and
+// always run. Loud-skip contract identical to arm_on. Drive through run.das --family — the
+// profiling cadence gate: a llama-format round re-verifies the llama family only.
+def family_on(t : T?; name : string) : bool {
+    let filter = get_env_variable("DASLLAMA_TEST_FAMILY")
+    if (empty(filter)) {
+        return true
+    }
+    for (tok in split(filter, ",")) {
+        if (strip(tok) == name) {
+            return true
+        }
+    }
+    t |> skip("family '{name}' filtered out (DASLLAMA_TEST_FAMILY={filter})")
     return false
 }
 

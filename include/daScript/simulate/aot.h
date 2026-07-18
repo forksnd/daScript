@@ -93,6 +93,14 @@ namespace das {
         value.value = on ? (value.value | mask.value) : (value.value & ~mask.value);
     }
 
+    // AOT emits a raw uint32 mask when assigning a field on a standalone das
+    // bitfield. Keep this exact overload alongside the handle-bound uint32_t&
+    // form below so Bitfield's conversion operators do not make the call
+    // ambiguous.
+    __forceinline void __bit_set ( Bitfield & value, uint32_t mask, bool on ) {
+        value.value = on ? (value.value | mask) : (value.value & ~mask);
+    }
+
     __forceinline void __bit_set8 ( Bitfield8 & value, Bitfield8 mask, bool on ) {
         value.value = on ? (value.value | mask.value) : (value.value & ~mask.value);
     }

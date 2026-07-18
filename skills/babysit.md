@@ -64,6 +64,20 @@ Rejecting is the common case, not the exception. Give the user a concise per-com
 
 Real-bug verdicts deserve a probe before declaring fix direction — the obvious fix isn't always the right fix (e.g. aligning the bind-push wasn't enough for the `take(n) |> sum()` bug because the underlying SQL was degenerate; the right answer was compile-time rejection).
 
+**"Cheap to fix" is NOT a reason to accept — BE CONSERVATIVE.** The
+trap: an over-defensive/can't-happen comment arrives, the fix is 3 harmless lines, so you accept
+"for contract tightness" — and every such accept hands Copilot a fresh diff, which produces the
+next marginal comment; #3492 ran 16 rounds and rounds 12–16 were pure hygiene drip that changed
+no reachable behavior. Hold the line the table already draws:
+- **Over-defensive / can't-happen guards → reject**, even when the guard is one line. Cite why
+  the case can't occur (call-site inventory, an upstream guard, a type that makes it
+  unrepresentable). Do not add warnings/asserts for states no shipped caller can produce.
+- **Wording/comment nits → reject; don't reword.** Only fix prose that is factually WRONG
+  (claims X, code does Y) — precision upgrades, tone, "clarify this" are not fixes, they're
+  fresh paragraphs for the next round to nit.
+- Accepting a marginal comment to "keep the reviewer happy" costs a commit + a full CI matrix +
+  a new review round. Rejecting costs one evidence sentence. Reject.
+
 A rejected comment still gets a reply (one-line reason, evidence if the reviewer is wrong) + a resolved thread (Section 5). Surface the verdicts and wait for the user's greenlight before applying — they may reject more ("reject this one too") or defer a fix to a later chunk.
 
 ## 4. Apply fixes + re-run gates

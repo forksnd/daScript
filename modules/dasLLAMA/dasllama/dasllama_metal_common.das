@@ -460,6 +460,51 @@ def kq_load_gpu_supported(t : Model) : bool {
         (kq_fmt_gpu_supported(t.wcls_fmt) && kq_fmt_gpu_supported(t.emb_fmt)))
 }
 
+// ===== zero-copy logits: bytesNoCopy wrappers over session-owned storage =====
+// The classifier (single-stream) or the copy-row scatter (batch) writes STRAIGHT into
+// s.logits — that row's landing memcpy disappears. The wrapper borrows the session's memory
+// (no deallocator): releasing it never frees anything, a dead session's storage dies with the
+// session, and the flush-before-delete contract keeps in-flight steps off dead sessions.
+// Gated per session on 16KB page alignment + page-rounded capacity (make_run_state reserves
+// it); a null entry caches the decline. The data pointer is revalidated on every lookup — a
+// session whose logits array moved re-registers.
+var g_nc_logits : table<uint64; tuple<buf : MetalBuffer?; ptr : uint64>>
+
+def nc_logits_for(dev : MetalDevice?; s : Session) : MetalBuffer? {
+    let p : uint64 = intptr(unsafe(addr(s.logits[0])))
+    if (key_exists(g_nc_logits, s.uid)) {
+        if (g_nc_logits[s.uid].ptr == p) {
+            return g_nc_logits[s.uid].buf
+        }
+        var stale = g_nc_logits[s.uid].buf
+        if (stale != null) {
+            metal_release(stale)
+        }
+        g_nc_logits |> erase(s.uid)
+    }
+    let bytes = (uint64(length(s.logits)) * 4ul + 16383ul) & ~16383ul
+    var buf : MetalBuffer?
+    if ((p & 16383ul) == 0ul && uint64(capacity(s.logits)) * 4ul >= bytes) {
+        unsafe {
+            buf = metal_new_buffer_no_copy(dev, reinterpret<void?>(p), bytes)
+        }
+    }
+    g_nc_logits[s.uid] = (buf = buf, ptr = p)
+    return buf
+}
+
+def nc_logits_release {
+    for (e in values(g_nc_logits)) {
+        if (e.buf != null) {
+            metal_release(e.buf)
+            e.buf = null
+        }
+    }
+    unsafe {
+        delete g_nc_logits
+    }
+}
+
 // One kq tensor's quant plane slice, uploaded BYTE-IDENTICAL (disk-order superblock payloads —
 // the backend_repack decline excludes grp-repacked loads, and the non-repack backends leave the
 // planes disk-order). Cached in g_regions by source address like every weight region.
@@ -1057,6 +1102,7 @@ def weight_caches_flush_on_reload {
 }
 
 def metal_common_release {
+    nc_logits_release()
     metal_blob_regions_release()   // the batch mm path creates blobs in the prefill module's cache
     for (buf in values(g_cat_blobs)) {
         if (buf != null) {

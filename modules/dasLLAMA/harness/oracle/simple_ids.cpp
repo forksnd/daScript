@@ -7,7 +7,7 @@
 //
 // CPU-only (n_gpu_layers = 0) so the argmax matches dasLLAMA's CPU forward on ties.
 // No EOG break: emit a fixed N so both sides are the same length. This is the oracle
-// that mints tests/dasLLAMA fixtures — keep it in sync with the linked llama.cpp.
+// that mints modules/dasLLAMA/tests fixtures — keep it in sync with the linked llama.cpp.
 //
 // Build (from the llama.cpp checkout, against its already-built libs):
 //   clang++ -std=c++17 -O2 -I include -I ggml/include simple_ids.cpp \

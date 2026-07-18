@@ -1,11 +1,12 @@
 options gen2
 options indenting = 4
 
-// The ONLY sanctioned way to run the dasLLAMA Metal suites (see tests/dasLLAMA/CLAUDE.md).
-// Enforces the iteration discipline that keeps suite walls honest: exactly ONE of --arm
-// (filtered iteration, minutes) or --full (the pre-commit gate: every arm + the large-tier
-// models, run ONCE after batching fixes). Every run's COMPLETE output lands in a log file
-// whose path is printed — never pipe suite output through a grep at capture time.
+// The ONLY sanctioned way to run the dasLLAMA Metal suites (see modules/dasLLAMA/tests/CLAUDE.md).
+// Enforces the iteration discipline that keeps suite walls honest: --arm (filtered iteration,
+// minutes) scoped to the arms a change can actually affect. --full is REFUSED while the Metal
+// build-out is in progress — a whole-zoo pass buys soak time, not coverage; narrow the scope.
+// Every run's COMPLETE output lands in a log file whose path is printed — never pipe suite
+// output through a grep at capture time.
 
 require daslib/clargs
 require daslib/fio
@@ -19,12 +20,15 @@ struct RunArgs {
     arm : string
 
     @clarg_short = "f"
-    @clarg_doc = "The pre-commit gate: every arm + large-tier models (DASLLAMA_PARITY_FULL=1), raised dastest timeout. Run ONCE after batching fixes"
+    @clarg_doc = "REFUSED while the Metal build-out is in progress — narrow the scope with --arm instead"
     full : bool
 
     @clarg_short = "s"
     @clarg_doc = "Suite: decode | prefill | matrix | kernels | image | all (default all)"
     suite : string = "all"
+
+    @clarg_doc = "Family filter — comma-separated family tokens (llama, gemma, ultravox, whisper, voxtral); only blocks of these model families run (model-free blocks always run); sets DASLLAMA_TEST_FAMILY"
+    family : string
 
     @clarg_short = "n"
     @clarg_doc = "Repeat count — explicit only (default 1, never best-of-N)"
@@ -41,21 +45,21 @@ struct RunArgs {
 
 def private suite_files(name : string) : array<string> {
     if (name == "decode") {
-        return <- [ "tests/dasLLAMA/test_metal_decode_parity.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_decode_parity.das" ]
     } elif (name == "prefill") {
-        return <- [ "tests/dasLLAMA/test_metal_prefill_parity.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_prefill_parity.das" ]
     } elif (name == "matrix") {
-        return <- [ "tests/dasLLAMA/test_metal_support_matrix.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_support_matrix.das" ]
     } elif (name == "kernels") {
-        return <- [ "tests/dasLLAMA/test_metal_prefill_kernels.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_prefill_kernels.das" ]
     } elif (name == "image") {
-        return <- [ "tests/dasLLAMA/test_model_image.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_model_image.das" ]
     } elif (name == "all") {
-        return <- [ "tests/dasLLAMA/test_metal_decode_parity.das",
-                    "tests/dasLLAMA/test_metal_prefill_parity.das",
-                    "tests/dasLLAMA/test_metal_support_matrix.das",
-                    "tests/dasLLAMA/test_metal_prefill_kernels.das",
-                    "tests/dasLLAMA/test_model_image.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_decode_parity.das",
+                    "modules/dasLLAMA/tests/test_metal_prefill_parity.das",
+                    "modules/dasLLAMA/tests/test_metal_support_matrix.das",
+                    "modules/dasLLAMA/tests/test_metal_prefill_kernels.das",
+                    "modules/dasLLAMA/tests/test_model_image.das" ]
     }
     var none : array<string>
     return <- none
@@ -92,16 +96,20 @@ def main() : int {
     var r <- parse_args(type<RunArgs>)
     if (r |> is_err) {
         to_log(LOG_ERROR, "error: {r |> unwrap_err}\n\n")
-        print_help(get_command_info(type<RunArgs>), "tests/dasLLAMA/run.das")
+        print_help(get_command_info(type<RunArgs>), "modules/dasLLAMA/tests/run.das")
         return 2
     }
     let cfg <- r |> move_unwrap
     if (cfg.help) {
-        print_help(get_command_info(type<RunArgs>), "tests/dasLLAMA/run.das")
+        print_help(get_command_info(type<RunArgs>), "modules/dasLLAMA/tests/run.das")
         return 0
     }
     if (cfg.full == !empty(cfg.arm)) {   // both set, or neither
-        to_log(LOG_ERROR, "pass exactly ONE of --arm <filter> (iteration) or --full (the pre-commit gate)\n")
+        to_log(LOG_ERROR, "pass --arm <filter> scoped to what the change can affect (--full is disabled while the Metal build-out is in progress; large tier = DASLLAMA_PARITY_FULL=1 with --arm)\n")
+        return 2
+    }
+    if (cfg.full) {
+        to_log(LOG_ERROR, "please narrow the scope to the correct set of gates, metal is not fully implemented yet\n")
         return 2
     }
     var files <- suite_files(cfg.suite)
@@ -110,7 +118,10 @@ def main() : int {
         return 2
     }
     let tmp = empty(get_env_variable("TMPDIR")) ? "/tmp" : get_env_variable("TMPDIR")
-    let envs = cfg.full ? "DASLLAMA_PARITY_FULL=1" : "DASLLAMA_TEST_ARMS='{cfg.arm}'"
+    var envs = cfg.full ? "DASLLAMA_PARITY_FULL=1" : "DASLLAMA_TEST_ARMS='{cfg.arm}'"
+    if (!empty(cfg.family)) {   // composes with either mode: a family-scoped full gate is the profiling-cadence default
+        envs = "{envs} DASLLAMA_TEST_FAMILY='{cfg.family}'"
+    }
     // the full gate holds the 8B/70B tails — the stock 1200s dastest wall is an arm-mode budget
     let tmo = cfg.full ? 3600 : 1200
     let reps = max(cfg.nreps, 1)

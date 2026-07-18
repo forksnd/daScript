@@ -1153,8 +1153,10 @@ def private confirm_and_write(winner : string) : bool {
     let model = get_env_variable("DASLLAMA_CONFIRM_MODEL")
     if (empty(model)) {
         print("confirm: winner '{winner}' DIVERGES from the per-ISA fallback '{fb}' — a 1-core crown must confirm end-to-end before it ships (the SPR amx lesson)\n")
-        print("confirm: manifest NOT updated — re-run with DASLLAMA_CONFIRM_MODEL=<q8 gguf> to run the confirm pass\n")
-        return true
+        print("confirm: pinning the fallback '{fb}' — re-run with DASLLAMA_CONFIRM_MODEL=<q8 gguf> to run the confirm pass\n")
+        // pin the fallback so the sidecar is COMPLETE — leaving the entry missing makes the
+        // startup completeness gate re-tune on every run (the runtime rides the fallback either way)
+        return write_winner(fb)
     }
     let tmpm = "{get_das_root()}/_tune_confirm_manifest.json"
     // the stamps read the manifest's "kernels" SECTION (read_manifest) — a flat root object

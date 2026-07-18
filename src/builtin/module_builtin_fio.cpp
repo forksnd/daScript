@@ -187,6 +187,7 @@ namespace das {
     int builtin_popen_binary ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int builtin_popen ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int builtin_popen_timeout ( const char * cmd, float timeout_sec, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_spawn_argv ( const Array & args_arr, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int builtin_system ( const char * cmd, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * get_full_file_name ( const char * path, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     bool has_env_variable ( const char * var, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
@@ -938,7 +939,159 @@ namespace das {
     }
 #endif
 
-    // popen_argv: argv-based subprocess. Bypasses the shell entirely — on
+    // Launch an argv-based subprocess and return immediately. The child
+    // inherits cwd, environment, and stdout/stderr; stdin is detached so it
+    // cannot consume the parent's input stream. No shell is involved.
+    bool builtin_spawn_argv ( const Array & args_arr, Context * context, LineInfoArg * at ) {
+        if ( args_arr.size == 0 ) {
+            context->throw_error_at(at, "spawn_argv with empty args");
+            return false;
+        }
+        char ** argv = (char **) args_arr.data;
+        if ( !argv[0] ) {
+            context->throw_error_at(at, "spawn_argv with null exe");
+            return false;
+        }
+#ifdef _WIN32
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.bInheritHandle = TRUE;
+        sa.lpSecurityDescriptor = NULL;
+        HANDLE hNullInput = CreateFileA("NUL", GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        auto duplicateOutput = [&sa](DWORD stdHandle) -> HANDLE {
+            HANDLE source = GetStdHandle(stdHandle);
+            HANDLE result = INVALID_HANDLE_VALUE;
+            if ( source && source != INVALID_HANDLE_VALUE
+                    && DuplicateHandle(GetCurrentProcess(), source,
+                        GetCurrentProcess(), &result, 0, TRUE,
+                        DUPLICATE_SAME_ACCESS) ) {
+                return result;
+            }
+            return CreateFileA("NUL", GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        };
+        HANDLE hOutput = duplicateOutput(STD_OUTPUT_HANDLE);
+        HANDLE hError = duplicateOutput(STD_ERROR_HANDLE);
+        if ( hNullInput == INVALID_HANDLE_VALUE
+                || hOutput == INVALID_HANDLE_VALUE || hError == INVALID_HANDLE_VALUE ) {
+            if ( hNullInput != INVALID_HANDLE_VALUE ) CloseHandle(hNullInput);
+            if ( hOutput != INVALID_HANDLE_VALUE ) CloseHandle(hOutput);
+            if ( hError != INVALID_HANDLE_VALUE ) CloseHandle(hError);
+            return false;
+        }
+        STARTUPINFOEXA si;
+        memset(&si, 0, sizeof(si));
+        si.StartupInfo.cb = sizeof(si);
+        si.StartupInfo.hStdInput = hNullInput;
+        si.StartupInfo.hStdOutput = hOutput;
+        si.StartupInfo.hStdError = hError;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        SIZE_T attributeBytes = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &attributeBytes);
+        vector<uint8_t> attributeStorage(attributeBytes);
+        si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+            attributeStorage.data());
+        HANDLE inheritedHandles[] = { hNullInput, hOutput, hError };
+        bool attributeListInitialized = InitializeProcThreadAttributeList(
+            si.lpAttributeList, 1, 0, &attributeBytes);
+        bool attributesReady = attributeListInitialized
+            && UpdateProcThreadAttribute(si.lpAttributeList, 0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inheritedHandles,
+                sizeof(inheritedHandles), NULL, NULL);
+        PROCESS_INFORMATION pi;
+        memset(&pi, 0, sizeof(pi));
+        string cmdLine = winBuildCommandLine(argv, args_arr.size);
+        BOOL created = attributesReady && CreateProcessA(NULL,
+            (LPSTR)cmdLine.c_str(), NULL, NULL, TRUE,
+            CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT,
+            NULL, NULL, &si.StartupInfo, &pi);
+        if ( attributeListInitialized ) {
+            DeleteProcThreadAttributeList(si.lpAttributeList);
+        }
+        CloseHandle(hNullInput);
+        CloseHandle(hOutput);
+        CloseHandle(hError);
+        if ( !created ) return false;
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return true;
+#else
+        vector<char *> cargv;
+        cargv.reserve(args_arr.size + 1);
+        for ( uint64_t i = 0; i < args_arr.size; ++i ) {
+            cargv.push_back(argv[i] ? argv[i] : (char *)"");
+        }
+        cargv.push_back(nullptr);
+        int execError[2];
+        if ( pipe(execError) == -1 ) return false;
+        int descriptorFlags = fcntl(execError[1], F_GETFD);
+        if ( descriptorFlags == -1
+                || fcntl(execError[1], F_SETFD, descriptorFlags | FD_CLOEXEC) == -1 ) {
+            close(execError[0]);
+            close(execError[1]);
+            return false;
+        }
+        pid_t launcher = fork();
+        if ( launcher == -1 ) {
+            close(execError[0]);
+            close(execError[1]);
+            return false;
+        }
+        if ( launcher == 0 ) {
+            close(execError[0]);
+            if ( setsid() == -1 ) {
+                int error = errno;
+                const ssize_t written = write(execError[1], &error, sizeof(error));
+                (void)written;
+                _exit(127);
+            }
+            pid_t child = fork();
+            if ( child == -1 ) {
+                int error = errno;
+                const ssize_t written = write(execError[1], &error, sizeof(error));
+                (void)written;
+                _exit(127);
+            }
+            if ( child > 0 ) {
+                close(execError[1]);
+                _exit(0);
+            }
+            int devnull = open("/dev/null", O_RDONLY);
+            if ( devnull >= 0 ) {
+                dup2(devnull, STDIN_FILENO);
+                close(devnull);
+            }
+            execvp(cargv[0], cargv.data());
+            int error = errno;
+            const ssize_t written = write(execError[1], &error, sizeof(error));
+            (void)written;
+            _exit(127);
+        }
+        close(execError[1]);
+        // Reap only the short-lived launcher. Its grandchild is adopted by
+        // init and remains independent of the caller without becoming a
+        // zombie in this process.
+        int status = 0;
+        while ( waitpid(launcher, &status, 0) == -1 ) {
+            if ( errno != EINTR ) {
+                close(execError[0]);
+                return false;
+            }
+        }
+        int childError = 0;
+        ssize_t errorBytes;
+        do {
+            errorBytes = read(execError[0], &childError, sizeof(childError));
+        } while ( errorBytes == -1 && errno == EINTR );
+        close(execError[0]);
+        return WIFEXITED(status) && WEXITSTATUS(status) == 0 && errorBytes == 0;
+#endif
+    }
+
+    // popen_argv: argv-based subprocess. Bypasses the shell entirely -- on
     // Windows, CreateProcess invokes the .exe directly (no cmd.exe, no
     // first-quote-stripping); on Unix, fork+execvp (no /bin/sh, no $() /
     // backtick expansion). timeout_sec <= 0 means no timeout.
@@ -2102,6 +2255,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(builtin_popen_timeout)>(*this, lib, "popen_timeout",
                 SideEffects::modifyExternal, "builtin_popen_timeout")
                     ->args({"command","timeout","scope","context","at"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(builtin_spawn_argv)>(*this, lib, "spawn_argv",
+                SideEffects::modifyExternal, "builtin_spawn_argv")
+                    ->args({"args","context","at"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(builtin_popen_argv)>(*this, lib, "popen_argv",
                 SideEffects::modifyExternal, "builtin_popen_argv")
                     ->args({"args","timeout","scope","context","at"})->unsafeOperation = true;

@@ -177,7 +177,7 @@ inferred return lands as `:auto` and won't match the clones), add a `[tuned]` re
 stub `<name>` (empty body) — with `fallback="<perm>"` when the shipped hand hints aren't
 `vec8_u2`, so bit-identity of the shipped default holds (that's the invariant) — then a
 `[dasllama_grid(src="<name>_template")]` + bench block in `tune_kernels.das`, passing the
-fallback as `report(...)`'s baseline. `tests/dasLLAMA/test_tune/test_tuned/test_grid.das` are
+fallback as `report(...)`'s baseline. `modules/dasLLAMA/tests/test_tune/test_tuned/test_grid.das` are
 the patterns.
 
 ## Tool 2 — `harness/tune_tb.das` (token-block sweep)
