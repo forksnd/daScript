@@ -4,6 +4,7 @@ options _jit_fast_math = true   // ggml-parity FP laxity — matches how llama.c
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + apply_box_profile_runtime (engine-level, not re-exported)
+require dasllama/dasllama_image   // load_model_cached — the .dlim rail, without the full facade's compile weight
 require ../performance/profile_common.das   // profile_threads + affinity_on — the standing per-box methodology
 require daslib/jobque_boost
 require daslib/clargs
@@ -40,6 +41,18 @@ struct Args {
     @clarg_short = "q"
     @clarg_doc = "Weight quant mode (default: q8)"
     quant : QuantMode = QuantMode.q8
+
+    @clarg_doc = "A/B the dense GPU rail in-process: every row runs twice, dense routing OFF then ON. Needs DASLLAMA_GPU_DENSE=1 (uploads + marks); both arms share one process/residency, so cross-run pp drift cancels"
+    dense_ab : bool
+
+    @clarg_doc = "A/B the device-side moe combine in-process: every row runs twice, combine OFF then ON (same drift-cancel rationale as --dense-ab; mutually exclusive with it)"
+    comb_ab : bool
+
+    @clarg_doc = "A/B the deltanet GPU chain in-process: every row runs twice, DN routing OFF then ON. Needs DASLLAMA_GPU_DN=1 (uploads + marks); mutually exclusive with the other A/B levers"
+    dn_ab : bool
+
+    @clarg_doc = "A/B the attention GPU chain in-process: every row runs twice, attention routing OFF then ON. Needs DASLLAMA_GPU_ATTN=1 (uploads + marks); mutually exclusive with the other A/B levers"
+    attn_ab : bool
 
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
@@ -102,43 +115,75 @@ def main() {
         set_jobque_affinity(2)   // 2 = hard mask, the llama-bench --cpu-strict mirror (mode 1 re-rolls SMT placement)
     }
     apply_box_profile_runtime()   // the tuned per-box stack — what load_model users get
+    if (cfg.dense_ab && !has_env_variable("DASLLAMA_GPU_DENSE")) {
+        print("warning: --dense-ab without DASLLAMA_GPU_DENSE=1 — no dense marks, both arms identical\n")
+    }
+    if (cfg.dn_ab && !has_env_variable("DASLLAMA_GPU_DN")) {
+        print("warning: --dn-ab without DASLLAMA_GPU_DN=1 — no deltanet marks, both arms identical\n")
+    }
+    if (cfg.attn_ab && !has_env_variable("DASLLAMA_GPU_ATTN")) {
+        print("warning: --attn-ab without DASLLAMA_GPU_ATTN=1 — no attention marks, both arms identical\n")
+    }
     print("loading {cfg.model}\n")
-    var t <- load_gguf(cfg.model, cfg.quant)
-    t.config.seq_len = min(t.config.seq_len, max(plen, ngen) + 8l)   // cap the KV allocation
-    let c = t.config
-    print("config: dim={c.dim} layers={c.n_layers} vocab={c.vocab_size} | backend {active_kernel_backend()} (batch {active_batch_backend()}) | t{threads} affinity {pinned ? "hard" : "env/off"} | pp{plen} tg{ngen} x {reps} reps\n")
     with_job_que() {
         setup_dasllama_jobque_()
+        // load INSIDE the que, on the image rail: the .dlim maps in ms, and the GPU tier's
+        // gather/upload parallelizes over the lanes (que-less it runs single-threaded — at
+        // STREAM=35 that gather was the dominant per-run cost)
+        var t <- load_model_cached(cfg.model, cfg.quant)
+        t.config.seq_len = min(t.config.seq_len, max(plen, ngen) + 8l)   // cap the KV allocation
+        let c = t.config
+        print("config: dim={c.dim} layers={c.n_layers} vocab={c.vocab_size} | backend {active_kernel_backend()} (batch {active_batch_backend()}) | t{threads} affinity {pinned ? "hard" : "env/off"} | pp{plen} tg{ngen} x {reps} reps\n")
         var s <- make_run_state(c)
-        if (plen > 0l) {
-            let warm <- build_prompt(plen, 999l)
-            forward_prefill(t, s, warm, plen, 0l)   // warmup — untimed full-size run, as llama-bench does
-            var tps : array<double>
-            for (rep in range(reps)) {
-                let prompt <- build_prompt(plen, int64(rep))
-                let t0 = ref_time_ticks()
-                forward_prefill(t, s, prompt, plen, 0l)
-                let us = get_time_usec(t0)
-                tps |> push(double(plen) * 1.0e6lf / double(us))
-            }
-            report("pp{plen}", tps)
-            delete tps
+        if ((cfg.dense_ab ? 1 : 0) + (cfg.comb_ab ? 1 : 0) + (cfg.dn_ab ? 1 : 0) + (cfg.attn_ab ? 1 : 0) > 1) {
+            print("warning: --dense-ab / --comb-ab / --dn-ab / --attn-ab are mutually exclusive — running the first only\n")
         }
-        if (ngen > 0l) {
-            forward(t, s, synth_id(0l, 999l), 0l)   // warmup — one untimed token, llama-bench's test_gen(ctx, 1)
-            var tps : array<double>
-            for (rep in range(reps)) {
-                let t0 = ref_time_ticks()
-                for (i in range64(ngen)) {
-                    forward(t, s, synth_id(i, int64(rep)), i)
-                }
-                let us = get_time_usec(t0)
-                tps |> push(double(ngen) * 1.0e6lf / double(us))
+        let ab = cfg.dense_ab || cfg.comb_ab || cfg.dn_ab || cfg.attn_ab
+        for (arm in range(ab ? 2 : 1)) {
+            var dtag = ""
+            if (cfg.dense_ab) {
+                dtag = arm == 0 ? " dense=off" : " dense=on"
+                set_moe_gpu_dense_route(arm != 0)
+            } elif (cfg.comb_ab) {
+                dtag = arm == 0 ? " comb=off" : " comb=on"
+                set_gpu_combine_route(arm != 0)
+            } elif (cfg.dn_ab) {
+                dtag = arm == 0 ? " dn=off" : " dn=on"
+                set_moe_gpu_dn_route(arm != 0)
+            } elif (cfg.attn_ab) {
+                dtag = arm == 0 ? " attn=off" : " attn=on"
+                set_moe_gpu_attn_route(arm != 0)
             }
-            report("tg{ngen}", tps)
-            delete tps
+            if (plen > 0l) {
+                let warm <- build_prompt(plen, 999l)
+                forward_prefill(t, s, warm, plen, 0l)   // warmup — untimed full-size run, as llama-bench does
+                var tps : array<double>
+                for (rep in range(reps)) {
+                    let prompt <- build_prompt(plen, int64(rep))
+                    let t0 = ref_time_ticks()
+                    forward_prefill(t, s, prompt, plen, 0l)
+                    let us = get_time_usec(t0)
+                    tps |> push(double(plen) * 1.0e6lf / double(us))
+                }
+                report("pp{plen}{dtag}", tps)
+                delete tps
+            }
+            if (ngen > 0l) {
+                forward(t, s, synth_id(0l, 999l), 0l)   // warmup — one untimed token, llama-bench's test_gen(ctx, 1)
+                var tps : array<double>
+                for (rep in range(reps)) {
+                    let t0 = ref_time_ticks()
+                    for (i in range64(ngen)) {
+                        forward(t, s, synth_id(i, int64(rep)), i)
+                    }
+                    let us = get_time_usec(t0)
+                    tps |> push(double(ngen) * 1.0e6lf / double(us))
+                }
+                report("tg{ngen}{dtag}", tps)
+                delete tps
+            }
         }
         delete s
+        delete t
     }
-    delete t
 }

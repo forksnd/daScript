@@ -610,3 +610,39 @@ def load_model_image(path : string; var t : Model) : bool {
     moe_gpu_upload_resident(t)
     return true
 }
+
+//! The image-cached model load — ``load_model``'s engine half, public so benches and tools that
+//! can't afford the full dasllama facade ride the same cache. A ``.dlim`` path maps directly
+//! (wrong identity panics — nothing to regenerate from); a q8-mode gguf load maps its prepared
+//! image when one matches, else loads the gguf and saves the image for next time
+//! (``DASLLAMA_IMAGE=0`` disables); anything else takes the plain gguf rail. Call it inside
+//! ``with_job_que()`` — the GPU tier's gather/upload parallelizes over the que at load.
+def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32) : Model {
+    if (path |> ends_with(".dlim")) {
+        apply_box_profile_runtime()
+        let ts_img = ref_time_ticks()
+        var t = Model()
+        if (!load_model_image(path, t)) {
+            panic("dasLLAMA: '{path}' is not a prepared image for this box/knobs (identity {image_identity()}) — regenerate it from the source gguf")
+        }
+        to_log(LOG_INFO, "dasLLAMA: prepared image mapped in {get_time_usec(ts_img) / 1000} ms — {path}\n")
+        return <- t
+    }
+    if (mode == QuantMode.q8 && get_env_variable("DASLLAMA_IMAGE") != "0") {
+        apply_box_profile_runtime()   // a backend pin must precede the identity (it names the backend)
+        let img = image_path_for(path)
+        let ts_img = ref_time_ticks()
+        var t = Model()
+        if (load_model_image(img, t)) {
+            to_log(LOG_INFO, "dasLLAMA: prepared image mapped in {get_time_usec(ts_img) / 1000} ms — {img}\n")
+            return <- t
+        }
+        var m <- load_model_(path, mode)
+        let ts_save = ref_time_ticks()
+        if (save_model_image(m, img)) {
+            to_log(LOG_INFO, "dasLLAMA: prepared image saved in {get_time_usec(ts_save) / 1000} ms — {img}\n")
+        }
+        return <- m
+    }
+    return <- load_model_(path, mode)
+}

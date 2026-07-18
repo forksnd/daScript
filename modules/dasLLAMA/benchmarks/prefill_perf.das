@@ -2,7 +2,9 @@ options gen2
 options stack = 65536   // dasLLAMA program-root convention (options stack does not unify up from libs)
 options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
-require dasllama/dasllama   // nolint:STYLE029 — the facade: arch [init] registrations + load_model's prepared-image (.dlim) cache
+require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration
+require dasllama/dasllama_image   // load_model_cached — the .dlim rail, without the full facade's compile weight
+require ../performance/profile_common.das   // profile_threads + affinity_on — the standing per-box methodology
 require daslib/jobque_boost
 require daslib/fio
 require strings
@@ -30,6 +32,17 @@ def main {
     let args = get_command_line_arguments()
     if (!empty(args) && ends_with(args[length(args) - 1], ".gguf")) {
         path = args[length(args) - 1]
+    }
+    // the standing per-box methodology (lcpp_bench's pattern): cap the future que's workers and
+    // hard-pin lanes — with a live GPU device in-process, unpinned CPU phases inflate 40-70%.
+    // Explicit DAS_JOBQUE_THREADS / DAS_JOBQUE_AFFINITY envs still win. Must run before any with_job_que.
+    let threads = has_env_variable("DAS_JOBQUE_THREADS") ? to_int(get_env_variable("DAS_JOBQUE_THREADS")) : profile_threads()
+    if (!has_env_variable("DAS_JOBQUE_THREADS")) {
+        set_jobque_threads_cap(max(threads - 1, 1))
+    }
+    let pinned = affinity_on() && !has_env_variable("DAS_JOBQUE_AFFINITY")
+    if (pinned) {
+        set_jobque_affinity(2)   // 2 = hard mask, the llama-bench --cpu-strict mirror
     }
     apply_box_profile_runtime()   // the tuned per-box stack first; the env pins below override it
     // backend pin for A/B on one binary — must land BEFORE load_gguf:
@@ -67,16 +80,17 @@ def main {
         }
     }
     print("loading {path}\n")
-    var t <- load_model(path, QuantMode.q8)   // facade: maps the prepared .dlim image when present
-    t.config.seq_len = min(t.config.seq_len, 8192l)   // cap KV cache (Llama-3 context length is 131072)
-    let c = t.config
-    print("config: dim={c.dim} hidden={c.hidden_dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size}\n")
-    print("active backend: {active_kernel_backend()}\n")
-    print("prompt processing: one batched forward_prefill per size\n\n")
-
-    var s <- make_run_state(c)
     with_job_que() {
         setup_dasllama_jobque_()
+        // load INSIDE the que, on the image rail: the .dlim maps in ms, and the GPU tier's
+        // gather/upload parallelizes over the lanes (que-less it runs single-threaded)
+        var t <- load_model_cached(path, QuantMode.q8)
+        t.config.seq_len = min(t.config.seq_len, 8192l)   // cap KV cache (Llama-3 context length is 131072)
+        let c = t.config
+        print("config: dim={c.dim} hidden={c.hidden_dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size} | t{threads} affinity {pinned ? "hard" : "env/off"}\n")
+        print("active backend: {active_kernel_backend()}\n")
+        print("prompt processing: one batched forward_prefill per size\n\n")
+        var s <- make_run_state(c)
         // join poll-level override (ggml denomination 0..100; setup default 50, 0 = park at join)
         if (has_env_variable("DAS_JOBQUE_JOIN_SPIN")) {
             let join_spin = to_int(get_env_variable("DAS_JOBQUE_JOIN_SPIN"))

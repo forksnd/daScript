@@ -178,7 +178,7 @@ def private compare_gout(gpu, refv : array<float>) : tuple<maxdiff : float; maxr
 def test_vulkan_moe_ffn_vs_ref(t : T?) {
     t |> run("vulkan MoE FFN tier == CPU reference (decode GEMV + prefill batch arms)") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
             // synthetic stacks: gate/up are (NE*NFE) x N, down is (NE*N) x NFE
             var wq1 : array<int8>
             var ws1 : array<float>
@@ -235,6 +235,77 @@ def test_vulkan_moe_ffn_vs_ref(t : T?) {
             t |> success(c.maxref > 0.0, "batch arm produced non-trivial outputs")
             t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
                 "prefill batch arm within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+
+            // combined arm: same batch fixture, the routed weighted-sum reduce on the device —
+            // an npos=10 x k=4 grid over the 40 bucket rows via a bijective inv map, judged
+            // against the same combine of the GPU's OWN per-row gout (isolates the combine op)
+            var cw : array<float>
+            var cinv : array<uint>
+            cw |> resize(40)
+            cinv |> resize(40)
+            for (g in range(40)) {
+                cw[g] = 0.5 + 0.01 * float(g)
+                cinv[g] = uint((g * 7 + 3) % 40)
+            }
+            var comb : array<float>
+            comb |> resize(int(10l * N))
+            matmul_moe_gpu_ffn_combined(comb, boffs1, boffs3, boffs2, 2l, xq, xs, cw, cinv, N, NFE, 40l, 10l, 0, 0, 0, false)
+            var combref : array<float>
+            combref |> resize(int(10l * N))
+            for (p in range(10)) {
+                for (i in range(int(N))) {
+                    var acc = 0.0
+                    for (j in range(4)) {
+                        acc += cw[p * 4 + j] * gout[int(cinv[p * 4 + j]) * int(N) + i]
+                    }
+                    combref[p * int(N) + i] = acc
+                }
+            }
+            var cc = compare_gout(comb, combref)
+            t |> success(cc.maxref > 0.0, "combined arm produced non-trivial outputs")
+            t |> success(cc.maxdiff <= float(REL_TOL) * cc.maxref,
+                "combined arm within tolerance (maxdiff {cc.maxdiff} vs {float(REL_TOL) * cc.maxref} bar, maxref {cc.maxref})")
+
+            // two-chunk combined arm: 8200 rows overflow the 8192-row chunk cap, so the combine
+            // accumulates across two dispatches AND region B straddles the chunk boundary; a
+            // position's slots land in both chunks (the cross-chunk r0 > 0 path)
+            let CNK = 8200l
+            fill_acts(xq, xs, CNK)
+            var coffs1 <- make_offs([0l, 2l], [0l, 4096l], [4096l, CNK - 4096l], WOFF1, ege1)
+            var coffs3 <- make_offs([0l, 2l], [0l, 4096l], [4096l, CNK - 4096l], WOFF3, ege1)
+            var coffs2 <- make_offs([0l, 2l], [0l, 4096l], [4096l, CNK - 4096l], WOFF2, ege2)
+            gout |> resize(int(CNK * N))
+            matmul_moe_gpu_ffn(gout, coffs1, coffs3, coffs2, 2l, xq, xs, N, NFE, CNK, 0, 0, 0, false)
+            cw |> resize(int(CNK))
+            cinv |> resize(int(CNK))
+            for (g in range(int(CNK))) {
+                cw[g] = 0.5 + 0.0001 * float(g)
+                cinv[g] = uint((g * 7 + 3) % int(CNK))
+            }
+            let CNP = CNK / 4l
+            comb |> resize(int(CNP * N))
+            matmul_moe_gpu_ffn_combined(comb, coffs1, coffs3, coffs2, 2l, xq, xs, cw, cinv, N, NFE, CNK, CNP, 0, 0, 0, false)
+            combref |> resize(int(CNP * N))
+            for (p in range(int(CNP))) {
+                for (i in range(int(N))) {
+                    var acc = 0.0
+                    for (j in range(4)) {
+                        acc += cw[p * 4 + j] * gout[int(cinv[p * 4 + j]) * int(N) + i]
+                    }
+                    combref[p * int(N) + i] = acc
+                }
+            }
+            cc = compare_gout(comb, combref)
+            t |> success(cc.maxref > 0.0, "two-chunk combined arm produced non-trivial outputs")
+            t |> success(cc.maxdiff <= float(REL_TOL) * cc.maxref,
+                "two-chunk combined arm within tolerance (maxdiff {cc.maxdiff} vs {float(REL_TOL) * cc.maxref} bar, maxref {cc.maxref})")
+            delete cw
+            delete cinv
+            delete comb
+            delete combref
+            delete coffs1
+            delete coffs3
+            delete coffs2
         } else {
             feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
         }
@@ -253,7 +324,7 @@ let SSTRIDE = 100000l   // per-stack offset stride inside the streamed fixture (
 def test_vulkan_moe_ffn_streamed(t : T?) {
     t |> run("vulkan MoE streamed prefill (pinned mirrors, 2 slots) == CPU reference") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
             let ege1 = NFE * N
             let ege2 = N * NFE
             var wq1 : array<array<int8>>
@@ -538,7 +609,7 @@ def private ref_ffn_kq(offs1, offs3, offs2 : array<int64>; nreg : int;
 def test_vulkan_moe_ffn_kq(t : T?) {
     t |> run("vulkan MoE kq tier (k4 gate/up + k5/k6 down) == CPU reference") @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls)
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
             // k4 gate/up stacks + BOTH down formats in one down stack region set is not a real
             // shape — use two arms sharing the gate/up stacks: down = k6, then down = k5 at a
             // fresh offset (the 35B carries k5 downs on most layers, k6 on the last two)
@@ -669,6 +740,909 @@ def test_vulkan_moe_ffn_kq(t : T?) {
             delete refv
         } else {
             feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
+        }
+    }
+}
+
+// ===== dense-GEMM rail arms (one-region ride on the batch tiles) =====
+
+let DWOFF = 30000000l   // q8 dense plane base (q8 offset space, clear of WOFF*/SWOFF)
+let KDWOFF = 31000000l  // k4 dense plane base (kq offset space, clear of KWOFF*)
+let DROP_WOFF = 32000000l   // drop-arm scratch plane (q8 space)
+let DD = 160l           // dense output dim (%32)
+let DNR = 40l           // batch rows — one full 32-tile plus an unpadded remainder
+
+[test]
+def test_vulkan_dense_gemm(t : T?) {
+    t |> run("vulkan dense GEMM rail == CPU reference (q8 + k4, one-region batch tiles)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            // q8 arm: [DD x N] plane, Q8_0 acts
+            var wq : array<int8>
+            var ws : array<float>
+            fill_stack(wq, ws, DD, N, 17l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(wq, ws, wqb, wsb)
+            if (!moe_gpu_upload_stack(wqb, wsb, DWOFF, N, DD, 0)) {
+                feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                return
+            }
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, DNR)
+            var y : array<float>
+            y |> resize(int(DNR * DD))
+            matmul_gpu_dense(y, DWOFF, xq, xs, N, DD, DNR, 0)
+            var refy : array<float>
+            refy |> resize(int(DNR * DD))
+            let nb = int(N / 32l)
+            for (r in range(int(DNR))) {
+                for (c in range(int(DD))) {
+                    var acc = 0.0lf
+                    for (b in range(nb)) {
+                        var id = 0
+                        for (k in range(32)) {
+                            id += int(xq[r * int(N) + b * 32 + k]) * int(wq[c * int(N) + b * 32 + k])
+                        }
+                        acc += double(ws[c * nb + b]) * double(xs[r * nb + b]) * double(id)
+                    }
+                    refy[r * int(DD) + c] = float(acc)
+                }
+            }
+            let c1 = compare_gout(y, refy)
+            t |> success(c1.maxdiff <= float(REL_TOL) * c1.maxref,
+                "dense q8 arm within tolerance (maxdiff {c1.maxdiff} vs {float(REL_TOL) * c1.maxref} bar, maxref {c1.maxref})")
+            // k4 arm: [DD x KN] plane, Q8_K acts through the same one-region rail
+            var kwqb : array<uint8>
+            var kwsb : array<uint8>
+            fill_kq_stack(1, DD, KN, 23l, false, kwqb, kwsb)
+            if (!moe_gpu_upload_stack(kwqb, kwsb, KDWOFF, KN, DD, 1)) {
+                feint("kq dense upload refused (budget); skipping the k4 arm\n")
+                return
+            }
+            var w : array<float>
+            dequant_kq_stack(1, kwqb, kwsb, DD, KN, w)
+            var kxq : array<int8>
+            var kxs : array<float>
+            fill_acts_kq(kxq, kxs, DNR)
+            var ky : array<float>
+            ky |> resize(int(DNR * DD))
+            matmul_gpu_dense(ky, KDWOFF, kxq, kxs, KN, DD, DNR, 1)
+            var krefy : array<float>
+            krefy |> resize(int(DNR * DD))
+            let nsb = int(KN / 256l)
+            for (r in range(int(DNR))) {
+                for (c in range(int(DD))) {
+                    var acc = 0.0lf
+                    for (sb in range(nsb)) {
+                        var dd = 0.0lf
+                        for (j in range(256)) {
+                            dd += double(w[c * int(KN) + sb * 256 + j]) * double(kxq[r * int(KN) + sb * 256 + j])
+                        }
+                        acc += dd * double(kxs[r * nsb + sb])
+                    }
+                    krefy[r * int(DD) + c] = float(acc)
+                }
+            }
+            let c2 = compare_gout(ky, krefy)
+            t |> success(c2.maxdiff <= float(REL_TOL) * c2.maxref,
+                "dense k4 arm within tolerance (maxdiff {c2.maxdiff} vs {float(REL_TOL) * c2.maxref} bar, maxref {c2.maxref})")
+            // drop arm: roll back a fresh upload (the partial-triple path), then prove the
+            // registry survived — the earlier q8 stack still serves, and the dropped offset
+            // re-uploads and serves (buffer free + budget refund didn't corrupt anything)
+            var wq3 : array<int8>
+            var ws3 : array<float>
+            fill_stack(wq3, ws3, DD, N, 29l, false)
+            var wqb3 : array<uint8>
+            var wsb3 : array<uint8>
+            pack_upload(wq3, ws3, wqb3, wsb3)
+            t |> success(moe_gpu_upload_stack(wqb3, wsb3, DROP_WOFF, N, DD, 0), "doomed upload lands")
+            moe_gpu_drop_stacks(1, false)
+            t |> success(moe_gpu_upload_stack(wqb3, wsb3, DROP_WOFF, N, DD, 0, [stream = true]), "stream mirror lands")
+            moe_gpu_drop_stacks(1, true)
+            y |> resize(0)
+            y |> resize(int(DNR * DD))
+            matmul_gpu_dense(y, DWOFF, xq, xs, N, DD, DNR, 0)
+            let c3 = compare_gout(y, refy)
+            t |> success(c3.maxdiff <= float(REL_TOL) * c3.maxref,
+                "q8 stack still serves after a later stack dropped (maxdiff {c3.maxdiff})")
+            t |> success(moe_gpu_upload_stack(wqb3, wsb3, DROP_WOFF, N, DD, 0), "dropped offset re-uploads")
+            var y3 : array<float>
+            y3 |> resize(int(DNR * DD))
+            matmul_gpu_dense(y3, DROP_WOFF, xq, xs, N, DD, DNR, 0)
+            var refy3 : array<float>
+            refy3 |> resize(int(DNR * DD))
+            for (r in range(int(DNR))) {
+                for (c in range(int(DD))) {
+                    var acc = 0.0lf
+                    for (b in range(nb)) {
+                        var id = 0
+                        for (k in range(32)) {
+                            id += int(xq[r * int(N) + b * 32 + k]) * int(wq3[c * int(N) + b * 32 + k])
+                        }
+                        acc += double(ws3[c * nb + b]) * double(xs[r * nb + b]) * double(id)
+                    }
+                    refy3[r * int(DD) + c] = float(acc)
+                }
+            }
+            let c4 = compare_gout(y3, refy3)
+            t |> success(c4.maxdiff <= float(REL_TOL) * c4.maxref,
+                "re-uploaded stack serves after drop (maxdiff {c4.maxdiff})")
+            delete wq3
+            delete ws3
+            delete wqb3
+            delete wsb3
+            delete y3
+            delete refy3
+            delete wq
+            delete ws
+            delete wqb
+            delete wsb
+            delete xq
+            delete xs
+            delete y
+            delete refy
+            delete kwqb
+            delete kwsb
+            delete w
+            delete kxq
+            delete kxs
+            delete ky
+            delete krefy
+        } else {
+            feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
+        }
+    }
+}
+
+// ===== the deltanet chain arm =====
+// The whole recurrent-attention chain (qkv/z GEMMs -> conv+SiLU+L2-norm -> chunked delta-rule
+// scan -> gated out-norm -> Q8_0 requant -> out projection) vs a CPU mirror of the same math.
+// Two fixtures: npos = 70 crosses the 64-chunk boundary; npos = 1100 crosses the 1024-row
+// window (device-side tail chaining + state carry across submits). Random-ish L2-normed k rows
+// keep |k_i . k_j| ~ 0.1, so the unit-lower solve stays conditioned (the real-model regime).
+// The recurrence compounds GPU-vs-CPU exp/f32-accumulation drift, so the bar is wider than the
+// GEMM arms' 1e-3.
+
+let DND = 64l          // model dim
+let DNDS = 128l        // d_state
+let DNKH = 1l          // k-heads
+let DNVH = 2l          // v-heads
+let DNKD = DNKH * DNDS
+let DNDI = DNVH * DNDS
+let DNCD = 2l * DNKD + DNDI
+let DNCONV = 4l
+let DNTAPS = DNCONV - 1l
+let DN_EPS = 1e-6
+let DNQKV_WOFF = 7000000l
+let DNZ_WOFF = 8000000l
+let DNO_WOFF = 9000000l
+let DN_REL_TOL = 3e-3
+
+def private synth_f(i, seed : int64; amp : float) : float {
+    let v = (i * 2654435761l + seed * 40503l) % 2048l
+    return (float(v) / 1024.0 - 1.0) * amp
+}
+
+// q8 image GEMM mirror (int block dots, double-accumulated): y [nrows x d] = X . W^T
+def private ref_q8_gemm(wq : array<int8>; ws : array<float>; xq : array<int8>; xs : array<float>;
+                        n, d, nrows : int64; var y : array<float>) {
+    y |> resize(int(nrows * d))
+    let nb = int(n / 32l)
+    for (r in range(int(nrows))) {
+        for (c in range(int(d))) {
+            var acc = 0.0lf
+            for (b in range(nb)) {
+                var id = 0
+                for (k in range(32)) {
+                    id += int(xq[r * int(n) + b * 32 + k]) * int(wq[c * int(n) + b * 32 + k])
+                }
+                acc += double(ws[c * nb + b]) * double(xs[r * nb + b]) * double(id)
+            }
+            y[r * int(d) + c] = float(acc)
+        }
+    }
+}
+
+// the CPU mirror of the deltanet chain past the qkv/z GEMMs: conv + SiLU + q/k L2-norm +
+// q pre-scale, the per-head chunked delta rule, the gated out-norm, the o requant, and the
+// out projection. state advances in place; qkvy/zy are the GEMM outputs the caller made.
+def private ref_dn_core(qkvy, zy : array<float>; bts, gts, tapsv, wnormv, av, dtv : array<float>;
+                        var state : array<float>; hist : array<float>; npos : int64;
+                        wo : array<int8>; wso : array<float>; var yout : array<float>; var conv : array<float>) {
+    conv |> resize(int(npos * DNCD))
+    for (p in range64(npos)) {
+        for (ch in range64(DNCD)) {
+            var acc = 0.0
+            for (k in range64(DNCONV)) {
+                let sp = p - DNTAPS + k
+                let xv = sp >= 0l ? qkvy[int(sp * DNCD + ch)] : hist[int(ch * DNTAPS + p + k)]
+                acc += xv * tapsv[int(ch * DNCONV + k)]
+            }
+            conv[int(p * DNCD + ch)] = acc / (1.0 + exp(-acc))
+        }
+        for (blk in range64(2l * DNKD / DNDS)) {   // q/k L2 norm; q folds the pre-scale
+            var sum = 0.0lf
+            for (j in range64(DNDS)) {
+                let v = conv[int(p * DNCD + blk * DNDS + j)]
+                sum += double(v * v)
+            }
+            var scale = 1.0 / max(sqrt(float(sum)), DN_EPS)
+            if (blk < DNKD / DNDS) {
+                scale *= 1.0 / sqrt(float(DNDS))
+            }
+            for (j in range64(DNDS)) {
+                conv[int(p * DNCD + blk * DNDS + j)] *= scale
+            }
+        }
+    }
+    let CS = 64l
+    var o : array<float>
+    o |> resize(int(npos * DNDI))
+    var p_qc : array<float>
+    var p_kc : array<float>
+    var p_kb : array<float>
+    var p_vb : array<float>
+    var p_w : array<float>
+    var p_vn : array<float>
+    var p_oc : array<float>
+    var p_tm : array<float>
+    var p_am : array<float>
+    var p_kq : array<float>
+    var gcum : array<float>
+    var egc : array<float>
+    var bv : array<float>
+    p_qc |> resize(int(CS * DNDS)); p_kc |> resize(int(CS * DNDS)); p_kb |> resize(int(CS * DNDS))
+    p_vb |> resize(int(CS * DNDS)); p_w |> resize(int(CS * DNDS)); p_vn |> resize(int(CS * DNDS))
+    p_oc |> resize(int(CS * DNDS)); p_tm |> resize(int(CS * CS)); p_am |> resize(int(CS * CS))
+    p_kq |> resize(int(CS * CS)); gcum |> resize(int(CS)); egc |> resize(int(CS)); bv |> resize(int(CS))
+    for (h in range64(DNVH)) {
+        let kh = h % DNKH
+        let qoff = kh * DNDS
+        let koff = DNKD + kh * DNDS
+        let voff = 2l * DNKD + h * DNDS
+        let sbase = int(h * DNDS * DNDS)
+        var c0 = 0l
+        while (c0 < npos) {
+            let cl = min(CS, npos - c0)
+            var gacc = 0.0
+            for (i in range64(cl)) {
+                bv[int(i)] = 1.0 / (1.0 + exp(-bts[int((c0 + i) * DNVH + h)]))
+                let graw = gts[int((c0 + i) * DNVH + h)] + dtv[int(h)]
+                gacc += av[int(h)] * (graw > 20.0 ? graw : log(1.0 + exp(graw)))
+                gcum[int(i)] = gacc
+                egc[int(i)] = exp(gacc)
+                for (j in range64(DNDS)) {
+                    let crow = int((c0 + i) * DNCD)
+                    p_qc[int(i * DNDS + j)] = conv[crow + int(qoff + j)]
+                    p_kc[int(i * DNDS + j)] = conv[crow + int(koff + j)]
+                    p_kb[int(i * DNDS + j)] = conv[crow + int(koff + j)] * bv[int(i)]
+                    p_vb[int(i * DNDS + j)] = conv[crow + int(voff + j)] * bv[int(i)]
+                }
+            }
+            for (i in range64(cl)) {   // A = kb k^T (decay-scaled below); KQ keeps its diagonal
+                for (jc in range64(cl)) {
+                    var sa = 0.0
+                    var sq = 0.0
+                    for (j in range64(DNDS)) {
+                        sa += p_kb[int(i * DNDS + j)] * p_kc[int(jc * DNDS + j)]
+                        sq += p_qc[int(i * DNDS + j)] * p_kc[int(jc * DNDS + j)]
+                    }
+                    p_am[int(i * CS + jc)] = sa
+                    p_kq[int(i * CS + jc)] = sq
+                }
+            }
+            for (i in range64(cl)) {
+                for (jc in range64(cl)) {
+                    if (jc < i) {
+                        let d = exp(gcum[int(i)] - gcum[int(jc)])
+                        p_am[int(i * CS + jc)] = -p_am[int(i * CS + jc)] * d
+                        p_kq[int(i * CS + jc)] *= d
+                    } elif (jc == i) {
+                        p_am[int(i * CS + jc)] = 1.0
+                    } else {
+                        p_am[int(i * CS + jc)] = 0.0
+                        p_kq[int(i * CS + jc)] = 0.0
+                    }
+                }
+            }
+            for (i in range64(cl * cl)) {   // unit-lower solve off the A' originals
+                p_tm[int(i)] = p_am[int(i)]
+            }
+            for (i in range64(cl)) {
+                for (jc in range64(i)) {
+                    var acc = p_am[int(i * CS + jc)]
+                    for (tt in range64(jc + 1l, i)) {
+                        acc += p_am[int(i * CS + tt)] * p_tm[int(tt * CS + jc)]
+                    }
+                    p_tm[int(i * CS + jc)] = acc
+                }
+            }
+            for (i in range64(cl)) {
+                for (j in range64(DNDS)) {
+                    p_kb[int(i * DNDS + j)] *= -egc[int(i)]
+                }
+            }
+            for (i in range64(cl)) {   // w = T kb_scaled; d = T vb + w S
+                for (j in range64(DNDS)) {
+                    var sw = 0.0
+                    var sv = 0.0
+                    for (tt in range64(cl)) {
+                        sw += p_tm[int(i * CS + tt)] * p_kb[int(tt * DNDS + j)]
+                        sv += p_tm[int(i * CS + tt)] * p_vb[int(tt * DNDS + j)]
+                    }
+                    p_w[int(i * DNDS + j)] = sw
+                    p_vn[int(i * DNDS + j)] = sv
+                }
+            }
+            for (i in range64(cl)) {
+                for (j in range64(DNDS)) {
+                    var sv = p_vn[int(i * DNDS + j)]
+                    for (d in range64(DNDS)) {
+                        sv += p_w[int(i * DNDS + d)] * state[sbase + int(d * DNDS + j)]
+                    }
+                    p_vn[int(i * DNDS + j)] = sv
+                }
+            }
+            for (i in range64(cl)) {   // o = (q e^gcum) S + KQ d
+                for (j in range64(DNDS)) {
+                    p_qc[int(i * DNDS + j)] *= egc[int(i)]
+                }
+            }
+            for (i in range64(cl)) {
+                for (j in range64(DNDS)) {
+                    var so = 0.0
+                    for (d in range64(DNDS)) {
+                        so += p_qc[int(i * DNDS + d)] * state[sbase + int(d * DNDS + j)]
+                    }
+                    for (tt in range64(cl)) {
+                        so += p_kq[int(i * CS + tt)] * p_vn[int(tt * DNDS + j)]
+                    }
+                    p_oc[int(i * DNDS + j)] = so
+                }
+            }
+            for (i in range64(cl)) {   // gated out-norm into the o rows
+                var sum = 0.0
+                for (j in range64(DNDS)) {
+                    let v = p_oc[int(i * DNDS + j)]
+                    sum += v * v
+                }
+                let scale = 1.0 / sqrt(sum / float(DNDS) + DN_EPS)
+                for (j in range64(DNDS)) {
+                    let zv = zy[int((c0 + i) * DNDI + h * DNDS + j)]
+                    let xn = p_oc[int(i * DNDS + j)] * scale * wnormv[int(j)]
+                    o[int((c0 + i) * DNDI + h * DNDS + j)] = xn * (zv / (1.0 + exp(-zv)))
+                }
+            }
+            let glast = gcum[int(cl - 1l)]
+            let egl = exp(glast)
+            for (i in range64(DNDS * DNDS)) {
+                state[sbase + int(i)] *= egl
+            }
+            for (d in range64(DNDS)) {   // S += (k e^{glast - gcum})^T d
+                for (j in range64(DNDS)) {
+                    var sv = state[sbase + int(d * DNDS + j)]
+                    for (i in range64(cl)) {
+                        sv += p_kc[int(i * DNDS + d)] * exp(glast - gcum[int(i)]) * p_vn[int(i * DNDS + j)]
+                    }
+                    state[sbase + int(d * DNDS + j)] = sv
+                }
+            }
+            c0 += cl
+        }
+    }
+    // Q8_0 requant of the o rows, then the out projection off the quantized image
+    var oq : array<int8>
+    var os : array<float>
+    oq |> resize(int(npos * DNDI))
+    os |> resize(int(npos * DNDI / 32l))
+    for (b in range64(npos * DNDI / 32l)) {
+        var amax = 0.0
+        for (j in range64(32l)) {
+            amax = max(amax, abs(o[int(b * 32l + j)]))
+        }
+        let d = amax / 127.0
+        let id = d != 0.0 ? 1.0 / d : 0.0
+        os[int(b)] = d
+        for (j in range64(32l)) {
+            oq[int(b * 32l + j)] = int8(int(round(o[int(b * 32l + j)] * id)))
+        }
+    }
+    ref_q8_gemm(wo, wso, oq, os, DNDI, DND, npos, yout)
+    delete o
+    delete oq
+    delete os
+    delete p_qc
+    delete p_kc
+    delete p_kb
+    delete p_vb
+    delete p_w
+    delete p_vn
+    delete p_oc
+    delete p_tm
+    delete p_am
+    delete p_kq
+    delete gcum
+    delete egc
+    delete bv
+}
+
+[test]
+def test_vulkan_deltanet(t : T?) {
+    t |> run("vulkan deltanet chain == CPU reference (chunk-boundary + multi-window arms)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            var wqkv : array<int8>
+            var wsqkv : array<float>
+            var wz : array<int8>
+            var wsz : array<float>
+            var wo : array<int8>
+            var wso : array<float>
+            fill_stack(wqkv, wsqkv, DNCD, DND, 31l, true)
+            fill_stack(wz, wsz, DNDI, DND, 37l, true)
+            fill_stack(wo, wso, DND, DNDI, 41l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(wqkv, wsqkv, wqb, wsb)
+            if (!moe_gpu_upload_stack(wqb, wsb, DNQKV_WOFF, DND, DNCD, 0)) {
+                feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                return
+            }
+            pack_upload(wz, wsz, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, DNZ_WOFF, DND, DNDI, 0), "z stack uploaded")
+            pack_upload(wo, wso, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, DNO_WOFF, DNDI, DND, 0), "out stack uploaded")
+            for (arm_npos in [70l, 1100l]) {
+                let npos = arm_npos
+                var xq : array<int8>
+                var xs : array<float>
+                xq |> resize(int(npos * DND))
+                xs |> resize(int(npos * (DND / 32l)))
+                for (i in range(int(npos * DND))) {
+                    xq[i] = int8((int64(i) * 13l + 7l) % 255l - 127l)
+                }
+                for (i in range(int(npos * (DND / 32l)))) {
+                    xs[i] = pow2_small(int64(i) + 4l)
+                }
+                var bts : array<float>
+                var gts : array<float>
+                bts |> resize(int(npos * DNVH))
+                gts |> resize(int(npos * DNVH))
+                for (i in range(int(npos * DNVH))) {
+                    bts[i] = synth_f(int64(i), 3l, 1.5)
+                    gts[i] = synth_f(int64(i), 11l, 1.5)
+                }
+                var tapsv : array<float>
+                tapsv |> resize(int(DNCD * DNCONV))
+                for (i in range(int(DNCD * DNCONV))) {
+                    tapsv[i] = synth_f(int64(i), 17l, 0.25)
+                }
+                var wnormv : array<float>
+                wnormv |> resize(int(DNDS))
+                for (i in range(int(DNDS))) {
+                    wnormv[i] = 1.0 + synth_f(int64(i), 19l, 0.3)
+                }
+                var av : array<float>
+                var dtv : array<float>
+                av |> resize(int(DNVH))
+                dtv |> resize(int(DNVH))
+                for (i in range(int(DNVH))) {
+                    av[i] = -(0.3 + abs(synth_f(int64(i), 23l, 1.2)))
+                    dtv[i] = synth_f(int64(i), 29l, 0.4)
+                }
+                var hist : array<float>
+                hist |> resize(int(DNCD * DNTAPS))
+                for (i in range(int(DNCD * DNTAPS))) {
+                    hist[i] = synth_f(int64(i), 43l, 0.5)
+                }
+                var gstate : array<float>
+                var rstate : array<float>
+                gstate |> resize(int(DNVH * DNDS * DNDS))
+                rstate |> resize(int(DNVH * DNDS * DNDS))
+                for (i in range(int(DNVH * DNDS * DNDS))) {
+                    gstate[i] = synth_f(int64(i), 47l, 0.1)
+                    rstate[i] = gstate[i]
+                }
+                var y : array<float>
+                var tail : array<float>
+                y |> resize(int(npos * DND))
+                tail |> resize(int(DNTAPS * DNCD))
+                unsafe {
+                    matmul_moe_gpu_dn(y, DNQKV_WOFF, DNZ_WOFF, DNO_WOFF, xq, xs, bts, gts,
+                        addr<float const?>(tapsv[0]), addr<float const?>(wnormv[0]),
+                        addr<float const?>(av[0]), addr<float const?>(dtv[0]),
+                        addr(gstate[0]), tail, addr<float const?>(hist[0]),
+                        npos, DND, DNCD, DNKD, DNDI, DNVH, DNKH, DNDS, DNCONV, DN_EPS)
+                }
+                var qkvy : array<float>
+                var zy : array<float>
+                ref_q8_gemm(wqkv, wsqkv, xq, xs, DND, DNCD, npos, qkvy)
+                ref_q8_gemm(wz, wsz, xq, xs, DND, DNDI, npos, zy)
+                var refy : array<float>
+                var refconv : array<float>
+                ref_dn_core(qkvy, zy, bts, gts, tapsv, wnormv, av, dtv, rstate, hist, npos, wo, wso, refy, refconv)
+                let cy = compare_gout(y, refy)
+                t |> success(cy.maxref > 0.0, "npos={npos}: chain produced non-trivial outputs")
+                t |> success(cy.maxdiff <= float(DN_REL_TOL) * cy.maxref,
+                    "npos={npos}: out rows within tolerance (maxdiff {cy.maxdiff} vs {float(DN_REL_TOL) * cy.maxref} bar, maxref {cy.maxref})")
+                let cs = compare_gout(gstate, rstate)
+                t |> success(cs.maxdiff <= float(DN_REL_TOL) * cs.maxref,
+                    "npos={npos}: final state within tolerance (maxdiff {cs.maxdiff} vs {float(DN_REL_TOL) * cs.maxref} bar, maxref {cs.maxref})")
+                var reft : array<float>
+                reft |> resize(int(DNTAPS * DNCD))
+                for (k in range64(DNTAPS)) {
+                    for (ch in range64(DNCD)) {
+                        reft[int(k * DNCD + ch)] = qkvy[int((npos - DNTAPS + k) * DNCD + ch)]
+                    }
+                }
+                let ct = compare_gout(tail, reft)
+                t |> success(ct.maxdiff <= float(REL_TOL) * ct.maxref,
+                    "npos={npos}: conv-tail rows within tolerance (maxdiff {ct.maxdiff} vs {float(REL_TOL) * ct.maxref} bar)")
+                delete xq
+                delete xs
+                delete bts
+                delete gts
+                delete tapsv
+                delete wnormv
+                delete av
+                delete dtv
+                delete hist
+                delete gstate
+                delete rstate
+                delete y
+                delete tail
+                delete qkvy
+                delete zy
+                delete refy
+                delete refconv
+                delete reft
+            }
+            delete wqkv
+            delete wsqkv
+            delete wz
+            delete wsz
+            delete wo
+            delete wso
+            delete wqb
+            delete wsb
+        } else {
+            feint("dasVulkan not installed; vulkan deltanet chain untestable here\n")
+        }
+    }
+}
+
+// ===== attention chain arms =====
+// The whole full-attention chain (q|gate/k/v GEMMs -> per-head qk-rms -> partial NEOX rope ->
+// flash-style causal attention with the sigmoid out-gate -> requant -> wo GEMM) vs a CPU mirror
+// of the same math (straight softmax — the online reorder is fp-equivalent within tolerance).
+// Arms: gated partial-rope, ungated full-rope, a k4 wo (the mixed-class Q8_K requant path), and
+// npos = 1100 (multi-window: absolute-position K/V accumulation + cross-window attention).
+
+let ATD = 64l          // model dim
+let ATHS = 128l        // head size (the kernel's dpl=4 shape)
+let ATNH = 4l          // q heads
+let ATNKV = 2l         // kv heads (GQA kv_mul = 2)
+let ATQD = ATNH * ATHS
+let ATKVD = ATNKV * ATHS
+let AT_EPS = 1e-6
+let ATQ_WOFF = 21000000l
+let ATK_WOFF = 22000000l
+let ATV_WOFF = 23000000l
+let ATO_WOFF = 24000000l
+let ATO4_WOFF = 25000000l
+let AT_REL_TOL = 3e-3
+
+// deinterleave (gated) + per-head rms + partial NEOX rope of one projection plane — the CPU
+// mirror of at_prep. rows out d-wide; a gated q also returns the raw gate plane.
+def private ref_at_prep(y : array<float>; rmsw : array<float>; cosr, sinr : array<float>;
+                        npos, d, rot : int64; gated : bool;
+                        var outp : array<float>; var gatep : array<float>) {
+    let half = rot / 2l
+    outp |> resize(int(npos * d))
+    if (gated) {
+        gatep |> resize(int(npos * d))
+    }
+    var row : array<float>
+    row |> resize(int(d))
+    for (p in range64(npos)) {
+        for (i in range64(d)) {
+            let h = i / ATHS
+            let j = i % ATHS
+            if (gated) {
+                row[int(i)] = y[int(p * 2l * d + h * 2l * ATHS + j)]
+                gatep[int(p * d + i)] = y[int(p * 2l * d + h * 2l * ATHS + ATHS + j)]
+            } else {
+                row[int(i)] = y[int(p * d + i)]
+            }
+        }
+        for (h in range64(d / ATHS)) {   // per-head rms (f32 square-sum, the kernel's order)
+            var ss = 0.0
+            for (j in range64(ATHS)) {
+                let v = row[int(h * ATHS + j)]
+                ss += v * v
+            }
+            let scale = 1.0 / sqrt(ss / float(ATHS) + AT_EPS)
+            for (j in range64(ATHS)) {
+                row[int(h * ATHS + j)] = rmsw[int(j)] * (row[int(h * ATHS + j)] * scale)
+            }
+        }
+        for (h in range64(d / ATHS)) {   // NEOX pairs (j, j+half) over the roped span
+            for (j in range64(half)) {
+                let v0 = row[int(h * ATHS + j)]
+                let v1 = row[int(h * ATHS + j + half)]
+                let cr = cosr[int(p * half + j)]
+                let ci = sinr[int(p * half + j)]
+                row[int(h * ATHS + j)] = v0 * cr - v1 * ci
+                row[int(h * ATHS + j + half)] = v0 * ci + v1 * cr
+            }
+        }
+        for (i in range64(d)) {
+            outp[int(p * d + i)] = row[int(i)]
+        }
+    }
+    delete row
+}
+
+// straight-softmax causal attention + out-gate — the CPU mirror of at_attn's online form
+def private ref_at_attn(qp, kp, vp, gatep : array<float>; npos : int64; gated : bool;
+                        var op : array<float>) {
+    let scale = 1.0 / sqrt(float(ATHS))
+    let kv_mul = ATNH / ATNKV
+    op |> resize(int(npos * ATQD))
+    var sc : array<float>
+    sc |> resize(int(npos))
+    for (p in range64(npos)) {
+        for (h in range64(ATNH)) {
+            let kvh = h / kv_mul
+            var mx = -3.0e38
+            for (j in range64(p + 1l)) {
+                var s = 0.0
+                for (dd in range64(ATHS)) {
+                    s += qp[int(p * ATQD + h * ATHS + dd)] * kp[int(j * ATKVD + kvh * ATHS + dd)]
+                }
+                sc[int(j)] = s * scale
+                mx = max(mx, sc[int(j)])
+            }
+            var lsum = 0.0
+            for (j in range64(p + 1l)) {
+                sc[int(j)] = exp(sc[int(j)] - mx)
+                lsum += sc[int(j)]
+            }
+            for (dd in range64(ATHS)) {
+                var acc = 0.0
+                for (j in range64(p + 1l)) {
+                    acc += sc[int(j)] * vp[int(j * ATKVD + kvh * ATHS + dd)]
+                }
+                var v = acc / lsum
+                if (gated) {
+                    let g = gatep[int(p * ATQD + h * ATHS + dd)]
+                    v = v / (1.0 + exp(-g))
+                }
+                op[int(p * ATQD + h * ATHS + dd)] = v
+            }
+        }
+    }
+    delete sc
+}
+
+[test]
+def test_vulkan_attention(t : T?) {
+    t |> run("vulkan attention chain == CPU reference (gated/ungated/kq-wo/multi-window arms)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            var wqg : array<int8>       // gated q|gate plane (2*ATQD rows)
+            var wsqg : array<float>
+            var wqp : array<int8>       // plain q plane (ungated arm)
+            var wsqp : array<float>
+            var wk : array<int8>
+            var wsk : array<float>
+            var wv : array<int8>
+            var wsv : array<float>
+            var wo : array<int8>
+            var wso : array<float>
+            fill_stack(wqg, wsqg, 2l * ATQD, ATD, 51l, true)
+            fill_stack(wqp, wsqp, ATQD, ATD, 53l, true)
+            fill_stack(wk, wsk, ATKVD, ATD, 57l, true)
+            fill_stack(wv, wsv, ATKVD, ATD, 59l, true)
+            fill_stack(wo, wso, ATD, ATQD, 61l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(wqg, wsqg, wqb, wsb)
+            if (!moe_gpu_upload_stack(wqb, wsb, ATQ_WOFF, ATD, 2l * ATQD, 0)) {
+                feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                return
+            }
+            pack_upload(wqp, wsqp, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, ATQ_WOFF + 500000l, ATD, ATQD, 0), "plain q stack uploaded")
+            pack_upload(wk, wsk, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, ATK_WOFF, ATD, ATKVD, 0), "k stack uploaded")
+            pack_upload(wv, wsv, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, ATV_WOFF, ATD, ATKVD, 0), "v stack uploaded")
+            pack_upload(wo, wso, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, ATO_WOFF, ATQD, ATD, 0), "wo stack uploaded")
+            var wo4b : array<uint8>
+            var wso4b : array<uint8>
+            fill_kq_stack(1, ATD, ATQD, 67l, false, wo4b, wso4b)
+            t |> success(moe_gpu_upload_stack(wo4b, wso4b, ATO4_WOFF, ATQD, ATD, 1), "k4 wo stack uploaded")
+            var wo4 : array<float>
+            dequant_kq_stack(1, wo4b, wso4b, ATD, ATQD, wo4)
+            var rmsq : array<float>
+            var rmsk : array<float>
+            rmsq |> resize(int(ATHS))
+            rmsk |> resize(int(ATHS))
+            for (i in range(int(ATHS))) {
+                rmsq[i] = 1.0 + synth_f(int64(i), 71l, 0.3)
+                rmsk[i] = 1.0 + synth_f(int64(i), 73l, 0.3)
+            }
+            // arms: (npos, rot, gated, k4 wo)
+            for (arm in [(npos = 70l, rot = 64l, gated = true, o4 = false),
+                         (npos = 70l, rot = 128l, gated = false, o4 = false),
+                         (npos = 70l, rot = 64l, gated = true, o4 = true),
+                         (npos = 1100l, rot = 64l, gated = true, o4 = false)]) {
+                let npos = arm.npos
+                let rot = arm.rot
+                let half = rot / 2l
+                var xq : array<int8>
+                var xs : array<float>
+                xq |> resize(int(npos * ATD))
+                xs |> resize(int(npos * (ATD / 32l)))
+                for (i in range(int(npos * ATD))) {
+                    xq[i] = int8((int64(i) * 13l + 7l) % 255l - 127l)
+                }
+                for (i in range(int(npos * (ATD / 32l)))) {
+                    xs[i] = pow2_small(int64(i) + 6l)
+                }
+                var cosr : array<float>
+                var sinr : array<float>
+                cosr |> resize(int(npos * half))
+                sinr |> resize(int(npos * half))
+                for (p in range64(npos)) {
+                    for (j in range64(half)) {
+                        let freq = 1.0 / pow(10000.0, float(2l * j) / float(rot))
+                        cosr[int(p * half + j)] = cos(float(p) * freq)
+                        sinr[int(p * half + j)] = sin(float(p) * freq)
+                    }
+                }
+                var y : array<float>
+                var kout : array<float>
+                var vout : array<float>
+                y |> resize(int(npos * ATD))
+                kout |> resize(int(npos * ATKVD))
+                vout |> resize(int(npos * ATKVD))
+                unsafe {
+                    matmul_moe_gpu_attn(y, kout, vout,
+                        arm.gated ? ATQ_WOFF : ATQ_WOFF + 500000l, ATK_WOFF, ATV_WOFF,
+                        arm.o4 ? ATO4_WOFF : ATO_WOFF,
+                        0, 0, 0, arm.o4 ? 1 : 0, xq, xs,
+                        addr<float const?>(rmsq[0]), addr<float const?>(rmsk[0]),
+                        addr<float const?>(cosr[0]), addr<float const?>(sinr[0]),
+                        npos, ATD, ATQD, ATKVD, ATHS, rot, ATNH, ATNH / ATNKV,
+                        1.0 / sqrt(float(ATHS)), float(AT_EPS), arm.gated, true)
+                }
+                // the CPU mirror: GEMMs, prep, attention, requant, wo
+                var qgy : array<float>
+                var ky : array<float>
+                var vy : array<float>
+                if (arm.gated) {
+                    ref_q8_gemm(wqg, wsqg, xq, xs, ATD, 2l * ATQD, npos, qgy)
+                } else {
+                    ref_q8_gemm(wqp, wsqp, xq, xs, ATD, ATQD, npos, qgy)
+                }
+                ref_q8_gemm(wk, wsk, xq, xs, ATD, ATKVD, npos, ky)
+                ref_q8_gemm(wv, wsv, xq, xs, ATD, ATKVD, npos, vy)
+                var qp : array<float>
+                var gatep : array<float>
+                var kp : array<float>
+                var kgate_unused : array<float>
+                ref_at_prep(qgy, rmsq, cosr, sinr, npos, ATQD, rot, arm.gated, qp, gatep)
+                ref_at_prep(ky, rmsk, cosr, sinr, npos, ATKVD, rot, false, kp, kgate_unused)
+                var op : array<float>
+                ref_at_attn(qp, kp, vy, gatep, npos, arm.gated, op)
+                // requant the o rows in the wo stack's form, then the wo GEMM
+                var refy : array<float>
+                if (arm.o4) {
+                    var oq : array<int>
+                    var os : array<float>
+                    oq |> resize(int(npos * ATQD))
+                    os |> resize(int(npos * ATQD / 256l))
+                    for (b in range64(npos * ATQD / 256l)) {
+                        var amax = 0.0
+                        for (j in range64(256l)) {
+                            amax = max(amax, abs(op[int(b * 256l + j)]))
+                        }
+                        let dq = amax / 127.0
+                        let id = dq != 0.0 ? 1.0 / dq : 0.0
+                        os[int(b)] = dq
+                        for (j in range64(256l)) {
+                            oq[int(b * 256l + j)] = int(round(op[int(b * 256l + j)] * id))
+                        }
+                    }
+                    refy |> resize(int(npos * ATD))
+                    let nsbh = int(ATQD / 256l)
+                    for (rw in range(int(npos))) {
+                        for (o in range(int(ATD))) {
+                            var acc = 0.0lf
+                            for (sb in range(nsbh)) {
+                                var dd = 0.0lf
+                                for (j in range(256)) {
+                                    dd += double(wo4[o * int(ATQD) + sb * 256 + j]) * double(oq[rw * int(ATQD) + sb * 256 + j])
+                                }
+                                acc += dd * double(os[rw * nsbh + sb])
+                            }
+                            refy[rw * int(ATD) + o] = float(acc)
+                        }
+                    }
+                    delete oq
+                    delete os
+                } else {
+                    var oq : array<int8>
+                    var os : array<float>
+                    oq |> resize(int(npos * ATQD))
+                    os |> resize(int(npos * ATQD / 32l))
+                    for (b in range64(npos * ATQD / 32l)) {
+                        var amax = 0.0
+                        for (j in range64(32l)) {
+                            amax = max(amax, abs(op[int(b * 32l + j)]))
+                        }
+                        let dq = amax / 127.0
+                        let id = dq != 0.0 ? 1.0 / dq : 0.0
+                        os[int(b)] = dq
+                        for (j in range64(32l)) {
+                            oq[int(b * 32l + j)] = int8(int(round(op[int(b * 32l + j)] * id)))
+                        }
+                    }
+                    ref_q8_gemm(wo, wso, oq, os, ATQD, ATD, npos, refy)
+                    delete oq
+                    delete os
+                }
+                let tag = "npos={npos} rot={rot} gated={arm.gated} o4={arm.o4}"
+                let cy = compare_gout(y, refy)
+                t |> success(cy.maxref > 0.0, "{tag}: chain produced non-trivial outputs")
+                t |> success(cy.maxdiff <= float(AT_REL_TOL) * cy.maxref,
+                    "{tag}: out rows within tolerance (maxdiff {cy.maxdiff} vs {float(AT_REL_TOL) * cy.maxref} bar, maxref {cy.maxref})")
+                let ck = compare_gout(kout, kp)
+                t |> success(ck.maxdiff <= float(AT_REL_TOL) * ck.maxref,
+                    "{tag}: roped k rows within tolerance (maxdiff {ck.maxdiff} vs {float(AT_REL_TOL) * ck.maxref} bar)")
+                let cv = compare_gout(vout, vy)
+                t |> success(cv.maxdiff <= float(AT_REL_TOL) * cv.maxref,
+                    "{tag}: v rows within tolerance (maxdiff {cv.maxdiff} vs {float(AT_REL_TOL) * cv.maxref} bar)")
+                delete xq
+                delete xs
+                delete cosr
+                delete sinr
+                delete y
+                delete kout
+                delete vout
+                delete qgy
+                delete ky
+                delete vy
+                delete qp
+                delete gatep
+                delete kp
+                delete kgate_unused
+                delete op
+                delete refy
+            }
+            delete wqg
+            delete wsqg
+            delete wqp
+            delete wsqp
+            delete wk
+            delete wsk
+            delete wv
+            delete wsv
+            delete wo
+            delete wso
+            delete wqb
+            delete wsb
+            delete wo4b
+            delete wso4b
+            delete wo4
+            delete rmsq
+            delete rmsk
+        } else {
+            feint("dasVulkan not installed; vulkan attention chain untestable here\n")
         }
     }
 }

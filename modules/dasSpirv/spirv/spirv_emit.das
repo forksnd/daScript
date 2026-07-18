@@ -2968,14 +2968,23 @@ class SpirvEmit : AstVisitor {
         }
         // barrier(): control + shared-memory barrier (OpControlBarrier at Workgroup execution+memory
         // scope, WorkgroupMemory|AcquireRelease semantics). memoryBarrierShared(): the memory-only
-        // variant (OpMemoryBarrier, same scope/semantics). Both compute-only; not block terminators.
-        if (name == "barrier" || name == "memoryBarrierShared") {
+        // variant (OpMemoryBarrier, same scope/semantics). memoryBarrierBuffer(): the SSBO variant
+        // (OpMemoryBarrier at Device scope, UniformMemory|AcquireRelease — glslang's lowering) for
+        // cross-invocation buffer handoffs, where barrier()'s WorkgroupMemory semantics do not
+        // reach; pair as `memoryBarrierBuffer(); barrier();`. All compute-only; not terminators.
+        if (name == "barrier" || name == "memoryBarrierShared" || name == "memoryBarrierBuffer") {
             if (ctx.stage != ShaderStage.Compute) {
                 errs |> push("{name}() is only valid in a compute shader")
                 return expr
             }
             if (!empty(expr.arguments)) {
                 errs |> push("{name}() takes no arguments")
+                return expr
+            }
+            if (name == "memoryBarrierBuffer") {
+                let dscope = const_uint(bm, uint(SpvScope.Device))
+                let bsem = const_uint(bm, uint(SpvMemorySemantics.UniformMemory) | uint(SpvMemorySemantics.AcquireRelease))
+                emit(bm, SEC_FUNCS, SpvOp.MemoryBarrier, dscope, bsem)
                 return expr
             }
             let scope = const_uint(bm, uint(SpvScope.Workgroup))

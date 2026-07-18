@@ -1001,6 +1001,26 @@ def cshared {
     let _o = atomicAdd(rout[0], rtile[lid])   // OpAtomicIAdd onto an SSBO element (Device scope)
 }
 
+// cbufbar: the cross-invocation SSBO handoff sync — memoryBarrierBuffer() (OpMemoryBarrier at
+// Device scope, UniformMemory|AcquireRelease semantics, glslang's lowering) paired with
+// barrier(). The buffer twin of the shared-memory sync above: barrier() alone carries only
+// WorkgroupMemory semantics, which does not order buffer writes for other invocations.
+var @ssbo @binding = 0 bb_io : array<uint>
+
+[compute_shader(local_size_x=64, name="cbufbar_spv"), marker(no_coverage)]
+def cbufbar {
+    let lid = gl_LocalInvocationID.x
+    let gid = gl_GlobalInvocationID.x
+    bb_io[gid] = gid * 3u
+    memoryBarrierBuffer()
+    barrier()
+    bb_io[gid] = bb_io[gid ^ 1u] + lid
+}
+
+def public cbufbar_words : array<uint> {
+    return clone_to_move(cbufbar_spv)
+}
+
 // catomics: the rest of the atomic family on @workgroup int + uint scalar counters (Workgroup
 // scope). Both signednesses are present so atomicMin/Max emit BOTH the signed (SMin/SMax) and
 // unsigned (UMin/UMax) opcodes; atomicCompSwap is the OpAtomicCompareExchange CAS. The results feed

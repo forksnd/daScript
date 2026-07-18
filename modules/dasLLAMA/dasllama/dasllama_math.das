@@ -1465,17 +1465,56 @@ var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend
 // count — the three lists share row ranges, which partition [0, nrows)); x is the row-major
 // gathered activation image — nrows x n quants + per-32 scales (q8 stacks) or the Q8_K form,
 // per-256 scales (kq stacks; the tier resolves which from the uploaded stack format). The whole
-// gate+up -> act -> requant -> down chain runs device-side; gout returns nrows x n floats.
+// gate+up -> act -> requant -> down chain runs device-side. npos = 0: gout returns nrows x n
+// floats (one row per routed bucket row). npos > 0 (prefill batches): the tier ALSO runs the
+// routed weighted-sum combine on the device — wp is the grid-order routing weight plane
+// (npos x k floats), invp the grid -> bucket row map (npos x k uints, nrows = npos * k) — and
+// gout returns npos x n combined rows (the down rows never cross PCIe).
 // is_gelu picks GeGLU over SwiGLU (swiglu_oai belongs to biased arches the callers exclude).
 // f1/f3/f2 (and the cls fmt) ride along because weight element offsets are PER-FORMAT plane
 // spaces (q8 qblob vs the k4/k5/k6 planes) — a bare offset is ambiguous across formats (a k4
 // gate and a k5 down can share the numeric range), so the tier resolves stacks by (fmt, offset).
-typedef MoeGpuFfnFn = function<(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; nfe : int64; nrows : int64; f1 : int; f3 : int; f2 : int; is_gelu : bool) : void>
+typedef MoeGpuFfnFn = function<(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; wp : float const?; invp : uint const?; n : int64; nfe : int64; nrows : int64; npos : int64; f1 : int; f3 : int; f2 : int; is_gelu : bool) : void>
 typedef MoeGpuUploadFn = function<(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int; stream : bool) : bool>
 typedef MoeGpuClsFn = function<(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; fmt : int) : void>
+typedef MoeGpuDenseFn = function<(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; nrows : int64; fmt : int) : void>
+typedef MoeGpuDropFn = function<(n : int; stream : bool) : void>
+// The whole deltanet attention block of one recurrent layer as ONE device chain: qkv + z-gate
+// GEMMs off the normed-x Q8_0 image (planes are always q8 — the split layout stores deltanet
+// projections in qblob whatever the file had), depthwise conv + silu + q/k L2-norm, the chunked
+// delta-rule scan (beta/alpha transforms in-kernel from the raw rows), gated out-norm, and the
+// out projection. yp gets npos x dim out-proj rows (the residual add stays on the caller); stp
+// is the f32 state in/out; tailp gets the last `taps` qkv rows (row-major — the caller's conv
+// history store); histp feeds the conv history in, channel-major (zeros at a fresh start —
+// dn_reset's state — so there is no validity flag).
+typedef MoeGpuDnFn = function<(var yp : float?; woq : int64; woz : int64; woo : int64;
+                               xqp : int8 const?; xsp : float const?; bp : float const?; gp : float const?;
+                               convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?;
+                               var stp : float?; var tailp : float?; histp : float const?;
+                               npos : int64; dim : int64; cd : int64; kd : int64; di : int64;
+                               nvh : int64; nkh : int64; ds : int64; dconv : int64; eps : float) : void>
+// The whole softmax attention block of one full-attention layer as ONE device chain per window:
+// q(|gate)/k/v GEMMs off the normed-x image, per-head qk-RMSNorm, partial NEOX RoPE off uploaded
+// cos/sin rows, flash-style causal attention (GQA, online softmax), the sigmoid out-gate folded
+// into the attention epilogue (gated arches), requant, and the wo projection. yp gets npos x dim
+// out-proj rows (the residual add stays on the caller); kp/vp get the npos x kv_dim roped-k /
+// raw-v rows — the caller's kv_store_batch source, so the cache codec never enters the tier.
+// Start-of-sequence only (start_pos == 0): attention reads K/V of the batch itself device-side;
+// continuation windows fall back to the CPU path (fail-closed). Weight formats ride per plane
+// ((fmt, offset) stack identity); q/k/v share one activation image so their format class must
+// agree — fo is free (the requant form follows the wo stack, the FFN-down rule).
+typedef MoeGpuAttnFn = function<(var yp : float?; var kp : float?; var vp : float?;
+                                 woq : int64; wok : int64; wov : int64; woo : int64;
+                                 fq : int; fk : int; fv : int; fo : int;
+                                 xqp : int8 const?; xsp : float const?;
+                                 rmsqp : float const?; rmskp : float const?;
+                                 cosp : float const?; sinp : float const?;
+                                 npos : int64; dim : int64; qd : int64; kv_dim : int64;
+                                 hs : int64; rot : int64; n_heads : int64; kv_mul : int64;
+                                 scale : float; eps : float; gated : bool; qknorm : bool) : void>
 
-[unused_argument(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)]
-def private moe_gpu_unset_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+[unused_argument(goutp, offs1, offs3, offs2, nregions, xqp, xsp, wp, invp, n, nfe, nrows, npos, f1, f3, f2, is_gelu)]
+def private moe_gpu_unset_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; wp : float const?; invp : uint const?; n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
     panic("dasLLAMA: MoE GPU FFN dispatch hit without an installed GPU tier")
 }
 
@@ -1489,20 +1528,64 @@ def private moe_gpu_unset_cls(var yp : float?; woff : int64; xqp : int8 const?; 
     panic("dasLLAMA: GPU classifier dispatch hit without an installed GPU tier")
 }
 
+[unused_argument(yp, woff, xqp, xsp, n, d, nrows, fmt)]
+def private moe_gpu_unset_dense(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n, d, nrows : int64; fmt : int) {
+    panic("dasLLAMA: GPU dense GEMM dispatch hit without an installed GPU tier")
+}
+
+[unused_argument(n, stream)]
+def private moe_gpu_unset_drop(n : int; stream : bool) {
+    panic("dasLLAMA: GPU stack drop hit without an installed GPU tier")
+}
+
+[unused_argument(yp, woq, woz, woo, xqp, xsp, bp, gp, convw, wnormp, ap, dtp, stp, tailp, histp, npos, dim, cd, kd, di, nvh, nkh, ds, dconv, eps)]
+def private moe_gpu_unset_dn(var yp : float?; woq, woz, woo : int64;
+                             xqp : int8 const?; xsp : float const?; bp : float const?; gp : float const?;
+                             convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?;
+                             var stp : float?; var tailp : float?; histp : float const?;
+                             npos, dim, cd, kd, di, nvh, nkh, ds, dconv : int64; eps : float) {
+    panic("dasLLAMA: GPU deltanet dispatch hit without an installed GPU tier")
+}
+
+[unused_argument(yp, kp, vp, woq, wok, wov, woo, fq, fk, fv, fo, xqp, xsp, rmsqp, rmskp, cosp, sinp, npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul, scale, eps, gated, qknorm)]
+def private moe_gpu_unset_attn(var yp : float?; var kp : float?; var vp : float?;
+                               woq, wok, wov, woo : int64; fq, fk, fv, fo : int;
+                               xqp : int8 const?; xsp : float const?;
+                               rmsqp : float const?; rmskp : float const?;
+                               cosp : float const?; sinp : float const?;
+                               npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul : int64;
+                               scale : float; eps : float; gated : bool; qknorm : bool) {
+    panic("dasLLAMA: GPU attention dispatch hit without an installed GPU tier")
+}
+
 var g_moe_gpu_ffn = @@moe_gpu_unset_ffn
 var g_moe_gpu_upload = @@moe_gpu_unset_upload
 var g_moe_gpu_cls = @@moe_gpu_unset_cls
+var g_moe_gpu_dense = @@moe_gpu_unset_dense
+var g_moe_gpu_drop = @@moe_gpu_unset_drop
+var g_moe_gpu_dn = @@moe_gpu_unset_dn
+var g_moe_gpu_attn = @@moe_gpu_unset_attn
 var g_moe_gpu_installed = false
 var g_moe_gpu_layer_count = 0l         // K = layers offloaded from the END (env-driven, set by the tier)
 var g_moe_gpu_from_layer = 1000000l    // first offloaded layer (n_layers - K, set by the loader)
 var g_moe_gpu_cls_off = -1l            // element offset of the resident classifier plane (loader contract)
 var g_moe_gpu_stream_from = 1000000l   // first STREAMED layer (streamed range = [stream_from, from_layer))
+var g_moe_gpu_dense_offs : table<int64>   // resident dense planes, keyed woff * 8 + fmt (per-format offset spaces)
+var g_moe_gpu_dense_route = true       // runtime routing gate over the marks (in-process A/B lever)
+var g_moe_gpu_dn_layers : table<int64>    // recurrent layers whose deltanet triple is tier-resident
+var g_moe_gpu_dn_route = true          // runtime routing gate over the deltanet marks (--dn-ab lever)
+var g_moe_gpu_attn_layers : table<int64>  // full-attention layers whose q/k/v/o quad is tier-resident
+var g_moe_gpu_attn_route = true        // runtime routing gate over the attention marks (--attn-ab lever)
 
 //! Install the GPU MoE tier (a GPU backend calls this at [init] when its device probe passes).
-def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn) {
+def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn; dense : MoeGpuDenseFn; drop : MoeGpuDropFn; dn : MoeGpuDnFn; attn : MoeGpuAttnFn) {
     g_moe_gpu_ffn = ffn
     g_moe_gpu_upload = upload
     g_moe_gpu_cls = cls
+    g_moe_gpu_dense = dense
+    g_moe_gpu_drop = drop
+    g_moe_gpu_dn = dn
+    g_moe_gpu_attn = attn
     g_moe_gpu_installed = true
 }
 
@@ -1543,6 +1626,66 @@ def public moe_gpu_cls_on_gpu(woff : int64) : bool {
     return g_moe_gpu_installed && woff == g_moe_gpu_cls_off
 }
 
+//! Loader contract: mark one dense (attention-side) plane resident on the tier. Keyed by
+//! (fmt, element offset) — the same identity the tier resolves stacks by, so the batch GEMM
+//! funnels route any marked weight without knowing layers or arches. Reset per load.
+def public set_moe_gpu_dense_off(fmt : int; woff : int64) {
+    g_moe_gpu_dense_offs |> insert(woff * 8l + int64(fmt))
+}
+
+def public reset_moe_gpu_dense_offs {
+    g_moe_gpu_dense_offs |> clear()
+}
+
+def public moe_gpu_dense_on_gpu(fmt : int; woff : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_dense_route && key_exists(g_moe_gpu_dense_offs, woff * 8l + int64(fmt))
+}
+
+//! Runtime routing gate over the dense marks: uploads stay resident, only the funnels' routing
+//! flips. The in-process A/B lever — both arms share one process, one residency, one budget
+//! knee, so the measured delta is the dense rail alone (cross-run pp drift measured ±12).
+def public set_moe_gpu_dense_route(on : bool) {
+    g_moe_gpu_dense_route = on
+}
+
+//! Loader contract: mark one recurrent layer's deltanet triple (qkv / z-gate / out-proj planes)
+//! resident on the tier — the prefill deltanet block then runs as one device chain. Reset per load.
+def public set_moe_gpu_dn_layer(l : int64) {
+    g_moe_gpu_dn_layers |> insert(l)
+}
+
+def public reset_moe_gpu_dn_layers {
+    g_moe_gpu_dn_layers |> clear()
+}
+
+def public moe_gpu_dn_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_dn_route && key_exists(g_moe_gpu_dn_layers, l)
+}
+
+//! Runtime routing gate over the deltanet marks (the --dn-ab in-process lever; uploads stay).
+def public set_moe_gpu_dn_route(on : bool) {
+    g_moe_gpu_dn_route = on
+}
+
+//! Loader contract: mark one full-attention layer's q/k/v/o plane quad resident on the tier —
+//! the prefill attention block then runs as one device chain. Reset per load.
+def public set_moe_gpu_attn_layer(l : int64) {
+    g_moe_gpu_attn_layers |> insert(l)
+}
+
+def public reset_moe_gpu_attn_layers {
+    g_moe_gpu_attn_layers |> clear()
+}
+
+def public moe_gpu_attn_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_attn_route && key_exists(g_moe_gpu_attn_layers, l)
+}
+
+//! Runtime routing gate over the attention marks (the --attn-ab in-process lever; uploads stay).
+def public set_moe_gpu_attn_route(on : bool) {
+    g_moe_gpu_attn_route = on
+}
+
 //! Upload one weight stack ([rows x n] at element offset woff) as the GPU tier's row-major
 //! planes — q8 (fmt 0): int8 quants + f16 halfword scales; native K-quant (fmt = int(KqFmt)
 //! k4/k5/k6): superblock quant payloads + decoded 20B scale rows. stream = keep in a pinned
@@ -1568,8 +1711,77 @@ def public matmul_moe_gpu_ffn(var gout : array<float>; offs1 : array<int64>; off
     unsafe {
         invoke(g_moe_gpu_ffn, addr(gout[0]),
             addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,
-            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, nfe, nrows, f1, f3, f2, is_gelu)
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), null, null, n, nfe, nrows, 0l, f1, f3, f2, is_gelu)
     }
+}
+
+//! The combined prefill form: the routed weighted-sum reduce ALSO runs on the device, so gout
+//! returns npos x n combined rows instead of nrows x n bucket rows (the down rows never cross
+//! PCIe — the readback shrinks k-fold). w is the grid-order routing weight plane (npos x k),
+//! inv the grid -> bucket row map (npos x k, nrows = npos * k). Within a chunk slots accumulate
+//! in ascending slot order (the decode order); a position whose rows span chunks sums chunk-major.
+def public matmul_moe_gpu_ffn_combined(var gout : array<float>; offs1 : array<int64>; offs3 : array<int64>; offs2 : array<int64>;
+                                       nregions : int64; xq : array<int8>; xs : array<float>; w : array<float>; inv : array<uint>;
+                                       n, nfe, nrows, npos : int64; f1, f3, f2 : int; is_gelu : bool) {
+    unsafe {
+        invoke(g_moe_gpu_ffn, addr(gout[0]),
+            addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), addr<float const?>(w[0]), addr<uint const?>(inv[0]),
+            n, nfe, nrows, npos, f1, f3, f2, is_gelu)
+    }
+}
+
+//! Dense batched GEMM on the GPU tier — y [nrows x d] = X · Wᵀ over the resident plane
+//! ([d x n] at element offset woff). xq/xs is the row-major pre-quantized activation image in
+//! the plane's own quant form — q8_0 per-32 scales for q8, Q8_K per-256 for kq (the tier
+//! resolves which from the uploaded stack format; per-16 block sums are recomputed in-kernel).
+def public matmul_gpu_dense(var y : array<float>; woff : int64; xq : array<int8>; xs : array<float>; n, d, nrows : int64; fmt : int) {
+    unsafe {
+        invoke(g_moe_gpu_dense, addr(y[0]), woff, addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, nrows, fmt)
+    }
+}
+
+//! One recurrent layer's whole deltanet attention block on the GPU tier — see MoeGpuDnFn for
+//! the contract. y gets npos x dim out-proj rows, state/tail update in place; beta/alpha arrive
+//! RAW (transforms run in-kernel), conv taps in the fblob disk layout (cd x dconv).
+def public matmul_moe_gpu_dn(var y : array<float>; woq, woz, woo : int64;
+                             xq : array<int8>; xs : array<float>; b : array<float>; g : array<float>;
+                             convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?;
+                             var stp : float?; var tail : array<float>; histp : float const?;
+                             npos, dim, cd, kd, di, nvh, nkh, ds, dconv : int64; eps : float) {
+    unsafe {
+        invoke(g_moe_gpu_dn, addr(y[0]), woq, woz, woo,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), addr<float const?>(b[0]), addr<float const?>(g[0]),
+            convw, wnormp, ap, dtp, stp, addr(tail[0]), histp,
+            npos, dim, cd, kd, di, nvh, nkh, ds, dconv, eps)
+    }
+}
+
+//! One full-attention layer's whole softmax attention block on the GPU tier — see MoeGpuAttnFn
+//! for the contract. y gets npos x dim wo rows; k/v get the npos x kv_dim roped-k / raw-v rows
+//! (the caller's kv_store_batch source). cos/sin are npos x rot/2 NEOX rope rows; rms weight
+//! rows may be null when qknorm is off.
+def public matmul_moe_gpu_attn(var y : array<float>; var k : array<float>; var v : array<float>;
+                               woq, wok, wov, woo : int64; fq, fk, fv, fo : int;
+                               xq : array<int8>; xs : array<float>;
+                               rmsqp : float const?; rmskp : float const?;
+                               cosp : float const?; sinp : float const?;
+                               npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul : int64;
+                               scale : float; eps : float; gated : bool; qknorm : bool) {
+    unsafe {
+        invoke(g_moe_gpu_attn, addr(y[0]), addr(k[0]), addr(v[0]),
+            woq, wok, wov, woo, fq, fk, fv, fo,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            rmsqp, rmskp, cosp, sinp,
+            npos, dim, qd, kv_dim, hs, rot, n_heads, kv_mul, scale, eps, gated, qknorm)
+    }
+}
+
+//! Roll back the last n weight-stack uploads (a partial layer triple the VRAM budget cut
+//! mid-way) — a dangling plane would hijack the residency check when its layer re-enters as
+//! streamed or CPU. stream selects the pinned-mirror registry instead of the resident one.
+def public moe_gpu_drop_stacks(n : int; stream : bool) {
+    invoke(g_moe_gpu_drop, n, stream)
 }
 
 //! Classifier GEMV on the GPU tier — y[d] = W · x over the resident plane at woff (one region
