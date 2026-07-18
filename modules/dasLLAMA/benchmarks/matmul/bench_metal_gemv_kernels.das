@@ -64,6 +64,16 @@ require strings
 // behind lcpp everywhere. Production uploads therefore strip the pads GPU-side: quant plane
 // byte-identical (zero-copy-able), scale plane repacked 20B->16B at upload (2.7% of tensor bytes).
 //
+// K-quant ext round 3 (M1 Max, 2026-07-18, the gemma4-12B shapes): ALL three fused-B levers
+// REFUTED at B=4 — extb4 (load batching) dead neutral, extv4 (float4 accumulators) -20..-26%
+// (register pressure: max_threads 448 -> 384), extx4 (tgmem x-stage) -12..-21%. GMAC/s is flat
+// ~550-830 across every form = instruction-issue-bound; the production ext twins already sit at
+// the reachable wall, and the compiler already extracts the ILP the v forms spell by hand. The
+// production B=4-8 board reds are therefore NOT in this kernel. B=8 single-pass caveat: extv8
+// loses to 2 x ext4 passes outright, extx8 ties them — but every 12B shape is SLC-resident here
+// (<= 33MB vs 48MB SLC), so a single pass's halved DRAM weight traffic is INVISIBLE in this lab;
+// only an in-graph A/B can resolve the B=8 form. Arms kept as negative controls.
+//
 // k5/k6 round (M1 Max, 2026-07-15): k6_b1d beats the lcpp q6_K wall at EVERY shape (-11..-19%,
 // 321-370 wGB/s; the uint4+select sub-scale read of k6_b1c cost 2 resident sgs — lcpp-shape
 // scattered byte loads of the 16B block win). k5 is ALU-bound on the per-element 5th-bit
@@ -3007,6 +3017,699 @@ class MetalKqLabK6Ext4U {
     }
 }
 
+// ===== K-quant ext arms (round 3) — the fused-B rework levers, isolated =====
+// The knockout said the ext twins' GEMV share scales ~linearly in B and is FORMAT-INDEPENDENT
+// (~14ms/row at the 12B shapes) — that fingerprints the per-column dot block, not the dequant:
+// 16 SERIAL adds into one scalar accumulator per chunk per column. Round-3 levers, one arm each:
+//   extb4 = quant loads for BOTH chunks issued ahead of any decode (the q8 mv load-batching
+//           lesson), scalar accumulators unchanged — isolates the load-latency half.
+//   extv4 = extb4 + float4 accumulators (4 independent fma chains per column, one horizontal
+//           fold per row after the loop) — the fma-ILP half. Reassociates the add order (exact
+//           under the lab fill; production compares within tolerance).
+//   extv8 = the v form at 8 columns in ONE weight pass (production B=8 today = 2 x B4 groups =
+//           2 weight passes) — trades register pressure for halved weight traffic.
+
+class MetalKqLabK4ExtB4 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k4_extb4_msl")]
+    def lab_k4_extb4 {
+        let lane = gl_SubgroupInvocationID
+        let tx = lane % 8u
+        let ty = lane / 8u
+        let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
+        let nb = ndim / 256u
+        let q4i = tx / 4u
+        let hp = (tx % 4u) / 2u
+        let lo = (tx % 2u) * 4u
+        let jl = 2u * q4i + hp
+        let nib = (tx % 4u) < 2u
+        let nsh = nib ? 0u : 4u
+        let nb4 = ndim / 4u
+        var sumf : float[4]
+        var sb = 0u
+        while (sb < nb) {
+            let blk = row * nb + sb
+            let sv = ks4[blk]
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            let qb = blk * 32u + q4i * 8u + lo
+            var qv : uint[8]
+            for [unroll_full] (u in range(4)) {
+                qv[u] = kqu[qb + uint(u)]
+                qv[4 + u] = kqu[qb + 16u + uint(u)]
+            }
+            for [unroll_full] (ch in range(2)) {
+                let sy = (sv.y >> (8u * jl)) & 255u
+                let szv = (sv.z >> (8u * jl)) & 255u
+                let sw = (sv.w >> (8u * jl)) & 255u
+                let sc = ch == 0 ? (sy & 63u) : ((sw & 0x0Fu) | ((sy >> 6u) << 4u))
+                let mn = ch == 0 ? (szv & 63u) : ((sw >> 4u) | ((szv >> 6u) << 4u))
+                let dl = dd * float(sc)
+                let ml = dm * float(mn)
+                var w : float[16]
+                for [unroll_full] (u in range(4)) {
+                    let qvv = qv[4 * ch + u]
+                    for [unroll_full] (e in range(4)) {
+                        let byv = (qvv >> (8u * uint(e))) & 255u
+                        w[4 * u + e] = float((byv >> nsh) & 0x0Fu) * dl - ml
+                    }
+                }
+                let cx4 = sb * 64u + (q4i + uint(ch) * 2u) * 16u + (nib ? 0u : 8u) + lo
+                for [unroll_full] (b in range(4)) {
+                    let xb4 = uint(b) * nb4 + cx4
+                    var acc = 0.0
+                    for [unroll_full] (u in range(4)) {
+                        let v = x[xb4 + uint(u)]
+                        acc += v.x * w[4 * u] + v.y * w[4 * u + 1] + v.z * w[4 * u + 2] + v.w * w[4 * u + 3]
+                    }
+                    sumf[b] += acc
+                }
+            }
+            sb++
+        }
+        for [unroll_full] (b in range(4)) {
+            var s = sumf[b]
+            s += simd_shuffle_down(s, 4u)
+            s += simd_shuffle_down(s, 2u)
+            s += simd_shuffle_down(s, 1u)
+            if (tx == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = s
+            }
+        }
+    }
+}
+
+class MetalKqLabK4ExtV4 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k4_extv4_msl")]
+    def lab_k4_extv4 {
+        let lane = gl_SubgroupInvocationID
+        let tx = lane % 8u
+        let ty = lane / 8u
+        let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
+        let nb = ndim / 256u
+        let q4i = tx / 4u
+        let hp = (tx % 4u) / 2u
+        let lo = (tx % 2u) * 4u
+        let jl = 2u * q4i + hp
+        let nib = (tx % 4u) < 2u
+        let nsh = nib ? 0u : 4u
+        let nb4 = ndim / 4u
+        var acc : float4[4]
+        var sb = 0u
+        while (sb < nb) {
+            let blk = row * nb + sb
+            let sv = ks4[blk]
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            let qb = blk * 32u + q4i * 8u + lo
+            var qv : uint[8]
+            for [unroll_full] (u in range(4)) {
+                qv[u] = kqu[qb + uint(u)]
+                qv[4 + u] = kqu[qb + 16u + uint(u)]
+            }
+            for [unroll_full] (ch in range(2)) {
+                let sy = (sv.y >> (8u * jl)) & 255u
+                let szv = (sv.z >> (8u * jl)) & 255u
+                let sw = (sv.w >> (8u * jl)) & 255u
+                let sc = ch == 0 ? (sy & 63u) : ((sw & 0x0Fu) | ((sy >> 6u) << 4u))
+                let mn = ch == 0 ? (szv & 63u) : ((sw >> 4u) | ((szv >> 6u) << 4u))
+                let dl = dd * float(sc)
+                let ml = dm * float(mn)
+                var w4 : float4[4]
+                for [unroll_full] (u in range(4)) {
+                    let qvv = qv[4 * ch + u]
+                    w4[u] = float4(float((qvv >> nsh) & 15u), float((qvv >> (8u + nsh)) & 15u),
+                        float((qvv >> (16u + nsh)) & 15u), float((qvv >> (24u + nsh)) & 15u)) * dl - float4(ml)
+                }
+                let cx4 = sb * 64u + (q4i + uint(ch) * 2u) * 16u + (nib ? 0u : 8u) + lo
+                for [unroll_full] (b in range(4)) {
+                    let xb4 = uint(b) * nb4 + cx4
+                    for [unroll_full] (u in range(4)) {
+                        acc[b] += x[xb4 + uint(u)] * w4[u]
+                    }
+                }
+            }
+            sb++
+        }
+        for [unroll_full] (b in range(4)) {
+            var s = acc[b].x + acc[b].y + acc[b].z + acc[b].w
+            s += simd_shuffle_down(s, 4u)
+            s += simd_shuffle_down(s, 2u)
+            s += simd_shuffle_down(s, 1u)
+            if (tx == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = s
+            }
+        }
+    }
+}
+
+class MetalKqLabK4ExtV8 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k4_extv8_msl")]
+    def lab_k4_extv8 {
+        let lane = gl_SubgroupInvocationID
+        let tx = lane % 8u
+        let ty = lane / 8u
+        let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
+        let nb = ndim / 256u
+        let q4i = tx / 4u
+        let hp = (tx % 4u) / 2u
+        let lo = (tx % 2u) * 4u
+        let jl = 2u * q4i + hp
+        let nib = (tx % 4u) < 2u
+        let nsh = nib ? 0u : 4u
+        let nb4 = ndim / 4u
+        var acc : float4[8]
+        var sb = 0u
+        while (sb < nb) {
+            let blk = row * nb + sb
+            let sv = ks4[blk]
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            let qb = blk * 32u + q4i * 8u + lo
+            var qv : uint[8]
+            for [unroll_full] (u in range(4)) {
+                qv[u] = kqu[qb + uint(u)]
+                qv[4 + u] = kqu[qb + 16u + uint(u)]
+            }
+            for [unroll_full] (ch in range(2)) {
+                let sy = (sv.y >> (8u * jl)) & 255u
+                let szv = (sv.z >> (8u * jl)) & 255u
+                let sw = (sv.w >> (8u * jl)) & 255u
+                let sc = ch == 0 ? (sy & 63u) : ((sw & 0x0Fu) | ((sy >> 6u) << 4u))
+                let mn = ch == 0 ? (szv & 63u) : ((sw >> 4u) | ((szv >> 6u) << 4u))
+                let dl = dd * float(sc)
+                let ml = dm * float(mn)
+                var w4 : float4[4]
+                for [unroll_full] (u in range(4)) {
+                    let qvv = qv[4 * ch + u]
+                    w4[u] = float4(float((qvv >> nsh) & 15u), float((qvv >> (8u + nsh)) & 15u),
+                        float((qvv >> (16u + nsh)) & 15u), float((qvv >> (24u + nsh)) & 15u)) * dl - float4(ml)
+                }
+                let cx4 = sb * 64u + (q4i + uint(ch) * 2u) * 16u + (nib ? 0u : 8u) + lo
+                for [unroll_full] (b in range(8)) {
+                    let xb4 = uint(b) * nb4 + cx4
+                    for [unroll_full] (u in range(4)) {
+                        acc[b] += x[xb4 + uint(u)] * w4[u]
+                    }
+                }
+            }
+            sb++
+        }
+        for [unroll_full] (b in range(8)) {
+            var s = acc[b].x + acc[b].y + acc[b].z + acc[b].w
+            s += simd_shuffle_down(s, 4u)
+            s += simd_shuffle_down(s, 2u)
+            s += simd_shuffle_down(s, 1u)
+            if (tx == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = s
+            }
+        }
+    }
+}
+
+// k6 v-form: the 8 quant-plane loads of each chunk (ql x4 + qh x4) batch ahead of the chunk's
+// decode; the nibble/high-bit composition and scale math are the ext twins' verbatim.
+class MetalKqLabK6ExtV4 {
+    @ssbo @binding = 0 kdh : array<float16>
+    @ssbo @binding = 1 kscb : array<uint8>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k6_extv4_msl")]
+    def lab_k6_extv4 {
+        let lane = gl_SubgroupInvocationID
+        let tx = lane % 8u
+        let ty = lane / 8u
+        let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
+        let nb = ndim / 256u
+        let s = tx / 2u
+        let o4 = (tx % 2u) * 4u
+        let qoff = (s % 2u) * 8u + o4
+        let shr = s < 2u ? 0u : 4u
+        let hsh = 2u * s
+        let nb4 = ndim / 4u
+        var acc : float4[4]
+        var sb = 0u
+        while (sb < nb) {
+            let blk = row * nb + sb
+            let dd = float(kdh[blk])
+            for [unroll_full] (ch in range(2)) {
+                let ip = uint(ch)
+                let qb = blk * 48u + ip * 16u + qoff
+                let hb = blk * 48u + 32u + ip * 8u + o4
+                var qu : uint[4]
+                var hu : uint[4]
+                for [unroll_full] (u in range(4)) {
+                    qu[u] = kqu[qb + uint(u)]
+                    hu[u] = kqu[hb + uint(u)]
+                }
+                let g = ip * 8u + s * 2u + (tx % 2u)
+                let sc = float((int(kscb[blk * 16u + g]) ^ 128) - 128)
+                let dl = dd * sc
+                let ml = dl * 32.0
+                var w4 : float4[4]
+                for [unroll_full] (u in range(4)) {
+                    let qv = ((qu[u] >> shr) & 0x0F0F0F0F) | (((hu[u] >> hsh) & 0x03030303) << 4u)
+                    w4[u] = float4(float(qv & 255u), float((qv >> 8u) & 255u),
+                        float((qv >> 16u) & 255u), float((qv >> 24u) & 255u)) * dl - float4(ml)
+                }
+                let cx4 = sb * 64u + ip * 32u + s * 8u + o4
+                for [unroll_full] (b in range(4)) {
+                    let xb4 = uint(b) * nb4 + cx4
+                    for [unroll_full] (u in range(4)) {
+                        acc[b] += x[xb4 + uint(u)] * w4[u]
+                    }
+                }
+            }
+            sb++
+        }
+        for [unroll_full] (b in range(4)) {
+            var sm = acc[b].x + acc[b].y + acc[b].z + acc[b].w
+            sm += simd_shuffle_down(sm, 4u)
+            sm += simd_shuffle_down(sm, 2u)
+            sm += simd_shuffle_down(sm, 1u)
+            if (tx == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
+class MetalKqLabK6ExtV8 {
+    @ssbo @binding = 0 kdh : array<float16>
+    @ssbo @binding = 1 kscb : array<uint8>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k6_extv8_msl")]
+    def lab_k6_extv8 {
+        let lane = gl_SubgroupInvocationID
+        let tx = lane % 8u
+        let ty = lane / 8u
+        let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
+        let nb = ndim / 256u
+        let s = tx / 2u
+        let o4 = (tx % 2u) * 4u
+        let qoff = (s % 2u) * 8u + o4
+        let shr = s < 2u ? 0u : 4u
+        let hsh = 2u * s
+        let nb4 = ndim / 4u
+        var acc : float4[8]
+        var sb = 0u
+        while (sb < nb) {
+            let blk = row * nb + sb
+            let dd = float(kdh[blk])
+            for [unroll_full] (ch in range(2)) {
+                let ip = uint(ch)
+                let qb = blk * 48u + ip * 16u + qoff
+                let hb = blk * 48u + 32u + ip * 8u + o4
+                var qu : uint[4]
+                var hu : uint[4]
+                for [unroll_full] (u in range(4)) {
+                    qu[u] = kqu[qb + uint(u)]
+                    hu[u] = kqu[hb + uint(u)]
+                }
+                let g = ip * 8u + s * 2u + (tx % 2u)
+                let sc = float((int(kscb[blk * 16u + g]) ^ 128) - 128)
+                let dl = dd * sc
+                let ml = dl * 32.0
+                var w4 : float4[4]
+                for [unroll_full] (u in range(4)) {
+                    let qv = ((qu[u] >> shr) & 0x0F0F0F0F) | (((hu[u] >> hsh) & 0x03030303) << 4u)
+                    w4[u] = float4(float(qv & 255u), float((qv >> 8u) & 255u),
+                        float((qv >> 16u) & 255u), float((qv >> 24u) & 255u)) * dl - float4(ml)
+                }
+                let cx4 = sb * 64u + ip * 32u + s * 8u + o4
+                for [unroll_full] (b in range(8)) {
+                    let xb4 = uint(b) * nb4 + cx4
+                    for [unroll_full] (u in range(4)) {
+                        acc[b] += x[xb4 + uint(u)] * w4[u]
+                    }
+                }
+            }
+            sb++
+        }
+        for [unroll_full] (b in range(8)) {
+            var sm = acc[b].x + acc[b].y + acc[b].z + acc[b].w
+            sm += simd_shuffle_down(sm, 4u)
+            sm += simd_shuffle_down(sm, 2u)
+            sm += simd_shuffle_down(sm, 1u)
+            if (tx == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = sm
+            }
+        }
+    }
+}
+
+// k5 v-form: the hoisted qh uints (shared by both chunks) + both chunks' qs uints batch ahead;
+// the 5th-bit overlay folds into the uint domain before the float4 conversion.
+class MetalKqLabK5ExtV4 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k5_extv4_msl")]
+    def lab_k5_extv4 {
+        let lane = gl_SubgroupInvocationID
+        let tx = lane % 8u
+        let ty = lane / 8u
+        let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
+        let nb = ndim / 256u
+        let q4i = tx / 4u
+        let hp = (tx % 4u) / 2u
+        let lo = (tx % 2u) * 4u
+        let jl = 2u * q4i + hp
+        let nib = (tx % 4u) < 2u
+        let nsh = nib ? 0u : 4u
+        let nb4 = ndim / 4u
+        var acc : float4[4]
+        var sb = 0u
+        while (sb < nb) {
+            let blk = row * nb + sb
+            let sv = ks4[blk]
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            let qb = blk * 40u + q4i * 8u + lo
+            var qv : uint[8]
+            var hq : uint[4]
+            for [unroll_full] (u in range(4)) {
+                qv[u] = kqu[qb + uint(u)]
+                qv[4 + u] = kqu[qb + 16u + uint(u)]
+                hq[u] = kqu[blk * 40u + 32u + lo + uint(u)]
+            }
+            for [unroll_full] (ch in range(2)) {
+                let sy = (sv.y >> (8u * jl)) & 255u
+                let szv = (sv.z >> (8u * jl)) & 255u
+                let sw = (sv.w >> (8u * jl)) & 255u
+                let sc = ch == 0 ? (sy & 63u) : ((sw & 0x0Fu) | ((sy >> 6u) << 4u))
+                let mn = ch == 0 ? (szv & 63u) : ((sw >> 4u) | ((szv >> 6u) << 4u))
+                let dl = dd * float(sc)
+                let ml = dm * float(mn)
+                let hsh = jl + 4u * uint(ch)
+                var w4 : float4[4]
+                for [unroll_full] (u in range(4)) {
+                    let qvv = qv[4 * ch + u]
+                    let hv = hq[u] >> hsh
+                    w4[u] = float4(float(((qvv >> nsh) & 15u) | ((hv & 1u) << 4u)),
+                        float(((qvv >> (8u + nsh)) & 15u) | (((hv >> 8u) & 1u) << 4u)),
+                        float(((qvv >> (16u + nsh)) & 15u) | (((hv >> 16u) & 1u) << 4u)),
+                        float(((qvv >> (24u + nsh)) & 15u) | (((hv >> 24u) & 1u) << 4u))) * dl - float4(ml)
+                }
+                let cx4 = sb * 64u + (q4i + uint(ch) * 2u) * 16u + (nib ? 0u : 8u) + lo
+                for [unroll_full] (b in range(4)) {
+                    let xb4 = uint(b) * nb4 + cx4
+                    for [unroll_full] (u in range(4)) {
+                        acc[b] += x[xb4 + uint(u)] * w4[u]
+                    }
+                }
+            }
+            sb++
+        }
+        for [unroll_full] (b in range(4)) {
+            var s = acc[b].x + acc[b].y + acc[b].z + acc[b].w
+            s += simd_shuffle_down(s, 4u)
+            s += simd_shuffle_down(s, 2u)
+            s += simd_shuffle_down(s, 1u)
+            if (tx == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = s
+            }
+        }
+    }
+}
+
+class MetalKqLabK5ExtV8 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+
+    [metal_kernel(name="lab_k5_extv8_msl")]
+    def lab_k5_extv8 {
+        let lane = gl_SubgroupInvocationID
+        let tx = lane % 8u
+        let ty = lane / 8u
+        let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
+        let nb = ndim / 256u
+        let q4i = tx / 4u
+        let hp = (tx % 4u) / 2u
+        let lo = (tx % 2u) * 4u
+        let jl = 2u * q4i + hp
+        let nib = (tx % 4u) < 2u
+        let nsh = nib ? 0u : 4u
+        let nb4 = ndim / 4u
+        var acc : float4[8]
+        var sb = 0u
+        while (sb < nb) {
+            let blk = row * nb + sb
+            let sv = ks4[blk]
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            let qb = blk * 40u + q4i * 8u + lo
+            var qv : uint[8]
+            var hq : uint[4]
+            for [unroll_full] (u in range(4)) {
+                qv[u] = kqu[qb + uint(u)]
+                qv[4 + u] = kqu[qb + 16u + uint(u)]
+                hq[u] = kqu[blk * 40u + 32u + lo + uint(u)]
+            }
+            for [unroll_full] (ch in range(2)) {
+                let sy = (sv.y >> (8u * jl)) & 255u
+                let szv = (sv.z >> (8u * jl)) & 255u
+                let sw = (sv.w >> (8u * jl)) & 255u
+                let sc = ch == 0 ? (sy & 63u) : ((sw & 0x0Fu) | ((sy >> 6u) << 4u))
+                let mn = ch == 0 ? (szv & 63u) : ((sw >> 4u) | ((szv >> 6u) << 4u))
+                let dl = dd * float(sc)
+                let ml = dm * float(mn)
+                let hsh = jl + 4u * uint(ch)
+                var w4 : float4[4]
+                for [unroll_full] (u in range(4)) {
+                    let qvv = qv[4 * ch + u]
+                    let hv = hq[u] >> hsh
+                    w4[u] = float4(float(((qvv >> nsh) & 15u) | ((hv & 1u) << 4u)),
+                        float(((qvv >> (8u + nsh)) & 15u) | (((hv >> 8u) & 1u) << 4u)),
+                        float(((qvv >> (16u + nsh)) & 15u) | (((hv >> 16u) & 1u) << 4u)),
+                        float(((qvv >> (24u + nsh)) & 15u) | (((hv >> 24u) & 1u) << 4u))) * dl - float4(ml)
+                }
+                let cx4 = sb * 64u + (q4i + uint(ch) * 2u) * 16u + (nib ? 0u : 8u) + lo
+                for [unroll_full] (b in range(8)) {
+                    let xb4 = uint(b) * nb4 + cx4
+                    for [unroll_full] (u in range(4)) {
+                        acc[b] += x[xb4 + uint(u)] * w4[u]
+                    }
+                }
+            }
+            sb++
+        }
+        for [unroll_full] (b in range(8)) {
+            var s = acc[b].x + acc[b].y + acc[b].z + acc[b].w
+            s += simd_shuffle_down(s, 4u)
+            s += simd_shuffle_down(s, 2u)
+            s += simd_shuffle_down(s, 1u)
+            if (tx == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = s
+            }
+        }
+    }
+}
+
+// extx = the v form with the x panel STAGED through tgmem per superblock (cooperative 64-thread
+// load, 2 barriers/round): the kq lane geometry's x reads are SCATTERED within the superblock
+// (unlike q8's clean stripes, where the in-graph verdict kept streaming) — staging turns 16
+// scattered device loads per chunk-column into tgmem reads. B=4 panel = 4KB, B=8 = 8KB.
+class MetalKqLabK4ExtX4 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+    @workgroup txp : float4[256]            // [4 streams x 64 float4] one superblock's X panel
+
+    [metal_kernel(name="lab_k4_extx4_msl")]
+    def lab_k4_extx4 {
+        let lid = gl_LocalInvocationID.x
+        let lane = gl_SubgroupInvocationID
+        let tx = lane % 8u
+        let ty = lane / 8u
+        let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
+        let nb = ndim / 256u
+        let q4i = tx / 4u
+        let hp = (tx % 4u) / 2u
+        let lo = (tx % 2u) * 4u
+        let jl = 2u * q4i + hp
+        let nib = (tx % 4u) < 2u
+        let nsh = nib ? 0u : 4u
+        let nb4 = ndim / 4u
+        var acc : float4[4]
+        var sb = 0u
+        while (sb < nb) {
+            barrier()
+            for [unroll_full] (j in range(4)) {
+                let slot = uint(j) * 64u + lid
+                txp[slot] = x[(slot / 64u) * nb4 + sb * 64u + (slot % 64u)]
+            }
+            barrier()
+            let blk = row * nb + sb
+            let sv = ks4[blk]
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            let qb = blk * 32u + q4i * 8u + lo
+            var qv : uint[8]
+            for [unroll_full] (u in range(4)) {
+                qv[u] = kqu[qb + uint(u)]
+                qv[4 + u] = kqu[qb + 16u + uint(u)]
+            }
+            for [unroll_full] (ch in range(2)) {
+                let sy = (sv.y >> (8u * jl)) & 255u
+                let szv = (sv.z >> (8u * jl)) & 255u
+                let sw = (sv.w >> (8u * jl)) & 255u
+                let sc = ch == 0 ? (sy & 63u) : ((sw & 0x0Fu) | ((sy >> 6u) << 4u))
+                let mn = ch == 0 ? (szv & 63u) : ((sw >> 4u) | ((szv >> 6u) << 4u))
+                let dl = dd * float(sc)
+                let ml = dm * float(mn)
+                var w4 : float4[4]
+                for [unroll_full] (u in range(4)) {
+                    let qvv = qv[4 * ch + u]
+                    w4[u] = float4(float((qvv >> nsh) & 15u), float((qvv >> (8u + nsh)) & 15u),
+                        float((qvv >> (16u + nsh)) & 15u), float((qvv >> (24u + nsh)) & 15u)) * dl - float4(ml)
+                }
+                let cxl = (q4i + uint(ch) * 2u) * 16u + (nib ? 0u : 8u) + lo
+                for [unroll_full] (b in range(4)) {
+                    for [unroll_full] (u in range(4)) {
+                        acc[b] += txp[uint(b) * 64u + cxl + uint(u)] * w4[u]
+                    }
+                }
+            }
+            sb++
+        }
+        for [unroll_full] (b in range(4)) {
+            var s = acc[b].x + acc[b].y + acc[b].z + acc[b].w
+            s += simd_shuffle_down(s, 4u)
+            s += simd_shuffle_down(s, 2u)
+            s += simd_shuffle_down(s, 1u)
+            if (tx == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = s
+            }
+        }
+    }
+}
+
+class MetalKqLabK4ExtX8 {
+    @ssbo @binding = 0 ksh : array<float16>
+    @ssbo @binding = 1 ks4 : array<uint4>
+    @ssbo @binding = 2 kqu : array<uint>
+    @ssbo @binding = 3 x : array<float4>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+    @workgroup txp : float4[512]            // [8 streams x 64 float4]
+
+    [metal_kernel(name="lab_k4_extx8_msl")]
+    def lab_k4_extx8 {
+        let lid = gl_LocalInvocationID.x
+        let lane = gl_SubgroupInvocationID
+        let tx = lane % 8u
+        let ty = lane / 8u
+        let row = gl_WorkGroupID.x * 8u + gl_SubgroupID * 4u + ty
+        let nb = ndim / 256u
+        let q4i = tx / 4u
+        let hp = (tx % 4u) / 2u
+        let lo = (tx % 2u) * 4u
+        let jl = 2u * q4i + hp
+        let nib = (tx % 4u) < 2u
+        let nsh = nib ? 0u : 4u
+        let nb4 = ndim / 4u
+        var acc : float4[8]
+        var sb = 0u
+        while (sb < nb) {
+            barrier()
+            for [unroll_full] (j in range(8)) {
+                let slot = uint(j) * 64u + lid
+                txp[slot] = x[(slot / 64u) * nb4 + sb * 64u + (slot % 64u)]
+            }
+            barrier()
+            let blk = row * nb + sb
+            let sv = ks4[blk]
+            let dd = float(ksh[blk * 8u])
+            let dm = float(ksh[blk * 8u + 1u])
+            let qb = blk * 32u + q4i * 8u + lo
+            var qv : uint[8]
+            for [unroll_full] (u in range(4)) {
+                qv[u] = kqu[qb + uint(u)]
+                qv[4 + u] = kqu[qb + 16u + uint(u)]
+            }
+            for [unroll_full] (ch in range(2)) {
+                let sy = (sv.y >> (8u * jl)) & 255u
+                let szv = (sv.z >> (8u * jl)) & 255u
+                let sw = (sv.w >> (8u * jl)) & 255u
+                let sc = ch == 0 ? (sy & 63u) : ((sw & 0x0Fu) | ((sy >> 6u) << 4u))
+                let mn = ch == 0 ? (szv & 63u) : ((sw >> 4u) | ((szv >> 6u) << 4u))
+                let dl = dd * float(sc)
+                let ml = dm * float(mn)
+                var w4 : float4[4]
+                for [unroll_full] (u in range(4)) {
+                    let qvv = qv[4 * ch + u]
+                    w4[u] = float4(float((qvv >> nsh) & 15u), float((qvv >> (8u + nsh)) & 15u),
+                        float((qvv >> (16u + nsh)) & 15u), float((qvv >> (24u + nsh)) & 15u)) * dl - float4(ml)
+                }
+                let cxl = (q4i + uint(ch) * 2u) * 16u + (nib ? 0u : 8u) + lo
+                for [unroll_full] (b in range(8)) {
+                    for [unroll_full] (u in range(4)) {
+                        acc[b] += txp[uint(b) * 64u + cxl + uint(u)] * w4[u]
+                    }
+                }
+            }
+            sb++
+        }
+        for [unroll_full] (b in range(8)) {
+            var s = acc[b].x + acc[b].y + acc[b].z + acc[b].w
+            s += simd_shuffle_down(s, 4u)
+            s += simd_shuffle_down(s, 2u)
+            s += simd_shuffle_down(s, 1u)
+            if (tx == 0u && row < ddim) {
+                y[uint(b) * ddim + row] = s
+            }
+        }
+    }
+}
+
 // ===== driver (Apple-only; every Metal-typed helper is a generic so non-Apple never compiles it) =====
 
 struct private LabVariant {
@@ -3504,11 +4207,15 @@ def private run_lab(b : B?; variants) {
     // pre-built B uniforms for the dynamic-B variant
     var bbufs <- [for (bi in range(5)); upload_u32(dev, uint(1 << bi))]
     // the llama-3B decode GEMV geometries (n = reduction dim, d = output rows) + the qwen3-4B
-    // set (dim 2560 / qd 4096 / hidden 9728 — qd != dim splits the q and wo shapes)
+    // set (dim 2560 / qd 4096 / hidden 9728 — qd != dim splits the q and wo shapes) + the
+    // gemma4-12B set (dim 3840 / hidden 15360; qkv = the sliding class 4096+2048+2048, wogl =
+    // the global class's qd-8192 reduction — the fattest n the batch loop dispatches)
     var shapes <- [("q3b", 3072l, 3072l), ("kv3b", 3072l, 1024l), ("qkv3b", 3072l, 5120l), ("w13_3b", 3072l, 8192l),
                    ("w2_3b", 8192l, 3072l), ("cls3b", 3072l, 128256l),
                    ("qkv4b", 2560l, 6144l), ("wo4b", 4096l, 2560l), ("w13_4b", 2560l, 9728l),
-                   ("w2_4b", 9728l, 2560l), ("cls4b", 2560l, 151936l)]
+                   ("w2_4b", 9728l, 2560l), ("cls4b", 2560l, 151936l),
+                   ("qkv12b", 3840l, 8192l), ("wogl12b", 8192l, 3840l), ("w13_12b", 3840l, 15360l),
+                   ("w2_12b", 15360l, 3840l)]
     for (sh in shapes) {
         if (!want("DASMETAL_LAB_SHAPES", sh._0)) {
             continue
@@ -3931,7 +4638,25 @@ def bench_metal_gemv_kernels(b : B?) {
             LabVariant(name = "k6_ext2u", src = lab_k6_ext2u_msl, entry = lab_k6_ext2u_msl_entry,
                        b_list <- [2], kq = 6, kq16 = true, tgsz = 64, rtg = 8),
             LabVariant(name = "k6_ext4u", src = lab_k6_ext4u_msl, entry = lab_k6_ext4u_msl_entry,
-                       b_list <- [4], kq = 6, kq16 = true, tgsz = 64, rtg = 8)
+                       b_list <- [4], kq = 6, kq16 = true, tgsz = 64, rtg = 8),
+            LabVariant(name = "k4_extb4", src = lab_k4_extb4_msl, entry = lab_k4_extb4_msl_entry,
+                       b_list <- [4], kq = 4, kq16 = true, tgsz = 64, rtg = 8),
+            LabVariant(name = "k4_extv4", src = lab_k4_extv4_msl, entry = lab_k4_extv4_msl_entry,
+                       b_list <- [4], kq = 4, kq16 = true, tgsz = 64, rtg = 8),
+            LabVariant(name = "k4_extv8", src = lab_k4_extv8_msl, entry = lab_k4_extv8_msl_entry,
+                       b_list <- [8], kq = 4, kq16 = true, tgsz = 64, rtg = 8),
+            LabVariant(name = "k6_extv4", src = lab_k6_extv4_msl, entry = lab_k6_extv4_msl_entry,
+                       b_list <- [4], kq = 6, kq16 = true, tgsz = 64, rtg = 8),
+            LabVariant(name = "k6_extv8", src = lab_k6_extv8_msl, entry = lab_k6_extv8_msl_entry,
+                       b_list <- [8], kq = 6, kq16 = true, tgsz = 64, rtg = 8),
+            LabVariant(name = "k5_extv4", src = lab_k5_extv4_msl, entry = lab_k5_extv4_msl_entry,
+                       b_list <- [4], kq = 5, kq16 = true, tgsz = 64, rtg = 8),
+            LabVariant(name = "k5_extv8", src = lab_k5_extv8_msl, entry = lab_k5_extv8_msl_entry,
+                       b_list <- [8], kq = 5, kq16 = true, tgsz = 64, rtg = 8),
+            LabVariant(name = "k4_extx4", src = lab_k4_extx4_msl, entry = lab_k4_extx4_msl_entry,
+                       b_list <- [4], kq = 4, kq16 = true, tgsz = 64, rtg = 8, tgmem = lab_k4_extx4_msl_tgmem),
+            LabVariant(name = "k4_extx8", src = lab_k4_extx8_msl, entry = lab_k4_extx8_msl_entry,
+                       b_list <- [8], kq = 4, kq16 = true, tgsz = 64, rtg = 8, tgmem = lab_k4_extx8_msl_tgmem)
         ]
         run_lab(b, variants)
         delete variants

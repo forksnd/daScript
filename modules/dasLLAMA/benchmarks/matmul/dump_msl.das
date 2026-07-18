@@ -49,7 +49,14 @@ def main {
         "k5_b2r" => lab_k5_b2r_msl,
         "k6_b1d" => lab_k6_b1d_msl,
         "k6_ext2" => lab_k6_ext2_msl,
-        "k6_ext4" => lab_k6_ext4_msl
+        "k6_ext4" => lab_k6_ext4_msl,
+        "k4_extb4" => lab_k4_extb4_msl,
+        "k4_extv4" => lab_k4_extv4_msl,
+        "k4_extv8" => lab_k4_extv8_msl,
+        "k6_extv4" => lab_k6_extv4_msl,
+        "k6_extv8" => lab_k6_extv8_msl,
+        "k5_extv4" => lab_k5_extv4_msl,
+        "k5_extv8" => lab_k5_extv8_msl
     }
     for (nm in split(cfg.arms, ",")) {
         let arm = strip(nm)
