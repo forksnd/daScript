@@ -2068,4 +2068,7 @@ def dasllama_metal_llama_register() {
         g_skip = get_env_variable("DASLLAMA_METAL_DECODE_SKIP")
         to_log(LOG_WARNING, "dasLLAMA metal decode: SKIP={g_skip} — timing-attribution mode, output is GARBAGE\n")
     }
+    if (has_env_variable("DASLLAMA_METAL_SPEC")) {   // the spec chain's A/B rail: 0 off, 1 forced, -1 adaptive
+        set_metal_decode_speculate(env_int("DASLLAMA_METAL_SPEC", -1))
+    }
 }
