@@ -333,6 +333,375 @@ def moe_combine {
     }
 }
 
+// ===== the deltanet kernels =====
+// The whole recurrent-layer attention core between the qkv/z GEMMs and the out projection:
+// dn_conv (depthwise 4-tap conv + SiLU + per-head q/k L2-norm + q pre-scale, one workgroup per
+// position) and dn_scan (the chunked delta rule — one workgroup per v-head, CS=64 chunks
+// SEQUENTIAL inside the kernel, heads fill the GPU; panels live in DN_WS device scratch, GEMMs
+// stage 16-deep K-tiles through shared, the unit-lower solve runs in a shared 64x64 tile).
+// dn_requant is the plain Q8_0 image builder for the out-proj GEMM (act-free actrq twin).
+// Numerics mirror the CPU chunked path op-for-op; GPU exp/accumulation differs from libm at the
+// ulp class — the DN parity bar is drift-class, not bit-identical (the qwen35 knife-edge).
+//
+// dn meta (vk_meta view, uints): [0]=npos_w (window rows) [1]=cd [2]=kd [3]=di [4]=nvh [5]=nkh
+// [6]=ds [7]=dconv [8]=hist_mode (1 = channel-major host history, 2 = row-major prev-window
+// tail) [9]=slab stride (floats) [10]=o region offset in DN_WS (floats) [11]=beta [12]=g
+// [13]=taps [14]=wnorm [15]=a [16]=dt [17]=hist (float offsets into the smalls plane)
+// [18]=o 32-block count (dn_requant). Smalls floats [0]=eps [1]=qscale.
+
+var @ssbo @binding = 1 vk_wsf : array<float>   // float view: the persistent per-head f32 state
+var @ssbo @binding = 3 vk_xqf : array<float>   // float view: the DN_WS panel/o scratch
+
+// conv output rows (f32, the scan's input) ride binding 0's float view (vk_upf)
+
+// conv shared: the whole position row staged in shared (silu'd), plus its q/k block scales —
+// every handoff stays in shared, each global output element has exactly one writer
+var @workgroup cv_row : float[8192]
+var @workgroup cv_scale : float[64]
+
+[compute_shader(local_size_x=256, name="dn_conv_spv")]
+def dn_conv {
+    let p = gl_WorkGroupID.x
+    let cd = vk_meta[1u]
+    let kd = vk_meta[2u]
+    let dconv = vk_meta[7u]
+    let taps = dconv - 1u
+    let hist_mode = vk_meta[8u]
+    let taps_off = vk_meta[13u]
+    let hist_off = vk_meta[17u]
+    let ds = vk_meta[6u]
+    let eps = vk_xs[0u]
+    let qscale = vk_xs[1u]
+    let tid = gl_LocalInvocationID.x
+    // depthwise conv + SiLU into shared, strided channels; taps in the raw fblob layout (ch x dconv)
+    var ch = tid
+    while (ch < cd) {
+        var acc = 0.0
+        var k = 0u
+        while (k < dconv) {
+            let sp = int(p + k) - int(taps)
+            var xv = 0.0
+            if (sp >= 0) {
+                xv = vk_y[uint(sp) * cd + ch]
+            } elif (hist_mode == 1u) {
+                xv = vk_xs[hist_off + ch * taps + p + k]
+            } else {
+                xv = vk_xs[hist_off + (p + k) * cd + ch]
+            }
+            acc += xv * vk_xs[taps_off + ch * dconv + k]
+            k++
+        }
+        cv_row[ch] = acc / (1.0 + exp(-acc))
+        ch += 256u
+    }
+    barrier()
+    // per-head L2 norm scale over the q and k regions (2*kd channels in ds-blocks), q pre-scale
+    // folded in — one thread per block, f32 square-sum (CPU accumulates double: drift-class)
+    let nblk = (2u * kd) / ds
+    if (tid < nblk) {
+        var sum = 0.0
+        var j = 0u
+        while (j < ds) {
+            let v = cv_row[tid * ds + j]
+            sum += v * v
+            j++
+        }
+        cv_scale[tid] = (1.0 / max(sqrt(sum), eps)) * (tid < kd / ds ? qscale : 1.0)
+    }
+    barrier()
+    ch = tid
+    while (ch < cd) {
+        let s = ch < 2u * kd ? cv_scale[ch / ds] : 1.0
+        vk_upf[p * cd + ch] = cv_row[ch] * s
+        ch += 256u
+    }
+}
+
+// scan shared: the 64x64 unit-lower solve tile + the GEMM staging tiles (16-deep K)
+var @workgroup st_tm : float[4096]
+var @workgroup st_ta : float[2048]
+var @workgroup st_tb : float[2048]
+
+// C[M x N] (+)= A[M x K] * B[K x N] over DN_WS floats (row-major, explicit leading strides),
+// 16-deep K-tiles staged through shared; every thread owns outputs strided 256, accumulating
+// straight into C (zeroed here first unless accum). K ascending — the CPU dot order. Operand
+// visibility is the CALLER's job (a buffer sync before the call); the trailing sync here makes
+// C available to the next phase's different-thread reads.
+def private dn_gemm(cofs, aofs, bofs : uint; mm, kk, nn : uint; lda, ldb, ldc : uint; accum : uint) {
+    let tid = gl_LocalInvocationID.x
+    var kb = 0u
+    while (kb < kk) {
+        let kt = min(kk - kb, 16u)
+        var i = tid
+        while (i < mm * kt) {
+            st_ta[(i / kt) * 16u + i % kt] = vk_xqf[aofs + (i / kt) * lda + kb + i % kt]
+            i += 256u
+        }
+        i = tid
+        while (i < kt * nn) {
+            st_tb[(i / nn) * 128u + i % nn] = vk_xqf[bofs + (kb + i / nn) * ldb + i % nn]
+            i += 256u
+        }
+        barrier()
+        var o = tid
+        while (o < mm * nn) {
+            let r = o / nn
+            let c = o % nn
+            var acc = (kb == 0u && accum == 0u) ? 0.0 : vk_xqf[cofs + r * ldc + c]
+            var k2 = 0u
+            while (k2 < kt) {
+                acc += st_ta[r * 16u + k2] * st_tb[k2 * 128u + c]
+                k2++
+            }
+            vk_xqf[cofs + r * ldc + c] = acc
+            o += 256u
+        }
+        memoryBarrierBuffer()
+        barrier()
+        kb += 16u
+    }
+}
+
+[compute_shader(local_size_x=256, name="dn_scan_spv")]
+def dn_scan {
+    let h = gl_WorkGroupID.x
+    let npos = vk_meta[0u]
+    let cd = vk_meta[1u]
+    let kd = vk_meta[2u]
+    let di = vk_meta[3u]
+    let nvh = vk_meta[4u]
+    let nkh = vk_meta[5u]
+    let ds = vk_meta[6u]
+    let slab = vk_meta[9u] * h
+    let o_off = vk_meta[10u]
+    let beta_off = vk_meta[11u]
+    let g_off = vk_meta[12u]
+    let wnorm_off = vk_meta[14u]
+    let a_off = vk_meta[15u]
+    let dt_off = vk_meta[16u]
+    let eps = vk_xs[0u]
+    let tid = gl_LocalInvocationID.x
+    let CS = 64u
+    // slab regions (floats, per head)
+    let qc = slab
+    let kcT = slab + CS * ds
+    let kb = slab + 2u * CS * ds
+    let vb = slab + 3u * CS * ds
+    let w = slab + 4u * CS * ds
+    let vnew = slab + 5u * CS * ds
+    let och = slab + 6u * CS * ds
+    let kgT = slab + 7u * CS * ds
+    let kq = slab + 8u * CS * ds
+    let tmg = kq + CS * CS
+    let st = tmg + CS * CS
+    let gcum = st + ds * ds
+    let egc = gcum + CS
+    let kgc = gcum + 2u * CS
+    let bvec = gcum + 3u * CS
+    let kh = h % nkh
+    let qoff = kh * ds
+    let koff = kd + kh * ds
+    let voff = 2u * kd + h * ds
+    let aa = vk_xs[a_off + h]
+    let dtb = vk_xs[dt_off + h]
+    // the persistent state works in its slab copy (one GEMM surface for everything)
+    var i0 = tid
+    while (i0 < ds * ds) {
+        vk_xqf[st + i0] = vk_wsf[h * ds * ds + i0]
+        i0 += 256u
+    }
+    memoryBarrierBuffer()
+    barrier()
+    var c0 = 0u
+    while (c0 < npos) {
+        let cl = min(CS, npos - c0)
+        // per-token transforms: beta = sigmoid(raw), g-cumsum of a*softplus(raw + dt) —
+        // sequential scan, one thread (the other lanes wait at the barrier)
+        if (tid == 0u) {
+            var gacc = 0.0
+            var t = 0u
+            while (t < cl) {
+                let graw = vk_xs[g_off + (c0 + t) * nvh + h] + dtb
+                gacc += aa * (graw > 20.0 ? graw : log(1.0 + exp(graw)))
+                vk_xqf[gcum + t] = gacc
+                vk_xqf[egc + t] = exp(gacc)
+                vk_xqf[bvec + t] = 1.0 / (1.0 + exp(-vk_xs[beta_off + (c0 + t) * nvh + h]))
+                t++
+            }
+        }
+        memoryBarrierBuffer()
+        barrier()
+        // panels off the conv rows: qc/kb/vb row-major cl x ds, kcT transposed ds x CS
+        var e = tid
+        while (e < cl * ds) {
+            let i = e / ds
+            let j = e % ds
+            let crow = (c0 + i) * cd
+            let kv = vk_upf[crow + koff + j]
+            let bv = vk_xqf[bvec + i]
+            vk_xqf[qc + i * ds + j] = vk_upf[crow + qoff + j]
+            vk_xqf[kcT + j * CS + i] = kv
+            vk_xqf[kb + i * ds + j] = kv * bv
+            vk_xqf[vb + i * ds + j] = vk_upf[crow + voff + j] * bv
+            e += 256u
+        }
+        memoryBarrierBuffer()
+        barrier()
+        // A = (k_beta k^T) decay-scaled strictly lower (negated); KQ keeps its diagonal
+        dn_gemm(tmg, kb, kcT, cl, ds, cl, ds, CS, CS, 0u)
+        dn_gemm(kq, qc, kcT, cl, ds, cl, ds, CS, CS, 0u)
+        e = tid
+        while (e < cl * cl) {
+            let i = e / cl
+            let j = e % cl
+            if (j < i) {
+                let d = exp(vk_xqf[gcum + i] - vk_xqf[gcum + j])
+                vk_xqf[tmg + i * CS + j] = -vk_xqf[tmg + i * CS + j] * d
+                vk_xqf[kq + i * CS + j] = vk_xqf[kq + i * CS + j] * d
+            } elif (j == i) {
+                vk_xqf[tmg + i * CS + j] = 1.0
+            } else {
+                vk_xqf[tmg + i * CS + j] = 0.0
+                vk_xqf[kq + i * CS + j] = 0.0
+            }
+            e += 256u
+        }
+        memoryBarrierBuffer()
+        barrier()
+        // unit-lower solve in shared: T[i][j] = A'[i][j] + sum_{tt in (j,i)} A'[i][tt] T[tt][j],
+        // rows finalized top-down (phase 1 computes from originals + final rows, phase 2 writes)
+        e = tid
+        while (e < cl * cl) {
+            st_tm[(e / cl) * CS + e % cl] = vk_xqf[tmg + (e / cl) * CS + e % cl]
+            e += 256u
+        }
+        barrier()
+        var i2 = 1u
+        while (i2 < cl) {
+            var fin = 0.0
+            if (tid < i2) {
+                fin = st_tm[i2 * CS + tid]
+                var t2 = tid + 1u
+                while (t2 < i2) {
+                    fin += st_tm[i2 * CS + t2] * st_tm[t2 * CS + tid]
+                    t2++
+                }
+            }
+            barrier()
+            if (tid < i2) {
+                st_tm[i2 * CS + tid] = fin
+            }
+            barrier()
+            i2++
+        }
+        e = tid
+        while (e < cl * cl) {
+            vk_xqf[tmg + (e / cl) * CS + e % cl] = st_tm[(e / cl) * CS + e % cl]
+            e += 256u
+        }
+        // d = T v_beta - (T (k_beta e^gcum)) S — kb scaled in place, minus folded into the scale
+        e = tid
+        while (e < cl * ds) {
+            vk_xqf[kb + e] = vk_xqf[kb + e] * -vk_xqf[egc + e / ds]
+            e += 256u
+        }
+        memoryBarrierBuffer()
+        barrier()
+        dn_gemm(w, tmg, kb, cl, cl, ds, CS, ds, ds, 0u)
+        dn_gemm(vnew, tmg, vb, cl, cl, ds, CS, ds, ds, 0u)
+        dn_gemm(vnew, w, st, cl, ds, ds, ds, ds, ds, 1u)
+        // o = (q e^gcum) S + KQ d
+        e = tid
+        while (e < cl * ds) {
+            vk_xqf[qc + e] = vk_xqf[qc + e] * vk_xqf[egc + e / ds]
+            e += 256u
+        }
+        memoryBarrierBuffer()
+        barrier()
+        dn_gemm(och, qc, st, cl, ds, ds, ds, ds, ds, 0u)
+        dn_gemm(och, kq, vnew, cl, cl, ds, CS, ds, ds, 1u)
+        // gated out-norm straight into the o rows: rms(och) * wnorm, silu(z)-gated — one thread
+        // per row (the row loop is tiny; heads supply the parallelism)
+        if (tid < cl) {
+            let ob = och + tid * ds
+            var sum = 0.0
+            var j3 = 0u
+            while (j3 < ds) {
+                let v = vk_xqf[ob + j3]
+                sum += v * v
+                j3++
+            }
+            let scale = 1.0 / sqrt(sum / float(ds) + eps)
+            let orow = o_off + (c0 + tid) * di + h * ds
+            let zrow = (c0 + tid) * di + h * ds
+            j3 = 0u
+            while (j3 < ds) {
+                let zv = vk_y[zrow + j3]
+                let xn = vk_xqf[ob + j3] * scale * vk_xs[wnorm_off + j3]
+                vk_xqf[orow + j3] = xn * (zv / (1.0 + exp(-zv)))
+                j3++
+            }
+        }
+        barrier()
+        // state advance, once per chunk: S = e^glast S + (k e^{glast - gcum})^T d
+        let glast = vk_xqf[gcum + cl - 1u]
+        if (tid < cl) {
+            vk_xqf[kgc + tid] = exp(glast - vk_xqf[gcum + tid])
+        }
+        memoryBarrierBuffer()
+        barrier()
+        let egl = exp(glast)
+        e = tid
+        while (e < ds * ds) {
+            vk_xqf[st + e] = vk_xqf[st + e] * egl
+            e += 256u
+        }
+        e = tid
+        while (e < ds * cl) {
+            let j = e / cl
+            let i = e % cl
+            vk_xqf[kgT + j * CS + i] = vk_xqf[kcT + j * CS + i] * vk_xqf[kgc + i]
+            e += 256u
+        }
+        memoryBarrierBuffer()
+        barrier()
+        dn_gemm(st, kgT, vnew, ds, cl, ds, CS, ds, ds, 1u)
+        c0 += CS
+    }
+    // the advanced state back to its persistent plane
+    i0 = tid
+    while (i0 < ds * ds) {
+        vk_wsf[h * ds * ds + i0] = vk_xqf[st + i0]
+        i0 += 256u
+    }
+}
+
+// plain Q8_0 requant of the o rows (no act) — the out-proj GEMM's activation image; input
+// floats at the DN_WS o region (binding 0 float view), one thread per 32-block
+[compute_shader(local_size_x=256, name="dn_requant_spv")]
+def dn_requant {
+    let b = gl_GlobalInvocationID.x
+    if (b < vk_meta[18u]) {
+        let base = vk_meta[10u] + b * 32u
+        var amax = 0.0
+        for (i in range(32)) {
+            amax = max(amax, abs(vk_upf[base + uint(i)]))
+        }
+        let d = amax / 127.0
+        let id = d != 0.0 ? 1.0 / d : 0.0
+        vk_xs[b] = d
+        for (wi in range(8)) {
+            let wb = base + uint(wi) * 4u
+            var word = 0u
+            for (j in range(4)) {
+                let q = int(round(vk_upf[wb + uint(j)] * id))
+                word = word | ((uint(q) & 0xFF) << (uint(j) * 8u))
+            }
+            vk_xq[b * 8u + uint(wi)] = word
+        }
+    }
+}
+
 // ===== the K-quant decode kernels =====
 // Native k4/k5/k6 GEMVs over superblock quant payloads + decoded 20B scale rows, with Q8_K
 // activations (per-256 f32 scales in vk_xs). Same one-subgroup-per-row shape as q8_moe_groupn,
@@ -938,6 +1307,35 @@ let private STREAM_RESERVE = 1_100_000_000l  // VRAM reserved out of the weight 
                                              // (35B kq measured: 2 x 532.7MB slots = 1065MB;
                                              // ensure_stream_slots asserts actual <= reserve)
 
+// deltanet chain capacities (npos chunks over DN_WINDOW windows, state carried device-side).
+// DN_SLAB = the per-head scan scratch in floats: 8 CS x ds panels, kq + tm (CS x CS), the state
+// working copy (ds x ds), gcum/egc/kgc/bvec (4 x CS). Maxima match qwen35 (ds 128, 32 v-heads,
+// conv dim 8192, dconv 4) — vk_moe_dn asserts them (the engine arm fail-closes on bigger models)
+let private DN_CS = 64l
+let private DN_MAX_DS = 128l
+let private DN_MAX_HEADS = 32l
+let private DN_MAX_CD = 8_192l
+let private DN_MAX_DCONV = 4l
+let private DN_WINDOW = 1_024l
+let private DN_SLAB = 8l * DN_CS * DN_MAX_DS + 2l * DN_CS * DN_CS + DN_MAX_DS * DN_MAX_DS + 4l * DN_CS
+let private DN_O_OFF = DN_MAX_HEADS * DN_SLAB
+let private DN_WS_BYTES = (DN_O_OFF + DN_WINDOW * DN_MAX_HEADS * DN_MAX_DS) * 4l
+let private DN_STATE_BYTES = DN_MAX_HEADS * DN_MAX_DS * DN_MAX_DS * 4l
+let private DN_META_BYTES = 128l
+// smalls plane float offsets: [eps, qscale] consts, raw beta/g windows, conv taps (cd x dconv),
+// out-norm weights, per-head a/dt, then the conv history (channel-major from the host on window
+// 0, row-major prev-window tail rows device-copied in place for later windows — the per-window
+// smalls re-stage stops SHORT of the hist region so it never clobbers that device-side tail)
+let private DN_SM_BETA = 16l
+let private DN_SM_G = DN_SM_BETA + DN_WINDOW * DN_MAX_HEADS
+let private DN_SM_TAPS = DN_SM_G + DN_WINDOW * DN_MAX_HEADS
+let private DN_SM_WNORM = DN_SM_TAPS + DN_MAX_CD * DN_MAX_DCONV
+let private DN_SM_A = DN_SM_WNORM + DN_MAX_DS
+let private DN_SM_DT = DN_SM_A + DN_MAX_HEADS
+let private DN_SM_HIST = DN_SM_DT + DN_MAX_HEADS
+let private DN_SMALLS_BYTES = (DN_SM_HIST + DN_MAX_CD * (DN_MAX_DCONV - 1l) + 64l) * 4l
+let private DN_TAIL_BYTES = DN_MAX_CD * (DN_MAX_DCONV - 1l) * 4l
+
 struct private HostBuf {
     buf : uint64       // VkBuffer
     mem : uint64       // VkDeviceMemory
@@ -1030,6 +1428,9 @@ struct private GpuState {
     batch_k5 : Pipeline
     batch_k6 : Pipeline
     comb_pipeline : Pipeline    // routed weighted-sum combine (device-side reduce, prefill batches)
+    dn_conv_pipeline : Pipeline // deltanet conv + SiLU + q/k L2-norm (one workgroup per position)
+    dn_scan_pipeline : Pipeline // deltanet chunked delta-rule scan (one workgroup per v-head)
+    dn_rq_pipeline : Pipeline   // plain Q8_0 requant of the scan's o rows (out-proj image)
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
@@ -1075,6 +1476,20 @@ struct private GpuState {
     stream_max_dn_wq : int64
     stream_max_dn_ws : int64
     stream_ready : bool
+    // deltanet chain state (lazy — first DN dispatch creates it)
+    dn_meta : HostBuf             // dn kernel params staging
+    dn_meta_dev : uint64
+    dn_smalls : HostBuf           // beta/g/taps/wnorm/a/dt/hist staging
+    dn_smalls_dev : uint64
+    dn_state_stage : HostBuf      // f32 state upload staging (chain start)
+    dn_state_host : HostBuf       // host-cached state readback (chain end)
+    dn_tail_host : HostBuf        // host-cached conv-tail readback (the caller's history store)
+    dn_state_dev : uint64
+    dn_ws_dev : uint64            // per-head scan slabs + the gated o rows
+    dn_conv_set : VkDescriptorSet
+    dn_scan_set : VkDescriptorSet
+    dn_rq_set : VkDescriptorSet
+    dn_ready : bool
 }
 
 var private g_gpu : GpuState?
@@ -1285,6 +1700,12 @@ def private vk_moe_init : bool {
     g_gpu.batch_k6 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bk6shader)
     var cshader <- create_shader_module(g_gpu.device, moe_combine_spv)
     g_gpu.comb_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, cshader)
+    var dcshader <- create_shader_module(g_gpu.device, dn_conv_spv)
+    g_gpu.dn_conv_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, dcshader)
+    var dsshader <- create_shader_module(g_gpu.device, dn_scan_spv)
+    g_gpu.dn_scan_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, dsshader)
+    var drshader <- create_shader_module(g_gpu.device, dn_requant_spv)
+    g_gpu.dn_rq_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, drshader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -2027,6 +2448,219 @@ def vk_moe_dense(var yp : float?; woff : int64; xqp : int8 const?; xsp : float c
     }
 }
 
+// ===== deltanet dispatch (the recurrent-layer attention chain) =====
+
+def private cmd_copy_range(raw : VkCommandBuffer; src : uint64; src_off : int64; dst : uint64; dst_off : int64; bytes : int64) {
+    var regions : array<BufferCopy>
+    regions |> push(BufferCopy(srcOffset = uint64(src_off), dstOffset = uint64(dst_off), size = uint64(bytes)))
+    cmd_copy_buffer(vk_value_to_boost(raw), nonowning_buf(src), nonowning_buf(dst), regions)
+}
+
+def private ensure_dn_state {
+    if (g_gpu.dn_ready) {
+        return
+    }
+    ensure_batch_state()
+    g_gpu.dn_meta = make_host_buf(DN_META_BYTES, false)
+    g_gpu.dn_meta_dev = make_device_buf(DN_META_BYTES)
+    g_gpu.dn_smalls = make_host_buf(DN_SMALLS_BYTES, false)
+    g_gpu.dn_smalls_dev = make_device_buf(DN_SMALLS_BYTES)
+    g_gpu.dn_state_stage = make_host_buf(DN_STATE_BYTES, false)
+    g_gpu.dn_state_host = make_host_buf(DN_STATE_BYTES, true, [cached = true])
+    g_gpu.dn_tail_host = make_host_buf(DN_TAIL_BYTES, true, [cached = true])
+    g_gpu.dn_state_dev = make_device_buf(DN_STATE_BYTES)
+    g_gpu.dn_ws_dev = make_device_buf(DN_WS_BYTES)
+    g_gpu.dn_conv_set = alloc_desc_set()
+    g_gpu.dn_scan_set = alloc_desc_set()
+    g_gpu.dn_rq_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    // conv: qkv rows in at 5 (vk_y), conv rows out at 0 (vk_upf float view of hq_dev), smalls
+    // at 4, params at 2; 1/3 fillers
+    write_buf_desc(writes, g_gpu.dn_conv_set, 0u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, g_gpu.dn_conv_set, 1u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, g_gpu.dn_conv_set, 2u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, g_gpu.dn_conv_set, 3u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, g_gpu.dn_conv_set, 4u, g_gpu.dn_smalls_dev, DN_SMALLS_BYTES)
+    write_buf_desc(writes, g_gpu.dn_conv_set, 5u, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
+    // scan: conv rows at 0, the persistent state at 1 (vk_wsf), slabs + o rows at 3 (vk_xqf),
+    // smalls at 4, z rows at 5 (vk_y = batch y2), params at 2
+    write_buf_desc(writes, g_gpu.dn_scan_set, 0u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, g_gpu.dn_scan_set, 1u, g_gpu.dn_state_dev, DN_STATE_BYTES)
+    write_buf_desc(writes, g_gpu.dn_scan_set, 2u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, g_gpu.dn_scan_set, 3u, g_gpu.dn_ws_dev, DN_WS_BYTES)
+    write_buf_desc(writes, g_gpu.dn_scan_set, 4u, g_gpu.dn_smalls_dev, DN_SMALLS_BYTES)
+    write_buf_desc(writes, g_gpu.dn_scan_set, 5u, g_gpu.batch_y2_dev, BATCH_Y_BYTES)
+    // requant: o rows in at 0 (vk_upf view of DN_WS), quant words out at 3 (hq), scales out at
+    // 4 (hs) — the out-proj GEMM's activation image bindings; params at 2; 1/5 fillers
+    write_buf_desc(writes, g_gpu.dn_rq_set, 0u, g_gpu.dn_ws_dev, DN_WS_BYTES)
+    write_buf_desc(writes, g_gpu.dn_rq_set, 1u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, g_gpu.dn_rq_set, 2u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, g_gpu.dn_rq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, g_gpu.dn_rq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
+    write_buf_desc(writes, g_gpu.dn_rq_set, 5u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.dn_ready = true
+    to_log(LOG_INFO, "dasLLAMA vulkan tier: deltanet chain engaged\n")
+}
+
+def private fill_dn_meta(npos_w, cd, kd, di, nvh, nkh, ds, dconv : int64; hist_mode : int; nblocks : int64) {
+    unsafe {
+        var mp = reinterpret<uint?>(g_gpu.dn_meta.mapped)
+        mp[0] = uint(npos_w)
+        mp[1] = uint(cd)
+        mp[2] = uint(kd)
+        mp[3] = uint(di)
+        mp[4] = uint(nvh)
+        mp[5] = uint(nkh)
+        mp[6] = uint(ds)
+        mp[7] = uint(dconv)
+        mp[8] = uint(hist_mode)
+        mp[9] = uint(DN_SLAB)
+        mp[10] = uint(DN_O_OFF)
+        mp[11] = uint(DN_SM_BETA)
+        mp[12] = uint(DN_SM_G)
+        mp[13] = uint(DN_SM_TAPS)
+        mp[14] = uint(DN_SM_WNORM)
+        mp[15] = uint(DN_SM_A)
+        mp[16] = uint(DN_SM_DT)
+        mp[17] = uint(DN_SM_HIST)
+        mp[18] = uint(nblocks)
+    }
+}
+
+// one deltanet window: acts/meta/smalls staging copies, qkv + z tiles, conv, scan, the conv-tail
+// extraction (before out-proj overwrites the qkv rows in y1), o requant, out-proj tile, y DMA;
+// the state uploads on the first window and reads back on the last
+def private record_dn_cmd(s_qkv, s_z, s_o : int; nwg_qkv, nwg_z, nwg_out : uint; rows, cd, di, dim, taps, nvh, ds : int64;
+                          axq_bytes, axs_bytes : int64; first, last : bool) {
+    let raw = g_gpu.batch_cmd
+    let rf : VkCommandBufferResetFlags
+    vk_check(vkResetCommandBuffer(raw, rf), null)
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    cmd_copy_batch_acts(raw, axq_bytes, axs_bytes)
+    cmd_copy_batch_meta(raw, s_qkv)
+    cmd_copy_batch_meta(raw, s_z)
+    cmd_copy_batch_meta(raw, s_o)
+    cmd_copy_whole(raw, g_gpu.dn_meta.buf, g_gpu.dn_meta_dev, DN_META_BYTES)
+    // the per-window smalls re-stage stops SHORT of the hist region — later windows read the
+    // device-copied tail rows there
+    cmd_copy_range(raw, g_gpu.dn_smalls.buf, 0l, g_gpu.dn_smalls_dev, 0l, DN_SM_HIST * 4l)
+    if (first) {
+        cmd_copy_range(raw, g_gpu.dn_smalls.buf, DN_SM_HIST * 4l, g_gpu.dn_smalls_dev, DN_SM_HIST * 4l, cd * taps * 4l)
+        cmd_copy_whole(raw, g_gpu.dn_state_stage.buf, g_gpu.dn_state_dev, nvh * ds * ds * 4l)
+    }
+    batch_barrier(raw, true)
+    bind_batch_pipe(raw, 0)
+    cmd_bind_dispatch(raw, g_gpu.stacks[s_qkv].batch_set, nwg_qkv)
+    cmd_bind_dispatch(raw, g_gpu.stacks[s_z].batch_set, nwg_z)
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.dn_conv_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.dn_conv_set, uint(rows))
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.dn_scan_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.dn_scan_set, uint(nvh))
+    comp_barrier(raw)
+    // conv-tail extraction: the last `taps` RAW qkv rows out of y1 before out-proj reuses it —
+    // to the smalls hist region (the next window's conv history) and, on the last window, to the
+    // host (the caller's channel-major history store); the state rides the same transfer window
+    batch_barrier(raw, false)
+    if (!last) {
+        cmd_copy_range(raw, g_gpu.batch_y1_dev, (rows - taps) * cd * 4l, g_gpu.dn_smalls_dev, DN_SM_HIST * 4l, taps * cd * 4l)
+    } else {
+        cmd_copy_range(raw, g_gpu.batch_y1_dev, (rows - taps) * cd * 4l, g_gpu.dn_tail_host.buf, 0l, taps * cd * 4l)
+        cmd_copy_whole(raw, g_gpu.dn_state_dev, g_gpu.dn_state_host.buf, nvh * ds * ds * 4l)
+    }
+    batch_barrier(raw, true)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.dn_rq_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.dn_rq_set, uint((rows * di / 32l + 255l) / 256l))
+    comp_barrier(raw)
+    bind_batch_pipe(raw, 0)
+    cmd_bind_dispatch(raw, g_gpu.stacks[s_o].batch_set, nwg_out)
+    batch_barrier(raw, false)
+    cmd_copy_whole(raw, g_gpu.batch_y1_dev, g_gpu.batch_y1.buf, rows * dim * 4l)
+    vk_check(vkEndCommandBuffer(raw), null)
+}
+
+//! MoeGpuDnFn: one recurrent layer's whole deltanet attention block as one submit chain per
+//! DN_WINDOW rows — qkv + z GEMMs off the normed-x Q8_0 image, conv + SiLU + q/k L2-norm, the
+//! chunked delta-rule scan (raw beta/alpha transformed in-kernel), gated out-norm, Q8_0 requant,
+//! out projection. yp gets npos x dim rows; the f32 state round-trips once per call (device-side
+//! between windows); tailp gets the last taps qkv rows for the caller's conv-history store.
+def vk_moe_dn(var yp : float?; woq, woz, woo : int64;
+              xqp : int8 const?; xsp : float const?; bp : float const?; gp : float const?;
+              convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?;
+              var stp : float?; var tailp : float?; histp : float const?;
+              npos, dim, cd, kd, di, nvh, nkh, ds, dconv : int64; eps : float) {
+    let s_qkv = find_stack(woq, 0)
+    let s_z = find_stack(woz, 0)
+    let s_o = find_stack(woo, 0)
+    let taps = dconv - 1l
+    assert(ds <= DN_MAX_DS && ds % 16l == 0l && nvh <= DN_MAX_HEADS && cd <= DN_MAX_CD
+           && dconv <= DN_MAX_DCONV && di == nvh * ds && kd == nkh * ds && cd == 2l * kd + di
+           && npos > taps && dim % 32l == 0l && di % 32l == 0l,
+        "dasLLAMA vulkan tier: deltanet geometry outside chain capacity")
+    ensure_batch_state()
+    ensure_dn_state()
+    ensure_batch_set(s_qkv, g_gpu.batch_y1_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
+    ensure_batch_set(s_z, g_gpu.batch_y2_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
+    ensure_batch_set(s_o, g_gpu.batch_y1_dev, g_gpu.hq_dev, g_gpu.hs_dev, BATCH_HQ_BYTES, BATCH_HS_BYTES)
+    unsafe {
+        var sp = reinterpret<float?>(g_gpu.dn_smalls.mapped)
+        sp[0] = eps
+        sp[1] = 1.0 / sqrt(float(ds))
+        memcpy(reinterpret<void?>(sp + DN_SM_TAPS), reinterpret<void? -const>(convw), int(cd * dconv * 4l))
+        memcpy(reinterpret<void?>(sp + DN_SM_WNORM), reinterpret<void? -const>(wnormp), int(ds * 4l))
+        memcpy(reinterpret<void?>(sp + DN_SM_A), reinterpret<void? -const>(ap), int(nvh * 4l))
+        memcpy(reinterpret<void?>(sp + DN_SM_DT), reinterpret<void? -const>(dtp), int(nvh * 4l))
+        memcpy(reinterpret<void?>(sp + DN_SM_HIST), reinterpret<void? -const>(histp), int(cd * taps * 4l))
+        memcpy(g_gpu.dn_state_stage.mapped, reinterpret<void? -const>(stp), int(nvh * ds * ds * 4l))
+    }
+    var qkv_region = fixed_array(woq, 0l, 0l)
+    var z_region = fixed_array(woz, 0l, 0l)
+    var o_region = fixed_array(woo, 0l, 0l)
+    var r0 = 0l
+    while (r0 < npos) {
+        let rows = min(DN_WINDOW, npos - r0)
+        let ts0 = ref_time_ticks()
+        qkv_region[2] = rows
+        z_region[2] = rows
+        o_region[2] = rows
+        var nwg_qkv = 0u
+        var nwg_z = 0u
+        var nwg_out = 0u
+        unsafe {
+            nwg_qkv = fill_batch_meta(s_qkv, addr(qkv_region[0]), 1l, dim, cd, 0l, rows)
+            nwg_z = fill_batch_meta(s_z, addr(z_region[0]), 1l, dim, di, 0l, rows)
+            nwg_out = fill_batch_meta(s_o, addr(o_region[0]), 1l, di, dim, 0l, rows)
+        }
+        upload_batch_acts(xqp, xsp, r0, rows, dim, 32l)
+        unsafe {
+            var sp = reinterpret<float?>(g_gpu.dn_smalls.mapped)
+            par_memcpy(reinterpret<void?>(sp + DN_SM_BETA), reinterpret<void? -const>(bp + r0 * nvh), rows * nvh * 4l)
+            par_memcpy(reinterpret<void?>(sp + DN_SM_G), reinterpret<void? -const>(gp + r0 * nvh), rows * nvh * 4l)
+        }
+        fill_dn_meta(rows, cd, kd, di, nvh, nkh, ds, dconv, r0 == 0l ? 1 : 2, rows * di / 32l)
+        let ts1 = ref_time_ticks()
+        record_dn_cmd(s_qkv, s_z, s_o, nwg_qkv, nwg_z, nwg_out, rows, cd, di, dim, taps, nvh, ds,
+            rows * dim, rows * (dim / 32l) * 4l, r0 == 0l, r0 + rows == npos)
+        submit_wait(g_gpu.batch_cmd)
+        let ts2 = ref_time_ticks()
+        unsafe {
+            par_memcpy(reinterpret<void?>(yp + r0 * dim), g_gpu.batch_y1.mapped, rows * dim * 4l)
+        }
+        if (vk_prof()) {
+            to_log(LOG_INFO, "vk_dn prep {get_time_usec(ts0) - get_time_usec(ts1)} submit {get_time_usec(ts1) - get_time_usec(ts2)} copy {get_time_usec(ts2)}\n")
+        }
+        r0 += rows
+    }
+    unsafe {
+        par_memcpy(reinterpret<void?>(stp), g_gpu.dn_state_host.mapped, nvh * ds * ds * 4l)
+        memcpy(reinterpret<void?>(tailp), g_gpu.dn_tail_host.mapped, int(taps * cd * 4l))
+    }
+}
+
 // ===== decode dispatch (the FFN's GEMV arm) =====
 
 // pre-record (or refresh on a row-count change) the triple's chain: gate+up GEMV pair, fused
@@ -2360,8 +2994,9 @@ def dasllama_math_vulkan_register() {
         needs_repack = false, priority = -1, available = @@vulkan_backend_available))
     let layers = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_LAYERS")))
     let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
-    if ((layers > 0l || nstream > 0l) && vulkan_backend_available()) {
+    let dn_on = get_env_variable("DASLLAMA_GPU_DN") == "1"
+    if ((layers > 0l || nstream > 0l || dn_on) && vulkan_backend_available()) {
         set_moe_gpu_layer_count(layers)
-        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks)
+        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn)
     }
 }

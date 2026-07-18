@@ -165,6 +165,7 @@ def test_golden_disassembly(t : T?) {
         check(t, "fragx", fragx_words())
         check(t, "fragshadow", fragshadow_words())
         check(t, "cshared", cshared_words())
+        check(t, "cbufbar", cbufbar_words())
         check(t, "catomics", catomics_words())
         check(t, "imgquery", imgquery_words())
         check(t, "modconst", modconst_words())

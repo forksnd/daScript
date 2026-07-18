@@ -73,6 +73,7 @@ def main {
     emit_golden(dir, "fragx", fragx_words())                // 10.3 fragment realism rails
     emit_golden(dir, "fragshadow", fragshadow_words())      // 10.4 depth-compare sampling (Dref)
     emit_golden(dir, "cshared", cshared_words())            // 10.5 shared memory + barriers
+    emit_golden(dir, "cbufbar", cbufbar_words())            // memoryBarrierBuffer() + barrier()
     emit_golden(dir, "catomics", catomics_words())          // 10.5 atomics
     emit_golden(dir, "imgquery", imgquery_words())          // 10.6 imageSize
     emit_golden(dir, "modconst", modconst_words())          // 10.6 module-scope let constants

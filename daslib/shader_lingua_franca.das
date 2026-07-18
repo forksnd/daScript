@@ -148,6 +148,12 @@ def public barrier() : void {}
 [sideeffects]
 def public memoryBarrierShared() : void {}
 
+//! memoryBarrierBuffer(): order buffer (SSBO) writes so other invocations can read them — pair
+//! as `memoryBarrierBuffer(); barrier();` for a cross-invocation buffer handoff (barrier() alone
+//! only covers shared memory).
+[sideeffects]
+def public memoryBarrierBuffer() : void {}
+
 // ===== fragment realism =====
 // discard(): abandon the current fragment (block terminator -- last statement on its path).
 // dFdx/dFdy: screen-space partial derivatives over the 2x2 fragment quad. fwidth = |dFdx| + |dFdy|,

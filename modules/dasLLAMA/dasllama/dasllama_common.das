@@ -1777,10 +1777,12 @@ def moe_gpu_upload_resident(var t : Model) {
     set_moe_gpu_stream_from(t.config.n_layers)
     set_moe_gpu_cls_off(-1l)
     reset_moe_gpu_dense_offs()
+    reset_moe_gpu_dn_layers()
     // mx4/biased expert stacks never dispatch on the GPU, so they never upload either
     let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
+    let dn_want = get_env_variable("DASLLAMA_GPU_DN") == "1"
     if (t.quant != QuantMode.q8 || t.config.n_expert <= 0l
-            || (moe_gpu_layer_count() <= 0l && nstream <= 0l)
+            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want)
             || t.experts_mx4 || t.config.moe_exps_bias) {
         return
     }
@@ -1847,6 +1849,50 @@ def moe_gpu_upload_resident(var t : Model) {
         }
         if (dense_marked > 0l) {
             to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: {dense_marked} dense planes resident\n")
+        }
+    }
+    // deltanet triples third — DASLLAMA_GPU_DN=1 opt-in: each recurrent layer's qkv / z-gate /
+    // out-proj planes (always q8 in the split layout) + the layer mark that routes its whole
+    // prefill attention block through the device chain (deltanet_prefill's GPU arm). Layer-
+    // ascending; a budget stop leaves later layers on the CPU path, a partial triple rolls
+    // back. A layer the dense walk already uploaded just gets the mark — same planes.
+    if (dn_want) {
+        var dn_marked = 0l
+        var dn_stop = false
+        for (l in range64(layers)) {
+            if (!layer_is_recurrent(t.config, l)
+                    || t.dnqkv_offs[l] < 0l || t.dngate_offs[l] < 0l || t.dnout_offs[l] < 0l) {
+                continue
+            }
+            if (moe_gpu_dense_on_gpu(int(KqFmt.q8), t.dnqkv_offs[l])) {
+                set_moe_gpu_dn_layer(l)
+                dn_marked++
+                continue
+            }
+            let cd = dn_conv_dim(t.config)
+            let di = t.config.ssm_d_inner
+            var got = 0
+            if (moe_gpu_gather_upload(t, KqFmt.q8, t.dnqkv_offs[l], dim, cd, cd, mr, kgroup, wbias, wq, ws)) {
+                got++
+            }
+            if (got == 1 && moe_gpu_gather_upload(t, KqFmt.q8, t.dngate_offs[l], dim, di, di, mr, kgroup, wbias, wq, ws)) {
+                got++
+            }
+            if (got == 2 && moe_gpu_gather_upload(t, KqFmt.q8, t.dnout_offs[l], di, dim, dim, mr, kgroup, wbias, wq, ws)) {
+                got++
+            }
+            if (got < 3) {
+                if (got > 0) {
+                    moe_gpu_drop_stacks(got, false)
+                }
+                dn_stop = true
+            }
+            break if (dn_stop)
+            set_moe_gpu_dn_layer(l)
+            dn_marked++
+        }
+        if (dn_marked > 0l) {
+            to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: deltanet triples of {dn_marked} layers resident\n")
         }
     }
     for (i in range64(want)) {
@@ -3365,6 +3411,7 @@ struct Session {
     dn_conv_b : array<float>       // batched conv + SiLU output (npos x conv_dim)
     dn_wtap : array<float>         // conv weights transposed tap-major for the batched form (d_conv x conv_dim)
     dn_cws : array<float>          // per-v-head chunk workspace slabs (dt_rank x dn_cws_head_size)
+    dn_tail : array<float>         // GPU deltanet chain: last taps qkv rows back (conv-history store)
     // MTP/NextN self-spec state (empty unless config.n_layer_nextn > 0). mtp_h is the trunk's
     // post-output-norm hidden of the LAST evaluated position — llama.cpp's t_h_nextn handoff,
     // stashed by forward()/forward_prefill() right after the final rms_at; mtp_h_pos1 is the
@@ -9120,10 +9167,70 @@ def private deltanet_prefill_chunked(t : Model; var s : Session; l : int64; npos
     prof_add("dn_scan", ts_scan)
 }
 
+// The GPU arm: the whole block (qkv/z GEMMs, conv, chunked scan, gated out-norm, out-proj) as
+// one device chain per window — the norm, the tiny raw beta/alpha GEMMs, the residual, and the
+// conv-history store stay CPU. Numerics are the chunked algorithm on GPU exp/f32-accumulation —
+// drift-class vs CPU, the DN parity bar (the qwen35 knife-edge; see the Q4a investigation).
+def private deltanet_prefill_gpu(t : Model; var s : Session; l : int64; npos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let cd = dn_conv_dim(c)
+    let kd = dn_key_dim(c)
+    let di = c.ssm_d_inner
+    let nvh = c.ssm_dt_rank
+    let nkh = c.ssm_n_group
+    let ds = c.ssm_d_state
+    let dconv = c.ssm_d_conv
+    let taps = dconv - 1l
+    let ts_norm0 = ref_time_ticks()
+    rms_batch(s.xb_b, s.x_b, t, t.rms_att_off + l * dim, dim, npos)
+    prof_add("dn_norm", ts_norm0)
+    let ts_in = ref_time_ticks()
+    if (t.dn_ba_f32) {   // raw beta/alpha rows — the transforms run in-kernel
+        mm_fblob_b(s.dn_beta_b, t, t.dn_betaf_off + l * dim * nvh, s.xb_b, dim, nvh, npos)
+        mm_fblob_b(s.dn_g_b, t, t.dn_alphaf_off + l * dim * nvh, s.xb_b, dim, nvh, npos)
+    } else {
+        mm_b_f(s, s.dn_beta_b, t, KqFmt.q8, t.dnbeta_offs[l], s.xb_b, dim, nvh, npos)
+        mm_b_f(s, s.dn_g_b, t, KqFmt.q8, t.dnalpha_offs[l], s.xb_b, dim, nvh, npos)
+    }
+    requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)   // one Q8_0 image serves the qkv AND z GEMMs
+    prof_add("dn_mm_in", ts_in)
+    let ts_gpu = ref_time_ticks()
+    s.dn_tail |> resize(int(taps * cd))
+    unsafe {
+        matmul_moe_gpu_dn(s.xb2_b, t.dnqkv_offs[l], t.dngate_offs[l], t.dnout_offs[l],
+            s.xqb, s.xsb, s.dn_beta_b, s.dn_g_b,
+            addr<float const?>(t.fblob[t.dn_conv_off + l * dconv * cd]),
+            addr<float const?>(t.fblob[t.dn_norm_off + l * ds]),
+            addr<float const?>(t.fblob[t.dn_a_off + l * nvh]),
+            addr<float const?>(t.fblob[t.dn_dt_off + l * nvh]),
+            addr(s.dn_state[s.dn_state_prefix[l]]), s.dn_tail,
+            addr<float const?>(s.dn_conv_state[s.dn_conv_prefix[l]]),
+            npos, dim, cd, kd, di, nvh, nkh, ds, dconv, c.norm_eps)
+    }
+    prof_add("dn_gpu", ts_gpu)
+    let ts_resid = ref_time_ticks()
+    unsafe {   // conv-history advance from the tail rows (channel-major — the decode layout)
+        var st = addr(s.dn_conv_state[s.dn_conv_prefix[l]])
+        let tp = addr < float const? >(s.dn_tail[0])
+        for (k in range64(taps)) {
+            for (ch in range64(cd)) {
+                st[ch * taps + k] = tp[k * cd + ch]
+            }
+        }
+    }
+    add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
+    prof_add("dn_resid", ts_resid)
+}
+
 // qwen35 deltanet prefill: batched projections, then the inherently sequential per-token core
 // (state carried across positions), then one batched ssm_out projection + residual.
 def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64) {
     trace_tag(TRACE_TAG_DN)   // override the loop's attn_std stamp: dn layers color separately
+    if (g_dn_prefill_mode == DnPrefillMode.chunked && npos >= 32l && moe_gpu_dn_on_gpu(l)) {
+        deltanet_prefill_gpu(t, s, l, npos)   // buckets dn_norm / dn_mm_in / dn_gpu / dn_resid
+        return
+    }
     let c = t.config
     let dim = c.dim
     let cd = dn_conv_dim(c)

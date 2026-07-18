@@ -44,6 +44,19 @@ def test_shared_and_barriers(t : T?) {
 }
 
 [test]
+def test_buffer_barrier(t : T?) {
+    t |> run("compute: memoryBarrierBuffer() + barrier() (the cross-invocation SSBO handoff)") <| @(t : T?) {
+        var words <- cbufbar_words()
+        t |> success(has_op(words, SpvOp.ControlBarrier), "cbufbar: barrier() -> OpControlBarrier")
+        // memoryBarrierBuffer() -> OpMemoryBarrier (Device scope, UniformMemory|AcquireRelease —
+        // the scope/semantics operands are constant <id>s, left to spirv-val per the header note)
+        t |> success(has_op(words, SpvOp.MemoryBarrier), "cbufbar: memoryBarrierBuffer() -> OpMemoryBarrier")
+        validate(t, words, "cbufbar")
+        delete words
+    }
+}
+
+[test]
 def test_atomic_family(t : T?) {
     t |> run("compute: atomic family on shared int/uint counters") <| @(t : T?) {
         var words <- catomics_words()
