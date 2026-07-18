@@ -602,5 +602,11 @@ def load_image(path : string; var t; tag : string = "") : bool {
 
 //! Model entry point — see load_image.
 def load_model_image(path : string; var t : Model) : bool {
-    return load_image(path, t)
+    if (!load_image(path, t)) {
+        return false
+    }
+    // AFTER the plane borrows (image_post_load runs before them, when every array is still
+    // empty): the GPU MoE tier gathers from the PREPARED planes, so the mapped rail serves it too
+    moe_gpu_upload_resident(t)
+    return true
 }

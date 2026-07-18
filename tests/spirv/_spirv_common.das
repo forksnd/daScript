@@ -1898,3 +1898,26 @@ def q8blk_kernel {
 def public q8blk_words : array<uint> {
     return clone_to_move(q8blk_spv)
 }
+
+// ===== packed integer dot product: sdot4 -> OpSDot with the PackedVectorFormat4x8Bit literal.
+// The DotProduct / DotProductInput4x8BitPacked caps + SPV_KHR_integer_dot_product ride the
+// declared Capability/Extension opcodes. =====
+def public sdot_emitter_opcodes : table<uint> {
+    var s <- storage816_emitter_opcodes()
+    s |> insert(uint(SpvOp.SDot))
+    return <- s
+}
+
+var @ssbo @binding = 0 sd_a : array<uint>
+var @ssbo @binding = 1 sd_b : array<uint>
+var @ssbo @binding = 2 sd_y : array<int>
+
+[compute_shader(local_size_x=64, name="sdot_spv"), marker(no_coverage)]
+def sdot_kernel {
+    let gi = gl_GlobalInvocationID.x
+    sd_y[gi] = sdot4(sd_a[gi], sd_b[gi]) + sdot4(sd_a[gi], 0x01010101u)
+}
+
+def public sdot_words : array<uint> {
+    return clone_to_move(sdot_spv)
+}

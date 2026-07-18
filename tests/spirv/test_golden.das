@@ -205,5 +205,7 @@ def test_golden_disassembly(t : T?) {
         // 8/16-bit SSBO storage (visitor baseline): pins the std430 tight strides (34/1/8), the
         // sub-32 member Offsets, and the unpack8/pack32 Bitcast + SConvert emission order.
         check(t, "q8blk", q8blk_words())
+        // packed integer dot product: OpSDot + the PackedVectorFormat4x8Bit literal
+        check(t, "sdot", sdot_words())
     }
 }

@@ -107,6 +107,7 @@ struct EmitCtx {
     group_nonuniform_arith_cap : bool           // OpCapability GroupNonUniformArithmetic already emitted (subgroupAdd/Min/Max)
     group_nonuniform_shuffle_cap : bool         // OpCapability GroupNonUniformShuffle already emitted (subgroupShuffleXor)
     group_nonuniform_ballot_cap : bool          // OpCapability GroupNonUniformBallot already emitted (subgroupBroadcastFirst)
+    integer_dot_cap : bool                      // OpCapability DotProduct + DotProductInput4x8BitPacked + OpExtension "SPV_KHR_integer_dot_product" already emitted (sdot4)
     mesh_max_vertices : int                     // mesh-output array sizing (from MeshOutputConfig): gl_MeshVerticesEXT length
     mesh_max_primitives : int                   // mesh-output array sizing: gl_PrimitiveTriangleIndicesEXT length
     mesh_topology : MeshOutputTopology          // declared output topology; the index-array builtin must match it (triangles -> gl_PrimitiveTriangleIndicesEXT)
@@ -1495,6 +1496,19 @@ def private ensure_group_nonuniform_ballot(var m : SpirvModule; var ctx : EmitCt
     if (ctx.group_nonuniform_ballot_cap) return
     emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.GroupNonUniformBallot))
     ctx.group_nonuniform_ballot_cap = true
+}
+
+// sdot4 (OpSDot on packed 4x8-bit operands) requires the DotProduct + DotProductInput4x8BitPacked
+// capabilities and the SPV_KHR_integer_dot_product extension (core at SPIR-V 1.6 — above our 1.3/1.4
+// target, so the OpExtension is unconditional). Emit-once + ctx-flag dedupe.
+def private ensure_integer_dot_product(var m : SpirvModule; var ctx : EmitCtx) {
+    if (ctx.integer_dot_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.DotProduct))
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.DotProductInput4x8BitPacked))
+    var nm <- string_words("SPV_KHR_integer_dot_product")
+    emit_n(m, SEC_EXT, SpvOp.Extension, nm)
+    delete nm
+    ctx.integer_dot_cap = true
 }
 
 // Descriptor indexing (Vulkan VK_EXT_descriptor_indexing): nonuniformEXT() emits the NonUniform
@@ -3098,6 +3112,26 @@ class SpirvEmit : AstVisitor {
             let rt = emit_type(bm, expr._type)
             let res = alloc_id(bm)
             emit(bm, SEC_FUNCS, SpvOp.Bitcast, rt, res, v)
+            e2id[k] = res
+            return expr
+        }
+        // sdot4: packed 4x8-bit signed integer dot product (dp4a) — OpSDot on two uint words with
+        // the PackedVectorFormat4x8Bit LITERAL as the trailing operand (not an id). Pulls the
+        // DotProduct + DotProductInput4x8BitPacked caps + SPV_KHR_integer_dot_product.
+        if (name == "sdot4") {
+            if (length(expr.arguments) != 2) {
+                errs |> push("sdot4 expects 2 arguments")
+                return expr
+            }
+            let wa = value_of(expr.arguments[0])
+            let wb = value_of(expr.arguments[1])
+            if (wa == 0u || wb == 0u) return expr
+            ensure_integer_dot_product(bm, *ctx)
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            var ops <- [rt, res, wa, wb, uint(SpvPackedVectorFormat.PackedVectorFormat4x8Bit)]
+            emit_n(bm, SEC_FUNCS, SpvOp.SDot, ops)
+            delete ops
             e2id[k] = res
             return expr
         }

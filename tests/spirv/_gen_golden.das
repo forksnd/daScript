@@ -106,4 +106,6 @@ def main {
     emit_golden(dir, "specc", specc_words())
     // 8/16-bit SSBO storage: block_q8_0-mirror struct + half4 elements + unpack8/pack32
     emit_golden(dir, "q8blk", q8blk_words())
+    // packed integer dot product: sdot4 -> OpSDot + PackedVectorFormat4x8Bit literal
+    emit_golden(dir, "sdot", sdot_words())
 }
