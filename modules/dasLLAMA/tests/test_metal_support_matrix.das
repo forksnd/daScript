@@ -48,10 +48,12 @@ require _model_tier
 // The FAMILY matrix (family waves A, test_metal_family_matrix below): the gate is no longer
 // arch-named — the block set declares the graph (`graph` decline) and metal_needs derives the
 // feature set (`feature` + need_* declines) against per-path implemented masks. Served today:
-// llama + phi3 (neox) + qwen2 (neox+qkv_bias) + qwen3 (neox+qk_norm+qd_neq_dim), each row
+// llama + phi3 (neox) + qwen2 (neox+qkv_bias) + qwen3 (neox+qk_norm+qd_neq_dim) + gemma2
+// (neox+softcap+sliding+pre_post_norm+geglu, hs 256 — wave B stage 1), each row
 // token-parity-proven. mistral3 (empty config = the llama shape) serves by construction; no
 // <= 35B mistral3-arch GGUF exists to validate against (Mistral Small 3.x converts as llama),
-// so its real-model row waits on a fixture. gemma/MoE/deltanet = waves B-D.
+// so its real-model row waits on a fixture. gemma3/4 (dual-theta rope, hetero heads) = wave B
+// stages 2-3; MoE/deltanet = waves C-D.
 
 def private counting_prompt(start, last : int) : string {
     return build_string() $(var w) {
@@ -536,6 +538,57 @@ def private family_cells(t : T?; path, family, tag : string; expect_needs : Meta
     }
 }
 
+[unused_argument(t, path)]   // off-Apple the gated body is empty
+def private gemma2_window_row(t : T?; path : string) {
+    // sliding-window masking parity: shrink the window post-load (config-driven everywhere —
+    // gemma2 is single-θ, so rope is unaffected) and generate PAST it. The prompt-depth assert
+    // guarantees decode crosses chunk 224, so whole below-window chunks are skipped (chlo >= 1)
+    // and the comb's chlo skip is on the proven path, not just the boundary mask.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "gemma2") || !arm_on(t, "fam-gemma2") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        tr.config.sliding_window = 160l
+        let prompt <- encode(tr, counting_prompt(1, 120), true, false)
+        t |> success(int64(length(prompt)) > 224l,
+            "gemma2-2b/window: prompt depth {length(prompt)} crosses chunk 224")
+        var cpu_ids : array<int64>
+        var gpu_ids : array<int64>
+        var served_de = 0l
+        var served_pf = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids <- generate(tr, s, prompt, length(prompt) + 16)
+            cpu_ids := ids
+            delete s
+            let de0 = metal_decode_stats().decodes
+            let pf0 = metal_prefill_stats().prefills
+            select_decode_override("metal")
+            select_prefill_override("metal")
+            set_metal_prefill_min_npos(1l)
+            var s2 = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids2 <- generate(tr, s2, prompt, length(prompt) + 16)
+            gpu_ids := ids2
+            delete s2
+            set_metal_prefill_min_npos(64l)
+            select_decode_override("")
+            select_prefill_override("")
+            served_de = metal_decode_stats().decodes - de0
+            served_pf = metal_prefill_stats().prefills - pf0
+        }
+        t |> success(served_de > 0l && served_pf > 0l,
+            "gemma2-2b/window: both GPU paths engaged (decode {served_de}, prefill {served_pf})")
+        t |> success(same(cpu_ids, gpu_ids),
+            "gemma2-2b/window: window-crossing generate matches the CPU truth token-for-token")
+        delete cpu_ids
+        delete gpu_ids
+        delete tr
+    }
+}
+
 // The family axis (family waves A): each non-llama dense family loads its small carrier and
 // asserts per-path ENGAGE/DECLINE with the exact need_* reason — the descriptor refactor's
 // living expectation table. mistral3 (empty config = the llama shape) has no <= 35B fixture;
@@ -590,6 +643,39 @@ def test_metal_family_matrix(t : T?) {
                 "phi3.5-mini/q8/s16", MetalNeed.neox,
                 "")
             set_wscale_f16(false)
+            // gemma2 = NEOX + attn/final softcaps + sliding (even layers) + 4-norms + GeGLU +
+            // hs 256 (the wave B widening) — ENGAGE on all three paths. The Q4_K_M row proves the
+            // K-quant sites x wide heads x q8_0-KV block attention; the Q8/s16 row proves the s16
+            // GEMVs with the swiglu-fused w13 form standing down to the geglu ew
+            family_cells(t, path_join(models_dir(), "gemma-2-2b-it-Q4_K_M.gguf"), "gemma2",
+                "gemma2-2b/k4/f16", MetalNeed.neox | MetalNeed.softcap | MetalNeed.sliding |
+                    MetalNeed.pre_post_norm | MetalNeed.geglu,
+                "", KVDtype.q8_0)
+            set_wscale_f16(true)
+            family_cells(t, path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf"), "gemma2",
+                "gemma2-2b/q8/s16", MetalNeed.neox | MetalNeed.softcap | MetalNeed.sliding |
+                    MetalNeed.pre_post_norm | MetalNeed.geglu,
+                "")
+            set_wscale_f16(false)
+            // the sliding-window MASKING row: gemma2's stock window (4096) never triggers at test
+            // depths, so shrink it post-load to 160 (>= 128, the gate's single-form floor) and
+            // cross it — prefill masks the below-window prefix, decode's chunked attention skips
+            // whole below-window chunks (chlo > 0 by the depth assert). CPU truth slides the same
+            // window, so generate parity proves the masking math end-to-end.
+            gemma2_window_row(t, path_join(models_dir(), "gemma-2-2b-it-Q4_K_M.gguf"))
+            // gemma3 = gemma2's shape minus the softcaps, plus QK-norm and the 5:1 SWA pattern
+            // with DUAL-THETA per-layer rope (sliding θ=10k vs global θ=1M) — the stage-2 swa
+            // table pair; qd != dim on both carriers. 5 of 6 layers slide, so ANY generate
+            // proves the per-layer table pick (a wrong θ breaks parity immediately). The 1b's
+            // q8_0-KV row drives the hs-256 QK-norm PREPASS, its f16 row the widened H-form.
+            family_cells(t, path_join(models_dir(), "gemma-3-1b-it-Q8_0.gguf"), "gemma3",
+                "gemma3-1b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding |
+                    MetalNeed.pre_post_norm | MetalNeed.geglu | MetalNeed.qd_neq_dim,
+                "", KVDtype.q8_0)
+            family_cells(t, path_join(models_dir(), "gemma-3-4b-it-Q8_0.gguf"), "gemma3",
+                "gemma3-4b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding |
+                    MetalNeed.pre_post_norm | MetalNeed.geglu | MetalNeed.qd_neq_dim,
+                "")
             metal_decode_shutdown()
             metal_prefill_shutdown()
             t |> equal(metal_live_object_count(), 0l)

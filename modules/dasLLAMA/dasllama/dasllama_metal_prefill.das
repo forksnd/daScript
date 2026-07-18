@@ -1464,7 +1464,7 @@ class MetalQkNorm {
     @uniform @binding = 5 hs : uint         // head size == the threadgroup width
     @uniform @binding = 6 woffe : uint      // k plane's element offset in w
     @uniform @binding = 7 eps : float
-    @workgroup part : float[4]
+    @workgroup part : float[16]     // one per simdgroup — hs <= 512 (gemma4 global heads)
 
     [metal_kernel(name="metal_qk_norm_msl")]
     def metal_qk_norm {
@@ -1665,6 +1665,7 @@ class MetalAttnQK {
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 qoff : uint      // the chunk's first GLOBAL position (0 = fresh start)
     @uniform @binding = 11 qrows : uint     // padded QUERY rows — the score slab's row extent
+    @uniform @binding = 12 window : uint    // > 0 = sliding span (this layer); 0 = global
     @workgroup ta : float[2048]             // Q block: 32 qi-rows x 64 (row stride 64)
     @workgroup tb : float[2048]             // KT block: 64 k-rows x 32 j-cols (row stride 32)
 
@@ -1673,8 +1674,11 @@ class MetalAttnQK {
         let qi0 = gl_WorkGroupID.x * 32u
         let j0 = gl_WorkGroupID.y * 32u
         let h = gl_WorkGroupID.z
-        if (j0 > qoff + qi0 + 31u) {
-            return                          // fully above the causal diagonal
+        // skip blocks fully above the causal diagonal, or fully below every row's sliding window
+        // (the first row's wstart is the block minimum; softmax zeroes P over the skipped region)
+        if (j0 > qoff + qi0 + 31u ||
+                (window > 0u && qoff + qi0 + 1u > window && j0 + 32u <= qoff + qi0 + 1u - window)) {
+            return
         }
         let lid = gl_LocalInvocationID.x
         let sg = gl_SubgroupID
@@ -1734,6 +1738,8 @@ class MetalAttnSoftmax {
     @uniform @binding = 1 np32 : uint
     @uniform @binding = 2 qoff : uint       // the chunk's first GLOBAL position (0 = fresh start)
     @uniform @binding = 3 qrows : uint      // padded query rows — the slab's row extent
+    @uniform @binding = 4 window : uint     // > 0 = sliding span: keys < cnt - window are masked
+    @uniform @binding = 5 softcap : float   // > 0 = attention-logit soft cap (gemma2)
     @workgroup red : float[4]               // one per simdgroup
     @workgroup bcast : float
 
@@ -1744,11 +1750,13 @@ class MetalAttnSoftmax {
         let lid = gl_LocalInvocationID.x
         let nthreads = gl_WorkGroupSize.x
         let cnt = qoff + qi + 1u
+        let jlo = window > 0u && cnt > window ? cnt - window : 0u
         let rowbase = (h * qrows + qi) * np32
         var m = -1.0e30
-        var j = lid
+        var j = jlo + lid
         while (j < cnt) {
-            m = max(m, att[rowbase + j])
+            let sr = att[rowbase + j]
+            m = max(m, softcap > 0.0 ? softcap * tanh(min(max(sr / softcap, -40.0), 40.0)) : sr)   // nolint:STYLE019
             j += nthreads
         }
         m = max(m, simd_shuffle_xor(m, 16u))
@@ -1772,9 +1780,10 @@ class MetalAttnSoftmax {
         barrier()
         let rowmax = bcast
         var sum = 0.0
-        j = lid
+        j = jlo + lid
         while (j < cnt) {
-            let ev = exp(att[rowbase + j] - rowmax)
+            let sr = att[rowbase + j]
+            let ev = exp((softcap > 0.0 ? softcap * tanh(min(max(sr / softcap, -40.0), 40.0)) : sr) - rowmax)   // nolint:STYLE019
             att[rowbase + j] = ev
             sum += ev
             j += nthreads
@@ -1795,9 +1804,14 @@ class MetalAttnSoftmax {
         }
         barrier()
         let inv = bcast
-        j = lid
+        j = jlo + lid
         while (j < cnt) {
             att[rowbase + j] *= inv
+            j += nthreads
+        }
+        j = lid
+        while (j < jlo) {
+            att[rowbase + j] = 0.0          // below-window prefix: P zeroes (QK may have skipped it)
             j += nthreads
         }
         j = cnt + lid
@@ -1895,6 +1909,7 @@ class MetalAttnQKMm {
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 qoff : uint      // the chunk's first GLOBAL position (0 = fresh start)
     @uniform @binding = 11 qrows : uint     // padded query rows — the slab's row extent
+    @uniform @binding = 12 window : uint    // > 0 = sliding span (this layer); 0 = global
     @workgroup ta : float16[2048]           // K: k-tiles x 8 key-tiles of 8x8, tile (k row, key col)
     @workgroup tb : float16[1024]           // Q: k-tiles x 4 query-tiles of 8x8 (query row, k col)
 
@@ -1902,8 +1917,10 @@ class MetalAttnQKMm {
     def metal_attn_qk_mm {
         let mBase = gl_WorkGroupID.x * 32u  // query rows
         let nBase = gl_WorkGroupID.y * 64u  // key rows
-        if (nBase > qoff + mBase + 31u) {
-            return                          // fully above the causal diagonal
+        // skip blocks fully above the causal diagonal, or fully below every row's sliding window
+        if (nBase > qoff + mBase + 31u ||
+                (window > 0u && qoff + mBase + 1u > window && nBase + 64u <= qoff + mBase + 1u - window)) {
+            return
         }
         let lid = gl_LocalInvocationID.x
         let sg = gl_SubgroupID
@@ -2097,6 +2114,27 @@ class MetalSwiglu {
     }
 }
 
+// GeGLU twin (gemma line): g = gelu(g) * u with the CPU's tanh-approx gelu (dasllama_math gelu —
+// 0.5*v*(1+tanh(sqrt(2/pi)*(v + 0.044715*v^3)))); GPU tanh vs the CPU exp identity differ inside
+// the shared tolerance envelope, same as swiglu's exp.
+class MetalGeglu {
+    @ssbo @binding = 0 g : array<float>     // [ntok x hidden] W1 gate, in place
+    @ssbo @binding = 1 u : array<float>     // [ntok x hidden] W3 up
+    @uniform @binding = 2 total : uint      // ntok * hidden — grid guard
+
+    [metal_kernel(name="metal_geglu_msl")]
+    def metal_geglu {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= total) {
+            return
+        }
+        let vv = g[gid]
+        // Metal tanh(|x| > ~44) is NaN (exp-form INF/INF) — clamp; tanh(+-40) == +-1 exactly in f32
+        let a = 0.7978845608028654 * (vv + 0.044715 * vv * vv * vv)
+        g[gid] = 0.5 * vv * (1.0 + tanh(min(max(a, -40.0), 40.0))) * u[gid]   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
+    }
+}
+
 // Residual add, one thread per element: x += y (add_inplace).
 class MetalAdd {
     @ssbo @binding = 0 x : array<float>
@@ -2113,6 +2151,23 @@ class MetalAdd {
     }
 }
 
+// Logit soft-cap, one thread per element: x = cap * tanh(x / cap) — softcap4's scalar reference
+// (gemma2/gemma4 final_logit_softcap on the GPU classifier row).
+class MetalSoftcapRow {
+    @ssbo @binding = 0 x : array<float>
+    @uniform @binding = 1 total : uint      // grid guard
+    @uniform @binding = 2 cap : float
+
+    [metal_kernel(name="metal_softcap_row_msl")]
+    def metal_softcap_row {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= total) {
+            return
+        }
+        x[gid] = cap * tanh(min(max(x[gid] / cap, -40.0), 40.0))   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
+    }
+}
+
 // ===== the whole-prefill driver =====
 // Registered as prefill override "metal" (DASLLAMA_PIN_PREFILL). One command buffer per prefill;
 // ONE commit+wait, then unified-memory readback hands x_b + per-layer roped-K/raw-V back to the CPU.
@@ -2124,7 +2179,8 @@ var private g_pf_regions : table<uint64; MetalBuffer?>    // base address -> res
 var private g_pf_pool : MetalBufferPool
 var private g_pf_upool : MetalBufferPool     // UNTRACKED pool: uniforms + rope tables (GPU-read-only)
 // what the prefill kernels implement beyond the base llama dense block — grows wave by wave
-let PF_NEEDS_OK = MetalNeed.neox | MetalNeed.qkv_bias | MetalNeed.qk_norm | MetalNeed.qd_neq_dim
+let PF_NEEDS_OK = (MetalNeed.neox | MetalNeed.qkv_bias | MetalNeed.qk_norm | MetalNeed.qd_neq_dim |
+    MetalNeed.softcap | MetalNeed.sliding | MetalNeed.pre_post_norm | MetalNeed.geglu)
 
 var private g_min_npos = 64l
 var private g_max_npos = 2048l          // naive-attention P footprint cap: heads x npos^2 floats
@@ -2140,6 +2196,8 @@ var private g_pso_qk : MetalComputePipeline?
 var private g_pso_softmax : MetalComputePipeline?
 var private g_pso_av : MetalComputePipeline?
 var private g_pf_pso_swiglu : MetalComputePipeline?
+var private g_pf_pso_geglu : MetalComputePipeline?
+var private g_pf_pso_softcap : MetalComputePipeline?
 var private g_pf_pso_add : MetalComputePipeline?
 var private g_pso_addrmsq : MetalComputePipeline?
 var private g_pso_swigluq : MetalComputePipeline?
@@ -2255,6 +2313,14 @@ def public metal_prefill_shutdown {
         metal_release(g_pf_pso_swiglu)
         g_pf_pso_swiglu = null
     }
+    if (g_pf_pso_geglu != null) {
+        metal_release(g_pf_pso_geglu)
+        g_pf_pso_geglu = null
+    }
+    if (g_pf_pso_softcap != null) {
+        metal_release(g_pf_pso_softcap)
+        g_pf_pso_softcap = null
+    }
     if (g_pf_pso_add != null) {
         metal_release(g_pf_pso_add)
         g_pf_pso_add = null
@@ -2345,6 +2411,8 @@ def private metal_prefill_init : bool {
     g_pso_softmax = pf_compile_pso(metal_attn_softmax_msl, metal_attn_softmax_msl_entry, metal_attn_softmax_msl_fastmath, ok)
     g_pso_av = pf_compile_pso(metal_attn_av_msl, metal_attn_av_msl_entry, metal_attn_av_msl_fastmath, ok)
     g_pf_pso_swiglu = pf_compile_pso(metal_swiglu_msl, metal_swiglu_msl_entry, metal_swiglu_msl_fastmath, ok)
+    g_pf_pso_geglu = pf_compile_pso(metal_geglu_msl, metal_geglu_msl_entry, metal_geglu_msl_fastmath, ok)
+    g_pf_pso_softcap = pf_compile_pso(metal_softcap_row_msl, metal_softcap_row_msl_entry, metal_softcap_row_msl_fastmath, ok)
     g_pf_pso_add = pf_compile_pso(metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath, ok)
     g_pso_addrmsq = pf_compile_pso(metal_add_rms_quant_msl, metal_add_rms_quant_msl_entry, metal_add_rms_quant_msl_fastmath, ok)
     g_pso_swigluq = pf_compile_pso(metal_swiglu_quant_msl, metal_swiglu_quant_msl_entry, metal_swiglu_quant_msl_fastmath, ok)
@@ -2465,12 +2533,14 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
     }
     for (l in range64(c.n_layers)) {
         if ((t.kv_src[l] != l || layer_kv_dim(c, l) != kv_dim || layer_head_size(c, l) != head_size) ||
-                (layer_hidden(t, l) != hidden || layer_is_sliding(c, l) || t.wv_offs[l] < 0l)) {
+                (layer_hidden(t, l) != hidden || t.wv_offs[l] < 0l)) {
             return MetalPrefillDecline.layers
         }
     }
-    // the rope table is the kernel's input — forward_prefill_body builds it right before the hook
-    if (int64(length(s.rope_cos)) < npos * (head_size / 2l)) {
+    // the rope table(s) are the kernel's input — forward_prefill_body builds them right before
+    // the hook (dual-rope: the sliding class's rows too)
+    if (int64(length(s.rope_cos)) < npos * (head_size / 2l) ||
+            (has_dual_rope(c) && int64(length(s.rope_cos_swa)) < npos * (head_size / 2l))) {
         return MetalPrefillDecline.rope_rows
     }
     return MetalPrefillDecline.none
@@ -2680,7 +2750,7 @@ def private enc_rope_qk(enc : MetalComputeEncoder?; bq, bk, bcos, bsin, bqd, bkv
 // the ggml-geometry attention pair: same buffer lists as the trio, 32x64 C tiles, z = heads.
 // The key grid spans nk64 (= np32's value — existing rows + the chunk on a continuation);
 // bqoff/bqrows carry the causal shift and the score slab's row extent.
-def private enc_qk_mm(enc : MetalComputeEncoder?; bq, bk, batt, bqd, bkvd, bhs, bkvm, bnp, bnp32, bscale, bqoff, bqrows : MetalBuffer?; mp, nk64, heads : int64) {
+def private enc_qk_mm(enc : MetalComputeEncoder?; bq, bk, batt, bqd, bkvd, bhs, bkvm, bnp, bnp32, bscale, bqoff, bqrows, bwin : MetalBuffer?; mp, nk64, heads : int64) {
     metal_set_pipeline(enc, g_pso_qkmm)
     metal_set_threadgroup_memory_length(enc, metal_attn_qk_mm_msl_tgmem, 0)
     metal_set_buffer(enc, bq, 0ul, 0)
@@ -2695,6 +2765,7 @@ def private enc_qk_mm(enc : MetalComputeEncoder?; bq, bk, batt, bqd, bkvd, bhs, 
     metal_set_buffer(enc, bscale, 0ul, 9)
     metal_set_buffer(enc, bqoff, 0ul, 10)
     metal_set_buffer(enc, bqrows, 0ul, 11)
+    metal_set_buffer(enc, bwin, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(nk64 / 64l), uint(heads)), uint3(128u, 1u, 1u))
 }
 
@@ -2715,7 +2786,7 @@ def private enc_av_mm(enc : MetalComputeEncoder?; batt, bv, bxb, bqd, bkvd, bhs,
     metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(head_size / 64l), uint(heads)), uint3(128u, 1u, 1u))
 }
 
-def private enc_qk(enc : MetalComputeEncoder?; bq, bk, batt, bqd, bkvd, bhs, bkvm, bnp, bnp32, bscale, bqoff, bqrows : MetalBuffer?; mp, nk64, heads : int64) {
+def private enc_qk(enc : MetalComputeEncoder?; bq, bk, batt, bqd, bkvd, bhs, bkvm, bnp, bnp32, bscale, bqoff, bqrows, bwin : MetalBuffer?; mp, nk64, heads : int64) {
     metal_set_pipeline(enc, g_pso_qk)
     metal_set_threadgroup_memory_length(enc, metal_attn_qk_msl_tgmem, 0)
     metal_set_buffer(enc, bq, 0ul, 0)
@@ -2730,16 +2801,19 @@ def private enc_qk(enc : MetalComputeEncoder?; bq, bk, batt, bqd, bkvd, bhs, bkv
     metal_set_buffer(enc, bscale, 0ul, 9)
     metal_set_buffer(enc, bqoff, 0ul, 10)
     metal_set_buffer(enc, bqrows, 0ul, 11)
+    metal_set_buffer(enc, bwin, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(nk64 / 32l), uint(heads)), uint3(128u, 1u, 1u))
 }
 
-def private enc_softmax(enc : MetalComputeEncoder?; batt, bnp32, bqoff, bqrows : MetalBuffer?; npos, heads : int64) {
+def private enc_softmax(enc : MetalComputeEncoder?; batt, bnp32, bqoff, bqrows, bwin, bcap : MetalBuffer?; npos, heads : int64) {
     metal_set_pipeline(enc, g_pso_softmax)
     metal_set_threadgroup_memory_length(enc, metal_attn_softmax_msl_tgmem, 0)
     metal_set_buffer(enc, batt, 0ul, 0)
     metal_set_buffer(enc, bnp32, 0ul, 1)
     metal_set_buffer(enc, bqoff, 0ul, 2)
     metal_set_buffer(enc, bqrows, 0ul, 3)
+    metal_set_buffer(enc, bwin, 0ul, 4)
+    metal_set_buffer(enc, bcap, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(npos), uint(heads), 1u), uint3(128u, 1u, 1u))
 }
 
@@ -2846,6 +2920,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     var batt = pool_acquire(g_pf_pool, g_pf_dev, bytes_att)
     var bcos = pool_acquire_untracked(g_pf_upool, g_pf_dev, bytes_tab)
     var bsin = pool_acquire_untracked(g_pf_upool, g_pf_dev, bytes_tab)
+    let dual_rope = has_dual_rope(c)
+    var bcos_swa = dual_rope ? pool_acquire_untracked(g_pf_upool, g_pf_dev, bytes_tab) : null
+    var bsin_swa = dual_rope ? pool_acquire_untracked(g_pf_upool, g_pf_dev, bytes_tab) : null
     var bks : array<MetalBuffer?>
     var bvs : array<MetalBuffer?>
     bks |> reserve(int(c.n_layers))
@@ -2854,12 +2931,16 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
         bks |> push(pool_acquire(g_pf_pool, g_pf_dev, bytes_kv))
         bvs |> push(pool_acquire(g_pf_pool, g_pf_dev, bytes_kv))
     }
-    // upload the embedded rows + this prefill's rope table (built for the chunk's GLOBAL
-    // positions — build_rope_table takes start_pos)
+    // upload the embedded rows + this prefill's rope table(s) (built for the chunk's GLOBAL
+    // positions — build_rope_table takes start_pos; dual-rope: the sliding class's pair too)
     unsafe {
         memcpy(metal_buffer_contents(bx), addr < void? >(s.x_b[0]), int(npos * dim * 4l))
         memcpy(metal_buffer_contents(bcos), addr < void? >(s.rope_cos[0]), int(npos * half * 4l))
         memcpy(metal_buffer_contents(bsin), addr < void? >(s.rope_sin[0]), int(npos * half * 4l))
+        if (dual_rope) {
+            memcpy(metal_buffer_contents(bcos_swa), addr < void? >(s.rope_cos_swa[0]), int(npos * half * 4l))
+            memcpy(metal_buffer_contents(bsin_swa), addr < void? >(s.rope_sin_swa[0]), int(npos * half * 4l))
+        }
     }
     // continuation: gather the session's existing rows [0, start_pos) into every layer's panel
     // head as f32 (paged sessions gather through kv_runs; tq4 rows dequant ROTATED and un-rotate
@@ -2919,6 +3000,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     var u_addv0 = pf_uniform_u32(0u)
     var u_addv1 = pf_uniform_u32(1u)
     var u_npairs_all = pf_uniform_u32(uint(npos * (qd + kv_dim) / 2l))
+    var u_softcap = pf_uniform_f32(c.attn_logit_softcap)
+    var u_win0 = pf_uniform_u32(0u)          // global layers' window bind
+    var u_winsl = c.sliding_window > 0l ? pf_uniform_u32(uint(c.sliding_window)) : null
     // the mul_mm GEMM path (the default): W as resident 34B q8-block blobs, raw f32 activations —
     // the X-quant dispatches disappear and the GEMMs run at mul_mm rate. Needs every GEMM output
     // dim % 64; DASLLAMA_METAL_MULMM=0 pins the legacy quantized path (bit-identical to CPU).
@@ -2930,15 +3014,18 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
     let gpu_logits = (!g_pf_logits_cpu && get_env_variable("DASLLAMA_METAL_LOGITS") != "0" && empty(g_pf_skip) &&
-        !tied_f32 && c.final_logit_softcap <= 0.0 && c.n_layer_nextn == 0l &&
+        !tied_f32 && c.n_layer_nextn == 0l &&
         empty(t.suppress) && t.wcls_off >= 0l)
     var bxf = gpu_logits ? pool_acquire(g_pf_pool, g_pf_dev, uint64(dim * 4l)) : null
     var blog = gpu_logits ? pool_acquire(g_pf_pool, g_pf_dev, uint64(c.vocab_size * 4l)) : null
     var u_vocab = gpu_logits ? pf_uniform_u32(uint(c.vocab_size)) : null
+    var u_flcap = (gpu_logits && c.final_logit_softcap > 0.0) ? pf_uniform_f32(c.final_logit_softcap) : null
     // the fused add+rms+quant stages one row in threadgroup memory — dim must fit its 3072 cap.
     // DASLLAMA_METAL_FUSE=0 pins the unfused dispatch set (the A/B rail). The lcpp path runs the
-    // unfused elementwise set (no quant tails to fuse).
-    let fused = !mm && dim <= 3072l && get_env_variable("DASLLAMA_METAL_FUSE") != "0"
+    // unfused elementwise set (no quant tails to fuse). Gemma stands the rail down: the deferred
+    // W2-add trick has no post-ffn-norm slot, and swiglu_quant has no gelu twin.
+    let fused = (!mm && dim <= 3072l && !c.pre_post_norm && c.ffn_act == FfnAct.silu &&
+        get_env_variable("DASLLAMA_METAL_FUSE") != "0")
     // ggml-geometry QK/AV (default): ~10x the old trio GEMMs' rate; needs hs % 64 (the AV grid)
     // and mp % 64 (the QK key grid — true by construction). DASLLAMA_METAL_ATTN=0 pins the trio.
     let mmattn = (head_size % 64l) == 0l && get_env_variable("DASLLAMA_METAL_ATTN") != "0"
@@ -3044,23 +3131,29 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         n_heads / kv_mul, npos, head_size, koff)
                 }
                 if (g_pf_skip != "ew" && g_pf_skip != "nongemm") {
+                    // sliding layers rope with the swa row pair (dual-rope configs — gemma3/4)
+                    var bcos_l = layer_is_sliding(c, l) && dual_rope ? bcos_swa : bcos
+                    var bsin_l = layer_is_sliding(c, l) && dual_rope ? bsin_swa : bsin
                     if (fused) {
-                        enc_rope_qk(enc, bq, bks[l], bcos, bsin, u_qd, u_kvd, u_hs, u_npairs_q, u_npairs_all, u_neox, npos * (qd + kv_dim) / 2l, koff)
+                        enc_rope_qk(enc, bq, bks[l], bcos_l, bsin_l, u_qd, u_kvd, u_hs, u_npairs_q, u_npairs_all, u_neox, npos * (qd + kv_dim) / 2l, koff)
                     } else {
-                        enc_rope(enc, bq, bcos, bsin, u_qd, u_hs, u_npairs_q, u_neox, npos * qd / 2l)
-                        enc_rope(enc, bks[l], bcos, bsin, u_kvd, u_hs, u_npairs_k, u_neox, npos * kv_dim / 2l, koff)
+                        enc_rope(enc, bq, bcos_l, bsin_l, u_qd, u_hs, u_npairs_q, u_neox, npos * qd / 2l)
+                        enc_rope(enc, bks[l], bcos_l, bsin_l, u_kvd, u_hs, u_npairs_k, u_neox, npos * kv_dim / 2l, koff)
                     }
                 }
                 if (g_pf_skip != "attn" && g_pf_skip != "nongemm") {
+                    // sliding layers bind the span — the QK forms skip fully-below-window blocks,
+                    // the softmax masks + zeroes the below-window prefix; global layers bind 0
+                    var bwin = layer_is_sliding(c, l) && u_winsl != null ? u_winsl : u_win0
                     if (g_pf_skip != "attn_qk") {
                         if (mmattn) {
-                            enc_qk_mm(enc, bq, bks[l], batt, u_qd, u_kvd, u_hs, u_kvm, u_np, u_np32, u_scale, u_qoff, u_qrows, mp, nk64, n_heads)
+                            enc_qk_mm(enc, bq, bks[l], batt, u_qd, u_kvd, u_hs, u_kvm, u_np, u_np32, u_scale, u_qoff, u_qrows, bwin, mp, nk64, n_heads)
                         } else {
-                            enc_qk(enc, bq, bks[l], batt, u_qd, u_kvd, u_hs, u_kvm, u_np, u_np32, u_scale, u_qoff, u_qrows, mp, nk64, n_heads)
+                            enc_qk(enc, bq, bks[l], batt, u_qd, u_kvd, u_hs, u_kvm, u_np, u_np32, u_scale, u_qoff, u_qrows, bwin, mp, nk64, n_heads)
                         }
                     }
                     if (g_pf_skip != "attn_sm") {
-                        enc_softmax(enc, batt, u_np32, u_qoff, u_qrows, npos, n_heads)
+                        enc_softmax(enc, batt, u_np32, u_qoff, u_qrows, bwin, u_softcap, npos, n_heads)
                     }
                     if (g_pf_skip != "attn_av") {
                         if (mmattn) {
@@ -3086,8 +3179,14 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         enc_gemm(enc, bwo, bwo_s, bxq, bxs, bxb2, u_qd, u_dim, mp, dim)
                     }
                 }
-                // ffn: [WO residual +] norm -> [requant ->] W1/W3 -> swiglu[+requant] -> W2
+                // ffn: [post-attn norm ->] [WO residual +] norm -> [requant ->] W1/W3 ->
+                // swiglu/geglu[+requant] -> W2 [-> post-ffn norm]
                 if (g_pf_skip != "ew" && g_pf_skip != "nongemm") {
+                    if (c.pre_post_norm) {
+                        // gemma sandwich: norm the attention branch IN PLACE before the residual add
+                        var bw_pa = pf_upload_region(addr < void? >(t.fblob[t.rms_post_att_off + l * dim]), uint64(dim * 4l))
+                        pf_enc_rms(enc, bxb2, bw_pa, bxb2, u_dim, u_eps, npos)
+                    }
                     if (fused) {
                         enc_add_rms_quant(enc, bx, bxb2, bw_ffn, bxq, bxs, u_dim, u_eps, u_addv1, npos)
                     } else {
@@ -3130,7 +3229,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     if (fused) {
                         enc_swiglu_quant(enc, bhb, bhb2, bxq, bxs, u_hidden, u_nblk_h, npos * (hidden / 32l))
                     } else {
-                        pf_enc_ew2(enc, g_pf_pso_swiglu, bhb, bhb2, u_total_h, npos * hidden)
+                        pf_enc_ew2(enc, c.ffn_act != FfnAct.silu ? g_pf_pso_geglu : g_pf_pso_swiglu, bhb, bhb2, u_total_h, npos * hidden)
                         if (!mm) {
                             enc_quant(enc, bhb, bxq, bxs, u_hidden, u_nblk_h, npos * (hidden / 32l))
                         }
@@ -3150,6 +3249,10 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     }
                 }
                 if (!fused && g_pf_skip != "ew" && g_pf_skip != "nongemm") {
+                    if (c.pre_post_norm) {
+                        var bw_pf = pf_upload_region(addr < void? >(t.fblob[t.rms_post_ffn_off + l * dim]), uint64(dim * 4l))
+                        pf_enc_rms(enc, bxb, bw_pf, bxb, u_dim, u_eps, npos)
+                    }
                     pf_enc_ew2(enc, g_pf_pso_add, bx, bxb, u_total_dim, npos * dim)
                 }
             }
@@ -3171,6 +3274,14 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         pf_upload_region(addr < void? >(t.qscales16[t.wcls_off / 32l]), uint64(c.vocab_size * (dim / 32l) * 2l)) :
                         pf_upload_region(addr < void? >(t.qscales[t.wcls_off / 32l]), uint64(c.vocab_size * (dim / 32l) * 4l)))
                     pf_enc_gemv(enc, t.wscale_f16, bwc, bwc_s, bxf, blog, u_dim, u_vocab, c.vocab_size)
+                }
+                if (u_flcap != null) {
+                    // final-logit soft cap (gemma2): cap*tanh over the classifier row in place
+                    metal_set_pipeline(enc, g_pf_pso_softcap)
+                    metal_set_buffer(enc, blog, 0ul, 0)
+                    metal_set_buffer(enc, u_vocab, 0ul, 1)
+                    metal_set_buffer(enc, u_flcap, 0ul, 2)
+                    metal_dispatch_threadgroups(enc, uint3(uint((c.vocab_size + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
                 }
             }
         }
@@ -3274,6 +3385,10 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
         pool_release(g_pf_upool, u_vocab, 4ul)
     }
     pool_release(g_pf_upool, bcos, bytes_tab)
+    if (dual_rope) {
+        pool_release(g_pf_upool, bcos_swa, bytes_tab)
+        pool_release(g_pf_upool, bsin_swa, bytes_tab)
+    }
     pool_release(g_pf_upool, bsin, bytes_tab)
     for (l in range64(c.n_layers)) {
         pool_release(g_pf_pool, bks[l], bytes_kv)
@@ -3316,6 +3431,14 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     pool_release(g_pf_upool, u_addv0, 4ul)
     pool_release(g_pf_upool, u_addv1, 4ul)
     pool_release(g_pf_upool, u_npairs_all, 4ul)
+    pool_release(g_pf_upool, u_softcap, 4ul)
+    pool_release(g_pf_upool, u_win0, 4ul)
+    if (u_winsl != null) {
+        pool_release(g_pf_upool, u_winsl, 4ul)
+    }
+    if (u_flcap != null) {
+        pool_release(g_pf_upool, u_flcap, 4ul)
+    }
     if (ok) {
         let total_us = get_time_usec(ts_all)
         let repack_note = g_repack_us > 0l ? " weight-repack={float(g_repack_us) / 1000.0}ms(one-time)" : ""

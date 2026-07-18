@@ -35,8 +35,9 @@ class MetalSqAttnF16 {
     @uniform @binding = 7 kv_mul : uint
     @uniform @binding = 8 hs : uint         // head_size == threads per group
     @uniform @binding = 9 scale : float
+    @uniform @binding = 10 softcap : float  // > 0 = attention-logit soft cap (gemma2)
     @workgroup scores : float[128]  // >= ATTN_CHUNK_ROWS — the single-tg depth ceiling
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn16_msl")]
     def metal_sq_attn16 {
@@ -58,6 +59,10 @@ class MetalSqAttnF16 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = j * kv_dim + khoff + sl * epl
@@ -71,9 +76,22 @@ class MetalSqAttnF16 {
             if (epl > 3u) {
                 s += q3 * float(kc[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kc[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kc[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kc[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kc[kb + 7u])
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
@@ -158,8 +176,9 @@ class MetalSqAttnF32 {
     @uniform @binding = 7 kv_mul : uint
     @uniform @binding = 8 hs : uint
     @uniform @binding = 9 scale : float
+    @uniform @binding = 10 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn32_msl")]
     def metal_sq_attn32 {
@@ -178,6 +197,10 @@ class MetalSqAttnF32 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = j * kv_dim + khoff + sl * epl
@@ -191,9 +214,22 @@ class MetalSqAttnF32 {
             if (epl > 3u) {
                 s += q3 * kc[kb + 3u]
             }
+            if (epl > 4u) {
+                s += q4 * kc[kb + 4u]
+            }
+            if (epl > 5u) {
+                s += q5 * kc[kb + 5u]
+            }
+            if (epl > 6u) {
+                s += q6 * kc[kb + 6u]
+            }
+            if (epl > 7u) {
+                s += q7 * kc[kb + 7u]
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
@@ -279,8 +315,9 @@ class MetalSqAttnQ8 {
     @uniform @binding = 9 kv_mul : uint
     @uniform @binding = 10 hs : uint        // head_size == threads per group
     @uniform @binding = 11 scale : float
+    @uniform @binding = 12 softcap : float
     @workgroup scores : float[128]  // >= ATTN_CHUNK_ROWS — the single-tg depth ceiling
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_q8_msl")]
     def metal_sq_attn_q8 {
@@ -300,6 +337,10 @@ class MetalSqAttnQ8 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         let hb = (sl * epl) / 32u               // lane's block within the head
         let ib = (sl * epl) % 32u               // lane's quant offset within the block
         var j = sg
@@ -317,9 +358,22 @@ class MetalSqAttnQ8 {
             if (epl > 3u) {
                 s += q3 * float(kqb[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kqb[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kqb[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kqb[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kqb[kb + 7u])
+            }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
@@ -414,8 +468,9 @@ class MetalSqAttnTq4 {
     @uniform @binding = 9 kv_mul : uint
     @uniform @binding = 10 hs : uint
     @uniform @binding = 11 scale : float
+    @uniform @binding = 12 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_tq4_msl")]
     def metal_sq_attn_tq4 {
@@ -434,6 +489,10 @@ class MetalSqAttnTq4 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u          // this lane's element offset inside its block
         var j = sg
@@ -454,10 +513,21 @@ class MetalSqAttnTq4 {
                     s += q2 * float(int(by1 & 15u) - 8)
                     s += q3 * float(int(by1 >> 4u) - 8)
                 }
+                if (epl > 4u) {
+                    let by2 = uint(kqb[kb + 2u])
+                    s += q4 * float(int(by2 & 15u) - 8)
+                    s += q5 * float(int(by2 >> 4u) - 8)
+                }
+                if (epl > 6u) {
+                    let by3 = uint(kqb[kb + 3u])
+                    s += q6 * float(int(by3 & 15u) - 8)
+                    s += q7 * float(int(by3 >> 4u) - 8)
+                }
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
@@ -539,8 +609,10 @@ class MetalSqAttnPartF16 {
     @uniform @binding = 8 hs : uint
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 nchunks : uint
+    @uniform @binding = 11 softcap : float  // > 0 = attention-logit soft cap (gemma2)
+    @uniform @binding = 12 window : uint    // > 0 = sliding span: rows < cnt - window are masked
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part16_msl")]
     def metal_sq_attn_part16 {
@@ -555,6 +627,12 @@ class MetalSqAttnPartF16 {
         let c0 = ci * 64u
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         // pass 1: simdgroup-cooperative score fill over this chunk's rows (coalesced K loads,
         // loop-invariant q hoisted to registers)
         let sg = gl_SubgroupID
@@ -565,6 +643,10 @@ class MetalSqAttnPartF16 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = (c0 + j) * kv_dim + khoff + sl * epl
@@ -578,14 +660,38 @@ class MetalSqAttnPartF16 {
             if (epl > 3u) {
                 s += q3 * float(kc[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kc[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kc[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kc[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kc[kb + 7u])
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
         barrier()
         // pass 2a: chunk max
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -671,8 +777,10 @@ class MetalSqAttnPartF32 {
     @uniform @binding = 8 hs : uint
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 nchunks : uint
+    @uniform @binding = 11 softcap : float
+    @uniform @binding = 12 window : uint
     @workgroup scores : float[64]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part32_msl")]
     def metal_sq_attn_part32 {
@@ -687,6 +795,12 @@ class MetalSqAttnPartF32 {
         let c0 = ci * 64u
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -695,6 +809,10 @@ class MetalSqAttnPartF32 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = (c0 + j) * kv_dim + khoff + sl * epl
@@ -708,13 +826,37 @@ class MetalSqAttnPartF32 {
             if (epl > 3u) {
                 s += q3 * kc[kb + 3u]
             }
+            if (epl > 4u) {
+                s += q4 * kc[kb + 4u]
+            }
+            if (epl > 5u) {
+                s += q5 * kc[kb + 5u]
+            }
+            if (epl > 6u) {
+                s += q6 * kc[kb + 6u]
+            }
+            if (epl > 7u) {
+                s += q7 * kc[kb + 7u]
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -801,8 +943,10 @@ class MetalSqAttnPartQ8 {
     @uniform @binding = 10 hs : uint
     @uniform @binding = 11 scale : float
     @uniform @binding = 12 nchunks : uint
+    @uniform @binding = 13 softcap : float
+    @uniform @binding = 14 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_q8_msl")]
     def metal_sq_attn_part_q8 {
@@ -817,6 +961,12 @@ class MetalSqAttnPartQ8 {
         let c0 = ci * 64u
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         // pass 1: simdgroup-cooperative score fill over this chunk's rows
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
@@ -826,6 +976,10 @@ class MetalSqAttnPartQ8 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         let hb = (sl * epl) / 32u
         let ib = (sl * epl) % 32u
         var j = sg
@@ -843,14 +997,38 @@ class MetalSqAttnPartQ8 {
             if (epl > 3u) {
                 s += q3 * float(kqb[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kqb[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kqb[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kqb[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kqb[kb + 7u])
+            }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
         barrier()
         // pass 2a: chunk max
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -946,8 +1124,10 @@ class MetalSqAttnPartTq4 {
     @uniform @binding = 10 hs : uint
     @uniform @binding = 11 scale : float
     @uniform @binding = 12 nchunks : uint
+    @uniform @binding = 13 softcap : float
+    @uniform @binding = 14 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_tq4_msl")]
     def metal_sq_attn_part_tq4 {
@@ -962,6 +1142,12 @@ class MetalSqAttnPartTq4 {
         let c0 = ci * 64u
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -970,6 +1156,10 @@ class MetalSqAttnPartTq4 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u
         var j = sg
@@ -990,14 +1180,36 @@ class MetalSqAttnPartTq4 {
                     s += q2 * float(int(by1 & 15u) - 8)
                     s += q3 * float(int(by1 >> 4u) - 8)
                 }
+                if (epl > 4u) {
+                    let by2 = uint(kqb[kb + 2u])
+                    s += q4 * float(int(by2 & 15u) - 8)
+                    s += q5 * float(int(by2 >> 4u) - 8)
+                }
+                if (epl > 6u) {
+                    let by3 = uint(kqb[kb + 3u])
+                    s += q6 * float(int(by3 & 15u) - 8)
+                    s += q7 * float(int(by3 >> 4u) - 8)
+                }
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -1072,6 +1284,7 @@ class MetalSqAttnComb {
     @uniform @binding = 2 nchunks : uint
     @uniform @binding = 3 nheads : uint
     @uniform @binding = 4 hs : uint
+    @uniform @binding = 5 chlo : uint       // first live chunk (sliding: chunks below the window are unwritten)
 
     [metal_kernel(name="metal_sq_attn_comb_msl")]
     def metal_sq_attn_comb {
@@ -1081,14 +1294,14 @@ class MetalSqAttnComb {
         let lid = gl_LocalInvocationID.x
         let base = (bb * nheads + h) * nchunks
         var mm = -3.0e38
-        var ci = 0u
+        var ci = chlo
         while (ci < nchunks) {
             mm = max(mm, part[(base + ci) * (hs + 2u) + hs])
             ci++
         }
         var acc = 0.0
         var l = 0.0
-        ci = 0u
+        ci = chlo
         while (ci < nchunks) {
             let pb = (base + ci) * (hs + 2u)
             let w = exp(part[pb + hs] - mm)
@@ -1584,8 +1797,8 @@ class MetalRopeStoreHF16 {
     @uniform @binding = 13 has_bias : uint
     @uniform @binding = 14 has_norm : uint
     @uniform @binding = 15 eps : float
-    @workgroup buf : float[128]
-    @workgroup part : float[4]
+    @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
+    @workgroup part : float[16]
 
     [metal_kernel(name="metal_rope_store_h16_msl")]
     def metal_rope_store_h16 {
@@ -1814,7 +2027,7 @@ class MetalRopeStoreTq4 {
     @uniform @binding = 13 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
     @ssbo @binding = 14 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 15 has_bias : uint
-    @workgroup buf : float[128]
+    @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
 
     [metal_kernel(name="metal_rope_store_tq4_msl")]
     def metal_rope_store_tq4 {
@@ -1909,7 +2122,7 @@ class MetalFwhtUnsign {
     @ssbo @binding = 1 signs : array<float>
     @uniform @binding = 2 head_size : uint
     @uniform @binding = 3 qstride : uint
-    @workgroup buf : float[128]
+    @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
 
     [metal_kernel(name="metal_fwht_unsign_msl")]
     def metal_fwht_unsign {
@@ -2653,8 +2866,9 @@ class MetalSqAttnBF16 {
     @uniform @binding = 9 hs : uint
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
+    @uniform @binding = 12 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_b16_msl")]
     def metal_sq_attn_b16 {
@@ -2678,6 +2892,10 @@ class MetalSqAttnBF16 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = kb0 + j * kv_dim + khoff + sl * epl
@@ -2691,9 +2909,22 @@ class MetalSqAttnBF16 {
             if (epl > 3u) {
                 s += q3 * float(kc[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kc[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kc[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kc[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kc[kb + 7u])
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
@@ -2777,8 +3008,9 @@ class MetalSqAttnBF32 {
     @uniform @binding = 9 hs : uint
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
+    @uniform @binding = 12 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_b32_msl")]
     def metal_sq_attn_b32 {
@@ -2802,6 +3034,10 @@ class MetalSqAttnBF32 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = kb0 + j * kv_dim + khoff + sl * epl
@@ -2815,9 +3051,22 @@ class MetalSqAttnBF32 {
             if (epl > 3u) {
                 s += q3 * kc[kb + 3u]
             }
+            if (epl > 4u) {
+                s += q4 * kc[kb + 4u]
+            }
+            if (epl > 5u) {
+                s += q5 * kc[kb + 5u]
+            }
+            if (epl > 6u) {
+                s += q6 * kc[kb + 6u]
+            }
+            if (epl > 7u) {
+                s += q7 * kc[kb + 7u]
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
@@ -2905,8 +3154,9 @@ class MetalSqAttnBQ8 {
     @uniform @binding = 11 hs : uint
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
+    @uniform @binding = 14 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_b_q8_msl")]
     def metal_sq_attn_b_q8 {
@@ -2933,6 +3183,10 @@ class MetalSqAttnBQ8 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         let hb = (sl * epl) / 32u
         let ib = (sl * epl) % 32u
         var j = sg
@@ -2950,9 +3204,22 @@ class MetalSqAttnBQ8 {
             if (epl > 3u) {
                 s += q3 * float(kqb[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kqb[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kqb[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kqb[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kqb[kb + 7u])
+            }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
@@ -3046,8 +3313,9 @@ class MetalSqAttnBTq4 {
     @uniform @binding = 11 hs : uint
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
+    @uniform @binding = 14 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_b_tq4_msl")]
     def metal_sq_attn_b_tq4 {
@@ -3074,6 +3342,10 @@ class MetalSqAttnBTq4 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u
         var j = sg
@@ -3094,10 +3366,21 @@ class MetalSqAttnBTq4 {
                     s += q2 * float(int(by1 & 15u) - 8)
                     s += q3 * float(int(by1 >> 4u) - 8)
                 }
+                if (epl > 4u) {
+                    let by2 = uint(kqb[kb + 2u])
+                    s += q4 * float(int(by2 & 15u) - 8)
+                    s += q5 * float(int(by2 >> 4u) - 8)
+                }
+                if (epl > 6u) {
+                    let by3 = uint(kqb[kb + 3u])
+                    s += q6 * float(int(by3 & 15u) - 8)
+                    s += q7 * float(int(by3 >> 4u) - 8)
+                }
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
@@ -3177,8 +3460,10 @@ class MetalSqAttnPartBF16 {
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
     @uniform @binding = 12 nchmax : uint
+    @uniform @binding = 13 softcap : float
+    @uniform @binding = 14 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_b16_msl")]
     def metal_sq_attn_part_b16 {
@@ -3200,6 +3485,12 @@ class MetalSqAttnPartBF16 {
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -3208,6 +3499,10 @@ class MetalSqAttnPartBF16 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = kb0 + (c0 + j) * kv_dim + khoff + sl * epl
@@ -3221,13 +3516,37 @@ class MetalSqAttnPartBF16 {
             if (epl > 3u) {
                 s += q3 * float(kc[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kc[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kc[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kc[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kc[kb + 7u])
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -3313,8 +3632,10 @@ class MetalSqAttnPartBF32 {
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
     @uniform @binding = 12 nchmax : uint
+    @uniform @binding = 13 softcap : float
+    @uniform @binding = 14 window : uint
     @workgroup scores : float[64]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_b32_msl")]
     def metal_sq_attn_part_b32 {
@@ -3336,6 +3657,12 @@ class MetalSqAttnPartBF32 {
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -3344,6 +3671,10 @@ class MetalSqAttnPartBF32 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = kb0 + (c0 + j) * kv_dim + khoff + sl * epl
@@ -3357,13 +3688,37 @@ class MetalSqAttnPartBF32 {
             if (epl > 3u) {
                 s += q3 * kc[kb + 3u]
             }
+            if (epl > 4u) {
+                s += q4 * kc[kb + 4u]
+            }
+            if (epl > 5u) {
+                s += q5 * kc[kb + 5u]
+            }
+            if (epl > 6u) {
+                s += q6 * kc[kb + 6u]
+            }
+            if (epl > 7u) {
+                s += q7 * kc[kb + 7u]
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -3452,8 +3807,10 @@ class MetalSqAttnPartBQ8 {
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
     @uniform @binding = 14 nchmax : uint
+    @uniform @binding = 15 softcap : float
+    @uniform @binding = 16 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_b_q8_msl")]
     def metal_sq_attn_part_b_q8 {
@@ -3478,6 +3835,12 @@ class MetalSqAttnPartBQ8 {
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -3486,6 +3849,10 @@ class MetalSqAttnPartBQ8 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         let hb = (sl * epl) / 32u
         let ib = (sl * epl) % 32u
         var j = sg
@@ -3503,13 +3870,37 @@ class MetalSqAttnPartBQ8 {
             if (epl > 3u) {
                 s += q3 * float(kqb[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kqb[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kqb[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kqb[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kqb[kb + 7u])
+            }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -3604,8 +3995,10 @@ class MetalSqAttnPartBTq4 {
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
     @uniform @binding = 14 nchmax : uint
+    @uniform @binding = 15 softcap : float
+    @uniform @binding = 16 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_b_tq4_msl")]
     def metal_sq_attn_part_b_tq4 {
@@ -3630,6 +4023,12 @@ class MetalSqAttnPartBTq4 {
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -3638,6 +4037,10 @@ class MetalSqAttnPartBTq4 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u
         var j = sg
@@ -3658,14 +4061,36 @@ class MetalSqAttnPartBTq4 {
                     s += q2 * float(int(by1 & 15u) - 8)
                     s += q3 * float(int(by1 >> 4u) - 8)
                 }
+                if (epl > 4u) {
+                    let by2 = uint(kqb[kb + 2u])
+                    s += q4 * float(int(by2 & 15u) - 8)
+                    s += q5 * float(int(by2 >> 4u) - 8)
+                }
+                if (epl > 6u) {
+                    let by3 = uint(kqb[kb + 3u])
+                    s += q6 * float(int(by3 & 15u) - 8)
+                    s += q7 * float(int(by3 >> 4u) - 8)
+                }
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                scores[j] = softcap > 0.0 ? softcap * tanh(min(max(sc / softcap, -40.0), 40.0)) : sc   // nolint:STYLE019 — Metal tanh NaNs past ~44; +-40 saturates exactly
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -3741,6 +4166,7 @@ class MetalSqAttnCombB {
     @uniform @binding = 3 nchmax : uint
     @uniform @binding = 4 nheads : uint
     @uniform @binding = 5 hs : uint
+    @uniform @binding = 6 window : uint     // > 0 = sliding span — this row's below-window chunks are unwritten
 
     [metal_kernel(name="metal_sq_attn_comb_b_msl")]
     def metal_sq_attn_comb_b {
@@ -3750,16 +4176,18 @@ class MetalSqAttnCombB {
         let lid = gl_LocalInvocationID.x
         let cnt = rt[bb].w
         let nch = (cnt + 63u) / 64u
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        let chlo = wstart / 64u
         let base = (bb * nheads + h) * nchmax
         var mm = -3.0e38
-        var ci = 0u
+        var ci = chlo
         while (ci < nch) {
             mm = max(mm, part[(base + ci) * (hs + 2u) + hs])
             ci++
         }
         var acc = 0.0
         var l = 0.0
-        ci = 0u
+        ci = chlo
         while (ci < nch) {
             let pb = (base + ci) * (hs + 2u)
             let w = exp(part[pb + hs] - mm)
@@ -4577,7 +5005,7 @@ class MetalRopeStoreBTq4 {
     @uniform @binding = 15 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
     @ssbo @binding = 16 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 17 has_bias : uint
-    @workgroup buf : float[128]
+    @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
 
     [metal_kernel(name="metal_rope_store_b_tq4_msl")]
     def metal_rope_store_b_tq4 {
@@ -4725,6 +5153,8 @@ var g_pso_rms : MetalComputePipeline?
 var g_pso_add : MetalComputePipeline?
 var g_pso_addrms : MetalComputePipeline?
 var g_pso_swiglu : MetalComputePipeline?
+var g_pso_geglu : MetalComputePipeline?
+var g_pso_softcap : MetalComputePipeline?
 var g_pso_attn16 : MetalComputePipeline?
 var g_pso_attn32 : MetalComputePipeline?
 var g_pso_attn_q8 : MetalComputePipeline?   // q8_0-mirror twin (dual-view block reads)
@@ -4830,6 +5260,8 @@ def metal_decode_init : bool {
     g_pso_add = compile_pso(metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath, ok)
     g_pso_addrms = compile_pso(metal_add_rms_msl, metal_add_rms_msl_entry, metal_add_rms_msl_fastmath, ok)
     g_pso_swiglu = compile_pso(metal_swiglu_msl, metal_swiglu_msl_entry, metal_swiglu_msl_fastmath, ok)
+    g_pso_geglu = compile_pso(metal_geglu_msl, metal_geglu_msl_entry, metal_geglu_msl_fastmath, ok)
+    g_pso_softcap = compile_pso(metal_softcap_row_msl, metal_softcap_row_msl_entry, metal_softcap_row_msl_fastmath, ok)
     g_pso_attn16 = compile_pso(metal_sq_attn16_msl, metal_sq_attn16_msl_entry, metal_sq_attn16_msl_fastmath, ok)
     g_pso_attn32 = compile_pso(metal_sq_attn32_msl, metal_sq_attn32_msl_entry, metal_sq_attn32_msl_fastmath, ok)
     g_pso_attnp16 = compile_pso(metal_sq_attn_part16_msl, metal_sq_attn_part16_msl_entry, metal_sq_attn_part16_msl_fastmath, ok)
@@ -5239,7 +5671,7 @@ def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Me
 }
 
 def enc_attn(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-             bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale : MetalBuffer?; nheads, head_size : int64) {
+             bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_attn16 : g_pso_attn32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn16_msl_tgmem : metal_sq_attn32_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -5252,11 +5684,12 @@ def enc_attn(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; ko
     metal_set_buffer(enc, bkvm, 0ul, 7)
     metal_set_buffer(enc, bhs, 0ul, 8)
     metal_set_buffer(enc, bscale, 0ul, 9)
+    metal_set_buffer(enc, bcap, 0ul, 10)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_part(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                  bq, bpart, bcnt, bkvd, bnh, bkvm, bhs, bscale, bnch : MetalBuffer?; ntg, head_size : int64) {
+                  bq, bpart, bcnt, bkvd, bnh, bkvm, bhs, bscale, bnch, bcap, bwin : MetalBuffer?; ntg, head_size : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_attnp16 : g_pso_attnp32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_part16_msl_tgmem : metal_sq_attn_part32_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -5270,12 +5703,14 @@ def enc_attn_part(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer
     metal_set_buffer(enc, bhs, 0ul, 8)
     metal_set_buffer(enc, bscale, 0ul, 9)
     metal_set_buffer(enc, bnch, 0ul, 10)
+    metal_set_buffer(enc, bcap, 0ul, 11)
+    metal_set_buffer(enc, bwin, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // tq4-mirror attention twins — same dual-view shape as the q8_0 encoders below
 def enc_attn_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                 bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale : MetalBuffer?; nheads, head_size : int64) {
+                 bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attn_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -5290,11 +5725,12 @@ def enc_attn_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff
     metal_set_buffer(enc, bkvm, 0ul, 9)
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
+    metal_set_buffer(enc, bcap, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_part_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                      bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch : MetalBuffer?; ntg, head_size : int64) {
+                      bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch, bcap, bwin : MetalBuffer?; ntg, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnp_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -5310,13 +5746,15 @@ def enc_attn_part_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff,
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
     metal_set_buffer(enc, bnch, 0ul, 12)
+    metal_set_buffer(enc, bcap, 0ul, 13)
+    metal_set_buffer(enc, bwin, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // q8_0-mirror attention twins: the K/V slabs bind TWICE each (half-scale + byte views at the
 // same layer offset); nblk (blocks per row) replaces the kv_dim uniform
 def enc_attn_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale : MetalBuffer?; nheads, head_size : int64) {
+                bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attn_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_q8_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -5331,11 +5769,12 @@ def enc_attn_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff 
     metal_set_buffer(enc, bkvm, 0ul, 9)
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
+    metal_set_buffer(enc, bcap, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_part_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                     bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch : MetalBuffer?; ntg, head_size : int64) {
+                     bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch, bcap, bwin : MetalBuffer?; ntg, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnp_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_q8_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -5351,17 +5790,29 @@ def enc_attn_part_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, 
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
     metal_set_buffer(enc, bnch, 0ul, 12)
+    metal_set_buffer(enc, bcap, 0ul, 13)
+    metal_set_buffer(enc, bwin, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs : MetalBuffer?; nheads, head_size : int64) {
+def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs, bchlo : MetalBuffer?; nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attncomb)
     metal_set_buffer(enc, bpart, 0ul, 0)
     metal_set_buffer(enc, by, 0ul, 1)
     metal_set_buffer(enc, bnch, 0ul, 2)
     metal_set_buffer(enc, bnh, 0ul, 3)
     metal_set_buffer(enc, bhs, 0ul, 4)
+    metal_set_buffer(enc, bchlo, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+}
+
+// logit soft-cap over a row in place (gemma2/gemma4 final_logit_softcap on the GPU classifier)
+def enc_softcap_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64; btot, bcap : MetalBuffer?; total : int64) {
+    metal_set_pipeline(enc, g_pso_softcap)
+    metal_set_buffer(enc, bx, xoff, 0)
+    metal_set_buffer(enc, btot, 0ul, 1)
+    metal_set_buffer(enc, bcap, 0ul, 2)
+    metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // swiglu and add share the (a, b, total) elementwise shape; offsets serve the fused-buffer binds
@@ -5523,7 +5974,7 @@ def enc_gemm64_b(enc : MetalComputeEncoder?; bwq : MetalBuffer?; wqoff : uint64;
 // owns a bit; a barrier is inserted iff a dispatch's read hits a pending write (RAW), or its
 // write hits a pending write/read (WAW/WAR) — read-after-read runs concurrently.
 
-def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_attnb16 : g_pso_attnb32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_b16_msl_tgmem : metal_sq_attn_b32_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5538,10 +5989,11 @@ def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, 
     metal_set_buffer(enc, bhs, 0ul, 9)
     metal_set_buffer(enc, bscale, 0ul, 10)
     metal_set_buffer(enc, bqs, 0ul, 11)
+    metal_set_buffer(enc, bcap, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bnch : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
+def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_attnpb16 : g_pso_attnpb32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_part_b16_msl_tgmem : metal_sq_attn_part_b32_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5557,11 +6009,13 @@ def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay
     metal_set_buffer(enc, bscale, 0ul, 10)
     metal_set_buffer(enc, bqs, 0ul, 11)
     metal_set_buffer(enc, bnch, 0ul, 12)
+    metal_set_buffer(enc, bcap, 0ul, 13)
+    metal_set_buffer(enc, bwin, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // tq4-mirror batch attention twins — same four-way arena binding as the q8_0 encoders below
-def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnb_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_b_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5578,10 +6032,11 @@ def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bk
     metal_set_buffer(enc, bhs, 0ul, 11)
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
+    metal_set_buffer(enc, bcap, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_part_b_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
+def enc_attn_part_b_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnpb_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_b_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5599,6 +6054,8 @@ def enc_attn_part_b_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk,
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
     metal_set_buffer(enc, bnch, 0ul, 14)
+    metal_set_buffer(enc, bcap, 0ul, 15)
+    metal_set_buffer(enc, bwin, 0ul, 16)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -5626,7 +6083,7 @@ def enc_attn_d_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh,
 
 // q8_0-mirror batch attention twins: the arena binds FOUR times (half-scale + byte views for K
 // and V); the row table carries byte offsets and nblk replaces the kv_dim uniform
-def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnb_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_b_q8_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5643,10 +6100,11 @@ def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkv
     metal_set_buffer(enc, bhs, 0ul, 11)
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
+    metal_set_buffer(enc, bcap, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_part_b_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
+def enc_attn_part_b_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnpb_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_b_q8_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5664,6 +6122,8 @@ def enc_attn_part_b_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, 
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
     metal_set_buffer(enc, bnch, 0ul, 14)
+    metal_set_buffer(enc, bcap, 0ul, 15)
+    metal_set_buffer(enc, bwin, 0ul, 16)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -5689,7 +6149,7 @@ def enc_attn_d_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, 
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
 }
 
-def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs, bwin : MetalBuffer?; nrows, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attncombb)
     metal_set_buffer(enc, bpart, 0ul, 0)
     metal_set_buffer(enc, by, 0ul, 1)
@@ -5697,6 +6157,7 @@ def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs :
     metal_set_buffer(enc, bnch, 0ul, 3)
     metal_set_buffer(enc, bnh, 0ul, 4)
     metal_set_buffer(enc, bhs, 0ul, 5)
+    metal_set_buffer(enc, bwin, 0ul, 6)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -5862,6 +6323,14 @@ def metal_kernels_release {
     if (g_pso_addrms != null) {
         metal_release(g_pso_addrms)
         g_pso_addrms = null
+    }
+    if (g_pso_geglu != null) {
+        metal_release(g_pso_geglu)
+        g_pso_geglu = null
+    }
+    if (g_pso_softcap != null) {
+        metal_release(g_pso_softcap)
+        g_pso_softcap = null
     }
     if (g_pso_swiglu != null) {
         metal_release(g_pso_swiglu)

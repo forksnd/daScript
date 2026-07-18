@@ -363,11 +363,19 @@ def batch_decode_override_logits_done {
 
 //! Build one position's RoPE cos/sin row into caller arrays — bit-identical to the row forward()
 //! hands the decode override (an encode-ahead driver pre-builds the NEXT position's row; the
-//! global-rope class only — dual-rope configs carry a second row this does not cover).
+//! global-rope class only — dual-rope configs pre-build the swa row with the twin below).
 def public build_decode_rope_row(t : Model; pos : int64; var cos_tab, sin_tab : array<float>) {
     let c = t.config
     build_rope_table(cos_tab, sin_tab, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l,
                      c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
+}
+
+//! The sliding class's row (dual-rope configs) — bit-identical to forward()'s swa row build.
+def public build_decode_rope_row_swa(t : Model; pos : int64; var cos_tab, sin_tab : array<float>) {
+    let c = t.config
+    let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
+    build_rope_table(cos_tab, sin_tab, t, c.rope_freq_base_swa, c.rope_freq_scale_swa, pos, 1l,
+                     swa_hs, !c.rope_ff_global_only)
 }
 
 //! The copyable hot-path block pointers, resolved onto the Model at load and called per layer.

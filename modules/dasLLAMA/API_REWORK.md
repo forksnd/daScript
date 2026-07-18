@@ -352,6 +352,33 @@ what it costs today and what the fix would change.
   dispatch over B rows, so the gap is smaller there), and a norm-capable fused qkv_rs
   two-pass form for the s16 path (fused qkv_rs still stands down under qk_norm).
 
+- **Gemma stage-1 Metal deferrals (wave B, 2026-07-17).** The gemma2 enablement chose
+  correctness-first shapes; each entry names today's cost on gemma-class models only (llama/qwen
+  paths untouched):
+  (1) *GeGLU fused-w13 stand-down* — the s16 w13sw fused GEMV (single) and the batch fuse13 rail
+  carry a hardcoded silu epilogue, so `ffn_act == gelu` falls back to unfused W1+W3 GEMVs + a
+  geglu ew pass (+1 dispatch/layer single, +1-2 batch). Fix: an `act` uniform (or gelu twin) on
+  the w13sw kernels. Same for prefill's legacy fused rail (`enc_swiglu_quant` has no gelu twin,
+  and the deferred-W2-add trick has no post-ffn-norm slot, so `fused` stands down entirely —
+  mm-path prefill, the default, is unaffected).
+  (2) *pre_post_norm sites are composed, not fused* — each post-norm is a separate in-place rms
+  dispatch before the residual add (+2 dispatches/layer on every path). Fix: a `post_add_rms`
+  kernel (rms(branch)·w_post + x, then the next pre-norm in the same tg — the row is already
+  staged for the add_rms reduction).
+  (3) *Sliding chunked dispatch is not compacted* — the single-stream part dispatch still grids
+  ALL context chunks; below-window chunks exit whole-tg on entry (the comb skips them via chlo).
+  At gemma2's 4096 window this only bites past 4K depth; fix = dispatch chunks [chlo, nchunks)
+  with a ch0 uniform. Batch shares the early-exit shape (per-row windows preclude one compact
+  range).
+  (4) *Spec-chain stands down on embed-scale models* — the greedy GPU-argmax chain requires
+  `embed_scale == 1.0`, so every gemma (sqrt-dim scale) eats the CPU next-token poke per step.
+  Fix: a scale uniform on the embed-gather kernels (enc_embed / enc_embed_k6). Revisit at the
+  gemma4-12B B=1 board — this was the 4B chase's biggest single lever.
+  (5) *Batch window-crossing parity has no dedicated test* — the fam-gemma2 masking row proves
+  single-decode + prefill past the window; the batch part/comb twins share the masked-kernel
+  code but no batch test drives depth > window. Add one when a batch harness with deep
+  per-row contexts exists.
+
 - **Embeddings path (spotted building `/v1/embeddings`, 2026-07-06).** Two small items, neither
   chased: (1) `embed_forward` takes approach A — reuse `forward_prefill` then re-norm every
   position — which pays **one wasted last-position classifier GEMM** (vocab×dim) per embed call,
