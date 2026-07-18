@@ -7,7 +7,7 @@
 # lives in build_doc below.
 if(NOT DAS_TOOLS_DISABLED)
     add_custom_target(check_docs_generated
-        COMMAND $<TARGET_FILE:daslang> ${PROJECT_SOURCE_DIR}/doc/reflections/das2rst.das
+        COMMAND $<TARGET_FILE:daslang> -documentation ${PROJECT_SOURCE_DIR}/doc/reflections/das2rst.das
         DEPENDS daslang
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMENT "Regenerating stdlib RST (das2rst)"
@@ -40,7 +40,7 @@ if(DAS_BUILD_DOCUMENTATION)
         # Step 1: regenerate stdlib RST from daslib source comments (requires daslang)
         add_custom_command(
             OUTPUT  ${CMAKE_CURRENT_BINARY_DIR}/das2rst.stamp
-            COMMAND $<TARGET_FILE:daslang> "${PROJECT_SOURCE_DIR}/doc/reflections/das2rst.das"
+            COMMAND $<TARGET_FILE:daslang> -documentation "${PROJECT_SOURCE_DIR}/doc/reflections/das2rst.das"
             COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/das2rst.stamp
             DEPENDS daslang
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}

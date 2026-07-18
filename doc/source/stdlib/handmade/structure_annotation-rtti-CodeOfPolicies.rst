@@ -10,6 +10,7 @@ Whether to validate the AST after compilation (uniqueness checks, etc.). Off by 
 Whether cross-platform AOT is enabled (if not, we generate code for the current platform).
 File name for AOT output (if not set, we generate a temporary file).
 If we are in code completion mode.
+Whether this is a documentation/reflection compile; build-machine-specific transforms stay disabled.
 Whether we are in lint-check mode (standalone linters set this so modules can adapt behavior).
 Skip the Module::Initialize() assert in compileDaScript (for environments initialized later, e.g. dynamic-module discovery).
 Export all functions and global variables.

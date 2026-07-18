@@ -58,6 +58,7 @@ static bool gen2MakeSyntax = false;
 static bool trackAllocations = false;
 static bool heapReportAtExit = false;
 static bool logModuleCompileTime = false;
+static bool buildingDocumentation = false;
 
 static CodeOfPolicies getPolicies() {
     CodeOfPolicies policies;
@@ -76,6 +77,7 @@ static CodeOfPolicies getPolicies() {
     policies.track_allocations = trackAllocations;
     policies.no_lint = noLint;
     policies.log_module_compile_time = logModuleCompileTime;
+    policies.building_documentation = buildingDocumentation;
     return policies;
 }
 
@@ -417,6 +419,7 @@ int compile_and_run ( const string & fn, const string & mainFnName, bool outputP
     policies.track_allocations = trackAllocations;
     policies.no_lint = noLint;
     policies.log_module_compile_time = logModuleCompileTime;
+    policies.building_documentation = buildingDocumentation;
     policies.persistent_heap = true;
     if ( auto program = compileDaScript(fn,access,tout,dummyGroup,policies) ) {
         if ( program->failed() ) {
@@ -579,6 +582,7 @@ void print_help() {
         << "    -pause      pause after errors and pause again before exiting program\n"
         << "    -dry-run    compile and simulate script without execution\n"
         << "    -compile-only compile script without simulation and execution\n"
+        << "    -documentation compile in documentation/reflection mode (disables per-box transforms)\n"
         << "    -dasroot <path> set path to daslang root folder (with daslib)\n"
         << "    --track-smart-ptr <id> track smart pointer with id\n"
         << "    --track-job-status <id> track JobStatus/Channel/LockBox with id\n"
@@ -744,6 +748,8 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
                 dryRun = true;
             } else if ( cmd=="compile-only" ) {
                 compileOnly = true;
+            } else if ( cmd=="documentation" ) {
+                buildingDocumentation = true;
             } else if ( cmd=="no-lint" ) {
                 noLint = true;
             } else if ( cmd=="log-compile-time" ) {

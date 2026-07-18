@@ -18,6 +18,7 @@ require suite
 require log
 require math
 require dastest_clargs
+require worker_policy
 
 options multiple_contexts
 
@@ -608,7 +609,9 @@ def main() : int {
         let totalFiles = length(files)
         var totalThreads = test_args.isolated_mode_threads
         if (totalThreads == 0) {
-            totalThreads = get_total_hw_threads() * 2
+            totalThreads = (jit_enabled()
+                ? default_jit_isolated_threads(get_total_hw_threads())
+                : max(1, get_total_hw_threads() * 2))
         }
         let testTimeout = test_args.test_timeout
         // --headless is a pass-through flag (not parsed by DastestArgs); detect once
@@ -676,6 +679,8 @@ def main() : int {
             bidx = hi
         }
         let numBatches = length(batches)
+        let workerLimit = max(1, numBatches)
+        totalThreads = min(totalThreads, workerLimit)
         log::info("Running {totalFiles} tests in isolated mode: {totalThreads} threads, batch {batchSize} ({numBatches} worker subprocess(es))\n")
         with_channel(numBatches) $(inputChannel) {
             with_channel(totalFiles) $(outputChannel) {

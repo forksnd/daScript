@@ -10,6 +10,7 @@ namespace das {
     DAS_API void reset_aot();
     DAS_API bool is_in_completion();
     DAS_API bool is_in_lint_check();
+    DAS_API bool is_building_documentation();
     DAS_API bool is_folding();
     DAS_API const char * compiling_file_name ( );
     DAS_API const char * compiling_module_name ( );

@@ -16,6 +16,12 @@ host tool or module is missing report `SKIP` with an install/rebuild hint. The
 tables below remain the reference for what each gate mirrors and for running
 any step by hand.
 
+A complete `--full` run is Release-only and fails immediately for a Debug
+host. Debug may be used for intentional subset diagnosis with `--only` or
+`--skip`; it must never be substituted when a Windows MCP process locks the
+Release runtime DLL. Stop the worktree's `utils/mcp/main.das` host and rebuild
+Release instead — the MCP watcher restarts it.
+
 **Conventions.** `<daslang>` = your compiler binary: `bin/Release/daslang.exe`
 (Windows MSVC multi-config), `bin/daslang` (Ninja single-config — what CI's
 extended_checks uses on all three OSes), or `build/daslang` (Make/Ninja
@@ -157,7 +163,7 @@ workflow: `skills/make_pr.md` §4; conventions: `skills/documentation_rst.md`.
 
 | # | Gate | Local mirror |
 |---|---|---|
-| 1 | das2rst runs clean (positional handmade-doc validation panics on count mismatch) | `<daslang> doc/reflections/das2rst.das` — repeat until no panic |
+| 1 | das2rst runs clean (positional handmade-doc validation panics on count mismatch) | `<daslang> -documentation doc/reflections/das2rst.das` — repeat until no panic; the host policy keeps per-box transforms inert |
 | 2 | no `// stub` in handmade docs | `grep -rl '// stub' doc/source/stdlib/handmade/` → must be empty |
 | 3 | no `Uncategorized` sections | `grep -rl '^Uncategorized$' doc/source/stdlib/generated/` → must be empty; fix via `group_by_regex` in das2rst.das |
 | 4 | no untracked generated RST | `git ls-files --others --exclude-standard doc/source/stdlib/` → must be empty; `git add` the new files |

@@ -66,6 +66,13 @@ def tune_aot_gate() : bool {
         || (compiling_program().policies.aot && !compiling_program().policies.jit_enabled))
 }
 
+//! True when this compile must retain reference bodies. Documentation roots
+//! inspect source APIs and, like frozen/AOT consumers, must never consult or
+//! stamp per-box tune state.
+def tune_stamp_free_gate() : bool {
+    return tune_aot_gate() || is_building_documentation()
+}
+
 //! True when this compile produces a standalone exe (`llvm-jit -exe`). Stamping still runs:
 //! an exe built on a box WITH a manifest ships those winners (a local-use artifact by
 //! definition), and without one it ships the generic per-ISA `fallback=` stamps. Only the
@@ -833,7 +840,7 @@ class private TuneAnnotation : AstFunctionAnnotation {
         // code compiles. Overrides grid modes too: a stale DAS_TUNE_MODE env must not leak
         // variant stubs into generated C++. (-exe is NOT gated here: an exe ships the box's
         // manifest winners — local-use build — or the generic fallback= stamps without one.)
-        if (tune_aot_gate()) {
+        if (tune_stamp_free_gate()) {
             let noPerms : array<TunePerm>
             var gok = emit_registry(compiling_module(), func, noPerms, errors)
             for (c in comps) {
@@ -1154,7 +1161,7 @@ def private collect_status(prog : Program?) : array<TuneStatus> {
 // emits the status [init] so the artifact can self-report its baked stamps — the two call
 // sites below split on tune_exe_gate() explicitly.
 def private tune_policy_gated() : bool {
-    return (tune_aot_gate() || tune_mode() != "normal"
+    return (tune_stamp_free_gate() || tune_mode() != "normal"
         || !empty(get_env_variable("DAS_TUNE_MANIFEST")))
 }
 
@@ -1188,12 +1195,6 @@ def private emit_status_init(var errors : string&) {
 // below): resolve the policy (env > declared), then per incomplete scope warn / error /
 // inject the auto or restart guard into `func` (the app's main)
 def private apply_tune_policy(var func : FunctionPtr; declared : string; var errors : string&) : bool {
-    // `options _no_tune = true` — program-level opt-out: reflection/doc tools (das2rst) compile
-    // [tune_scope] libraries without wanting a tuner run or an injected auto/restart guard; the
-    // whole policy pass goes inert for that program (fallback stamps stay in effect)
-    if (compiling_program()._options |> find_arg("_no_tune") ?as tBool ?? false) {
-        return true
-    }
     var policy = declared
     {
         let penv = get_env_variable("DAS_TUNE_POLICY")

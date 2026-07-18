@@ -2692,6 +2692,7 @@ namespace das {
               << value.aot_macros
               << value.tune_frozen
               << value.completion
+              << value.building_documentation
               << value.export_all
               << value.serialize_main_module
               << value.keep_alive

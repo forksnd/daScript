@@ -123,7 +123,7 @@ jobs:
     - name: "Run das2rst"
       run: |
         set -eux
-        ./bin/daslang doc/reflections/das2rst.das
+        ./bin/daslang -documentation doc/reflections/das2rst.das
 
     - name: "Build Sphinx HTML"
       run: |
