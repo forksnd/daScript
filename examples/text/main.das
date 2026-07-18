@@ -13,14 +13,12 @@ require imgui/imgui_document_model
 require imgui/imgui_text_source_view
 require imgui/imgui_theme_daslang
 require daslib/clargs
-require daslib/command_line
 require daslib/fio
 require daslib/json
 require daslib/json_boost
 require daslib/module_path
 require daslib/safe_addr
 require daslib/stringify
-require daslib/utf8_utils
 require live/live_commands
 require math
 require strings
@@ -140,7 +138,7 @@ def private set_zoom_percent(var doc : TextViewerDocument; percent : int) {
 
 def private active_document_index() : int {
     let index = find_index_if(g_documents) $(doc) => doc.id == g_active_document_id
-    return index >= 0 ? index : (length(g_documents) > 0 ? 0 : -1)
+    return index >= 0 ? index : (!empty(g_documents) ? 0 : -1)
 }
 
 def private markdown_path(path : string) : bool {
@@ -708,7 +706,7 @@ def private handle_global_shortcuts() {
     command_poll_scope(g_commands, CommandScope.application)
 }
 
-def private handle_document_shortcuts(var doc : TextViewerDocument) {
+def private handle_document_shortcuts(doc : TextViewerDocument const) {
     let io & = unsafe(GetIO())
     command_poll_scope(g_commands, CommandScope.document, "{doc.id}")
     command_poll_scope(g_commands, CommandScope.component, "{doc.id}")
@@ -758,7 +756,7 @@ def private remove_closed_documents() {
             g_documents |> erase(index)
             g_document_windows |> erase(id)
             if (removed_active) {
-                g_active_document_id = length(g_documents) > 0 ? g_documents[0].id : 0
+                g_active_document_id = !empty(g_documents) ? g_documents[0].id : 0
             }
         }
     }
@@ -769,7 +767,7 @@ def text_viewer_state(_input : JsonValue?) : JsonValue? {
     let active = active_document_index()
     if (active < 0) return JV((ok = false, error = "no document is open",
                                document_count = 0, active_document_id = 0))
-    var doc & = unsafe(g_documents[active])
+    let doc & = unsafe(g_documents[active])
     let window = g_document_windows[doc.id]
     return JV((
         ok = doc.document.ok,
@@ -968,17 +966,14 @@ def text_viewer_command(input : JsonValue?) : JsonValue? {
 
 [live_command(description = "Inspect semantic commands and current bindings.")]
 def text_viewer_commands(_input : JsonValue?) : JsonValue? {
-    var definitions : array<JsonValue?>
-    for (definition in g_commands.definitions) {
-        definitions |> push(JV((
+    var definitions <- [for (definition in g_commands.definitions); JV((
             id = definition.id,
             title = definition.title,
             category = definition.category,
             scope = int(definition.scope),
             enabled = definition.enabled,
             selected = definition.selected,
-            shortcut = command_shortcut_text(g_commands, definition.id))))
-    }
+            shortcut = command_shortcut_text(g_commands, definition.id)))]
     return JV((ok = true, revision = g_commands.revision,
                saved_revision = g_commands.saved_revision,
                config_path = g_commands.config_path,

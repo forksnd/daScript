@@ -262,10 +262,10 @@ def test_text_viewer_checkbox_save_reload_roundtrip(t : T?) {
         if (ready) {
             // Command responses are transient live-API values; snapshot the
             // geometry before issuing any later commands.
-            let checkbox_width_before = (checkbox?["x1"] ?? 0.0f)
-                - (checkbox?["x0"] ?? 0.0f)
-            let checkbox_height_before = (checkbox?["y1"] ?? 0.0f)
-                - (checkbox?["y0"] ?? 0.0f)
+            let checkbox_width_before = ((checkbox?["x1"] ?? 0.0f)
+                - (checkbox?["x0"] ?? 0.0f))
+            let checkbox_height_before = ((checkbox?["y1"] ?? 0.0f)
+                - (checkbox?["y0"] ?? 0.0f))
             let no_op_save = post_command(app, "text_viewer_save", JV((path = fixture)))
             t |> success(no_op_save?["ok"] ?? false, "no-op save succeeds")
             t |> equal(fread(fixture), original,
@@ -294,10 +294,10 @@ def test_text_viewer_checkbox_save_reload_roundtrip(t : T?) {
             if (toggled) {
                 let toggled_checkbox = post_command(
                     app, "text_viewer_checkbox", JV((index = 0)))
-                let width_after = (toggled_checkbox?["x1"] ?? 0.0f)
-                    - (toggled_checkbox?["x0"] ?? 0.0f)
-                let height_after = (toggled_checkbox?["y1"] ?? 0.0f)
-                    - (toggled_checkbox?["y0"] ?? 0.0f)
+                let width_after = ((toggled_checkbox?["x1"] ?? 0.0f)
+                    - (toggled_checkbox?["x0"] ?? 0.0f))
+                let height_after = ((toggled_checkbox?["y1"] ?? 0.0f)
+                    - (toggled_checkbox?["y0"] ?? 0.0f))
                 t |> equal(width_after, checkbox_width_before,
                            "checked and unchecked controls reserve identical width")
                 t |> equal(height_after, checkbox_height_before,
