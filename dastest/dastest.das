@@ -53,6 +53,7 @@ struct FailedFile {
 var private fileTimings : array<FileTiming>
 var private failedFiles : array<FailedFile>
 var private timingOutliers : int = 0
+var private maxFileTime : float = 0.0
 var private jsonFilePath : string
 var private jsonTestFile : string
 
@@ -553,6 +554,7 @@ def main() : int {
     }
 
     timingOutliers = test_args.timing_outliers
+    maxFileTime = test_args.max_file_time
     jsonFilePath = test_args.json_file
     if (!empty(jsonFilePath)) {
         suite::clear_test_results()
@@ -597,7 +599,7 @@ def main() : int {
                 let reason = "{status.failed} failed, {status.errors} errors"
                 failedFiles |> push(FailedFile(uri = clone_string(uri), reason = clone_string(reason)))
             }
-            if (timingOutliers > 0) {
+            if (timingOutliers > 0 || maxFileTime > 0.0) {
                 fileTimings |> push(FileTiming(uri = clone_string(uri), dt = fileDt))
             }
             res += status
@@ -712,7 +714,7 @@ def main() : int {
                         for (err in isoRes.err) {
                             log::error(err)
                         }
-                        if (timingOutliers > 0) {
+                        if (timingOutliers > 0 || maxFileTime > 0.0) {
                             fileTimings |> push(FileTiming(uri = clone_string(isoRes.uri), dt = isoRes.fileDt))
                         }
                         let isoPassed = isoRes.exitCode == 0 && isoRes.parsedResult && isoRes.status.failed + isoRes.status.errors == 0
@@ -807,7 +809,30 @@ def private print_timing_outliers() {
 }
 
 
-def finish_tests(res : SuiteResult; start_time : int64) : int {
+def private enforce_max_file_time(var res : SuiteResult) {
+    if (maxFileTime <= 0.0) return
+    let limitUsec = double(maxFileTime) * 1000000.0lf
+    let limitStr = fmt(":.3f", maxFileTime)
+    for (ft in fileTimings) {
+        if (double(ft.dt) <= limitUsec) continue
+        let dtStr = fmt(":.3f", double(ft.dt) / 1000000.0lf)
+        let timingReason = "took {dtStr}s, exceeding --max-file-time {limitStr}s"
+        let failedIndex = find_index_if(failedFiles) $(ff) => ff.uri == ft.uri
+        if (failedIndex >= 0) {
+            failedFiles[failedIndex].reason = "{failedFiles[failedIndex].reason}; {timingReason}"
+        } else {
+            failedFiles |> push(FailedFile(uri = clone_string(ft.uri), reason = clone_string(timingReason)))
+            // Treat the file-time contract as one synthetic test failure so
+            // text and JSON summaries remain internally consistent.
+            res.total++
+            res.failed++
+        }
+    }
+}
+
+
+def finish_tests(var res : SuiteResult; start_time : int64) : int {
+    enforce_max_file_time(res)
     let resCode = res.failed + res.errors
     let totalDt = get_time_usec(start_time)
     log::info("\n{to_string(res)}")

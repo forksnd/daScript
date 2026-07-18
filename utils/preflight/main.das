@@ -724,7 +724,7 @@ def classify_build_fail(gate, base : string; r : tuple<rc : int; out : string>; 
 
 def gate_tests_interp(ctx : PreflightCtx) : GateResult {
     return run_test_gate("tests-interp",
-        [ctx.daslang, "dastest/dastest.das", "--", "--failures-only", "--timeout", "900", "--test", "tests"],
+        [ctx.daslang, "dastest/dastest.das", "--", "--failures-only", "--max-file-time", "30", "--timeout", "900", "--test", "tests"],
         "interpreter suite failures")
 }
 
@@ -745,7 +745,7 @@ def gate_tests_jit(ctx : PreflightCtx) : GateResult {
     // Isolated-parallel like CI's run_tests_jit (~3x faster than sequential, identical
     // pass/fail set; workers mint the dll cache themselves). Timeout matches CI's 1800.
     return run_test_gate("tests-jit",
-        [ctx.daslang, "dastest/dastest.das", "-jit", "--", "--jit-opt-level=3", "--failures-only", "--isolated-mode", "--batch", "4", "--timeout", "1800", "--test", "tests"],
+        [ctx.daslang, "dastest/dastest.das", "-jit", "--", "--jit-opt-level=3", "--failures-only", "--max-file-time", "30", "--isolated-mode", "--batch", "4", "--timeout", "1800", "--test", "tests"],
         "JIT suite failures")
 }
 
@@ -796,7 +796,7 @@ def gate_tests_aot(ctx : PreflightCtx) : GateResult {
             detail = "test_aot binary not found next to daslang ({test_aot})")
     }
     return run_test_gate("tests-aot",
-        [test_aot, "-use-aot", "dastest/dastest.das", "--", "--use-aot", "--failures-only", "--timeout", "900", "--test", "tests"],
+        [test_aot, "-use-aot", "dastest/dastest.das", "--", "--use-aot", "--failures-only", "--max-file-time", "30", "--timeout", "900", "--test", "tests"],
         "AOT suite failures (error[50101] → skills/aot_hash_desync_debugging.md)")
 }
 

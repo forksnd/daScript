@@ -21,6 +21,9 @@ struct DastestArgs {
     @clarg_doc = "Print the top N slowest test files and highlight statistical timing outliers (above mean + 2x stddev)"
     timing_outliers : int = 0
 
+    @clarg_doc = "Fail the suite when any completed test file takes longer than this many seconds. If 0, the limit is disabled"
+    max_file_time : float = 0.0
+
     @clarg_doc = "Path to write the JSON test results report to"
     json_file : string
 

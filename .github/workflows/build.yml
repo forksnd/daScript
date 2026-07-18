@@ -17,7 +17,7 @@ on:
     # bundle_smoke / gcc stay per-PR-only. A manual `workflow_dispatch` runs
     # the FULL workflow: every per-PR job, both toolchains, and the full AOT
     # suite.
-    # 02:00 UTC: dead time for EU working hours — the nightly is ~11 jobs and
+    # 02:00 UTC: dead time for EU working hours — the nightly is ~12 jobs and
     # must not compete with daytime PR lanes for runners.
     - cron: '0 2 * * *'
 defaults:
@@ -180,8 +180,16 @@ jobs:
             architecture: 64
             architecture_string: x64
 
-          # Debug win64 skips JIT. Win64 MSVC JIT stays covered by Release;
-          # RelWithDebInfo is a separate nightly-only memory/leak diagnostic.
+          # The regular Win64 Release lane is the fast MSVC compile/interpreter
+          # gate. LLVM + the JIT sweep are preserved by the nightly copy below.
+          - target: windows
+            architecture: 64
+            cmake_preset: Release
+            llvm_disabled: 'ON'
+            jit_disabled: 'ON'
+
+          # Debug Win64 also skips JIT. RelWithDebInfo is a separate
+          # nightly-only memory/leak diagnostic.
           - target: windows
             architecture: 64
             cmake_preset: Debug
@@ -359,8 +367,8 @@ jobs:
         path: ${{ runner.temp }}/sccache
         key: sccache-${{ matrix.target }}-${{ matrix.architecture }}-${{ matrix.cmake_preset }}-${{ matrix.sanitizers }}
 
-    - name: "Override das_llvm_disabled for win32"
-      if: matrix.target == 'windows' && matrix.architecture == 32
+    - name: "Override das_llvm_disabled for LLVM-free matrix cells"
+      if: (matrix.target == 'windows' && matrix.architecture == 32) || matrix.llvm_disabled == 'ON'
       shell: bash
       run: echo "das_llvm_disabled=ON" >> $GITHUB_ENV
 
@@ -562,6 +570,7 @@ jobs:
       contents: read
       actions: write
     env:
+      das_dll_build: 'NO'
       das_llvm_disabled: 'OFF'
       SCCACHE_GHA_ENABLED: 'false'
 
@@ -645,6 +654,111 @@ jobs:
 
     - name: "Small C++ Tests"
       run: ctest --test-dir build --build-config RelWithDebInfo -L small --output-on-failure
+
+  ###########################################################
+  build_windows_release_llvm_nightly:
+  ###########################################################
+    # Preserve the former PR Win64 Release configuration as a nightly signal:
+    # LLVM enabled, full JIT + interpreter sweeps, and the small C++ tests.
+    # The regular matrix cell is the fast LLVM-free MSVC gate. Its scheduled
+    # run still owns the full AOT suite, so do not duplicate that sweep here.
+    needs: pre_job
+    if: >-
+      (github.event_name == 'schedule' && github.repository == 'GaijinEntertainment/daScript')
+      || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: write
+    env:
+      das_dll_build: 'NO'
+      das_llvm_disabled: 'OFF'
+      SCCACHE_GHA_ENABLED: 'false'
+
+    steps:
+    - name: "SCM Checkout"
+      uses: actions/checkout@v4
+
+    - name: "Exclude workspace from Windows Defender"
+      shell: pwsh
+      continue-on-error: true
+      run: |
+        Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction SilentlyContinue
+        foreach ($p in 'daslang.exe','daslang_static.exe','test_aot.exe','cl.exe','link.exe','lld-link.exe','mt.exe','vctip.exe','mspdbsrv.exe','vcpkg.exe') {
+          Add-MpPreference -ExclusionProcess $p -ErrorAction SilentlyContinue
+        }
+        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+        Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, IsTamperProtected
+        Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+
+    - name: "Install CMake and Ninja"
+      uses: lukka/get-cmake@latest
+
+    - uses: ilammy/setup-nasm@v1
+
+    - name: "Set up MSVC environment"
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: "Cache vcpkg + openssl"
+      uses: actions/cache@v4
+      with:
+        path: vcpkg
+        key: vcpkg-x64-windows-v2
+
+    - name: "Install openssl windows"
+      run: |
+        if [ ! -x vcpkg/vcpkg.exe ] && [ ! -x vcpkg/vcpkg ]; then
+            git clone https://github.com/microsoft/vcpkg && ./vcpkg/bootstrap-vcpkg.sh
+        fi
+        ./vcpkg/vcpkg install openssl:x64-windows --binarycaching
+        echo "VCPKG_ROOT=$(pwd)/vcpkg" >> $GITHUB_ENV
+        rm -rf vcpkg/buildtrees vcpkg/downloads vcpkg/packages
+
+    - uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: "Configure sccache"
+      run: echo "SCCACHE_DIR=${{ runner.temp }}/sccache" >> $GITHUB_ENV
+
+    - name: "Restore sccache objects"
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/sccache
+        key: sccache-windows-64-Release-none-llvm-on-nightly
+
+    - name: "Build: Daslang Release with LLVM"
+      run: |
+        set -eux
+        export PATH="/c/Strawberry/perl/bin:$PATH"
+        cmake --no-warn-unused-cli -B./build -G Ninja \
+          -DCMAKE_BUILD_TYPE:STRING=Release \
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+          -DDAS_LLVM_DISABLED=${{ env.das_llvm_disabled }} \
+          -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+        cmake --build ./build --config Release --parallel
+
+    - name: "Refresh sccache slot"
+      if: github.ref == 'refs/heads/master'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh cache delete "sccache-windows-64-Release-none-llvm-on-nightly" -R ${{ github.repository }} || true
+
+    - name: "Save sccache objects"
+      if: github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/sccache
+        key: sccache-windows-64-Release-none-llvm-on-nightly
+
+    - name: "Test: JIT + interpreter"
+      run: |
+        cmake --build ./build --config Release --target run_tests_jit || cmake --build ./build --config Release --target run_tests_jit_isolated
+        cmake --build ./build --config Release --target run_tests_interpreter || cmake --build ./build --config Release --target run_tests_interpreter_isolated
+
+    - name: "Small C++ Tests"
+      run: ctest --test-dir build --build-config Release -L small --output-on-failure
 
   ###########################################################
   bundle_smoke:
