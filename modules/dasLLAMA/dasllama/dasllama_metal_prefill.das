@@ -75,6 +75,8 @@ class MetalRmsNorm {
                                             // read before the barrier that precedes any write)
     @uniform @binding = 3 dim : uint
     @uniform @binding = 4 eps : float
+    @uniform @binding = 5 oscale : float    // output scalar (gemma4 layer_out_scale folds into
+                                            // the post-ffn norm; every other site binds 1.0)
     @workgroup partial : float[32]          // one per simdgroup — width-agnostic up to 1024
                                             // threads (prefill dispatches 256, decode 1024)
     @workgroup inv_sh : float
@@ -108,7 +110,7 @@ class MetalRmsNorm {
         let inv = inv_sh
         k = lid
         while (k < dim) {
-            y[row * dim + k] = w[k] * (x[row * dim + k] * inv)
+            y[row * dim + k] = w[k] * (x[row * dim + k] * inv) * oscale
             k += gl_WorkGroupSize.x
         }
     }
@@ -2152,6 +2154,23 @@ class MetalAdd {
     }
 }
 
+// Suppress-token pinning (gemma4): logits[ids[i]] = -1e30 after the soft cap — the CPU
+// forward's pin value exactly; one thread per suppressed id.
+class MetalSuppressRow {
+    @ssbo @binding = 0 x : array<float>
+    @ssbo @binding = 1 ids : array<uint>
+    @uniform @binding = 2 n : uint
+
+    [metal_kernel(name="metal_suppress_row_msl")]
+    def metal_suppress_row {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= n) {
+            return
+        }
+        x[ids[gid]] = -1.0e30
+    }
+}
+
 // Logit soft-cap, one thread per element: x = cap * tanh(x / cap) — softcap4's scalar reference
 // (gemma2/gemma4 final_logit_softcap on the GPU classifier row).
 class MetalSoftcapRow {
@@ -2199,7 +2218,9 @@ var private g_pso_softmax : MetalComputePipeline?
 var private g_pso_av : MetalComputePipeline?
 var private g_pf_pso_swiglu : MetalComputePipeline?
 var private g_pf_pso_geglu : MetalComputePipeline?
+var private g_pf_one : MetalBuffer?         // persistent 1.0f — the rms oscale default bind
 var private g_pf_pso_softcap : MetalComputePipeline?
+var private g_pf_pso_suppress : MetalComputePipeline?
 var private g_pf_pso_add : MetalComputePipeline?
 var private g_pso_addrmsq : MetalComputePipeline?
 var private g_pso_swigluq : MetalComputePipeline?
@@ -2315,6 +2336,10 @@ def public metal_prefill_shutdown {
         metal_release(g_pf_pso_swiglu)
         g_pf_pso_swiglu = null
     }
+    if (g_pf_one != null) {
+        metal_release(g_pf_one)
+        g_pf_one = null
+    }
     if (g_pf_pso_geglu != null) {
         metal_release(g_pf_pso_geglu)
         g_pf_pso_geglu = null
@@ -2322,6 +2347,10 @@ def public metal_prefill_shutdown {
     if (g_pf_pso_softcap != null) {
         metal_release(g_pf_pso_softcap)
         g_pf_pso_softcap = null
+    }
+    if (g_pf_pso_suppress != null) {
+        metal_release(g_pf_pso_suppress)
+        g_pf_pso_suppress = null
     }
     if (g_pf_pso_add != null) {
         metal_release(g_pf_pso_add)
@@ -2413,8 +2442,14 @@ def private metal_prefill_init : bool {
     g_pso_softmax = pf_compile_pso(metal_attn_softmax_msl, metal_attn_softmax_msl_entry, metal_attn_softmax_msl_fastmath, ok)
     g_pso_av = pf_compile_pso(metal_attn_av_msl, metal_attn_av_msl_entry, metal_attn_av_msl_fastmath, ok)
     g_pf_pso_swiglu = pf_compile_pso(metal_swiglu_msl, metal_swiglu_msl_entry, metal_swiglu_msl_fastmath, ok)
+    g_pf_one = metal_new_buffer(g_pf_dev, 4ul)
+    unsafe {
+        var onep = reinterpret<float?>(metal_buffer_contents(g_pf_one))
+        onep[0] = 1.0
+    }
     g_pf_pso_geglu = pf_compile_pso(metal_geglu_msl, metal_geglu_msl_entry, metal_geglu_msl_fastmath, ok)
     g_pf_pso_softcap = pf_compile_pso(metal_softcap_row_msl, metal_softcap_row_msl_entry, metal_softcap_row_msl_fastmath, ok)
+    g_pf_pso_suppress = pf_compile_pso(metal_suppress_row_msl, metal_suppress_row_msl_entry, metal_suppress_row_msl_fastmath, ok)
     g_pf_pso_add = pf_compile_pso(metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath, ok)
     g_pso_addrmsq = pf_compile_pso(metal_add_rms_quant_msl, metal_add_rms_quant_msl_entry, metal_add_rms_quant_msl_fastmath, ok)
     g_pso_swigluq = pf_compile_pso(metal_swiglu_quant_msl, metal_swiglu_quant_msl_entry, metal_swiglu_quant_msl_fastmath, ok)
@@ -2637,7 +2672,7 @@ def private enc_quant(enc : MetalComputeEncoder?; bx, bxq, bxs, bn, bnblk : Meta
     metal_dispatch_threadgroups(enc, uint3(uint((nblk + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
-def private pf_enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64) {
+def private pf_enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64; boscale : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pf_pso_rms)
     metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, 0ul, 0)
@@ -2645,6 +2680,7 @@ def private pf_enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : Meta
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
+    metal_set_buffer(enc, boscale != null ? boscale : g_pf_one, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
@@ -2657,6 +2693,7 @@ def private enc_rms_last(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : u
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
+    metal_set_buffer(enc, g_pf_one, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(256u, 1u, 1u))
 }
 

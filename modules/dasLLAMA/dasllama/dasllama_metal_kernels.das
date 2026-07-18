@@ -63,6 +63,14 @@ class MetalSqAttnF16 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = j * kv_dim + khoff + sl * epl
@@ -87,6 +95,18 @@ class MetalSqAttnF16 {
             }
             if (epl > 7u) {
                 s += q7 * float(kc[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kc[kb + 8u])
+                s += q9 * float(kc[kb + 9u])
+                s += q10 * float(kc[kb + 10u])
+                s += q11 * float(kc[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kc[kb + 12u])
+                s += q13 * float(kc[kb + 13u])
+                s += q14 * float(kc[kb + 14u])
+                s += q15 * float(kc[kb + 15u])
             }
             s = simd_sum(s)
             if (sl == 0u) {
@@ -203,6 +223,14 @@ class MetalSqAttnF32 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = j * kv_dim + khoff + sl * epl
@@ -227,6 +255,18 @@ class MetalSqAttnF32 {
             }
             if (epl > 7u) {
                 s += q7 * kc[kb + 7u]
+            }
+            if (epl > 8u) {
+                s += q8 * kc[kb + 8u]
+                s += q9 * kc[kb + 9u]
+                s += q10 * kc[kb + 10u]
+                s += q11 * kc[kb + 11u]
+            }
+            if (epl > 12u) {
+                s += q12 * kc[kb + 12u]
+                s += q13 * kc[kb + 13u]
+                s += q14 * kc[kb + 14u]
+                s += q15 * kc[kb + 15u]
             }
             s = simd_sum(s)
             if (sl == 0u) {
@@ -345,6 +385,14 @@ class MetalSqAttnQ8 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u               // lane's block within the head
         let ib = (sl * epl) % 32u               // lane's quant offset within the block
         var j = sg
@@ -373,6 +421,18 @@ class MetalSqAttnQ8 {
             }
             if (epl > 7u) {
                 s += q7 * float(kqb[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kqb[kb + 8u])
+                s += q9 * float(kqb[kb + 9u])
+                s += q10 * float(kqb[kb + 10u])
+                s += q11 * float(kqb[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kqb[kb + 12u])
+                s += q13 * float(kqb[kb + 13u])
+                s += q14 * float(kqb[kb + 14u])
+                s += q15 * float(kqb[kb + 15u])
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
@@ -499,6 +559,14 @@ class MetalSqAttnTq4 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u          // this lane's element offset inside its block
         var j = sg
@@ -528,6 +596,22 @@ class MetalSqAttnTq4 {
                     let by3 = uint(kqb[kb + 3u])
                     s += q6 * float(int(by3 & 15u) - 8)
                     s += q7 * float(int(by3 >> 4u) - 8)
+                }
+                if (epl > 8u) {
+                    let by4 = uint(kqb[kb + 4u])
+                    let by5 = uint(kqb[kb + 5u])
+                    s += q8 * float(int(by4 & 15u) - 8)
+                    s += q9 * float(int(by4 >> 4u) - 8)
+                    s += q10 * float(int(by5 & 15u) - 8)
+                    s += q11 * float(int(by5 >> 4u) - 8)
+                }
+                if (epl > 12u) {
+                    let by6 = uint(kqb[kb + 6u])
+                    let by7 = uint(kqb[kb + 7u])
+                    s += q12 * float(int(by6 & 15u) - 8)
+                    s += q13 * float(int(by6 >> 4u) - 8)
+                    s += q14 * float(int(by7 & 15u) - 8)
+                    s += q15 * float(int(by7 >> 4u) - 8)
                 }
             }
             s = simd_sum(s * d)
@@ -655,6 +739,14 @@ class MetalSqAttnPartF16 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = (c0 + j) * kv_dim + khoff + sl * epl
@@ -679,6 +771,18 @@ class MetalSqAttnPartF16 {
             }
             if (epl > 7u) {
                 s += q7 * float(kc[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kc[kb + 8u])
+                s += q9 * float(kc[kb + 9u])
+                s += q10 * float(kc[kb + 10u])
+                s += q11 * float(kc[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kc[kb + 12u])
+                s += q13 * float(kc[kb + 13u])
+                s += q14 * float(kc[kb + 14u])
+                s += q15 * float(kc[kb + 15u])
             }
             s = simd_sum(s)
             if (sl == 0u) {
@@ -823,6 +927,14 @@ class MetalSqAttnPartF32 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = (c0 + j) * kv_dim + khoff + sl * epl
@@ -847,6 +959,18 @@ class MetalSqAttnPartF32 {
             }
             if (epl > 7u) {
                 s += q7 * kc[kb + 7u]
+            }
+            if (epl > 8u) {
+                s += q8 * kc[kb + 8u]
+                s += q9 * kc[kb + 9u]
+                s += q10 * kc[kb + 10u]
+                s += q11 * kc[kb + 11u]
+            }
+            if (epl > 12u) {
+                s += q12 * kc[kb + 12u]
+                s += q13 * kc[kb + 13u]
+                s += q14 * kc[kb + 14u]
+                s += q15 * kc[kb + 15u]
             }
             s = simd_sum(s)
             if (sl == 0u) {
@@ -992,6 +1116,14 @@ class MetalSqAttnPartQ8 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let ib = (sl * epl) % 32u
         var j = sg
@@ -1020,6 +1152,18 @@ class MetalSqAttnPartQ8 {
             }
             if (epl > 7u) {
                 s += q7 * float(kqb[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kqb[kb + 8u])
+                s += q9 * float(kqb[kb + 9u])
+                s += q10 * float(kqb[kb + 10u])
+                s += q11 * float(kqb[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kqb[kb + 12u])
+                s += q13 * float(kqb[kb + 13u])
+                s += q14 * float(kqb[kb + 14u])
+                s += q15 * float(kqb[kb + 15u])
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
@@ -1174,6 +1318,14 @@ class MetalSqAttnPartTq4 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u
         var j = sg
@@ -1203,6 +1355,22 @@ class MetalSqAttnPartTq4 {
                     let by3 = uint(kqb[kb + 3u])
                     s += q6 * float(int(by3 & 15u) - 8)
                     s += q7 * float(int(by3 >> 4u) - 8)
+                }
+                if (epl > 8u) {
+                    let by4 = uint(kqb[kb + 4u])
+                    let by5 = uint(kqb[kb + 5u])
+                    s += q8 * float(int(by4 & 15u) - 8)
+                    s += q9 * float(int(by4 >> 4u) - 8)
+                    s += q10 * float(int(by5 & 15u) - 8)
+                    s += q11 * float(int(by5 >> 4u) - 8)
+                }
+                if (epl > 12u) {
+                    let by6 = uint(kqb[kb + 6u])
+                    let by7 = uint(kqb[kb + 7u])
+                    s += q12 * float(int(by6 & 15u) - 8)
+                    s += q13 * float(int(by6 >> 4u) - 8)
+                    s += q14 * float(int(by7 & 15u) - 8)
+                    s += q15 * float(int(by7 >> 4u) - 8)
                 }
             }
             s = simd_sum(s * d)
@@ -2912,6 +3080,14 @@ class MetalSqAttnBF16 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = kb0 + j * kv_dim + khoff + sl * epl
@@ -2936,6 +3112,18 @@ class MetalSqAttnBF16 {
             }
             if (epl > 7u) {
                 s += q7 * float(kc[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kc[kb + 8u])
+                s += q9 * float(kc[kb + 9u])
+                s += q10 * float(kc[kb + 10u])
+                s += q11 * float(kc[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kc[kb + 12u])
+                s += q13 * float(kc[kb + 13u])
+                s += q14 * float(kc[kb + 14u])
+                s += q15 * float(kc[kb + 15u])
             }
             s = simd_sum(s)
             if (sl == 0u) {
@@ -3056,6 +3244,14 @@ class MetalSqAttnBF32 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = kb0 + j * kv_dim + khoff + sl * epl
@@ -3080,6 +3276,18 @@ class MetalSqAttnBF32 {
             }
             if (epl > 7u) {
                 s += q7 * kc[kb + 7u]
+            }
+            if (epl > 8u) {
+                s += q8 * kc[kb + 8u]
+                s += q9 * kc[kb + 9u]
+                s += q10 * kc[kb + 10u]
+                s += q11 * kc[kb + 11u]
+            }
+            if (epl > 12u) {
+                s += q12 * kc[kb + 12u]
+                s += q13 * kc[kb + 13u]
+                s += q14 * kc[kb + 14u]
+                s += q15 * kc[kb + 15u]
             }
             s = simd_sum(s)
             if (sl == 0u) {
@@ -3207,6 +3415,14 @@ class MetalSqAttnBQ8 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let ib = (sl * epl) % 32u
         var j = sg
@@ -3235,6 +3451,18 @@ class MetalSqAttnBQ8 {
             }
             if (epl > 7u) {
                 s += q7 * float(kqb[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kqb[kb + 8u])
+                s += q9 * float(kqb[kb + 9u])
+                s += q10 * float(kqb[kb + 10u])
+                s += q11 * float(kqb[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kqb[kb + 12u])
+                s += q13 * float(kqb[kb + 13u])
+                s += q14 * float(kqb[kb + 14u])
+                s += q15 * float(kqb[kb + 15u])
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
@@ -3368,6 +3596,14 @@ class MetalSqAttnBTq4 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u
         var j = sg
@@ -3397,6 +3633,22 @@ class MetalSqAttnBTq4 {
                     let by3 = uint(kqb[kb + 3u])
                     s += q6 * float(int(by3 & 15u) - 8)
                     s += q7 * float(int(by3 >> 4u) - 8)
+                }
+                if (epl > 8u) {
+                    let by4 = uint(kqb[kb + 4u])
+                    let by5 = uint(kqb[kb + 5u])
+                    s += q8 * float(int(by4 & 15u) - 8)
+                    s += q9 * float(int(by4 >> 4u) - 8)
+                    s += q10 * float(int(by5 & 15u) - 8)
+                    s += q11 * float(int(by5 >> 4u) - 8)
+                }
+                if (epl > 12u) {
+                    let by6 = uint(kqb[kb + 6u])
+                    let by7 = uint(kqb[kb + 7u])
+                    s += q12 * float(int(by6 & 15u) - 8)
+                    s += q13 * float(int(by6 >> 4u) - 8)
+                    s += q14 * float(int(by7 & 15u) - 8)
+                    s += q15 * float(int(by7 >> 4u) - 8)
                 }
             }
             s = simd_sum(s * d)
@@ -3527,6 +3779,14 @@ class MetalSqAttnPartBF16 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = kb0 + (c0 + j) * kv_dim + khoff + sl * epl
@@ -3551,6 +3811,18 @@ class MetalSqAttnPartBF16 {
             }
             if (epl > 7u) {
                 s += q7 * float(kc[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kc[kb + 8u])
+                s += q9 * float(kc[kb + 9u])
+                s += q10 * float(kc[kb + 10u])
+                s += q11 * float(kc[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kc[kb + 12u])
+                s += q13 * float(kc[kb + 13u])
+                s += q14 * float(kc[kb + 14u])
+                s += q15 * float(kc[kb + 15u])
             }
             s = simd_sum(s)
             if (sl == 0u) {
@@ -3701,6 +3973,14 @@ class MetalSqAttnPartBF32 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = kb0 + (c0 + j) * kv_dim + khoff + sl * epl
@@ -3725,6 +4005,18 @@ class MetalSqAttnPartBF32 {
             }
             if (epl > 7u) {
                 s += q7 * kc[kb + 7u]
+            }
+            if (epl > 8u) {
+                s += q8 * kc[kb + 8u]
+                s += q9 * kc[kb + 9u]
+                s += q10 * kc[kb + 10u]
+                s += q11 * kc[kb + 11u]
+            }
+            if (epl > 12u) {
+                s += q12 * kc[kb + 12u]
+                s += q13 * kc[kb + 13u]
+                s += q14 * kc[kb + 14u]
+                s += q15 * kc[kb + 15u]
             }
             s = simd_sum(s)
             if (sl == 0u) {
@@ -3881,6 +4173,14 @@ class MetalSqAttnPartBQ8 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let ib = (sl * epl) % 32u
         var j = sg
@@ -3909,6 +4209,18 @@ class MetalSqAttnPartBQ8 {
             }
             if (epl > 7u) {
                 s += q7 * float(kqb[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kqb[kb + 8u])
+                s += q9 * float(kqb[kb + 9u])
+                s += q10 * float(kqb[kb + 10u])
+                s += q11 * float(kqb[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kqb[kb + 12u])
+                s += q13 * float(kqb[kb + 13u])
+                s += q14 * float(kqb[kb + 14u])
+                s += q15 * float(kqb[kb + 15u])
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
@@ -4071,6 +4383,14 @@ class MetalSqAttnPartBTq4 {
         let q5 = epl > 5u ? q[qb + 5u] : 0.0
         let q6 = epl > 6u ? q[qb + 6u] : 0.0
         let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u
         var j = sg
@@ -4100,6 +4420,22 @@ class MetalSqAttnPartBTq4 {
                     let by3 = uint(kqb[kb + 3u])
                     s += q6 * float(int(by3 & 15u) - 8)
                     s += q7 * float(int(by3 >> 4u) - 8)
+                }
+                if (epl > 8u) {
+                    let by4 = uint(kqb[kb + 4u])
+                    let by5 = uint(kqb[kb + 5u])
+                    s += q8 * float(int(by4 & 15u) - 8)
+                    s += q9 * float(int(by4 >> 4u) - 8)
+                    s += q10 * float(int(by5 & 15u) - 8)
+                    s += q11 * float(int(by5 >> 4u) - 8)
+                }
+                if (epl > 12u) {
+                    let by6 = uint(kqb[kb + 6u])
+                    let by7 = uint(kqb[kb + 7u])
+                    s += q12 * float(int(by6 & 15u) - 8)
+                    s += q13 * float(int(by6 >> 4u) - 8)
+                    s += q14 * float(int(by7 & 15u) - 8)
+                    s += q15 * float(int(by7 >> 4u) - 8)
                 }
             }
             s = simd_sum(s * d)
@@ -5187,6 +5523,8 @@ var g_pso_addrms : MetalComputePipeline?
 var g_pso_swiglu : MetalComputePipeline?
 var g_pso_geglu : MetalComputePipeline?
 var g_pso_softcap : MetalComputePipeline?
+var g_pso_suppress : MetalComputePipeline?
+var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind
 var g_pso_attn16 : MetalComputePipeline?
 var g_pso_attn32 : MetalComputePipeline?
 var g_pso_attn_q8 : MetalComputePipeline?   // q8_0-mirror twin (dual-view block reads)
@@ -5292,8 +5630,14 @@ def metal_decode_init : bool {
     g_pso_add = compile_pso(metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath, ok)
     g_pso_addrms = compile_pso(metal_add_rms_msl, metal_add_rms_msl_entry, metal_add_rms_msl_fastmath, ok)
     g_pso_swiglu = compile_pso(metal_swiglu_msl, metal_swiglu_msl_entry, metal_swiglu_msl_fastmath, ok)
+    g_one = metal_new_buffer(g_dev, 4ul)
+    unsafe {
+        var onep = reinterpret<float?>(metal_buffer_contents(g_one))
+        onep[0] = 1.0
+    }
     g_pso_geglu = compile_pso(metal_geglu_msl, metal_geglu_msl_entry, metal_geglu_msl_fastmath, ok)
     g_pso_softcap = compile_pso(metal_softcap_row_msl, metal_softcap_row_msl_entry, metal_softcap_row_msl_fastmath, ok)
+    g_pso_suppress = compile_pso(metal_suppress_row_msl, metal_suppress_row_msl_entry, metal_suppress_row_msl_fastmath, ok)
     g_pso_attn16 = compile_pso(metal_sq_attn16_msl, metal_sq_attn16_msl_entry, metal_sq_attn16_msl_fastmath, ok)
     g_pso_attn32 = compile_pso(metal_sq_attn32_msl, metal_sq_attn32_msl_entry, metal_sq_attn32_msl_fastmath, ok)
     g_pso_attnp16 = compile_pso(metal_sq_attn_part16_msl, metal_sq_attn_part16_msl_entry, metal_sq_attn_part16_msl_fastmath, ok)
@@ -5467,7 +5811,7 @@ def enc_kq_gemm_mm_b(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by : M
     metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(rows / 64l), 1u), uint3(128u, 1u, 1u))
 }
 
-def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?) {
+def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; boscale : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_rms)
     metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, 0ul, 0)
@@ -5475,6 +5819,7 @@ def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?) {
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
+    metal_set_buffer(enc, boscale != null ? boscale : g_one, 0ul, 5)
     // one row, latency-bound — the widest tg shortens the strided-load rounds (1024 max on M1)
     metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
 }
@@ -5836,6 +6181,15 @@ def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs, bchlo :
     metal_set_buffer(enc, bhs, 0ul, 4)
     metal_set_buffer(enc, bchlo, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+}
+
+// suppress-token pinning over a logits row in place (gemma4) — ids as a u32 buffer
+def enc_suppress_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64; bids, bn : MetalBuffer?; n : int64) {
+    metal_set_pipeline(enc, g_pso_suppress)
+    metal_set_buffer(enc, bx, xoff, 0)
+    metal_set_buffer(enc, bids, 0ul, 1)
+    metal_set_buffer(enc, bn, 0ul, 2)
+    metal_dispatch_threadgroups(enc, uint3(uint((n + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // logit soft-cap over a row in place (gemma2/gemma4 final_logit_softcap on the GPU classifier)
@@ -6308,7 +6662,7 @@ def enc_add_rms_b(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Metal
 }
 
 // batched rmsnorm (the prologue): the prefill rms kernel is width-agnostic — one tg per row
-def enc_rms_b(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64) {
+def enc_rms_b(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64; boscale : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_rms)
     metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, 0ul, 0)
@@ -6316,6 +6670,7 @@ def enc_rms_b(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?;
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
+    metal_set_buffer(enc, boscale != null ? boscale : g_one, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(1024u, 1u, 1u))
 }
 
@@ -6356,6 +6711,10 @@ def metal_kernels_release {
         metal_release(g_pso_addrms)
         g_pso_addrms = null
     }
+    if (g_one != null) {
+        metal_release(g_one)
+        g_one = null
+    }
     if (g_pso_geglu != null) {
         metal_release(g_pso_geglu)
         g_pso_geglu = null
@@ -6363,6 +6722,10 @@ def metal_kernels_release {
     if (g_pso_softcap != null) {
         metal_release(g_pso_softcap)
         g_pso_softcap = null
+    }
+    if (g_pso_suppress != null) {
+        metal_release(g_pso_suppress)
+        g_pso_suppress = null
     }
     if (g_pso_swiglu != null) {
         metal_release(g_pso_swiglu)

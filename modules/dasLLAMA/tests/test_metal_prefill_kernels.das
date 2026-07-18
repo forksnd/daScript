@@ -292,6 +292,7 @@ def test_metal_prefill_kernels(t : T?) {
                 var bry = buf_fill(dev, NROWS * DIM, 0.0)
                 var brdim = buf_u32(dev, uint(DIM))
                 var breps = buf_f32(dev, EPS)
+                var brone = buf_f32(dev, 1.0)   // the wave-B oscale uniform at its identity value
                 let rran = with_compute_encoder(queue, err) <| $(enc : MetalComputeEncoder?) {
                     metal_set_pipeline(enc, pso_rms)
                     metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
@@ -300,6 +301,7 @@ def test_metal_prefill_kernels(t : T?) {
                     metal_set_buffer(enc, bry, 0ul, 2)
                     metal_set_buffer(enc, brdim, 0ul, 3)
                     metal_set_buffer(enc, breps, 0ul, 4)
+                    metal_set_buffer(enc, brone, 0ul, 5)
                     metal_dispatch_threadgroups(enc, uint3(uint(NROWS), 1u, 1u), uint3(256u, 1u, 1u))
                 }
                 t |> success(rran, "rmsnorm dispatch: {err}")
@@ -309,6 +311,7 @@ def test_metal_prefill_kernels(t : T?) {
                 metal_release(bry)
                 metal_release(brdim)
                 metal_release(breps)
+                metal_release(brone)
                 metal_release(pso_rms)
 
                 // ===== rope (NORM pairs, table-driven) — the q-width dispatch =====
