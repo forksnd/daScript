@@ -611,6 +611,18 @@ def finalize(var t : Model) {
     }
 }
 
+//! Resident weight bytes across every plane family (only the loaded quant's planes are
+//! non-empty; a mapped .dlim's borrowed views count their mapped extent).
+def model_weights_bytes(t : Model) : int64 {
+    return (int64(length(t.fblob)) * 4l + int64(length(t.wblob)) * 4l
+        + int64(length(t.qblob)) + int64(length(t.qscales)) * 4l + int64(length(t.qscales16)) * 2l
+        + int64(length(t.q4blob)) + int64(length(t.q4scales)) * 4l
+        + int64(length(t.mxq)) + int64(length(t.mxs))
+        + int64(length(t.bf16blob)) * 2l
+        + int64(length(t.k4q)) + int64(length(t.k4s)) + int64(length(t.k5q)) + int64(length(t.k5s))
+        + int64(length(t.k6q)) + int64(length(t.k6s)) + int64(length(t.q40q)) + int64(length(t.q40s)))
+}
+
 // ===== Arch registry: per-architecture blocks + chat template =====
 
 //! A chat-template part: literal `text`, a `special`-token spelling (the chat layer resolves it to an
@@ -3169,6 +3181,19 @@ struct KVPool {
     vblobs : array<array<uint8>>
     free_groups : array<int>     // LIFO free list
     refcnt : array<int>          // per group; 0/1 today (the prefix cache bumps it later)
+}
+
+//! Allocated KV pool bytes (capacity, not just referenced pages) — the sum of every blob's
+//! K and V backing arrays. Empty (0) for flat serving, where KV lives inside each session.
+def kv_pool_bytes(pool : KVPool) : int64 {
+    var total = 0l
+    for (kb in pool.kblobs) {
+        total += int64(length(kb))
+    }
+    for (vb in pool.vblobs) {
+        total += int64(length(vb))
+    }
+    return total
 }
 
 //! Per-step scratch buffers and the KV cache (allocated once, reused every token).

@@ -1544,8 +1544,10 @@ var g_moe_gpu_total_layers = 0l       // loader contract: n_layers of the loaded
 
 def private moe_gpu_no_arm : bool => false
 def private moe_gpu_no_vram : int64 => 0l
+def private moe_gpu_no_device : string => ""
 var g_moe_gpu_arm = @@moe_gpu_no_arm
 var g_moe_gpu_vram_report = @@moe_gpu_no_vram
+var g_moe_gpu_device_report = @@moe_gpu_no_device
 
 def public set_gpu_tier_want(want : GpuTierWant) {
     g_gpu_want = want
@@ -1591,6 +1593,11 @@ def public set_moe_gpu_vram_report(f : function<() : int64>) {
     g_moe_gpu_vram_report = f
 }
 
+//! The tier reports its device's marketing name through this hook ("" until the device exists).
+def public set_moe_gpu_device_report(f : function<() : string>) {
+    g_moe_gpu_device_report = f
+}
+
 def public moe_gpu_tier_installed : bool {
     return g_moe_gpu_installed
 }
@@ -1609,6 +1616,7 @@ def public set_moe_gpu_model_support(reason : string) {
 //! Live GPU-tier status (the control-page badge): actual post-load residency and routing.
 struct GpuTierStatus {
     backend : string          //!< tier backend name ("vulkan"); "" = no GPU tier installed
+    device : string           //!< GPU marketing name ("" until the device is created at first upload)
     supported : bool          //!< tier installed AND the loaded model rides it
     reason : string           //!< why not, when the tier is installed but ``supported`` is false
     resident_layers : int64   //!< expert-stack layers resident (from the end)
@@ -1629,6 +1637,7 @@ def public gpu_tier_status : GpuTierStatus {
     let streamed = total > 0l ? max(min(g_moe_gpu_from_layer, total) - min(g_moe_gpu_stream_from, total), 0l) : 0l
     return GpuTierStatus(
         backend = g_moe_gpu_backend,
+        device = invoke(g_moe_gpu_device_report),
         supported = empty(g_moe_gpu_unsupported),
         reason = g_moe_gpu_unsupported,
         resident_layers = resident,

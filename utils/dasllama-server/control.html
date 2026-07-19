@@ -43,6 +43,8 @@ header {
 .badge.err   { border-color: var(--red);   color: var(--red); }    .badge.err::before   { background: var(--red); }
 .uptime { font-family: var(--font-mono); font-size: 12px; color: var(--fg-faint); }
 
+.hw { font-family: var(--font-mono); font-size: 11px; color: var(--fg-faint); margin: -14px 0 18px; }
+
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
 .tile { background: var(--bg-2); border: 1px solid var(--rule); border-radius: 6px; padding: 12px 14px; }
 .tile .n { font-family: var(--font-mono); font-size: 22px; color: var(--fg); white-space: nowrap; }
@@ -124,6 +126,7 @@ button:disabled { opacity: 0.45; cursor: default; }
         <span class="badge" id="badge">connecting</span>
         <span class="uptime" id="uptime"></span>
     </header>
+    <div class="hw" id="hw"></div>
 
     <div class="tiles">
         <div class="tile"><div class="n" id="t-tps">—</div><div class="l">gen tok/s</div></div>
@@ -133,6 +136,8 @@ button:disabled { opacity: 0.45; cursor: default; }
         <div class="tile sm"><div class="n" id="t-req">—</div><div class="l">admitted / finished / evicted</div></div>
         <div class="tile"><div class="n" id="t-batch">—</div><div class="l">avg decode batch</div></div>
         <div class="tile sm"><div class="n" id="t-prefix">—</div><div class="l">prefix cache: tokens / pages</div></div>
+        <div class="tile sm"><div class="n" id="t-ttft">—</div><div class="l">ttft last / avg (ms)</div></div>
+        <div class="tile sm"><div class="n" id="t-mem">—</div><div class="l">weights + kv (GB)</div></div>
         <div class="tile sm hide" id="tile-mtp"><div class="n" id="t-mtp">—</div><div class="l">mtp accepted / drafted</div></div>
         <div class="tile hide" id="tile-asr"><div class="n" id="t-asr">—</div><div class="l">asr ready·active·pending</div></div>
     </div>
@@ -142,6 +147,10 @@ button:disabled { opacity: 0.45; cursor: default; }
         <div class="panel">
             <div class="chart-title"><span>generation tok/s · last 2 min</span><span class="chart-now" id="c-tps-now"></span></div>
             <canvas id="c-tps" height="96"></canvas>
+        </div>
+        <div class="panel">
+            <div class="chart-title"><span>prefill tok/s · last 2 min</span><span class="chart-now" id="c-pf-now"></span></div>
+            <canvas id="c-pf" height="96"></canvas>
         </div>
         <div class="panel">
             <div class="chart-title"><span>streams · last 2 min</span><span class="chart-now" id="c-str-now"></span></div>
@@ -178,8 +187,8 @@ button:disabled { opacity: 0.45; cursor: default; }
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const HIST = 120;                       // ~2 min at 1s polling
-const tps = [], act = [], que = [];     // rolling series
+const HIST = 120;                            // ~2 min at 1s polling
+const tps = [], pf = [], act = [], que = []; // rolling series
 let last = null, lastT = 0, failures = 0;
 
 function fmt(n) {
@@ -201,11 +210,13 @@ function apply(s) {
     $("uptime").textContent = fmtUptime(s.uptime_s);
     setBadge(s.draining ? "warn" : "ok", s.draining ? "draining" : "serving");
     const now = performance.now();
-    let rate = 0;
+    let rate = 0, pfRate = 0;
     if (last !== null && now > lastT) {
-        rate = Math.max(0, (s.gen_tokens - last.gen_tokens) / ((now - lastT) / 1000));
+        const dt = (now - lastT) / 1000;
+        rate = Math.max(0, (s.gen_tokens - last.gen_tokens) / dt);
+        pfRate = Math.max(0, ((s.prefill_tokens || 0) - (last.prefill_tokens || 0)) / dt);
     }
-    push(tps, rate); push(act, s.active); push(que, s.queued);
+    push(tps, rate); push(pf, pfRate); push(act, s.active); push(que, s.queued);
     last = s; lastT = now;
 
     $("t-tps").textContent = rate.toFixed(1);
@@ -215,6 +226,11 @@ function apply(s) {
     $("t-req").textContent = fmt(s.admitted) + " / " + fmt(s.finished) + " / " + fmt(s.evicted);
     $("t-batch").textContent = s.avg_batch.toFixed(2);
     $("t-prefix").textContent = fmt(s.cached_tokens) + " / " + fmt(s.prefix_pages);
+    $("t-ttft").textContent = s.ttft_avg_ms > 0
+        ? s.ttft_last_ms.toFixed(0) + " / " + s.ttft_avg_ms.toFixed(0)
+        : "—";
+    $("t-mem").textContent = (s.weights_bytes / 1e9).toFixed(1) + " + " + (s.kv_bytes / 1e9).toFixed(1);
+    $("hw").textContent = s.hardware || "";
     if (s.mtp_drafted > 0) {
         $("tile-mtp").classList.remove("hide");
         $("t-mtp").textContent = fmt(s.mtp_accepted) + " / " + fmt(s.mtp_drafted) +
@@ -230,8 +246,10 @@ function apply(s) {
         " · peak active <b>" + s.peak_active + "</b> · decode steps <b>" + fmt(s.decode_steps) + "</b>" +
         (s.asr_workers > 0 ? " · asr workers <b>" + s.asr_workers + "</b>" : "");
     $("c-tps-now").textContent = rate.toFixed(1);
+    $("c-pf-now").textContent = pfRate.toFixed(0);
     $("c-str-now").textContent = s.active + " · " + s.queued;
     draw($("c-tps"), [{ data: tps, color: css("--amber") }]);
+    draw($("c-pf"), [{ data: pf, color: css("--green") }]);
     draw($("c-str"), [{ data: act, color: css("--amber") }, { data: que, color: css("--blue") }]);
 }
 
@@ -263,7 +281,7 @@ function draw(cv, series) {
 }
 
 // crosshair tooltip: nearest sample, value(s) + age
-for (const id of ["c-tps", "c-str"]) {
+for (const id of ["c-tps", "c-pf", "c-str"]) {
     const cv = $(id);
     cv.addEventListener("mousemove", e => {
         const s = cv._series; if (!s || !s[0].data.length) return;

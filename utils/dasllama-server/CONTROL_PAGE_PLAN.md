@@ -19,6 +19,14 @@ override); capability guard (`supported` + `reason` recorded at load); `gpu_tier
 Verified: toml 108/108, server 17/17 live, vulkan tier 12/12, e2e restart loop (CLI-beats-toml
 → save authoritative → exit 4 → relaunch → toml-beats-CLI), page behavior via mock+playwright.
 
+**S2 DONE (2026-07-19):** scheduler `prefill_tokens` (computed tokens only, cache hits
+excluded) + TTFT aggregate (sum/count/last at reap; per-stream `ttft_us` predated); /v1/stats
+grows prefill/ttft/memory (`model_weights_bytes` + `kv_pool_bytes` engine helpers, das heaps)
++ `hardware` line (CPU brand via argv `run_and_capture`, worker lanes, GPU device name via new
+`set_moe_gpu_device_report` hook feeding `GpuTierStatus.device`); page: separate prefill and
+generation tok/s charts, TTFT + memory tiles, hardware disclosure under the header. Verified:
+scheduler 12/12, server 17/17 live (post-work stats assertions), page via mock+playwright.
+
 ---
 
 ## Slices (order = build order)

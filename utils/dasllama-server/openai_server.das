@@ -115,6 +115,56 @@ def server_restart_requested : bool {
     return g_restart_requested
 }
 
+var private g_hardware_line = ""   // "<cpu> · N worker lanes · <gpu>" — composed once at init_server
+
+// The CPU marketing name: registry on Windows, /proc/cpuinfo on Linux, sysctl on macOS.
+def private cpu_brand : string {
+    var out = ""
+    if (get_env_variable("OS") == "Windows_NT") {
+        var args <- ["reg", "query", "HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     "/v", "ProcessorNameString"]
+        run_and_capture(args, out, 10.0)
+        delete args
+        for (ln in split(out, "\n")) {
+            let i = find(ln, "REG_SZ")
+            if (i >= 0 && find(ln, "ProcessorNameString") >= 0) {
+                return strip(slice(ln, i + length("REG_SZ")))
+            }
+        }
+        return ""
+    }
+    let cpuinfo = fread("/proc/cpuinfo")
+    if (!empty(cpuinfo)) {
+        for (ln in split(cpuinfo, "\n")) {
+            if (ln |> starts_with("model name")) {
+                let c = find(ln, ":")
+                return c >= 0 ? strip(slice(ln, c + 1)) : ""
+            }
+        }
+    }
+    var args <- ["sysctl", "-n", "machdep.cpu.brand_string"]
+    run_and_capture(args, out, 10.0)
+    delete args
+    return strip(out)
+}
+
+def private compose_hardware_line {
+    var cpu = cpu_brand()
+    if (empty(cpu)) {
+        cpu = "unknown cpu"
+    }
+    let lanes = get_dispatch_worker_limit()
+    let lanes_desc = lanes > 0 ? "{lanes}" : "all"
+    let tier = gpu_tier_status()
+    var gpu_part = ""
+    if (!empty(tier.device)) {
+        gpu_part = " · {tier.device}"
+    } elif (get_metal_mode() != MetalMode.off) {
+        gpu_part = " · metal"
+    }
+    g_hardware_line = "{cpu} · {lanes_desc} worker lanes{gpu_part}"
+}
+
 //! Consume a coalesced request from POST /gc. The lifecycle loop calls this only after update()
 //! returns, when no request-local values remain on its stack.
 def take_gc_request() : bool {
@@ -1206,6 +1256,14 @@ struct private OaiStatsResponse {
     asr_pending : int
     mtp_drafted : int64
     mtp_accepted : int64
+    prefill_tokens : int64
+    ttft_avg_ms : float
+    ttft_last_ms : float
+    weights_bytes : int64
+    kv_bytes : int64
+    heap_bytes : int64
+    string_heap_bytes : int64
+    hardware : string
 }
 
 def private handle_stats(var resp : HttpResponse?) : http_status {
@@ -1221,7 +1279,15 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         max_streams = g_sched.max_streams, chunk_tokens = g_sched.chunk_tokens,
         asr_workers = g_asr_worker_count, asr_ready = g_asr_ready,
         asr_active = g_asr_active, asr_pending = g_asr_pending,
-        mtp_drafted = g_sched.mtp_drafted, mtp_accepted = g_sched.mtp_accepted)
+        mtp_drafted = g_sched.mtp_drafted, mtp_accepted = g_sched.mtp_accepted,
+        prefill_tokens = g_sched.prefill_tokens,
+        ttft_avg_ms = g_sched.ttft_count > 0l ? float(g_sched.ttft_sum_us / g_sched.ttft_count) / 1000.0 : 0.0,
+        ttft_last_ms = float(g_sched.last_ttft_us) / 1000.0,
+        weights_bytes = model_weights_bytes(g_model),
+        kv_bytes = kv_pool_bytes(g_sched.pool),
+        heap_bytes = int64(heap_bytes_allocated()),
+        string_heap_bytes = int64(string_heap_bytes_allocated()),
+        hardware = g_hardware_line)
     return resp |> JSON(sprint_json(out, false), http_status.OK)
 }
 
@@ -1745,6 +1811,7 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     }
     g_server_started = true
     g_started_at = created_ts()
+    compose_hardware_line()
     let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
     let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
     let spec_desc = spec ? ", mtp: on" : ""

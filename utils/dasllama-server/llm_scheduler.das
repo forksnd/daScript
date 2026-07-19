@@ -106,6 +106,10 @@ struct Scheduler {
     sum_batch : int64                       // Σ decode batch size (avg batch = sum_batch / decode_steps)
     peak_active : int64
     cached_tokens : int64                   // prefix-cache hits (tokens attached instead of prefilled)
+    prefill_tokens : int64                  // prompt tokens actually computed (cache hits excluded)
+    ttft_sum_us : int64                     // Σ ttft over reaped streams that produced a token
+    ttft_count : int64
+    last_ttft_us : int64                    // most recently reaped stream's ttft
     mtp_drafted : int64                     // self-spec telemetry across streams (drafts attempted / accepted)
     mtp_accepted : int64
 }
@@ -335,6 +339,7 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         }
         eval(m, sch.streams[i].session, sch.chunk)
         sch.streams[i].n_prefilled += take
+        sch.prefill_tokens += take
         if (sch.streams[i].n_prefilled >= np) {
             let pf_ms = int64(get_time_usec(sch.streams[i].t_admit)) / 1000l
             let pf_tok = np - sch.streams[i].n_cached
@@ -352,6 +357,11 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
     var i = 0
     while (i < length(sch.streams)) {
         if (sch.streams[i].state == StreamState.done) {
+            if (sch.streams[i].ttft_us > 0l) {
+                sch.ttft_sum_us += sch.streams[i].ttft_us
+                sch.ttft_count ++
+                sch.last_ttft_us = sch.streams[i].ttft_us
+            }
             if (sch.paged) {
                 donate_stream(m, sch, sch.streams[i])
                 release_kv_pages(sch.streams[i].session)

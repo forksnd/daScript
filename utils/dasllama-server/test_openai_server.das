@@ -298,6 +298,22 @@ def test_openai_server(t : T?) {
             POST("{base_url}/config", "\{\"port\":\"eight\"}") $(resp) {
                 t |> equal(int(resp.status_code), int(http_status.BAD_REQUEST))
             }
+            // /v1/stats S2 depth — after real work went through the scheduler
+            GET("{base_url}/v1/stats") $(resp) {
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "stats JSON parses (post-work)")
+                if (js != null) {
+                    t |> success((js?["prefill_tokens"] ?? 0l) > 0l, "prefill tokens counted")
+                    t |> success((js?["weights_bytes"] ?? 0l) > 100000000l, "weights bytes reported")
+                    t |> success((js?["kv_bytes"] ?? 0l) > 0l, "kv pool bytes reported")
+                    t |> success((js?["ttft_avg_ms"] ?? 0.0lf) > 0.0lf, "ttft aggregate reported")
+                    t |> success(!empty(string(js?["hardware"] ?? "")), "hardware line composed")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
             // POST /restart — LAST in the block: the server starts draining after this. The exit-4
             // half of the contract lives in main.das + watchdog.py (not exercisable here).
             POST("{base_url}/restart", "") $(resp) {

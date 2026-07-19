@@ -3407,7 +3407,18 @@ def private vulkan_no_group3(var y0p : float?; var y1p : float?; var y2p : float
 [unused_argument(wp, sp, n, d)]
 def private vulkan_repack_noop(var wp : int8?; var sp : float?; n, d : int64) {}
 
-def private vk_resident_bytes : int64 => g_gpu.resident_bytes
+def private vk_resident_bytes : int64 => g_gpu != null ? g_gpu.resident_bytes : 0l
+
+def private vk_device_name : string {
+    if (g_gpu == null) {
+        return ""
+    }
+    var props : VkPhysicalDeviceProperties
+    vkGetPhysicalDeviceProperties(g_gpu.phys, props)
+    unsafe {
+        return "{reinterpret<string>(addr(props.deviceName[0]))}"
+    }
+}
 
 //! Arm the vulkan MoE tier from the effective GPU want (env-else-programmatic). Registered as
 //! the ``moe_gpu_tier_arm`` probe; ``[init]`` also runs it directly for the env-only path.
@@ -3432,5 +3443,6 @@ def dasllama_math_vulkan_register() {
         needs_repack = false, priority = -1, available = @@vulkan_backend_available))
     set_moe_gpu_arm("vulkan", @@vulkan_moe_gpu_arm)
     set_moe_gpu_vram_report(@@vk_resident_bytes)
+    set_moe_gpu_device_report(@@vk_device_name)
     vulkan_moe_gpu_arm()
 }
