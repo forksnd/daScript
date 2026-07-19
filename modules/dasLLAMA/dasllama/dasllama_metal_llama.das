@@ -142,17 +142,14 @@ def private spec_cls_capable(t : Model) : bool {
 
 // One weight site's GEMV — a q8-tagged tensor rides the planar q8 kernels, a kq tensor the
 // plane GEMVs (kq_upload_quants/scales + enc_kq_gemv). yoff places the k/v/w3 output segments.
-def private enc_site_gemv(enc : MetalComputeEncoder?; t : Model; s16 : bool; fmt : KqFmt; woff, rows, n : int64; bx, by, bn, bd : MetalBuffer?; yoff : uint64 = 0ul) {
+def private enc_site_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; woff, rows, n : int64; bx, by, bn, bd : MetalBuffer?; yoff : uint64 = 0ul) {
     if (fmt == KqFmt.q8) {
-        unsafe {
-            var bw = upload_region(addr < void? >(t.qblob[woff]), uint64(rows * n))
-            var bws = upload_scales(t, woff, rows, n)
-            enc_gemv(enc, s16, bw, bws, bx, by, bn, bd, rows, yoff)
-        }
+        let bw = blob_of(g_dev, t, woff)
+        enc_gemv(enc, bw.buf, bw.boff, bx, by, bn, bd, rows, yoff)
     } else {
-        var bq = kq_upload_quants(g_dev, t, fmt, woff, rows, n)
-        var bs = kq_upload_scales(g_dev, t, fmt, woff, rows, n)
-        enc_kq_gemv(enc, fmt, bq, bs, bx, by, bn, bd, rows, n, yoff)
+        let bq = kq_quants_of(g_dev, t, fmt, woff)
+        let bs = kq_scales_of(g_dev, t, fmt, woff)
+        enc_kq_gemv(enc, fmt, bq.buf, bq.qoff, bs.buf, bs.soff, bs.doff, bx, by, bn, bd, rows, n, yoff)
     }
 }
 
@@ -162,20 +159,20 @@ def private enc_site_gemv(enc : MetalComputeEncoder?; t : Model; s16 : bool; fmt
 def private enc_kq_site_b(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; woff, rows, n : int64;
                           bx : MetalBuffer?; xstride : int64; by : MetalBuffer?; ystride, ycol : int64;
                           bn, bd, bys, bnr : MetalBuffer?; nrows, mp : int64) {
-    var bq = kq_upload_quants(g_dev, t, fmt, woff, rows, n)
-    var bs = kq_upload_scales(g_dev, t, fmt, woff, rows, n)
+    let bq = kq_quants_of(g_dev, t, fmt, woff)
+    let bs = kq_scales_of(g_dev, t, fmt, woff)
     if (nrows > 8l) {
-        enc_kq_gemm_mm_b(enc, fmt, bq, bs, bx, by, uint64(ycol * 4l), bn, bys, mp, rows, n)
+        enc_kq_gemm_mm_b(enc, fmt, bq.buf, bq.qoff, bs.buf, bs.soff, bs.doff, bx, by, uint64(ycol * 4l), bn, bys, mp, rows)
         return
     }
     // B = 2..8: the ext small-batch twins — one weight pass per R-column group instead of B per-stream passes (-25..-40% at the 3B sites)
     if (nrows >= 2l && bnr != null) {
         assert(xstride == n)
-        enc_kq_mvb(enc, fmt, bq, bs, bx, by, uint64(ycol * 4l), bn, bd, bys, bnr, rows, n, nrows)
+        enc_kq_mvb(enc, fmt, bq.buf, bq.qoff, bs.buf, bs.soff, bs.doff, bx, by, uint64(ycol * 4l), bn, bd, bys, bnr, rows, n, nrows)
         return
     }
     for (b in range64(nrows)) {
-        enc_kq_gemv(enc, fmt, bq, bs, bx, by, bn, bd, rows, n,
+        enc_kq_gemv(enc, fmt, bq.buf, bq.qoff, bs.buf, bs.soff, bs.doff, bx, by, bn, bd, rows, n,
             uint64((b * ystride + ycol) * 4l), uint64(b * xstride * 4l))
     }
 }
@@ -455,13 +452,12 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
         unsafe {
             enc_argmax(enc, prev_blog, r.btok, r.u_vocab)
             if (t.cls_q8) {
-                var bembq = upload_region(addr < void? >(t.qblob[t.emb_q8_off]), uint64(c.vocab_size * dim))
-                var bembs = upload_scales(t, t.emb_q8_off, c.vocab_size, dim)
-                enc_embed(enc, r.s16, bembq, bembs, r.btok, r.bx, r.u_dim, r.u_embscale, dim)
+                let bemb = blob_of(g_dev, t, t.emb_q8_off)
+                enc_embed(enc, bemb.buf, bemb.boff, r.btok, r.bx, r.u_dim, r.u_embscale, dim)
             } else {
-                var bembq = kq_upload_quants(g_dev, t, KqFmt.k6, t.wcls_off, c.vocab_size, dim)
-                var bembs = kq_upload_scales(g_dev, t, KqFmt.k6, t.wcls_off, c.vocab_size, dim)
-                enc_embed_k6(enc, bembq, bembs, r.btok, r.bx, r.u_dim, r.u_embscale, dim, (c.vocab_size * dim) / 256l)
+                let bembq = kq_quants_of(g_dev, t, KqFmt.k6, t.wcls_off)
+                let bembs = kq_scales_of(g_dev, t, KqFmt.k6, t.wcls_off)
+                enc_embed_k6(enc, bembq.buf, bembq.qoff, bembs.buf, bembs.soff, bembs.doff, r.btok, r.bx, r.u_dim, r.u_embscale, dim)
             }
         }
     }
@@ -503,7 +499,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             var u_npall_l = het ? r.u_npall_sw : r.u_npall
             // qk_norm needs the head-wide prepass between GEMV and rope — the fused form stands
             // down (hetero too: its row map bakes one class geometry)
-            let fused_qkv = r.s16 && scalar_kv && qkv_q8 && !c.qk_norm && !r.hetero
+            let fused_qkv = scalar_kv && qkv_q8 && !c.qk_norm && !r.hetero
             // the [bq | bk | bv] bias plane matches the fused QKV index space; the rope-store /
             // qkv_rs epilogues add it pre-rope. No bias -> the qkv buffer dummy-binds the slot
             var bbias = r.bqkv
@@ -514,25 +510,21 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     addr < void? >(t.bv[l * kv_dim]), uint64(kv_dim * 4l))
             }
             if (g_skip != "gemv") {
-                if (qkv_q8 && t.wv_offs[l] >= 0l) {
-                    var bwqkv = upload_region_cat3(
-                        addr < void? >(t.qblob[t.wq_offs[l]]), uint64(qd * dim),
-                        addr < void? >(t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim),
-                        addr < void? >(t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
-                    var bwqkv_s = upload_scales_cat3(t, t.wq_offs[l], qd, t.wk_offs[l], kv_dim, t.wv_offs[l], kv_dim, dim)
-                    if (fused_qkv) {
-                        enc_gemv_qkv_rs(enc, f16v, bwqkv, bwqkv_s, r.bxb, r.bqkv, g_arena, g_arena,
-                            lkoff + uint64(pos * rowb), lvoff + uint64(pos * rowb),
-                            bcos_l, bsin_l, r.u_dim, r.u_qkvd, r.u_qd, r.u_kvd, r.u_hs, r.u_neox,
-                            bbias, r.u_hasb, qkvd)
-                    } else {
-                        enc_gemv(enc, r.s16, bwqkv, bwqkv_s, r.bxb, r.bqkv, r.u_dim, u_qkvd_l, qkvd)
-                    }
+                if (fused_qkv && t.wv_offs[l] >= 0l) {
+                    // one dispatch over all three segments — the kernel binds each tensor's
+                    // blob slice separately (kind-major layout keeps q/k/v apart)
+                    let bwq_ = blob_of(g_dev, t, t.wq_offs[l])
+                    enc_gemv_qkv_rs(enc, f16v, bwq_.buf, bwq_.boff,
+                        uint64((t.wk_offs[l] / 32l) * 34l), uint64((t.wv_offs[l] / 32l) * 34l),
+                        r.bxb, r.bqkv, g_arena, g_arena,
+                        lkoff + uint64(pos * rowb), lvoff + uint64(pos * rowb),
+                        bcos_l, bsin_l, r.u_dim, r.u_qkvd, r.u_qd, r.u_kvd, r.u_hs, r.u_neox,
+                        bbias, r.u_hasb, qkvd)
                 } else {
-                    enc_site_gemv(enc, t, r.s16, fq, t.wq_offs[l], qd, dim, r.bxb, r.bqkv, r.u_dim, u_qd_l)
-                    enc_site_gemv(enc, t, r.s16, fk, t.wk_offs[l], kv_dim, dim, r.bxb, r.bqkv, r.u_dim, u_kvd_l, uint64(qd * 4l))
+                    enc_site_gemv(enc, t, fq, t.wq_offs[l], qd, dim, r.bxb, r.bqkv, r.u_dim, u_qd_l)
+                    enc_site_gemv(enc, t, fk, t.wk_offs[l], kv_dim, dim, r.bxb, r.bqkv, r.u_dim, u_kvd_l, uint64(qd * 4l))
                     if (t.wv_offs[l] >= 0l) {
-                        enc_site_gemv(enc, t, r.s16, fv, t.wv_offs[l], kv_dim, dim, r.bxb, r.bqkv, r.u_dim, u_kvd_l, uint64((qd + kv_dim) * 4l))
+                        enc_site_gemv(enc, t, fv, t.wv_offs[l], kv_dim, dim, r.bxb, r.bqkv, r.u_dim, u_kvd_l, uint64((qd + kv_dim) * 4l))
                     }
                 }
             }
@@ -629,7 +621,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 }
             }
             if (g_skip != "gemv") {
-                enc_site_gemv(enc, t, r.s16, kq_fmt_at(t.wo_fmt, l), t.wo_offs[l], dim, qd, r.bxb, r.bxb2, u_qd_l, r.u_dim)
+                enc_site_gemv(enc, t, kq_fmt_at(t.wo_fmt, l), t.wo_offs[l], dim, qd, r.bxb, r.bxb2, u_qd_l, r.u_dim)
             }
             // ffn: [post-attn norm ->] fused add+norm -> fused W1|W3 GEMV -> swiglu/geglu ->
             // W2 GEMV [-> post-ffn norm] -> fused add + next layer's attention norm (gemma's
@@ -646,26 +638,22 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             let f3 = kq_fmt_at(t.w3_fmt, l)
             let w13_q8 = f1 == KqFmt.q8 && f3 == KqFmt.q8
             if (g_skip != "gemv") {
-                if (w13_q8) {
-                    var bw13 = upload_region_cat3(
-                        addr < void? >(t.qblob[t.w1_offs[l]]), uint64(hidden * dim),
-                        addr < void? >(t.qblob[t.w3_offs[l]]), uint64(hidden * dim), null, 0ul)
-                    var bw13_s = upload_scales_cat3(t, t.w1_offs[l], hidden, t.w3_offs[l], hidden, 0l, 0l, dim)
-                    if (r.s16 && !geglu) {   // fused gate+up dot with the swiglu epilogue — one dispatch
-                        enc_gemv_w13sw(enc, bw13, bw13_s, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
-                    } else {
-                        enc_gemv(enc, r.s16, bw13, bw13_s, r.bxb, r.bh12, r.u_dim, r.u_h2, h2)
-                    }
+                if (w13_q8 && !geglu) {
+                    // fused gate+up dot with the swiglu epilogue — one dispatch over both
+                    // tensors' blob slices
+                    let bw1 = blob_of(g_dev, t, t.w1_offs[l])
+                    enc_gemv_w13sw(enc, bw1.buf, bw1.boff, uint64((t.w3_offs[l] / 32l) * 34l),
+                        r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
                 } else {
-                    enc_site_gemv(enc, t, r.s16, f1, t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
-                    enc_site_gemv(enc, t, r.s16, f3, t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
+                    enc_site_gemv(enc, t, f1, t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
+                    enc_site_gemv(enc, t, f3, t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
                 }
             }
-            if (g_skip != "ew" && !(r.s16 && w13_q8 && !geglu)) {
+            if (g_skip != "ew" && !(w13_q8 && !geglu)) {
                 enc_ew2(enc, geglu ? g_pso_geglu : g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(hidden * 4l), r.u_hidden, hidden)
             }
             if (g_skip != "gemv") {
-                enc_site_gemv(enc, t, r.s16, kq_fmt_at(t.w2_fmt, l), t.w2_offs[l], dim, hidden, r.bh12, r.bxb, r.u_hidden, r.u_dim)
+                enc_site_gemv(enc, t, kq_fmt_at(t.w2_fmt, l), t.w2_offs[l], dim, hidden, r.bh12, r.bxb, r.u_hidden, r.u_dim)
             }
             if (g_skip != "ew") {
                 if (c.pre_post_norm) {
@@ -695,7 +683,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
         }
         let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
         var bcls = r.bnc != null ? r.bnc : r.blog
-        enc_site_gemv(enc, t, r.s16, cls_fmt, t.wcls_off, c.vocab_size, dim, r.bxf, bcls, r.u_dim, r.u_vocab)
+        enc_site_gemv(enc, t, cls_fmt, t.wcls_off, c.vocab_size, dim, r.bxf, bcls, r.u_dim, r.u_vocab)
         if (r.u_flcap != null) {
             // final-logit soft cap (gemma2/gemma4): cap*tanh in place — monotonic, so the spec
             // argmax downstream is unaffected; sampled logits match the CPU classifier's
