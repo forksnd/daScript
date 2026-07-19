@@ -115,6 +115,173 @@ def server_restart_requested : bool {
     return g_restart_requested
 }
 
+//! True while POST /bench's worker runs its child benchmarks.
+def server_bench_running : bool {
+    return g_bench_state == "running"
+}
+
+// ===== benchmark button (the llama.cpp A/B) =====
+// POST /bench runs, QUIESCED ONLY, our lcpp_bench (a child daslang process — same model, same
+// thread budget, llama-bench methodology) then llama-bench itself, on a worker thread; progress
+// and results flow back over a channel the tick loop drains. GET /bench serves state/log/result.
+
+var private g_lcpp_bin = ""
+var private g_daslang_bin = ""
+var private g_bench_state = "idle"        // idle | running | done | failed
+var private g_bench_log : array<string>
+var private g_bench_result_json = ""      // "" until a run completes
+var private g_bench_events : Channel?
+
+struct private BenchEvent {
+    kind : int         // 0 = log line, 1 = result (text = result json), 2 = failed (text = reason)
+    text : string
+}
+
+//! Register the benchmark configuration (call before run_server): ``lcpp_bin`` is the llama-bench
+//! binary (config key; empty disables the button), ``daslang_bin`` the running daslang used to
+//! spawn our bench child ("" in a standalone-exe deployment — also disables).
+def set_bench_config(lcpp_bin : string; daslang_bin : string) {
+    g_lcpp_bin = lcpp_bin
+    g_daslang_bin = daslang_bin
+}
+
+def private bench_emit(events : Channel?; kind : int; text : string) {
+    events |> push_clone(BenchEvent(kind = kind, text = text))
+}
+
+// parse "pp512: 202.54 ± 1.23 tok/s (3 reps)" (ours) — the number after "<tag>:"
+def private parse_ours_row(out : string; tag : string) : float {
+    for (ln in split(out, "\n")) {
+        if (ln |> starts_with("{tag}:")) {
+            return to_float(strip(slice(ln, length(tag) + 1)))
+        }
+    }
+    return 0.0
+}
+
+// parse llama-bench's markdown table — the row whose test cell equals `tag`, value = next cell
+def private parse_theirs_row(out : string; tag : string) : float {
+    for (ln in split(out, "\n")) {
+        continue if (find(ln, "|") < 0)
+        var cells <- split(ln, "|")
+        var found = 0.0
+        for (i in range(length(cells) - 1)) {
+            if (strip(cells[i]) == tag) {
+                found = to_float(strip(cells[i + 1]))
+                break
+            }
+        }
+        delete cells
+        if (found > 0.0) {
+            return found
+        }
+    }
+    return 0.0
+}
+
+def private bench_worker(daslang_bin, lcpp_bin, model_path : string; threads : int; events : Channel?) {
+    let t0 = ref_time_ticks()
+    bench_emit(events, 0, "our bench: lcpp_bench pp512/tg128 x 3 reps (llama-bench methodology) — minutes-class, hold on")
+    var ours = ""
+    var args <- [daslang_bin, "-jit", path_join(get_das_root(), "modules/dasLLAMA/benchmarks/lcpp_bench.das"), "--",
+                 "-m", model_path, "-r", "3"]
+    var rc1 = run_and_capture(args, ours, 3600.0)
+    if (rc1 == 3 && find(ours, "restart to apply") >= 0) {
+        // [tune] bootstrap: the child tuned this box's kernels and exited with the restart code
+        // (the watchdog convention) — relaunch once to run with the winners
+        bench_emit(events, 0, "bench child tuned this box's kernels first — relaunching with the winners")
+        ours = ""
+        rc1 = run_and_capture(args, ours, 3600.0)
+    }
+    delete args
+    let ours_pp = parse_ours_row(ours, "pp512")
+    let ours_tg = parse_ours_row(ours, "tg128")
+    if (rc1 != 0 || ours_pp <= 0.0 || ours_tg <= 0.0) {
+        bench_emit(events, 2, "our bench failed (rc={rc1}) — tail: {slice(ours, max(0, length(ours) - 300))}")
+        return
+    }
+    bench_emit(events, 0, "ours: pp512 {ours_pp} tok/s · tg128 {ours_tg} tok/s")
+    bench_emit(events, 0, "their bench: llama-bench -p 512 -n 128 -r 3 -t {threads}")
+    var theirs = ""
+    var targs <- [lcpp_bin, "-m", model_path, "-p", "512", "-n", "128", "-r", "3", "-t", "{threads}"]
+    let rc2 = run_and_capture(targs, theirs, 3600.0)
+    delete targs
+    let theirs_pp = parse_theirs_row(theirs, "pp512")
+    let theirs_tg = parse_theirs_row(theirs, "tg128")
+    if (rc2 != 0 || theirs_pp <= 0.0 || theirs_tg <= 0.0) {
+        bench_emit(events, 2, "llama-bench failed (rc={rc2}) — tail: {slice(theirs, max(0, length(theirs) - 300))}")
+        return
+    }
+    bench_emit(events, 0, "theirs: pp512 {theirs_pp} tok/s · tg128 {theirs_tg} tok/s")
+    let elapsed = int64(get_time_usec(t0)) / 1000000l
+    bench_emit(events, 1,
+        "\{\"ours_pp\":{ours_pp},\"ours_tg\":{ours_tg},\"theirs_pp\":{theirs_pp},\"theirs_tg\":{theirs_tg},\"pp_ratio\":{ours_pp / theirs_pp},\"tg_ratio\":{ours_tg / theirs_tg},\"threads\":{threads},\"elapsed_s\":{elapsed},\"ts\":{created_ts()}}")
+}
+
+def private drain_bench_events() {
+    if (g_bench_events == null) {
+        return
+    }
+    var more = true
+    while (more) {
+        more = g_bench_events |> try_pop_clone() $(ev : BenchEvent#) {
+            if (ev.kind == 0) {
+                g_bench_log |> push(clone_string(ev.text))
+                to_log(LOG_INFO, "dasllama-server: bench: {ev.text}\n")
+            } elif (ev.kind == 1) {
+                g_bench_result_json = clone_string(ev.text)
+                g_bench_state = "done"
+                to_log(LOG_INFO, "dasllama-server: bench complete\n")
+            } else {
+                g_bench_log |> push(clone_string(ev.text))
+                g_bench_state = "failed"
+                to_log(LOG_WARNING, "dasllama-server: bench failed: {ev.text}\n")
+            }
+        }
+    }
+}
+
+def private handle_bench_start(var resp : HttpResponse?) : http_status {
+    if (g_bench_state == "running") {
+        return resp |> JSON(error_body("a benchmark is already running", "invalid_request_error"), http_status.CONFLICT)
+    }
+    if (empty(g_lcpp_bin) || empty(g_daslang_bin)) {
+        return resp |> JSON(
+            error_body(empty(g_lcpp_bin) ? "set lcpp_bin in the config to enable benchmarking" : "benchmarking needs a source-tree daslang (standalone exe cannot spawn the bench child)", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    if (n_active(g_sched) > 0l || n_queued(g_sched) > 0l || g_asr_pending > 0) {
+        return resp |> JSON(
+            error_body("streams are active — contended numbers are misleading; drain first, then bench", "invalid_request_error"),
+            http_status.CONFLICT)
+    }
+    g_bench_state = "running"
+    delete g_bench_log
+    g_bench_result_json = ""
+    let daslang_bin = g_daslang_bin
+    let lcpp_bin = g_lcpp_bin
+    let model_path = g_config_model_path
+    let threads = get_dispatch_worker_limit() > 0 ? get_dispatch_worker_limit() : 16
+    var events_capture = g_bench_events
+    new_thread() <| @capture(= daslang_bin, = lcpp_bin, = model_path, = threads, = events_capture) {
+        bench_worker(daslang_bin, lcpp_bin, model_path, threads, events_capture)
+    }
+    to_log(LOG_INFO, "dasllama-server: benchmark started (quiesced) — ours then {lcpp_bin}\n")
+    return resp |> JSON("\{\"ok\":true,\"state\":\"running\"}", http_status.ACCEPTED)
+}
+
+def private handle_bench_get(var resp : HttpResponse?) : http_status {
+    var log_doc = JV(g_bench_log)
+    let log_json = write_json_compact(log_doc)
+    unsafe {
+        delete log_doc
+    }
+    let result = empty(g_bench_result_json) ? "null" : g_bench_result_json
+    return resp |> JSON(
+        "\{\"state\":{json_str(g_bench_state)},\"log\":{log_json},\"result\":{result},\"hardware\":{json_str(g_hardware_line)}}",
+        http_status.OK)
+}
+
 var private g_hardware_line = ""   // "<cpu> · N worker lanes · <gpu>" — composed once at init_server
 
 // The CPU marketing name: registry on Windows, /proc/cpuinfo on Linux, sysctl on macOS.
@@ -1373,7 +1540,7 @@ let private CONFIG_KEY_KINDS <- {
     "gpu_dense" => "b", "gpu_vram_mb" => "i", "asr" => "s", "mmproj" => "s", "asr_workers" => "i",
     "ctx" => "i", "max_tokens" => "i", "streams" => "i", "threads" => "i", "team_dispatch" => "s",
     "affinity" => "i", "chunk" => "i", "page_rows" => "i", "prefix" => "i", "flat" => "b",
-    "mtp" => "b"
+    "mtp" => "b", "lcpp_bin" => "s"
 }
 
 def private json_str(s : string) : string {
@@ -1790,6 +1957,12 @@ class OpenAiServer : HvWebServer {
         POST("/config") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_config_save(req, resp)
         }
+        POST("/bench") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_bench_start(resp)
+        }
+        GET("/bench") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_bench_get(resp)
+        }
         POST("/restart") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!g_shutdown_requested) {
                 to_log(
@@ -1862,6 +2035,9 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     to_log(LOG_INFO, "dasllama-server: jobque compute dispatch = {dispatch_mode}\n")
     g_asr_jobs = unsafe(channel_create())
     g_asr_events = unsafe(channel_create())
+    g_bench_events = unsafe(channel_create())
+    g_bench_state = "idle"
+    g_bench_result_json = ""
     start_asr_worker_threads()
     var pfx = prefix_groups
     if (page_rows > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
@@ -1904,6 +2080,7 @@ def update_server() : bool {
     }
     g_server->tick()   // drains queued handlers: requests parse + render + submit here
     drain_asr_events(g_server.server)
+    drain_bench_events()
     reap_disconnected(g_server.server)
     let t_step = ref_time_ticks()
     let busy = scheduler_step(g_model, g_sched, g_events)
@@ -1951,8 +2128,10 @@ def shutdown_server() {
     delete g_asr_wires
     var asr_jobs = g_asr_jobs
     var asr_events = g_asr_events
+    var bench_events = g_bench_events
     g_asr_jobs = null
     g_asr_events = null
+    g_bench_events = null
     unsafe {
         if (asr_jobs != null) {
             asr_jobs |> channel_remove
@@ -1960,7 +2139,11 @@ def shutdown_server() {
         if (asr_events != null) {
             asr_events |> channel_remove
         }
+        if (bench_events != null) {
+            bench_events |> channel_remove
+        }
     }
+    delete g_bench_log
     if (g_mtp_spec_changed) {
         set_mtp_spec(g_prev_mtp_spec)   // a /shutdown + restart in the same context starts from a clean gate
         g_mtp_spec_changed = false

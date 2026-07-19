@@ -19,6 +19,21 @@ override); capability guard (`supported` + `reason` recorded at load); `gpu_tier
 Verified: toml 108/108, server 17/17 live, vulkan tier 12/12, e2e restart loop (CLI-beats-toml
 → save authoritative → exit 4 → relaunch → toml-beats-CLI), page behavior via mock+playwright.
 
+**S8 BUILT, BLOCKED ON AN ENGINE-SEAM CRASH (2026-07-19):** `lcpp_bin` config key end-to-end;
+quiesced-only `POST /bench` (409 while streams active, 400 without lcpp_bin / on standalone
+exe); worker THREAD (never jobque jobs — those are the LLM team's) runs our `lcpp_bench` child
+then `llama-bench`, progress/results over a channel the tick loop drains; child tune-restart
+(exit 3) relaunched once; `GET /bench` state/log/result; page panel with the A/B table.
+**BLOCKER:** the server process dies SILENTLY (exit 127, no exception, no dump, log tee stops)
+seconds after the worker's SECOND popen_argv child (llama-bench) spawns — 5/5 reproductions.
+Exonerated by bisection: /bench HTTP polling (dies without it), popen's job-object/watchdog
+machinery (timeout 0 dies too), GC (gated off — dies), jobque team shape + double-spawn + -jit
+(a probe with the identical worker/children but no libhv/serving loop SURVIVES, full-size),
+llama-bench beside an idle server (fine). First child completes + parses every time (ours
+pp512 ≈ 510-600, tg128 ≈ 42-46 on tinyllama, hot box). Remaining delta = libhv serving loop /
+full server state. Boris to call fix-vs-workaround (candidate workaround: a bench_runner.das
+child that runs BOTH benches itself, so the server does ONE spawn — one spawn is proven safe).
+
 **S7 + S10 DONE (2026-07-19):** `demo_load.das` (clargs; staged ramp 1→2→4→8 default, `-n`
 constant, `-r` per-stage requests; per-request status lines) — live run 15/15 × 200 against
 tinyllama with all 4 swimlane lanes lit + queued strip at the 8-worker stage. Reveal footer:
