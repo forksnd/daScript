@@ -484,8 +484,9 @@ def test_metal_prefill_kernels(t : T?) {
     }
 }
 
-// The classifier GEMV kernel on exact-arithmetic data: [d x n] Q8 rows dot one f32 vector vs
-// a direct CPU dot, BIT-exact (see the call site for why exactness holds).
+// The classifier GEMV kernel on exact-arithmetic data: [d x n] Q8 rows (the 34B blob form —
+// half scale + 32 int8, mulmm_gate's layout) dot one f32 vector vs a direct CPU dot,
+// BIT-exact (see the call site for why exactness holds; pow2 scales are exact in f16).
 def private gemv_gate(t : T?; dev, queue; n, d : int) {
     var err : string
     var pso = pipeline_from_source(dev, metal_q8_gemv_msl, metal_q8_gemv_msl_entry, metal_q8_gemv_msl_fastmath, err)
@@ -519,16 +520,27 @@ def private gemv_gate(t : T?; dev, queue; n, d : int) {
         }
         want[r] = acc
     }
-    var bwq = buf_upload(dev, wq)
-    var bws = buf_upload(dev, ws)
+    // W blob: 34-byte blocks, built straight in the buffer (bound TWICE — half + byte views)
+    var bw = metal_new_buffer(dev, uint64(d * nblk * 34))
+    unsafe {
+        var base = reinterpret<int8?>(metal_buffer_contents(bw))
+        for (b in range(d * nblk)) {
+            let off = b * 34
+            var ph = reinterpret<float16?>(base + off)
+            ph[0] = float16(ws[b])
+            for (c in range(32)) {
+                base[off + 2 + c] = wq[b * 32 + c]
+            }
+        }
+    }
     var bx = buf_upload(dev, xv)
     var by = buf_fill(dev, d, -1000.0)
     var bn = buf_u32(dev, uint(n))
     var bd = buf_u32(dev, uint(d))
     let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso)
-        metal_set_buffer(enc, bwq, 0ul, 0)
-        metal_set_buffer(enc, bws, 0ul, 1)
+        metal_set_buffer(enc, bw, 0ul, 0)   // half-scale view
+        metal_set_buffer(enc, bw, 0ul, 1)   // byte view
         metal_set_buffer(enc, bx, 0ul, 2)
         metal_set_buffer(enc, by, 0ul, 3)
         metal_set_buffer(enc, bn, 0ul, 4)
@@ -537,8 +549,7 @@ def private gemv_gate(t : T?; dev, queue; n, d : int) {
     }
     t |> success(ran, "gemv dispatch n={n} d={d}: {err}")
     t |> equal(buf_mismatch_exact(by, want), 0)
-    metal_release(bwq)
-    metal_release(bws)
+    metal_release(bw)
     metal_release(bx)
     metal_release(by)
     metal_release(bn)

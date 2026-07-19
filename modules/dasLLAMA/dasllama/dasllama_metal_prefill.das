@@ -2760,7 +2760,9 @@ def private pf_mm_shape64(t : Model) : bool {
 // existing rows gather into the K/V panels and the causal diagonal shifts by qoff — the gate
 // keeps the argument so future clauses can window it
 def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : MetalPrefillDecline {
-    if (npos < g_min_npos || npos > g_max_npos) {
+    // the npos window is a POLICY decline (short prefills were cheaper on the CPU) — a
+    // blob-only model has no CPU path, so the window collapses and the GPU serves any npos
+    if (!t.metal_blob && (npos < g_min_npos || npos > g_max_npos)) {
         return MetalPrefillDecline.npos_window
     }
     if (t.quant != QuantMode.q8) {
