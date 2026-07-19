@@ -143,6 +143,7 @@ struct ReleaseSpec {
     web_shell : string                  //!< optional emcc `--shell-file` HTML for `release wasm`; empty = daslang's minimal canvas shell
     wasm_build_command : string         //!< shell command that builds this EXTERNAL module's wasm archives (run with cwd = module dir); empty = in-tree module built by `daspkg build --wasm`
     wasm_archives : array<string>       //!< archives (relative to module dir) produced by wasm_build_command, staged into the release wasm lib dir
+    requires_jit : bool                 //!< app is JIT-only (per-box [tune]/[llvm_code] kernels); a baked -exe would run broken, so `daspkg release` refuses it
 }
 
 var _release_spec : ReleaseSpec
@@ -153,6 +154,13 @@ def release_name(name : string) {
 
 def release_main(script : string) {
     _release_spec.main_script = script
+}
+
+//! Mark the app JIT-only: its kernels are per-box JIT-compiled/tuned ([llvm_code]/[tune]) and a
+//! baked standalone -exe would run broken (or refuse to start). `daspkg release` then fails with
+//! a clear message instead of producing a dead binary. Such an app deploys as `daslang -jit <main>`.
+def release_requires_jit() {
+    _release_spec.requires_jit = true
 }
 
 //! Entry script for `daspkg release wasm` (the wasm64 build) when it differs from the native release_main() — e.g. a live_stub variant that drops the desktop live-reload stack (which can't cross-compile). Falls back to release_main() when unset.

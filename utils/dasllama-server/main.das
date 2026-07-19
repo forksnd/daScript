@@ -470,8 +470,11 @@ def parse_args() {
     g_args_parsed = true
     g_args_ready = false
     g_exit_code = 0
-    if (!jit_enabled() && !is_standalone_exe()) {
-        to_log(LOG_ERROR, "dasllama-server: run under the JIT — bin/daslang -jit utils/dasllama-server/main.das -- ...\n")
+    // JIT is mandatory: the kernels are per-box JIT-tuned [llvm_code], the tune framework needs
+    // a live JIT, and a baked standalone -exe additionally mis-wires shared-module [init] globals
+    // (the vulkan GPU-tier arm probe bakes null -> crash). There is no correct non-JIT path here.
+    if (!jit_enabled()) {
+        to_log(LOG_ERROR, "dasllama-server requires the JIT — run: daslang -jit main.das -- ... (a baked -exe is unsupported)\n")
         g_exit_code = 1
         request_exit()
         return
@@ -612,9 +615,16 @@ def init() {
     let team_dispatch = dispatch_mode != "inline"
     let asr_team_dispatch = dispatch_mode == "team"
     // matmul dispatch lane cap: LLM decode saturates memory bandwidth long before big core
-    // counts, and an uncapped dispatch fights every other process on the box. -1 = all cores.
+    // counts, and an uncapped dispatch fights every other process on the box. A negative config
+    // value maps to 0 here, which set_dispatch_worker_limit reads as "no limit" = all cores.
     let threads = g_cfg.threads > 0 ? g_cfg.threads : (g_cfg.threads < 0 ? 0 : 16)
     set_dispatch_worker_limit(threads)
+    // Cap the jobque WORKER count at construction from the config (total lanes = workers + the
+    // computing main, so `threads` lanes -> threads-1 workers, floored at 1 worker). Without this
+    // the queue spawns cores-1 workers on a big box and parks the surplus — which is why
+    // DAS_JOBQUE_THREADS used to be mandatory. Must land before the jobque exists, same as affinity
+    // below; the env still overrides. threads<=0 means "all cores" -> cap 0 (off, the stock default).
+    set_jobque_threads_cap(threads > 0 ? max(1, threads - 1) : 0)
     // worker CPU affinity — must land before the jobque exists (applied at worker spawn)
     set_jobque_affinity(g_cfg.affinity)
     let lanes_desc = threads > 0 ? "{threads}" : "all"

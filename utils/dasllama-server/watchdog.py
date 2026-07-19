@@ -44,17 +44,22 @@ WER_LOCAL_DUMPS = r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDump
 
 
 def find_daslang() -> Path:
-    names = (
+    # dasllama-server is JIT-only (per-box [tune]/[llvm_code] kernels), so the watchdog always
+    # runs `daslang -jit main.das`, never a baked exe. Prefer a daslang inside a deployed JIT
+    # bundle (bin/Release beside this script — the layout getDasRoot() resolves the bundle from),
+    # then the source-repo build tree, then bare name on PATH.
+    rel = (
         "bin/Release/daslang.exe",
         "bin/daslang.exe",
         "bin/Release/daslang",
         "bin/daslang",
         "build/daslang",
     )
-    for name in names:
-        candidate = SOURCE_REPO_ROOT / name
-        if candidate.is_file():
-            return candidate
+    for root in (SCRIPT_DIR, SOURCE_REPO_ROOT):
+        for name in rel:
+            candidate = root / name
+            if candidate.is_file():
+                return candidate
     return Path("daslang.exe" if IS_WINDOWS else "daslang")
 
 
