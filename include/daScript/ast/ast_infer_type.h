@@ -551,6 +551,7 @@ namespace das {
         virtual void preVisitLetInit(ExprLet *expr, const VariablePtr &var, Expression *init) override;
         bool isEmptyInit(const VariablePtr &var) const;
         virtual VariablePtr visitLet(ExprLet *expr, const VariablePtr &var, bool last) override;
+        ExpressionPtr promoteStringInitToClone(const VariablePtr &var);
         ExpressionPtr promoteToCloneToMove(const VariablePtr &var);
         bool canRelaxAssign(Expression *init) const;
         virtual ExpressionPtr visitLetInit(ExprLet *expr, const VariablePtr &var, Expression *init) override;

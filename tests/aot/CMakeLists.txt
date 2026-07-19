@@ -639,6 +639,7 @@ SET(AOT_LANGUAGE_MODULE_FILES
     tests/language/_lambda_vis_mid.das
     tests/language/_operators_derived.das
     tests/language/_operators_parent.das
+    tests/language/_string_clone_init_helper.das
 )
 
 add_custom_target(test_aot_algorithm)

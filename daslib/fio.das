@@ -650,9 +650,9 @@ def run_and_capture(args : array<string>; var output : string&; timeout_sec : fl
     var captured : string
     let exit_code = unsafe(popen_argv(args, timeout_sec, $(f) {
         if (f != null) {
-            captured := unsafe(fread_to_eof(f))
+            captured = unsafe(fread_to_eof(f))
         }
     }))
-    output := captured
+    output = captured
     return exit_code
 }

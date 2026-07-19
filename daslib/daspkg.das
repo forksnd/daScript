@@ -49,7 +49,7 @@ def package_license(license : string) {
 }
 
 def package_tag(tag : string) {
-    _pkg_meta.tags |> push_clone(tag)
+    _pkg_meta.tags |> push(tag)
 }
 
 def package_tags(tags : array<string>) {
