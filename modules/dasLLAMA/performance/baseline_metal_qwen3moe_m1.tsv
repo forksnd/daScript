@@ -5,6 +5,18 @@ q4km	tg128_b2	87.57	llama-batched-bench -npp 512 -ntg 128
 q4km	tg128_b4	111.55	llama-batched-bench
 q4km	tg128_b8	128.43	llama-batched-bench
 q4km	tg128_b16	143.99	llama-batched-bench
+q5km	pp512	783.83	llama-bench -r 1 (local requant from Q8, --allow-requantize)
+q5km	tg128_b1	62.80	llama-bench -r 1
+q5km	tg128_b2	70.58	llama-batched-bench
+q5km	tg128_b4	91.53	llama-batched-bench
+q5km	tg128_b8	103.09	llama-batched-bench
+q5km	tg128_b16	113.22	llama-batched-bench
+q6k	pp512	837.07	llama-bench -r 1 (local requant from Q8, --allow-requantize)
+q6k	tg128_b1	68.32	llama-bench -r 1
+q6k	tg128_b2	77.78	llama-batched-bench
+q6k	tg128_b4	99.23	llama-batched-bench
+q6k	tg128_b8	113.93	llama-batched-bench
+q6k	tg128_b16	126.35	llama-batched-bench
 q8	pp512	963.82	llama-bench -r 1
 q8	tg128_b1	54.86	llama-bench -r 1
 q8	tg128_b2	68.58	llama-batched-bench

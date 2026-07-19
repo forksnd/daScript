@@ -32,6 +32,33 @@ First MoE-on-Metal board: single-stream and the B>=4 ladder land within the pari
 on the very first measurement pass; B=2 leads 1.13x. pp512 0.93x — the gathered expert
 mul_mm chain runs unfused with a serial CSR build per layer (perf ledger).
 
+### Q5_K_M (local requant from Q8; k5 gate/up + k6 down — parity smoke 24/24 token-exact)
+
+| shape | das tok/s | lcpp tok/s | das/lcpp |
+| :--- | ---: | ---: | ---: |
+| pp512 | 707.0 | 783.8 | 0.90x |
+| tg128 B=1 | 57.8 | 62.8 | 0.92x |
+| tg128 B=2 | 83.9 | 70.6 | **1.19x** |
+| tg128 B=4 | 99.7 | 91.5 | **1.09x** |
+| tg128 B=8 | 109.1 | 103.1 | **1.06x** |
+| tg128 B=16 | 120.6 | 113.2 | **1.07x** |
+
+Batch ladder all green; B=1 0.92x is the k5 single-stream class (the 4B chase's b1c
+select-form pick does not yet apply to the expert-indexed twin — perf ledger).
+
+### Q6_K (local requant from Q8; pure-k6 stacks — parity smoke 24/24 token-exact)
+
+| shape | das tok/s | lcpp tok/s | das/lcpp |
+| :--- | ---: | ---: | ---: |
+| pp512 | 728.9 | 837.1 | 0.87x |
+| tg128 B=1 | 68.1 | 68.3 | 1.00x |
+| tg128 B=2 | 102.4 | 77.8 | **1.32x** |
+| tg128 B=4 | 120.6 | 99.2 | **1.22x** |
+| tg128 B=8 | 134.0 | 113.9 | **1.18x** |
+| tg128 B=16 | 145.6 | 126.4 | **1.15x** |
+
+B=1 dead-even, the whole batch ladder green 1.15-1.32x.
+
 ### Q8_0 (q8 expert stacks through the 34B blob rail)
 
 | shape | das tok/s | lcpp tok/s | das/lcpp |
