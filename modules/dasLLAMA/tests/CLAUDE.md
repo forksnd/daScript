@@ -48,8 +48,24 @@ fam-gemma4 is DASLLAMA_PARITY_FULL-gated — 7.4GB). The
 `kernels` suite (test_metal_prefill_kernels — model-less kernel units, ~80s) has no arms;
 remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
-carrier, model-free, runs in CI) `smol tower whisper voxtral`; the voxtral arm re-saves a
-5.4 GB image from cold every run by design (it IS the >2 GiB-plane IO coverage).
+carrier, model-free, runs in CI) `smol metal tower whisper voxtral`; the voxtral arm re-saves a
+5.4 GB image from cold every run by design (it IS the >2 GiB-plane IO coverage); the `metal`
+arm mints/maps the blob-only metal flavor (SmolLM2) incl. the CPU-tripwire and a
+teacher-forced logits-tolerance parity cell (greedy token equality is NOT a valid bar on a
+135M — genuine near-ties flip on ~0.02 gaps under ~0.75 cross-backend noise).
+
+## Blob-only Metal fixtures (the two-model pattern)
+
+The Metal drivers serve ONLY blob-form models (`convert_model_to_metal_blob` /
+metal-flavor images), and CPU inference on a blob model PANICS. Every CPU-vs-GPU arm
+therefore runs a PLANAR model for CPU stages and its `blob_twin(t, path, seq_cap)` for
+override-selected stages — sessions are geometry-bound, so one session spans both models
+(CPU prefill on the planar model, GPU decode on the twin, etc.). Decline-reason cells keep
+the planar model: capability reasons (`feature`, `graph`, `shape`, ...) out-rank the
+`planar` decline in every gate, and the planar CPU fallback serves quietly. The prefill
+npos POLICY window is planar-only now (a blob model serves any npos — no CPU fallback
+exists); the legacy quantized-X prefill rail is dead (`set_metal_prefill_mulmm_legacy`
+forces a `planar` capability decline — the required-mode panic cell uses it).
 
 ## Family filter (profiling cadence)
 

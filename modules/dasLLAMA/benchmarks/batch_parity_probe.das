@@ -225,6 +225,19 @@ def main() : int {
     var t <- load_model(cfg.model, QuantMode.q8)
     t.config.seq_len = min(t.config.seq_len, 1024l)   // B=16's deepest stream (30+7*15 numbers) needs ~500 + steps
     print("config: dim={t.config.dim} layers={t.config.n_layers} vocab={t.config.vocab_size}  backend {active_kernel_backend()}\n")
+    // the replay half rides the blob-only drivers: a second facade load under metal mode maps
+    // (or mints) the METAL flavor beside the planar truth model — flavors are self-sufficient
+    var tg = Model()
+    if (!cfg.truth_only) {
+        set_metal_mode(MetalMode.when_available)
+        var tg2 <- load_model(cfg.model, QuantMode.q8)
+        set_metal_mode(MetalMode.off)   // overrides select per phase below
+        tg <- tg2
+        tg.config.seq_len = min(tg.config.seq_len, 1024l)
+        if (!tg.metal_blob) {
+            print("WARNING: the replay model is NOT blob-form (a CPU-flavor .dlim?) — the GPU replay will decline `planar` and run on the CPU\n")
+        }
+    }
     var rc = 0
     with_job_que() {
         setup_dasllama_jobque_()
@@ -261,7 +274,7 @@ def main() : int {
             select_prefill_override("metal")
             select_decode_override("metal")
             var sink2 : array<int64>
-            var gpu <- teacher_logits(t, nb, nsteps, feeds, sink2)
+            var gpu <- teacher_logits(tg, nb, nsteps, feeds, sink2)
             select_prefill_override("")
             select_decode_override("")
             delete sink2
@@ -281,5 +294,6 @@ def main() : int {
         }
     }
     delete t
+    delete tg
     return rc
 }

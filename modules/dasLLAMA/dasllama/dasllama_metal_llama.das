@@ -117,12 +117,14 @@ def private decode_decline(t : Model; s : Session; pos : int64) : MetalDecodeDec
     if (s.uid == 0ul) {
         return MetalDecodeDecline.no_uid
     }
-    if (!t.metal_blob) {
-        return MetalDecodeDecline.planar
-    }
     let shape = decode_shape_decline(t, DECODE_NEEDS_OK)
     if (shape != MetalDecodeDecline.none) {
         return shape
+    }
+    // AFTER the capability gates: a planar model still reports its capability reason (the
+    // support matrix asserts those); only a fully-servable planar load declines `planar`
+    if (!t.metal_blob) {
+        return MetalDecodeDecline.planar
     }
     // forward() built this position's rope row(s) right before the hook (dual-rope: both
     // classes, each at ITS class's width — gemma4 swa rows are hs_swa/2)
@@ -1078,9 +1080,6 @@ var private g_b_ulays : array<MetalBuffer?>   // per-layer uniforms, pooled per 
 // attention depth cap with a real uid, per-row rope rows built, and dim within the add+rms row
 // slabs (GEMM path caps at 3072, fixed-B GEMV at ADD_RMS_MAX_DIM — B >= 5 on a wider model declines)
 def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : array<Session?>; nrows : int64) : MetalDecodeDecline {
-    if (t.quant == QuantMode.q8 && !t.metal_blob) {
-        return MetalDecodeDecline.planar   // the drivers are blob-only (load via metal-mode load_model)
-    }
     // kquant batch: the interim path serves B <= 8 via per-stream plane GEMVs (the fused/GEMM
     // kq twins are the W4 tail). Each fused site must be format-uniform in CLASS per layer
     // (all-q8 or all-kq — real K-quant files are; a mixed qkv/w13 site has no batched form),
@@ -1116,6 +1115,10 @@ def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : arra
     let shape = decode_shape_decline(t, BATCH_NEEDS_OK)
     if (shape != MetalDecodeDecline.none) {
         return shape
+    }
+    // AFTER the capability gates — see decode_decline's planar clause
+    if (!t.metal_blob) {
+        return MetalDecodeDecline.planar
     }
     let c = t.config
     let kdt = ws.scr.kv_dtype_k

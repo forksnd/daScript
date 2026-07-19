@@ -166,6 +166,11 @@ def private run_chase(cfg) {   // untyped param = generic — non-Apple builds n
     let n = max(int64(cfg.ngen), 1l)
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, QuantMode.q8)
+    if (!convert_model_to_metal_blob(t)) {   // the drivers are blob-only
+        print("metal-blob transform declined — the drivers cannot serve this load\n")
+        delete t
+        return
+    }
     let ctx_cap = max(2048l, max(p, p2) + n + 16l)
     t.config.seq_len = min(t.config.seq_len, ctx_cap)   // cap the KV allocation
     let c = t.config

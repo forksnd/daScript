@@ -2783,14 +2783,6 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
             return MetalPrefillDecline.wscale_f16
         }
     }
-    // the drivers are BLOB-ONLY: a planar q8 model (engine-direct load outside the metal
-    // flavor) has no upload path — load through load_model under metal mode, or call
-    // convert_model_to_metal_blob. And a blob model rides the mul_mm rail exclusively: the
-    // legacy quantized-X rail reads the planar scale planes a blob model no longer carries.
-    if (!t.metal_blob || g_mm_legacy || get_env_variable("DASLLAMA_METAL_MULMM") == "0" ||
-            !pf_mm_shape64(t)) {
-        return MetalPrefillDecline.planar
-    }
     // the drivers encode the std dense stack; the block set declares the graph shape
     // (attn_is_std / ffn_is_dense) — MoE, recurrent, and custom-attention arches decline here
     if (!t.blocks.attn_is_std || !t.blocks.ffn_is_dense) {
@@ -2819,6 +2811,14 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
         if (t.kv_src[l] != l || layer_hidden(t, l) != hidden) {
             return MetalPrefillDecline.layers
         }
+    }
+    // AFTER the capability gates (the support matrix asserts capability reasons): the drivers
+    // are BLOB-ONLY — a planar q8 model has no upload path (load through metal-mode load_model
+    // or convert_model_to_metal_blob), and a blob model rides the mul_mm rail exclusively
+    // (the legacy quantized-X rail read the planar scale planes a blob model no longer carries)
+    if (!t.metal_blob || g_mm_legacy || get_env_variable("DASLLAMA_METAL_MULMM") == "0" ||
+            !pf_mm_shape64(t)) {
+        return MetalPrefillDecline.planar
     }
     // the rope table(s) are the kernel's input — forward_prefill_body builds them right before
     // the hook (dual-rope: the sliding class's rows too, at THAT class's width)
