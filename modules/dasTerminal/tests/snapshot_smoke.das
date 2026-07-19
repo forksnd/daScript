@@ -41,7 +41,7 @@ def main {
     let exit_code = terminal_exit_code(failed)
     let terminated = terminal_terminate(failed)
     assert(poll_status == TerminalPollStatus.error)
-    assert(length(transport_error) > 0)
+    assert(!empty(transport_error))
     assert(!process_exited)
     assert(exit_code == -1l)
     assert(!terminated)
