@@ -5688,6 +5688,8 @@ var g_pso_moe_combine : MetalComputePipeline?  // weighted top-k reduce into the
 var g_pso_g4rnorm : MetalComputePipeline?      // gemma4 MoE router-input norm (stage 3)
 var g_pso_moe_wscale : MetalComputePipeline?   // gemma4 per-expert down-scale fold
 var g_pso_swiglu_oai : MetalComputePipeline?   // gpt-oss clamped swiglu (stage 4)
+var g_pso_moe_gemv_mx4 : MetalComputePipeline?  // gpt-oss MXFP4 expert GEMV
+var g_e8m0_tab : MetalBuffer?                   // [256] exact e8m0_half scales
 var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
 var g_pso_qkvrs32 : MetalComputePipeline?
 var g_pso_w13sw : MetalComputePipeline?
@@ -5813,6 +5815,14 @@ def metal_decode_init : bool {
     g_pso_g4rnorm = compile_pso(metal_g4_router_norm_msl, metal_g4_router_norm_msl_entry, metal_g4_router_norm_msl_fastmath, ok)
     g_pso_moe_wscale = compile_pso(metal_moe_wscale_msl, metal_moe_wscale_msl_entry, metal_moe_wscale_msl_fastmath, ok)
     g_pso_swiglu_oai = compile_pso(metal_swiglu_oai_msl, metal_swiglu_oai_msl_entry, metal_swiglu_oai_msl_fastmath, ok)
+    g_pso_moe_gemv_mx4 = compile_pso(metal_moe_gemv_mx4_msl, metal_moe_gemv_mx4_msl_entry, metal_moe_gemv_mx4_msl_fastmath, ok)
+    g_e8m0_tab = metal_new_buffer(g_dev, 1024ul)
+    unsafe {
+        var ep = reinterpret<uint?>(metal_buffer_contents(g_e8m0_tab))
+        for (ei in range(256)) {
+            ep[ei] = ei < 2 ? (0x00200000u << uint(ei)) : (uint(ei - 1) << 23u)
+        }
+    }
     g_pso_copy_row = compile_pso(metal_copy_row_msl, metal_copy_row_msl_entry, metal_copy_row_msl_fastmath, ok)
     g_pso_emb = compile_pso(metal_embed_q8_msl, metal_embed_q8_msl_entry, metal_embed_q8_msl_fastmath, ok)
     g_pso_emb_k6 = compile_pso(metal_embed_k6_msl, metal_embed_k6_msl_entry, metal_embed_k6_msl_fastmath, ok)
@@ -6319,6 +6329,30 @@ def enc_moe_wscale(enc : MetalComputeEncoder?; bsel, bds, bnk : MetalBuffer?; ns
     metal_set_buffer(enc, bds, 0ul, 2)
     metal_set_buffer(enc, bnk, 0ul, 3)
     metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
+}
+
+// the MXFP4 expert site (gpt-oss): the mx4 planes bind at the layer stack's byte offsets;
+// bwb/bhasb = the layer's per-expert bias slab (identity g_one + g_zero when absent)
+def enc_moe_gemv_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, rows, k, nst : int64;
+                     bx, by, bn, bd, bsel, beblk, bxs, bss, bbxs, bbys, bwb, bhasb : MetalBuffer?; yoff : uint64 = 0ul) {
+    let mp = mx4_of(g_dev, t, stack_off)
+    metal_set_pipeline(enc, g_pso_moe_gemv_mx4)
+    metal_set_buffer(enc, mp.qbuf, mp.qoff, 0)
+    metal_set_buffer(enc, mp.sbuf, mp.soff, 1)
+    metal_set_buffer(enc, bx, 0ul, 2)
+    metal_set_buffer(enc, by, yoff, 3)
+    metal_set_buffer(enc, bn, 0ul, 4)
+    metal_set_buffer(enc, bd, 0ul, 5)
+    metal_set_buffer(enc, bsel, 0ul, 6)
+    metal_set_buffer(enc, beblk, 0ul, 7)
+    metal_set_buffer(enc, bxs, 0ul, 8)
+    metal_set_buffer(enc, bss, 0ul, 9)
+    metal_set_buffer(enc, bbxs, 0ul, 10)
+    metal_set_buffer(enc, bbys, 0ul, 11)
+    metal_set_buffer(enc, bwb, 0ul, 12)
+    metal_set_buffer(enc, bhasb, 0ul, 13)
+    metal_set_buffer(enc, g_e8m0_tab, 0ul, 14)
+    metal_dispatch_threadgroups(enc, uint3(uint((rows + g_gemv_rows - 1l) / g_gemv_rows), uint(k), uint(nst)), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
 }
 
 def enc_moe_combine(enc : MetalComputeEncoder?; bdn, bsel, by, bdim, bnk : MetalBuffer?; dim, nst : int64) {
@@ -7116,6 +7150,11 @@ def metal_kernels_release {
     release_pso(g_pso_g4rnorm)
     release_pso(g_pso_moe_wscale)
     release_pso(g_pso_swiglu_oai)
+    release_pso(g_pso_moe_gemv_mx4)
+    if (g_e8m0_tab != null) {
+        metal_release(g_e8m0_tab)
+        g_e8m0_tab = null
+    }
     if (g_pso_qkvrs16 != null) {
         metal_release(g_pso_qkvrs16)
         g_pso_qkvrs16 = null

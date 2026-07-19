@@ -3648,6 +3648,9 @@ var private g_pf_pso_moe_mm_k6 : MetalComputePipeline?
 var private g_pf_pso_g4rnorm : MetalComputePipeline?   // gemma4 MoE router-input norm (stage 3)
 var private g_pf_pso_moe_wscale : MetalComputePipeline?
 var private g_pf_pso_swiglu_oai : MetalComputePipeline?
+var private g_pf_pso_moe_mm_mx4 : MetalComputePipeline?
+var private g_pf_pso_moe_bias_rows : MetalComputePipeline?
+var private g_pf_e8m0_tab : MetalBuffer?
 var private g_mm_legacy = false             // set_metal_prefill_mulmm_legacy — tests' exact-parity rail
 var private g_pf_logits_cpu = false            // set_metal_prefill_logits_cpu — the logits A/B rail
 // timing-attribution knockout (DASLLAMA_METAL_PREFILL_SKIP=attn|gemm|ew|nongemm): skips encoding
@@ -3774,7 +3777,8 @@ def public metal_prefill_shutdown {
     for (pso in [g_pso_kq_mm4, g_pso_kq_mm5, g_pso_kq_mm6, g_pf_pso_kq4, g_pf_pso_kq5, g_pf_pso_kq6,
                  g_pf_pso_moe_router, g_pf_pso_moe_select, g_pf_pso_moe_count, g_pf_pso_moe_prefix,
                  g_pf_pso_moe_bucket, g_pf_pso_moe_reduce, g_pf_pso_moe_mm_q8, g_pf_pso_moe_mm_k4,
-                 g_pf_pso_moe_mm_k5, g_pf_pso_moe_mm_k6, g_pf_pso_g4rnorm, g_pf_pso_moe_wscale, g_pf_pso_swiglu_oai]) {
+                 g_pf_pso_moe_mm_k5, g_pf_pso_moe_mm_k6, g_pf_pso_g4rnorm, g_pf_pso_moe_wscale, g_pf_pso_swiglu_oai,
+                 g_pf_pso_moe_mm_mx4, g_pf_pso_moe_bias_rows]) {
         if (pso != null) {
             metal_release(pso)
         }
@@ -3798,6 +3802,12 @@ def public metal_prefill_shutdown {
     g_pf_pso_g4rnorm = null
     g_pf_pso_moe_wscale = null
     g_pf_pso_swiglu_oai = null
+    g_pf_pso_moe_mm_mx4 = null
+    g_pf_pso_moe_bias_rows = null
+    if (g_pf_e8m0_tab != null) {
+        metal_release(g_pf_e8m0_tab)
+        g_pf_e8m0_tab = null
+    }
     if (g_pso_qkmm != null) {
         metal_release(g_pso_qkmm)
         g_pso_qkmm = null
@@ -3894,6 +3904,15 @@ def private metal_prefill_init : bool {
     g_pf_pso_g4rnorm = pf_compile_pso(metal_g4_router_norm_msl, metal_g4_router_norm_msl_entry, metal_g4_router_norm_msl_fastmath, ok)
     g_pf_pso_moe_wscale = pf_compile_pso(metal_moe_wscale_msl, metal_moe_wscale_msl_entry, metal_moe_wscale_msl_fastmath, ok)
     g_pf_pso_swiglu_oai = pf_compile_pso(metal_swiglu_oai_msl, metal_swiglu_oai_msl_entry, metal_swiglu_oai_msl_fastmath, ok)
+    g_pf_pso_moe_mm_mx4 = pf_compile_pso(metal_moe_mulmm_mx4_msl, metal_moe_mulmm_mx4_msl_entry, metal_moe_mulmm_mx4_msl_fastmath, ok)
+    g_pf_pso_moe_bias_rows = pf_compile_pso(metal_moe_bias_rows_msl, metal_moe_bias_rows_msl_entry, metal_moe_bias_rows_msl_fastmath, ok)
+    g_pf_e8m0_tab = metal_new_buffer(g_pf_dev, 1024ul)
+    unsafe {
+        var ep = reinterpret<uint?>(metal_buffer_contents(g_pf_e8m0_tab))
+        for (ei in range(256)) {
+            ep[ei] = ei < 2 ? (0x00200000u << uint(ei)) : (uint(ei - 1) << 23u)
+        }
+    }
     if (!ok) {
         metal_prefill_shutdown()
         g_pf_failed = true
@@ -4220,6 +4239,41 @@ def private pf_enc_moe_mm(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; st
 }
 
 // gemma4 router-input norm rows (weightless rms * 1/sqrt(dim) * rscale, one tg per position)
+// the MXFP4 gathered expert mul_mm (gpt-oss)
+def private pf_enc_moe_mm_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, rows, npos : int64;
+                              bx, by, bkdim, bndim, bcnt, bbase, bbkt, beblk, bnk, bgather : MetalBuffer?) {
+    let tiles = (npos + 31l) / 32l
+    let ne = t.config.n_expert
+    let mp = mx4_of(g_pf_dev, t, stack_off)
+    metal_set_pipeline(enc, g_pf_pso_moe_mm_mx4)
+    metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_mx4_msl_tgmem, 0)
+    metal_set_buffer(enc, mp.qbuf, mp.qoff, 0)
+    metal_set_buffer(enc, mp.sbuf, mp.soff, 1)
+    metal_set_buffer(enc, bx, 0ul, 2)
+    metal_set_buffer(enc, by, 0ul, 3)
+    metal_set_buffer(enc, bkdim, 0ul, 4)
+    metal_set_buffer(enc, bndim, 0ul, 5)
+    metal_set_buffer(enc, bcnt, 0ul, 6)
+    metal_set_buffer(enc, bbase, 0ul, 7)
+    metal_set_buffer(enc, bbkt, 0ul, 8)
+    metal_set_buffer(enc, beblk, 0ul, 9)
+    metal_set_buffer(enc, bnk, 0ul, 10)
+    metal_set_buffer(enc, bgather, 0ul, 11)
+    metal_set_buffer(enc, g_pf_e8m0_tab, 0ul, 12)
+    metal_dispatch_threadgroups(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
+}
+
+// the per-expert bias over the padded bucket rows (ggml_add_id order — before the reduce)
+def private pf_enc_moe_bias_rows(enc : MetalComputeEncoder?; by, bwb, bcnt, bbase, bd : MetalBuffer?; d, npos, ne : int64) {
+    metal_set_pipeline(enc, g_pf_pso_moe_bias_rows)
+    metal_set_buffer(enc, by, 0ul, 0)
+    metal_set_buffer(enc, bwb, 0ul, 1)
+    metal_set_buffer(enc, bcnt, 0ul, 2)
+    metal_set_buffer(enc, bbase, 0ul, 3)
+    metal_set_buffer(enc, bd, 0ul, 4)
+    metal_dispatch_threadgroups(enc, uint3(uint((d + 255l) / 256l), uint(npos), uint(ne)), uint3(256u, 1u, 1u))
+}
+
 def private pf_enc_g4_router_norm(enc : MetalComputeEncoder?; bx, brs, by, bdim, beps, binvd : MetalBuffer?; npos : int64) {
     metal_set_pipeline(enc, g_pf_pso_g4rnorm)
     metal_set_threadgroup_memory_length(enc, metal_g4_router_norm_msl_tgmem, 0)

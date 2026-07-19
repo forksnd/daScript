@@ -282,6 +282,8 @@ struct private StepRes {
     u_moe_xs_dn : MetalBuffer? // the down site's per-slot x stride (nfe)
     bmoe_rt : MetalBuffer?     // gemma4: router-input row, reused as the routed-branch acc
     u_moe_invd : MetalBuffer?  // gemma4: 1/sqrt(dim) router scale
+    u_moe_gmode : MetalBuffer? // select gating mode (1 = gpt-oss softmax_weight)
+    u_hass : MetalBuffer?      // attention sinks present (binds hass on the attn dispatches)
     bytes_moe_lg : uint64
     bytes_moe_dn : uint64
     bytes_supp : uint64
@@ -410,6 +412,10 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
             r.bmoe_rt = pool_acquire(g_pool, g_dev, r.bytes_x)
             r.u_moe_invd = uniform_f32(1.0 / sqrt(float(dim)))
         }
+        r.u_moe_gmode = uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : 0u)
+    }
+    if (c.attn_sinks) {
+        r.u_hass = uniform_u32(1u)
     }
     // logits-on-GPU (default ON, DASLLAMA_METAL_LOGITS=0 pins the CPU classifier) mirrors the prefill gates
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
@@ -615,6 +621,10 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 // sliding layers bind `window` (wstart = cnt - window) + the first-live-chunk comb start, global bind 0; sliding only surfaces chunked (the gate pins window >= 128 >= the single-form ceiling)
                 var bwin = lsl ? r.u_winsl : r.u_zero32
                 var bchlo = lsl ? r.u_chlo : r.u_zero32
+                var bsnk : MetalBuffer?   // null = the enc defaults bind the identity
+                if (c.attn_sinks) {
+                    bsnk = upload_region(addr < void? >(t.fblob[t.sinks_off + l * n_heads]), uint64(n_heads * 4l))
+                }
                 if (r.chunked) {
                     if (r.kdt == KVDtype.q8_0) {
                         enc_attn_part_q8(enc, g_arena, g_arena, lkoff, lvoff,
@@ -626,17 +636,17 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                         enc_attn_part(enc, f16v, g_arena, g_arena, lkoff, lvoff,
                             r.bqkv, r.bpart, r.u_cnt, u_kvd_l, r.u_nh, u_kvm_l, u_hs_l, u_scale_l, r.u_nch, r.u_softcap, bwin, n_heads * nchunks, head_size)
                     }
-                    enc_attn_comb(enc, r.bpart, r.bxb, r.u_nch, r.u_nh, u_hs_l, bchlo, n_heads, head_size)
+                    enc_attn_comb(enc, r.bpart, r.bxb, r.u_nch, r.u_nh, u_hs_l, bchlo, n_heads, head_size, bsnk, r.u_hass)
                 } else {
                     if (r.kdt == KVDtype.q8_0) {
                         enc_attn_q8(enc, g_arena, g_arena, lkoff, lvoff,
-                            r.bqkv, r.bxb, r.u_cnt, u_nblk_l, r.u_nh, u_kvm_l, u_hs_l, u_scale_l, r.u_softcap, n_heads, head_size)
+                            r.bqkv, r.bxb, r.u_cnt, u_nblk_l, r.u_nh, u_kvm_l, u_hs_l, u_scale_l, r.u_softcap, n_heads, head_size, bsnk, r.u_hass)
                     } elif (r.kdt == KVDtype.tq4) {
                         enc_attn_tq4(enc, g_arena, g_arena, lkoff, lvoff,
-                            r.bqkv, r.bxb, r.u_cnt, u_nblk_l, r.u_nh, u_kvm_l, u_hs_l, u_scale_l, r.u_softcap, n_heads, head_size)
+                            r.bqkv, r.bxb, r.u_cnt, u_nblk_l, r.u_nh, u_kvm_l, u_hs_l, u_scale_l, r.u_softcap, n_heads, head_size, bsnk, r.u_hass)
                     } else {
                         enc_attn(enc, f16v, g_arena, g_arena, lkoff, lvoff,
-                            r.bqkv, r.bxb, r.u_cnt, u_kvd_l, r.u_nh, u_kvm_l, u_hs_l, u_scale_l, r.u_softcap, n_heads, head_size)
+                            r.bqkv, r.bxb, r.u_cnt, u_kvd_l, r.u_nh, u_kvm_l, u_hs_l, u_scale_l, r.u_softcap, n_heads, head_size, bsnk, r.u_hass)
                     }
                 }
                 if (r.kdt == KVDtype.tq4) {
@@ -646,6 +656,10 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             }
             if (g_skip != "gemv") {
                 enc_site_gemv(enc, t, kq_fmt_at(t.wo_fmt, l), t.wo_offs[l], dim, qd, r.bxb, r.bxb2, u_qd_l, r.u_dim)
+                if (c.attn_out_bias) {
+                    var bwo_b = upload_region(addr < void? >(t.bo[l * dim]), uint64(dim * 4l))
+                    enc_ew2(enc, g_pso_add, r.bxb2, 0ul, bwo_b, 0ul, r.u_dim, dim)
+                }
             }
             // ffn: [post-attn norm ->] fused add+norm -> W1|W3 -> swiglu/geglu -> W2 [-> post-ffn norm] -> fused add + next attn norm (pre_post_norm norms IN PLACE — the CPU order)
             if (g_skip != "ew") {
@@ -671,32 +685,58 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 }
                 if (g_skip != "gemv") {
                     var bw_rt = upload_region(addr < void? >(t.fblob[t.router_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
+                    var brb : MetalBuffer? = g_one
+                    var bhrb = r.u_zero32
+                    if (c.moe_router_bias) {
+                        brb = upload_region(addr < void? >(t.fblob[t.router_b_off + l * c.n_expert]), uint64(c.n_expert * 4l))
+                        bhrb = r.u_moe_gmode   // gpt-oss: gmode == 1 doubles as the has-bias flag
+                    }
                     if (g4) {
                         var bw_rs = upload_region(addr < void? >(t.fblob[t.moe_router_scale_off + l * dim]), uint64(dim * 4l))
                         enc_g4_router_norm(enc, r.bx, bw_rs, r.bmoe_rt, r.u_dim, r.u_eps, r.u_moe_invd, 1l)
-                        enc_moe_router(enc, bw_rt, r.bmoe_rt, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, g_one, r.u_zero32, c.n_expert, 1l)
+                        enc_moe_router(enc, bw_rt, r.bmoe_rt, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, brb, bhrb, c.n_expert, 1l)
                     } else {
-                        enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, g_one, r.u_zero32, c.n_expert, 1l)
+                        enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, brb, bhrb, c.n_expert, 1l)
                     }
-                    enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_zero32, 1l)
+                    enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_moe_gmode, 1l)
                     if (g4) {
                         var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
                         enc_moe_wscale(enc, r.bmoe_sel, bw_ds, r.u_moe_k, 1l)
                     }
-                    enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
-                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
-                        r.u_zero32, r.u_zero32, r.u_zero32)
-                    enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
-                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
-                        r.u_zero32, r.u_zero32, r.u_zero32, uint64(knfe * 4l))
+                    if (t.experts_mx4) {
+                        // gpt-oss: mx4 expert planes + per-expert biases fold into the twins
+                        var bwb1 = upload_region(addr < void? >(t.fblob[t.web1_off + l * c.n_expert * c.n_ff_exp]), uint64(c.n_expert * c.n_ff_exp * 4l))
+                        var bwb3 = upload_region(addr < void? >(t.fblob[t.web3_off + l * c.n_expert * c.n_ff_exp]), uint64(c.n_expert * c.n_ff_exp * 4l))
+                        enc_moe_gemv_mx4(enc, t, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
+                            r.u_dim, r.u_moe_nfe, r.bmoe_sel, r.u_moe_eblk, r.u_zero32,
+                            r.u_zero32, r.u_zero32, r.u_zero32, bwb1, r.u_moe_gmode)
+                        enc_moe_gemv_mx4(enc, t, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
+                            r.u_dim, r.u_moe_nfe, r.bmoe_sel, r.u_moe_eblk, r.u_zero32,
+                            r.u_zero32, r.u_zero32, r.u_zero32, bwb3, r.u_moe_gmode, uint64(knfe * 4l))
+                    } else {
+                        enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
+                            r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                            r.u_zero32, r.u_zero32, r.u_zero32)
+                        enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
+                            r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                            r.u_zero32, r.u_zero32, r.u_zero32, uint64(knfe * 4l))
+                    }
                 }
                 if (g_skip != "ew") {
-                    enc_ew2(enc, g4 ? g_pso_geglu : g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(knfe * 4l), r.u_moe_knfe, knfe)
+                    let pso_act = c.ffn_act == FfnAct.swiglu_oai ? g_pso_swiglu_oai : (g4 ? g_pso_geglu : g_pso_swiglu)
+                    enc_ew2(enc, pso_act, r.bh12, 0ul, r.bh12, uint64(knfe * 4l), r.u_moe_knfe, knfe)
                 }
                 if (g_skip != "gemv") {
-                    enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, 1l, r.bh12, r.bmoe_dn,
-                        r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
-                        r.u_zero32, r.u_zero32, r.u_zero32)
+                    if (t.experts_mx4) {
+                        var bwb2 = upload_region(addr < void? >(t.fblob[t.web2_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
+                        enc_moe_gemv_mx4(enc, t, t.we2_offs[l], dim, c.n_expert_used, 1l, r.bh12, r.bmoe_dn,
+                            r.u_moe_nfe, r.u_dim, r.bmoe_sel, r.u_moe_eblk, r.u_moe_xs_dn,
+                            r.u_zero32, r.u_zero32, r.u_zero32, bwb2, r.u_moe_gmode)
+                    } else {
+                        enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, 1l, r.bh12, r.bmoe_dn,
+                            r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
+                            r.u_zero32, r.u_zero32, r.u_zero32)
+                    }
                     enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, g4 ? r.bmoe_rt : r.bxb, r.u_dim, r.u_moe_k, dim, 1l)
                 }
                 if (g4) {
@@ -951,6 +991,10 @@ def private release_step(var r : StepRes) {
             pool_release(g_pool, r.bmoe_rt, r.bytes_x)
             pool_release(g_upool, r.u_moe_invd, 4ul)
         }
+        pool_release(g_upool, r.u_moe_gmode, 4ul)
+    }
+    if (r.u_hass != null) {
+        pool_release(g_upool, r.u_hass, 4ul)
     }
     r.valid = false
 }
