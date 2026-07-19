@@ -5,7 +5,7 @@ options stack = 131072   // several by-value Sessions per cell (test_batch_decod
 require dastest/testing_boost public
 require dasllama/dasllama   // nolint:STYLE029 — the public facade (engine + arch registrations + the metal overrides); off-Apple the static_if halves compile out and only its dasllama_common re-export stays referenced
 require dasllama/dasllama_math   // set_wscale_f16 — the wscale matrix axis
-require dasllama/dasllama_parity   // cached_ids/cached_vals — CPU references mapped like .dlim images
+require dasllama/dasllama_parity   // nolint:STYLE030 — cached_ids/cached_vals (CPU references mapped like .dlim images), used only inside the Apple static_if half
 require ?das_metal dasllama/dasllama_metal_llama  // nolint:STYLE030 — stats/declines/shutdown rails
 require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — prefill stats/declines rails
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — device probe + metal_live_object_count
@@ -583,13 +583,14 @@ def private cont_logits_cell(t : T?; tr, trg : Model; tag : string; tol : float)
 }
 
 [unused_argument(t, path, family, tag, expect_needs, want, kv2, cont_tol)]   // off-Apple the gated body is empty
-def private family_cells(t : T?; path, family, tag : string; expect_needs : MetalNeed; want : string;
+def private family_cells(t : T?; path, family, tag : string; expect_needs : uint; want : string;
                          kv2 : KVDtype = KVDtype.f16; cont_tol : float = 0.0) {
-    // one family's row: pin the metal_needs derivation bits, then the three path cells — each
-    // asserts ENGAGE ("") or DECLINE with the named need_* reason. Wave stages flip these.
-    // An ENGAGE row ("" cells) ALSO proves token parity: a metal-overrides generate must equal
-    // the CPU truth. kv2 != f16 adds a second cell row on that KV codec (its rope-store twin);
-    // cont_tol > 0 adds the continuation-prefill numeric cell (cont_logits_cell).
+    // one family's row: pin the metal_needs derivation bits (uint in the signature — MetalNeed
+    // does not exist off-Apple, and signatures compile on every platform), then the three path
+    // cells — each asserts ENGAGE ("") or DECLINE with the named need_* reason. Wave stages flip
+    // these. An ENGAGE row ("" cells) ALSO proves token parity: a metal-overrides generate must
+    // equal the CPU truth. kv2 != f16 adds a second cell row on that KV codec (its rope-store
+    // twin); cont_tol > 0 adds the continuation-prefill numeric cell (cont_logits_cell).
     static_if (typeinfo builtin_module_exists(das_metal)) {
         if (!family_on(t, family) || !arm_on(t, "fam-{family}") || !model_available(t, path)) {
             return
@@ -597,8 +598,9 @@ def private family_cells(t : T?; path, family, tag : string; expect_needs : Meta
         var tr <- load_model(path, QuantMode.q8)
         tr.config.seq_len = min(tr.config.seq_len, 512l)
         let derived = metal_needs(tr)
-        t |> success((uint(derived) & uint(expect_needs)) == uint(expect_needs),
-            "{tag}: metal_needs derives {expect_needs} (got {derived})")
+        let expected = MetalNeed(expect_needs)   // nolint:LINT005 — uint→named-bitfield relabel so the message prints bit NAMES
+        t |> success((uint(derived) & expect_needs) == expect_needs,
+            "{tag}: metal_needs derives {expected} (got {derived})")
         if (want == "") {
             // ENGAGE row: the cells + GPU generate ride the blob twin; the planar model keeps
             // the CPU truths (the ref-cache rail keys them by path)
@@ -983,33 +985,33 @@ def test_metal_family_matrix(t : T?) {
             // qwen3 = NEOX + QK-norm + qd != dim (0.6B: dim 1024, qd 2048) — ENGAGE since the
             // wave A norm prepass; the tq4 row proves the tq4 rope-store's NEOX partner (pow2 hs)
             family_cells(t, path_join(models_dir(), "Qwen3-0.6B-Q8_0.gguf"), "qwen3",
-                "qwen3-0.6b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim,
+                "qwen3-0.6b/q8/f16", uint(MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim),
                 "", KVDtype.tq4, 4.0)
             // the wave's showcase model: k4/k6 mixed sites x qk_norm x qd != dim at 4B scale
             family_cells(t, path_join(models_dir(), "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"), "qwen3",
-                "qwen3-4b/k4/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim,
+                "qwen3-4b/k4/f16", uint(MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim),
                 "")
             // qwen2 = NEOX + QKV bias — ENGAGE since the wave A bias epilogue; two carriers
             // cover the hs-64 and hs-128 bias geometries (the 0.5B also proves q8_0-KV bias)
             family_cells(t, path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf"), "qwen2",
-                "qwen2.5-0.5b/q8/f16", MetalNeed.neox | MetalNeed.qkv_bias,
+                "qwen2.5-0.5b/q8/f16", uint(MetalNeed.neox | MetalNeed.qkv_bias),
                 "", KVDtype.q8_0)
             family_cells(t, path_join(models_dir(), "Qwen2.5-1.5B-Instruct-Q8_0.gguf"), "qwen2",
-                "qwen2.5-1.5b/q8/f16", MetalNeed.neox | MetalNeed.qkv_bias,
+                "qwen2.5-1.5b/q8/f16", uint(MetalNeed.neox | MetalNeed.qkv_bias),
                 "")
             set_wscale_f16(true)   // the s16 row drives the fused qkv_rs NEOX+bias epilogue
             family_cells(t, path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf"), "qwen2",
-                "qwen2.5-0.5b/q8/s16", MetalNeed.neox | MetalNeed.qkv_bias,
+                "qwen2.5-0.5b/q8/s16", uint(MetalNeed.neox | MetalNeed.qkv_bias),
                 "")
             set_wscale_f16(false)
             // phi3 = NEOX only — ENGAGE since the wave A rope twins; the Q4 row also proves the
             // q8_0-KV rope-store's NEOX block loop, the Q8/s16 row the fused qkv_rs NEOX mapping
             family_cells(t, path_join(models_dir(), "Phi-3.5-mini-instruct-Q4_K_M.gguf"), "phi3",
-                "phi3.5-mini/k4/f16", MetalNeed.neox,
+                "phi3.5-mini/k4/f16", uint(MetalNeed.neox),
                 "", KVDtype.q8_0)
             set_wscale_f16(true)
             family_cells(t, path_join(models_dir(), "Phi-3.5-mini-instruct-Q8_0.gguf"), "phi3",
-                "phi3.5-mini/q8/s16", MetalNeed.neox,
+                "phi3.5-mini/q8/s16", uint(MetalNeed.neox),
                 "")
             set_wscale_f16(false)
             // gemma2 = NEOX + attn/final softcaps + sliding (even layers) + 4-norms + GeGLU +
@@ -1017,13 +1019,13 @@ def test_metal_family_matrix(t : T?) {
             // K-quant sites x wide heads x q8_0-KV block attention; the Q8/s16 row proves the s16
             // GEMVs with the swiglu-fused w13 form standing down to the geglu ew
             family_cells(t, path_join(models_dir(), "gemma-2-2b-it-Q4_K_M.gguf"), "gemma2",
-                "gemma2-2b/k4/f16", MetalNeed.neox | MetalNeed.softcap | MetalNeed.sliding |
-                    MetalNeed.pre_post_norm | MetalNeed.geglu,
+                "gemma2-2b/k4/f16", uint(MetalNeed.neox | MetalNeed.softcap | MetalNeed.sliding |
+                    MetalNeed.pre_post_norm | MetalNeed.geglu),
                 "", KVDtype.q8_0, 4.0)
             set_wscale_f16(true)
             family_cells(t, path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf"), "gemma2",
-                "gemma2-2b/q8/s16", MetalNeed.neox | MetalNeed.softcap | MetalNeed.sliding |
-                    MetalNeed.pre_post_norm | MetalNeed.geglu,
+                "gemma2-2b/q8/s16", uint(MetalNeed.neox | MetalNeed.softcap | MetalNeed.sliding |
+                    MetalNeed.pre_post_norm | MetalNeed.geglu),
                 "")
             set_wscale_f16(false)
             // the sliding-window MASKING row: gemma2's stock window (4096) never triggers at test
@@ -1038,12 +1040,12 @@ def test_metal_family_matrix(t : T?) {
             // proves the per-layer table pick (a wrong θ breaks parity immediately). The 1b's
             // q8_0-KV row drives the hs-256 QK-norm PREPASS, its f16 row the widened H-form.
             family_cells(t, path_join(models_dir(), "gemma-3-1b-it-Q8_0.gguf"), "gemma3",
-                "gemma3-1b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding |
-                    MetalNeed.pre_post_norm | MetalNeed.geglu | MetalNeed.qd_neq_dim,
+                "gemma3-1b/q8/f16", uint(MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding |
+                    MetalNeed.pre_post_norm | MetalNeed.geglu | MetalNeed.qd_neq_dim),
                 "", KVDtype.q8_0, 4.0)
             family_cells(t, path_join(models_dir(), "gemma-3-4b-it-Q8_0.gguf"), "gemma3",
-                "gemma3-4b/q8/f16", MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding |
-                    MetalNeed.pre_post_norm | MetalNeed.geglu | MetalNeed.qd_neq_dim,
+                "gemma3-4b/q8/f16", uint(MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding |
+                    MetalNeed.pre_post_norm | MetalNeed.geglu | MetalNeed.qd_neq_dim),
                 "")
             // gemma4-12B (stage 3): the heterogeneous line — two attention classes (sliding
             // 16q/8kv/256, global 16q/1kv/512 MQA), V-from-K on global layers, v_norm,
