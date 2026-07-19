@@ -1492,6 +1492,18 @@ def private write_toml_float(var writer : StringBuilderWriter; v : double) {
         write(writer, "inf")
     } elif (v == DBL_NEG_INF) {
         write(writer, "-inf")
+    } elif (v != 0.0lf && (abs(v) < 1e-4lf || abs(v) >= 1e17lf)) {
+        // exponent form: fixed-point truncates tiny magnitudes (|v| < ~1e-17 becomes 0.0)
+        var m = fmt(":.17e", v)
+        let e = find(m, "e")
+        if (e > 0) {
+            var mant = slice(m, 0, e) |> rtrim("0")
+            if (mant |> ends_with(".")) {
+                mant += "0"
+            }
+            m = mant + slice(m, e)
+        }
+        write(writer, m)
     } else {
         // keep a trailing digit after '.' so the value re-reads as a float, not an integer
         let base = fmt(":.17f", v) |> rtrim("0")

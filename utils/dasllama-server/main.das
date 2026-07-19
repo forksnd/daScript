@@ -252,13 +252,15 @@ def private mark_cli_sources(cfg : ServerArgs) {
     if (cfg.gpu_stream != 0 || cli_has_flag("--gpu-stream")) {
         g_cfg_sources["gpu_stream"] = "cli"
     }
-    if (cfg.gpu_dn) {
+    // bool knobs: flag PRESENCE, not value — clargs accepts --gpu-dn=false, and an explicit
+    // false must beat both the blessed vulkan default (true) and a non-authoritative TOML
+    if (cli_has_flag("--gpu-dn")) {
         g_cfg_sources["gpu_dn"] = "cli"
     }
-    if (cfg.gpu_attn) {
+    if (cli_has_flag("--gpu-attn")) {
         g_cfg_sources["gpu_attn"] = "cli"
     }
-    if (cfg.gpu_dense) {
+    if (cli_has_flag("--gpu-dense")) {
         g_cfg_sources["gpu_dense"] = "cli"
     }
     if (cfg.gpu_vram_mb > 0) {
@@ -300,10 +302,10 @@ def private mark_cli_sources(cfg : ServerArgs) {
     if (cfg.prefix != 0 || cli_has_flag("--prefix")) {
         g_cfg_sources["prefix"] = "cli"
     }
-    if (cfg.flat) {
+    if (cli_has_flag("--flat")) {
         g_cfg_sources["flat"] = "cli"
     }
-    if (cfg.mtp) {
+    if (cli_has_flag("--mtp")) {
         g_cfg_sources["mtp"] = "cli"
     }
 }
@@ -618,6 +620,11 @@ def init() {
     // kernels read, and the vulkan tier want must be armed before the load walk uploads stacks
     let gpu = effective_gpu(g_cfg)
     var metal_mode = pick_metal_mode(g_cfg.metal)
+    if (!empty(gpu) && !from_cli("gpu") && from_cli("metal")) {
+        // gpu is the master backend switch, but an explicit CLI --metal losing to a config-file
+        // key silently would invert the documented precedence — say so
+        to_log(LOG_WARNING, "dasllama-server: config key gpu = '{gpu}' overrides the explicit --metal flag (drop one of them)\n")
+    }
     if (gpu == "metal") {
         metal_mode = MetalMode.when_available
     } elif (gpu == "metal-required") {

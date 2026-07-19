@@ -5,6 +5,7 @@ module llm_scheduler
 require dasllama/dasllama   // the public facade — the scheduler reaches no engine internals
 require math
 require strings             // tail bookkeeping for the poll surface (length / slice / peek_data)
+require daslib/utf8_utils   // is_first_byte_of_utf8_char: codepoint-safe tail/head trims
 
 // Continuous-batching scheduler over the dasLLAMA facade. One thread, synchronous: each
 // scheduler_step admits queued requests, runs ONE eval_batch decode step over every decoding
@@ -86,7 +87,6 @@ struct DoneStream {
     n_cached : int64
     n_gen : int64
     ttft_us : int64
-    gen_us : int64
     prompt_head : string
     gen_tail : string
     done_at : int64                         // ref_time_ticks at reap
@@ -212,11 +212,39 @@ def private trim_tail_utf8(s : string; keep : int) : string {
     }
     var cut = n - keep
     peek_data(s) $(bytes) {
-        while (cut < n && (int(bytes[cut]) & 0xC0) == 0x80) {
+        while (cut < n && !is_first_byte_of_utf8_char(bytes[cut])) {
             cut ++
         }
     }
     return slice(s, cut)
+}
+
+//! Drop a trailing INCOMPLETE UTF-8 sequence (a lead byte whose continuations are missing) —
+//! byte-fallback BPE pieces can end mid-codepoint; display surfaces call this before shipping.
+def utf8_trim_partial_end(s : string) : string {
+    let n = length(s)
+    var cut = n
+    peek_data(s) $(bytes) {
+        var i = n - 1
+        while (i >= 0 && !is_first_byte_of_utf8_char(bytes[i])) {
+            i --
+        }
+        if (i >= 0) {
+            let lead = int(bytes[i])
+            var need = 1
+            if ((lead & 0xE0) == 0xC0) {
+                need = 2
+            } elif ((lead & 0xF0) == 0xE0) {
+                need = 3
+            } elif ((lead & 0xF8) == 0xF0) {
+                need = 4
+            }
+            if (n - i < need) {
+                cut = i
+            }
+        }
+    }
+    return cut == n ? s : slice(s, 0, cut)
 }
 
 def private advance_with(m : Model; var st : Stream; tok : int64; var events : array<SchedEvent>) : bool {
@@ -280,9 +308,11 @@ def evict(var sch : Scheduler; id : int64; var events : array<SchedEvent>) : boo
 //! logits sample the first token inline), then reap finished streams. Events append to `events`
 //! (the caller drains it). Returns true while any stream or queued request remains.
 def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent>) : bool {
-    // (0) drop finished-stream linger entries past their poll window (bounded backstop at 32)
+    // (0) drop finished-stream linger entries past their poll window (bounded backstop at 32).
+    // get_time_nsec, NOT get_time_usec: the usec helper returns int and wraps at ~35.8 min,
+    // which would freeze this comparison for any entry that survived a wrap
     while (!empty(sch.recent_done)
-           && (int64(get_time_usec(sch.recent_done[0].done_at)) > 10_000_000l || length(sch.recent_done) > 32)) {
+           && (get_time_nsec(sch.recent_done[0].done_at) > 10_000_000_000l || length(sch.recent_done) > 32)) {
         delete sch.recent_done[0]
         sch.recent_done |> erase(0)
     }
@@ -317,6 +347,7 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
             break if (length(st.prompt_head) + length(p) > 160)
             st.prompt_head += p
         }
+        st.prompt_head = utf8_trim_partial_end(st.prompt_head)   // byte-fallback pieces can end mid-codepoint
         sch.streams |> emplace(st)
         delete sch.queue[0]   // erase is a raw memmove — finalize what the move-out left behind
         sch.queue |> erase(0)
@@ -417,7 +448,6 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
                 id = sch.streams[i].id, finish = sch.streams[i].finish,
                 n_prompt = int64(length(sch.streams[i].prompt)), n_cached = sch.streams[i].n_cached,
                 n_gen = sch.streams[i].n_gen, ttft_us = sch.streams[i].ttft_us,
-                gen_us = sch.streams[i].t_first != 0l ? int64(get_time_usec(sch.streams[i].t_first)) : 0l,
                 prompt_head = sch.streams[i].prompt_head, gen_tail = sch.streams[i].gen_tail,
                 done_at = ref_time_ticks()))
             if (sch.paged) {

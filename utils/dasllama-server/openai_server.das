@@ -21,9 +21,10 @@ require math
 require dasllama/dasllama_audio_io   // load_audio_16k_mono: any uploaded audio format -> 16 kHz mono f32
 require dasllama/dasllama_vad        // POST /vad: silero speech spans for the page's waveform overlay
 
-// An OpenAI-compatible HTTP server over the dasLLAMA facade. It reaches only public facade verbs —
-// no engine internals — which is the acceptance test for the API: if a full OpenAI surface builds
-// without reaching into the engine, the facade is complete.
+// An OpenAI-compatible HTTP server over the dasLLAMA facade. The SERVING paths reach only public
+// facade verbs — no engine internals — which is the acceptance test for the API: if a full OpenAI
+// surface builds without reaching into the engine, the facade is complete. (The dashboard-only
+// surfaces additionally read dasllama_math's tier-status getters — see the require above.)
 // Chat and completion requests batch continuously: handlers parse + render + register and return;
 // run_server's loop drives llm_scheduler (one eval_batch decode step over every live stream + one
 // bounded prefill chunk per tick) and routes SchedEvents back to each request's writer. Streaming
@@ -100,10 +101,9 @@ var private g_config_surface_json = ""   // main's pre-serialized {config, sourc
 var private g_config_save_path = ""
 var private g_config_model_path = ""
 
-//! Register the ``/config`` surface (call before run_server): ``surface_json`` is the launcher's
-//! pre-serialized effective-config object (values + per-key provenance), ``save_path`` where
-//! ``POST /config`` writes the authoritative TOML, ``model_path`` the served model file (its
-//! directory feeds the model picker).
+//! Register the ``/config`` surface (call before run_server): the launcher's pre-serialized
+//! effective-config object, the path ``POST /config`` saves to, and the served model file
+//! (its directory feeds the model picker).
 def set_config_surface(surface_json : string; save_path : string; model_path : string) {
     g_config_surface_json = surface_json
     g_config_save_path = save_path
@@ -1355,6 +1355,12 @@ struct private OaiStreamsResponse {
     asr : array<OaiAsrRow>
 }
 
+// Age of a ref_time_ticks stamp in seconds, wrap-safe: get_time_usec returns int and wraps at
+// ~35.8 min — poison for prefix-cache chains and anything else that lives hours.
+def private age_seconds(t : int64) : float {
+    return float(double(get_time_nsec(t)) * 1e-9lf)
+}
+
 def private handle_streams(var resp : HttpResponse?) : http_status {
     var out = OaiStreamsResponse(max_streams = g_sched.max_streams)
     out.streams |> reserve(length(g_sched.streams) + length(g_sched.queue) + length(g_sched.recent_done))
@@ -1362,16 +1368,16 @@ def private handle_streams(var resp : HttpResponse?) : http_status {
         out.streams |> push(OaiStreamInfo(
             id = st.id,
             state = st.state == StreamState.prefilling ? "prefilling" : "decoding",
-            age_s = float(get_time_usec(st.t_admit)) / 1000000.0,
+            age_s = age_seconds(st.t_admit),
             n_prompt = int64(length(st.prompt)), n_cached = st.n_cached,
             n_prefilled = st.n_prefilled, n_gen = st.n_gen, max_new = st.max_new,
             ttft_ms = float(st.ttft_us) / 1000.0,
-            prompt_head = st.prompt_head, gen_tail = st.gen_tail))
+            prompt_head = st.prompt_head, gen_tail = utf8_trim_partial_end(st.gen_tail)))
     }
     for (q in g_sched.queue) {
         out.streams |> push(OaiStreamInfo(
             id = q.id, state = "queued",
-            age_s = q.t_submit != 0l ? float(get_time_usec(q.t_submit)) / 1000000.0 : 0.0,
+            age_s = q.t_submit != 0l ? age_seconds(q.t_submit) : 0.0,
             n_prompt = int64(length(q.prompt)), max_new = q.max_new))
     }
     for (d in g_sched.recent_done) {
@@ -1379,15 +1385,15 @@ def private handle_streams(var resp : HttpResponse?) : http_status {
             id = d.id, state = "finished", finish = d.finish,
             n_prompt = d.n_prompt, n_cached = d.n_cached, n_prefilled = d.n_prompt, n_gen = d.n_gen,
             ttft_ms = float(d.ttft_us) / 1000.0,
-            prompt_head = d.prompt_head, gen_tail = d.gen_tail))
+            prompt_head = d.prompt_head, gen_tail = utf8_trim_partial_end(d.gen_tail)))
     }
     var chains <- prefix_chain_list(g_sched.prefix)
     out.cache |> reserve(length(chains))
     for (c in chains) {
-        let age = float(get_time_usec(c.born_at)) / 1000000.0
+        let age = age_seconds(c.born_at)
         out.cache |> push(OaiCacheEntry(
             tokens = c.n_tokens, pages = c.pages_live, hits = c.hits, age_s = age,
-            idle_s = c.last_hit_at != 0l ? float(get_time_usec(c.last_hit_at)) / 1000000.0 : age,
+            idle_s = c.last_hit_at != 0l ? age_seconds(c.last_hit_at) : age,
             preview = c.preview))
     }
     delete chains
@@ -1395,7 +1401,7 @@ def private handle_streams(var resp : HttpResponse?) : http_status {
     for (j in g_asr_recent) {
         out.asr |> push(OaiAsrRow(
             id = j.id, state = j.state, audio_s = j.audio_s, wall_ms = j.wall_ms, rtf = j.rtf,
-            age_s = float(get_time_usec(j.started_at)) / 1000000.0))
+            age_s = age_seconds(j.started_at)))
     }
     let body = sprint_json(out, false)
     delete out
@@ -1471,12 +1477,7 @@ def private handle_vad(var req : HttpRequest?; var resp : HttpResponse?) : http_
 }
 
 def private json_str(s : string) : string {
-    var v = JV(s)
-    let text = write_json_compact(v)
-    unsafe {
-        delete v
-    }
-    return text
+    return sprint_json(s, false)   // a bare string serializes as its quoted+escaped JSON literal
 }
 
 def private kind_name(kind : string) : string {
@@ -1810,7 +1811,7 @@ def private drain_asr_events(srv : WebSocketServer) {
                 g_asr_pending = max(g_asr_pending - 1, 0)
                 for (i in range(length(g_asr_recent))) {
                     continue if (g_asr_recent[i].id != event.id)
-                    let wall_ms = float(get_time_usec(g_asr_recent[i].started_at)) / 1000.0
+                    let wall_ms = float(double(get_time_nsec(g_asr_recent[i].started_at)) * 1e-6lf)   // wrap-safe: clips can run > 35 min
                     g_asr_recent[i].state = event.status == int(http_status.OK) ? "done" : "failed"
                     g_asr_recent[i].audio_s = event.audio_s
                     g_asr_recent[i].wall_ms = wall_ms
@@ -1837,12 +1838,18 @@ def private drain_asr_events(srv : WebSocketServer) {
             }
         }
     }
-    // finished jobs linger ~30 s on the poll surface, then drop (bounded backstop at 16)
-    while (!empty(g_asr_recent)
-           && g_asr_recent[0].done_at != 0l
-           && (int64(get_time_usec(g_asr_recent[0].done_at)) > 30_000_000l || length(g_asr_recent) > 16)) {
-        delete g_asr_recent[0]
-        g_asr_recent |> erase(0)
+    // finished jobs linger ~30 s on the poll surface, then drop (bounded backstop at 16).
+    // Index sweep, not a head-gated loop: a long-RUNNING job at the head must not block the
+    // expiry of finished jobs behind it. Wrap-safe nsec compare (clips can run > 35 min).
+    var i = 0
+    while (i < length(g_asr_recent)) {
+        if (g_asr_recent[i].done_at != 0l
+                && (get_time_nsec(g_asr_recent[i].done_at) > 30_000_000_000l || length(g_asr_recent) > 16)) {
+            delete g_asr_recent[i]
+            g_asr_recent |> erase(i)
+        } else {
+            i ++
+        }
     }
 }
 

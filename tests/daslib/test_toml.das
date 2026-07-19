@@ -3,6 +3,7 @@ options gen2
 require dastest/testing_boost
 require daslib/toml
 require daslib/json
+require daslib/json_boost   // ?["key"] ?? default lookups in the write_toml round-trip checks
 require daslib/math_bits
 require strings
 
@@ -646,6 +647,25 @@ def test_write_toml_round_trip(t : T?) {
         t |> success(find(out1, "i = 9007199254740993") >= 0, "int64 exact")
         t |> success(find(out1, "f = 4.0") >= 0, "whole float keeps .0")
         t |> success(find(out1, "date = \"2024-01-15T10:00:00Z\"") >= 0, "datetime becomes quoted string")
+    }
+}
+
+[test]
+def test_write_toml_tiny_huge_floats(t : T?) {
+    t |> run("tiny and huge magnitudes round-trip via exponent form") @@(t : T?) {
+        var v = expect_ok(t, "wt_exp", "a = 1e-30\nb = 1.5e-17\nc = 5e+22\nd = 0.001\n")
+        var err : string
+        let out = write_toml(v, err)
+        t |> success(empty(err), "write clean")
+        var v2 = expect_ok(t, "wt_exp_rt", out)
+        t |> success((v2?["a"] ?? 0.0lf) == 1e-30lf, "1e-30 survives (fixed-point would emit 0.0)")
+        t |> success((v2?["b"] ?? 0.0lf) == 1.5e-17lf, "1.5e-17 survives exactly")
+        t |> success((v2?["c"] ?? 0.0lf) == 5e22lf, "5e+22 survives exactly")
+        t |> success((v2?["d"] ?? 0.0lf) == 0.001lf, "0.001 stays on the fixed-point path")
+        t |> success(find(out, "d = 0.001") >= 0, "borderline magnitude keeps the readable form")
+        unsafe {
+            delete v2
+        }
     }
 }
 

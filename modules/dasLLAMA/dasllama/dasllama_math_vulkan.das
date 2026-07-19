@@ -1844,11 +1844,11 @@ def private vk_moe_init : bool {
     g_gpu.queue = get_device_queue(g_gpu.device, g_gpu.fam, 0u)
     let sg = subgroup_properties(g_gpu.phys).subgroupSize
     g_gpu.rows_per_wg = int64((WG_X + sg - 1u) / sg)   // = gl_NumSubgroups for our 1D workgroup
-    // DASLLAMA_GPU_VRAM_MB / gpu_vram_mb wins outright; queried heap budget only clamps DOWN (WEIGHT_CAP)
+    // DASLLAMA_GPU_VRAM_MB / gpu_vram_mb wins outright; env PRESENCE alone skips the budget clamp (=0 pins WEIGHT_CAP — the misreporting-driver escape hatch)
     g_gpu.weight_budget = WEIGHT_CAP
     let vram_mb = gpu_want_vram_mb()
-    let vram_override = vram_mb > 0l
-    if (vram_override) {
+    let vram_override = vram_mb > 0l || has_env_variable("DASLLAMA_GPU_VRAM_MB")
+    if (vram_mb > 0l) {
         g_gpu.weight_budget = vram_mb * 1_000_000l
     }
     if (device_extension_available(g_gpu.phys, "VK_EXT_memory_budget")) {

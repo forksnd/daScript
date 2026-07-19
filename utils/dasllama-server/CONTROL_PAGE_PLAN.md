@@ -19,6 +19,22 @@ override); capability guard (`supported` + `reason` recorded at load); `gpu_tier
 Verified: toml 108/108, server 17/17 live, vulkan tier 12/12, e2e restart loop (CLI-beats-toml
 → save authoritative → exit 4 → relaunch → toml-beats-CLI), page behavior via mock+playwright.
 
+**REVIEW PASS DONE (2026-07-19):** 8-angle fan-out over the branch diff, 29 candidates, 10
+findings reported, 8 fixed same-session (form saving GPU sentinels → gpu-select now fills the
+blessed shape; get_time_usec 35.8-min wrap → wrap-safe get_time_nsec ages everywhere on the
+poll surface + linger compares; `--gpu-dn=false`-class bool flags now marked by argv presence;
+config-gpu-vs-explicit-`--metal` now warns; ASR linger prune de-head-blocked (index sweep);
+mergeTail gap marker; laneOf/transcripts staleness sweep; write_toml exponent form for tiny/
+huge floats + tests; plus cleanups: json_str→sprint_json, utf8 predicate reuse +
+`utf8_trim_partial_end` on both preview surfaces, dead act/que arrays + DoneStream.gen_us
+removed, renderCache drained state, renderHistory dirty flag, VRAM_MB env-presence override
+restored, facade header comment honest). **DEFERRED (Boris's call): (1) per-token `gen_tail +=`
+string garbage on the hot decode path — candidate fix is a fixed per-stream byte ring
+stringified at poll/reap; (2) the 27-key config schema hand-listed 5× across main.das +
+openai_server.das — candidate fix is one exported key→kind table driving all five sites;
+(3) GpuTierWant has no `cls` field (env-only DASLLAMA_GPU_CLS) while the badge shows
+cls_resident — retrofit cost grows if the env polarity ossifies.**
+
 **S6 DONE (2026-07-19):** `POST /vad` (silero preview in-handler: lazy `load_vad_model` from
 the in-repo `silero_vad.bin`, 120 s cap, honest 501 without a source tree); AsrEvent carries
 `audio_s`; drain-side ASR job tracking (running/done/failed, wall ms, RTF = audio s per wall s,

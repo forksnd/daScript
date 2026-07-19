@@ -333,8 +333,8 @@ button:disabled { opacity: 0.45; cursor: default; }
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const HIST = 120;                            // ~2 min at 1s polling
-const tps = [], pf = [], act = [], que = []; // rolling series
+const HIST = 120;                  // ~2 min at 1s polling
+const tps = [], pf = [];           // rolling series
 let last = null, lastT = 0, failures = 0;
 
 function fmt(n) {
@@ -362,7 +362,7 @@ function apply(s) {
         rate = Math.max(0, (s.gen_tokens - last.gen_tokens) / dt);
         pfRate = Math.max(0, ((s.prefill_tokens || 0) - (last.prefill_tokens || 0)) / dt);
     }
-    push(tps, rate); push(pf, pfRate); push(act, s.active); push(que, s.queued);
+    push(tps, rate); push(pf, pfRate);
     last = s; lastT = now;
 
     $("t-tps").textContent = rate.toFixed(1);
@@ -448,14 +448,20 @@ const laneHist = [];              // per poll tick: { states: Uint8Array(maxLane
 const laneOf = new Map();         // stream id -> lane index
 const transcripts = new Map();    // stream id -> { head, text, info }
 const doneHist = [];              // finished: { id, finish, head, text, info } newest first
+const lastSeenAt = new Map();     // stream id -> pollTick (sweeps ids whose finished state we missed)
+let pollTick = 0;
 let maxLanes = 4;
+let historyDirty = false;
 
 function mergeTail(text, tail) {
     if (!tail) return text;
     for (let k = Math.min(text.length, tail.length); k > 0; k--) {
         if (text.endsWith(tail.slice(0, k))) return text + tail.slice(k);
     }
-    return text + tail;
+    // no overlap: generation outran the capped tail between polls — mark the gap honestly
+    // instead of silently splicing (the server keeps only the last ~240-480 chars)
+    if (text) return text + " […] " + tail;
+    return tail;
 }
 
 function applyStreams(p, queued) {
@@ -491,8 +497,28 @@ function applyStreams(p, queued) {
             t.text = mergeTail(t.text, s.gen_tail);
             doneHist.unshift({ id: s.id, finish: s.finish, head: t.head, text: t.text, info: s });
             if (doneHist.length > 20) doneHist.pop();
+            historyDirty = true;
             transcripts.delete(s.id);
             laneOf.delete(s.id);
+            lastSeenAt.delete(s.id);
+        }
+    }
+    // sweep ids whose finished state we never observed (throttled background tab: a stream can
+    // start AND age out of the server's 10 s linger between two polls) — without this the lane
+    // stays occupied forever and the transcripts Map grows without bound
+    pollTick++;
+    for (const s of p.streams) lastSeenAt.set(s.id, pollTick);
+    for (const [id, seen] of lastSeenAt) {
+        if (pollTick - seen > 30) {
+            const t = transcripts.get(id);
+            if (t) {
+                doneHist.unshift({ id, finish: "lost", head: t.head, text: t.text, info: t.info });
+                if (doneHist.length > 20) doneHist.pop();
+                historyDirty = true;
+            }
+            transcripts.delete(id);
+            laneOf.delete(id);
+            lastSeenAt.delete(id);
         }
     }
     drawLanes();
@@ -508,9 +534,20 @@ function fmtAge(s) {
     return s.toFixed(0) + "s";
 }
 
+let hadCache = false;
+
 function renderCache(entries) {
     const body = $("ctable-body");
-    if (!entries.length) return;   // keep the hint row until something lands
+    if (!entries.length) {
+        // keep the first-run hint; but a cache that DRAINED (LRU evictions) must not keep
+        // showing stale rows with frozen ages
+        if (hadCache) {
+            body.innerHTML = "<tr><td colspan=\"6\" class=\"ctl-note\">cache drained — all chains evicted</td></tr>";
+            hadCache = false;
+        }
+        return;
+    }
+    hadCache = true;
     entries.sort((a, b) => a.age_s - b.age_s);
     body.textContent = "";
     for (const e of entries) {
@@ -601,7 +638,8 @@ function renderCards(queuedStreams, active) {
 
 function renderHistory() {
     const box = $("history");
-    if (!doneHist.length) return;
+    if (!doneHist.length || !historyDirty) return;   // only rebuild when something actually finished
+    historyDirty = false;
     box.textContent = "";
     for (const hh of doneHist) {
         const el = document.createElement("div");
@@ -1102,6 +1140,20 @@ function renderForm(surface, status) {
         if (f.t === "bool") cell.append(input, label); else cell.append(label, input);
         form.append(cell);
     }
+    // switching gpu to vulkan while every detail knob still shows its raw unset sentinel would
+    // SAVE those zeros as explicit authoritative values and disarm the tier on restart — fill
+    // in the blessed serving shape (K=2 + S=35 + DN + ATTN) so the form shows what will run
+    $("f-gpu").addEventListener("change", () => {
+        if ($("f-gpu").value === "vulkan"
+            && Math.trunc(Number($("f-gpu_layers").value)) === 0
+            && Math.trunc(Number($("f-gpu_stream").value)) === 0
+            && !$("f-gpu_dn").checked && !$("f-gpu_attn").checked) {
+            $("f-gpu_layers").value = "2";
+            $("f-gpu_stream").value = "35";
+            $("f-gpu_dn").checked = true;
+            $("f-gpu_attn").checked = true;
+        }
+    });
     // model picker: same-directory gguf/dlim files; picking one swaps the basename
     const dl = $("model-files");
     dl.textContent = "";
