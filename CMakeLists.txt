@@ -40,7 +40,7 @@ option(DAS_CLIPBOARD_DISABLED "Disable dasClipboard (system clipboard transport)
 option(DAS_PUGIXML_DISABLED "Disable dasPUGIXML (xml parsing library)" OFF)
 option(DAS_SQLITE_DISABLED "Disable dasSQLITE (sqlite3 library)" ON)
 option(DAS_TOOLS_DISABLED "Disable dasTools" OFF)
-option(DAS_TREE_SITTER_DISABLED "Disable tree-sitter-daslang grammar (no dependencies)" OFF)
+option(DAS_TREE_SITTER_DISABLED "Disable dasTreeSitter and the tree-sitter-daslang grammar" OFF)
 option(DAS_AOT_EXAMPLES_DISABLED "Disable dasAOT examples" OFF)
 option(DAS_TUTORIAL_DISABLED "Disable dasTutorial" OFF)
 option(DAS_TESTS_DISABLED "Disable dasTests" OFF)
@@ -2154,10 +2154,16 @@ endif()
 # ============================================================================
 
 if(NOT ${DAS_TREE_SITTER_DISABLED})
-    add_library(tree_sitter_daslang SHARED
-        tree-sitter-daslang/src/parser.c
-        tree-sitter-daslang/src/scanner.c
-    )
+    # dasTreeSitter defines this object target so its in-process provider and
+    # the standalone ast-grep grammar share one generated parser build.
+    if(TARGET tree_sitter_daslang_objects)
+        add_library(tree_sitter_daslang SHARED
+            $<TARGET_OBJECTS:tree_sitter_daslang_objects>)
+    else()
+        add_library(tree_sitter_daslang SHARED
+            tree-sitter-daslang/src/parser.c
+            tree-sitter-daslang/src/scanner.c)
+    endif()
     target_include_directories(tree_sitter_daslang PRIVATE
         tree-sitter-daslang/src
     )
