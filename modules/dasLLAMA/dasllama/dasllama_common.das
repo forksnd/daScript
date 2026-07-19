@@ -10196,8 +10196,11 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     if (npos <= 0l) {
         return
     }
-    if (t.quant == QuantMode.q4_0) {
-        panic("forward_prefill: q4_0 mode has no batched prefill path (use q8 or fp32)")
+    if (t.quant == QuantMode.q4_0) {   // legacy per-row tier, no batched kernels: its prefill IS the decode loop
+        for (p in range64(npos)) {
+            forward(t, s, tokens[p], start_pos + p)
+        }
+        return
     }
     let ts_alloc = ref_time_ticks()
     kv_ensure(s, start_pos + npos)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
