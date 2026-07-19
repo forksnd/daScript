@@ -650,6 +650,80 @@ def private family_cells(t : T?; path, family, tag : string; expect_needs : uint
 }
 
 [unused_argument(t, path)]   // off-Apple the gated body is empty
+def private qwen3moe_row(t : T?; path : string) {
+    // Wave C stage 1: MoE routing serves SINGLE DECODE only — batch/prefill keep the graph
+    // decline (flipping those cells IS stage 2), and register_metal_servable stays false (a
+    // blob load cannot fall back to CPU), so the planar matrix row asserts (graph, planar,
+    // graph) and decode parity rides a decode-only harness: the blob twin has no CPU prefill,
+    // so the prompt is teacher-forced through GPU decode from position 0.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "qwen3moe") || !arm_on(t, "fam-qwen3moe") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let c = tr.config
+        t |> success(c.moe && c.n_expert == 128l && c.n_expert_used == 8l && c.n_ff_exp == 768l,
+            "qwen3moe-30b: MoE geometry loads (ne={c.n_expert} k={c.n_expert_used} nfe={c.n_ff_exp})")
+        let derived = metal_needs(tr)
+        let expected = MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim
+        t |> success((derived & expected) == expected,
+            "qwen3moe-30b: metal_needs derives {expected} (got {derived})")
+        matrix_cell(t, tr, KVDtype.f16, "qwen3moe-30b/k4/f16", "graph", "planar", "graph")
+        var trg <- blob_twin(t, path, 512l)
+        var prompt <- encode(tr, counting_prompt(1, 20), true, false)
+        let vocab = c.vocab_size
+        var cpu_ids : array<int64>
+        var gpu_ids : array<int64>
+        cpu_ids |> reserve(16)
+        gpu_ids |> reserve(16)
+        var served = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            eval_(tr, s, prompt)
+            var cur = greedy_top(s.logits, vocab)
+            for (_i in range(16)) {
+                cpu_ids |> push(cur)   // nolint:STYLE012 — greedy chain, each push feeds the next step
+                var one <- [cur]
+                eval_(tr, s, one)
+                delete one
+                cur = greedy_top(s.logits, vocab)
+            }
+            delete s
+            select_decode_override("metal")
+            let before = metal_decode_stats().decodes
+            var s2 = make_run_state(trg.config, KVDtype.f16, KVDtype.f16)
+            for (i in range(length(prompt))) {   // teacher-forced prompt, one GPU decode per token
+                var one <- [prompt[i]]
+                eval_(trg, s2, one)
+                delete one
+            }
+            var cur2 = greedy_top(s2.logits, vocab)
+            for (_i in range(16)) {
+                gpu_ids |> push(cur2)   // nolint:STYLE012 — greedy chain, each push feeds the next step
+                var one <- [cur2]
+                eval_(trg, s2, one)
+                delete one
+                cur2 = greedy_top(s2.logits, vocab)
+            }
+            served = metal_decode_stats().decodes - before
+            delete s2
+            select_decode_override("")
+        }
+        t |> success(served == int64(length(prompt) + 16),
+            "qwen3moe-30b: GPU decode served every step ({served}/{length(prompt) + 16})")
+        t |> success(same(cpu_ids, gpu_ids),
+            "qwen3moe-30b: GPU decode continuation matches the CPU truth token-for-token")
+        delete cpu_ids
+        delete gpu_ids
+        delete prompt
+        delete trg
+        delete tr
+    }
+}
+
+[unused_argument(t, path)]   // off-Apple the gated body is empty
 def private gemma2_window_row(t : T?; path : string) {
     // sliding-window masking parity: shrink the window post-load (config-driven everywhere —
     // gemma2 is single-θ, so rope is unaffected) and generate PAST it. The prompt-depth assert
@@ -1056,6 +1130,10 @@ def test_metal_family_matrix(t : T?) {
             // the q8 twin drives the hetero fixed-B mul_mv rail (a class the k4 row never
             // dispatches); 12.5GB — DASLLAMA_PARITY_FULL-gated like the row above
             gemma4_hetero_q8_row(t, path_join(models_dir(), "gemma-4-12B-it-Q8_0.gguf"))
+            // qwen3moe (Wave C stage 1): qwen3 attention + GPU MoE routing — router GEMV +
+            // top-k select + expert-indexed GEMVs (k4 gate/up, k6 down through the kq twins).
+            // Decode-only for now; 18.5GB > the 6GiB tier — DASLLAMA_PARITY_FULL-gated.
+            qwen3moe_row(t, path_join(models_dir(), "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"))
             metal_decode_shutdown()
             metal_prefill_shutdown()
             t |> equal(metal_live_object_count(), 0l)
