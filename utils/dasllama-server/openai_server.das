@@ -935,8 +935,8 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
     prompt <- rendered
     stop_ids <- chat.stop_ids
     close <- render_close(g_model, chat)
-    call_open := chat.tmpl.tool_call_open
-    call_close := chat.tmpl.tool_call_close
+    call_open = chat.tmpl.tool_call_open
+    call_close = chat.tmpl.tool_call_close
     return ""
 }
 

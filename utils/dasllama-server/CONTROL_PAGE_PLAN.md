@@ -25,8 +25,10 @@ tick-loop handler path (JIT-fuzzy frames: chat render / wire completion; Context
 top). Repro: full ramp's 8-worker stage final wave (96-tok streams, queue + admit-on-reap
 racing finishes) — 3/3 reproductions incl. a fresh cold child dying ~3 s after listening under
 the ramp tail. Does NOT repro: solo, 2-concurrent, constant-4 x 48 tok, cache donate+attach.
-tinyllama survived the identical ramp → gemma-specific (template/renderer or SWA path) or a
-window widened by slower decode. Minidumps + maps + JIT artifacts:
+tinyllama survived the identical ramp. **UPDATE: crashed on Qwen too (23:06 bundle) with the
+IDENTICAL address/instruction/frames, only the garbage pointer differs (0x7a vs 0x1735) —
+MODEL-INDEPENDENT, one deterministic site in the serving path. Boris suspects team-mode
+dispatch or config interplay.** Minidumps + maps + JIT artifacts:
 logs/crashes/dasllama-20260718-22{5415,5448,5523,5834,5938}*. CDB QUICK LOOK (pid16432 dump):
 faulting instr `mov r10,[r9+28h]` with r9=0x1735 (5941 — token-id-sized int in a pointer slot,
 field read at +0x28); frame[1] = Context::to_out → the crash SITE is the runtime's out/log
