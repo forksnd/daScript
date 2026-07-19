@@ -27,7 +27,13 @@ racing finishes) — 3/3 reproductions incl. a fresh cold child dying ~3 s after
 the ramp tail. Does NOT repro: solo, 2-concurrent, constant-4 x 48 tok, cache donate+attach.
 tinyllama survived the identical ramp → gemma-specific (template/renderer or SWA path) or a
 window widened by slower decode. Minidumps + maps + JIT artifacts:
-logs/crashes/dasllama-20260718-22{5415,5448,5523,5834,5938}*. Batching-theory test that
+logs/crashes/dasllama-20260718-22{5415,5448,5523,5834,5938}*. CDB QUICK LOOK (pid16432 dump):
+faulting instr `mov r10,[r9+28h]` with r9=0x1735 (5941 — token-id-sized int in a pointer slot,
+field read at +0x28); frame[1] = Context::to_out → the crash SITE is the runtime's out/log
+formatting path chewing a corrupted struct (string slot holding an int) — the corruption is
+upstream (suspect: freed/overwritten SchedEvent or wire struct reuse on the finish path). No
+Release pdbs on the box; the dump walker dies at JIT frames — decode frames [2]/[3]/[7] via
+the bundle's jitted .map next session. Batching-theory test that
 triggered it: dense 12B single 5.7 tok/s, scales with streams (vs 35B A3B flat 15.0 -> 14.8
 aggregate, marginal batch 3.91 — experts don't amortize).
 
