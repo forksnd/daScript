@@ -150,9 +150,7 @@ class public Attributes {
 
 // Indices MUST match the field order produced by `type_to_llvm_type` for `Type.tArray`
 // below, which itself mirrors the C++ `das::Array` layout (data, size, capacity, magic,
-// lock, flags, _pad_after_flags). The enum order was originally `LOOK, MAGIC` to match
-// an older mirror that had `lock, magic` in that order — when the mirror was corrected
-// to C++ order, the enum needed the same flip.
+// lock, flags, _pad_after_flags).
 enum public JIT_ARRAY {
     DATA
     SIZE
@@ -242,8 +240,7 @@ def public FN_JIT_STRING_TABLE_AT_AFTER_PACKED_MISS() {
 
 
 def private add_table_linkage(val : LLVMOpaqueValue?) {
-    // DLLExport storage so ResolveExternVisitor's set_glob_address (GetProcAddress
-    // on Windows) can find the slot on cache-hit reload; otherwise #2802 stale-addr.
+    // DLLExport storage so set_glob_address (GetProcAddress on Windows) finds the slot on cache-hit reload — else #2802 stale-addr.
     LLVMSetLinkage(val, LLVMLinkage.LLVMDLLExportLinkage)
     LLVMSetDLLStorageClass(val, LLVMDLLStorageClass.LLVMDLLExportStorageClass)
 }
@@ -375,19 +372,14 @@ var public g_fn_types : table<string; LLVMTypeRef>
 // Keyed by the global name; value carries the (module, type, field) for the init call.
 var public g_handled_field_offset_globals : table<string; tuple<modName : string; typeName : string; fieldName : string>>
 
-// Set by init_jit when target_triple is a wasm target. Cross-compile path's
-// host-LLVM wasm32 codegen mishandles several user-provided hints (alwaysinline
-// over complex inlined bodies, certain loop-vectorize / unroll metadata). When
-// this flag is true, the LlvmJitVisitor skips ALL user hint application —
-// function-level [hint(...)] AND for/while-loop hints — and falls back to the
-// optimizer's default heuristics. Slight perf hit, but eliminates a class of
-// wasm32-only miscompiles.
+// Set by init_jit when target_triple is a wasm target. Host-LLVM wasm32 codegen mishandles
+// several user hints (alwaysinline, loop-vectorize/unroll metadata), so when true the
+// LlvmJitVisitor skips ALL user hint application (function + loop) — avoids wasm32 miscompiles.
 var public g_target_is_wasm = false
 
-// The resolved host_features truth of the last flag pass (see init_jit_target_flags): true
-// when the g_target_* gates were computed from the running box's cpuid/host features, false
-// on the generic/forced-only rail (cross triples, kernel-free standalone exes). Build
-// provenance for generators and probes — a generated kernel can bake it into the artifact.
+// The resolved host_features truth of the last flag pass (see init_jit_target_flags): true when
+// the g_target_* gates came from the running box's cpuid/host features, false on the generic/
+// forced-only rail (cross triples, kernel-free standalone exes). Build provenance for generators.
 var public g_target_host_features = false
 
 // Set by init_jit when the JIT target is aarch64 (arm64). Gates the g_aarch64_intrin_lookup
@@ -399,7 +391,7 @@ var public g_target_is_aarch64 = false
 // table in llvm_jit_intrin — same contract as g_target_is_aarch64 above.
 var public g_target_is_x64 = false
 
-// The x64 intrinsic table additionally requires AVX2 on the TARGET — unlike aarch64 (where every
+// The x64 intrinsic table additionally requires AVX2 on the TARGET — unlike aarch64 (where every // nolint:STYLE014
 // daslang JIT host has dotprod, force-appended to the feature set), AVX2 is not universal on x86-64
 // (pre-Haswell, pre-Gracemont Pentium/Celeron/Atom). Emitting llvm.x86.avx2.* against a TargetMachine
 // whose cpuid-derived features lack +avx2 is a FATAL "Cannot select" at codegen — and the JIT compiles
@@ -409,7 +401,7 @@ var public g_target_is_x64 = false
 // either, so the intrinsics compile their portable fallback bodies: correct, just not fast.
 var public g_target_x64_avx2 = false
 
-// F16C (half<->float convert, VCVTPH2PS/VCVTPS2PH) gate for the f16_cvt intrinsic table — same
+// F16C (half<->float convert, VCVTPH2PS/VCVTPS2PH) gate for the f16_cvt intrinsic table — same // nolint:STYLE014
 // contract as g_target_x64_avx2, but its OWN cpuid bit, NOT tied to avx2 (Ivy Bridge has F16C
 // without AVX2). Without it, fpext/fptrunc through half on x86-64 lowers to a compiler-rt libcall
 // (__extendhfsf2/__truncsfhf2) the JIT doesn't link — so the gate must stay false there and the
@@ -417,7 +409,7 @@ var public g_target_x64_avx2 = false
 // fp16 convert is ARMv8.0 baseline.
 var public g_target_x64_f16c = false
 
-// The AVX kernel-matrix tiers (x64_avx dot32_vnni / dot64_acc16 / mx4_dequant64 families) gate on
+// The AVX kernel-matrix tiers (x64_avx dot32_vnni / dot64_acc16 / mx4_dequant64 families) gate on // nolint:STYLE014
 // finer cpuid truth, same contract as g_target_x64_avx2 — each flag guards its own lookup table in
 // llvm_jit_intrin, and a false flag means the call compiles its daslang body (which delegates to
 // the next tier down, so degradation is graceful). vnni256 = 256-bit VPDPBUSD (VEX AVX-VNNI, or
@@ -435,7 +427,7 @@ var public g_target_x64_avx512vnni = false
 // yet; lights up via cpuid on future boxes and via DAS_JIT_X64_FORCE_FEATURES for emission-only
 // verification today.
 var public g_target_x64_vnniint8 = false
-// AMX INT8 tiles (TDPBSSD — SPR/Genoa-X server silicon; the dasLLAMA amx tile family). Both
+// AMX INT8 tiles (TDPBSSD — SPR/Genoa-X server silicon; the dasLLAMA amx tile family). Both // nolint:STYLE014
 // amx-tile and amx-int8 cpuid bits, hyphen-spelled like the LLVM target features so the force
 // env and llc -mattr take the same names. cpuid says nothing about the per-process XTILEDATA
 // grant — that runtime enable (Linux arch_prctl) lives in the family's witness companion.
@@ -445,7 +437,7 @@ var public g_target_x64_amx = false
 // targets. Gates emission that calls Linux-only externs (the amx witness's arch_prctl).
 var public g_target_os_linux = false
 
-// ARMv8.6 i8mm (SMMLA — 2×2 s8 matrix-multiply-accumulate; Apple M2/A15+, Graviton3+; M1 has
+// ARMv8.6 i8mm (SMMLA — 2×2 s8 matrix-multiply-accumulate; Apple M2/A15+, Graviton3+; M1 has // nolint:STYLE014
 // DotProd only). Host truth comes off LLVMGetHostCPUFeatures() ("+i8mm" — populated on Linux
 // aarch64; EMPTY on macOS, where features are implied by the CPU name), OR'd with
 // DAS_JIT_ARM64_FORCE_FEATURES — so on Apple silicon the env is the rail on BOTH the emitting
@@ -453,7 +445,7 @@ var public g_target_os_linux = false
 // Cross aarch64 triples read the force string only, same contract as the x64 tiers above.
 var public g_target_arm64_i8mm = false
 
-// ARMv8.2 fullfp16 (native half arithmetic — fadd.4h/8h etc.). Same detection contract as
+// ARMv8.2 fullfp16 (native half arithmetic — fadd.4h/8h etc.). Same detection contract as // nolint:STYLE014
 // i8mm, except darwin-arm64 is unconditionally true: LLVMGetHostCPUFeatures is empty on
 // macOS and every darwin-arm64 host is Apple Silicon (M1+), which always has fullfp16.
 // The target machine needs no feature append: Linux host feature strings carry +fullfp16
@@ -495,9 +487,8 @@ def private x64_target_feature(name : string) : bool {
 }
 
 // Tier truth per target kind: host targets read cpuid (OR'd with the emission-only force);
-// explicit cross-compile triples read the force string ONLY — the host's cpuid says nothing
-// about a cross target, so without DAS_JIT_X64_FORCE_FEATURES a cross x64 module gets no
-// AVX emission at all (today's behavior).
+// explicit cross-compile triples read the force string ONLY — the host's cpuid says nothing about
+// a cross target, so without DAS_JIT_X64_FORCE_FEATURES a cross x64 module gets no AVX emission.
 def private x64_tier_feature(name : string; cross : bool) : bool {
     return cross ? x64_forced_feature(name) : x64_target_feature(name)
 }
@@ -510,7 +501,7 @@ def public x64_forced_plus_features() : string {
     return join(plus, ",")
 }
 
-// Cross-compile a wasm object compatible with a -pthread (SharedArrayBuffer)
+// Cross-compile a wasm object compatible with a -pthread (SharedArrayBuffer) // nolint:STYLE014
 // runtime: add +atomics,+bulk-memory to the target_features section so wasm-ld
 // links it into a --shared-memory build. Set from the --jit-threads CLI flag in
 // llvm_jit_run.das BEFORE codegen. MUST match the archives: a +atomics object
@@ -519,11 +510,9 @@ def public x64_forced_plus_features() : string {
 // +simd128 vec4f-sret match documented in write_wasm.
 var public g_target_wasm_threads = false
 
-// --jit-check-abi: emit a startup sweep that compares every used handled-type's
-// HOST-baked size + field offsets against the TARGET runtime annotation and
-// kabooms — reporting ALL divergences — on any mismatch. Diagnostic for the
-// MSVC-host vs wasm/clang-target C++ ABI layout class (vptr/base ordering or
-// #ifdef WIN32/EMSCRIPTEN-conditional members). Opt-in; off by default.
+// --jit-check-abi: startup sweep comparing every used handled-type's HOST-baked size + field
+// offsets against the TARGET runtime annotation, aborting (reporting ALL divergences) on any
+// mismatch. Diagnoses the MSVC-host vs wasm/clang-target C++ ABI layout class. Opt-in, off by default.
 var public g_jit_check_handled_abi = false
 
 def private wasm_target_features() : string {
@@ -533,7 +522,7 @@ def private wasm_target_features() : string {
 def public LLVMAddFunctionWithType(mod : LLVMModuleRef; name : string; typ : LLVMTypeRef) {
     var rv = LLVMAddFunction(mod, name, typ)
     g_fn_types[name] = typ
-    // uwtable(async): -O3 function-attrs infers `nounwind` through the runtime-helper
+    // uwtable(async): -O3 function-attrs infers `nounwind` through the runtime-helper // nolint:STYLE014
     // attributes, and Win64 codegen then omits .pdata for provably-nounwind functions —
     // a C++-EH panic (DAS_ENABLE_EXCEPTIONS=1 host) crossing such a frame kills the
     // process. uwtable forces the tables regardless; ignored on declarations. Skipped
@@ -547,23 +536,9 @@ def public LLVMAddFunctionWithType(mod : LLVMModuleRef; name : string; typ : LLV
 
 var g_jit_clopts_parsed = false
 
-// LLVM's cost-model thresholds for unroll / partial-unroll / unroll-and-jam
-// are compiled-in cl::opt globals. opt(1) sets them indirectly via
-// cl::ParseCommandLineOptions before parsing the -passes string; daslang's
-// JIT path does not, so the same `default<O3>` pipeline lands different
-// IR shapes (rolled outer loops, no unroll-and-jam) than `opt` produces
-// on the same input.
-//
-// Bisected against the dasProfile benchmark suite (JIT mode, 16 tests):
-//   * spectral-norm 2.77x, native 1.44x, queen 1.39x, sha256 1.17x
-//   * dict/mandelbrot/exp marginal +1-3%
-//   * 8 others within +-2%
-//   * primes -9% (tight `for (i in 2..n) if (n%i==0) return false` loop —
-//     partial unroll bloats the early-exit path without enabling vectorization)
-//
-// The three permission flags (-unroll-allow-partial + the unroll-and-jam
-// pair) are load-bearing for spectral-norm/native. The threshold quartet
-// is what pushes queen from 1.05x to 1.39x.
+// LLVM's unroll / partial-unroll / unroll-and-jam cost-model thresholds are compiled-in cl::opt
+// globals; daslang's JIT path never runs cl::ParseCommandLineOptions, so without these the O3
+// pipeline lands different (worse) IR shapes than `opt` on the same input (bisected on dasProfile).
 [macro_function]
 def public init_jit_clopts() {
     return if (g_jit_clopts_parsed)
@@ -584,7 +559,7 @@ def public init_jit_clopts() {
     }
 }
 
-// Pure target-truth computation — no LLVM state touched, so it is safe (and required) to
+// Pure target-truth computation — no LLVM state touched, so it is safe (and required) to // nolint:STYLE014
 // call BEFORE init_jit: the DisableJitVisitor pass consults the g_target_* gates through
 // has_intrinsic, and it runs before the LLVM module exists. init_jit re-runs it (idempotent —
 // callers must pass the SAME host_features both times or the pass and emission diverge).
@@ -654,12 +629,9 @@ def public init_jit(cg_opt_level : uint; target_triple : string = ""; host_featu
     g_handled_field_offset_globals |> clear()
     g_mod = LLVMModuleCreateWithNameInContext("llvm_jit_module", g_ctx)
     LLVMCreateJITCompilerForModule(g_engine, g_mod, cg_opt_level)
-    // For cross-compile targets (wasm32, etc.) pin the module's data layout
-    // to the TARGET's, not the host's, BEFORE any IR is built. LLVM constant-
-    // folds GEPs eagerly using the module's current layout — if the host has
-    // 8-byte pointers and the target has 4-byte, every for-loop end-pointer
-    // GEP bakes in the wrong stride and the loop never terminates. The native
-    // path (empty triple) keeps the host default.
+    // Cross-compile targets (wasm32, etc.): pin the module's data layout to the TARGET's, not the
+    // host's, BEFORE any IR is built — LLVM constant-folds GEPs against the current layout, so a
+    // host/target pointer-size mismatch bakes wrong strides and the loop never terminates.
     init_jit_target_flags(target_triple, host_features)
     if (!(target_triple |> empty())) {
         // wasm32 target isn't always part of LLVMInitializeAllTargets in
@@ -667,7 +639,7 @@ def public init_jit(cg_opt_level : uint; target_triple : string = ""; host_featu
         if (g_target_is_wasm) {
             LLVMInitializeWasmTarget()
         }
-        // +simd128 / +nontrapping-fptoint is the feature set the wasm runtime
+        // +simd128 / +nontrapping-fptoint is the feature set the wasm runtime // nolint:STYLE014
         // archive is compiled with (see web/CMakeLists.txt). Required on wasm
         // so vec4f returns are v128-in-register on both sides; meaningless
         // (and potentially a target-machine-creation failure) on other
@@ -770,17 +742,15 @@ def public init_jit(cg_opt_level : uint; target_triple : string = ""; host_featu
     LLVMAddAttributesToFunction(jit_get_shared_mnh, fixed_array(nounwind, willreturn))
     LLVMAddAttributeToFunctionArgument(jit_get_shared_mnh, 1u, nocapture)
     // uint32_t jit_get_handled_field_offset ( const char * module, const char * type, const char * field )
-    // Wasm-only: resolves a handled-type (C++) field offset against the TARGET runtime's
-    // annotation registry. Filled into per-field offset globals once at init. Declared
-    // unconditionally (zero cost if unused); only emitted/called when g_target_is_wasm.
+    // Wasm-only: resolves a handled-type (C++) field offset against the TARGET runtime's annotation
+    // registry, into per-field globals at init. Declared unconditionally; only used when g_target_is_wasm.
     var jit_get_handled_field_offset = LLVMAddFunctionWithType(g_mod, FN_JIT_GET_HANDLED_FIELD_OFFSET,
         LLVMFunctionType(g_prim_t.t_int32,
             fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
     LLVMAddGlobalMapping(g_engine, jit_get_handled_field_offset, get_jit_get_handled_field_offset())
     LLVMAddAttributesToFunction(jit_get_handled_field_offset, fixed_array(nounwind, willreturn))
-    // --jit-check-abi safe-check trio (declared unconditionally; only called from the
-    // init function when g_jit_check_handled_abi). The host bakes its layout into the
-    // call args; these resolve the TARGET annotation and record/abort on mismatch.
+    // --jit-check-abi safe-check trio (declared unconditionally; called only when g_jit_check_handled_abi).
+    // Host bakes its layout into the call args; these resolve the TARGET annotation and record/abort on mismatch.
     // void jit_check_handled_type_size ( const char * module, const char * type, uint32_t hostSize )
     var jit_check_handled_type_size = LLVMAddFunctionWithType(g_mod, FN_JIT_CHECK_HANDLED_TYPE_SIZE,
         LLVMFunctionType(g_prim_t.t_void,
@@ -794,9 +764,8 @@ def public init_jit(cg_opt_level : uint; target_triple : string = ""; host_featu
     LLVMAddGlobalMapping(g_engine, jit_check_handled_field_offset, get_jit_check_handled_field_offset())
     LLVMAddAttributesToFunction(jit_check_handled_field_offset, fixed_array(nounwind, willreturn))
     // void jit_handled_abi_check_report ()
-    // NO willreturn: this aborts (DAS_FATAL_ERROR) on any mismatch, so it may not
-    // return normally — willreturn would be UB. (The two check fns above DO always
-    // return, so they keep willreturn.)
+    // NO willreturn: this aborts (DAS_FATAL_ERROR) on any mismatch, so it may not return
+    // normally — willreturn would be UB. (The two check fns above keep willreturn.)
     var jit_handled_abi_check_report = LLVMAddFunctionWithType(g_mod, FN_JIT_HANDLED_ABI_CHECK_REPORT,
         LLVMFunctionType(g_prim_t.t_void, array<LLVMTypeRef>()))
     LLVMAddGlobalMapping(g_engine, jit_handled_abi_check_report, get_jit_handled_abi_check_report())
@@ -1103,17 +1072,9 @@ def public build_block_type {
     ]
 }
 
-// opt_level: 0..3 — picks LLVMCodeGenOptLevel for codegen-side passes
-// use_host_cpu: when true, plumb the host CPU name + feature set into the
-//   TargetMachine. Without this, TargetTransformInfo returns a generic
-//   baseline cost model, which throttles loop unrolling, register-pressure
-//   estimation, and vectorization decisions for the IR-level pipeline
-//   driven by LLVMRunPasses. Use true for JIT and JIT-DLL-cache emission
-//   (the artifact only ever runs on this host); use false for redistributable
-//   exe/dll emission where the binary must run on any compatible CPU.
-// Build a TargetMachine for an arbitrary triple/cpu/features. Caller owns
-// triple/cpu/features (we do not LLVMDisposeMessage them — they are plain
-// das `string`s here, not heap-owned LLVM messages).
+// opt_level 0..3 → LLVMCodeGenOptLevel. use_host_cpu=true bakes the host CPU+features (JIT /
+// DLL-cache, host-only artifacts); false = generic baseline for redistributable exe/dll. Build a
+// TargetMachine for a triple/cpu/features — caller owns them; we do NOT LLVMDisposeMessage (plain das strings).
 [macro_function]
 def public with_target_machine(triple, cpu, features : string; opt_level : uint;
                                blk : block<(LLVMTargetMachineRef) : void>) {
@@ -1151,12 +1112,9 @@ def public with_default_target_machine(opt_level : uint; use_host_cpu : bool;
     LLVMInitializeAllTargetMCs()
     LLVMInitializeAllAsmPrinters()
 
-    // host_jit_triple() returns the daslang-host toolchain's triple when it
-    // differs from LLVM.dll's default. On clang-mingw64, the prebuilt LLVM.dll
-    // (MSVC clang-cl-built) defaults to x86_64-pc-windows-msvc — emitting
-    // MSVC-ABI .o files that mingw's linker can't satisfy (_fltused etc).
-    // Empty string means "use LLVM default" (existing MSVC / linux / macOS
-    // builds where LLVM.dll's triple already matches the host).
+    // host_jit_triple() returns the daslang-host toolchain's triple when it differs from LLVM.dll's
+    // default (clang-mingw64: prebuilt MSVC clang-cl LLVM.dll defaults to x86_64-pc-windows-msvc,
+    // emitting MSVC-ABI .o that mingw's linker can't satisfy). Empty = use LLVM default.
     let host_triple = host_jit_triple()
     var triple_msg : string
     var triple_owned_by_llvm = false
@@ -1169,7 +1127,7 @@ def public with_default_target_machine(opt_level : uint; use_host_cpu : bool;
     let cpu_msg = use_host_cpu ? LLVMGetHostCPUName() : ""
     let features_msg = use_host_cpu ? LLVMGetHostCPUFeatures() : ""
 
-    // JIT host artifact on aarch64: force +dotprod into the feature set. On macOS
+    // JIT host artifact on aarch64: force +dotprod into the feature set. On macOS // nolint:STYLE014
     // LLVMGetHostCPUFeatures() is empty — the features are implied by the CPU name
     // (e.g. apple-m1) — so when LLVM maps a chip it doesn't recognize (a newer Apple
     // part on an older LLVM) to "generic", SDOT (@llvm.aarch64.neon.sdot, emitted for
@@ -1179,7 +1137,7 @@ def public with_default_target_machine(opt_level : uint; use_host_cpu : bool;
     // SDOT; -mcpu=generic -mattr=+dotprod emits `sdot.4s`.)
     if (use_host_cpu && g_target_is_aarch64) {
         var feats = empty(features_msg) ? "+dotprod" : "{features_msg},+dotprod"
-        // DAS_JIT_ARM64_FORCE_FEATURES (comma-separated aarch64 feature names, e.g. "i8mm"): the
+        // DAS_JIT_ARM64_FORCE_FEATURES (comma-separated aarch64 feature names, e.g. "i8mm"): the // nolint:STYLE014
         // x64 rail's twin — lets a pre-i8mm host EMIT AND LINK an artifact for newer silicon (the
         // DLL-cache key folds the string, so a forced artifact never cache-hits a normal run, and
         // the same-env run on the target box cache-hits it without needing a linker there).
@@ -1209,26 +1167,24 @@ def public with_default_target_machine(opt_level : uint; use_host_cpu : bool;
     }
 }
 
-// @mod - module to dump to dll
-// @out_path - folder and name of file, without extension
-// @path_to_dascript_lib - path to library, required on Windows. Has no effect on Linux.
-// @path_to_linker - linker override. Windows-MSVC defaults to lld-link from the LLVM package
-// (link.exe-flavored cmd), c++/clang default elsewhere.
-def public write_dll(mod : LLVMOpaqueModule?; out_path : string; path_to_dascript_lib, path_to_linker, linker_string : string; link_whole_lib : bool) {
+// @out_path - folder + file name, without extension. @path_to_dascript_lib - required on Windows,
+// no effect on Linux. @path_to_linker - linker override; Windows-MSVC defaults to lld-link (link.exe
+// flavor) from the LLVM package, c++/clang elsewhere.
+def public write_dll(mod : LLVMOpaqueModule?; out_path : string; path_to_dascript_lib, path_to_linker, linker_string : string; link_whole_lib : bool; debug_info : bool = false) {
     // JIT DLL cache: emitted artifact only ever runs on this host.
     with_default_target_machine(3u, true) $(targetMachine : LLVMTargetMachineRef) {
         let error : string?
         let file = add_obj_extension(out_path)
         let filetype = LLVMCodeGenFileType.LLVMObjectFile
         LLVMTargetMachineEmitToFile(targetMachine, mod, file, filetype, error)
-        let ok = create_shared_library(file, add_dll_extension(out_path), "{path_to_dascript_lib}", "{path_to_linker}", "{linker_string}", true, link_whole_lib)
+        let ok = create_shared_library(file, add_dll_extension(out_path), "{path_to_dascript_lib}", "{path_to_linker}", "{linker_string}", true, link_whole_lib, debug_info)
         if (!ok) {
             panic("write_dll: link failed for {out_path}")
         }
     }
 }
 
-def public write_exe(mod : LLVMOpaqueModule?; out_path : string; path_to_dascript_lib, path_to_linker, linker_string : string; link_whole_lib : bool; use_host_cpu : bool) {
+def public write_exe(mod : LLVMOpaqueModule?; out_path : string; path_to_dascript_lib, path_to_linker, linker_string : string; link_whole_lib : bool; use_host_cpu : bool; debug_info : bool = false) {
     // Standalone exe: generic (redistributable) by default, but a local-use build carrying
     // tuner-generated kernels targets the current box (use_host_cpu) so its host-specific IR
     // (e.g. AVX2) can be legalized — the generic target aborts codegen on it otherwise.
@@ -1237,16 +1193,15 @@ def public write_exe(mod : LLVMOpaqueModule?; out_path : string; path_to_dascrip
         let file = add_obj_extension(out_path)
         let filetype = LLVMCodeGenFileType.LLVMObjectFile
         LLVMTargetMachineEmitToFile(targetMachine, mod, file, filetype, error)
-        let ok = create_shared_library(file, add_exe_extension(out_path), "{path_to_dascript_lib}", "{path_to_linker}", "{linker_string}", false, link_whole_lib)
+        let ok = create_shared_library(file, add_exe_extension(out_path), "{path_to_dascript_lib}", "{path_to_linker}", "{linker_string}", false, link_whole_lib, debug_info)
         if (!ok) {
             panic("write_exe: link failed for {out_path}")
         }
     }
 }
 
-// Locate the wasm64 (memory64) libDaScript_runtime.a. If `override_path` is non-empty
-// it wins (caller-supplied path, e.g. from --jit-runtime-lib CLI flag) and a missing
-// file logs a warning. Otherwise auto-locates the archive at
+// Locate the wasm64 (memory64) libDaScript_runtime.a. Non-empty `override_path` wins (e.g.
+// --jit-runtime-lib CLI flag; a missing file logs a warning); otherwise auto-locate at
 // <das_root>/web/output64/lib/liblibDaScript_runtime.a.
 def private find_runtime_lib(override_path : string) : Option<string> {
     if (!(override_path |> empty())) {
@@ -1258,14 +1213,9 @@ def private find_runtime_lib(override_path : string) : Option<string> {
     return stat(candidate).is_valid ? some(candidate) : none(type<string>)
 }
 
-// Cross-compile a module to wasm64 (memory64) and link to a runnable .wasm via
-// emcc, against the web/output64 runtime archive with -sMEMORY64=1.
-// triple defaults to wasm64-unknown-emscripten.
-// path_to_emcc may be empty; link_wasm falls back to bin/emcc then PATH.
-// needs_runtime gates inclusion of libDaScript_runtime.a in the link:
-// true → archive is linked when found, otherwise warning + link without;
-// false → archive is omitted unconditionally (pure programs).
-// explicit_runtime is an optional caller-supplied archive path.
+// Cross-compile a module to wasm64 (memory64) and link a runnable .wasm via emcc against the
+// web/output64 runtime archive (-sMEMORY64=1). triple defaults to wasm64-unknown-emscripten;
+// needs_runtime gates linking libDaScript_runtime.a (true=link if found else warn; false=omit).
 def public write_wasm(mod : LLVMOpaqueModule?; out_path : string; triple : string; path_to_emcc : string; needs_runtime : bool; explicit_runtime : string = ""; emit_object_only : bool = false) {
     LLVMInitializeWasmTarget()
     let real_triple = (!(triple |> empty()) ? triple : "wasm64-unknown-emscripten")
@@ -1273,7 +1223,7 @@ def public write_wasm(mod : LLVMOpaqueModule?; out_path : string; triple : strin
     if (needs_runtime && is_none(runtime_lib)) {
         to_log(LOG_WARNING, "wasm: runtime symbols referenced but libDaScript_runtime.a not found at web/output64/lib/ — run the web/ emscripten build to link in the runtime, or pass --jit-runtime-lib=<path>\n")
     }
-    // Match the feature set web/CMakeLists.txt compiles the runtime archive with
+    // Match the feature set web/CMakeLists.txt compiles the runtime archive with // nolint:STYLE014
     // (-msimd128 -mnontrapping-fptoint). Without +simd128 the host LLVM lowers
     // vec4f returns via sret while emcc returns them as native v128, causing
     // function-signature mismatches at wasm-ld link time and `unreachable`

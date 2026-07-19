@@ -13,4 +13,5 @@ def release() {
     release_main("main.das")
     release_name("dasllama-server")
     release_include("watchdog.py")
+    release_include("control.html")   // the control page — SERVE_FILE reads it from <exe_dir> at runtime
 }

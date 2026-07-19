@@ -310,8 +310,22 @@ button:disabled { opacity: 0.45; cursor: default; }
         <span class="ctl-note" id="ctl-note">gc runs at the next lifecycle safe point · shutdown drains accepted work, then exits</span>
     </div>
 
+    <div class="sec"><span>§ 09</span><span class="rule"></span><span>benchmark</span></div>
+    <div class="panel">
+        <div class="controls" style="margin-bottom:10px">
+            <button id="b-bench" type="button">run llama.cpp A/B</button>
+            <span class="ctl-note" id="bench-note">quiesced only — refuses while streams are active · runs our lcpp_bench then llama-bench on the same GGUF (minutes-class)</span>
+        </div>
+        <div class="cfg" id="bench-log" style="display:none"></div>
+        <table class="ctable" id="bench-table" style="display:none">
+            <thead><tr><th></th><th>pp512 tok/s</th><th>tg128 tok/s</th></tr></thead>
+            <tbody id="bench-body"></tbody>
+        </table>
+        <div class="cfg-file" id="bench-meta"></div>
+    </div>
+
     <footer class="reveal">
-        <div class="sec"><span>§ 09</span><span class="rule"></span><span>how this works</span></div>
+        <div class="sec"><span>§ 10</span><span class="rule"></span><span>how this works</span></div>
         <p>
             Everything above — the tokenizer, every matmul kernel, the continuous-batching
             scheduler, the paged KV cache, this HTTP server — is written in
@@ -1134,7 +1148,8 @@ const FIELDS = [
     { k: "ctx", t: "int" }, { k: "max_tokens", t: "int" },
     { k: "streams", t: "int" }, { k: "port", t: "int" },
     { k: "threads", t: "int" }, { k: "team_dispatch", t: "sel", o: ["hybrid", "team", "inline"] },
-    { k: "affinity", t: "int" }, { k: "chunk", t: "int" },
+    { k: "affinity", t: "isel", o: [[0, "off"], [1, "ideal-cpu hint"], [2, "hard mask"]] },
+    { k: "chunk", t: "int" },
     { k: "page_rows", t: "int" }, { k: "prefix", t: "int" },
     { k: "flat", t: "bool" }, { k: "mtp", t: "bool" },
     { k: "gpu", t: "sel", o: ["", "off", "metal", "metal-required", "vulkan"] },
@@ -1144,6 +1159,7 @@ const FIELDS = [
     { k: "metal", t: "sel", o: ["off", "auto", "required"] },
     { k: "asr", t: "path", wide: true }, { k: "mmproj", t: "path", wide: true },
     { k: "asr_workers", t: "int" },
+    { k: "lcpp_bin", t: "path", wide: true },
 ];
 let cfgSurface = null;
 let savedSnapshot = "";   // JSON of the last rendered/saved form — restart guards against unsaved edits
@@ -1174,6 +1190,18 @@ function renderForm(surface, status) {
             }
             input.value = String(cfg[f.k]);
             if (input.value !== String(cfg[f.k])) input.value = f.o[0];   // unknown value fallback
+        } else if (f.t === "isel") {
+            // int-valued select: options are [value, label] pairs — the config key stays an
+            // int, the user sees words (a bare "2" told nobody it meant a hard mask)
+            input = document.createElement("select");
+            for (const [v, txt] of f.o) {
+                const opt = document.createElement("option");
+                opt.value = String(v);
+                opt.textContent = txt;
+                input.append(opt);
+            }
+            input.value = String(cfg[f.k]);
+            if (input.value !== String(cfg[f.k])) input.value = String(f.o[0][0]);
         } else if (f.t === "bool") {
             input = document.createElement("input");
             input.type = "checkbox";
@@ -1260,7 +1288,7 @@ function gatherConfig() {
         const el = $("f-" + f.k);
         if (!el) continue;
         if (f.t === "bool") out[f.k] = el.checked;
-        else if (f.t === "int") out[f.k] = Math.trunc(Number(el.value) || 0);
+        else if (f.t === "int" || f.t === "isel") out[f.k] = Math.trunc(Number(el.value) || 0);
         else out[f.k] = el.value;
     }
     return out;
@@ -1345,6 +1373,63 @@ $("b-drain").addEventListener("click", async () => {
     try { await fetch("/shutdown", { method: "POST" }); $("ctl-note").textContent = "draining — the process exits when active work completes"; }
     catch (_e) { $("ctl-note").textContent = "shutdown request failed"; $("b-drain").disabled = false; }
 });
+
+// ===== benchmark panel =====
+let benchPolling = false;
+
+function renderBench(b) {
+    const log = $("bench-log");
+    if (b.log && b.log.length) {
+        log.style.display = "block";
+        log.innerHTML = b.log.map(l => esc(l)).join("<br>");
+    }
+    if (b.result) {
+        const r = b.result;
+        $("bench-table").style.display = "table";
+        const body = $("bench-body");
+        body.innerHTML =
+            "<tr><td class=\"pv\">dasllama (this server)</td><td>" + r.ours_pp.toFixed(1) + "</td><td>" + r.ours_tg.toFixed(1) + "</td></tr>" +
+            "<tr><td class=\"pv\">llama.cpp (llama-bench)</td><td>" + r.theirs_pp.toFixed(1) + "</td><td>" + r.theirs_tg.toFixed(1) + "</td></tr>" +
+            "<tr><td class=\"pv\">ratio</td><td class=\"" + (r.pp_ratio >= 1 ? "hit" : "") + "\">" + r.pp_ratio.toFixed(2) + "x</td>" +
+            "<td class=\"" + (r.tg_ratio >= 1 ? "hit" : "") + "\">" + r.tg_ratio.toFixed(2) + "x</td></tr>";
+        $("bench-meta").textContent = (b.hardware || "") + " · " + r.threads + " threads · " +
+            new Date(r.ts * 1000).toLocaleString() + " · " + r.elapsed_s + "s run";
+    }
+    $("bench-note").textContent = b.state === "running" ? "running — both benches finish before results appear"
+        : b.state === "failed" ? "failed — see the log above"
+        : b.state === "done" ? "done"
+        : $("bench-note").textContent;
+    $("b-bench").disabled = b.state === "running";
+    if (b.state === "running" && !benchPolling) {
+        benchPolling = true;
+        const tickB = async () => {
+            try {
+                const r = await fetch("/bench", { cache: "no-store" });
+                const j = await r.json();
+                renderBench(j);
+                if (j.state === "running") { setTimeout(tickB, 2000); return; }
+            } catch (_e) { /* server may be gone */ }
+            benchPolling = false;
+        };
+        setTimeout(tickB, 2000);
+    }
+}
+
+$("b-bench").addEventListener("click", async () => {
+    try {
+        const r = await fetch("/bench", { method: "POST" });
+        const j = await r.json();
+        if (!r.ok) {
+            $("bench-note").textContent = j.error ? j.error.message : ("failed: " + r.status);
+            return;
+        }
+        renderBench({ state: "running", log: [] });
+    } catch (_e) {
+        $("bench-note").textContent = "bench request failed";
+    }
+});
+
+fetch("/bench", { cache: "no-store" }).then(r => r.json()).then(renderBench).catch(() => {});
 
 poll();
 loadConfig();

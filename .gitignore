@@ -125,26 +125,11 @@ utils/**/modules/
 examples/games/sequence/modules/.daspkg.log
 tutorials/integration/cpp/_standalone_ctx_generated/standalone_context.das.cpp
 tutorials/integration/cpp/_standalone_ctx_generated/standalone_context.das.h
-modules/dasAudio/dasModuleAudio.pdb
-modules/dasHV/dasModuleHV.pdb
-modules/dasLiveHost/dasModuleLiveHost.pdb
-modules/dasMinfft/dasModuleMinfft.pdb
-modules/dasPUGIXML/dasModulePUGIXML.pdb
-modules/dasSQLITE/dasModuleSQLITE.pdb
-modules/dasStbImage/dasModuleStbImage.pdb
-modules/dasStdDlg/dasModuleStdDlg.pdb
-modules/dasUnitTest/dasModuleUnitTest.pdb
+# shared-module PDBs — Release now emits /Z7+/DEBUG side PDBs for every module
+# (was an enumerated list; the glob covers the modules that only started getting PDBs)
+modules/**/*.pdb
 tree-sitter-daslang/daslang.pdb
 libhv.*.log
-modules/dasAudio/dasModuleAudio_debug.pdb
-modules/dasHV/dasModuleHV_debug.pdb
-modules/dasLiveHost/dasModuleLiveHost_debug.pdb
-modules/dasMinfft/dasModuleMinfft_debug.pdb
-modules/dasPUGIXML/dasModulePUGIXML_debug.pdb
-modules/dasSQLITE/dasModuleSQLITE_debug.pdb
-modules/dasStbImage/dasModuleStbImage_debug.pdb
-modules/dasStdDlg/dasModuleStdDlg_debug.pdb
-modules/dasUnitTest/dasModuleUnitTest_debug.pdb
 build-ubsan/.ninja_log
 doc/sphinx-build-latex/environment.pickle
 opencode.json

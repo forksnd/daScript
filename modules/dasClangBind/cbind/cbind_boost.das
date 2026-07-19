@@ -805,7 +805,9 @@ class DasGenBind : AnyGenBind {
     struct_class_file : FILE const?
     enum_class_file : FILE const?
     module_name : string
-    MAX_ARGUMENTS = 16
+    // Must not exceed MAX_ARGUMENTS in src/builtin/generate_x86_64_calls.das —
+    // the dasbind fastcall wrapper table is what actually dispatches these calls.
+    MAX_ARGUMENTS = 24
 
     def filter_das_words(s : string) {
         let to_replace = {

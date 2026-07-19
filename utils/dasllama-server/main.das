@@ -124,6 +124,9 @@ struct ServerArgs {
     @clarg_doc = "MTP/NextN self-speculative decode for greedy requests (needs a model with an in-file NextN head, e.g. the -MTP- GGUFs; pays on the dense qwen35 models)"
     mtp : bool
 
+    @clarg_doc = "Path to a llama.cpp llama-bench binary — enables the control page's benchmark button"
+    lcpp_bin : string
+
     @clarg_doc = "Re-tune this box's dasLLAMA kernels, then relaunch (handled before arg parsing)"
     tune : bool
 
@@ -191,7 +194,7 @@ var private g_cfg_authoritative = false
 let CONFIG_KEYS = fixed_array("model", "port", "quant", "kv_dtype", "metal", "gpu", "gpu_layers",
     "gpu_stream", "gpu_dn", "gpu_attn", "gpu_dense", "gpu_vram_mb", "asr", "mmproj", "asr_workers",
     "ctx", "max_tokens", "streams", "threads", "team_dispatch", "affinity", "chunk", "page_rows",
-    "prefix", "flat", "mtp")
+    "prefix", "flat", "mtp", "lcpp_bin")
 
 def private from_cli(key : string) : bool
     => (g_cfg_sources?[key] ?? "") == "cli"
@@ -308,6 +311,9 @@ def private mark_cli_sources(cfg : ServerArgs) {
     if (cli_has_flag("--mtp")) {
         g_cfg_sources["mtp"] = "cli"
     }
+    if (!empty(cfg.lcpp_bin)) {
+        g_cfg_sources["lcpp_bin"] = "cli"
+    }
 }
 
 // fill fields from the TOML config. Default precedence: defaults < config file < explicit CLI
@@ -353,6 +359,7 @@ def apply_config(var cfg : ServerArgs) : bool {
     cfg_from_toml(root, "prefix", cfg.prefix, auth)
     cfg_from_toml(root, "flat", cfg.flat, auth)
     cfg_from_toml(root, "mtp", cfg.mtp, auth)
+    cfg_from_toml(root, "lcpp_bin", cfg.lcpp_bin, auth)
     unsafe {
         delete root
     }
@@ -439,7 +446,8 @@ def private build_config_surface(cfg : ServerArgs; save_path : string) : string 
         page_rows = cfg.page_rows > 0 ? cfg.page_rows : 64,
         prefix = cfg.prefix,
         flat = cfg.flat,
-        mtp = cfg.mtp))
+        mtp = cfg.mtp,
+        lcpp_bin = cfg.lcpp_bin))
     var sources <- { for (k in CONFIG_KEYS); k => JV(g_cfg_sources?[k] ?? "default") }
     var top <- {
         "config" => config,
@@ -646,6 +654,9 @@ def init() {
         }
     }
     print("loading {g_cfg.model} ...\n")
+    // A serving process prefers degrading (warn + nearest working mode) over dying on an
+    // unsupported model/quant combo; API-facing tools keep the strict fail-loud default.
+    set_resilient_load(true)
     var m <- load_model(g_cfg.model, pick_quant(g_cfg.quant))
     if (ctx > 0l) {
         m.config.seq_len = min(m.config.seq_len, ctx)
@@ -663,6 +674,16 @@ def init() {
     // auto-discovery in parse_args looks)
     let save_path = !empty(g_cfg.config) ? g_cfg.config : path_join(get_this_module_dir(), "dasllama-server.toml")
     set_config_surface(build_config_surface(g_cfg, save_path), save_path, g_cfg.model)
+    // the bench button runs OUR bench as a child daslang process (lcpp_bench.das) — a
+    // standalone-exe deployment has no script runner, so the button stays disabled there
+    var daslang_bin = ""
+    if (!is_standalone_exe()) {
+        for (a in get_command_line_arguments()) {   // argv[0] = the running daslang binary (locked temp — no delete)
+            daslang_bin = a
+            break
+        }
+    }
+    set_bench_config(g_cfg.lcpp_bin, daslang_bin)
 
     g_server_ready = init_server(
         port, streams,

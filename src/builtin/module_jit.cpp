@@ -1102,7 +1102,7 @@ extern "C" {
         return true;
     }
 
-    bool create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasLib, const char * customLinker, const char * extraLinkerArgs, bool isShared, bool linkWholeLib, Context *context ) {
+    bool create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasLib, const char * customLinker, const char * extraLinkerArgs, bool isShared, bool linkWholeLib, [[maybe_unused]] bool debugInfo, Context *context ) {
         // cmd is built via fmt::format (heap-allocated std::string) rather
         // than a fixed stack buffer — long paths (deep build roots, spaces,
         // long extraLinkerArgs) can easily exceed a few hundred bytes, and
@@ -1135,6 +1135,10 @@ extern "C" {
                 // whole command for cmd.exe because the linker path itself
                 // contains spaces on Program Files installs.
                 const auto linkerParam = isShared ? "/DLL" : "";
+                // /DEBUG makes lld-link emit a PDB next to /OUT. Without CodeView in the
+                // object it carries publics only; once the emitter attaches DI it upgrades
+                // to full line info for the same flag.
+                const auto debugParam = debugInfo ? "/DEBUG" : "";
                 // Keep a compact linker map beside every JIT PE. A normal minidump deliberately
                 // omits the process heap (and therefore model weights), while the map plus the
                 // retained COFF object resolves generated module+RVA frames after a crash.
@@ -1147,8 +1151,8 @@ extern "C" {
                     mapPath.replace(dot, std::string::npos, ".map");
                 }
                 cmd = compilerLibrary.empty()
-                    ? fmt::format(FMT_STRING("\"\"{}\" \"{}\" \"{}\" msvcrt.lib {} {} /OUT:\"{}\" /MAP:\"{}\" 2>&1\""), linker.c_str(), objFilePath, runtimeLibrary.c_str(), extra, linkerParam, libraryName, mapPath.c_str())
-                    : fmt::format(FMT_STRING("\"\"{}\" \"{}\" \"{}\" \"{}\" msvcrt.lib {} {} /OUT:\"{}\" /MAP:\"{}\" 2>&1\""), linker.c_str(), objFilePath, runtimeLibrary.c_str(), compilerLibrary.c_str(), extra, linkerParam, libraryName, mapPath.c_str());
+                    ? fmt::format(FMT_STRING("\"\"{}\" \"{}\" \"{}\" msvcrt.lib {} {} {} /OUT:\"{}\" /MAP:\"{}\" 2>&1\""), linker.c_str(), objFilePath, runtimeLibrary.c_str(), extra, linkerParam, debugParam, libraryName, mapPath.c_str())
+                    : fmt::format(FMT_STRING("\"\"{}\" \"{}\" \"{}\" \"{}\" msvcrt.lib {} {} {} /OUT:\"{}\" /MAP:\"{}\" 2>&1\""), linker.c_str(), objFilePath, runtimeLibrary.c_str(), compilerLibrary.c_str(), extra, linkerParam, debugParam, libraryName, mapPath.c_str());
             #else
                 // mingw clang/gcc: Unix-flavored driver, -shared/-o syntax.
                 // No rpath on Windows (DLLs resolve via PATH / LoadLibrary
@@ -1200,7 +1204,7 @@ extern "C" {
         return run_link_cmd(cmd.c_str(), libraryName, "Library", context);
     }
 #else
-    bool create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasLib, const char * customLinker, const char * extraLinkerArgs, bool isShared, bool linkWholeLib, Context *context ) { return true; }
+    bool create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasLib, const char * customLinker, const char * extraLinkerArgs, bool isShared, bool linkWholeLib, bool debugInfo, Context *context ) { return true; }
 #endif
 
 #if (defined(_WIN32) || defined(__linux__) || defined(__APPLE__)) && !defined(_GAMING_XBOX) && !defined(_DURANGO)
@@ -1427,7 +1431,7 @@ extern "C" {
                     ->args({"library"});
             addExtern<DAS_BIND_FUN(create_shared_library)>(*this, lib,  "create_shared_library",
                 SideEffects::worstDefault, "create_shared_library")
-                    ->args({"objFilePath","libraryName","dasLib","customLinker","extraLinkerArgs","isShared","linkWholeLib","context"});
+                    ->args({"objFilePath","libraryName","dasLib","customLinker","extraLinkerArgs","isShared","linkWholeLib","debugInfo","context"});
             addExtern<DAS_BIND_FUN(host_jit_triple)>(*this, lib, "host_jit_triple",
                 SideEffects::none, "host_jit_triple");
             addExtern<DAS_BIND_FUN(link_wasm)>(*this, lib,  "link_wasm",

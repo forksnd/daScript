@@ -38,6 +38,7 @@ require llvm/llvm_debug
 
 var active_filenames : table<string>
 
+// nolint:STYLE014
 // Packed-find codegen for STRING keys (the only key type that still packs; non-string keys are
 // open-addressed at every capacity — see build_workhorse_table_find). Early-out wins for strings:
 // 8xi64 SIMD is 512 bits -> 2x vpcmpeqq + mask reduction (heavy), while the scalar early-out exits
@@ -227,10 +228,9 @@ def public is_workhorse_table_key(t : Type) : bool {
         || t == Type.tBool || t == Type.tFloat || t == Type.tDouble)
 }
 
-// Per-source state of an inline table slot walk (a `keys(tab)` / `values(tab)` for-loop source
-// over a workhorse-keyed table) — set up by the first() arm, advanced by next(), torn down by
-// emit_iterator_close. Non-string keys are open-addressed at every capacity (1-byte CTRL array),
-// so the walk is a flat `ctrl[slot] > CTRL_TOMBSTONE` scan with no regime branch.
+// Per-source state of an inline `keys(tab)` / `values(tab)` slot walk over a workhorse-keyed table:
+// set up by first(), advanced by next(), torn down by emit_iterator_close. Non-string keys are
+// open-addressed at every capacity (1-byte CTRL), so the walk is a flat `ctrl[slot] > TOMBSTONE` scan.
 struct TableWalkState {
     slot    : LLVMOpaqueValue?   // alloca i64 — current slot cursor
     cap     : LLVMOpaqueValue?   // i64 capacity, loaded once at first()
@@ -246,6 +246,7 @@ struct TableWalkState {
 class public LlvmJitVisitor : AstVisitor {
     adapter : VisitorAdapter?
     e2v : table<Expression?; LLVMOpaqueValue?>
+    // nolint:STYLE014
     // makeArrayOnHeap literals: stack of arr.data buffer bases for heap make-arrays currently being
     // built. getE(expr) holds the Array struct (the expression result); the top of this stack is where
     // element make-local cmres writes go, mirroring interp's abiCMRES redirect in SimNode_MakeArrayHeap.
@@ -303,6 +304,15 @@ class public LlvmJitVisitor : AstVisitor {
         if (flags.need_di) {
             own_di = true
             g_di_builder = LLVMCreateDIBuilder(g_mod)
+            // One CU per DIBuilder (LLVM asserts on a second). DIBuilder remembers it and
+            // stamps `unit:` on every subprogram definition; per-function DIFiles carry the
+            // real .das paths, so the CU's own file name is just a label.
+            let cu_name = "das-jit"
+            let producer = "daslang jit"
+            let cu_file = LLVMDIBuilderCreateFile(g_di_builder, cu_name, uint64(length(cu_name)), "", 0ul)
+            LLVMDIBuilderCreateCompileUnit(g_di_builder, LLVMDWARFSourceLanguage.C, cu_file,
+                producer, uint64(length(producer)), 0, "", 0ul, 0u, "", 0ul,
+                LLVMDWARFEmissionKind.LLVMDWARFEmissionFull, 0u, 0, 0, "", 0ul, "", 0ul)
         }
     }
 
@@ -322,20 +332,15 @@ class public LlvmJitVisitor : AstVisitor {
     def debug_before_function(fun : FunctionPtr) {
         if (debug_info_enabled()) {
             clear_builder_location()
-            di_function = null
-            // TODO: re-enable per-function DI subprogram emission once the
-            // function type generation below is correct. Kept as reference.
-            /*
             let unit = get_debug_file_location(fun.at)
             let implName = uid.get_dll_fn_name(fun).impl()
+            // Untyped subroutine (no param/return DI types yet) — enough for line tables.
             var ty = LLVMDIBuilderCreateSubroutineType(
                 g_di_builder, unit, null, 0u, LLVMDIFlags.LLVMDIFlagZero)
             di_function = LLVMDIBuilderCreateFunction(g_di_builder, unit,
                 implName, uint64(length(implName)), "", 0ul, unit, fun.at.line,
-                ty, 0, 1, 0u, LLVMDIFlags.LLVMDIFlagZero,
-                LLVM_ENABLE_OPT_PASS ? 1 : 0)
+                ty, 1, 1, fun.at.line, LLVMDIFlags.LLVMDIFlagZero, 0)
             LLVMSetSubprogram(ffunc, di_function)
-            */
         }
     }
 
@@ -363,8 +368,9 @@ class public LlvmJitVisitor : AstVisitor {
     def get_debug_file_location_by_name(filename : string) : LLVMOpaqueMetadata? {
         var meta & = unsafe(di_file_location[filename])
         if (meta == null) {
-            let dir = dir_name(filename)
-            meta = LLVMDIBuilderCreateFile(g_di_builder, filename, uint64(length(filename)), dir, uint64(length(dir)))   // todo: boost
+            // filename already carries its path; a non-empty directory would make CodeView
+            // consumers print the dir twice (dir/dir/file) when they join the two fields
+            meta = LLVMDIBuilderCreateFile(g_di_builder, filename, uint64(length(filename)), "", 0ul)
         }
         return meta
     }
@@ -655,11 +661,9 @@ class public LlvmJitVisitor : AstVisitor {
         thisFunc = null
     }
 
-    // [llvm_code(name="key")] path: the registered das generator (llvm_jit_code registry, modules
-    // wired in via llvm_user_modules.das) emits the impl body wholesale; only the public wrapper
-    // comes from the signature. Returns true when the function is fully handled — generated, or
-    // hard-errored via failed(). Returns false when the generator declines: the caller falls
-    // through to normal body codegen, so the reference body is the fallback tier.
+    // [llvm_code(name="key")] path: the registered das generator (llvm_jit_code registry) emits the
+    // impl body wholesale; only the public wrapper comes from the signature. Returns true when fully
+    // handled (generated or hard-errored via failed()); false = generator declines, caller falls to normal body codegen.
     def try_llvm_code_function(fun : FunctionPtr) : bool {
         register_user_llvm_code_generators()   // direct call: registrations land in THIS context's registry
         let ann = find_llvm_code_annotation(fun)
@@ -689,6 +693,19 @@ class public LlvmJitVisitor : AstVisitor {
     def build_wrapper_function(fnmna : DllName; arguments : dasvector`ptr`Variable; var result : TypeDeclPtr; isCmres : bool; captureType : LLVMOpaqueType?; at : LineInfo) {
         var wentry = LLVMAppendBasicBlockInContext(g_ctx, wfunc, "entry")
         LLVMPositionBuilderAtEnd(g_builder, wentry)
+        if (debug_info_enabled()) {
+            // The wrapper needs its own DISubprogram: at O2+ the impl often inlines into
+            // it, and LLVM drops the callee's !dbg when the host has no debug scope.
+            let unit = get_debug_file_location(at)
+            let publName = fnmna.publ()
+            var wty = LLVMDIBuilderCreateSubroutineType(g_di_builder, unit, null, 0u, LLVMDIFlags.LLVMDIFlagZero)
+            let wsp = LLVMDIBuilderCreateFunction(g_di_builder, unit,
+                publName, uint64(length(publName)), "", 0ul, unit, at.line,
+                wty, 0, 1, at.line, LLVMDIFlags.LLVMDIFlagZero, 0)
+            LLVMSetSubprogram(wfunc, wsp)
+            LLVMSetCurrentDebugLocation2(g_builder,
+                LLVMDIBuilderCreateDebugLocation(g_ctx, at.line, at.column, wsp, null))
+        }
         var wargs : array<LLVMOpaqueValue?>
         var args = LLVMGetParam(wfunc, 1u)
         for (a, ai in arguments, count()) {
@@ -731,6 +748,8 @@ class public LlvmJitVisitor : AstVisitor {
         } else {
             LLVMBuildRet(g_builder, LLVMGetUndef(types.LLVMFloat4Type()))
         }
+        // Wrapper-scoped location must not leak onto the next function's entry code.
+        clear_builder_location()
     }
 
     def create_line_info_global(at : LineInfo; dummy : LLVMOpaqueValue?) {
@@ -805,11 +824,8 @@ class public LlvmJitVisitor : AstVisitor {
             var typ = g_fn_types[FN_JIT_PROLOGUE]
             LLVMBuildCall2(g_builder, typ, LLVMGetNamedFunction(g_mod, FN_JIT_PROLOGUE), params, "")
         }
-        // allocate arguments, which need to be promoted to local variables
-        // NOTE:
-        //  thisFunc hasMakeBlock is here just in case we need to capture argument variables
-        //  in the future, we can optimize this out by checking, if particular variable is captured via block
-        //  additionally this causes every block variable to be promoted - which may not be ideal since it would clutter the optimizer (or not?)
+        // allocate arguments (promoted to local variables). hasMakeBlock forces always-promote so
+        // block-captured argument variables are addressable; could be narrowed to captured-only.
         var alwaysPromote = false
         if (thisBlock != null && thisBlock.blockFlags.hasMakeBlock) {
             alwaysPromote = true
@@ -1466,6 +1482,7 @@ class public LlvmJitVisitor : AstVisitor {
     // immutable in runtime
     def load_local_const(val : LLVMOpaqueValue?; type_ : LLVMOpaqueType?) {
         let load_inst = LLVMBuildLoad2(g_builder, type_, val, "")
+        // nolint:STYLE014
         // For -exe mode the global holds a JIT-process function pointer baked
         // at codegen time; with `invariant.load`, LLVM constant-folds the load
         // to the immediate at some call sites (notably top-level `let`
@@ -1496,6 +1513,7 @@ class public LlvmJitVisitor : AstVisitor {
         if (global_addr == null) {
             global_addr = LLVMAddGlobal(g_mod, nonnull_type, name.glob())
             if (flags.gen_exe) {
+                // nolint:STYLE014
                 // For standalone exes the JIT-process address is meaningless
                 // (different ASLR slide in the new process). Leave the global
                 // null at link time; the runtime initialize_modules() walks
@@ -1512,10 +1530,9 @@ class public LlvmJitVisitor : AstVisitor {
                 LLVMSetInitializer(global_addr, types.ConstPtr(address |> intptr, nonnull_type))
             }
         } elif (!flags.gen_exe) {
-            // In JIT mode each function is codegen'd once, so a duplicate name is a real bug.
-            // In exe mode init_globals and init_globals_clone both codegen the same global-var
-            // initializers, so the same addr/global-const slot is legitimately re-encountered —
-            // reuse it silently (idempotent: same name is the same module-level slot).
+            // JIT mode codegen's each function once, so a duplicate name is a real bug. Exe mode
+            // re-codegens the same global-var initializers in init_globals + init_globals_clone, so the
+            // same slot is legitimately re-encountered — reuse silently (idempotent: same name, same slot).
             failed("Name duplicate {name.glob()}\n")
         }
         return load_local_const(global_addr, nonnull_type)
@@ -1556,6 +1573,7 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     def make_call(expr : ExprCallFunc?; doesNotNeedSp : bool) {
+        // nolint:STYLE014
         // $::length over an array truncates Array.size (u64) to i32 — guard the truncation to
         // match the ALWAYS-ON C++ builtin_array_size panic (interp + AOT). Deliberately not
         // gated on option_no_range_check: the C++ guard is not a bounds check and never
@@ -1797,6 +1815,7 @@ class public LlvmJitVisitor : AstVisitor {
         return (lhs, rhs)
     }
 
+    // nolint:STYLE014
     // For signed index: sign-extend on widening so negative becomes
     // 0xFFFF...FFFE; the subsequent unsigned compare against size then catches
     // both negative and oversize indices. Plain ZExt would zero-extend -2 to
@@ -1898,6 +1917,7 @@ class public LlvmJitVisitor : AstVisitor {
         return LLVMBuildSelect(g_builder, none, types.ConstI32(uint64(-1)), ctz32, "lane.idx")
     }
 
+    // nolint:STYLE014
     // String packed find: one <N x i64> SIMD compare of the 64-bit hash array, no liveness mask.
     // The packed-string hash tail is always 0 (alloc / erase / table_clear all clear the full
     // 64-bit width) and a real hash is >1, so the tail never matches — unlike the integer key-data
@@ -2044,6 +2064,7 @@ class public LlvmJitVisitor : AstVisitor {
         return LLVMBuildAnd(g_builder, nz, le, "cap.small")
     }
 
+    // nolint:STYLE014
     // String tab[key]: packed -> inline 64-bit-hash SIMD scan over [0,size); hit returns the slot,
     // miss inserts via the skip-packed reserve (no strcmp, no collision fork — 64-bit exact).
     // large/empty -> inline open-addressed probe + in-place insert (build_string_table_at_large),
@@ -2093,6 +2114,7 @@ class public LlvmJitVisitor : AstVisitor {
         return LLVMBuildSelect(g_builder, le1, types.ConstI32(16777619ul), hk, "shk")
     }
 
+    // nolint:STYLE014
     // Inline open-addressed find for a LARGE string table (cap > TABLE_MAX_LINEAR_CAPACITY): probe the
     // 32-bit hashKey array — EMPTY(0) -> miss; hashKey-match + key-equal -> hit; else advance. Key-equal
     // is ptr-eq then strcmp, evaluated ONLY on a 32-bit hashKey match (behind the pre-filter), mirroring
@@ -2174,6 +2196,7 @@ class public LlvmJitVisitor : AstVisitor {
         return res
     }
 
+    // nolint:STYLE014
     // Inline open-addressed tab[key] for a LARGE string table: reads/probe inline; a write commits in
     // place (reuse first tombstone else EMPTY slot, store hashKey + key ptr, size++, tombstones-- on
     // reuse) unless it must grow (size>=cap/2, also catches cap==0), rehash ((cap-size)/2<tombstones),
@@ -2292,6 +2315,7 @@ class public LlvmJitVisitor : AstVisitor {
         return res
     }
 
+    // nolint:STYLE014
     // Inline wymix hash for a workhorse (non-string) key, bit-identical to hash_uint32 / hash_uint64
     // (anyhash.h): adapt the key to u64 (zext / bitcast, matching the C++ implicit conversions), then
     // h = lo(key*SEED) ^ hi(key*SEED) over the 128-bit product, clamped h<=1 -> FNV prime so the result
@@ -2401,6 +2425,7 @@ class public LlvmJitVisitor : AstVisitor {
         return build_workhorse_table_find(ttype, tab, key)
     }
 
+    // nolint:STYLE014
     // Integer / workhorse tab[key] (insert-or-get): the whole operation is inlined EXCEPT a grow.
     // Mirrors TableHash::reserve's non-string branch (runtime_table.h). Up front we route to the C++
     // at only when an in-place insert is impossible: the table is locked (must throw, like the
@@ -2528,6 +2553,7 @@ class public LlvmJitVisitor : AstVisitor {
         var ptr_idx : LLVMOpaqueValue?
         if (elemType.isVectorType && elemType.vectorDim == 3) {
             var data_bytes = LLVMBuildPointerCast(g_builder, data, LLVMPointerType(types.t_int8, 0u), "")
+            // nolint:STYLE014
             // Stride const must match tidx width — Array.size-derived `tail` is i64,
             // dim-derived tail is i32; an i32 ConstI32 against i64 tidx is a verifier error.
             // das packs 3-lane elements (12B float3/int3, 6B half3/short3, 3B byte3) while
@@ -2909,6 +2935,7 @@ class public LlvmJitVisitor : AstVisitor {
             right = build_broadcast_vector(g_builder, shiftType, right)
         }
         if (is_f16_small_type(opType.baseType)) {
+            // nolint:STYLE014
             // fp16 family (float16 scalar + halfN): the reference semantics ARE promote-to-
             // f32 -> compute -> round-back (RNE), which is exactly fpext -> fop -> fptrunc.
             // With native fullfp16 (arm64) the ops run directly on half — bit-identical for
@@ -3670,6 +3697,7 @@ class public LlvmJitVisitor : AstVisitor {
         return cf.func.flags.builtIn && cf.func._module.name == "$" && (cf.func.name == "count" || cf.func.name == "ucount")
     }
 
+    // nolint:STYLE014
     // A `keys(tab)` / `values(tab)` for-loop source over a workhorse-keyed table — the inline
     // slot-walk fast path. String / non-workhorse keys keep the generic C++ iterator (different
     // liveness regimes; see runtime_table.h tableLiveSlot). The daslib generics instantiate into
@@ -3838,6 +3866,7 @@ class public LlvmJitVisitor : AstVisitor {
                 LLVMBuildStore(g_builder, s0, getV(svar))
                 let dimSize = ssrc._type.fixedDim
                 var tail = types.ConstI32(uint64(dimSize - 1))
+                // nolint:STYLE014
                 // Stash end-element pointer as-is; compare directly in next-step.
                 // Previous code ptrtoint'd to LLVMIntPtrType which is statically i64
                 // on a 64-bit host even when codegen target is wasm32 — that zero-
@@ -4314,6 +4343,7 @@ class public LlvmJitVisitor : AstVisitor {
         return blk
     }
 
+    // nolint:STYLE014
     // Handled-type (C++ struct) field offset, as an LLVM i32 *value*. The JIT bakes
     // these via the HOST annotation's offsetof. That is correct only when the target
     // C++ ABI lays the struct out identically to the host. A wasm cross-compile from
@@ -5059,6 +5089,7 @@ class public LlvmJitVisitor : AstVisitor {
         return global
     }
 
+    // nolint:STYLE014
     // For tHandle: dedup'd static AnnotationInfo { name, module_name, null, 0, null }.
     // Plain pointer-to-global in slot 0 — no tagged pointer, no runtime ctor
     // (the old ptrtoint|1 scheme needed one because wasm32 forbids widening
@@ -6345,12 +6376,9 @@ class public LlvmJitVisitor : AstVisitor {
         var lblk = loop_stack |> back()
         let target = lblk.loop_continue != null ? lblk.loop_continue : lblk.loop_start
         let br = LLVMBuildBr(g_builder, target)
-        // Attach loop metadata to any branch that lands directly on the header.
-        // for-loops route through loop_continue (no metadata needed here, the
-        // continue's terminating br to loop_start carries it); while-loops
-        // have no continue latch, so this branch IS a backedge. The parent
-        // ExprWhile is stashed on the LoopBlock so we can read its per-loop
-        // annotations here for the while-continue backedge.
+        // Attach loop metadata only to a branch that lands directly on the header. for-loops carry it
+        // on the continue latch's br to loop_start; while-loops have no continue latch, so this branch IS
+        // the backedge — parent_while is stashed on the LoopBlock to read its per-loop annotations here.
         if (target == lblk.loop_start) {
             if (lblk.parent_while != null) {
                 attach_loop_metadata(br, lblk.parent_while.annotations)
@@ -6800,6 +6828,7 @@ class public LlvmJitVisitor : AstVisitor {
         return tres
     }
 
+    // nolint:STYLE014
     // 16/8-bit lattice vectors <-> the das vec4f slot. One shuffle widens/narrows between
     // the value's lane count and its full-128-bit form; one bitcast crosses to <4 x float>.
     // Little-endian lane order makes this byte-identical to cast<T>::from/to (memcpy of the
@@ -6973,6 +7002,7 @@ class public LlvmJitVisitor : AstVisitor {
         if (etype.baseType == Type.tDistinct && etype.firstType != null && !etype.isRef) {
             return cast_to_vec4f(etype.firstType, tsrc)
         }
+        // nolint:STYLE014
         // Zero-fill (not undef) the unused lanes: a wrapped scalar return
         // (lane 0 = value) is sometimes consumed as a full vec4f by a vector
         // `icmp` (e.g. block-key comparison in order_by). undef sibling lanes
@@ -7190,6 +7220,7 @@ class public LlvmJitVisitor : AstVisitor {
         else                                          failed("unknown loop hint '{a.name}'")
     }
 
+    // nolint:STYLE014
     // Attach `!llvm.loop !N` with `!N = distinct !{!N, !{!"llvm.loop.mustprogress"}, <user-mds...>}`
     // to the given backedge branch. Self-reference is required by LangRef and is
     // what gives the loop its pointer-identity for opt's loop-info bookkeeping.
@@ -7204,6 +7235,7 @@ class public LlvmJitVisitor : AstVisitor {
     // the recognized vocabulary.
     def attach_loop_metadata(branch_inst : LLVMValueRef; args : AnnotationArgumentList) {
         var operands : array<LLVMOpaqueMetadata?>
+        // nolint:STYLE014
         // LLVMMetadataReplaceAllUsesWith calls MDNode::deleteTemporary on
         // `temp` internally, so do NOT also call LLVMDisposeTemporaryMDNode
         // — that would be a double-free (crashes on Linux/Windows, masked
@@ -7212,6 +7244,7 @@ class public LlvmJitVisitor : AstVisitor {
         operands |> push(temp)
         var mustprog = make_loop_md_flag("llvm.loop.mustprogress")
         operands |> push(mustprog)
+        // nolint:STYLE014
         // Skip user-supplied loop hints on wasm — host LLVM's wasm32 backend
         // has had miscompiles around llvm.loop.* metadata in combination with
         // certain bodies. mustprogress alone is preserved (safe, required for
@@ -7228,10 +7261,9 @@ class public LlvmJitVisitor : AstVisitor {
         LLVMSetMetadata(branch_inst, kind_id, loop_md_val)
     }
 
-    // Thin wrapper for callsites without a source AST node (build_fixed_loop
-    // for ExprNew array init): mustprogress only. Inlined rather than calling
-    // attach_loop_metadata to sidestep the "construct empty AnnotationArgumentList"
-    // dance — handled types aren't safely default-constructible from das.
+    // Thin wrapper for callsites without a source AST node (build_fixed_loop / ExprNew array init):
+    // mustprogress only. Inlined rather than reusing attach_loop_metadata because handled types like
+    // AnnotationArgumentList aren't safely default-constructible from das (no empty to pass).
     def attach_loop_mustprogress(branch_inst : LLVMValueRef) {
         var temp = LLVMTemporaryMDNode(g_ctx, null, 0ul)
         var loop_arr : LLVMOpaqueMetadata? [2]
@@ -7382,8 +7414,7 @@ def private add_ctor_dtor_function(ctor_dtor : array<tuple<LLVMOpaqueValue?, LLV
     ctor_entries |> reserve(n_entries)
     dtor_entries |> reserve(n_entries)
 
-    // Skip null fn entries — caller passed null to opt out of ctor or dtor.
-    // ctor / dtor counted independently; each may be null without affecting the other.
+    // Skip null fn entries — caller passed null to opt out of ctor or dtor (counted independently).
     var ci = 0
     var di = 0
     for ((ctor, dtor) in ctor_dtor) {
@@ -7739,10 +7770,9 @@ def public generate_globals_initialization_fn(ctx : Context?; prog : Program?;
                                               flags : LlvmJitFlags;
                                               fn_name : string = "init_globals";
                                               skip_shared : bool = false) {
-    // skip_shared: for a CLONED context (sharedOwner==false) that re-runs init,
-    // shared globals belong to the owner — re-initializing them writes into the
-    // parent's shared buffer and corrupts it. Skipping them matches the interpreter's
-    // `if (sharedOwner || !pv.shared)` gate (context.cpp Context::runInitScript).
+    // skip_shared: a CLONED context (sharedOwner==false) re-running init must NOT re-init shared
+    // globals — they belong to the owner, and writing them corrupts the parent's shared buffer. Matches
+    // the interpreter's `if (sharedOwner || !pv.shared)` gate (context.cpp Context::runInitScript).
     let attrs = new Attributes(g_ctx)
     var visitor = new LlvmJitVisitor(ctx, types, uids, flags, null, attrs)
     var globals_fn : LLVMOpaqueValue?
@@ -7812,6 +7842,7 @@ def public generate_globals_initialization_fn(ctx : Context?; prog : Program?;
                 }
             }
         }
+        // nolint:STYLE014
         // Populate globalVariables[] (offset/debugInfo/shared) for EVERY global so the GC
         // can trace standalone-exe globals. The exe otherwise leaves globalVariables zeroed
         // (only tabGMnLookup is filled), so collectHeap would deref a NULL debugInfo and
@@ -7881,11 +7912,8 @@ def public generate_llvm_code(var dll : DLLHandle?; fmna : DllName; dll_enabled 
     return code
 }
 
-// During JIT compilation we create some complex
-// global types (fileInfo), that can't be const initialized.
-// This function creates single global constructor
-// that will be called at the startup of compiled
-// object file.
+// Creates a single global constructor (run at compiled-object startup) for complex global types
+// like fileInfo that can't be const-initialized.
 [macro_function]
 def public generate_global_ctors_dtors(types : PrimitiveTypes?; jit_mode : bool) {
     let ctor_dtor <- [
@@ -7897,11 +7925,9 @@ def public generate_global_ctors_dtors(types : PrimitiveTypes?; jit_mode : bool)
     reset_codegen_accumulators()
 }
 
-// Clears the per-codegen-run accumulators (filenames).
-// Normally drained at the tail of generate_global_ctors_dtors; also called from
-// the JIT failure path (reset_jit_globals_after_failure) so a file that panics
-// mid-codegen doesn't leave stale fileinfo entries that crash the next file's
-// ctor generation with assert(variable != null).
+// Clears the per-codegen-run accumulators (filenames). Drained at the tail of
+// generate_global_ctors_dtors, and also from the JIT failure path (reset_jit_globals_after_failure) so a
+// file panicking mid-codegen leaves no stale fileinfo entries that crash the next file's ctor gen.
 def public reset_codegen_accumulators() {
     active_filenames = table<string>()
 }
@@ -7922,10 +7948,9 @@ def public optimize_llvm_module(opt_level : uint; size_level : uint; inline_thre
     let pipeline = (size_level >= 2u ? "default<Oz>"
                   : (size_level == 1u ? "default<Os>"
                                       : "default<O{opt_level:d}>"))
-    // use_host_cpu=true for JIT (artifact runs on this host); false for
-    // exe emission so the IR pipeline's TTI cost model stays generic and
-    // produces redistributable shapes (otherwise loop unroll / vectorize
-    // pick host-tuned shapes baked into the emitted object).
+    // use_host_cpu=true for JIT (artifact runs on this host); false for exe emission so the IR
+    // pipeline's TTI cost model stays generic and produces redistributable shapes (host-tuned loop
+    // unroll / vectorize would otherwise get baked into the emitted object).
     with_default_target_machine(opt_level, use_host_cpu) $(targetMachine : LLVMTargetMachineRef) {
         let err = LLVMRunPasses(g_mod, pipeline, targetMachine, pbopts)
         if (err != null) {
@@ -7945,10 +7970,9 @@ class public DisableJitVisitor : AstVisitor {
     def TypeInfoVisitor {
         disable = false
     }
-    // 16/8-bit lattice floor: data movement (loads/stores/moves/locals/indexing/swizzles)
-    // and the vec4f wrapper ABI lower natively; what still falls back is lattice values
-    // crossing a BUILTIN CALL boundary (ctors/converts/operators) — the builtin-address
-    // gates below catch those until the per-op emission wave completes.
+    // 16/8-bit lattice floor: data movement (loads/stores/moves/locals/indexing/swizzles) and the
+    // vec4f wrapper ABI lower natively; what still falls back is lattice values crossing a BUILTIN CALL
+    // boundary (ctors/converts/operators) — the builtin-address gates below catch those.
     def lattice_fallback(t : TypeDeclPtr; at : LineInfo) {
         if (!disable && t != null && is_lattice_small_type(t.baseType)) {
             to_log(LOG_WARNING, "LLVM JIT: 16/8-bit lattice type `{describe(t)}` at {at}, falling back to interpreter.\n")
@@ -8027,10 +8051,9 @@ class public DisableJitVisitor : AstVisitor {
             }
         }
         if (!disable && expr.func.flags.builtIn && !has_intrinsic(expr)) {
-            // lattice values crossing a builtin call lower as intrinsics (ctors/converts/
-            // sat-narrows emit IR directly); anything NOT in the intrinsic tables would hit
-            // the direct-extern ABI, where LLVM half / packed vectors mismatch the C++ das
-            // slot conventions — those still fall back
+            // lattice values crossing a builtin call lower as intrinsics (ctors/converts/sat-narrows
+            // emit IR directly); anything NOT in the intrinsic tables hits the direct-extern ABI, where
+            // LLVM half / packed vectors mismatch the C++ das slot conventions — those still fall back.
             var lattice = is_lattice_small_type(expr._type.baseType)
             if (!lattice) {
                 for (arg in expr.arguments) {

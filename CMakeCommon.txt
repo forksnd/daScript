@@ -267,7 +267,15 @@ MACRO(SETUP_COMPILER)
 			STRING(REPLACE "/Zi" "/Z7" CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
 			STRING(REPLACE "/Zi" "/Z7" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
 			SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /EHa")
-			SET(CMAKE_CXX_FLAGS_RELEASE "/Ot /Ox /Oi /DNDEBUG=1 /Gy /GS- /GR- /EHa /DDAS_FREE_LIST=1")
+			# Release carries /Z7 + /DEBUG so every shipped exe/DLL gets a side PDB: crash
+			# dumps and the in-process handler then resolve runtime frames with real names
+			# and C++ lines instead of nearest-EXPORT guesses. Codegen is untouched — /Z7
+			# changes no code, and /OPT:REF /OPT:ICF below restores the exact optimizations
+			# /DEBUG would otherwise default off.
+			SET(CMAKE_CXX_FLAGS_RELEASE "/Z7 /Ot /Ox /Oi /DNDEBUG=1 /Gy /GS- /GR- /EHa /DDAS_FREE_LIST=1")
+			SET(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /Z7")
+			SET(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /DEBUG /OPT:REF /OPT:ICF")
+			SET(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /DEBUG /OPT:REF /OPT:ICF")
 			SET(CMAKE_CXX_FLAGS_MINSIZEREL "/Os /Oi /DNDEBUG=1 /Gy /GS- /GR- /EHa /DDAS_FREE_LIST=1")
 			SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/Z7 /Ot /Oi /DNDEBUG=1 /Gy /GS- /GR- /EHa")
 
