@@ -12,12 +12,6 @@ MAKE_TYPE_FACTORY(terminal_handle, das_terminal::TerminalHandle)
 namespace das_terminal {
 namespace {
 
-const BufferSnapshot * selectBuffer(const Snapshot & snapshot, int32_t screen) {
-    if (screen == 0) return &snapshot.normal;
-    if (screen == 1) return &snapshot.alternate;
-    return nullptr;
-}
-
 int32_t colorKind(const Color & color) {
     return static_cast<int32_t>(color.kind);
 }
@@ -184,20 +178,24 @@ char * builtin_terminal_encode_paste(
 }
 
 int32_t builtin_terminal_columns(const das::smart_ptr<TerminalHandle> & terminal) {
-    return terminal ? terminal->state.snapshot().columns : 0;
+    return terminal ? terminal->state.columns() : 0;
 }
 
 int32_t builtin_terminal_rows(const das::smart_ptr<TerminalHandle> & terminal) {
-    return terminal ? terminal->state.snapshot().rows : 0;
+    return terminal ? terminal->state.rows() : 0;
 }
 
 bool builtin_terminal_alternate_active(const das::smart_ptr<TerminalHandle> & terminal) {
-    return terminal && terminal->state.snapshot().alternate_active;
+    return terminal && terminal->state.alternateActive();
+}
+
+int64_t builtin_terminal_revision(const das::smart_ptr<TerminalHandle> & terminal) {
+    return terminal ? static_cast<int64_t>(terminal->state.revision()) : 0;
 }
 
 int32_t builtin_terminal_mode_bits(const das::smart_ptr<TerminalHandle> & terminal) {
     if (!terminal) return 0;
-    const Modes & modes = terminal->state.snapshot().modes;
+    const Modes & modes = terminal->state.modes();
     int32_t result = 0;
     if (modes.auto_wrap) result |= 1 << 0;
     if (modes.application_cursor_keys) result |= 1 << 1;
@@ -211,22 +209,21 @@ int32_t builtin_terminal_mode_bits(const das::smart_ptr<TerminalHandle> & termin
 
 char * builtin_terminal_title(
     const das::smart_ptr<TerminalHandle> & terminal, das::Context * context, das::LineInfoArg * at) {
-    const std::string value = terminal ? terminal->state.snapshot().title : std::string();
+    const std::string value = terminal ? terminal->state.title() : std::string();
     return context->allocateString(value, at);
 }
 
 char * builtin_terminal_current_directory(
     const das::smart_ptr<TerminalHandle> & terminal, das::Context * context, das::LineInfoArg * at) {
-    const std::string value = terminal ? terminal->state.snapshot().current_directory : std::string();
+    const std::string value = terminal ? terminal->state.currentDirectory() : std::string();
     return context->allocateString(value, at);
 }
 
 int32_t builtin_terminal_scrollback_rows(
     const das::smart_ptr<TerminalHandle> & terminal, int32_t screen) {
     if (!terminal) return 0;
-    const Snapshot snapshot = terminal->state.snapshot();
-    const BufferSnapshot * buffer = selectBuffer(snapshot, screen);
-    return buffer ? static_cast<int32_t>(buffer->scrollback.size()) : 0;
+    const Terminal::CellRows * rows = terminal->state.cellRows(screen, true);
+    return rows ? static_cast<int32_t>(rows->size()) : 0;
 }
 
 void builtin_terminal_cursor(
@@ -234,23 +231,16 @@ void builtin_terminal_cursor(
     const das::TBlock<void, int32_t, int32_t, bool, bool, int32_t> & block,
     das::Context * context, das::LineInfoArg * at) {
     if (!terminal) return;
-    const Snapshot snapshot = terminal->state.snapshot();
-    const BufferSnapshot * buffer = selectBuffer(snapshot, screen);
-    if (!buffer) return;
+    const Cursor * cursor = terminal->state.cursor(screen);
+    if (!cursor) return;
     das::das_invoke<void>::invoke<int32_t, int32_t, bool, bool, int32_t>(
-        context, at, block, buffer->cursor.row, buffer->cursor.column,
-        buffer->cursor.visible, buffer->cursor.blinking, buffer->cursor.style);
+        context, at, block, cursor->row, cursor->column,
+        cursor->visible, cursor->blinking, cursor->style);
 }
 
-void builtin_terminal_visit_cells(
-    const das::smart_ptr<TerminalHandle> & terminal, int32_t screen, bool scrollback,
-    const CellBlock & block, das::Context * context, das::LineInfoArg * at) {
-    if (!terminal) return;
-    const Snapshot snapshot = terminal->state.snapshot();
-    const BufferSnapshot * buffer = selectBuffer(snapshot, screen);
-    if (!buffer) return;
-    const std::vector<std::vector<Cell>> & rows = scrollback ? buffer->scrollback : buffer->rows;
-    for (size_t row = 0; row != rows.size(); ++row) {
+void visitCells(const Terminal::CellRows & rows, size_t first_row, size_t end_row,
+                const CellBlock & block, das::Context * context, das::LineInfoArg * at) {
+    for (size_t row = first_row; row != end_row; ++row) {
         for (size_t column = 0; column != rows[row].size(); ++column) {
             const Cell & cell = rows[row][column];
             das::das_invoke<void>::invoke<
@@ -269,12 +259,35 @@ void builtin_terminal_visit_cells(
     }
 }
 
+void builtin_terminal_visit_cells(
+    const das::smart_ptr<TerminalHandle> & terminal, int32_t screen, bool scrollback,
+    const CellBlock & block, das::Context * context, das::LineInfoArg * at) {
+    if (!terminal) return;
+    const Terminal::CellRows * rows = terminal->state.cellRows(screen, scrollback);
+    if (!rows) return;
+    visitCells(*rows, 0, rows->size(), block, context, at);
+}
+
+void builtin_terminal_visit_viewport_scrollback(
+    const das::smart_ptr<TerminalHandle> & terminal, int32_t screen, int32_t scroll_offset,
+    const CellBlock & block, das::Context * context, das::LineInfoArg * at) {
+    if (!terminal) return;
+    const Terminal::CellRows * rows = terminal->state.cellRows(screen, true);
+    if (!rows) return;
+    const size_t offset = static_cast<size_t>(std::clamp(
+        scroll_offset, 0, static_cast<int32_t>(rows->size())));
+    const size_t first_row = rows->size() - offset;
+    const size_t end_row = std::min(
+        rows->size(), first_row + static_cast<size_t>(terminal->state.rows()));
+    visitCells(*rows, first_row, end_row, block, context, at);
+}
+
 void builtin_terminal_visit_unknown(
     const das::smart_ptr<TerminalHandle> & terminal,
     const das::TBlock<void, das::TTemporary<const char *>> & block,
     das::Context * context, das::LineInfoArg * at) {
     if (!terminal) return;
-    const std::vector<std::string> values = terminal->state.snapshot().unknown_sequences;
+    const std::vector<std::string> & values = terminal->state.unknownSequences();
     for (const std::string & value : values)
         das::das_invoke<void>::invoke<const char *>(context, at, block, value.c_str());
 }
@@ -370,6 +383,9 @@ public:
         addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_alternate_active)>(*this, lib,
             "_terminal_alternate_active", SideEffects::none,
             "das_terminal::builtin_terminal_alternate_active")->arg("terminal");
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_revision)>(*this, lib,
+            "_terminal_revision", SideEffects::none,
+            "das_terminal::builtin_terminal_revision")->arg("terminal");
         addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_mode_bits)>(*this, lib,
             "_terminal_mode_bits", SideEffects::none,
             "das_terminal::builtin_terminal_mode_bits")->arg("terminal");
@@ -390,6 +406,10 @@ public:
             "_terminal_visit_cells", SideEffects::invoke,
             "das_terminal::builtin_terminal_visit_cells")
                 ->args({"terminal", "screen", "scrollback", "block", "context", "at"});
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_visit_viewport_scrollback)>(
+            *this, lib, "_terminal_visit_viewport_scrollback", SideEffects::invoke,
+            "das_terminal::builtin_terminal_visit_viewport_scrollback")
+                ->args({"terminal", "screen", "scroll_offset", "block", "context", "at"});
         addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_visit_unknown)>(*this, lib,
             "_terminal_visit_unknown", SideEffects::invoke,
             "das_terminal::builtin_terminal_visit_unknown")

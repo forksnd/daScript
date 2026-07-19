@@ -11,6 +11,12 @@ width and style per cell, cursor state, terminal modes, title/CWD metadata, and
 unknown-sequence diagnostics. That schema is also intended to become the
 session-host-to-UI IPC contract.
 
+Renderers use `terminal_viewport_snapshot` instead of the canonical full
+snapshot. It returns only the active screen and the visible scrollback slice,
+while retaining total history size and global row indices for selection. This
+keeps per-frame projection bounded by the grid size; the full snapshot remains
+available for explicit whole-history operations such as copying a selection.
+
 The first conformance slice covers text controls, wrapping and scrolling,
 cursor movement, erase operations, common SGR colors/attributes, OSC title/CWD
 and hyperlinks, alternate screen, selected DEC modes, device replies, and

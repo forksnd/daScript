@@ -56,6 +56,7 @@ char * builtin_terminal_encode_paste(
 int32_t builtin_terminal_columns(const das::smart_ptr<TerminalHandle> & terminal);
 int32_t builtin_terminal_rows(const das::smart_ptr<TerminalHandle> & terminal);
 bool builtin_terminal_alternate_active(const das::smart_ptr<TerminalHandle> & terminal);
+int64_t builtin_terminal_revision(const das::smart_ptr<TerminalHandle> & terminal);
 int32_t builtin_terminal_mode_bits(const das::smart_ptr<TerminalHandle> & terminal);
 char * builtin_terminal_title(
     const das::smart_ptr<TerminalHandle> & terminal, das::Context * context, das::LineInfoArg * at);
@@ -69,6 +70,9 @@ void builtin_terminal_cursor(
     das::Context * context, das::LineInfoArg * at);
 void builtin_terminal_visit_cells(
     const das::smart_ptr<TerminalHandle> & terminal, int32_t screen, bool scrollback,
+    const CellBlock & block, das::Context * context, das::LineInfoArg * at);
+void builtin_terminal_visit_viewport_scrollback(
+    const das::smart_ptr<TerminalHandle> & terminal, int32_t screen, int32_t scroll_offset,
     const CellBlock & block, das::Context * context, das::LineInfoArg * at);
 void builtin_terminal_visit_unknown(
     const das::smart_ptr<TerminalHandle> & terminal,

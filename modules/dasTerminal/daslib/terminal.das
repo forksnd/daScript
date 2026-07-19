@@ -113,6 +113,17 @@ struct public TerminalSnapshot {
     unknown_sequences : array<string>
 }
 
+//! Rendering snapshot bounded to the active screen and visible scrollback rows.
+//! ``buffer.scrollback_rows`` remains the total retained row count; cells in
+//! ``buffer.scrollback`` retain their global scrollback row indices.
+struct public TerminalViewportSnapshot {
+    revision : int64
+    columns : int
+    rows : int
+    alternate_active : bool
+    buffer : TerminalBufferSnapshot = TerminalBufferSnapshot()
+}
+
 typedef public Terminal = smart_ptr<terminal_handle>
 
 def public terminal_create(columns : int = 80; rows : int = 25) : Terminal {
@@ -169,6 +180,10 @@ def public terminal_terminate(terminal : Terminal const; exit_code : int = 1) : 
 
 def public terminal_transport_error(terminal : Terminal const) : string {
     return _terminal_transport_error(terminal)
+}
+
+def public terminal_revision(terminal : Terminal const) : int64 {
+    return _terminal_revision(terminal)
 }
 
 def public terminal_encode_key(terminal : Terminal const;
@@ -239,6 +254,51 @@ def private collect_cursor(terminal : Terminal const; screen : int;
             blinking = blinking,
             style = style)
     }
+}
+
+def private collect_viewport_scrollback(terminal : Terminal const; screen, scroll_offset : int;
+                                        var cells : array<TerminalCell>) {
+    delete cells
+    _terminal_visit_viewport_scrollback(terminal, screen, scroll_offset) $(row, column : int;
+                                                                           grapheme : string const#; width, attributes : int;
+                                                                           foreground_kind, foreground_index, foreground_red,
+                                                                           foreground_green, foreground_blue : int;
+                                                                           background_kind, background_index, background_red,
+                                                                           background_green, background_blue : int;
+                                                                           hyperlink : string const#) {
+        cells |> push(TerminalCell(
+            row = row,
+            column = column,
+            grapheme = "{grapheme}",
+            width = width,
+            attributes = attributes,
+            foreground = TerminalColor(
+                kind = unsafe(reinterpret<TerminalColorKind>(foreground_kind)),
+                index = foreground_index,
+                red = foreground_red,
+                green = foreground_green,
+                blue = foreground_blue),
+            background = TerminalColor(
+                kind = unsafe(reinterpret<TerminalColorKind>(background_kind)),
+                index = background_index,
+                red = background_red,
+                green = background_green,
+                blue = background_blue),
+            hyperlink = "{hyperlink}"))
+    }
+}
+
+def public terminal_viewport_snapshot(terminal : Terminal const; scroll_offset : int;
+                                      var snapshot : TerminalViewportSnapshot) {
+    snapshot.revision = _terminal_revision(terminal)
+    snapshot.columns = _terminal_columns(terminal)
+    snapshot.rows = _terminal_rows(terminal)
+    snapshot.alternate_active = _terminal_alternate_active(terminal)
+    let screen = snapshot.alternate_active ? 1 : 0
+    collect_cells(terminal, screen, false, snapshot.buffer.cells)
+    collect_viewport_scrollback(terminal, screen, scroll_offset, snapshot.buffer.scrollback)
+    snapshot.buffer.scrollback_rows = _terminal_scrollback_rows(terminal, screen)
+    collect_cursor(terminal, screen, snapshot.buffer.cursor)
 }
 
 def public terminal_snapshot(terminal : Terminal const;

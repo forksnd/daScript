@@ -138,6 +138,8 @@ struct KeyEvent {
 
 class Terminal {
 public:
+    using CellRows = std::vector<std::vector<Cell>>;
+
     Terminal(int columns, int rows);
     ~Terminal();
     Terminal(const Terminal &) = delete;
@@ -151,6 +153,17 @@ public:
 
     std::string encodeKey(const KeyEvent & event) const;
     std::string encodePaste(const std::string & text) const;
+
+    int columns() const { return columns_; }
+    int rows() const { return rows_; }
+    bool alternateActive() const { return alternate_active_; }
+    const Modes & modes() const { return modes_; }
+    const std::string & title() const { return title_; }
+    const std::string & currentDirectory() const { return current_directory_; }
+    const std::vector<std::string> & unknownSequences() const { return unknown_sequences_; }
+    uint64_t revision() const { return revision_; }
+    const CellRows * cellRows(int screen, bool scrollback) const;
+    const Cursor * cursor(int screen) const;
 
     Snapshot snapshot() const;
     std::vector<std::string> drainReplies();
@@ -206,6 +219,7 @@ private:
     uint32_t utf8_codepoint_ = 0;
     uint32_t utf8_minimum_ = 0;
     int utf8_remaining_ = 0;
+    uint64_t revision_ = 0;
 };
 
 } // namespace das_terminal

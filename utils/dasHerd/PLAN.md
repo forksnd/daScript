@@ -294,6 +294,63 @@ daScript. Mouse encoding joins the contract with the renderer/ConPTY slice.
   bracketed paste, alternate screen, and resize during output.
 - Logs and abandoned probe artifacts are cleaned when work completes.
 
+## Performance and stress gate
+
+Terminal performance is a product contract. A terminal that is semantically
+correct but drops interaction below real-time under ordinary agent output is not
+complete. JIT is an eventual deployment tool, not permission to keep work
+proportional to retained history or to rebuild unchanged state every frame.
+
+Measure interpreter and JIT lanes separately and report cold start separately
+from warmed steady state. Every performance report must attribute at least PTY
+poll/feed, emulator mutation, C++ snapshot/copy, daScript projection, layout and
+input, draw-list emission, and total frame time. The live inspection surface
+must expose those timings together with bytes read and cells visited, copied,
+and drawn so screenshots and subjective feel are never the only evidence.
+
+The stress matrix covers:
+
+- 80x24, 160x50, and 240x80 grids at 0, 1,000, and 10,000 retained rows;
+- idle cursor blink, continuous ASCII, dense SGR/color changes, alternate-screen
+  redraw, combining/CJK/emoji text, resize during output, selection, and search;
+- 1,000-line interactive bursts plus sustained and bursty multi-megabyte output;
+- bottom-follow and scrolled-back viewports, including input while output is
+  still arriving.
+
+Initial acceptance budgets on the reference workstation are:
+
+- retained history changes warmed idle/render cost by no more than 10%; only the
+  visible viewport and bounded inspection request may be copied or traversed;
+- the full UI remains at or above 60 FPS (16.7 ms p95 frame time) with 10,000
+  retained rows, with no output-burst frame longer than 50 ms;
+- focused input reaches the PTY and its echo becomes visible within 50 ms p95
+  while output is active;
+- benchmarks pin emulator feed throughput, viewport snapshot cost, allocation
+  counts, and interpreter-versus-JIT deltas before optimization claims land.
+
+The first measured 78x26 interpreter/live baseline on 2026-07-19 demonstrated
+the current failure clearly: warmed idle with zero history held 120 FPS / 8.3
+ms, 978 retained rows fell to 18.4 FPS / about 54 ms, and 4,980 rows fell to
+about 3.1 FPS / 332 ms. The immediate cause is repeated deep copies of both
+buffers plus full-history daScript projection and traversal on every frame.
+
+The viewport-bounded adapter pass on the same day removed history from the
+frame path. Viewport projection remained between 0.94 and 1.08 ms in the
+interpreter and 0.36 and 0.37 ms under JIT from zero through 9,975 retained
+rows, with a flat 147,456 bytes and 2,028 string allocations per 78x26
+projection. The live 78x26 UI then held about 120 FPS at 978, 4,980, and 9,982
+retained rows, including a viewport scrolled back 300 rows and new output while
+scrolled. The explicit compatibility snapshot remains history-proportional and
+cost 407.7 ms interpreted / 164.5 ms JIT at 9,975 rows, so it is reserved for
+explicit whole-history operations and must not return to rendering.
+
+A persistent renderer cache now keys that bounded projection by terminal
+revision and scroll offset, so unchanged blink/idle frames reuse cells and
+strings without polluting the concise inspectable state. A single 10,000-line
+live burst stayed around 86.5 FPS while output was still arriving, returned to
+about 120 FPS after settlement, and held about 109 FPS while scrolled back 300
+rows at 9,933 retained rows.
+
 ## Structured UI inspection gate
 
 Terminal and rich-text correctness must be inspectable through live commands;
@@ -347,16 +404,19 @@ painted and made interactive.
 
 Continue T1 from the working local terminal:
 
-1. finish structured terminal-cell and rich-text-run inspection through live
+1. add phase timing and batch compatible glyph runs, then run the larger-grid,
+   SGR, Unicode, resize, and multi-megabyte stress lanes; viewport projection
+   is now history-independent and revision-gated;
+2. finish structured terminal-cell and rich-text-run inspection through live
    commands, including actual font fallback and missing-glyph reporting;
-2. finish the bottom Edit/View menus, 5% zoom, cursor blink, and Unicode font
+3. finish the bottom Edit/View menus, 5% zoom, cursor blink, and Unicode font
    fallback with structured snapshot coverage;
-3. extend deterministic headless interaction tests to paste, scrollback,
+4. extend deterministic headless interaction tests to paste, scrollback,
    selection, clipboard, retained-history search, and resolver hover/click;
-4. build the record-once/replay-twice `@xterm/headless` oracle harness;
-5. run a full-screen agent TUI through the embedded-terminal example and pin
+5. build the record-once/replay-twice `@xterm/headless` oracle harness;
+6. run a full-screen agent TUI through the embedded-terminal example and pin
    every semantic discrepancy as a renderless regression test;
-6. move PTY/emulator ownership into the first detachable session host.
+7. move PTY/emulator ownership into the first detachable session host.
 
 ## Decision log
 
@@ -391,3 +451,9 @@ Continue T1 from the working local terminal:
 - 2026-07-19: Treat terminal and rich-text live-command inspection as a product
   gate. Structured state must expose the final drawn cells/runs, font fallback,
   missing glyphs, paint, clipping, hover, and cursor; `view_image` is not proof.
+- 2026-07-19: Treat stress and performance as a terminal correctness gate.
+  Retained history must not affect per-frame work; measure cold and warm,
+  interpreter and JIT, emulator and renderer phases independently before tuning.
+- 2026-07-19: Keep the full terminal snapshot as an explicit compatibility API,
+  but render only a bounded active viewport. The first pass restored about 120
+  FPS at 10,000 retained rows and pinned flat interpreter/JIT projection costs.

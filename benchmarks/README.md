@@ -4,6 +4,12 @@
 
 Every `.das` benchmark file in this directory tree is listed below, grouped by subdirectory.
 
+## terminal/
+
+| File | Description |
+|---|---|
+| `snapshot_scaling.das` | Full compatibility snapshot versus bounded render-viewport cost at 0, 1K, 5K, and 10K retained rows in interpreter and JIT lanes |
+
 ## core/hash/
 
 | File | Description |

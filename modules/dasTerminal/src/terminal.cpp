@@ -235,7 +235,8 @@ void Terminal::reset() {
 }
 
 void Terminal::feed(const uint8_t * bytes, size_t count) {
-    if (!bytes) return;
+    if (!bytes || count == 0) return;
+    ++revision_;
     for (size_t index = 0; index != count; ++index) processByte(bytes[index]);
 }
 
@@ -645,6 +646,7 @@ void Terminal::resize(int columns, int rows) {
     columns = std::max(1, columns);
     rows = std::max(1, rows);
     if (columns == columns_ && rows == rows_) return;
+    ++revision_;
     columns_ = columns;
     rows_ = rows;
     Buffer * buffers[] = {normal_, alternate_};
@@ -713,6 +715,17 @@ std::string Terminal::encodeKey(const KeyEvent & event) const {
 std::string Terminal::encodePaste(const std::string & text) const {
     if (!modes_.bracketed_paste) return text;
     return std::string("\x1b[200~") + text + "\x1b[201~";
+}
+
+const Terminal::CellRows * Terminal::cellRows(int screen, bool scrollback) const {
+    const Buffer * buffer = screen == 0 ? normal_ : screen == 1 ? alternate_ : nullptr;
+    if (!buffer) return nullptr;
+    return scrollback ? &buffer->scrollback : &buffer->rows;
+}
+
+const Cursor * Terminal::cursor(int screen) const {
+    const Buffer * buffer = screen == 0 ? normal_ : screen == 1 ? alternate_ : nullptr;
+    return buffer ? &buffer->cursor : nullptr;
 }
 
 Snapshot Terminal::snapshot() const {
