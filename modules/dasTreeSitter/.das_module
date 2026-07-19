@@ -1,0 +1,10 @@
+options gen2
+require daslib/fio
+
+[export]
+def initialize(project_path : string) {
+    if (das_is_dll_build()) {
+        register_dynamic_module("{project_path}/dasModuleTreeSitter.shared_module", "Module_TreeSitter")
+    }
+    register_native_path("tree_sitter", "tree_sitter", "{project_path}/daslib/tree_sitter.das")
+}

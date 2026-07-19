@@ -33,6 +33,10 @@ bin/
 .jitted_scripts/
 # All build libraries stored here
 lib/
+# dasTreeSitter vendors Tree-sitter's source directory named `lib`; it is an
+# input dependency, not a build-output directory.
+!modules/dasTreeSitter/3rdparty/tree-sitter/lib/
+!modules/dasTreeSitter/3rdparty/tree-sitter/lib/**
 modules/**/*.shared_module
 examples/**/*.shared_module
 _aot_generated/

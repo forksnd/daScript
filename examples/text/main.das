@@ -8,9 +8,10 @@ require imgui/imgui_file_dialog
 require imgui/imgui_fonts
 require imgui/imgui_icons
 require imgui/imgui_commands
-require imgui/imgui_markdown_view
+require imgui/imgui_markdown_tree_sitter
 require imgui/imgui_document_model
 require imgui/imgui_text_source_view
+require imgui/imgui_text_tree_sitter
 require imgui/imgui_theme_daslang
 require daslib/clargs
 require daslib/fio
@@ -73,12 +74,14 @@ struct TextViewerDocument {
     document : RichDocument = RichDocument()
     projection : RichDocumentProjection = RichDocumentProjection()
     markdown_view : MarkdownViewState = MarkdownViewState()
+    markdown_syntax : MarkdownTreeSitterState = MarkdownTreeSitterState()
     source_document : TextSourceDocument = TextSourceDocument()
     source_view : TextSourceViewState = TextSourceViewState()
     source_result : TextSourceViewResult = TextSourceViewResult()
     status : string = "Open a UTF-8 text or Markdown file."
     mode : TextViewMode = TextViewMode.markdown
     mode_override : int = -1
+    syntax_mode : int = 0
     zoom_step : int = 20       // 10..60 maps to 50%..300% in exact 5% steps
 }
 
@@ -107,6 +110,13 @@ var private g_edit_copy_clicks = 0
 var private g_edit_select_all_clicks = 0
 var private g_edit_clear_clicks = 0
 var private g_edit_bindings_clicks = 0
+
+let SYNTAX_MODE_LABELS : array<string> <- [
+    "Auto", "Plain", "daScript", "C", "C++", "Markdown"
+]
+let SYNTAX_MODE_VALUES : array<string> <- [
+    "auto", "none", "das", "c", "cpp", "markdown"
+]
 
 let CMD_FILE_OPEN = "file.open"
 let CMD_FILE_SAVE = "file.save"
@@ -163,6 +173,7 @@ def private release_document_content(var doc : TextViewerDocument) {
 }
 
 def private dispose_document(var doc : TextViewerDocument) {
+    markdown_tree_sitter_dispose(doc.markdown_syntax)
     markdown_view_dispose(doc.markdown_view)
     text_source_view_dispose(doc.source_view)
     release_document_content(doc)
@@ -172,8 +183,11 @@ def private install_document(var viewer : TextViewerDocument;
                              var next_source : TextDocumentSource) {
     var next_document <- md_parse(next_source.text)
     var next_projection <- md_rich_projection(next_document, next_source.revision)
-    var next_source_document <- markdown_source_document(
-        next_source.text, next_source.revision)
+    var next_source_document <- (markdown_path(next_source.path)
+        ? markdown_source_document(next_source.text, next_source.revision)
+        : tree_sitter_source_document(next_source.text,
+                                      extension(next_source.path),
+                                      next_source.revision))
     release_document_content(viewer)
     viewer.source <- next_source
     viewer.document <- next_document
@@ -195,8 +209,11 @@ def private install_document(var viewer : TextViewerDocument;
 def private rebuild_projection(var viewer : TextViewerDocument) {
     var next_document <- md_parse(viewer.source.text)
     var next_projection <- md_rich_projection(next_document, viewer.source.revision)
-    var next_source_document <- markdown_source_document(
-        viewer.source.text, viewer.source.revision)
+    var next_source_document <- (markdown_path(viewer.source.path)
+        ? markdown_source_document(viewer.source.text, viewer.source.revision)
+        : tree_sitter_source_document(viewer.source.text,
+                                      extension(viewer.source.path),
+                                      viewer.source.revision))
     release_document_content(viewer)
     viewer.document <- next_document
     viewer.projection <- next_projection
@@ -655,9 +672,9 @@ def private draw_document(var doc : TextViewerDocument) {
                     code_block_scale = 0.90f),
                 zoom = float(zoom_percent(doc)) / 100.0f,
                 write_system_clipboard = !harness_is_headless())
-            let view_result <- rich_document_view(
-                "text viewer", doc.document, doc.markdown_view,
-                style, doc.source.revision)
+            let view_result <- markdown_view_tree_sitter(
+                "text viewer", doc.document, doc.markdown_syntax,
+                doc.markdown_view, style, doc.source.revision)
             if (view_result.control_event.active) {
                 let _ = apply_control_event(doc, view_result.control_event)
             }
@@ -683,6 +700,17 @@ def private draw_document(var doc : TextViewerDocument) {
     same_line()
     text_disabled(MODE_LABEL,
         (text = rendered ? "Rendered Markdown" : "Markdown source"))
+    if (rendered) {
+        same_line()
+        SetNextItemWidth(115.0f)
+        if (edit_combo(unsafe(addr(doc.syntax_mode)),
+                (id = "TEXT_VIEWER_SYNTAX", text = "Syntax",
+                 items <- SYNTAX_MODE_LABELS))) {
+            let index = clamp(doc.syntax_mode, 0, length(SYNTAX_MODE_VALUES) - 1)
+            let _ = markdown_tree_sitter_set_default(
+                doc.markdown_syntax, SYNTAX_MODE_VALUES[index])
+        }
+    }
     same_line()
     text_disabled(STATUS, (text = doc.status))
 
@@ -830,6 +858,7 @@ def text_viewer_source_range(input : JsonValue?) : JsonValue? {
     var columns = 0
     var matched_cells = 0
     var marker_cells = 0
+    var syntax_cells = 0
     var first_cell_start = -1
     var last_cell_end = -1
     var rect = float4()
@@ -852,6 +881,7 @@ def text_viewer_source_range(input : JsonValue?) : JsonValue? {
         columns += cell.columns
         matched_cells++
         marker_cells += cell.style_id == 1 ? 1 : 0
+        syntax_cells += cell.style_id > 1 ? 1 : 0
         if (first_cell_start < 0) {
             first_cell_start = cell.source.start_byte
         }
@@ -861,7 +891,8 @@ def text_viewer_source_range(input : JsonValue?) : JsonValue? {
     return JV((ok = found, text = args.text,
         source_start = start_byte, source_end = end_byte,
         columns = columns, matched_cells = matched_cells,
-        marker_cells = marker_cells, first_cell_start = first_cell_start,
+        marker_cells = marker_cells, syntax_cells = syntax_cells,
+        first_cell_start = first_cell_start,
         last_cell_end = last_cell_end,
         all_markers = found && all_markers,
         cell_width = doc.source_view.key.cell_width,
