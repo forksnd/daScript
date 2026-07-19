@@ -1012,6 +1012,10 @@ let HZ_BLOG   = 1024u
 let HZ_BMLG   = 2048u   // MoE router logits (Wave C)
 let HZ_BMSEL  = 4096u   // MoE selection rows
 let HZ_BMDN   = 8192u   // MoE per-slot down outputs
+let HZ_BMG4X  = 16384u  // gemma4 MoE: the pre_ffn2 expert-input panel
+let HZ_BMRT   = 32768u  // gemma4 MoE: router-input / routed-acc panel
+let HZ_BMGH   = 65536u  // gemma4 MoE: expert gate panel (dense branch keeps bhb)
+let HZ_BMGH2  = 131072u // gemma4 MoE: expert up panel
 
 struct HazTrack {
     on : bool

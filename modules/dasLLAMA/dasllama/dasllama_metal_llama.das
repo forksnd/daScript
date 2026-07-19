@@ -1418,9 +1418,11 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         !tied_f32 && c.n_layer_nextn == 0l &&
         t.wcls_off >= 0l &&
         (cls_fmt != KqFmt.q8 || !use_gemm || (c.vocab_size % (use_mm ? 64l : 32l)) == 0l))
-    // MoE (Wave C): per-stream routing + expert-indexed GEMVs; bhb/bhb2 hold the (row, slot)
-    // gate/up rows, so they size to the larger of the dense and MoE spans
+    // MoE (Wave C): plain moe rides bhb/bhb2 for the (row, slot) gate/up rows; g4moe keeps
+    // the dense branch there and gives the experts their OWN panels (the concurrent encoder
+    // has no write-after-read tracking, so reuse would race)
     let moe = !t.blocks.ffn_is_dense
+    let g4moe = moe && c.moe_dense_shexp
     let knfe = moe ? c.n_expert_used * c.n_ff_exp : 0l
     // pooled per-step buffers (mp rows: the fixed-B forms read their full B, the GEMM its M pad —
     // stale pad rows only ever land in pad outputs, which nothing reads back)
@@ -1459,6 +1461,12 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     var bmlg = moe ? pool_acquire(g_pool, g_dev, bytes_mlg) : null
     var bmsel = moe ? pool_acquire(g_pool, g_dev, bytes_msel) : null
     var bmdn = moe ? pool_acquire(g_pool, g_dev, bytes_mdn) : null
+    let bytes_mg4x = uint64(nrows * dim * 4l)
+    let bytes_mgh = uint64(nrows * knfe * 4l)
+    var bmg4x = g4moe ? pool_acquire(g_pool, g_dev, bytes_mg4x) : null
+    var bmg4rt = g4moe ? pool_acquire(g_pool, g_dev, bytes_mg4x) : null
+    var bmgh = g4moe ? pool_acquire(g_pool, g_dev, bytes_mgh) : null
+    var bmgh2 = g4moe ? pool_acquire(g_pool, g_dev, bytes_mgh) : null
     let bytes_log = uint64(mp * c.vocab_size * 4l)
     var bxf = gpu_logits ? pool_acquire(g_pool, g_dev, bytes_x) : null
     var blog = gpu_logits ? pool_acquire(g_pool, g_dev, bytes_log) : null
@@ -1531,6 +1539,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     var u_moe_knfe = moe ? uniform_u32(uint(knfe)) : null
     var u_moe_kdim = moe ? uniform_u32(uint(c.n_expert_used * dim)) : null
     var u_moe_tot = moe ? uniform_u32(uint(nrows * knfe)) : null
+    var u_moe_invd = g4moe ? uniform_f32(1.0 / sqrt(float(dim))) : null
     var u_xs4_dim = mv ? uniform_u32(uint(dim / 4l)) : null
     var u_xs4_qd = mv ? uniform_u32(uint(qd / 4l)) : null
     var u_xs4_qd_sw = (mv && hetero) ? uniform_u32(uint(qd_sw / 4l)) : null   // the wo x stride's sliding-class twin
@@ -1832,38 +1841,67 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     enc_rms_b(enc, bx, bw_ffn, bxb, u_dim, u_eps, nrows)
                 }
             }
+            // g4moe: experts ride their OWN panels (bmgh/bmgh2, input bmg4x, acc bmg4rt) so the
+            // dense shared branch's bhb/bhb2 tiers run concurrently with the expert chain
+            let bex = g4moe ? bmg4x : bxb
+            let bgh = g4moe ? bmgh : bhb
+            let bgh2 = g4moe ? bmgh2 : bhb2
+            let hz_ex = g4moe ? HZ_BMG4X : HZ_BXB
+            let hz_gh = g4moe ? HZ_BMGH : HZ_BHB
+            let hz_gh2 = g4moe ? HZ_BMGH2 : HZ_BHB2
             if (moe && g_skip != "gemv") {
                 // MoE FFN (Wave C): per-row router -> select -> expert gate/up (grid (nfe, k,
-                // rows)) -> swiglu over rows*k*nfe -> expert down -> per-row weighted combine
+                // rows)) -> act over rows*k*nfe -> expert down -> per-row weighted combine
                 let fe1 = kq_fmt_at(t.we1_fmt, l)
                 let fe3 = kq_fmt_at(t.we3_fmt, l)
                 var bw_rt = upload_region(addr < void? >(t.fblob[t.router_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
-                bar_dep(enc, haz, HZ_BXB, HZ_BMLG)
-                enc_moe_router(enc, bw_rt, bxb, bmlg, u_dim, u_moe_ne, u_dim, c.n_expert, nrows)
+                if (g4moe) {
+                    var bw_p2 = upload_region(addr < void? >(t.fblob[t.rms_pre_ffn2_off + l * dim]), uint64(dim * 4l))
+                    bar_dep(enc, haz, HZ_BX, HZ_BMG4X)
+                    enc_rms_b(enc, bx, bw_p2, bmg4x, u_dim, u_eps, nrows)
+                    var bw_rs = upload_region(addr < void? >(t.fblob[t.moe_router_scale_off + l * dim]), uint64(dim * 4l))
+                    bar_dep(enc, haz, HZ_BX, HZ_BMRT)
+                    enc_g4_router_norm(enc, bx, bw_rs, bmg4rt, u_dim, u_eps, u_moe_invd, nrows)
+                    bar_dep(enc, haz, HZ_BMRT, HZ_BMLG)
+                    enc_moe_router(enc, bw_rt, bmg4rt, bmlg, u_dim, u_moe_ne, u_dim, c.n_expert, nrows)
+                } else {
+                    bar_dep(enc, haz, HZ_BXB, HZ_BMLG)
+                    enc_moe_router(enc, bw_rt, bxb, bmlg, u_dim, u_moe_ne, u_dim, c.n_expert, nrows)
+                }
                 bar_dep(enc, haz, HZ_BMLG, HZ_BMSEL)
                 enc_moe_select(enc, bmlg, bmsel, u_moe_ne, u_moe_k, nrows)
-                bar_dep(enc, haz, HZ_BXB | HZ_BMSEL, HZ_BHB | HZ_BHB2)
-                enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bxb, bhb,
+                if (g4moe) {
+                    var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
+                    bar_dep(enc, haz, HZ_BMSEL, HZ_BMSEL)
+                    enc_moe_wscale(enc, bmsel, bw_ds, u_moe_k, nrows)
+                }
+                bar_dep(enc, haz, hz_ex | HZ_BMSEL, hz_gh | hz_gh2)
+                enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bex, bgh,
                     u_dim, u_moe_nfe, bmsel, fe1 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_zero32,
                     u_moe_ss, u_dim, u_moe_knfe)
-                enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bxb, bhb2,
+                enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bex, bgh2,
                     u_dim, u_moe_nfe, bmsel, fe3 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_zero32,
                     u_moe_ss, u_dim, u_moe_knfe)
             }
             if (moe && g_skip != "ew") {
-                bar_dep(enc, haz, HZ_BHB | HZ_BHB2, HZ_BHB)
-                enc_ew2(enc, g_pso_swiglu, bhb, 0ul, bhb2, 0ul, u_moe_tot, nrows * knfe)
+                bar_dep(enc, haz, hz_gh | hz_gh2, hz_gh)
+                enc_ew2(enc, g4moe ? g_pso_geglu : g_pso_swiglu, bgh, 0ul, bgh2, 0ul, u_moe_tot, nrows * knfe)
             }
             if (moe && g_skip != "gemv") {
                 let fe2 = kq_fmt_at(t.we2_fmt, l)
-                bar_dep(enc, haz, HZ_BHB | HZ_BMSEL, HZ_BMDN)
-                enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, nrows, bhb, bmdn,
+                bar_dep(enc, haz, hz_gh | HZ_BMSEL, HZ_BMDN)
+                enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, nrows, bgh, bmdn,
                     u_moe_nfe, u_dim, bmsel, fe2 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_xs_dn,
                     u_moe_ss, u_moe_knfe, u_moe_kdim)
-                bar_dep(enc, haz, HZ_BMDN | HZ_BMSEL, HZ_BXB)
-                enc_moe_combine(enc, bmdn, bmsel, bxb, u_dim, u_moe_k, dim, nrows)
+                bar_dep(enc, haz, HZ_BMDN | HZ_BMSEL, g4moe ? HZ_BMRT : HZ_BXB)
+                enc_moe_combine(enc, bmdn, bmsel, g4moe ? bmg4rt : bxb, u_dim, u_moe_k, dim, nrows)
+                if (g4moe && g_skip != "ew") {
+                    var bw_pf2 = upload_region(addr < void? >(t.fblob[t.rms_post_ffn2_off + l * dim]), uint64(dim * 4l))
+                    bar_dep(enc, haz, HZ_BMRT, HZ_BMRT)
+                    enc_rms_b(enc, bmg4rt, bw_pf2, bmg4rt, u_dim, u_eps, nrows)
+                }
             }
-            if (!moe && g_skip != "gemv") {
+            if ((!moe || g4moe) && g_skip != "gemv") {
                 if (f1 != KqFmt.q8) {
                     // gate + up into DISJOINT bhb/bhb2 — the ew2 swiglu below fuses them
                     // (fuse13 stands down on kq loads)
@@ -1907,12 +1945,12 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     }
                 }
             }
-            if (!moe && g_skip != "ew" && !fuse13) {
+            if ((!moe || g4moe) && g_skip != "ew" && !fuse13) {
                 // the gate ew reads gate (bhb) + up (bhb2), writes act(gate)*up back into bhb
                 bar_dep(enc, haz, HZ_BHB | HZ_BHB2, HZ_BHB)
                 enc_ew2(enc, geglu ? g_pso_geglu : g_pso_swiglu, bhb, 0ul, bhb2, 0ul, u_total_h, nrows * hidden)
             }
-            if (!moe && g_skip != "gemv") {
+            if ((!moe || g4moe) && g_skip != "gemv") {
                 if (f2 != KqFmt.q8) {
                     bar_dep(enc, haz, HZ_BHB, HZ_BXB)
                     enc_kq_site_b(enc, t, f2, t.w2_offs[l], dim, hidden, bhb, hidden, bxb, dim, 0l, u_hidden, u_dim, u_dim, u_nrows_kq, nrows, mp)
@@ -1940,6 +1978,14 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                         enc_gemv_b(enc, nrows > 2l, bw2.buf, bw2.boff, bhb, bxb, u_hidden, u_dim, u_dim, dim)
                     }
                 }
+            }
+            if (g4moe && g_skip != "ew") {
+                // dense-branch post-norm, then routed + dense summed into bxb for the epilogue
+                var bw_pf1 = upload_region(addr < void? >(t.fblob[t.rms_post_ffn1_off + l * dim]), uint64(dim * 4l))
+                bar_dep(enc, haz, HZ_BXB, HZ_BXB)
+                enc_rms_b(enc, bxb, bw_pf1, bxb, u_dim, u_eps, nrows)
+                bar_dep(enc, haz, HZ_BXB | HZ_BMRT, HZ_BXB)
+                enc_ew2(enc, g_pso_add, bxb, 0ul, bmg4rt, 0ul, u_total_dim, nrows * dim)
             }
             if (g_skip != "ew") {
                 if (c.pre_post_norm) {
@@ -2085,6 +2131,13 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         g_lp_upooled |> push((buf = u_moe_knfe, size = 4ul))
         g_lp_upooled |> push((buf = u_moe_kdim, size = 4ul))
         g_lp_upooled |> push((buf = u_moe_tot, size = 4ul))
+        if (g4moe) {
+            g_lp_pooled |> push((buf = bmg4x, size = bytes_mg4x))
+            g_lp_pooled |> push((buf = bmg4rt, size = bytes_mg4x))
+            g_lp_pooled |> push((buf = bmgh, size = bytes_mgh))
+            g_lp_pooled |> push((buf = bmgh2, size = bytes_mgh))
+            g_lp_upooled |> push((buf = u_moe_invd, size = 4ul))
+        }
     }
     if (use_attn_d) {
         g_lp_upooled |> push((buf = u_nsgs, size = 4ul))
