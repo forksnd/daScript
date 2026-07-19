@@ -200,12 +200,12 @@ def private collect_cells(terminal : Terminal const; screen : int; scrollback : 
                           var cells : array<TerminalCell>) {
     delete cells
     _terminal_visit_cells(terminal, screen, scrollback) $(row, column : int;
-            grapheme : string const#; width, attributes : int;
-            foreground_kind, foreground_index, foreground_red,
-            foreground_green, foreground_blue : int;
-            background_kind, background_index, background_red,
-            background_green, background_blue : int;
-            hyperlink : string const#) {
+                                                          grapheme : string const#; width, attributes : int;
+                                                          foreground_kind, foreground_index, foreground_red,
+                                                          foreground_green, foreground_blue : int;
+                                                          background_kind, background_index, background_red,
+                                                          background_green, background_blue : int;
+                                                          hyperlink : string const#) {
         cells |> push(TerminalCell(
             row = row,
             column = column,
@@ -231,7 +231,7 @@ def private collect_cells(terminal : Terminal const; screen : int; scrollback : 
 def private collect_cursor(terminal : Terminal const; screen : int;
                            var cursor : TerminalCursor) {
     _terminal_cursor(terminal, screen) $(row, column : int;
-            visible, blinking : bool; style : int) {
+                                         visible, blinking : bool; style : int) {
         cursor = TerminalCursor(
             row = row,
             column = column,
