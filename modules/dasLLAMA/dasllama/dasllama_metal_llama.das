@@ -701,21 +701,23 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 let fe2 = kq_fmt_at(t.we2_fmt, l)
                 if (g_skip != "gemv") {
                     var bw_rt = upload_region(addr < void? >(t.fblob[t.router_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
-                    enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, c.n_expert)
-                    enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, c.n_expert_used)
-                    enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, r.bxb, r.bh12,
-                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32)
-                    enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, r.bxb, r.bh12,
+                    enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, c.n_expert, 1l)
+                    enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, 1l)
+                    enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, 1l, r.bxb, r.bh12,
+                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                        r.u_zero32, r.u_zero32, r.u_zero32)
+                    enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, 1l, r.bxb, r.bh12,
                         r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
-                        uint64(knfe * 4l))
+                        r.u_zero32, r.u_zero32, r.u_zero32, uint64(knfe * 4l))
                 }
                 if (g_skip != "ew") {
                     enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(knfe * 4l), r.u_moe_knfe, knfe)
                 }
                 if (g_skip != "gemv") {
-                    enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, r.bh12, r.bmoe_dn,
-                        r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn)
-                    enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, c.n_expert_used, r.bxb, r.u_dim, r.u_moe_k, dim)
+                    enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, 1l, r.bh12, r.bmoe_dn,
+                        r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
+                        r.u_zero32, r.u_zero32, r.u_zero32)
+                    enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, r.bxb, r.u_dim, r.u_moe_k, dim, 1l)
                 }
             } else {
                 let f1 = kq_fmt_at(t.w1_fmt, l)
@@ -1185,7 +1187,7 @@ def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : arra
             }
         }
     }
-    let shape = decode_shape_decline(t, BATCH_NEEDS_OK)
+    let shape = decode_shape_decline(t, BATCH_NEEDS_OK, true)
     if (shape != MetalDecodeDecline.none) {
         return shape
     }
@@ -1410,12 +1412,16 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         !tied_f32 && c.n_layer_nextn == 0l &&
         t.wcls_off >= 0l &&
         (cls_fmt != KqFmt.q8 || !use_gemm || (c.vocab_size % (use_mm ? 64l : 32l)) == 0l))
+    // MoE (Wave C): per-stream routing + expert-indexed GEMVs; bhb/bhb2 hold the (row, slot)
+    // gate/up rows, so they size to the larger of the dense and MoE spans
+    let moe = !t.blocks.ffn_is_dense
+    let knfe = moe ? c.n_expert_used * c.n_ff_exp : 0l
     // pooled per-step buffers (mp rows: the fixed-B forms read their full B, the GEMM its M pad —
     // stale pad rows only ever land in pad outputs, which nothing reads back)
     let bytes_x = uint64(mp * dim * 4l)
     let bytes_xb = uint64(mp * max(dim, qd_mx) * 4l)   // dim-wide norm outs AND the qd-wide attention out
     let bytes_qkv = uint64(mp * qkvd_mx * 4l)
-    let bytes_h = uint64(mp * hidden * 4l)
+    let bytes_h = uint64(max(mp * hidden, nrows * knfe) * 4l)
     let bytes_tab = uint64(nrows * half * 4l)
     let bytes_tab_sw = uint64(nrows * half_sw * 4l)   // the swa pair's rows are ITS class's hs/2
     let bytes_rt = uint64(nrows * 16l)
@@ -1441,6 +1447,12 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         bytes_sk = max(bytes_sk, uint64(w2_sk * 32l * dim * 4l))
     }
     var bpsk = bytes_sk > 0ul ? pool_acquire(g_pool, g_dev, bytes_sk) : null
+    let bytes_mlg = uint64(nrows * c.n_expert * 4l)
+    let bytes_msel = uint64(nrows * 2l * c.n_expert_used * 4l)
+    let bytes_mdn = uint64(nrows * c.n_expert_used * dim * 4l)
+    var bmlg = moe ? pool_acquire(g_pool, g_dev, bytes_mlg) : null
+    var bmsel = moe ? pool_acquire(g_pool, g_dev, bytes_msel) : null
+    var bmdn = moe ? pool_acquire(g_pool, g_dev, bytes_mdn) : null
     let bytes_log = uint64(mp * c.vocab_size * 4l)
     var bxf = gpu_logits ? pool_acquire(g_pool, g_dev, bytes_x) : null
     var blog = gpu_logits ? pool_acquire(g_pool, g_dev, bytes_log) : null
@@ -1502,6 +1514,17 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     var u_s16 = uniform_u32(s16 ? 1u : 0u)
     var u_total_dim = uniform_u32(uint(nrows * dim))
     var u_total_h = uniform_u32(uint(nrows * hidden))
+    // MoE per-step uniforms (the expert twins' stride set; see enc_moe_gemv)
+    var u_moe_ne = moe ? uniform_u32(uint(c.n_expert)) : null
+    var u_moe_k = moe ? uniform_u32(uint(c.n_expert_used)) : null
+    var u_moe_nfe = moe ? uniform_u32(uint(c.n_ff_exp)) : null
+    var u_moe_eblk = moe ? uniform_u32(uint(dim * c.n_ff_exp / 32l)) : null
+    var u_moe_esb = moe ? uniform_u32(uint(dim * c.n_ff_exp / 256l)) : null
+    var u_moe_ss = moe ? uniform_u32(uint(2l * c.n_expert_used)) : null
+    var u_moe_xs_dn = moe ? uniform_u32(uint(c.n_ff_exp)) : null
+    var u_moe_knfe = moe ? uniform_u32(uint(knfe)) : null
+    var u_moe_kdim = moe ? uniform_u32(uint(c.n_expert_used * dim)) : null
+    var u_moe_tot = moe ? uniform_u32(uint(nrows * knfe)) : null
     var u_xs4_dim = mv ? uniform_u32(uint(dim / 4l)) : null
     var u_xs4_qd = mv ? uniform_u32(uint(qd / 4l)) : null
     var u_xs4_qd_sw = (mv && hetero) ? uniform_u32(uint(qd_sw / 4l)) : null   // the wo x stride's sliding-class twin
@@ -1803,7 +1826,38 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     enc_rms_b(enc, bx, bw_ffn, bxb, u_dim, u_eps, nrows)
                 }
             }
-            if (g_skip != "gemv") {
+            if (moe && g_skip != "gemv") {
+                // MoE FFN (Wave C): per-row router -> select -> expert gate/up (grid (nfe, k,
+                // rows)) -> swiglu over rows*k*nfe -> expert down -> per-row weighted combine
+                let fe1 = kq_fmt_at(t.we1_fmt, l)
+                let fe3 = kq_fmt_at(t.we3_fmt, l)
+                var bw_rt = upload_region(addr < void? >(t.fblob[t.router_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
+                bar_dep(enc, haz, HZ_BXB, HZ_BMLG)
+                enc_moe_router(enc, bw_rt, bxb, bmlg, u_dim, u_moe_ne, u_dim, c.n_expert, nrows)
+                bar_dep(enc, haz, HZ_BMLG, HZ_BMSEL)
+                enc_moe_select(enc, bmlg, bmsel, u_moe_ne, u_moe_k, nrows)
+                bar_dep(enc, haz, HZ_BXB | HZ_BMSEL, HZ_BHB | HZ_BHB2)
+                enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bxb, bhb,
+                    u_dim, u_moe_nfe, bmsel, fe1 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_zero32,
+                    u_moe_ss, u_dim, u_moe_knfe)
+                enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bxb, bhb2,
+                    u_dim, u_moe_nfe, bmsel, fe3 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_zero32,
+                    u_moe_ss, u_dim, u_moe_knfe)
+            }
+            if (moe && g_skip != "ew") {
+                bar_dep(enc, haz, HZ_BHB | HZ_BHB2, HZ_BHB)
+                enc_ew2(enc, g_pso_swiglu, bhb, 0ul, bhb2, 0ul, u_moe_tot, nrows * knfe)
+            }
+            if (moe && g_skip != "gemv") {
+                let fe2 = kq_fmt_at(t.we2_fmt, l)
+                bar_dep(enc, haz, HZ_BHB | HZ_BMSEL, HZ_BMDN)
+                enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, nrows, bhb, bmdn,
+                    u_moe_nfe, u_dim, bmsel, fe2 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_xs_dn,
+                    u_moe_ss, u_moe_knfe, u_moe_kdim)
+                bar_dep(enc, haz, HZ_BMDN | HZ_BMSEL, HZ_BXB)
+                enc_moe_combine(enc, bmdn, bmsel, bxb, u_dim, u_moe_k, dim, nrows)
+            }
+            if (!moe && g_skip != "gemv") {
                 if (f1 != KqFmt.q8) {
                     // gate + up into DISJOINT bhb/bhb2 — the ew2 swiglu below fuses them
                     // (fuse13 stands down on kq loads)
@@ -1847,12 +1901,12 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     }
                 }
             }
-            if (g_skip != "ew" && !fuse13) {
+            if (!moe && g_skip != "ew" && !fuse13) {
                 // the gate ew reads gate (bhb) + up (bhb2), writes act(gate)*up back into bhb
                 bar_dep(enc, haz, HZ_BHB | HZ_BHB2, HZ_BHB)
                 enc_ew2(enc, geglu ? g_pso_geglu : g_pso_swiglu, bhb, 0ul, bhb2, 0ul, u_total_h, nrows * hidden)
             }
-            if (g_skip != "gemv") {
+            if (!moe && g_skip != "gemv") {
                 if (f2 != KqFmt.q8) {
                     bar_dep(enc, haz, HZ_BHB, HZ_BXB)
                     enc_kq_site_b(enc, t, f2, t.w2_offs[l], dim, hidden, bhb, hidden, bxb, dim, 0l, u_hidden, u_dim, u_dim, u_nrows_kq, nrows, mp)
@@ -2010,6 +2064,21 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     }
     if (bytes_sk > 0ul) {
         g_lp_pooled |> push((buf = bpsk, size = bytes_sk))
+    }
+    if (moe) {
+        g_lp_pooled |> push((buf = bmlg, size = bytes_mlg))
+        g_lp_pooled |> push((buf = bmsel, size = bytes_msel))
+        g_lp_pooled |> push((buf = bmdn, size = bytes_mdn))
+        g_lp_upooled |> push((buf = u_moe_ne, size = 4ul))
+        g_lp_upooled |> push((buf = u_moe_k, size = 4ul))
+        g_lp_upooled |> push((buf = u_moe_nfe, size = 4ul))
+        g_lp_upooled |> push((buf = u_moe_eblk, size = 4ul))
+        g_lp_upooled |> push((buf = u_moe_esb, size = 4ul))
+        g_lp_upooled |> push((buf = u_moe_ss, size = 4ul))
+        g_lp_upooled |> push((buf = u_moe_xs_dn, size = 4ul))
+        g_lp_upooled |> push((buf = u_moe_knfe, size = 4ul))
+        g_lp_upooled |> push((buf = u_moe_kdim, size = 4ul))
+        g_lp_upooled |> push((buf = u_moe_tot, size = 4ul))
     }
     if (use_attn_d) {
         g_lp_upooled |> push((buf = u_nsgs, size = 4ul))

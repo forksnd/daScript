@@ -943,6 +943,9 @@ let HZ_ARENA  = 128u
 let HZ_BPSK   = 256u
 let HZ_BXF    = 512u
 let HZ_BLOG   = 1024u
+let HZ_BMLG   = 2048u   // MoE router logits (Wave C)
+let HZ_BMSEL  = 4096u   // MoE selection rows
+let HZ_BMDN   = 8192u   // MoE per-slot down outputs
 
 struct HazTrack {
     on : bool
