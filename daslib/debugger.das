@@ -36,11 +36,17 @@ class DapiDebugAgent {
     @do_not_delete thisAgent : DebugAgent ?
 }
 
+// GC root for every installed agent: the C++ DebugAgentAdapter holds a raw classPtr the das GC
+// can't see, so an unrooted agent is collected and the adapter reads freed memory (the
+// 2026-07-19 serving crash). Base-typed — the gc walker traces class objects by runtime type.
+var private g_installed_agents : array<DapiDebugAgent?>
+
 def install_new_debug_agent(var agentPtr; category : string) {
     static_if (typeinfo is_class(*agentPtr)) {
         let agentInfo = class_info(*agentPtr)
         var inscope agentAdapter <- make_debug_agent(agentPtr, agentInfo)
         agentPtr.thisAgent = unsafe(reinterpret<DebugAgent?>(agentAdapter))
+        g_installed_agents |> push(unsafe(reinterpret<DapiDebugAgent?>(agentPtr)))
         install_debug_agent(agentAdapter, category)
         this_context().name := "debug agent {category}"
     } else {
@@ -53,6 +59,7 @@ def install_new_thread_local_debug_agent(var agentPtr) {
         let agentInfo = class_info(*agentPtr)
         var inscope agentAdapter <- make_debug_agent(agentPtr, agentInfo)
         agentPtr.thisAgent = unsafe(reinterpret<DebugAgent?>(agentAdapter))
+        g_installed_agents |> push(unsafe(reinterpret<DapiDebugAgent?>(agentPtr)))
         install_debug_agent_thread_local(agentAdapter)
         this_context().name := "thread local debug agent"
     } else {

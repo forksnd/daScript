@@ -29,27 +29,18 @@ module llvm_jit_run shared private
 
 var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole library; when false, only against runtime
 
+// nolint:STYLE014
 // Bump this constant whenever LLVM codegen / linking logic changes in a way that
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x43ul   // length() emits the >INT_MAX guard (0x42: full-stack prologue emission reads LlvmJitFlags)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x46ul   // DIFile drops the duplicated directory (0x45: DISubprogram+CodeView lines, /DEBUG pdb)
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
-// `options fast_math = true` (or policies.fast_math; `_jit_fast_math` is a legacy alias) stamps every FP
-// instruction with the VALUE-SAFE fast-math flags before opt — reassoc|nsz|contract — which lets
-// reductions reassociate/vectorize and FP contract everywhere. NON-bit-exact, but this is the same FP
-// laxity llama.cpp/ggml already runs with (hand-coded FMA + ~2ulp poly exp + reassociated SIMD reductions;
-// ggml CPU is just -O3, no -ffast-math flag — it hand-writes the equivalent). Measured greedy-STABLE on
-// Llama-3.2-1B prefill (identical next token @512/1024/2048, ~1% logit drift) for +8-10% end-to-end.
-// Default off (bit-exact). The magic-number exp survives reassoc — LLVM keeps `z` (its bits feed the
-// exponent bitcast), so it does NOT fold `(x*log2e + M) - M` away.
-//
-// nnan|ninf|arcp|afn are deliberately NOT stamped: engine kernels produce real infs (a sigmoid's
-// exp(-v) overflows float for v < -88), and on x64 arcp+ninf licensed rcp-estimate division whose
-// Newton step computes inf*0 = NaN — the whole parakeet encoder went NaN under the old all-flags
-// stamp (aarch64 never takes that lowering, which hid it). Regression: tests/jit/fast_math_specials.das.
+// `options fast_math` stamps every FP op with VALUE-SAFE flags (reassoc|nsz|contract) before opt —
+// NON-bit-exact, default off, +8-10% e2e. nnan|ninf|arcp|afn are deliberately NOT stamped: engine
+// kernels make real infs and arcp+ninf's rcp-estimate div computes inf*0=NaN (tests/jit/fast_math_specials.das).
 var g_jit_fast_math = false
 
 def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
@@ -59,9 +50,7 @@ def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
         while (bb != null) {
             var inst = LLVMGetFirstInstruction(bb)
             while (inst != null) {
-                // authored flags win: an [llvm_code] generator that sets explicit FMF (e.g.
-                // the GEMM fold's contract-without-reassoc, pinning its fold order across
-                // loop shapes) keeps them; the blanket stamp only fills unset instructions
+                // authored flags win — the blanket stamp only fills instructions with no explicit FMF
                 if (LLVMCanValueUseFastMathFlags(inst) != 0 && LLVMGetFastMathFlags(inst) == 0u) {
                     LLVMSetFastMathFlags(inst, 0x29u)   // reassoc|nsz|contract (see header note)
                 }
@@ -73,6 +62,7 @@ def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
     }
 }
 
+// nolint:STYLE014
 // Loop tune hints (vectorize / vectorize_width / unroll / unroll_count / interleave_count)
 // live on ExprFor / ExprWhile annotations and reach ONLY the JIT — attach_loop_metadata
 // turns them into LLVM !llvm.loop metadata. They never enter the interpreter SimNode tree
@@ -127,10 +117,9 @@ def private fold_loop_hints(funcs : array<FunctionPtr>; seed : uint64) : uint64 
     return r
 }
 
-// [llvm_code] annotation args are generator parameters: they change the emitted IR without
-// touching the reference body, so the aot hash is blind to them — fold them like loop hints.
-// A change to the GENERATOR's own code is invisible to the key too: bump
-// LLVM_JIT_CODEGEN_VERSION when a generator's emission changes for fixed args (manual, by design).
+// [llvm_code] annotation args are generator params: they change emitted IR without touching the
+// reference body, so the aot hash is blind — fold them like loop hints. A generator CODE change is
+// invisible too: bump LLVM_JIT_CODEGEN_VERSION when a generator's emission changes for fixed args.
 def private fold_llvm_code_hints(funcs : array<FunctionPtr>; seed : uint64) : uint64 {
     var h = seed
     for (fn in funcs) {
@@ -144,12 +133,9 @@ def private fold_llvm_code_hints(funcs : array<FunctionPtr>; seed : uint64) : ui
     return h
 }
 
-// True when the program will jit any [llvm_code] generated kernel (a tuner-stamped or
-// hand-written generator body). Such kernels emit host-specific IR (e.g. AVX2 256-bit ops)
-// that a generic x86-64 exe target cannot legalize — so a -exe carrying them must target the
-// current box. Scanned off the AST BEFORE the target flags are computed: the generators'
-// decline predicates consult the g_target_* gates, so a generic-CPU flag pass folds every
-// kernel to its reference body before any later machine choice could matter.
+// True when the program jits any [llvm_code] kernel — those emit host-specific IR (e.g. AVX2) a
+// generic x86-64 exe can't legalize, so a -exe carrying them must target the current box. Scanned
+// BEFORE target flags: the generators' decline predicates consult g_target_*, so order matters.
 def private has_generated_kernel(prog : Program?; jit_all_functions : bool) : bool {
     var found = false
     prog |> for_each_module() $(mod) {
@@ -179,15 +165,11 @@ def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : i
     h = (h ^ (emit_prologue ? 1ul : 0ul)) * JIT_FNV_PRIME
     h = (h ^ (debug_info ? 1ul : 0ul)) * JIT_FNV_PRIME
     h = (h ^ (g_jit_fast_math ? 1ul : 0ul)) * JIT_FNV_PRIME   // fast-math changes codegen → distinct cache
-    // EH hosts get uwtable on every function, longjmp hosts don't — a table-less DLL
-    // cached by a longjmp host must never cache-hit on an EH host (panic would crash).
+    // EH vs longjmp hosts emit different unwind tables — must not share a cache entry (panic would crash)
     h = (h ^ (das_is_exceptions_enabled() ? 1ul : 0ul)) * JIT_FNV_PRIME
-    // AVX2 gates the x64 intrinsic table (g_target_x64_avx2): a DLL jitted with AVX2 emission must
-    // never cache-hit on an AVX2-less host sharing the cache dir (illegal instruction), and vice versa.
+    // AVX2 gates the x64 intrinsic table — an AVX2-jitted DLL must not cache-hit an AVX2-less host (illegal instr)
     h = (h ^ (cpu_supports("avx2") ? 1ul : 0ul)) * JIT_FNV_PRIME
-    // Matrix-tier gates (g_target_x64_vnni256 / avx512bw / avx512vnni) key emission the same way —
-    // fold each cpuid bit, plus the DAS_JIT_X64_FORCE_FEATURES override string (emission-only
-    // diagnostics — a forced artifact must never cache-hit a normal run, and vice versa).
+    // Matrix-tier cpuid bits (vnni256/avx512bw/avx512vnni) + DAS_JIT_X64_FORCE_FEATURES key emission the same way
     var isa = 0ul
     if (cpu_supports("avxvnni")) {
         isa |= 1ul
@@ -212,15 +194,12 @@ def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : i
     if (!empty(forced)) {
         h = (h ^ hash(forced)) * JIT_FNV_PRIME
     }
-    // the aarch64 twin (DAS_JIT_ARM64_FORCE_FEATURES, e.g. "i8mm"): a forced artifact must never
-    // cache-hit a normal run — and the same-env run on the TARGET box must hit it exactly
+    // aarch64 twin (DAS_JIT_ARM64_FORCE_FEATURES, e.g. "i8mm"): a forced artifact must not cache-hit a normal run
     let forced_arm = get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES")
     if (!empty(forced_arm)) {
         h = (h ^ hash(forced_arm)) * JIT_FNV_PRIME
     }
-    // Cross-compile artifacts key on their triple: a --jit-target DLL must never
-    // cache-hit a host run of the same program (dlopen of a foreign-arch DLL), and
-    // vice versa.
+    // Cross-compile artifacts key on their triple — a --jit-target DLL must not cache-hit a host run (foreign-arch dlopen)
     if (!empty(target_triple)) {
         h = (h ^ hash(target_triple)) * JIT_FNV_PRIME
     }
@@ -228,8 +207,7 @@ def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : i
 }
 
 def jit_gc_stale_dlls(subdir : string; keep_basename : string) {
-    // Delete any file in subdir whose basename does not match the current hash.
-    // Covers stale `.dll` plus linker artifacts (`.o`, `.lib`, `.exp`, `.pdb`).
+    // Delete files in subdir whose basename != current hash (stale .dll + linker artifacts: .o/.lib/.exp/.pdb)
     let keep_prefix = "{keep_basename}."
     dir(subdir) $(fname) {
         if (fname == "." || fname == ".." || fname |> starts_with(keep_prefix)) return
@@ -287,12 +265,9 @@ def finalize_jit(use_dll : bool; gen_exe : bool; lib_handle : DLLHandle?) : JitS
     return result
 }
 
-// After a codegen failure the global LLVM state (g_mod/g_ctx/g_engine) is left
-// built but unusable. init_jit bails while g_mod != null, so the NEXT run_jit in
-// the same process would inherit it and cascade-fail. Dispose + null it (mirrors
-// finalize_jit's teardown) so each file starts clean — this is what lets a
-// one-process bulk run survive an unjittable file (e.g. one using quote/qmacro)
-// instead of poisoning every file after it.
+// After a codegen failure the global LLVM state is left built but unusable, and init_jit bails while
+// g_mod != null — so dispose + null it (mirrors finalize_jit) to let a one-process bulk run survive an
+// unjittable file instead of the next run_jit inheriting it and cascade-failing.
 [macro_function]
 def reset_jit_globals_after_failure() {
     if (g_engine != null) {
@@ -307,15 +282,13 @@ def reset_jit_globals_after_failure() {
     unsafe {
         delete g_str2v
     }
-    // Drain the per-run codegen accumulators the skipped generate_global_ctors_dtors
-    // would have cleared — otherwise stale fileinfo entries crash the next file.
+    // Drain codegen accumulators the skipped generate_global_ctors_dtors would have cleared (stale fileinfo crashes next file)
     reset_codegen_accumulators()
 }
 
-//! Run the full JIT backend for an already-compiled & simulated program:
-//! collects the functions to JIT (honoring [jit]/[no_jit] and jit_all),
-//! content-addresses the DLL, generates and optimizes IR, and emits a
-//! .dll / .exe / .wasm per the program's jit policies. Returns true.
+//! Run the full JIT backend for an already-compiled & simulated program: collect the functions to
+//! JIT (honoring [jit]/[no_jit] and jit_all), content-address the DLL, generate and optimize IR,
+//! and emit a .dll / .exe / .wasm per the program's jit policies. Returns true.
 [macro_function]
 def public run_jit(prog : Program?; var ctx : Context?) : bool {
     var funcs : array<FunctionPtr>
@@ -383,6 +356,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
     // `options fast_math` (or policies.fast_math) is the one knob; `_jit_fast_math` kept as a legacy alias
     g_jit_fast_math = (prog._options |> find_arg("fast_math") ?as tBool ?? prog.policies.fast_math) || (prog._options |> find_arg("_jit_fast_math") ?as tBool ?? false)
 
+    // nolint:STYLE014
     // the disable pass consults target-gated intrinsic tables (has_intrinsic) — the
     // g_target_* truth must be set BEFORE it runs, not first at init_jit time below.
     // Standalone exes target a GENERIC CPU (write_exe use_host_cpu=false default), so
@@ -426,10 +400,9 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
     }
     if (!empty(funcs)) {
         let totalTime = ref_time_ticks()
-        // Content-address the DLL so that distinct (AST + codegen version + opt flags)
-        // combinations land in distinct files. Same inputs -> same filename -> cache hit.
-        // Only applied in dll-mode with the default output path; if the user pinned
-        // jit_output_path explicitly or we're producing an exe, keep their path.
+        // Content-address the DLL: distinct (AST + codegen version + opt flags) → distinct files, same
+        // inputs → same filename → cache hit. Only in dll-mode with the default output path; a pinned
+        // jit_output_path or an exe keeps the user's path.
         var dll_hash_basename : string
         if (use_dll && config_out_path |> empty()) {
             dll_hash_basename = jit_dll_basename(funcs, opt_level, size_level, emit_prologue, debug_info, target_triple)
@@ -439,6 +412,23 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
             // BEFORE IR construction (wasm32 cross-compile needs 4-byte pointer
             // sizes baked into GEP folding from the very first IR instruction).
             init_jit(opt_level |> uint, target_triple, !gen_exe || exe_host_cpu)
+
+        // "Debug Info Version" gates all !dbg metadata (absent -> silently stripped);
+        // "CodeView" flips COFF debug emission from DWARF to CodeView so lld-link
+        // /DEBUG can build PDB line tables (windows targets only).
+        if (debug_info) {
+            let div_key = "Debug Info Version"
+            LLVMAddModuleFlag(g_mod, LLVMModuleFlagBehavior.Warning, div_key, uint64(length(div_key)),
+                LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(g_ctx), 3ul, 0)))
+            // host_jit_triple() is "" on MSVC hosts (it only disambiguates mingw arches) —
+            // LLVM's default triple is the actual host answer.
+            let triple = (target_triple |> empty()) ? LLVMGetDefaultTargetTriple() : target_triple
+            if (triple |> find("windows") != -1) {
+                let cv_key = "CodeView"
+                LLVMAddModuleFlag(g_mod, LLVMModuleFlagBehavior.Warning, cv_key, uint64(length(cv_key)),
+                    LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(g_ctx), 1ul, 0)))
+            }
+        }
 
         var jit_flags : LlvmJitFlags
         jit_flags.emit_prologue = emit_prologue
@@ -549,10 +539,10 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
                 write_wasm(g_mod, output_path, target_triple, path_to_linker, jit_has_externals, runtime_lib_override, emit_object)
             } elif (gen_exe) {
                 mkdir_rec(dir_name(output_path))
-                write_exe(g_mod, output_path, path_to_shared_lib, path_to_linker, linker_string, LINK_WHOLE_LIB, exe_host_cpu)
+                write_exe(g_mod, output_path, path_to_shared_lib, path_to_linker, linker_string, LINK_WHOLE_LIB, exe_host_cpu, debug_info)
             } elif (use_dll) {
                 mkdir_rec(dir_name(output_path))
-                write_dll(g_mod, output_path, path_to_shared_lib, path_to_linker, linker_string, LINK_WHOLE_LIB)
+                write_dll(g_mod, output_path, path_to_shared_lib, path_to_linker, linker_string, LINK_WHOLE_LIB, debug_info)
 
                 // Open just stored DLL, so we can keep working.
                 g_dynamic_lib_handle.reset()

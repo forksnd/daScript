@@ -1344,6 +1344,19 @@ def public get_wscale_f16() : bool {
     return g_wscale_f16
 }
 
+// Two error rails for unsupported model/quant combos at load: API-facing tools (probes,
+// harnesses, benchmarks) fail loud — panic with the exact reason. A user-facing server opts
+// into resilient loads: log the problem, pick the nearest working rail, keep serving.
+var private g_resilient_load = false
+
+//! Resilient load mode: unsupported combos log + degrade to a working mode instead of panicking.
+def public set_resilient_load(on : bool) {
+    g_resilient_load = on
+}
+def public get_resilient_load() : bool {
+    return g_resilient_load
+}
+
 // Native K-quant weight planes: Q4_K/Q5_K/Q6_K tensors stay packed in per-format planes instead of
 // requantizing to Q8. Default ON since the kernel tier landed; OFF loads through the q8-requant
 // fallback exactly as before — the A/B opt-out.
@@ -2466,7 +2479,7 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     return <- t
 }
 
-def private load_gguf_impl(path : string; mode : QuantMode) : Model {
+def private load_gguf_impl(path : string; var mode : QuantMode) : Model {
     g_weights_epoch++
     var t = Model()
     t.quant = mode
@@ -2502,7 +2515,7 @@ def private load_gguf_impl(path : string; mode : QuantMode) : Model {
 
 // The load once metadata is parsed and the byte view carrying the KVs (shard 0 for splits) is
 // mapped — config, vocab, plane sizing, tensor reads/transcodes, repack, wscale.
-def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> | #; mode : QuantMode; ts_load : int64) {
+def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> | #; var mode : QuantMode; ts_load : int64) {
     var ts_stage = ref_time_ticks()
     {
         let arch = gguf_str(m, bytes, "general.architecture")
@@ -2911,6 +2924,18 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                 t.rope_freqs[j] = 1.0 / (fscale + ramp * (1.0 - fscale))
             }
             t.config.rope_mscale *= 1.0 + 0.1 * log(1.0 / fscale)
+        }
+        // q4_0 serving has no per-layer-embedding rail: the PLE table reserves on the q8 cursor
+        // but its bytes route to q4blob, so the gather reads an empty qblob (E-series dies token
+        // 1). Not adding a PLE q4 rail — strict loads panic here, resilient (server) fall back to q8.
+        if (mode == QuantMode.q4_0 && has_ple(t.config)) {
+            if (get_resilient_load()) {
+                to_log(LOG_WARNING, "dasLLAMA: q4 serving mode has no per-layer-embedding rail — this model falls back to q8\n")
+                mode = QuantMode.q8
+                t.quant = QuantMode.q8
+            } else {
+                panic("dasLLAMA: q4 serving mode has no per-layer-embedding rail — serve this model with quant q8")
+            }
         }
         // a separate output.weight means the classifier is not tied to the embeddings
         t.config.shared_weights = gguf_find_tensor(m, "output.weight") < 0
@@ -7372,6 +7397,10 @@ def private dequant_q8_row(t : Model; off, n : int64; var dst : float?) {
             }
         }
         return
+    }
+    // Fail closed loudly (a bare bounds trip burned two sessions); guards the qblob path — metal returned above.
+    if (off < 0l || off + n > long_length(t.qblob)) {
+        panic("dequant_q8_row OOB: off={off} n={n} qblob={long_length(t.qblob)} ple_emb_off={t.ple_emb_off} emb_q8_off={t.emb_q8_off} quant={t.quant}")
     }
     unsafe {
         let qp = addr(t.qblob[off])
