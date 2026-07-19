@@ -25,7 +25,7 @@ require dasllama/dasllama_math   // active_kernel_backend — half the image ide
 // fields ride the meta blob via serialize_strings — raw string pointers can't be planes.
 
 // bump on ANY layout/serialization change — a mismatched image regenerates from the gguf
-let IMAGE_VERSION = 3
+let IMAGE_VERSION = 4   // v4: Model meta grew mx4_repacked (Wave C stage 4)
 
 //! The metal (blob-only) flavor's identity tag: q8 planes ride the 34B block_q8_0 blob and the
 //! kq scale planes their GPU forms (convert_model_to_metal_blob) — flavors are per-config and
@@ -243,6 +243,7 @@ def private serialize_image_meta(var arch : Archive; var t : Model) {
     arch |> serialize_raw(t.ple_model_bf16)
     arch |> serialize_raw(t.kquant_native)
     arch |> serialize_raw(t.kq_repacked)
+    arch |> serialize_raw(t.mx4_repacked)
     arch |> serialize_raw(t.kq_repack_mr4)
     arch |> serialize_raw(t.kq_repack_mr5)
     arch |> serialize_raw(t.kq_repack_mr6)
@@ -287,7 +288,7 @@ def private serialize_image_meta(var arch : Archive; var t : Model) {
 
 // the tripwire: serialize_image_meta(Model) covers 64 fields; blocks + image_map +
 // image_bytes are deliberate skips. A new non-array Model field trips this until BOTH agree.
-let IMAGE_META_FIELDS = 64 + 3
+let IMAGE_META_FIELDS = 65 + 3
 
 //! Count of meta-carried fields of any struct: non-arrays plus string arrays (those cannot
 //! be raw planes — see serialize_strings). Pair with a per-type field-count constant to

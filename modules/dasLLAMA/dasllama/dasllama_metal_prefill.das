@@ -3115,6 +3115,8 @@ class MetalAttnSoftmax {
     @uniform @binding = 3 qrows : uint      // padded query rows — the slab's row extent
     @uniform @binding = 4 window : uint     // > 0 = sliding span: keys < cnt - window are masked
     @uniform @binding = 5 softcap : float   // > 0 = attention-logit soft cap (gemma2)
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
     @workgroup red : float[4]               // one per simdgroup
     @workgroup bcast : float
 
@@ -3150,6 +3152,9 @@ class MetalAttnSoftmax {
                 mm = max(mm, red[sgi])
                 sgi++
             }
+            if (hass != 0u) {
+                mm = max(mm, sink[h])
+            }
             bcast = mm
         }
         barrier()
@@ -3174,6 +3179,9 @@ class MetalAttnSoftmax {
             while (sgi < gl_NumSubgroups) {
                 tot += red[sgi]
                 sgi++
+            }
+            if (hass != 0u) {
+                tot += exp(max(sink[h] - rowmax, -80.0))
             }
             bcast = 1.0 / tot
         }
@@ -3612,6 +3620,7 @@ var private g_pso_av : MetalComputePipeline?
 var private g_pf_pso_swiglu : MetalComputePipeline?
 var private g_pf_pso_geglu : MetalComputePipeline?
 var private g_pf_one : MetalBuffer?         // persistent 1.0f — the rms oscale default bind
+var private g_pf_zero : MetalBuffer?        // persistent 0u — the sink/hass identity bind
 var private g_pf_pso_softcap : MetalComputePipeline?
 var private g_pf_pso_suppress : MetalComputePipeline?
 var private g_pf_pso_copy : MetalComputePipeline?
@@ -3734,6 +3743,10 @@ def public metal_prefill_shutdown {
         metal_release(g_pf_one)
         g_pf_one = null
     }
+    if (g_pf_zero != null) {
+        metal_release(g_pf_zero)
+        g_pf_zero = null
+    }
     if (g_pf_pso_geglu != null) {
         metal_release(g_pf_pso_geglu)
         g_pf_pso_geglu = null
@@ -3847,6 +3860,11 @@ def private metal_prefill_init : bool {
     unsafe {
         var onep = reinterpret<float?>(metal_buffer_contents(g_pf_one))
         onep[0] = 1.0
+    }
+    g_pf_zero = metal_new_buffer(g_pf_dev, 4ul)
+    unsafe {
+        var zp = reinterpret<uint?>(metal_buffer_contents(g_pf_zero))
+        zp[0] = 0u
     }
     g_pf_pso_geglu = pf_compile_pso(metal_geglu_msl, metal_geglu_msl_entry, metal_geglu_msl_fastmath, ok)
     g_pf_pso_softcap = pf_compile_pso(metal_softcap_row_msl, metal_softcap_row_msl_entry, metal_softcap_row_msl_fastmath, ok)
@@ -4332,7 +4350,7 @@ def private enc_qk(enc : MetalComputeEncoder?; bq, bk, batt, bqd, bkvd, bhs, bkv
     metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(nk64 / 32l), uint(heads)), uint3(128u, 1u, 1u))
 }
 
-def private enc_softmax(enc : MetalComputeEncoder?; batt, bnp32, bqoff, bqrows, bwin, bcap : MetalBuffer?; npos, heads : int64) {
+def private enc_softmax(enc : MetalComputeEncoder?; batt, bnp32, bqoff, bqrows, bwin, bcap : MetalBuffer?; npos, heads : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_softmax)
     metal_set_threadgroup_memory_length(enc, metal_attn_softmax_msl_tgmem, 0)
     metal_set_buffer(enc, batt, 0ul, 0)
@@ -4341,6 +4359,8 @@ def private enc_softmax(enc : MetalComputeEncoder?; batt, bnp32, bqoff, bqrows, 
     metal_set_buffer(enc, bqrows, 0ul, 3)
     metal_set_buffer(enc, bwin, 0ul, 4)
     metal_set_buffer(enc, bcap, 0ul, 5)
+    metal_set_buffer(enc, bsink != null ? bsink : g_pf_one, 0ul, 20)
+    metal_set_buffer(enc, bhass != null ? bhass : g_pf_zero, 0ul, 21)
     metal_dispatch_threadgroups(enc, uint3(uint(npos), uint(heads), 1u), uint3(128u, 1u, 1u))
 }
 

@@ -36,6 +36,8 @@ class MetalSqAttnF16 {
     @uniform @binding = 8 hs : uint         // head_size == threads per group
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 softcap : float  // > 0 = attention-logit soft cap (gemma2)
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]  // >= ATTN_CHUNK_ROWS — the single-tg depth ceiling
     @workgroup red : float[16]
 
@@ -140,6 +142,9 @@ class MetalSqAttnF16 {
             mm = max(mm, red[sgi])
             sgi++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         barrier()                           // red[] reused for the sum below
         // pass 2b: exp in place + sum
         var l = 0.0
@@ -164,6 +169,9 @@ class MetalSqAttnF16 {
         while (sgi < gl_NumSubgroups) {
             tot += red[sgi]
             sgi++
+        }
+        if (hass != 0u) {
+            tot += exp(max(sink[h] - mm, -80.0))
         }
         // pass 3: lane owns V column `lid` — 4 rows in flight so device-load latency overlaps
         var acc0 = 0.0
@@ -199,6 +207,8 @@ class MetalSqAttnF32 {
     @uniform @binding = 8 hs : uint
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 softcap : float
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]
     @workgroup red : float[16]
 
@@ -299,6 +309,9 @@ class MetalSqAttnF32 {
             mm = max(mm, red[sgi])
             sgi++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         barrier()
         var l = 0.0
         j = lid
@@ -322,6 +335,9 @@ class MetalSqAttnF32 {
         while (sgi < gl_NumSubgroups) {
             tot += red[sgi]
             sgi++
+        }
+        if (hass != 0u) {
+            tot += exp(max(sink[h] - mm, -80.0))
         }
         var acc0 = 0.0
         var acc1 = 0.0
@@ -360,6 +376,8 @@ class MetalSqAttnQ8 {
     @uniform @binding = 10 hs : uint        // head_size == threads per group
     @uniform @binding = 11 scale : float
     @uniform @binding = 12 softcap : float
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]  // >= ATTN_CHUNK_ROWS — the single-tg depth ceiling
     @workgroup red : float[16]
 
@@ -466,6 +484,9 @@ class MetalSqAttnQ8 {
             mm = max(mm, red[sgi])
             sgi++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         barrier()                           // red[] reused for the sum below
         // pass 2b: exp in place + sum
         var l = 0.0
@@ -490,6 +511,9 @@ class MetalSqAttnQ8 {
         while (sgi < gl_NumSubgroups) {
             tot += red[sgi]
             sgi++
+        }
+        if (hass != 0u) {
+            tot += exp(max(sink[h] - mm, -80.0))
         }
         // pass 3: lane owns V column `lid` — 4 rows in flight, dequant rides the weighted sum
         let vb0 = khblk + lid / 32u
@@ -535,6 +559,8 @@ class MetalSqAttnTq4 {
     @uniform @binding = 10 hs : uint
     @uniform @binding = 11 scale : float
     @uniform @binding = 12 softcap : float
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]
     @workgroup red : float[16]
 
@@ -645,6 +671,9 @@ class MetalSqAttnTq4 {
             mm = max(mm, red[sgi])
             sgi++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         barrier()                           // red[] reused for the sum below
         var l = 0.0
         j = lid
@@ -668,6 +697,9 @@ class MetalSqAttnTq4 {
         while (sgi < gl_NumSubgroups) {
             tot += red[sgi]
             sgi++
+        }
+        if (hass != 0u) {
+            tot += exp(max(sink[h] - mm, -80.0))
         }
         // lane owns V column lid — nibble parity picks the half-byte
         let vblk0 = khblk + lid / 32u
@@ -1469,6 +1501,8 @@ class MetalSqAttnComb {
     @uniform @binding = 3 nheads : uint
     @uniform @binding = 4 hs : uint
     @uniform @binding = 5 chlo : uint       // first live chunk (sliding: chunks below the window are unwritten)
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
 
     [metal_kernel(name="metal_sq_attn_comb_msl")]
     def metal_sq_attn_comb {
@@ -1483,6 +1517,9 @@ class MetalSqAttnComb {
             mm = max(mm, part[(base + ci) * (hs + 2u) + hs])
             ci++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         var acc = 0.0
         var l = 0.0
         ci = chlo
@@ -1492,6 +1529,9 @@ class MetalSqAttnComb {
             acc += part[pb + lid] * w
             l += part[pb + hs + 1u] * w
             ci++
+        }
+        if (hass != 0u) {
+            l += exp(max(sink[h] - mm, -80.0))
         }
         yo[bb * (nheads * hs) + h * hs + lid] = acc / l
     }
@@ -3107,6 +3147,8 @@ class MetalSqAttnBF16 {
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
     @uniform @binding = 12 softcap : float
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]
     @workgroup red : float[16]
 
@@ -3212,6 +3254,9 @@ class MetalSqAttnBF16 {
             mm = max(mm, red[sgi])
             sgi++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         barrier()                           // red[] reused for the sum below
         var l = 0.0
         j = lid
@@ -3235,6 +3280,9 @@ class MetalSqAttnBF16 {
         while (sgi < gl_NumSubgroups) {
             tot += red[sgi]
             sgi++
+        }
+        if (hass != 0u) {
+            tot += exp(max(sink[h] - mm, -80.0))
         }
         var acc0 = 0.0
         var acc1 = 0.0
@@ -3271,6 +3319,8 @@ class MetalSqAttnBF32 {
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
     @uniform @binding = 12 softcap : float
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]
     @workgroup red : float[16]
 
@@ -3376,6 +3426,9 @@ class MetalSqAttnBF32 {
             mm = max(mm, red[sgi])
             sgi++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         barrier()
         var l = 0.0
         j = lid
@@ -3399,6 +3452,9 @@ class MetalSqAttnBF32 {
         while (sgi < gl_NumSubgroups) {
             tot += red[sgi]
             sgi++
+        }
+        if (hass != 0u) {
+            tot += exp(max(sink[h] - mm, -80.0))
         }
         var acc0 = 0.0
         var acc1 = 0.0
@@ -3439,6 +3495,8 @@ class MetalSqAttnBQ8 {
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
     @uniform @binding = 14 softcap : float
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]
     @workgroup red : float[16]
 
@@ -3550,6 +3608,9 @@ class MetalSqAttnBQ8 {
             mm = max(mm, red[sgi])
             sgi++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         barrier()                           // red[] reused for the sum below
         var l = 0.0
         j = lid
@@ -3573,6 +3634,9 @@ class MetalSqAttnBQ8 {
         while (sgi < gl_NumSubgroups) {
             tot += red[sgi]
             sgi++
+        }
+        if (hass != 0u) {
+            tot += exp(max(sink[h] - mm, -80.0))
         }
         let vblk0 = khblk + lid / 32u
         let vin = lid % 32u
@@ -3619,6 +3683,8 @@ class MetalSqAttnBTq4 {
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
     @uniform @binding = 14 softcap : float
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]
     @workgroup red : float[16]
 
@@ -3736,6 +3802,9 @@ class MetalSqAttnBTq4 {
             mm = max(mm, red[sgi])
             sgi++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         barrier()                           // red[] reused for the sum below
         var l = 0.0
         j = lid
@@ -3759,6 +3828,9 @@ class MetalSqAttnBTq4 {
         while (sgi < gl_NumSubgroups) {
             tot += red[sgi]
             sgi++
+        }
+        if (hass != 0u) {
+            tot += exp(max(sink[h] - mm, -80.0))
         }
         let vblk0 = khblk + lid / 32u
         let vbyte = (lid % 32u) / 2u
@@ -4587,6 +4659,8 @@ class MetalSqAttnCombB {
     @uniform @binding = 4 nheads : uint
     @uniform @binding = 5 hs : uint
     @uniform @binding = 6 window : uint     // > 0 = sliding span — this row's below-window chunks are unwritten
+    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @uniform @binding = 21 hass : uint
 
     [metal_kernel(name="metal_sq_attn_comb_b_msl")]
     def metal_sq_attn_comb_b {
@@ -4605,6 +4679,9 @@ class MetalSqAttnCombB {
             mm = max(mm, part[(base + ci) * (hs + 2u) + hs])
             ci++
         }
+        if (hass != 0u) {
+            mm = max(mm, sink[h])
+        }
         var acc = 0.0
         var l = 0.0
         ci = chlo
@@ -4614,6 +4691,9 @@ class MetalSqAttnCombB {
             acc += part[pb + lid] * w
             l += part[pb + hs + 1u] * w
             ci++
+        }
+        if (hass != 0u) {
+            l += exp(max(sink[h] - mm, -80.0))
         }
         yo[bb * (nheads * hs) + h * hs + lid] = acc / l
     }
@@ -5576,6 +5656,7 @@ var g_pso_geglu : MetalComputePipeline?
 var g_pso_softcap : MetalComputePipeline?
 var g_pso_suppress : MetalComputePipeline?
 var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind
+var g_zero : MetalBuffer?                   // persistent 0u — the sink/hass identity bind
 var g_pso_attn16 : MetalComputePipeline?
 var g_pso_attn32 : MetalComputePipeline?
 var g_pso_attn_q8 : MetalComputePipeline?   // q8_0-mirror twin (dual-view block reads)
@@ -5696,6 +5777,11 @@ def metal_decode_init : bool {
     unsafe {
         var onep = reinterpret<float?>(metal_buffer_contents(g_one))
         onep[0] = 1.0
+    }
+    g_zero = metal_new_buffer(g_dev, 4ul)
+    unsafe {
+        var zp = reinterpret<uint?>(metal_buffer_contents(g_zero))
+        zp[0] = 0u
     }
     g_pso_geglu = compile_pso(metal_geglu_msl, metal_geglu_msl_entry, metal_geglu_msl_fastmath, ok)
     g_pso_softcap = compile_pso(metal_softcap_row_msl, metal_softcap_row_msl_entry, metal_softcap_row_msl_fastmath, ok)
@@ -6265,7 +6351,7 @@ def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Me
 }
 
 def enc_attn(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-             bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64) {
+             bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     metal_set_pipeline(enc, f16 ? g_pso_attn16 : g_pso_attn32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn16_msl_tgmem : metal_sq_attn32_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -6279,6 +6365,8 @@ def enc_attn(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; ko
     metal_set_buffer(enc, bhs, 0ul, 8)
     metal_set_buffer(enc, bscale, 0ul, 9)
     metal_set_buffer(enc, bcap, 0ul, 10)
+    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6304,7 +6392,7 @@ def enc_attn_part(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer
 
 // tq4-mirror attention twins — same dual-view shape as the q8_0 encoders below
 def enc_attn_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                 bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64) {
+                 bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_attn_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -6320,6 +6408,8 @@ def enc_attn_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
     metal_set_buffer(enc, bcap, 0ul, 12)
+    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6348,7 +6438,7 @@ def enc_attn_part_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff,
 // q8_0-mirror attention twins: the K/V slabs bind TWICE each (half-scale + byte views at the
 // same layer offset); nblk (blocks per row) replaces the kv_dim uniform
 def enc_attn_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64) {
+                bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_attn_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_q8_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -6364,6 +6454,8 @@ def enc_attn_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff 
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
     metal_set_buffer(enc, bcap, 0ul, 12)
+    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6389,7 +6481,7 @@ def enc_attn_part_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, 
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs, bchlo : MetalBuffer?; nheads, head_size : int64) {
+def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs, bchlo : MetalBuffer?; nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_attncomb)
     metal_set_buffer(enc, bpart, 0ul, 0)
     metal_set_buffer(enc, by, 0ul, 1)
@@ -6397,6 +6489,8 @@ def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs, bchlo :
     metal_set_buffer(enc, bnh, 0ul, 3)
     metal_set_buffer(enc, bhs, 0ul, 4)
     metal_set_buffer(enc, bchlo, 0ul, 5)
+    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6580,7 +6674,7 @@ def enc_gemm64_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
 // owns a bit; a barrier is inserted iff a dispatch's read hits a pending write (RAW), or its
 // write hits a pending write/read (WAW/WAR) — read-after-read runs concurrently.
 
-def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     metal_set_pipeline(enc, f16 ? g_pso_attnb16 : g_pso_attnb32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_b16_msl_tgmem : metal_sq_attn_b32_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -6596,6 +6690,8 @@ def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, 
     metal_set_buffer(enc, bscale, 0ul, 10)
     metal_set_buffer(enc, bqs, 0ul, 11)
     metal_set_buffer(enc, bcap, 0ul, 12)
+    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6621,7 +6717,7 @@ def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay
 }
 
 // tq4-mirror batch attention twins — same four-way arena binding as the q8_0 encoders below
-def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_attnb_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_b_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -6639,6 +6735,8 @@ def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bk
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
     metal_set_buffer(enc, bcap, 0ul, 14)
+    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6689,7 +6787,7 @@ def enc_attn_d_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh,
 
 // q8_0-mirror batch attention twins: the arena binds FOUR times (half-scale + byte views for K
 // and V); the row table carries byte offsets and nblk replaces the kv_dim uniform
-def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_attnb_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_b_q8_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -6707,6 +6805,8 @@ def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkv
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
     metal_set_buffer(enc, bcap, 0ul, 14)
+    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6755,7 +6855,7 @@ def enc_attn_d_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, 
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
 }
 
-def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs, bwin : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs, bwin : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_attncombb)
     metal_set_buffer(enc, bpart, 0ul, 0)
     metal_set_buffer(enc, by, 0ul, 1)
@@ -6764,6 +6864,8 @@ def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs, 
     metal_set_buffer(enc, bnh, 0ul, 4)
     metal_set_buffer(enc, bhs, 0ul, 5)
     metal_set_buffer(enc, bwin, 0ul, 6)
+    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6933,6 +7035,10 @@ def metal_kernels_release {
     if (g_one != null) {
         metal_release(g_one)
         g_one = null
+    }
+    if (g_zero != null) {
+        metal_release(g_zero)
+        g_zero = null
     }
     if (g_pso_geglu != null) {
         metal_release(g_pso_geglu)

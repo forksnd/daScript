@@ -144,6 +144,8 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
         metal_set_buffer(enc, bqrows, 0ul, 3)
         metal_set_buffer(enc, bwin0, 0ul, 4)
         metal_set_buffer(enc, bcap0, 0ul, 5)
+        metal_set_buffer(enc, bcap0, 0ul, 20)   // sink identity (hass = 0)
+        metal_set_buffer(enc, bwin0, 0ul, 21)
         metal_dispatch_threadgroups(enc, uint3(uint(npos), uint(n_heads), 1u), uint3(128u, 1u, 1u))
         metal_set_pipeline(enc, pso_av)
         metal_set_threadgroup_memory_length(enc, mm ? metal_attn_av_mm_msl_tgmem : metal_attn_av_msl_tgmem, 0)

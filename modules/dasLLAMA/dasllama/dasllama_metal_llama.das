@@ -1407,6 +1407,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     // ownership assumes hs == 128 (32 lanes x half4 = one head); no softcap/window uniforms, so those
     // models stand down to the chunked pair. DASLLAMA_METAL_ATTN_D=0 = the A/B rail to the old path.
     let use_attn_d = (head_size == 128l && !hetero && c.attn_logit_softcap <= 0.0 && c.sliding_window == 0l &&
+        !c.attn_sinks &&   // partD's online softmax has no sink seed — sink models take the chunked pair
         get_env_variable("DASLLAMA_METAL_ATTN_D") != "0")
     let d_nsgs = min((maxcnt + 31l) / 32l, 16l)
     // logits-on-GPU (default ON): the batched final rms + classifier ride the same cb and the
