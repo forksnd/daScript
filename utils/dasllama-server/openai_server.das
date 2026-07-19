@@ -1372,7 +1372,7 @@ def private handle_streams(var resp : HttpResponse?) : http_status {
             n_prompt = int64(length(st.prompt)), n_cached = st.n_cached,
             n_prefilled = st.n_prefilled, n_gen = st.n_gen, max_new = st.max_new,
             ttft_ms = float(st.ttft_us) / 1000.0,
-            prompt_head = st.prompt_head, gen_tail = utf8_trim_partial_end(st.gen_tail)))
+            prompt_head = st.prompt_head, gen_tail = utf8_trim_partial_end(string(st.gen_tail_bytes))))
     }
     for (q in g_sched.queue) {
         out.streams |> push(OaiStreamInfo(
