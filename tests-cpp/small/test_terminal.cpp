@@ -1,5 +1,10 @@
 #include <doctest/doctest.h>
 
+#include "daScript/ast/ast.h"
+#include "daScript/ast/ast_handle.h"
+#include "daScript/ast/ast_interop.h"
+#include "daScript/misc/sysos.h"
+#include "../../modules/dasTerminal/src/aot_builtin_terminal.h"
 #include "../../modules/dasTerminal/src/terminal.h"
 #include "../../modules/dasTerminal/src/pty.h"
 
@@ -21,15 +26,19 @@ using das_terminal::Terminal;
 
 namespace {
 
-std::string rowText(const Snapshot & snapshot, int row, bool alternate = false) {
-    const auto & cells = (alternate ? snapshot.alternate : snapshot.normal)
-        .rows[static_cast<size_t>(row)];
+std::string cellRowText(const std::vector<das_terminal::Cell> & cells) {
     std::string result;
     for (const auto & cell : cells) {
         if (cell.width != 0) result += cell.grapheme;
     }
     while (!result.empty() && result.back() == ' ') result.pop_back();
     return result;
+}
+
+std::string rowText(const Snapshot & snapshot, int row, bool alternate = false) {
+    const auto & cells = (alternate ? snapshot.alternate : snapshot.normal)
+        .rows[static_cast<size_t>(row)];
+    return cellRowText(cells);
 }
 
 Snapshot feedInChunks(const std::string & bytes, const std::vector<size_t> & chunks,
@@ -143,6 +152,29 @@ struct PtyProcessGuard {
     PtyProcess * process;
 };
 
+struct ResizeProbePty final : PtyProcess {
+    uint32_t processId() const override { return 1; }
+    PtyReadStatus read(std::string &, std::string &, size_t) override {
+        return PtyReadStatus::idle;
+    }
+    bool write(const uint8_t *, size_t, std::string &) override { return true; }
+    bool resize(int columns, int rows, std::string & error) override {
+        resize_called = true;
+        resize_columns = columns;
+        resize_rows = rows;
+        if (resize_succeeds) return true;
+        error = "injected resize failure";
+        return false;
+    }
+    bool wait(uint32_t, uint32_t &, std::string &) override { return false; }
+    bool terminate(uint32_t, std::string &) override { return true; }
+
+    bool resize_succeeds = false;
+    bool resize_called = false;
+    int resize_columns = 0;
+    int resize_rows = 0;
+};
+
 } // namespace
 
 TEST_CASE("terminal: text controls, wrapping, and scrollback") {
@@ -156,6 +188,69 @@ TEST_CASE("terminal: text controls, wrapping, and scrollback") {
     CHECK(snapshot.normal.scrollback[0][0].grapheme == "Z");
     CHECK(snapshot.normal.cursor.row == 1);
     CHECK(snapshot.normal.cursor.column == 1);
+}
+
+TEST_CASE("terminal: scrollback keeps the newest 10000 rows") {
+    Terminal terminal(8, 1);
+    std::string stream;
+    for (int line = 0; line != 10005; ++line)
+        stream += "L" + std::to_string(line) + "\r\n";
+    terminal.feed(stream);
+    const Snapshot snapshot = terminal.snapshot();
+
+    REQUIRE(snapshot.normal.scrollback.size() == 10000);
+    CHECK(cellRowText(snapshot.normal.scrollback.front()) == "L5");
+    CHECK(cellRowText(snapshot.normal.scrollback.back()) == "L10004");
+}
+
+TEST_CASE("terminal: resize keeps screen and scrollback widths consistent") {
+    Terminal terminal(5, 1);
+    terminal.feed("abc\r\n");
+    terminal.resize(7, 1);
+    Snapshot snapshot = terminal.snapshot();
+
+    REQUIRE(snapshot.normal.scrollback.size() == 1);
+    CHECK(snapshot.normal.rows[0].size() == 7);
+    CHECK(snapshot.normal.scrollback[0].size() == 7);
+    CHECK(cellRowText(snapshot.normal.scrollback[0]) == "abc");
+
+    terminal.resize(2, 1);
+    snapshot = terminal.snapshot();
+    CHECK(snapshot.normal.rows[0].size() == 2);
+    CHECK(snapshot.normal.scrollback[0].size() == 2);
+    CHECK(cellRowText(snapshot.normal.scrollback[0]) == "ab");
+}
+
+TEST_CASE("terminal: resize does not leave a truncated wide cell") {
+    Terminal terminal(4, 1);
+    terminal.feed(std::string("A") + "\xe7\x95\x8c\r\n");
+    terminal.resize(2, 1);
+    const Snapshot snapshot = terminal.snapshot();
+
+    REQUIRE(snapshot.normal.scrollback.size() == 1);
+    REQUIRE(snapshot.normal.scrollback[0].size() == 2);
+    CHECK(cellRowText(snapshot.normal.scrollback[0]) == "A");
+    CHECK(snapshot.normal.scrollback[0][1].width == 1);
+}
+
+TEST_CASE("terminal: failed PTY resize preserves emulator dimensions") {
+    auto terminal = das::make_smart<das_terminal::TerminalHandle>(8, 2);
+    auto * process = new ResizeProbePty();
+    terminal->process.reset(process);
+
+    das_terminal::builtin_terminal_resize(terminal, 20, 5);
+    CHECK(process->resize_called);
+    CHECK(process->resize_columns == 20);
+    CHECK(process->resize_rows == 5);
+    CHECK(terminal->state.columns() == 8);
+    CHECK(terminal->state.rows() == 2);
+    CHECK(terminal->transport_error == "injected resize failure");
+
+    process->resize_succeeds = true;
+    das_terminal::builtin_terminal_resize(terminal, 20, 5);
+    CHECK(terminal->state.columns() == 20);
+    CHECK(terminal->state.rows() == 5);
+    CHECK(terminal->transport_error.empty());
 }
 
 TEST_CASE("terminal: cursor movement and erase are semantic") {
@@ -228,6 +323,80 @@ TEST_CASE("terminal: SGR snapshot preserves indexed, RGB, and attributes") {
     CHECK(row[2].foreground.kind == das_terminal::ColorKind::default_color);
 }
 
+TEST_CASE("terminal: SGR reset preserves an active OSC 8 hyperlink") {
+    Terminal terminal(8, 2);
+    terminal.feed("\x1b]8;;https://example.test\x1b\\"
+                  "\x1b[31mA\x1b[0mB"
+                  "\x1b]8;;\x1b\\C");
+    const Snapshot snapshot = terminal.snapshot();
+    const auto & row = snapshot.normal.rows[0];
+
+    CHECK(row[0].hyperlink == "https://example.test");
+    CHECK(row[1].hyperlink == "https://example.test");
+    CHECK(row[1].foreground.kind == das_terminal::ColorKind::default_color);
+    CHECK(row[2].hyperlink.empty());
+}
+
+TEST_CASE("terminal: oversized CSI parameters clamp without overflow") {
+    const std::string huge = "999999999999999999999999999999999999999999999999";
+    Terminal terminal(4, 3);
+    terminal.feed("X\x1b[" + huge + "C@\x1b[2;2H\x1b[" + huge + "B#");
+    Snapshot snapshot = terminal.snapshot();
+
+    CHECK(rowText(snapshot, 0) == "X  @");
+    CHECK(rowText(snapshot, 2) == " #");
+    CHECK(snapshot.normal.cursor.row == 2);
+    CHECK(snapshot.normal.cursor.column == 2);
+    CHECK(snapshot.unknown_sequences.empty());
+
+    terminal.feed("\x1b[1;1Habcd\x1b[1;2H\x1b[" + huge + "X");
+    snapshot = terminal.snapshot();
+    CHECK(rowText(snapshot, 0) == "a");
+    CHECK(snapshot.normal.cursor.column == 1);
+    CHECK(snapshot.unknown_sequences.empty());
+}
+
+TEST_CASE("terminal: ESC cancels an incomplete CSI sequence") {
+    Terminal terminal(8, 2);
+    terminal.feed("\x1b[12;\x1bZ");
+    const Snapshot snapshot = terminal.snapshot();
+
+    REQUIRE(snapshot.unknown_sequences.size() == 1);
+    CHECK(snapshot.unknown_sequences[0] == "\x1bZ");
+}
+
+TEST_CASE("terminal: overlong control strings are bounded and ignored") {
+    Terminal terminal(8, 2);
+    terminal.feed(std::string("\x1b[") + std::string(5000, ';') + "mX");
+    Snapshot snapshot = terminal.snapshot();
+    CHECK(rowText(snapshot, 0) == "X");
+    CHECK(snapshot.unknown_sequences.empty());
+
+    terminal.feed(std::string("\x1b]0;") + std::string(70 * 1024, 'a') + "\x1b\\Y");
+    snapshot = terminal.snapshot();
+    CHECK(rowText(snapshot, 0) == "XY");
+    CHECK(snapshot.title.empty());
+
+    terminal.feed(std::string("\x1b]999;") + std::string(60 * 1024, 'z') + "\x07");
+    snapshot = terminal.snapshot();
+    REQUIRE(snapshot.unknown_sequences.size() == 1);
+    CHECK(snapshot.unknown_sequences[0].size() == 4096);
+    CHECK(snapshot.unknown_sequences[0].substr(4082) == "...[truncated]");
+}
+
+TEST_CASE("terminal: empty DEC private mode parameters are ignored") {
+    Terminal terminal(8, 2);
+    terminal.feed("\x1b[?h\x1b[?;25l");
+    Snapshot snapshot = terminal.snapshot();
+    CHECK_FALSE(snapshot.normal.cursor.visible);
+    CHECK(snapshot.unknown_sequences.empty());
+
+    terminal.feed("\x1b[?25;h");
+    snapshot = terminal.snapshot();
+    CHECK(snapshot.normal.cursor.visible);
+    CHECK(snapshot.unknown_sequences.empty());
+}
+
 TEST_CASE("terminal: Core SGR set and reset forms are explicit") {
     struct SgrCase {
         const char * name;
@@ -291,6 +460,20 @@ TEST_CASE("terminal: title, CWD, alternate screen, modes, and replies are observ
     CHECK(rowText(snapshot, 0) == "main");
 }
 
+TEST_CASE("terminal: full reset drops queued replies and events") {
+    Terminal terminal(8, 2);
+    terminal.feed("before\x07\x1b]2;title\x07\x1b[5n\x1b" "c");
+    const Snapshot snapshot = terminal.snapshot();
+
+    CHECK(rowText(snapshot, 0).empty());
+    CHECK(snapshot.title.empty());
+    CHECK(terminal.drainReplies().empty());
+    CHECK(terminal.takeEvents().empty());
+
+    terminal.feed("\x07");
+    CHECK(terminal.takeEvents() == std::vector<std::string>{"bell"});
+}
+
 TEST_CASE("terminal: UTF-8 wide and combining cells are explicit") {
     Terminal terminal(8, 2);
     terminal.feed(std::string("A") + "\xcc\x81" + "\xe7\x95\x8c" + "B");
@@ -337,6 +520,21 @@ TEST_CASE("terminal: parsing is invariant under arbitrary byte chunks") {
         }
         CHECK(feedInChunks(stream, chunks) == expected);
     }
+}
+
+TEST_CASE("terminal: wide glyph at an unwrapped right edge stays in-grid") {
+    Terminal terminal(3, 2);
+    terminal.feed("\x1b[?7l" "AB\xe7\x95\x8c");
+    Snapshot snapshot = terminal.snapshot();
+    CHECK(rowText(snapshot, 0) == "AB\xe7\x95\x8c");
+    CHECK(snapshot.normal.rows[0][2].width == 1);
+    CHECK(snapshot.normal.cursor.column == 2);
+
+    Terminal narrow(1, 2);
+    narrow.feed("\xe7\x95\x8c");
+    snapshot = narrow.snapshot();
+    CHECK(rowText(snapshot, 0) == "\xe7\x95\x8c");
+    CHECK(snapshot.normal.rows[0][0].width == 1);
 }
 
 TEST_CASE("terminal: normalized key encoding follows VT modes and modifiers") {
@@ -395,12 +593,17 @@ TEST_CASE("terminal: paste encoding and terminal replies remain separate") {
 
 TEST_CASE("terminal: ConPTY PowerShell process uses semantic handshakes") {
 #if defined(_WIN32)
+    // PowerShell startup can exceed ten seconds on cold, heavily loaded CI
+    // runners. Successful handshakes still return immediately.
+    const int integration_timeout_ms = 30000;
     PtyProcessOptions options;
     options.columns = 40;
     options.rows = 10;
+    const std::string probe_path =
+        das::getDasRoot() + "/modules/dasTerminal/tests/conpty_probe.ps1";
     const std::string arguments =
         " -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass"
-        " -File \"modules/dasTerminal/tests/conpty_probe.ps1\"";
+        " -File \"" + probe_path + "\"";
     options.command_line = "pwsh.exe" + arguments;
 
     std::string error;
@@ -417,7 +620,8 @@ TEST_CASE("terminal: ConPTY PowerShell process uses semantic handshakes") {
     CHECK(process->processId() != 0);
 
     Terminal terminal(options.columns, options.rows);
-    REQUIRE(waitForTerminalText(*process, terminal, "DASHERD_READY:", 10000, error));
+    REQUIRE(waitForTerminalText(
+        *process, terminal, "DASHERD_READY:", integration_timeout_ms, error));
     INFO(error);
 
     REQUIRE(process->resize(100, 30, error));
@@ -425,11 +629,11 @@ TEST_CASE("terminal: ConPTY PowerShell process uses semantic handshakes") {
     REQUIRE(process->write(std::string("semantic-probe") +
         terminal.encodeKey(KeyEvent(Key::enter)), error));
     REQUIRE(waitForTerminalText(
-        *process, terminal, "DASHERD_ECHO:semantic-probe", 10000, error));
+        *process, terminal, "DASHERD_ECHO:semantic-probe", integration_timeout_ms, error));
     INFO(error);
 
     uint32_t exit_code = 0;
-    REQUIRE(process->wait(10000, exit_code, error));
+    REQUIRE(process->wait(integration_timeout_ms, exit_code, error));
     INFO(error);
     CHECK(exit_code == 23);
 #else

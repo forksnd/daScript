@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -138,7 +139,7 @@ struct KeyEvent {
 
 class Terminal {
 public:
-    using CellRows = std::vector<std::vector<Cell>>;
+    using CellRows = std::deque<std::vector<Cell>>;
 
     Terminal(int columns, int rows);
     ~Terminal();

@@ -98,6 +98,8 @@ public:
     bool terminate(uint32_t exit_code, std::string & error) override;
 
 private:
+    void closePty();
+
     ConPtyApi api_;
     HANDLE pseudo_console_ = nullptr;
     HANDLE input_write_ = nullptr;
@@ -106,7 +108,7 @@ private:
     uint32_t process_id_ = 0;
 };
 
-ConPtyProcess::~ConPtyProcess() {
+void ConPtyProcess::closePty() {
     closeHandle(input_write_);
     // Close our read end before the synchronous pseudoconsole close. ConHost
     // may still be flushing final output; leaving the reader open here can
@@ -114,10 +116,18 @@ ConPtyProcess::~ConPtyProcess() {
     closeHandle(output_read_);
     if (pseudo_console_) api_.close(pseudo_console_);
     pseudo_console_ = nullptr;
+}
+
+ConPtyProcess::~ConPtyProcess() {
+    closePty();
     closeHandle(process_);
 }
 
 bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & error) {
+    if (pseudo_console_ || input_write_ || output_read_ || process_) {
+        error = "ConPTY process is already launched";
+        return false;
+    }
     if (options.command_line.empty()) {
         error = "ConPTY command line is empty";
         return false;
@@ -132,6 +142,7 @@ bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & erro
     if (!CreatePipe(&output_read_, &output_write, nullptr, 0)) {
         error = windowsError("CreatePipe(output)");
         closeHandle(input_read);
+        closePty();
         return false;
     }
 
@@ -145,6 +156,7 @@ bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & erro
             std::to_string(static_cast<long>(create_result)) + ")";
         closeHandle(input_read);
         closeHandle(output_write);
+        closePty();
         return false;
     }
 
@@ -154,6 +166,7 @@ bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & erro
         error = windowsError("InitializeProcThreadAttributeList(size)");
         closeHandle(input_read);
         closeHandle(output_write);
+        closePty();
         return false;
     }
     std::vector<uint8_t> attribute_storage(attribute_bytes);
@@ -173,6 +186,7 @@ bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & erro
         error = windowsError("InitializeProcThreadAttributeList");
         closeHandle(input_read);
         closeHandle(output_write);
+        closePty();
         return false;
     }
     if (!UpdateProcThreadAttribute(
@@ -182,6 +196,7 @@ bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & erro
         DeleteProcThreadAttributeList(startup.lpAttributeList);
         closeHandle(input_read);
         closeHandle(output_write);
+        closePty();
         return false;
     }
 
@@ -191,6 +206,7 @@ bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & erro
         DeleteProcThreadAttributeList(startup.lpAttributeList);
         closeHandle(input_read);
         closeHandle(output_write);
+        closePty();
         return false;
     }
     std::vector<wchar_t> mutable_command(command.begin(), command.end());
@@ -209,6 +225,7 @@ bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & erro
     closeHandle(output_write);
     if (!created) {
         error = windowsError("CreateProcessW", create_error);
+        closePty();
         return false;
     }
     CloseHandle(process.hThread);
@@ -227,6 +244,7 @@ PtyReadStatus ConPtyProcess::read(
     DWORD available = 0;
     if (!PeekNamedPipe(output_read_, nullptr, 0, nullptr, &available, nullptr)) {
         const DWORD code = GetLastError();
+        closeHandle(output_read_);
         if (code == ERROR_BROKEN_PIPE) return PtyReadStatus::closed;
         error = windowsError("PeekNamedPipe", code);
         return PtyReadStatus::error;
@@ -244,6 +262,7 @@ PtyReadStatus ConPtyProcess::read(
     if (!ReadFile(output_read_, &bytes[0], requested, &received, nullptr)) {
         const DWORD code = GetLastError();
         bytes.clear();
+        closeHandle(output_read_);
         if (code == ERROR_BROKEN_PIPE) return PtyReadStatus::closed;
         error = windowsError("ReadFile(ConPTY output)", code);
         return PtyReadStatus::error;
@@ -257,16 +276,23 @@ bool ConPtyProcess::write(const uint8_t * bytes, size_t count, std::string & err
         error = "ConPTY input bytes are null";
         return false;
     }
+    if (!input_write_) {
+        error = "ConPTY input pipe is closed";
+        return false;
+    }
     size_t offset = 0;
     while (offset != count) {
         const DWORD requested = static_cast<DWORD>(
             std::min<size_t>(count - offset, 0xffffffffu));
         DWORD written = 0;
         if (!WriteFile(input_write_, bytes + offset, requested, &written, nullptr)) {
-            error = windowsError("WriteFile(ConPTY input)");
+            const DWORD code = GetLastError();
+            closeHandle(input_write_);
+            error = windowsError("WriteFile(ConPTY input)", code);
             return false;
         }
         if (!written) {
+            closeHandle(input_write_);
             error = "WriteFile(ConPTY input) wrote zero bytes";
             return false;
         }

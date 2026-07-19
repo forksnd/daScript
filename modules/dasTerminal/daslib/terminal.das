@@ -113,15 +113,29 @@ struct public TerminalSnapshot {
     unknown_sequences : array<string>
 }
 
-//! Rendering snapshot bounded to the active screen and visible scrollback rows.
-//! ``buffer.scrollback_rows`` remains the total retained row count; cells in
-//! ``buffer.scrollback`` retain their global scrollback row indices.
+//! Geometry-safe ASCII paint run. Cells with wide, combining, hidden, or
+//! non-ASCII graphemes remain in the viewport cell arrays for exact placement.
+struct public TerminalTextRun {
+    global_row : int
+    column : int
+    text : string
+    color : TerminalColor = TerminalColor()
+    default_is_background : bool
+    glyph_cells : int
+}
+
+//! Bounded render snapshot: compact text runs plus only the special cells needed
+//! for non-default chrome or exact-position fallback glyphs.
 struct public TerminalViewportSnapshot {
     revision : int64
     columns : int
     rows : int
     alternate_active : bool
     buffer : TerminalBufferSnapshot = TerminalBufferSnapshot()
+    text_runs : array<TerminalTextRun>
+    screen_text : string
+    cell_projection_us : int
+    text_run_projection_us : int
 }
 
 typedef public Terminal = smart_ptr<terminal_handle>
@@ -190,7 +204,7 @@ def public terminal_encode_key(terminal : Terminal const;
                                event : TerminalKeyEvent const) : string {
     return _terminal_encode_key(
         terminal,
-        unsafe(reinterpret<int>(event.key)),
+        int(event.key),
         event.text,
         length(event.text),
         event.shift,
@@ -213,7 +227,7 @@ def public terminal_send_paste(terminal : Terminal const; text : string) : bool 
 
 def private collect_cells(terminal : Terminal const; screen : int; scrollback : bool;
                           var cells : array<TerminalCell>) {
-    delete cells
+    cells |> clear()
     _terminal_visit_cells(terminal, screen, scrollback) $(row, column : int;
                                                           grapheme : string const#; width, attributes : int;
                                                           foreground_kind, foreground_index, foreground_red,
@@ -256,16 +270,41 @@ def private collect_cursor(terminal : Terminal const; screen : int;
     }
 }
 
-def private collect_viewport_scrollback(terminal : Terminal const; screen, scroll_offset : int;
-                                        var cells : array<TerminalCell>) {
-    delete cells
-    _terminal_visit_viewport_scrollback(terminal, screen, scroll_offset) $(row, column : int;
-                                                                           grapheme : string const#; width, attributes : int;
-                                                                           foreground_kind, foreground_index, foreground_red,
-                                                                           foreground_green, foreground_blue : int;
-                                                                           background_kind, background_index, background_red,
-                                                                           background_green, background_blue : int;
-                                                                           hyperlink : string const#) {
+def private collect_viewport_text_runs(terminal : Terminal const; scroll_offset : int;
+                                       var runs : array<TerminalTextRun>) {
+    runs |> clear()
+    _terminal_visit_viewport_text_runs(terminal, scroll_offset) $(global_row, column : int;
+                                                                  text : string const#;
+                                                                  color_kind, color_index,
+                                                                  color_red, color_green, color_blue : int;
+                                                                  default_is_background : bool;
+                                                                  glyph_cells : int) {
+        runs |> push(TerminalTextRun(
+            global_row = global_row,
+            column = column,
+            text = "{text}",
+            color = TerminalColor(
+                kind = unsafe(reinterpret<TerminalColorKind>(color_kind)),
+                index = color_index,
+                red = color_red,
+                green = color_green,
+                blue = color_blue),
+            default_is_background = default_is_background,
+            glyph_cells = glyph_cells))
+    }
+}
+
+def private collect_viewport_paint_cells(terminal : Terminal const; screen : int;
+                                         scrollback : bool; scroll_offset : int;
+                                         var cells : array<TerminalCell>) {
+    cells |> clear()
+    _terminal_visit_viewport_paint_cells(terminal, screen, scrollback, scroll_offset) $(row, column : int;
+                                                                                        grapheme : string const#; width, attributes : int;
+                                                                                        foreground_kind, foreground_index, foreground_red,
+                                                                                        foreground_green, foreground_blue : int;
+                                                                                        background_kind, background_index, background_red,
+                                                                                        background_green, background_blue : int;
+                                                                                        hyperlink : string const#) {
         cells |> push(TerminalCell(
             row = row,
             column = column,
@@ -295,8 +334,16 @@ def public terminal_viewport_snapshot(terminal : Terminal const; scroll_offset :
     snapshot.rows = _terminal_rows(terminal)
     snapshot.alternate_active = _terminal_alternate_active(terminal)
     let screen = snapshot.alternate_active ? 1 : 0
-    collect_cells(terminal, screen, false, snapshot.buffer.cells)
-    collect_viewport_scrollback(terminal, screen, scroll_offset, snapshot.buffer.scrollback)
+    let cells_started = ref_time_ticks()
+    collect_viewport_paint_cells(terminal, screen, false, scroll_offset, snapshot.buffer.cells)
+    collect_viewport_paint_cells(terminal, screen, true, scroll_offset, snapshot.buffer.scrollback)
+    snapshot.cell_projection_us = get_time_usec(cells_started)
+    let runs_started = ref_time_ticks()
+    collect_viewport_text_runs(terminal, scroll_offset, snapshot.text_runs)
+    //! Text-run projection refreshes the revision-keyed accessibility text cache
+    //! while it already walks screen rows, avoiding a second grid traversal.
+    snapshot.screen_text = _terminal_screen_text(terminal)
+    snapshot.text_run_projection_us = get_time_usec(runs_started)
     snapshot.buffer.scrollback_rows = _terminal_scrollback_rows(terminal, screen)
     collect_cursor(terminal, screen, snapshot.buffer.cursor)
 }
@@ -329,7 +376,7 @@ def public terminal_snapshot(terminal : Terminal const;
         mouse_any_reporting = (mode_bits & (1 << 5)) != 0,
         sgr_mouse_encoding = (mode_bits & (1 << 6)) != 0)
 
-    delete snapshot.unknown_sequences
+    snapshot.unknown_sequences |> clear()
     _terminal_visit_unknown(terminal) $(sequence : string const#) {
         snapshot.unknown_sequences |> push("{sequence}")
     }
@@ -337,7 +384,7 @@ def public terminal_snapshot(terminal : Terminal const;
 
 def public terminal_drain_replies(terminal : Terminal const;
                                   var replies : array<string>) {
-    delete replies
+    replies |> clear()
     _terminal_drain_replies(terminal) $(reply : string const#) {
         replies |> push("{reply}")
     }
@@ -345,7 +392,7 @@ def public terminal_drain_replies(terminal : Terminal const;
 
 def public terminal_take_events(terminal : Terminal const;
                                 var events : array<string>) {
-    delete events
+    events |> clear()
     _terminal_take_events(terminal) $(event : string const#) {
         events |> push("{event}")
     }

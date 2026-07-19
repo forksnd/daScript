@@ -351,6 +351,19 @@ live burst stayed around 86.5 FPS while output was still arriving, returned to
 about 120 FPS after settlement, and held about 109 FPS while scrolled back 300
 rows at 9,933 retained rows.
 
+The compact native paint pass on 2026-07-19 removed ordinary cells from the
+projection entirely, emitted geometry-safe ASCII as color-grouped text runs,
+and reduced selection to one rectangle per intersected row. The 78x26 viewport
+benchmark fell to 0.058-0.063 ms and 1,536 bytes / 2 allocations at 1,000-
+10,000 retained rows in both interpreter and JIT lanes. On the maximized
+318x69 live grid, a 10,000-line stream with a color change on every glyph held
+about 119-121 FPS while output was active: compact cell projection was about
+0.07 ms, native run projection about 0.8 ms, and text submission about 0.6 ms.
+The same lane measured about 70 ms / 13 FPS before batching and about 18 ms /
+48 FPS after run batching but before compact cell projection. Selection across
+nine visible rows and the Unicode/background fallback lane both remained near
+120 FPS, with zero ordinary paint cells and only the exceptional cells copied.
+
 ## Structured UI inspection gate
 
 Terminal and rich-text correctness must be inspectable through live commands;
@@ -404,9 +417,9 @@ painted and made interactive.
 
 Continue T1 from the working local terminal:
 
-1. add phase timing and batch compatible glyph runs, then run the larger-grid,
-   SGR, Unicode, resize, and multi-megabyte stress lanes; viewport projection
-   is now history-independent and revision-gated;
+1. complete the remaining resize/alternate-screen stress lanes and pin p95 PTY
+   feed, input-to-echo, and whole-frame timing; compact viewport projection and
+   batched glyph emission now clear the 120 Hz dense-SGR lane;
 2. finish structured terminal-cell and rich-text-run inspection through live
    commands, including actual font fallback and missing-glyph reporting;
 3. finish the bottom Edit/View menus, 5% zoom, cursor blink, and Unicode font

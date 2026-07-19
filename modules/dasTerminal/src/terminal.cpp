@@ -1,11 +1,16 @@
 #include "terminal.h"
 
 #include <algorithm>
-#include <cstdlib>
+#include <limits>
 #include <sstream>
 
 namespace das_terminal {
 namespace {
+
+constexpr size_t maxCsiSequenceBytes = 4096;
+constexpr size_t maxOscPayloadBytes = 64 * 1024;
+constexpr size_t maxUnknownSequenceBytes = 4096;
+constexpr char truncatedUnknownSuffix[] = "...[truncated]";
 
 Cell blankCell() { return Cell(); }
 
@@ -61,6 +66,39 @@ int parameterOr(const std::vector<int> & parameters, size_t index, int fallback)
     return parameters[index];
 }
 
+int clampInt64(int64_t value, int lower, int upper) {
+    return static_cast<int>(std::max<int64_t>(
+        lower, std::min<int64_t>(upper, value)));
+}
+
+int parseBoundedDecimal(const std::string & text, size_t begin, size_t end) {
+    while (begin != end && (text[begin] == ' ' || text[begin] == '\t' ||
+                            text[begin] == '\n' || text[begin] == '\r' ||
+                            text[begin] == '\f' || text[begin] == '\v'))
+        ++begin;
+    bool negative = false;
+    if (begin != end && (text[begin] == '+' || text[begin] == '-')) {
+        negative = text[begin] == '-';
+        ++begin;
+    }
+    const unsigned int positive_limit =
+        static_cast<unsigned int>(std::numeric_limits<int>::max());
+    const unsigned int limit = negative ? positive_limit + 1u : positive_limit;
+    unsigned int value = 0;
+    for (; begin != end; ++begin) {
+        const unsigned char byte = static_cast<unsigned char>(text[begin]);
+        if (byte < '0' || byte > '9') break;
+        const unsigned int digit = static_cast<unsigned int>(byte - '0');
+        if (value > (limit - digit) / 10u)
+            return negative ? std::numeric_limits<int>::min()
+                            : std::numeric_limits<int>::max();
+        value = value * 10u + digit;
+    }
+    if (!negative) return static_cast<int>(value);
+    if (value == positive_limit + 1u) return std::numeric_limits<int>::min();
+    return -static_cast<int>(value);
+}
+
 std::vector<int> parseParameters(const std::string & text, char & private_marker) {
     std::vector<int> result;
     size_t begin = 0;
@@ -74,7 +112,7 @@ std::vector<int> parseParameters(const std::string & text, char & private_marker
         const size_t separator = text.find(';', item);
         const size_t end = separator == std::string::npos ? text.size() : separator;
         if (end == item) result.push_back(-1);
-        else result.push_back(std::atoi(text.substr(item, end - item).c_str()));
+        else result.push_back(parseBoundedDecimal(text, item, end));
         if (separator == std::string::npos) break;
         item = separator + 1;
     }
@@ -179,8 +217,8 @@ bool Snapshot::operator==(const Snapshot & other) const {
 }
 
 struct Terminal::Buffer {
-    std::vector<std::vector<Cell>> rows;
-    std::vector<std::vector<Cell>> scrollback;
+    CellRows rows;
+    CellRows scrollback;
     Cursor cursor;
     Cursor saved_cursor;
     Cell pen;
@@ -191,8 +229,11 @@ enum class Terminal::ParseState : uint8_t {
     ground,
     escape,
     csi,
+    csi_ignore,
     osc,
     osc_escape,
+    osc_ignore,
+    osc_ignore_escape,
 };
 
 Terminal::Terminal(int columns, int rows)
@@ -232,6 +273,8 @@ void Terminal::reset() {
     title_.clear();
     current_directory_.clear();
     unknown_sequences_.clear();
+    replies_.clear();
+    events_.clear();
 }
 
 void Terminal::feed(const uint8_t * bytes, size_t count) {
@@ -256,24 +299,55 @@ void Terminal::processByte(uint8_t byte) {
     case ParseState::ground: processGroundByte(byte); break;
     case ParseState::escape: processEscape(byte); break;
     case ParseState::csi:
-        sequence_.push_back(static_cast<char>(byte));
-        if (byte >= 0x40u && byte <= 0x7eu) processCsi(byte);
-        else if (byte >= 0x20u && byte <= 0x3fu) csi_parameters_.push_back(static_cast<char>(byte));
-        else if (byte == 0x1bu) parse_state_ = ParseState::escape;
-        else recordUnknown(sequence_);
+        if (byte == 0x1bu) {
+            parse_state_ = ParseState::escape;
+            sequence_ = "\x1b";
+            csi_parameters_.clear();
+        } else if (sequence_.size() == maxCsiSequenceBytes) {
+            sequence_.clear();
+            csi_parameters_.clear();
+            parse_state_ = ParseState::csi_ignore;
+        } else {
+            sequence_.push_back(static_cast<char>(byte));
+            if (byte >= 0x40u && byte <= 0x7eu) processCsi(byte);
+            else if (byte >= 0x20u && byte <= 0x3fu)
+                csi_parameters_.push_back(static_cast<char>(byte));
+            else recordUnknown(sequence_);
+        }
+        break;
+    case ParseState::csi_ignore:
+        if (byte >= 0x40u && byte <= 0x7eu) parse_state_ = ParseState::ground;
+        else if (byte == 0x1bu) {
+            parse_state_ = ParseState::escape;
+            sequence_ = "\x1b";
+        }
         break;
     case ParseState::osc:
         if (byte == 0x07u) processOsc();
         else if (byte == 0x1bu) parse_state_ = ParseState::osc_escape;
-        else osc_data_.push_back(static_cast<char>(byte));
+        else if (osc_data_.size() == maxOscPayloadBytes) {
+            osc_data_.clear();
+            parse_state_ = ParseState::osc_ignore;
+        } else osc_data_.push_back(static_cast<char>(byte));
         break;
     case ParseState::osc_escape:
         if (byte == '\\') processOsc();
-        else {
+        else if (osc_data_.size() <= maxOscPayloadBytes - 2) {
             osc_data_.push_back('\x1b');
             osc_data_.push_back(static_cast<char>(byte));
             parse_state_ = ParseState::osc;
+        } else {
+            osc_data_.clear();
+            parse_state_ = ParseState::osc_ignore;
         }
+        break;
+    case ParseState::osc_ignore:
+        if (byte == 0x07u) parse_state_ = ParseState::ground;
+        else if (byte == 0x1bu) parse_state_ = ParseState::osc_ignore_escape;
+        break;
+    case ParseState::osc_ignore_escape:
+        if (byte == '\\') parse_state_ = ParseState::ground;
+        else if (byte != 0x1bu) parse_state_ = ParseState::osc_ignore;
         break;
     }
 }
@@ -362,26 +436,36 @@ void Terminal::processCsi(uint8_t final_byte) {
     const int first = parameterOr(parameters, 0, 1);
 
     if (private_marker == '?' && (final_byte == 'h' || final_byte == 'l')) {
-        for (size_t index = 0; index != parameters.size(); ++index)
-            setPrivateMode(parameters[index], final_byte == 'h');
+        for (size_t index = 0; index != parameters.size(); ++index) {
+            if (parameters[index] >= 0)
+                setPrivateMode(parameters[index], final_byte == 'h');
+        }
         return;
     }
     switch (final_byte) {
-    case 'A': buffer.cursor.row = std::max(0, buffer.cursor.row - first); break;
-    case 'B': buffer.cursor.row = std::min(rows_ - 1, buffer.cursor.row + first); break;
-    case 'C': buffer.cursor.column = std::min(columns_ - 1, buffer.cursor.column + first); break;
-    case 'D': buffer.cursor.column = std::max(0, buffer.cursor.column - first); break;
-    case 'E': setCursor(buffer.cursor.row + first, 0); break;
-    case 'F': setCursor(buffer.cursor.row - first, 0); break;
+    case 'A': buffer.cursor.row = clampInt64(
+        static_cast<int64_t>(buffer.cursor.row) - first, 0, rows_ - 1); break;
+    case 'B': buffer.cursor.row = clampInt64(
+        static_cast<int64_t>(buffer.cursor.row) + first, 0, rows_ - 1); break;
+    case 'C': buffer.cursor.column = clampInt64(
+        static_cast<int64_t>(buffer.cursor.column) + first, 0, columns_ - 1); break;
+    case 'D': buffer.cursor.column = clampInt64(
+        static_cast<int64_t>(buffer.cursor.column) - first, 0, columns_ - 1); break;
+    case 'E': setCursor(clampInt64(
+        static_cast<int64_t>(buffer.cursor.row) + first, 0, rows_ - 1), 0); break;
+    case 'F': setCursor(clampInt64(
+        static_cast<int64_t>(buffer.cursor.row) - first, 0, rows_ - 1), 0); break;
     case 'G': setCursor(buffer.cursor.row, first - 1); break;
     case 'H':
     case 'f': setCursor(parameterOr(parameters, 0, 1) - 1, parameterOr(parameters, 1, 1) - 1); break;
     case 'J': eraseDisplay(parameters[0] < 0 ? 0 : parameters[0]); break;
     case 'K': eraseLine(parameters[0] < 0 ? 0 : parameters[0]); break;
     case 'X': eraseCells(first); break;
-    case 'a': buffer.cursor.column = std::min(columns_ - 1, buffer.cursor.column + first); break;
+    case 'a': buffer.cursor.column = clampInt64(
+        static_cast<int64_t>(buffer.cursor.column) + first, 0, columns_ - 1); break;
     case 'd': setCursor(first - 1, buffer.cursor.column); break;
-    case 'e': buffer.cursor.row = std::min(rows_ - 1, buffer.cursor.row + first); break;
+    case 'e': buffer.cursor.row = clampInt64(
+        static_cast<int64_t>(buffer.cursor.row) + first, 0, rows_ - 1); break;
     case 'm': selectGraphicRendition(parameters); break;
     case 'n':
         if (private_marker == 0 && parameters[0] == 5) replies_.push_back("\x1b[0n");
@@ -450,10 +534,15 @@ void Terminal::putGrapheme(const std::string & grapheme, int width, bool combini
         carriageReturn();
         lineFeed();
     }
-    if (width == 2 && buffer.cursor.column == columns_ - 1 && modes_.auto_wrap) {
+    if (width == 2 && columns_ > 1 &&
+        buffer.cursor.column == columns_ - 1 && modes_.auto_wrap) {
         carriageReturn();
         lineFeed();
     }
+    // With wrapping disabled (or a one-column grid), a wide grapheme cannot
+    // own a continuation cell. Preserve the grapheme without violating the
+    // invariant that every width-2 cell has an in-row width-0 continuation.
+    if (width == 2 && buffer.cursor.column + 1 >= columns_) width = 1;
     const int row = buffer.cursor.row;
     const int column = buffer.cursor.column;
     clearCell(buffer, row, column);
@@ -509,9 +598,9 @@ void Terminal::tab() {
 void Terminal::scrollUp(Buffer & buffer) {
     if (&buffer == normal_) {
         buffer.scrollback.push_back(buffer.rows.front());
-        if (buffer.scrollback.size() > 10000) buffer.scrollback.erase(buffer.scrollback.begin());
+        if (buffer.scrollback.size() > 10000) buffer.scrollback.pop_front();
     }
-    buffer.rows.erase(buffer.rows.begin());
+    buffer.rows.pop_front();
     buffer.rows.push_back(blankRow(columns_));
 }
 
@@ -540,7 +629,8 @@ void Terminal::eraseLine(int mode) {
 
 void Terminal::eraseCells(int count) {
     Buffer & buffer = activeBuffer();
-    const int last = std::min(columns_, buffer.cursor.column + std::max(1, count));
+    const int last = clampInt64(
+        static_cast<int64_t>(buffer.cursor.column) + std::max(1, count), 0, columns_);
     for (int column = buffer.cursor.column; column < last; ++column)
         clearCell(buffer, buffer.cursor.row, column);
 }
@@ -600,7 +690,13 @@ void Terminal::selectGraphicRendition(const std::vector<int> & parameters) {
     for (size_t index = 0; index < parameters.size(); ++index) {
         const int value = parameters[index] < 0 ? 0 : parameters[index];
         switch (value) {
-        case 0: pen = Cell(); break;
+        case 0: {
+            std::string hyperlink;
+            hyperlink.swap(pen.hyperlink);
+            pen = Cell();
+            pen.hyperlink.swap(hyperlink);
+            break;
+        }
         case 1: pen.attributes |= attr_bold; break;
         case 2: pen.attributes |= attr_faint; break;
         case 3: pen.attributes |= attr_italic; break;
@@ -638,7 +734,17 @@ void Terminal::selectGraphicRendition(const std::vector<int> & parameters) {
 }
 
 void Terminal::recordUnknown(const std::string & sequence) {
-    if (unknown_sequences_.size() < 256) unknown_sequences_.push_back(sequence);
+    if (unknown_sequences_.size() < 256) {
+        if (sequence.size() <= maxUnknownSequenceBytes) {
+            unknown_sequences_.push_back(sequence);
+        } else {
+            const size_t suffix_bytes = sizeof(truncatedUnknownSuffix) - 1;
+            std::string truncated = sequence.substr(
+                0, maxUnknownSequenceBytes - suffix_bytes);
+            truncated += truncatedUnknownSuffix;
+            unknown_sequences_.push_back(truncated);
+        }
+    }
     parse_state_ = ParseState::ground;
 }
 
@@ -653,8 +759,13 @@ void Terminal::resize(int columns, int rows) {
     for (size_t item = 0; item != 2; ++item) {
         Buffer & buffer = *buffers[item];
         buffer.rows.resize(static_cast<size_t>(rows_), blankRow(columns_));
-        for (size_t row = 0; row != buffer.rows.size(); ++row)
-            buffer.rows[row].resize(static_cast<size_t>(columns_), blankCell());
+        CellRows * row_sets[] = {&buffer.rows, &buffer.scrollback};
+        for (CellRows * row_set : row_sets) {
+            for (std::vector<Cell> & row : *row_set) {
+                row.resize(static_cast<size_t>(columns_), blankCell());
+                if (!row.empty() && row.back().width == 2) row.back() = blankCell();
+            }
+        }
         buffer.cursor.row = std::min(buffer.cursor.row, rows_ - 1);
         buffer.cursor.column = std::min(buffer.cursor.column, columns_ - 1);
         buffer.saved_cursor.row = std::min(buffer.saved_cursor.row, rows_ - 1);
@@ -733,11 +844,11 @@ Snapshot Terminal::snapshot() const {
     result.columns = columns_;
     result.rows = rows_;
     result.alternate_active = alternate_active_;
-    result.normal.rows = normal_->rows;
-    result.normal.scrollback = normal_->scrollback;
+    result.normal.rows.assign(normal_->rows.begin(), normal_->rows.end());
+    result.normal.scrollback.assign(normal_->scrollback.begin(), normal_->scrollback.end());
     result.normal.cursor = normal_->cursor;
-    result.alternate.rows = alternate_->rows;
-    result.alternate.scrollback = alternate_->scrollback;
+    result.alternate.rows.assign(alternate_->rows.begin(), alternate_->rows.end());
+    result.alternate.scrollback.assign(alternate_->scrollback.begin(), alternate_->scrollback.end());
     result.alternate.cursor = alternate_->cursor;
     result.modes = modes_;
     result.title = title_;
