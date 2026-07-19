@@ -1918,6 +1918,463 @@ class MetalEmbedK6 {
     }
 }
 
+// ===== MoE routing (Wave C) =====
+// Router GEMV -> single-simdgroup select -> expert-indexed GEMV twins (grid.y = slot; the
+// kernel reads sel[slot] GPU-side — no CPU readback, encode-ahead/spec stays compatible).
+
+// Router GEMV over the uploaded fp32 router slab: y[ne] = W[ne x dim] . x. ne <= 256 rows —
+// latency-trivial next to the expert GEMVs.
+class MetalMoeRouter {
+    @ssbo @binding = 0 w : array<float4>    // [ne x dim] router weights, float4 view
+    @ssbo @binding = 1 x : array<float4>    // [dim] activation, float4 view
+    @ssbo @binding = 2 y : array<float>     // [ne] logits out
+    @uniform @binding = 3 ndim : uint       // dim (% 32)
+    @uniform @binding = 4 ddim : uint       // ne
+
+    [metal_kernel(name="metal_moe_router_msl")]
+    def metal_moe_router {
+        let row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (row >= ddim) {
+            return
+        }
+        let lane = gl_SubgroupInvocationID
+        let nb4 = ndim / 4u
+        var acc = 0.0
+        var k = lane
+        while (k < nb4) {
+            let wv = w[row * nb4 + k]
+            let xv = x[k]
+            acc += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w
+            k += gl_SubgroupSize
+        }
+        acc = simd_sum(acc)
+        if (lane == 0u) {
+            y[row] = acc
+        }
+    }
+}
+
+// Router select — moe_select_core's softmax + top-k + norm_topk on one simdgroup: per-lane
+// strided ownership (ne <= 256), per-winner argmax butterfly with the CPU tie-break (lowest
+// index), register knockout. Writes idx[0..k) uint + w[0..k) float (same buffer, byte k*4).
+class MetalMoeSelect {
+    @ssbo @binding = 0 lg : array<float>     // [ne] router logits
+    @ssbo @binding = 1 seli : array<uint>    // selection buffer, uint view — idx at [0..k)
+    @ssbo @binding = 2 selw : array<float>   // the same buffer, float view at byte k*4 — w at [0..k)
+    @uniform @binding = 3 ne : uint
+    @uniform @binding = 4 nk : uint
+
+    [metal_kernel(name="metal_moe_select_msl")]
+    def metal_moe_select {
+        let lane = gl_SubgroupInvocationID
+        var v : float[8]           // lane owns logits lane, lane+32, ... — 8 deep covers ne <= 256
+        for [unroll_full] (t in range(8)) {
+            let j = lane + uint(t) * 32u
+            v[t] = j < ne ? lg[j] : -3.0e38
+        }
+        // softmax over all ne (the CPU order: max, exp with the -80 floor, sum, divide-all)
+        var mx = v[0]
+        for [unroll_full] (t in range(8)) {
+            mx = max(mx, v[t])
+        }
+        var bm = 16u
+        while (bm >= 1u) {
+            mx = max(mx, simd_shuffle_xor(mx, bm))
+            bm /= 2u
+        }
+        var psum = 0.0
+        for [unroll_full] (t in range(8)) {
+            let j = lane + uint(t) * 32u
+            v[t] = j < ne ? exp(max(v[t] - mx, -80.0)) : 0.0
+            psum += v[t]
+        }
+        let sum = simd_sum(psum)
+        for [unroll_full] (t in range(8)) {
+            v[t] /= sum
+        }
+        var ws = 0.0
+        var j = 0u
+        while (j < nk) {
+            var bv = -3.0e38
+            var bt = 0u
+            for [unroll_full] (t in range(8)) {
+                if (v[t] > bv) {
+                    bv = v[t]
+                    bt = uint(t)
+                }
+            }
+            var bi = lane + bt * 32u
+            var m = 16u
+            while (m >= 1u) {
+                let ov = simd_shuffle_xor(bv, m)
+                let oi = simd_shuffle_xor(bi, m)
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov
+                    bi = oi
+                }
+                m /= 2u
+            }
+            if (lane == 0u) {
+                seli[j] = bi
+                selw[j] = bv
+            }
+            ws += bv   // every lane holds the same winner value after the butterfly
+            for [unroll_full] (t in range(8)) {   // owning lane knocks the winner out (constant indices)
+                if (uint(t) == (bi >> 5u) && (bi & 31u) == lane) {
+                    v[t] = -3.0e38
+                }
+            }
+            j++
+        }
+        // norm_topk renorm to sum 1 (the CPU f16-min clamp)
+        ws = max(ws, 6.103515625e-5)
+        if (lane == 0u) {
+            var i = 0u
+            while (i < nk) {
+                selw[i] /= ws
+                i++
+            }
+        }
+    }
+}
+
+// Expert-indexed q8 GEMV — MetalQ8Gemv's exact dot with the expert plane picked GPU-side:
+// the blob binds at the layer's expert STACK base, the kernel adds sel[slot] * eblk to the
+// block index, reads x at slot * xs (0 = shared activation), writes y at slot * ddim.
+class MetalMoeGemvQ8 {
+    @ssbo @binding = 0 wsh : array<float16> // the expert stack's blob slice, half-scale view
+    @ssbo @binding = 1 wqb : array<int8>    // the same blob buffer, byte view
+    @ssbo @binding = 2 x : array<float4>
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 ndim : uint
+    @uniform @binding = 5 ddim : uint
+    @ssbo @binding = 6 sel : array<uint>    // [k] winning expert ids
+    @uniform @binding = 7 eblk : uint       // 34B blocks per expert plane (ege / 32)
+    @uniform @binding = 8 xs : uint         // per-slot x stride, elements (0 = shared)
+
+    [metal_kernel(name="metal_moe_gemv_q8_msl")]
+    def metal_moe_gemv_q8 {
+        let row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (row >= ddim) {
+            return
+        }
+        let slot = gl_WorkGroupID.y
+        let eb = sel[slot] * eblk
+        let lane = gl_SubgroupInvocationID
+        let nb = ndim / 32u
+        let nb4 = ndim / 4u
+        let x0e = slot * (xs / 4u)
+        var sp = unsafe(addr(wsh[(eb + row * nb + lane / 8u) * 17u]))
+        var qp = unsafe(addr(wqb[(eb + row * nb + lane / 8u) * 34u + 2u + (lane % 8u) * 4u]))
+        var x0 = unsafe(addr(x[x0e + lane]))
+        var acc = 0.0
+        var lw : float4[4]
+        var k = lane
+        while (k + 96u < nb4) {
+            for [unroll_full] (c in range(4)) {
+                let d = float(unsafe(sp[uint(c) * 68u]))
+                let qb = uint(c) * 136u
+                lw[c] = float4(float(unsafe(qp[qb])), float(unsafe(qp[qb + 1u])),
+                    float(unsafe(qp[qb + 2u])), float(unsafe(qp[qb + 3u]))) * d
+            }
+            for [unroll_full] (c in range(4)) {
+                let xv = unsafe(x0[uint(c) * 32u])
+                acc += lw[c].x * xv.x + lw[c].y * xv.y + lw[c].z * xv.z + lw[c].w * xv.w
+            }
+            sp = unsafe(sp + 272)
+            qp = unsafe(qp + 544)
+            x0 = unsafe(x0 + 128)
+            k += 128u
+        }
+        while (k < nb4) {
+            let bi = eb + row * nb + k / 8u
+            let d = float(wsh[bi * 17u])
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let xv = x[x0e + k]
+            acc += (float(wqb[qb]) * xv.x + float(wqb[qb + 1u]) * xv.y +
+                float(wqb[qb + 2u]) * xv.z + float(wqb[qb + 3u]) * xv.w) * d
+            k += gl_SubgroupSize
+        }
+        acc = simd_sum(acc)
+        if (lane == 0u) {
+            y[slot * ddim + row] = acc
+        }
+    }
+}
+
+// Expert-indexed Q4_K GEMV — MetalKqGemvK4's dot; the superblock index shifts by sel[slot] * esb.
+class MetalMoeGemvK4 {
+    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
+    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
+    @ssbo @binding = 2 kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+    @ssbo @binding = 7 sel : array<uint>    // [k] winning expert ids
+    @uniform @binding = 8 esb : uint        // superblocks per expert plane (ege / 256)
+    @uniform @binding = 9 xs : uint         // per-slot x stride, elements (0 = shared)
+
+    [metal_kernel(name="metal_moe_gemv_k4_msl")]
+    def metal_moe_gemv_k4 {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u
+        let it = lane % 8u
+        let iq = it / 4u
+        let ir = it % 4u
+        let nb = ndim / 256u
+        let slot = gl_WorkGroupID.y
+        let eb = sel[slot] * esb
+        let xoff = slot * xs
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var yh : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = xoff + ib * 256u + iq * 64u + ir * 8u
+            var sumy : float[4]
+            for [unroll_full] (i in range(8)) {
+                yl[i] = x[yb + uint(i)]
+                sumy[0] += yl[i]
+                yl[i + 8] = x[yb + 32u + uint(i)]
+                sumy[1] += yl[i + 8]
+                yh[i] = x[yb + 128u + uint(i)]
+                sumy[2] += yh[i]
+                yh[i + 8] = x[yb + 160u + uint(i)]
+                sumy[3] += yh[i + 8]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = eb + (first_row + uint(r)) * nb + ib
+                let sv = ks4[blk]
+                let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+                let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+                let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+                let sc0 = hw0 & 0x3F3F
+                let sc1 = hw2 & 0x3F3F
+                let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+                let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+                let qb = blk * 32u + iq * 8u + ir * 2u
+                let q1a = kqu[qb]
+                let q1b = kqu[qb + 1u]
+                let q2a = kqu[qb + 16u]
+                let q2b = kqu[qb + 17u]
+                var acc1 : float[4]
+                var acc2 : float[4]
+                for [unroll_full] (i in range(4)) {
+                    let sh = 16u * (uint(i) & 1u)
+                    let q1 = ((i < 2 ? q1a : q1b) >> sh) & 0xFFFF
+                    let q2 = ((i < 2 ? q2a : q2b) >> sh) & 0xFFFF
+                    acc1[0] += yl[2 * i] * float(q1 & 0x000F)
+                    acc1[1] += yl[2 * i + 1] * float(q1 & 0x0F00)
+                    acc1[2] += yl[2 * i + 8] * float(q1 & 0x00F0)
+                    acc1[3] += yl[2 * i + 9] * float(q1 & 0xF000)
+                    acc2[0] += yh[2 * i] * float(q2 & 0x000F)
+                    acc2[1] += yh[2 * i + 1] * float(q2 & 0x0F00)
+                    acc2[2] += yh[2 * i + 8] * float(q2 & 0x00F0)
+                    acc2[3] += yh[2 * i + 9] * float(q2 & 0xF000)
+                }
+                let dd = float(ksh[blk * 8u])
+                let dm = float(ksh[blk * 8u + 1u])
+                sumf[r] += dd * ((acc1[0] + 0.00390625 * acc1[1]) * float(sc0 & 255u)
+                    + (acc1[2] + 0.00390625 * acc1[3]) * float(sc0 >> 8u) * 0.0625
+                    + (acc2[0] + 0.00390625 * acc2[1]) * float(sc2 & 255u)
+                    + (acc2[2] + 0.00390625 * acc2[3]) * float(sc2 >> 8u) * 0.0625)
+                sumf[r] -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                    + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[slot * ddim + first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// Expert-indexed Q5_K GEMV — MetalKqGemvK5's dot with the expert superblock shift.
+class MetalMoeGemvK5 {
+    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view
+    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view
+    @ssbo @binding = 2 kqb : array<uint8>   // k5 quant plane, byte view (qs at 160*blk, qh at +128)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+    @ssbo @binding = 7 sel : array<uint>    // [k] winning expert ids
+    @uniform @binding = 8 esb : uint        // superblocks per expert plane (ege / 256)
+    @uniform @binding = 9 xs : uint         // per-slot x stride, elements (0 = shared)
+
+    [metal_kernel(name="metal_moe_gemv_k5_msl")]
+    def metal_moe_gemv_k5 {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 4u
+        let ix = lane % 4u
+        let iq = tid / 4u
+        let ir = tid % 4u
+        let l0 = ir * 8u
+        let hb0 = 2u * iq
+        let nb = ndim / 256u
+        let slot = gl_WorkGroupID.y
+        let eb = sel[slot] * esb
+        let xoff = slot * xs
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var yh : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = xoff + ib * 256u + iq * 64u + l0
+            var sumy : float[4]
+            for [unroll_full] (l in range(8)) {
+                yl[l] = x[yb + uint(l)]
+                sumy[0] += yl[l]
+                yl[l + 8] = x[yb + 32u + uint(l)]
+                sumy[1] += yl[l + 8]
+                yh[l] = x[yb + 128u + uint(l)]
+                sumy[2] += yh[l]
+                yh[l + 8] = x[yb + 160u + uint(l)]
+                sumy[3] += yh[l + 8]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = eb + (first_row + uint(r)) * nb + ib
+                let sv = ks4[blk]
+                let hw0 = (sv.y >> (16u * iq)) & 0xFFFF
+                let hw2 = (sv.z >> (16u * iq)) & 0xFFFF
+                let hw4 = (sv.w >> (16u * iq)) & 0xFFFF
+                let sc0 = hw0 & 0x3F3F
+                let sc1 = hw2 & 0x3F3F
+                let sc2 = (hw4 & 0x0F0F) | ((hw0 & 0xC0C0) >> 2u)
+                let sc3 = ((hw4 >> 4u) & 0x0F0F) | ((hw2 & 0xC0C0) >> 2u)
+                let qs0 = blk * 160u + iq * 32u + l0
+                let qh0 = blk * 160u + 128u + l0
+                var acc : float[4]
+                for [unroll_full] (l in range(8)) {
+                    let q1 = uint(kqb[qs0 + uint(l)])
+                    let q2 = uint(kqb[qs0 + 64u + uint(l)])
+                    let h = uint(kqb[qh0 + uint(l)]) >> hb0
+                    acc[0] += yl[l] * float((q1 & 0x0F) | ((h & 1u) << 4u))
+                    acc[1] += yl[l + 8] * float((q1 >> 4u) | ((h & 2u) << 3u))
+                    acc[2] += yh[l] * float((q2 & 0x0F) | ((h & 16u) << 0u))
+                    acc[3] += yh[l + 8] * float((q2 >> 4u) | ((h & 32u) >> 1u))
+                }
+                let dd = float(ksh[blk * 8u])
+                let dm = float(ksh[blk * 8u + 1u])
+                sumf[r] += dd * (float(sc0 & 255u) * acc[0] + float(sc0 >> 8u) * acc[1]
+                    + float(sc2 & 255u) * acc[2] + float(sc2 >> 8u) * acc[3])
+                sumf[r] -= dm * (sumy[0] * float(sc1 & 255u) + sumy[1] * float(sc1 >> 8u)
+                    + sumy[2] * float(sc3 & 255u) + sumy[3] * float(sc3 >> 8u))
+            }
+            ib += 4u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[slot * ddim + first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// Expert-indexed Q6_K GEMV — MetalKqGemvK6's dot; the expert shift covers sub-scales AND the
+// trailing f16 d plane (both indexed by the same region-relative superblock).
+class MetalMoeGemvK6 {
+    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
+    @ssbo @binding = 2 kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
+    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 ndim : uint
+    @uniform @binding = 6 ddim : uint
+    @ssbo @binding = 7 sel : array<uint>    // [k] winning expert ids
+    @uniform @binding = 8 esb : uint        // superblocks per expert plane (ege / 256)
+    @uniform @binding = 9 xs : uint         // per-slot x stride, elements (0 = shared)
+
+    [metal_kernel(name="metal_moe_gemv_k6_msl")]
+    def metal_moe_gemv_k6 {
+        let lane = gl_SubgroupInvocationID
+        let tid = lane / 2u
+        let ix = lane % 2u
+        let ip = tid / 8u
+        let il = tid % 8u
+        let l0 = il * 4u
+        let is0 = ip * 8u + l0 / 16u
+        let nb = ndim / 256u
+        let slot = gl_WorkGroupID.y
+        let eb = sel[slot] * esb
+        let xoff = slot * xs
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        var yl : float[16]
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let yb = xoff + ib * 256u + ip * 128u + l0
+            for [unroll_full] (l in range(4)) {
+                yl[4 * l] = x[yb + uint(l)]
+                yl[4 * l + 1] = x[yb + 32u + uint(l)]
+                yl[4 * l + 2] = x[yb + 64u + uint(l)]
+                yl[4 * l + 3] = x[yb + 96u + uint(l)]
+            }
+            for [unroll_full] (r in range(2)) {
+                let blk = eb + (first_row + uint(r)) * nb + ib
+                let ql0 = blk * 192u + ip * 64u + l0
+                let qh0 = blk * 192u + 128u + ip * 32u + l0
+                let sb = blk * 16u + is0
+                var sums : float[4]
+                for [unroll_full] (l in range(4)) {
+                    let q1 = uint(kqb[ql0 + uint(l)])
+                    let q2 = uint(kqb[ql0 + 32u + uint(l)])
+                    let h = uint(kqb[qh0 + uint(l)])
+                    sums[0] += yl[4 * l] * (float((q1 & 0x0F) | ((h & 0x03) << 4u)) - 32.0)
+                    sums[1] += yl[4 * l + 1] * (float((q2 & 0x0F) | ((h & 0x0C) << 2u)) - 32.0)
+                    sums[2] += yl[4 * l + 2] * (float((q1 >> 4u) | (h & 0x30)) - 32.0)
+                    sums[3] += yl[4 * l + 3] * (float((q2 >> 4u) | ((h & 0xC0) >> 2u)) - 32.0)
+                }
+                let s0 = float((int(kscb[sb]) ^ 128) - 128)
+                let s2 = float((int(kscb[sb + 2u]) ^ 128) - 128)
+                let s4 = float((int(kscb[sb + 4u]) ^ 128) - 128)
+                let s6 = float((int(kscb[sb + 6u]) ^ 128) - 128)
+                let dd = float(kdh[blk])
+                sumf[r] += dd * (sums[0] * s0 + sums[1] * s2 + sums[2] * s4 + sums[3] * s6)
+            }
+            ib += 2u
+        }
+        for [unroll_full] (r in range(2)) {
+            let s = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[slot * ddim + first_row + uint(r)] = s
+            }
+        }
+    }
+}
+
+// Weighted top-k reduce: y[i] = sum_j w[j] * dn[j*dim + i] — the CPU slot-order axpy chain as
+// one deterministic in-kernel loop. Overwrites y (the dense w2 site's write shape).
+class MetalMoeCombine {
+    @ssbo @binding = 0 dn : array<float>    // [k x dim] per-slot down outputs
+    @ssbo @binding = 1 selw : array<float>  // the selection buffer's float view at byte k*4
+    @ssbo @binding = 2 y : array<float>     // [dim] combined out
+    @uniform @binding = 3 dim : uint
+    @uniform @binding = 4 nk : uint
+
+    [metal_kernel(name="metal_moe_combine_msl")]
+    def metal_moe_combine {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= dim) {
+            return
+        }
+        var acc = 0.0
+        var j = 0u
+        while (j < nk) {
+            acc += selw[j] * dn[j * dim + gid]
+            j++
+        }
+        y[gid] = acc
+    }
+}
+
 // Fused residual-add + rmsnorm: x += a in place, then y = rms(x)·w, one dispatch instead of two.
 // The added row stages through the threadgroup slab since barrier() is a threadgroup fence only.
 // dim caps at the slab; wider models take the unfused pair (enc_add_rms_site).
@@ -5597,6 +6054,13 @@ var g_pso_argmax : MetalComputePipeline?
 var g_pso_copy_row : MetalComputePipeline?   // zero-copy logits: staging row -> wrapped session storage
 var g_pso_emb : MetalComputePipeline?
 var g_pso_emb_k6 : MetalComputePipeline?     // tied-k6 spec chain's embed gather
+var g_pso_moe_router : MetalComputePipeline?   // MoE (Wave C): router GEMV over the fp32 slab
+var g_pso_moe_select : MetalComputePipeline?   // softmax + top-k + renorm (one simdgroup)
+var g_pso_moe_gemv_q8 : MetalComputePipeline?  // expert-indexed GEMV twins (grid.y = slot)
+var g_pso_moe_kq_k4 : MetalComputePipeline?
+var g_pso_moe_kq_k5 : MetalComputePipeline?
+var g_pso_moe_kq_k6 : MetalComputePipeline?
+var g_pso_moe_combine : MetalComputePipeline?  // weighted top-k reduce into the w2 write shape
 var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
 var g_pso_qkvrs32 : MetalComputePipeline?
 var g_pso_w13sw : MetalComputePipeline?
@@ -5707,6 +6171,13 @@ def metal_decode_init : bool {
     g_pso_unsign = compile_pso(metal_fwht_unsign_msl, metal_fwht_unsign_msl_entry, metal_fwht_unsign_msl_fastmath, ok)
     g_pso_qknorm = compile_pso(metal_qk_norm_msl, metal_qk_norm_msl_entry, metal_qk_norm_msl_fastmath, ok)
     g_pso_argmax = compile_pso(metal_argmax_msl, metal_argmax_msl_entry, metal_argmax_msl_fastmath, ok)
+    g_pso_moe_router = compile_pso(metal_moe_router_msl, metal_moe_router_msl_entry, metal_moe_router_msl_fastmath, ok)
+    g_pso_moe_select = compile_pso(metal_moe_select_msl, metal_moe_select_msl_entry, metal_moe_select_msl_fastmath, ok)
+    g_pso_moe_gemv_q8 = compile_pso(metal_moe_gemv_q8_msl, metal_moe_gemv_q8_msl_entry, metal_moe_gemv_q8_msl_fastmath, ok)
+    g_pso_moe_kq_k4 = compile_pso(metal_moe_gemv_k4_msl, metal_moe_gemv_k4_msl_entry, metal_moe_gemv_k4_msl_fastmath, ok)
+    g_pso_moe_kq_k5 = compile_pso(metal_moe_gemv_k5_msl, metal_moe_gemv_k5_msl_entry, metal_moe_gemv_k5_msl_fastmath, ok)
+    g_pso_moe_kq_k6 = compile_pso(metal_moe_gemv_k6_msl, metal_moe_gemv_k6_msl_entry, metal_moe_gemv_k6_msl_fastmath, ok)
+    g_pso_moe_combine = compile_pso(metal_moe_combine_msl, metal_moe_combine_msl_entry, metal_moe_combine_msl_fastmath, ok)
     g_pso_copy_row = compile_pso(metal_copy_row_msl, metal_copy_row_msl_entry, metal_copy_row_msl_fastmath, ok)
     g_pso_emb = compile_pso(metal_embed_q8_msl, metal_embed_q8_msl_entry, metal_embed_q8_msl_fastmath, ok)
     g_pso_emb_k6 = compile_pso(metal_embed_k6_msl, metal_embed_k6_msl_entry, metal_embed_k6_msl_fastmath, ok)
@@ -6113,6 +6584,80 @@ def enc_embed_k6(enc : MetalComputeEncoder?; bq : MetalBuffer?; qoff : uint64; b
     metal_set_buffer(enc, bdim, 0ul, 5)
     metal_set_buffer(enc, bescale != null ? bescale : g_one, 0ul, 6)   // embed_scale (identity 1.0)
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
+// ===== MoE routing encoders (Wave C) =====
+
+def enc_moe_router(enc : MetalComputeEncoder?; bw, bx, by, bn, bd : MetalBuffer?; ne : int64) {
+    metal_set_pipeline(enc, g_pso_moe_router)
+    metal_set_buffer(enc, bw, 0ul, 0)
+    metal_set_buffer(enc, bx, 0ul, 1)
+    metal_set_buffer(enc, by, 0ul, 2)
+    metal_set_buffer(enc, bn, 0ul, 3)
+    metal_set_buffer(enc, bd, 0ul, 4)
+    metal_dispatch_threadgroups(enc, uint3(uint((ne + g_gemv_rows - 1l) / g_gemv_rows), 1u, 1u), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
+}
+
+// the selection buffer binds twice: uint idx view at 0, float w view at byte k*4
+def enc_moe_select(enc : MetalComputeEncoder?; blg, bsel, bne, bnk : MetalBuffer?; k : int64) {
+    metal_set_pipeline(enc, g_pso_moe_select)
+    metal_set_buffer(enc, blg, 0ul, 0)
+    metal_set_buffer(enc, bsel, 0ul, 1)
+    metal_set_buffer(enc, bsel, uint64(k * 4l), 2)
+    metal_set_buffer(enc, bne, 0ul, 3)
+    metal_set_buffer(enc, bnk, 0ul, 4)
+    metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(32u, 1u, 1u))
+}
+
+// one expert-indexed weight site (gate/up/down) — the MoE twin of enc_site_gemv: the weight
+// binds at the layer's expert STACK base, grid.y = k slots, sel picks the plane GPU-side.
+// bes = blocks-per-expert (the q8 site binds ege/32, a kq site ege/256); bxs = per-slot x stride.
+def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, rows, k : int64;
+                 bx, by, bn, bd, bsel, bes, bxs : MetalBuffer?; yoff : uint64 = 0ul) {
+    if (fmt == KqFmt.q8) {
+        let bw = blob_of(g_dev, t, stack_off)
+        metal_set_pipeline(enc, g_pso_moe_gemv_q8)
+        metal_set_buffer(enc, bw.buf, bw.boff, 0)
+        metal_set_buffer(enc, bw.buf, bw.boff, 1)
+        metal_set_buffer(enc, bx, 0ul, 2)
+        metal_set_buffer(enc, by, yoff, 3)
+        metal_set_buffer(enc, bn, 0ul, 4)
+        metal_set_buffer(enc, bd, 0ul, 5)
+        metal_set_buffer(enc, bsel, 0ul, 6)
+        metal_set_buffer(enc, bes, 0ul, 7)
+        metal_set_buffer(enc, bxs, 0ul, 8)
+        metal_dispatch_threadgroups(enc, uint3(uint((rows + g_gemv_rows - 1l) / g_gemv_rows), uint(k), 1u), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
+    } else {
+        let bq = kq_quants_of(g_dev, t, fmt, stack_off)
+        let bs = kq_scales_of(g_dev, t, fmt, stack_off)
+        if (fmt == KqFmt.k6) {
+            metal_set_pipeline(enc, g_pso_moe_kq_k6)
+            metal_set_buffer(enc, bs.buf, bs.doff, 0)
+        } else {
+            metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_moe_kq_k4 : g_pso_moe_kq_k5)
+            metal_set_buffer(enc, bs.buf, bs.soff, 0)
+        }
+        metal_set_buffer(enc, bs.buf, bs.soff, 1)
+        metal_set_buffer(enc, bq.buf, bq.qoff, 2)
+        metal_set_buffer(enc, bx, 0ul, 3)
+        metal_set_buffer(enc, by, yoff, 4)
+        metal_set_buffer(enc, bn, 0ul, 5)
+        metal_set_buffer(enc, bd, 0ul, 6)
+        metal_set_buffer(enc, bsel, 0ul, 7)
+        metal_set_buffer(enc, bes, 0ul, 8)
+        metal_set_buffer(enc, bxs, 0ul, 9)
+        metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), 1u), uint3(64u, 1u, 1u))
+    }
+}
+
+def enc_moe_combine(enc : MetalComputeEncoder?; bdn, bsel : MetalBuffer?; k : int64; by, bdim, bnk : MetalBuffer?; dim : int64) {
+    metal_set_pipeline(enc, g_pso_moe_combine)
+    metal_set_buffer(enc, bdn, 0ul, 0)
+    metal_set_buffer(enc, bsel, uint64(k * 4l), 1)   // the float w view
+    metal_set_buffer(enc, by, 0ul, 2)
+    metal_set_buffer(enc, bdim, 0ul, 3)
+    metal_set_buffer(enc, bnk, 0ul, 4)
+    metal_dispatch_threadgroups(enc, uint3(uint((dim + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
 // fused add + rms when dim fits the kernel's row slab, the unfused pair otherwise
@@ -6870,6 +7415,13 @@ def metal_kernels_release {
         g_pso_emb = null
     }
     release_pso(g_pso_emb_k6)
+    release_pso(g_pso_moe_router)
+    release_pso(g_pso_moe_select)
+    release_pso(g_pso_moe_gemv_q8)
+    release_pso(g_pso_moe_kq_k4)
+    release_pso(g_pso_moe_kq_k5)
+    release_pso(g_pso_moe_kq_k6)
+    release_pso(g_pso_moe_combine)
     if (g_pso_qkvrs16 != null) {
         metal_release(g_pso_qkvrs16)
         g_pso_qkvrs16 = null

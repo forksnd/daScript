@@ -59,15 +59,58 @@ let DECODE_NEEDS_OK = (MetalNeed.neox | MetalNeed.qkv_bias | MetalNeed.qk_norm |
     MetalNeed.v_norm | MetalNeed.attn_scale | MetalNeed.out_scale)
 let BATCH_NEEDS_OK = DECODE_NEEDS_OK
 
-def private decode_shape_decline(t : Model; needs_ok : MetalNeed) : MetalDecodeDecline {
+// one MoE weight stack's (fmt, offset) serve check — the expert-indexed GEMV twins address the
+// stack via 256-superblock plane offsets (k6 additionally needs the 512-element d-plane pair)
+def private moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
+    if (fmt != KqFmt.q8 && fmt != KqFmt.k4 && fmt != KqFmt.k5 && fmt != KqFmt.k6) {
+        return false
+    }
+    let al = fmt == KqFmt.k6 ? 512l : 256l
+    return off >= 0l && (off % al) == 0l && (ege % al) == 0l
+}
+
+// Wave C stage 1: the decode MoE serve gate — the shapes the routing kernels cover today
+// (softmax + norm_topk, no shared expert / biases / mx4 / dense-lead; q8-mode expert stacks
+// in q8/k4/k5/k6 with aligned expert planes). Everything else keeps the graph decline.
+def private moe_metal_ok(t : Model) : bool {
+    let c = t.config
+    if (!c.moe || c.n_ff_shexp > 0l || c.moe_dense_shexp || c.n_layer_dense_lead > 0l ||
+            c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
+            c.moe_router_bias || c.moe_exps_bias || c.moe_exp_probs || t.experts_mx4 ||
+            (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0) ||
+            c.ffn_act != FfnAct.silu) {
+        return false
+    }
+    let ne = c.n_expert
+    let k = c.n_expert_used
+    let nfe = c.n_ff_exp
+    let ege = c.dim * nfe
+    // select kernel holds 8 logits per lane (ne <= 256); kq GEMVs need superblock dims both ways
+    if (ne < 1l || ne > 256l || k < 1l || k > 16l || k > ne || nfe <= 0l ||
+            (c.dim % 256l) != 0l || (nfe % 256l) != 0l ||
+            ne * ege > 3800000000l ||   // uint32 in-kernel indices (q8 byte view = elements * 34/32)
+            t.router_off < 0l || empty(t.we1_offs) || empty(t.we2_offs) || empty(t.we3_offs)) {
+        return false
+    }
+    for (l in range64(c.n_layers)) {
+        if (!moe_site_ok(kq_fmt_at(t.we1_fmt, l), t.we1_offs[l], ege) ||
+                !moe_site_ok(kq_fmt_at(t.we2_fmt, l), t.we2_offs[l], ege) ||
+                !moe_site_ok(kq_fmt_at(t.we3_fmt, l), t.we3_offs[l], ege)) {
+            return false
+        }
+    }
+    return true
+}
+
+def private decode_shape_decline(t : Model; needs_ok : MetalNeed; allow_moe : bool = false) : MetalDecodeDecline {
     if (t.quant != QuantMode.q8) {
         return MetalDecodeDecline.quant_mode
     }
     if (!kq_load_gpu_supported(t)) {   // a fmt without a GPU kernel (the q4_0 QAT tier, ...) must not dispatch
         return MetalDecodeDecline.kquant_native
     }
-    // the drivers encode the std dense stack (attn_is_std / ffn_is_dense) — MoE, recurrent, and custom-attention arches decline here
-    if (!t.blocks.attn_is_std || !t.blocks.ffn_is_dense) {
+    // non-std graphs decline here; MoE serves single-decode when the routing kernels cover it (Wave C)
+    if (!t.blocks.attn_is_std || (!t.blocks.ffn_is_dense && !(allow_moe && moe_metal_ok(t)))) {
         return MetalDecodeDecline.graph
     }
     if (kernel_backend_needs_repack(active_kernel_backend())) {
@@ -112,7 +155,7 @@ def private decode_decline(t : Model; s : Session; pos : int64) : MetalDecodeDec
     if (s.uid == 0ul) {
         return MetalDecodeDecline.no_uid
     }
-    let shape = decode_shape_decline(t, DECODE_NEEDS_OK)
+    let shape = decode_shape_decline(t, DECODE_NEEDS_OK, true)
     if (shape != MetalDecodeDecline.none) {
         return shape
     }
@@ -139,6 +182,7 @@ def private metal_model_servable_impl(t : Model) : bool {
     if (t.config.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8) {
         return false
     }
+    // allow_moe stays FALSE: blob loads can't fall back to CPU — MoE waits for batch+prefill (stage 2)
     return decode_shape_decline(t, DECODE_NEEDS_OK) == MetalDecodeDecline.none
 }
 
@@ -267,6 +311,20 @@ struct private StepRes {
     u_embscale : MetalBuffer?  // sqrt(dim) embed scale on the spec chain's GPU gather (gemma)
     bsupp : MetalBuffer?       // suppressed token ids (u32) + count — the gemma4 logits pin
     u_nsupp : MetalBuffer?
+    // MoE routing (Wave C) — moe steps only; bh12 sizes to max(2*hidden, 2*k*nfe)
+    moe : bool
+    bmoe_lg : MetalBuffer?     // [ne] router logits
+    bmoe_sel : MetalBuffer?    // [k idx u32][k w f32] — the select kernel's output pair
+    bmoe_dn : MetalBuffer?     // [k x dim] per-slot down outputs (combine's input)
+    u_moe_ne : MetalBuffer?
+    u_moe_k : MetalBuffer?
+    u_moe_nfe : MetalBuffer?
+    u_moe_knfe : MetalBuffer?  // k * n_ff_exp — the swiglu span over the slot rows
+    u_moe_eblk : MetalBuffer?  // q8 blocks per expert plane (ege / 32)
+    u_moe_esb : MetalBuffer?   // kq superblocks per expert plane (ege / 256)
+    u_moe_xs_dn : MetalBuffer? // the down site's per-slot x stride (nfe)
+    bytes_moe_lg : uint64
+    bytes_moe_dn : uint64
     bytes_supp : uint64
     bytes_tab_sw : uint64      // the swa rope pair's row bytes (hetero: hs_sw/2 floats != bytes_tab)
     bytes_x : uint64
@@ -307,9 +365,11 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     let hs_mx = max(head_size, hs_sw)
     let qd_mx = max(qd, qd_sw)
     let qkvd_mx = max(qkvd, qkvd_sw)
-    let h2 = 2l * hidden
+    let moe = !t.blocks.ffn_is_dense
+    let knfe = moe ? c.n_expert_used * c.n_ff_exp : 0l
+    let h2 = max(2l * hidden, 2l * knfe)   // moe: bh12 holds k gate rows | k up rows
     var r = StepRes(valid = true, pos = pos, uid = s.uid,
-        kdt = s.kv_dtype_k, s16 = t.wscale_f16, hetero = hetero,
+        kdt = s.kv_dtype_k, s16 = t.wscale_f16, hetero = hetero, moe = moe,
         koff = koff, voff = voff, cap = cap, arena_epoch = g_arena_epoch,
         bytes_x = uint64(dim * 4l), bytes_q = uint64(qd_mx * 4l), bytes_xb = uint64(max(dim, qd_mx) * 4l),
         bytes_qkv = uint64(qkvd_mx * 4l),
@@ -372,6 +432,21 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
         if (hetero) {
             r.u_nblk_sw = uniform_u32(uint(kvd_sw / 32l))
         }
+    }
+    if (moe) {
+        let ege = dim * c.n_ff_exp
+        r.bytes_moe_lg = uint64(c.n_expert * 4l)
+        r.bytes_moe_dn = uint64(c.n_expert_used * dim * 4l)
+        r.bmoe_lg = pool_acquire(g_pool, g_dev, r.bytes_moe_lg)
+        r.bmoe_sel = pool_acquire(g_pool, g_dev, 128ul)   // k <= 16: [k idx][k w]
+        r.bmoe_dn = pool_acquire(g_pool, g_dev, r.bytes_moe_dn)
+        r.u_moe_ne = uniform_u32(uint(c.n_expert))
+        r.u_moe_k = uniform_u32(uint(c.n_expert_used))
+        r.u_moe_nfe = uniform_u32(uint(c.n_ff_exp))
+        r.u_moe_knfe = uniform_u32(uint(knfe))
+        r.u_moe_eblk = uniform_u32(uint(ege / 32l))
+        r.u_moe_esb = uniform_u32(uint(ege / 256l))
+        r.u_moe_xs_dn = uniform_u32(uint(c.n_ff_exp))
     }
     // logits-on-GPU (default ON, DASLLAMA_METAL_LOGITS=0 pins the CPU classifier) mirrors the prefill gates
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
@@ -618,25 +693,51 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 var bw_ffn = upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
                 enc_add_rms_site(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, dim)
             }
-            let f1 = kq_fmt_at(t.w1_fmt, l)
-            let f3 = kq_fmt_at(t.w3_fmt, l)
-            let w13_q8 = f1 == KqFmt.q8 && f3 == KqFmt.q8
-            if (g_skip != "gemv") {
-                if (w13_q8 && !geglu) {
-                    // fused gate+up dot with the swiglu epilogue — one dispatch over both tensors' blob slices
-                    let bw1 = blob_of(g_dev, t, t.w1_offs[l])
-                    enc_gemv_w13sw(enc, bw1.buf, bw1.boff, uint64((t.w3_offs[l] / 32l) * 34l),
-                        r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
-                } else {
-                    enc_site_gemv(enc, t, f1, t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
-                    enc_site_gemv(enc, t, f3, t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
+            if (r.moe) {
+                // router -> select -> expert gate/up -> swiglu(k rows) -> expert down -> combine
+                let knfe = c.n_expert_used * c.n_ff_exp
+                let fe1 = kq_fmt_at(t.we1_fmt, l)
+                let fe3 = kq_fmt_at(t.we3_fmt, l)
+                let fe2 = kq_fmt_at(t.we2_fmt, l)
+                if (g_skip != "gemv") {
+                    var bw_rt = upload_region(addr < void? >(t.fblob[t.router_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
+                    enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, c.n_expert)
+                    enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, c.n_expert_used)
+                    enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, r.bxb, r.bh12,
+                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32)
+                    enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, r.bxb, r.bh12,
+                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                        uint64(knfe * 4l))
                 }
-            }
-            if (g_skip != "ew" && !(w13_q8 && !geglu)) {
-                enc_ew2(enc, geglu ? g_pso_geglu : g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(hidden * 4l), r.u_hidden, hidden)
-            }
-            if (g_skip != "gemv") {
-                enc_site_gemv(enc, t, kq_fmt_at(t.w2_fmt, l), t.w2_offs[l], dim, hidden, r.bh12, r.bxb, r.u_hidden, r.u_dim)
+                if (g_skip != "ew") {
+                    enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(knfe * 4l), r.u_moe_knfe, knfe)
+                }
+                if (g_skip != "gemv") {
+                    enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, r.bh12, r.bmoe_dn,
+                        r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn)
+                    enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, c.n_expert_used, r.bxb, r.u_dim, r.u_moe_k, dim)
+                }
+            } else {
+                let f1 = kq_fmt_at(t.w1_fmt, l)
+                let f3 = kq_fmt_at(t.w3_fmt, l)
+                let w13_q8 = f1 == KqFmt.q8 && f3 == KqFmt.q8
+                if (g_skip != "gemv") {
+                    if (w13_q8 && !geglu) {
+                        // fused gate+up dot with the swiglu epilogue — one dispatch over both tensors' blob slices
+                        let bw1 = blob_of(g_dev, t, t.w1_offs[l])
+                        enc_gemv_w13sw(enc, bw1.buf, bw1.boff, uint64((t.w3_offs[l] / 32l) * 34l),
+                            r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
+                    } else {
+                        enc_site_gemv(enc, t, f1, t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
+                        enc_site_gemv(enc, t, f3, t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
+                    }
+                }
+                if (g_skip != "ew" && !(w13_q8 && !geglu)) {
+                    enc_ew2(enc, geglu ? g_pso_geglu : g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(hidden * 4l), r.u_hidden, hidden)
+                }
+                if (g_skip != "gemv") {
+                    enc_site_gemv(enc, t, kq_fmt_at(t.w2_fmt, l), t.w2_offs[l], dim, hidden, r.bh12, r.bxb, r.u_hidden, r.u_dim)
+                }
             }
             if (g_skip != "ew") {
                 if (c.pre_post_norm) {
@@ -830,6 +931,18 @@ def private release_step(var r : StepRes) {
     if (r.bsupp != null) {
         pool_release(g_upool, r.bsupp, r.bytes_supp)
         pool_release(g_upool, r.u_nsupp, 4ul)
+    }
+    if (r.moe) {
+        pool_release(g_pool, r.bmoe_lg, r.bytes_moe_lg)
+        pool_release(g_pool, r.bmoe_sel, 128ul)
+        pool_release(g_pool, r.bmoe_dn, r.bytes_moe_dn)
+        pool_release(g_upool, r.u_moe_ne, 4ul)
+        pool_release(g_upool, r.u_moe_k, 4ul)
+        pool_release(g_upool, r.u_moe_nfe, 4ul)
+        pool_release(g_upool, r.u_moe_knfe, 4ul)
+        pool_release(g_upool, r.u_moe_eblk, 4ul)
+        pool_release(g_upool, r.u_moe_esb, 4ul)
+        pool_release(g_upool, r.u_moe_xs_dn, 4ul)
     }
     r.valid = false
 }
