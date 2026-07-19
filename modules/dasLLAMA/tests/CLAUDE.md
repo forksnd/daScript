@@ -41,12 +41,31 @@ never mask a red.
 Arm names — decode parity: `arm1-basic arm2-hybrid arm3-step arm4-paged arm5-rewind
 arm6-churn arm7-q8kv arm7b-tq4kv arm8-s16 arm9-reload arm10-kq arm11-depth arm12-dim`,
 batch test: `batch` (whole test), `batchB7-partd`, `batchB8-kq`. Prefill parity: `base s16
-kq cont dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b`. The
+kq cont dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b` + the
+family matrix `fam-qwen3 fam-qwen2 fam-phi3 fam-gemma2 fam-gemma3 fam-gemma4` (needs-derivation
+pins + per-path cells; fam-gemma2 also carries the sliding-window masking parity row;
+fam-gemma4 is DASLLAMA_PARITY_FULL-gated — 7.4GB). The
 `kernels` suite (test_metal_prefill_kernels — model-less kernel units, ~80s) has no arms;
 remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
-carrier, model-free, runs in CI) `smol tower whisper voxtral`; the voxtral arm re-saves a
-5.4 GB image from cold every run by design (it IS the >2 GiB-plane IO coverage).
+carrier, model-free, runs in CI) `smol metal tower whisper voxtral`; the voxtral arm re-saves a
+5.4 GB image from cold every run by design (it IS the >2 GiB-plane IO coverage); the `metal`
+arm mints/maps the blob-only metal flavor (SmolLM2) incl. the CPU-tripwire and a
+teacher-forced logits-tolerance parity cell (greedy token equality is NOT a valid bar on a
+135M — genuine near-ties flip on ~0.02 gaps under ~0.75 cross-backend noise).
+
+## Blob-only Metal fixtures (the two-model pattern)
+
+The Metal drivers serve ONLY blob-form models (`convert_model_to_metal_blob` /
+metal-flavor images), and CPU inference on a blob model PANICS. Every CPU-vs-GPU arm
+therefore runs a PLANAR model for CPU stages and its `blob_twin(t, path, seq_cap)` for
+override-selected stages — sessions are geometry-bound, so one session spans both models
+(CPU prefill on the planar model, GPU decode on the twin, etc.). Decline-reason cells keep
+the planar model: capability reasons (`feature`, `graph`, `shape`, ...) out-rank the
+`planar` decline in every gate, and the planar CPU fallback serves quietly. The prefill
+npos POLICY window is planar-only now (a blob model serves any npos — no CPU fallback
+exists); the legacy quantized-X prefill rail is dead (`set_metal_prefill_mulmm_legacy`
+forces a `planar` capability decline — the required-mode panic cell uses it).
 
 ## Family filter (profiling cadence)
 
@@ -54,8 +73,10 @@ carrier, model-free, runs in CI) `smol tower whisper voxtral`; the voxtral arm r
 model blocks tagged with a listed family run — `family_on(t, name)` in
 `_model_tier.das`, EXACT token match, loud `t |> skip` like the arm filter. Model-free blocks
 (the `kernels` suite, the image `mechanics` arm) carry no tag and always run. Family tokens
-today: `llama` (all four metal suites + the image smol arm), `gemma`, `ultravox`, `whisper`,
-`voxtral` (image suite arms). When profiling one family across formats, gate each round with
+today: `llama` (all four metal suites + the image smol arm), `qwen2`, `qwen3`, `phi3`,
+`gemma2`, `gemma3` (the support-matrix family cells), `gemma`, `ultravox`, `whisper`,
+`voxtral` (image suite arms).
+When profiling one family across formats, gate each round with
 `--arm <arms> --family <fam>` instead of the whole zoo. Tag every NEW model-loading block
 with its family or it silently joins every family's gate.
 

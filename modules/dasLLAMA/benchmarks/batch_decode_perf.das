@@ -20,6 +20,12 @@ require math
 //   DASLLAMA_METAL_KV_MIRROR_MB=3072 DASLLAMA_PIN_DECODE=metal DASLLAMA_PIN_BACKEND=portable \
 //     bin/daslang -jit modules/dasLLAMA/benchmarks/batch_decode_perf.das -- -m <3B.gguf> -p 512 -n 128 -b 16 --kv f16 --wscale-f16 1
 
+enum SeqMode {   // clargs rejects any other --seq value loudly (a typo'd mode must not silently skip the baseline)
+    each
+    once
+    skip
+}
+
 [CommandLineArgs]
 struct Args {
     @clarg_required
@@ -48,6 +54,9 @@ struct Args {
 
     @clarg_doc = "Weight-scale plane A/B: 1 = convert to f16 at load (llama.cpp byte parity), 0 = keep f32, -1 = keep default"
     wscale_f16 : int = -1
+
+    @clarg_doc = "Sequential baseline per B: each (default), once (measure at the first B, reuse the rate), skip"
+    seq : SeqMode = SeqMode.each
 
     @clarg_doc = "Feed this fixed token every step instead of greedy argmax (llama-batched-bench protocol parity; -1 = greedy)"
     fixed_token : int = -1
@@ -222,6 +231,7 @@ def main() {
         // (the lane-timeline viewer's input; same rig as decode_prof --trace)
         let trace = has_env_variable("DASLLAMA_BATCH_TRACE") ? get_env_variable("DASLLAMA_BATCH_TRACE") : ""
         var nb = 1l
+        var seq_ref = 0.0lf   // --seq once: the first B's per-stream rate serves the later rows
         while (nb <= bmax) {
             static_if (typeinfo builtin_module_exists(das_metal)) {
                 metal_decode_stage_reset()   // per-B stage attribution (the report below)
@@ -233,11 +243,17 @@ def main() {
             if (swap) {
                 bat_pre = run_batched(t, cfg.kv, nb, p, n)
             }
-            let seq_tps = run_sequential(t, cfg.kv, nb, p, n)
+            // --seq once: the baseline is B-independent (per-stream single decode), so measure it
+            // at the first B only and reuse the rate — a B=16 baseline alone is nb*n = 2048 steps
+            let want_seq = cfg.seq == SeqMode.each || (cfg.seq == SeqMode.once && seq_ref == 0.0lf)
+            let seq_tps = want_seq ? run_sequential(t, cfg.kv, nb, p, n) : seq_ref
+            if (want_seq) {
+                seq_ref = seq_tps
+            }
             static_if (typeinfo builtin_module_exists(das_metal)) {
                 // phase-split stage attribution: land the sequential phase's counters before the
                 // batched loop reuses the driver (the 3.5% seq-vs-batched-B1 split diagnostic)
-                if (metal_decode_stats().decodes > 0l) {
+                if (want_seq && metal_decode_stats().decodes > 0l) {
                     print("  [stage split: sequential phase]\n")
                     metal_decode_stage_report()
                     metal_decode_stage_reset()
@@ -258,9 +274,10 @@ def main() {
                     print("jobque trace: nothing recorded\n")
                 }
             }
-            let speedup = bat_tps / seq_tps
+            let speedup = seq_tps > 0.0lf ? bat_tps / seq_tps : 0.0lf
             let stream_tps = bat_tps / double(nb)
-            print("B={nb}: sequential {seq_tps} tok/s | batched {bat_tps} tok/s ({speedup}x) | per-stream {stream_tps} tok/s\n")
+            let seq_tag = cfg.seq == SeqMode.skip ? " (skipped)" : (!want_seq ? " (ref)" : "")
+            print("B={nb}: sequential {seq_tps} tok/s{seq_tag} | batched {bat_tps} tok/s ({speedup}x) | per-stream {stream_tps} tok/s\n")
             static_if (typeinfo builtin_module_exists(das_metal)) {
                 if (metal_batch_decode_stats().steps > 0l || metal_decode_stats().decodes > 0l) {
                     print("  [stage split: batched phase]\n")

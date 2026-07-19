@@ -27,7 +27,7 @@ struct RunArgs {
     @clarg_doc = "Suite: decode | prefill | matrix | kernels | image | all (default all)"
     suite : string = "all"
 
-    @clarg_doc = "Family filter — comma-separated family tokens (llama, gemma, ultravox, whisper, voxtral); only blocks of these model families run (model-free blocks always run); sets DASLLAMA_TEST_FAMILY"
+    @clarg_doc = "Family filter — comma-separated family tokens (llama, qwen2, qwen3, phi3, gemma, ultravox, whisper, voxtral); only blocks of these model families run (model-free blocks always run); sets DASLLAMA_TEST_FAMILY"
     family : string
 
     @clarg_short = "n"
@@ -118,7 +118,8 @@ def main() : int {
         return 2
     }
     let tmp = empty(get_env_variable("TMPDIR")) ? "/tmp" : get_env_variable("TMPDIR")
-    var envs = cfg.full ? "DASLLAMA_PARITY_FULL=1" : "DASLLAMA_TEST_ARMS='{cfg.arm}'"
+    // CPU_PREFILL: the suites' CPU truth halves and parity controls prefill on the CPU by intent
+    var envs = (cfg.full ? "DASLLAMA_PARITY_FULL=1" : "DASLLAMA_TEST_ARMS='{cfg.arm}'") + " DASLLAMA_CPU_PREFILL=1"
     if (!empty(cfg.family)) {   // composes with either mode: a family-scoped full gate is the profiling-cadence default
         envs = "{envs} DASLLAMA_TEST_FAMILY='{cfg.family}'"
     }

@@ -121,6 +121,7 @@ def private ref_for(baselines : array<LlmBaseline>; display : string; var prefil
 // set DASLLAMA_CONFIRM_MODEL=<q8 gguf> so a divergent crown must prove itself in real prefill.
 [export, tune_policy(missing = "auto")]
 def main() {
+    allow_cpu_prefill()   // CPU rows are this tool's product — disarm the Metal-build tripwire
     if (!jit_enabled()) {
         print("gen_profile is JIT-only — run with: daslang -jit <file>\n")
         return

@@ -1119,6 +1119,8 @@ def private run_attn_b2_sidebyside(b) {
     var hsbuf = upload_u32(dev, uint(head_size))
     var scalebuf = upload_f32(dev, scale)
     var qstridebuf = upload_u32(dev, uint(qd))
+    var cap0buf = upload_f32(dev, 0.0)     // the production kernels' wave-B uniforms at llama-shape
+    var win0buf = upload_u32(dev, 0u)      // values: no soft cap, no sliding window
     var ygot : array<float>
     for (depth in [512l, 640l, 1024l, 2048l, 4096l, 16384l]) {
         let nch = (depth + 63l) / 64l
@@ -1137,11 +1139,11 @@ def private run_attn_b2_sidebyside(b) {
         rte <- [0u, 0u, uint(depth), uint(depth), 0u, 0u, uint(depth), uint(depth)]
         var rtbuf = upload_array(dev, rte, nb * 16l)
         var yref <- cpu_sq_attn(kc, vc, q, nb, depth, nheads, head_size, kv_dim, kv_mul, scale)
-        var bufs_part <- [kbuf, vbuf, qbuf, partbuf, rtbuf, laybuf, kvdimbuf, nheadsbuf, kvmulbuf, hsbuf, scalebuf, qstridebuf, nchmaxbuf]
+        var bufs_part <- [kbuf, vbuf, qbuf, partbuf, rtbuf, laybuf, kvdimbuf, nheadsbuf, kvmulbuf, hsbuf, scalebuf, qstridebuf, nchmaxbuf, cap0buf, win0buf]
         var bufs_partf <- [kbuf, vbuf, qbuf, partbuf, rtbuf, laybuf, kvdimbuf, nheadsbuf, kvmulbuf, hsbuf, scalebuf, qstridebuf, nchmax32buf]
         var bufs_partg <- [kbuf, vbuf, qbuf, partbuf, rtbuf, laybuf, kvdimbuf, nheadsbuf, kvmulbuf, hsbuf, scalebuf, qstridebuf, nsgsbuf]
         var bufs_partd <- [kbuf, vbuf, qbuf, partbuf, rtbuf, laybuf, kvdimbuf, nheadsbuf, kvmulbuf, hsbuf, scalebuf, qstridebuf, nsgsdbuf]
-        var bufs_comb <- [partbuf, ybuf, rtbuf, nchmaxbuf, nheadsbuf, hsbuf]
+        var bufs_comb <- [partbuf, ybuf, rtbuf, nchmaxbuf, nheadsbuf, hsbuf, win0buf]
         var bufs_combp <- [partbuf, ybuf, rtbuf, nchmax32buf, nheadsbuf, hsbuf]
         var bufs_combg <- [partbuf, ybuf, rtbuf, nsgsbuf, nheadsbuf, hsbuf]
         var bufs_combd <- [partbuf, ybuf, rtbuf, nsgsdbuf, nheadsbuf, hsbuf]
@@ -1253,6 +1255,8 @@ def private run_attn_b2_sidebyside(b) {
     metal_release(hsbuf)
     metal_release(scalebuf)
     metal_release(qstridebuf)
+    metal_release(cap0buf)
+    metal_release(win0buf)
     metal_release(pso_part)
     metal_release(pso_comb)
     metal_release(pso_partp)

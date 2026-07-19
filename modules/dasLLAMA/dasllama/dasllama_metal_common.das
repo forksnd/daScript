@@ -40,10 +40,15 @@ enum MetalDecodeDecline {
     none                // supported — the step runs on the GPU
     quant_mode          // weights not loaded under QuantMode.q8
     kquant_native       // per-tensor K-quant planes: not readable as qblob offsets (kernels = W4)
-    arch                // not the llama family graph
+    arch                // RETIRED (family waves A): the arch-name check is gone — non-std block
+                        // sets decline `graph`, feature-flag configs decline `feature` per bit
     backend_repack      // repack backend: interleaved weight layout unreadable by the GPU kernels
     rope_mode           // rope tables off
-    config              // feature-flag config the kernels don't implement (neox/bias/qk-norm/softcap/...)
+    config              // RETIRED (family waves A): split into `feature` + the per-need
+                        // `need_*` keys in the declines-by-reason table
+    graph               // block set is not the std dense stack (MoE / recurrent / custom attn)
+    feature             // the model needs layer-stack features this path's kernels don't
+                        // implement — each missing bit records a `need_*` key alongside
     shape               // head/dim alignment outside the kernel grids
     layers              // per-layer non-uniformity (kv_dim/head_size/hidden/sliding/missing wv)
     kv_dtype            // session KV codec not uniform f16/f32 (the mirror moves raw row bytes)
@@ -56,6 +61,79 @@ enum MetalDecodeDecline {
     device              // metal_decode_init failed (no device / PSO build failure)
     mirror              // the mirror arena cannot hold the KV slice
     gpu_error           // dispatch failed at execution time
+    planar              // weights not in the blob-image form (the drivers are blob-only —
+                        // load_model under metal mode transforms/maps the metal flavor)
+}
+
+//! Layer-stack features a model's graph needs beyond the base llama dense block — ONE derivation
+//! (`metal_needs`) feeds every GPU gate; each path holds its own implemented-set mask and declines
+//! `feature` on the difference, recording a `need_*` key per missing bit.
+bitfield MetalNeed {
+    neox            // NEOX rope pairing (j, j+hs/2) — qwen2/qwen3/phi3/gemma/gptoss
+    qkv_bias        // additive bias on the Q/K/V projections — qwen2/glm4moe/gptoss
+    qk_norm         // per-head RMSNorm on Q/K before rope — qwen3/gemma3+/qwen35
+    v_norm          // weightless per-head RMSNorm on V — gemma4
+    partial_rope    // rope_dim < head_size rotates only the first rope_dim dims — qwen35/glm4moe
+    q_gated         // 2x-wide Q, out ⊙ σ(gate) before wo — qwen35
+    attn_scale      // attention-score scale override (not 1/sqrt(hs)) — gemma4
+    softcap         // attention-logit soft cap — gemma2
+    sliding         // sliding-window attention span — gemma2/3/4, gptoss
+    sinks           // per-head sink logit in the softmax denominator — gptoss
+    out_bias        // additive bias on the attention output projection — gptoss
+    pre_post_norm   // extra post-attention / post-FFN norms — gemma2/3/4
+    out_scale       // per-layer scalar on the layer output — gemma4
+    geglu           // GeGLU FFN activation (gelu, not silu) — gemma2/3/4
+    ple             // per-layer embeddings — gemma4 E-series
+    qd_neq_dim      // n_heads*head_size != dim (query width differs from the residual) — qwen3
+}
+
+//! The feature set model `t` needs from a resident GPU driver — derived from the loaded config
+//! (per-file truth: loader-detected flags included). Graph-shape needs are NOT bits here — the
+//! block set declares those (`attn_is_std` / `ffn_is_dense`) and the gates decline `graph` first.
+def metal_needs(t : Model) : MetalNeed {
+    let c = t.config
+    var n : MetalNeed
+    n.neox = c.rope_neox
+    n.qkv_bias = c.attn_qkv_bias
+    n.qk_norm = c.qk_norm
+    n.v_norm = c.v_norm
+    n.partial_rope = c.rope_dim > 0l && c.rope_dim != c.head_size
+    n.q_gated = c.q_gated
+    n.attn_scale = c.attn_scale > 0.0
+    n.softcap = c.attn_logit_softcap > 0.0
+    n.sliding = c.sliding_window > 0l
+    n.sinks = c.attn_sinks
+    n.out_bias = c.attn_out_bias
+    n.pre_post_norm = c.pre_post_norm
+    n.out_scale = c.layer_out_scale
+    n.geglu = c.ffn_act != FfnAct.silu
+    n.ple = c.n_embd_per_layer > 0l
+    n.qd_neq_dim = c.n_heads * c.head_size != c.dim
+    return n
+}
+
+def metal_missing_needs(t : Model; ok : MetalNeed) : MetalNeed {
+    return metal_needs(t) & ~ok
+}
+
+// one `need_*` key per missing bit — the support-matrix cells assert these names as strings
+def record_needs(var tab : table<string; int64>; missing : MetalNeed) {
+    if (missing.neox) { tab["need_neox"]++ }
+    if (missing.qkv_bias) { tab["need_qkv_bias"]++ }
+    if (missing.qk_norm) { tab["need_qk_norm"]++ }
+    if (missing.v_norm) { tab["need_v_norm"]++ }
+    if (missing.partial_rope) { tab["need_partial_rope"]++ }
+    if (missing.q_gated) { tab["need_q_gated"]++ }
+    if (missing.attn_scale) { tab["need_attn_scale"]++ }
+    if (missing.softcap) { tab["need_softcap"]++ }
+    if (missing.sliding) { tab["need_sliding"]++ }
+    if (missing.sinks) { tab["need_sinks"]++ }
+    if (missing.out_bias) { tab["need_out_bias"]++ }
+    if (missing.pre_post_norm) { tab["need_pre_post_norm"]++ }
+    if (missing.out_scale) { tab["need_out_scale"]++ }
+    if (missing.geglu) { tab["need_geglu"]++ }
+    if (missing.ple) { tab["need_ple"]++ }
+    if (missing.qd_neq_dim) { tab["need_qd_neq_dim"]++ }
 }
 
 var g_dev : MetalDevice?
@@ -91,6 +169,25 @@ var g_us_breadback = 0l
 var g_gpu_b_ms = 0.0lf
 var g_sched_b_ms = 0.0lf                     // driver scheduling span (kernelStart..kernelEnd)
 var g_handoff_b_ms = 0.0lf                   // kernelEnd -> GPUStart gap
+
+//! One retired single-stream decode step in the per-step trace (metal_decode_trace_arm) — host
+//! stamps are us on the arm clock; the cb stamps are Metal host-time SECONDS on one shared
+//! timeline across steps (gs - previous step's ge = GPU idle between the two cbs).
+struct MetalDecodeStepTrace {
+    pos : int64
+    mode : int64        // 0 = slow (encode-now), 1 = poked pre-encode, 2 = spec chain
+    commit_us : int64   // host stamp at this step's cb commit (spec: during the PREVIOUS step)
+    finish_us : int64   // host stamp at step retire (wait + readback done)
+    wait_us : int64     // the retire wait: commit-to-drain as the CPU saw it
+    ks : double         // cb kernelStart/EndTime — the driver scheduling span
+    ke : double
+    gs : double         // cb GPUStart/EndTime — the execution window
+    ge : double
+}
+
+var g_step_trace : array<MetalDecodeStepTrace>
+var g_step_trace_cap = 0l
+var g_step_trace_t0 = 0l
 
 // per-session logical KV mirror record (see module header). Mirrors are SLICES of one shared
 // arena buffer (g_arena): the batched kernel reaches every row via a per-row offset table; the
@@ -190,10 +287,25 @@ def decline(why : MetalDecodeDecline) {
     require_or_panic("decode", "{why}")
 }
 
+// the `feature` flavor: records a need_* key per missing bit, and the required-mode panic names them
+def decline(why : MetalDecodeDecline; missing : MetalNeed) {
+    g_declines++
+    g_declines_by_reason["{why}"]++
+    record_needs(g_declines_by_reason, missing)
+    require_or_panic("decode", "{why} {missing}")
+}
+
 def batch_decline(why : MetalDecodeDecline) {
     g_batch_declines++
     g_batch_declines_by_reason["{why}"]++
     require_or_panic("batch decode", "{why}")
+}
+
+def batch_decline(why : MetalDecodeDecline; missing : MetalNeed) {
+    g_batch_declines++
+    g_batch_declines_by_reason["{why}"]++
+    record_needs(g_batch_declines_by_reason, missing)
+    require_or_panic("batch decode", "{why} {missing}")
 }
 
 //! (gpu decode steps served, declines to the CPU path) since load — diagnostics / tests.
@@ -299,6 +411,22 @@ def public metal_decode_mirror_stats() : tuple<mirrors : int64; bytes : uint64> 
     return (mirrors = int64(length(g_mirrors)), bytes = g_mirror_bytes)
 }
 
+//! Arm the per-step single-stream decode trace for the next `cap` retired steps (0 disarms) — the
+//! bimodality diagnostic. Recording stops when full; batch/prefill steps are never recorded; a spec
+//! mispredict retires TWICE at the same pos (the wrong-token spec entry, then the slow rerun).
+def public metal_decode_trace_arm(cap : int64) {
+    g_step_trace |> clear()
+    g_step_trace |> reserve(int(cap))
+    g_step_trace_cap = cap
+    g_step_trace_t0 = ref_time_ticks()
+}
+
+//! Move out the recorded per-step trace and disarm.
+def public metal_decode_trace_take() : array<MetalDecodeStepTrace> {
+    g_step_trace_cap = 0l
+    return <- g_step_trace
+}
+
 // " reason=count reason=count" — the declines-by-reason tail of a report line
 def declines_line(tab : table<string; int64>) : string {
     return build_string() $(var w) {
@@ -389,39 +517,44 @@ def upload_region_cat3(p0 : void?; b0 : uint64; p1 : void?; b1 : uint64; p2 : vo
     return buf
 }
 
-// one tensor's scale-plane region — the f32 plane or the wscale_f16 halfword plane, whichever
-// the model carries (the GEMV PSO twin is picked to match)
-def upload_scales(t : Model; off, rows, n : int64) : MetalBuffer? {
-    let cnt = rows * (n / 32l)
-    unsafe {
-        if (t.wscale_f16) {
-            return upload_region(addr < void? >(t.qscales16[off / 32l]), uint64(cnt * 2l))
-        }
-        return upload_region(addr < void? >(t.qscales[off / 32l]), uint64(cnt * 4l))
+// ===== the whole-plane resident buffers (blob-only models) =====
+// Each GPU-ready plane becomes ONE resident buffer (zero-copy page wrap when image-mapped, else a
+// one-time untracked copy); tensors bind at byte offsets, keeping in-kernel indices REGION-relative — a 13GB blob's absolute byte indices overflow the kernels' uint32 index math.
+
+def private plane_buffer(dev : MetalDevice?; base : void?; bytes : uint64; mapped : bool) : MetalBuffer? {
+    let key = intptr(base)
+    if (key_exists(g_regions, key)) {
+        return g_regions[key]
     }
+    var buf : MetalBuffer?
+    if (mapped) {
+        // the rounded-up tail is only guaranteed mapped for image sections (page-aligned, file pads to a page multiple) — owned planes always copy
+        buf = unsafe(metal_new_buffer_no_copy_untracked(dev, base, (bytes + 16383ul) & ~16383ul))
+    } else {
+        buf = metal_new_buffer_untracked(dev, bytes)
+        unsafe {
+            var d = reinterpret<uint8?>(metal_buffer_contents(buf))
+            let s = reinterpret<uint8 const?>(base)
+            var at = 0l
+            while (at < int64(bytes)) {   // memcpy takes int — chunk the >2GB planes
+                let chunk = min(int64(bytes) - at, 1073741824l)
+                memcpy(reinterpret<void?>(d + at), reinterpret<void const?>(s + at), int(chunk))
+                at += chunk
+            }
+        }
+    }
+    g_regions[key] = buf
+    return buf
 }
 
-// one tensor's resident 34B q8-block blob (the prefill module's cache — shared, repacked once)
-def blob_of(t : Model; off, rows, n : int64) : MetalBuffer? {
+//! The whole-model 34B-block q8 blob buffer (metal_blob models) + one tensor's byte offset
+//! within it — bind BOTH blob views (half-scale + byte) at this offset. Layout gate at the
+//! transform keeps every offset 16B-aligned.
+def blob_of(dev : MetalDevice?; t : Model; off : int64) : tuple<buf : MetalBuffer?; boff : uint64> {
+    assert(t.metal_blob)   // planar models decline at the gates — they never reach an upload
     unsafe {
-        let q = addr < void? >(t.qblob[off])
-        let s = t.wscale_f16 ? addr < void? >(t.qscales16[off / 32l]) : addr < void? >(t.qscales[off / 32l])
-        return metal_blob_region(g_dev, q, s, rows, n, t.wscale_f16)
-    }
-}
-
-// the concat twin for the fused QKV / W1|W3 scale planes (rows2 == 0 = two-piece)
-def upload_scales_cat3(t : Model; off0, rows0, off1, rows1, off2, rows2, n : int64) : MetalBuffer? {
-    let ssz = t.wscale_f16 ? 2l : 4l
-    let nb = n / 32l
-    unsafe {
-        let p0 = t.wscale_f16 ? addr < void? >(t.qscales16[off0 / 32l]) : addr < void? >(t.qscales[off0 / 32l])
-        let p1 = t.wscale_f16 ? addr < void? >(t.qscales16[off1 / 32l]) : addr < void? >(t.qscales[off1 / 32l])
-        var p2 : void?
-        if (rows2 > 0l) {
-            p2 = t.wscale_f16 ? addr < void? >(t.qscales16[off2 / 32l]) : addr < void? >(t.qscales[off2 / 32l])
-        }
-        return upload_region_cat3(p0, uint64(rows0 * nb * ssz), p1, uint64(rows1 * nb * ssz), p2, uint64(rows2 * nb * ssz))
+        return (buf = plane_buffer(dev, addr < void? >(t.mblob[0]), uint64(long_length(t.mblob)), t.image_map != null),
+                boff = uint64((off / 32l) * 34l))
     }
 }
 
@@ -495,73 +628,44 @@ def nc_logits_release {
     }
 }
 
-// One kq tensor's quant plane slice, uploaded BYTE-IDENTICAL (disk-order superblock payloads —
-// the backend_repack decline excludes grp-repacked loads, and the non-repack backends leave the
-// planes disk-order). Cached in g_regions by source address like every weight region.
-def kq_upload_quants(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
+//! One kq tensor's quant plane bind: the whole disk-layout plane as one resident buffer + the
+//! tensor's byte offset (superblock payloads verbatim — the backend_repack decline excludes
+//! grp-repacked loads). Serves BOTH resident drivers (prefill passes its own device handle).
+def kq_quants_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tuple<buf : MetalBuffer?; qoff : uint64> {
+    assert(t.metal_blob)
     let sb0 = off / 256l
-    let nsb = (rows * n) / 256l
     unsafe {
         if (fmt == KqFmt.k4) {
-            return kq_region(dev, addr < void? >(t.k4q[sb0 * 128l]), uint64(nsb * 128l))
+            return (buf = plane_buffer(dev, addr < void? >(t.k4q[0]), uint64(long_length(t.k4q)), t.image_map != null),
+                    qoff = uint64(sb0 * 128l))
         }
         if (fmt == KqFmt.k5) {
-            return kq_region(dev, addr < void? >(t.k5q[sb0 * 160l]), uint64(nsb * 160l))
+            return (buf = plane_buffer(dev, addr < void? >(t.k5q[0]), uint64(long_length(t.k5q)), t.image_map != null),
+                    qoff = uint64(sb0 * 160l))
         }
-        return kq_region(dev, addr < void? >(t.k6q[sb0 * 192l]), uint64(nsb * 192l))
+        return (buf = plane_buffer(dev, addr < void? >(t.k6q[0]), uint64(long_length(t.k6q)), t.image_map != null),
+                qoff = uint64(sb0 * 192l))
     }
 }
 
-// upload_region's device-parameterized twin (the kq helpers serve BOTH resident drivers — the
-// prefill driver owns its own device handle; same shared address-keyed cache)
-def private kq_region(dev : MetalDevice?; src : void?; bytes : uint64) : MetalBuffer? {
-    let key = intptr(src)
-    if (key_exists(g_regions, key)) {
-        return g_regions[key]
-    }
-    var buf = metal_new_buffer_untracked(dev, bytes)
-    unsafe {
-        memcpy(metal_buffer_contents(buf), src, int(bytes))
-    }
-    g_regions[key] = buf
-    return buf
-}
-
-// One kq tensor's GPU-form scale buffer: k4/k5 = 16B compact blocks (20B production block minus
-// pad — its varying mod-16 phase defeats vector-load merge); k6 = [16B sub-scale][packed f16 d]
-// in ONE buffer, d plane at byte nsb*16 (kernel binds the buffer twice with offsets).
-def kq_upload_scales(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
+//! One kq tensor's GPU-form scale bind (the gemv lab's layouts, pre-baked by the blob
+//! transform): k4/k5 = 16B compact blocks at soff; k6 = the split plane — sub-scale strips at
+//! soff, the packed f16 d plane at doff (the kernels bind the buffer twice, once per offset).
+def kq_scales_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tuple<buf : MetalBuffer?; soff : uint64; doff : uint64> {
+    assert(t.metal_blob)
     let sb0 = off / 256l
-    let nsb = (rows * n) / 256l
     unsafe {
         if (fmt == KqFmt.k6) {
-            let key = intptr(addr(t.k6s[sb0 * 18l]))
-            if (key_exists(g_regions, key)) {
-                return g_regions[key]
-            }
-            var buf = metal_new_buffer_untracked(dev, uint64(nsb * 18l))
-            var d = reinterpret<uint8?>(metal_buffer_contents(buf))
-            let src = addr < uint8 const? >(t.k6s[sb0 * 18l])
-            for (sb in range64(nsb)) {
-                memcpy(reinterpret<void?>(d + sb * 16l), reinterpret<void const?>(src + sb * 18l), 16)
-                d[nsb * 16l + sb * 2l] = src[sb * 18l + 16l]
-                d[nsb * 16l + sb * 2l + 1l] = src[sb * 18l + 17l]
-            }
-            g_regions[key] = buf
-            return buf
+            let plane_sb = long_length(t.k6s) / 18l   // split form keeps the 18B/sb total
+            return (buf = plane_buffer(dev, addr < void? >(t.k6s[0]), uint64(long_length(t.k6s)), t.image_map != null),
+                    soff = uint64(sb0 * 16l), doff = uint64(plane_sb * 16l + sb0 * 2l))
         }
-        let src = fmt == KqFmt.k4 ? addr < uint8 const? >(t.k4s[sb0 * 20l]) : addr < uint8 const? >(t.k5s[sb0 * 20l])
-        let key = intptr(src)
-        if (key_exists(g_regions, key)) {
-            return g_regions[key]
+        if (fmt == KqFmt.k4) {
+            return (buf = plane_buffer(dev, addr < void? >(t.k4s[0]), uint64(long_length(t.k4s)), t.image_map != null),
+                    soff = uint64(sb0 * 16l), doff = 0ul)
         }
-        var buf = metal_new_buffer_untracked(dev, uint64(nsb * 16l))
-        var d = reinterpret<uint8?>(metal_buffer_contents(buf))
-        for (sb in range64(nsb)) {
-            memcpy(reinterpret<void?>(d + sb * 16l), reinterpret<void const?>(src + sb * 20l), 16)
-        }
-        g_regions[key] = buf
-        return buf
+        return (buf = plane_buffer(dev, addr < void? >(t.k5s[0]), uint64(long_length(t.k5s)), t.image_map != null),
+                soff = uint64(sb0 * 16l), doff = 0ul)
     }
 }
 
@@ -601,19 +705,33 @@ def mirror_evict_to_cap(cap_bytes : uint64; keep : uint64) {
     }
 }
 
+// Hetero-safe per-layer mirror addressing (gemma4's two kv-head classes): every KV codec is
+// linear bytes-per-element for kvd % 32 == 0, so the layout_offsets element prefix scales
+// straight to bytes. Uniform models reduce to the old l * cap * rowb addresses exactly.
+def mirror_row_total(t : Model) : int64 {
+    let c = t.config
+    var tot = 0l
+    for (l in range64(c.n_layers)) {
+        tot += layer_kv_dim(c, l)   // the GPU gate pins kv_src[l] == l, so every layer owns rows
+    }
+    return tot
+}
+
+//! layer l's slab base (bytes) within a mirror K or V plane of cap rows
+def mirror_lbase(t : Model; dt : KVDtype; cap, l : int64) : int64 => cap * kv_row_bytes(dt, t.kv_row_prefix[l])
+
 // the slice mirror_prepare would build for (s, pos): chunked high-water cap (pow2 from 256,
 // never past the session's own seq cap) and the K/V plane sizes
 def private mirror_slice_shape(t : Model; s : Session; pos : int64) : tuple<cap : int64; kbytes : uint64; vbytes : uint64> {
-    let c = t.config
-    let kv_dim = layer_kv_dim(c, 0l)
     let needed = pos + 1l
     var cap = 256l
     while (cap < needed) {
         cap *= 2l
     }
-    cap = clamp(cap, needed, c.seq_len)
-    return (cap = cap, kbytes = uint64(c.n_layers * cap * kv_row_bytes(s.kv_dtype_k, kv_dim)),
-            vbytes = uint64(c.n_layers * cap * kv_row_bytes(s.kv_dtype_v, kv_dim)))
+    cap = clamp(cap, needed, t.config.seq_len)
+    let total = mirror_row_total(t)
+    return (cap = cap, kbytes = uint64(cap * kv_row_bytes(s.kv_dtype_k, total)),
+            vbytes = uint64(cap * kv_row_bytes(s.kv_dtype_v, total)))
 }
 
 def private mirror_ceiling_bytes : uint64 {
@@ -700,9 +818,6 @@ def mirror_defrag(total : uint64) : bool {
 // advances the watermark only after the step + writeback complete. ok=false ⇒ decline to CPU.
 def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; koff : uint64; voff : uint64; cap : int64> {
     let c = t.config
-    let kv_dim = layer_kv_dim(c, 0l)
-    let krow = kv_row_bytes(s.kv_dtype_k, kv_dim)
-    let vrow = kv_row_bytes(s.kv_dtype_v, kv_dim)
     let needed = pos + 1l
     if (key_exists(g_mirrors, s.uid)) {
         // uid is never reused, so dtype can't legitimately change — a mismatch means a stale
@@ -777,15 +892,20 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
             var kdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + koff
             var vdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + voff
             for (l in range64(c.n_layers)) {
+                let kvd_l = layer_kv_dim(c, l)
+                let krow = kv_row_bytes(s.kv_dtype_k, kvd_l)
+                let vrow = kv_row_bytes(s.kv_dtype_v, kvd_l)
+                let klb = mirror_lbase(t, s.kv_dtype_k, cap, l)
+                let vlb = mirror_lbase(t, s.kv_dtype_v, cap, l)
                 let kbase = kv_layer_kbase(s, l, c.seq_len)
                 let vbase = kv_layer_vbase(s, l, c.seq_len)
                 for (r in range64(nrun)) {
                     let j0 = s.kv_runs[r].j0
                     let nrows = s.kv_runs[r].j1 - j0
                     let prow = s.kv_runs[r].row0
-                    memcpy(reinterpret<void?>(kdst + (l * cap + j0) * krow),
+                    memcpy(reinterpret<void?>(kdst + klb + j0 * krow),
                         reinterpret<void?>(kbase + prow * krow), int(nrows * krow))
-                    memcpy(reinterpret<void?>(vdst + (l * cap + j0) * vrow),
+                    memcpy(reinterpret<void?>(vdst + vlb + j0 * vrow),
                         reinterpret<void?>(vbase + prow * vrow), int(nrows * vrow))
                 }
             }
@@ -844,55 +964,8 @@ def bar_dep(enc : MetalComputeEncoder?; var h : HazTrack; rmask, wmask : uint) {
 }
 
 
-// ===== fused-GEMV cat blobs + the pending-step (encode-ahead) machinery =====
+// ===== the pending-step (encode-ahead) machinery =====
 
-// fused-GEMV weight blobs: 2-3 tensors' q8 rows repacked into ONE contiguous block_q8_0 stream.
-// Own cache (NOT the per-tensor blob cache — different content under a colliding base address);
-// released in metal_decode_shutdown.
-var g_cat_blobs : table<uint64; MetalBuffer?>
-
-// one q8 region (rows x n) interleaved into `base` at block offset blk0 — the same 34B layout
-// as metal_blob_region, targeting a slice of a cat blob
-def repack_blocks(base : int8?; blk0 : int64; t : Model; off, rows, n : int64) {
-    let nblocks = rows * (n / 32l)
-    unsafe {
-        var qp = addr < int8? >(t.qblob[off])
-        if (t.wscale_f16) {
-            var sp16 = addr < uint16? >(t.qscales16[off / 32l])
-            for (b in range64(nblocks)) {
-                let o = (blk0 + b) * 34l
-                var pb = reinterpret<uint16?>(base + o)
-                pb[0] = sp16[b]
-                memcpy(reinterpret<void?>(base + o + 2l), reinterpret<void?>(qp + b * 32l), 32)
-            }
-        } else {
-            var sp = addr < float? >(t.qscales[off / 32l])
-            for (b in range64(nblocks)) {
-                let o = (blk0 + b) * 34l
-                var ph = reinterpret<float16?>(base + o)
-                ph[0] = float16(sp[b])
-                memcpy(reinterpret<void?>(base + o + 2l), reinterpret<void?>(qp + b * 32l), 32)
-            }
-        }
-    }
-}
-
-def blob_cat3(t : Model; off0, rows0, off1, rows1, off2, rows2, n : int64) : MetalBuffer? {
-    let key = intptr(unsafe(addr(t.qblob[off0])))
-    if (key_exists(g_cat_blobs, key)) {
-        return g_cat_blobs[key]
-    }
-    let nb = n / 32l
-    var buf = metal_new_buffer_untracked(g_dev, uint64((rows0 + rows1 + rows2) * nb * 34l))
-    var base = unsafe(reinterpret<int8?>(metal_buffer_contents(buf)))
-    repack_blocks(base, 0l, t, off0, rows0, n)
-    repack_blocks(base, rows0 * nb, t, off1, rows1, n)
-    if (rows2 > 0l) {
-        repack_blocks(base, (rows0 + rows1) * nb, t, off2, rows2, n)
-    }
-    g_cat_blobs[key] = buf
-    return buf
-}
 // the pending pipelined step (one deep): everything finish_pending_step needs to wait, read
 // back, and release AFTER the next step is committed behind it. Sessions are borrowed pointers
 // (caller-owned) — always cleared, never deleted.
@@ -915,7 +988,11 @@ var g_lp_nrows = 0l
 var g_lp_layers = 0l
 var g_lp_seq = 0l
 var g_lp_vocab = 0l
-var g_lp_rowb = 0l
+// hetero (gemma4): per-layer row bytes + slab bases within a mirror plane (uniform models:
+// lbase_l == l * cap * rowb_l — captured at encode, one array per step)
+var g_lp_lrowb : array<int64>
+var g_lp_lkbase : array<int64>   // per (row i, layer l) flattened i * n_layers + l (caps differ per row)
+var g_lp_lvbase : array<int64>
 var g_lp_prev_gpu_end = 0.0lf   // last finished step's gpu_end — the handoff stat's anchor
 
 // wait + read back + release the pending step; x_b writes back only on the sync CPU-classifier
@@ -965,12 +1042,13 @@ def finish_pending_step {
                 var sp = g_lp_sessions[i]
                 let pos = g_lp_positions[i]
                 let prow = kv_phys_row(*sp, pos)
-                let cap = g_lp_caps[i]
                 for (l in range64(g_lp_layers)) {
-                    memcpy(reinterpret<void?>(kv_layer_kbase(*sp, l, g_lp_seq) + prow * g_lp_rowb),
-                        reinterpret<void?>(ab + (g_lp_koffs[i] + uint64((l * cap + pos) * g_lp_rowb))), int(g_lp_rowb))
-                    memcpy(reinterpret<void?>(kv_layer_vbase(*sp, l, g_lp_seq) + prow * g_lp_rowb),
-                        reinterpret<void?>(ab + (g_lp_voffs[i] + uint64((l * cap + pos) * g_lp_rowb))), int(g_lp_rowb))
+                    let rowb_l = g_lp_lrowb[l]
+                    let fb = i * g_lp_layers + l
+                    memcpy(reinterpret<void?>(kv_layer_kbase(*sp, l, g_lp_seq) + prow * rowb_l),
+                        reinterpret<void?>(ab + (g_lp_koffs[i] + uint64(g_lp_lkbase[fb] + pos * rowb_l))), int(rowb_l))
+                    memcpy(reinterpret<void?>(kv_layer_vbase(*sp, l, g_lp_seq) + prow * rowb_l),
+                        reinterpret<void?>(ab + (g_lp_voffs[i] + uint64(g_lp_lvbase[fb] + pos * rowb_l))), int(rowb_l))
                 }
                 if (lgp != null) {
                     memcpy(addr < void? >(sp.logits[0]),
@@ -1058,16 +1136,6 @@ def weight_caches_flush_on_reload {
         return
     }
     finish_pending_step()
-    metal_blob_regions_release()
-    for (buf in values(g_cat_blobs)) {
-        if (buf != null) {
-            metal_release(buf)
-        }
-        buf = null
-    }
-    unsafe {
-        delete g_cat_blobs
-    }
     for (buf in values(g_regions)) {
         if (buf != null) {
             metal_release(buf)
@@ -1082,16 +1150,6 @@ def weight_caches_flush_on_reload {
 
 def metal_common_release {
     nc_logits_release()
-    metal_blob_regions_release()   // the batch mm path creates blobs in the prefill module's cache
-    for (buf in values(g_cat_blobs)) {
-        if (buf != null) {
-            metal_release(buf)
-        }
-        buf = null
-    }
-    unsafe {
-        delete g_cat_blobs
-    }
     for (mr in values(g_mirrors)) {
         mirror_release(mr)
     }
@@ -1145,14 +1203,20 @@ enum MetalPrefillDecline {
     quant_mode          // weights not loaded under QuantMode.q8
     kquant_native       // per-tensor K-quant planes: not readable as qblob offsets (kernels = W4)
     wscale_f16          // f16 scale plane (the load DEFAULT) — GPU prefill needs the s16 path (W2)
-    arch                // not the llama family graph
+    arch                // RETIRED (family waves A): the arch-name check is gone — non-std block
+                        // sets decline `graph`, feature-flag configs decline `feature` per bit
     backend_repack      // repack backend: interleaved weight layout unreadable by the GEMM kernel
-    config              // feature-flag config the kernels don't implement (neox/bias/qk-norm/softcap/...)
+    config              // RETIRED (family waves A): split into `feature` + the per-need
+                        // `need_*` keys in the declines-by-reason table
+    graph               // block set is not the std dense stack (MoE / recurrent / custom attn)
+    feature             // the model needs layer-stack features this path's kernels don't
+                        // implement — each missing bit records a `need_*` key alongside
     shape               // head/dim alignment outside the kernel grids
     layers              // per-layer non-uniformity (kv_dim/head_size/hidden/sliding/missing wv)
     rope_rows           // the window's rope table not built
     device              // metal_prefill_init failed (no device / PSO build failure)
     gpu_error           // dispatch failed at execution time
+    planar              // weights not in the blob-image form (the drivers are blob-only)
 }
 
 var g_prefill_declines = 0l
@@ -1166,6 +1230,13 @@ def decline(why : MetalPrefillDecline) {
     }
 }
 
+def decline(why : MetalPrefillDecline; missing : MetalNeed) {
+    g_prefill_declines++
+    g_prefill_declines_by_reason["{why}"]++
+    record_needs(g_prefill_declines_by_reason, missing)
+    require_or_panic("prefill", "{why} {missing}")
+}
+
 //! Declines-by-reason since load — reason name -> count (the first failing gate clause per
 //! declined prefill). The support-matrix test asserts WHY a config declined; the stage report
 //! prints it alongside the decode tables.
@@ -1173,59 +1244,3 @@ def public metal_prefill_declines() : table<string; int64> {
     return clone_to_move(g_prefill_declines_by_reason)
 }
 
-var g_blob_regions : table<uint64; MetalBuffer?>    // quant base address -> resident block_q8_0 blob (lcpp mul_mm path)
-var g_repack_us = 0l
-
-//! Release the shared block_q8_0 blob cache — BOTH drivers' shutdowns call this (the prefill
-//! and batch-decode drivers create blobs here), and each shutdown must leave the count at zero
-//! for the leak gates. Blobs lazily rebuild on the next use.
-def public metal_blob_regions_release {
-    for (buf in values(g_blob_regions)) {
-        if (buf != null) {
-            metal_release(buf)
-        }
-        buf = null
-    }
-    unsafe {
-        delete g_blob_regions
-    }
-    g_repack_us = 0l
-}
-
-//! Resident block_q8_0 blob for one weight region — llama.cpp's mul_mm layout (34B blocks: half
-//! scale + 32 int8 quants), cached by quant base address, shared across prefill/batch-decode.
-//! `s16` reads raw f16 bits; f32->f16 narrowing is exact for GGUF-q8_0-sourced weights.
-def public metal_blob_region(dev : MetalDevice?; qsrc, ssrc : void?; rows, k : int64; s16 : bool) : MetalBuffer? {
-    // the scale encoding is part of the identity: the same quant region blobbed under f32 vs raw
-    // f16 scales must not share a cache slot (the top bit is never set in a user-space address)
-    let key = intptr(qsrc) | (s16 ? 0x8000000000000000ul : 0ul)
-    if (key_exists(g_blob_regions, key)) {
-        return g_blob_regions[key]
-    }
-    let ts = ref_time_ticks()
-    let nblocks = int(rows * (k / 32l))
-    var buf = metal_new_buffer_untracked(dev, uint64(nblocks) * 34ul)
-    var base = unsafe(reinterpret<int8?>(metal_buffer_contents(buf)))
-    var qp = unsafe(reinterpret<int8?>(qsrc))
-    var sp = unsafe(reinterpret<float?>(ssrc))
-    var sp16 = unsafe(reinterpret<uint16?>(ssrc))
-    for (b in range(nblocks)) {
-        let off = b * 34
-        unsafe {
-            if (s16) {
-                var pb = reinterpret<uint16?>(base + off)
-                pb[0] = sp16[b]
-            } else {
-                var ph = reinterpret<float16?>(base + off)
-                ph[0] = float16(sp[b])
-            }
-            let src = b * 32
-            for (c in range(32)) {
-                base[off + 2 + c] = qp[src + c]
-            }
-        }
-    }
-    g_blob_regions[key] = buf
-    g_repack_us += int64(get_time_usec(ts))
-    return buf
-}

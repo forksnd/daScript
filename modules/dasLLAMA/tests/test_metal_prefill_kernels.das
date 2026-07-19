@@ -7,13 +7,11 @@ require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — the P
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — device/pipeline/buffer plumbing + the leak gate
 require math
 
-// The Phase-6 GPU prefill kernels vs their dasLLAMA CPU twins on synthetic data. Quantize gets a
-// bit-exact scenario (planted ±127 per 32-block makes every scale exactly 1.0, so quants are
-// round(x) of integer values) plus an arbitrary-data scenario (scales compare within tolerance;
-// quants may sit on a rounding boundary, so one quantum of slack). rmsnorm / rope / swiglu /
-// attention compare within the shared fp tolerance (reduction order, hardware exp vs the CPU's
-// exp/exp4 — all inside 1e-4 relative); the residual add is bit-exact (one fadd both sides).
-// Off-Apple (or with no Metal device) everything feints cleanly.
+// The Phase-6 GPU prefill kernels vs their dasLLAMA CPU twins on synthetic data. rmsnorm /
+// rope / swiglu / attention compare within the shared fp tolerance (reduction order, hardware
+// exp vs the CPU's exp/exp4 — all inside 1e-4 relative); the residual add is bit-exact (one
+// fadd both sides); the blob GEMV gets exact-arithmetic data (pow2 scales). Off-Apple (or with
+// no Metal device) everything feints cleanly.
 
 // attention shape: GQA with 2 queries per kv head, small enough to hand-oracle; NPOS is
 // deliberately NOT a 32-multiple (np32 = 64) so the padded-slab rails are exercised
@@ -31,10 +29,6 @@ let NROWS = 6
 let DIM = 128
 let HIDDEN = 64
 let EPS = 1.0e-5
-
-// quantize shape
-let QN = 64                             // row width (2 blocks)
-let QTOK = 5
 
 def private approx(x, y : float) : bool {
     return abs(x - y) <= 1e-4 * max(1.0, max(abs(x), abs(y)))
@@ -121,6 +115,9 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
     // qrows = np32 (the score slab's row extent == the padded query count here)
     var bqoff = buf_u32(dev, 0u)
     var bqrows = buf_u32(dev, uint(np32))
+    // the wave-B gemma uniforms at their llama-shape values: no sliding window, no soft cap
+    var bwin0 = buf_u32(dev, 0u)
+    var bcap0 = buf_f32(dev, 0.0)
     let aran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso_sc)
         metal_set_threadgroup_memory_length(enc, mm ? metal_attn_qk_mm_msl_tgmem : metal_attn_qk_msl_tgmem, 0)
@@ -136,6 +133,7 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
         metal_set_buffer(enc, bscale, 0ul, 9)
         metal_set_buffer(enc, bqoff, 0ul, 10)
         metal_set_buffer(enc, bqrows, 0ul, 11)
+        metal_set_buffer(enc, bwin0, 0ul, 12)
         metal_dispatch_threadgroups(enc, uint3(uint(np32 / 32), uint(np32 / (mm ? 64 : 32)), uint(n_heads)), uint3(128u, 1u, 1u))
         metal_set_pipeline(enc, pso_sm)
         metal_set_threadgroup_memory_length(enc, metal_attn_softmax_msl_tgmem, 0)
@@ -143,6 +141,8 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
         metal_set_buffer(enc, bnp32, 0ul, 1)
         metal_set_buffer(enc, bqoff, 0ul, 2)
         metal_set_buffer(enc, bqrows, 0ul, 3)
+        metal_set_buffer(enc, bwin0, 0ul, 4)
+        metal_set_buffer(enc, bcap0, 0ul, 5)
         metal_dispatch_threadgroups(enc, uint3(uint(npos), uint(n_heads), 1u), uint3(128u, 1u, 1u))
         metal_set_pipeline(enc, pso_av)
         metal_set_threadgroup_memory_length(enc, mm ? metal_attn_av_mm_msl_tgmem : metal_attn_av_msl_tgmem, 0)
@@ -177,6 +177,8 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
     metal_release(bscale)
     metal_release(bqoff)
     metal_release(bqrows)
+    metal_release(bwin0)
+    metal_release(bcap0)
     metal_release(pso_sc)
     metal_release(pso_sm)
     metal_release(pso_av)
@@ -198,65 +200,6 @@ def test_metal_prefill_kernels(t : T?) {
                 }
                 var queue = metal_new_command_queue(dev)
                 var err : string
-
-                // ===== quantize: exact scenario (planted ±127 -> d == 1.0) =====
-                var pso_quant = pipeline_from_source(dev, metal_q8_quant_msl, metal_q8_quant_msl_entry, metal_q8_quant_msl_fastmath, err)
-                t |> success(pso_quant != null, "quant pipeline: {err}")
-                var qx : array<float>
-                qx |> resize(QTOK * QN)
-                for (k in range(QTOK * QN)) {
-                    qx[k] = float(k * 37 % 231 - 115)           // integers in [-115, 115]
-                }
-                for (b in range(QTOK * QN / 32)) {
-                    qx[b * 32 + b % 32] = (b % 2 == 0) ? 127.0 : -127.0     // plant the amax
-                }
-                var want_q : array<int8>
-                var want_s : array<float>
-                want_q |> resize(QTOK * QN)
-                want_s |> resize(QTOK * QN / 32)
-                quantize_q8_0_into(qx, int64(QTOK * QN), want_q, want_s, 0l, 0l)    // one flat row == same per-32-block math
-                var bqx = buf_upload(dev, qx)
-                var bxq = buf_fill(dev, QTOK * QN, int8(0))
-                var bxs = buf_fill(dev, QTOK * QN / 32, 0.0)
-                var bqn = buf_u32(dev, uint(QN))
-                var bqblk = buf_u32(dev, uint(QTOK * QN / 32))
-                var qbufs <- [bqx, bxq, bxs, bqn, bqblk]
-                let qran = run_compute_1d(queue, pso_quant, qbufs, uint(QTOK * QN / 32), 64u, err)
-                t |> success(qran, "quant dispatch: {err}")
-                t |> equal(buf_mismatch_exact(bxq, want_q), 0)      // d == 1.0: quants bit-exact
-                t |> equal(buf_mismatch_exact(bxs, want_s), 0)      // scales exactly 1.0 both sides
-                // arbitrary data: scales within tolerance, quants within one rounding quantum
-                for (k in range(QTOK * QN)) {
-                    qx[k] = 0.37 * float(k % 53) - 9.5 + 0.013 * float(k % 7)
-                }
-                quantize_q8_0_into(qx, int64(QTOK * QN), want_q, want_s, 0l, 0l)
-                buf_store(bqx, qx)
-                let qran2 = run_compute_1d(queue, pso_quant, qbufs, uint(QTOK * QN / 32), 64u, err)
-                t |> success(qran2, "quant dispatch 2: {err}")
-                let got_q <- buf_download(bxq, QTOK * QN, type<int8>)
-                let got_s <- buf_download(bxs, QTOK * QN / 32, type<float>)
-                var bad = 0
-                for (k in range(QTOK * QN)) {
-                    if (abs(int(got_q[k]) - int(want_q[k])) > 1) {
-                        bad++
-                    }
-                }
-                for (k in range(QTOK * QN / 32)) {
-                    if (!approx(got_s[k], want_s[k])) {
-                        bad++
-                    }
-                }
-                t |> equal(bad, 0)
-                qbufs |> clear()
-                unsafe {
-                    delete qbufs
-                }
-                metal_release(bqx)
-                metal_release(bxq)
-                metal_release(bxs)
-                metal_release(bqn)
-                metal_release(bqblk)
-                metal_release(pso_quant)
 
                 // ===== rmsnorm =====
                 var pso_rms = pipeline_from_source(dev, metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, err)
@@ -335,7 +278,8 @@ def test_metal_prefill_kernels(t : T?) {
                 var brn = buf_u32(dev, uint(QD))
                 var brhs = buf_u32(dev, uint(HEAD_SIZE))
                 var brnp = buf_u32(dev, uint(NPOS * QD / 2))
-                var ropebufs <- [brv, brc, brs, brn, brhs, brnp]
+                var brnx = buf_u32(dev, 0u)
+                var ropebufs <- [brv, brc, brs, brn, brhs, brnp, brnx]
                 let roperan = run_compute_1d(queue, pso_rope, ropebufs, uint(NPOS * QD / 2), 64u, err)
                 t |> success(roperan, "rope dispatch: {err}")
                 t |> equal(buf_mismatch_approx(brv, rvwant), 0)
@@ -344,6 +288,31 @@ def test_metal_prefill_kernels(t : T?) {
                     delete ropebufs
                 }
                 metal_release(brv)
+                metal_release(brnx)
+
+                // ===== the same kernel, NEOX pairing (j, j+half) — vs rope_scaled_neox_tab =====
+                for (k in range(NPOS * QD)) {
+                    rv[k] = 0.13 * float(k % 37) - 1.9
+                    rvwant[k] = rv[k]
+                }
+                unsafe {
+                    for (p in range(NPOS)) {
+                        rope_scaled_neox_tab(addr(rvwant[p * QD]), int64(HEAD_SIZE), int64(QD),
+                            addr<float const?>(rcos[p * half]), addr<float const?>(rsin[p * half]))
+                    }
+                }
+                var brv2 = buf_upload(dev, rv)
+                var brnx1 = buf_u32(dev, 1u)
+                var ropebufs2 <- [brv2, brc, brs, brn, brhs, brnp, brnx1]
+                let roperan2 = run_compute_1d(queue, pso_rope, ropebufs2, uint(NPOS * QD / 2), 64u, err)
+                t |> success(roperan2, "rope NEOX dispatch: {err}")
+                t |> equal(buf_mismatch_approx(brv2, rvwant), 0)
+                ropebufs2 |> clear()
+                unsafe {
+                    delete ropebufs2
+                }
+                metal_release(brv2)
+                metal_release(brnx1)
                 metal_release(brc)
                 metal_release(brs)
                 metal_release(brn)
@@ -400,7 +369,8 @@ def test_metal_prefill_kernels(t : T?) {
                 for (k in range(total)) {
                     add_want[k] = sg_gpu[k] + su[k]
                 }
-                var addbufs <- [bsg, bsu, btot]
+                var bone_add = buf_f32(dev, 1.0)   // the wave-B ascale slot at its identity (exact: *1.0)
+                var addbufs <- [bsg, bsu, btot, bone_add]
                 let addran = run_compute_1d(queue, pso_add, addbufs, uint(total), 64u, err)
                 t |> success(addran, "add dispatch: {err}")
                 t |> equal(buf_mismatch_exact(bsg, add_want), 0)
@@ -408,9 +378,24 @@ def test_metal_prefill_kernels(t : T?) {
                 unsafe {
                     delete addbufs
                 }
+                // flat copy (the gemma4 V-from-K panel copy): y = x, bit-exact
+                var pso_cp = pipeline_from_source(dev, metal_pf_copy_msl, metal_pf_copy_msl_entry, metal_pf_copy_msl_fastmath, err)
+                t |> success(pso_cp != null, "pf_copy pipeline: {err}")
+                var bcp = buf_upload(dev, su)   // pre-filled — fully overwritten by the copy
+                var cpbufs <- [bcp, bsg, btot]
+                let cpran = run_compute_1d(queue, pso_cp, cpbufs, uint(total), 64u, err)
+                t |> success(cpran, "pf_copy dispatch: {err}")
+                t |> equal(buf_mismatch_exact(bcp, add_want), 0)
+                cpbufs |> clear()
+                unsafe {
+                    delete cpbufs
+                }
+                metal_release(bcp)
+                metal_release(pso_cp)
                 metal_release(bsg)
                 metal_release(bsu)
                 metal_release(btot)
+                metal_release(bone_add)
                 metal_release(pso_sw)
                 metal_release(pso_add)
 
@@ -434,8 +419,9 @@ def test_metal_prefill_kernels(t : T?) {
     }
 }
 
-// The classifier GEMV kernel on exact-arithmetic data: [d x n] Q8 rows dot one f32 vector vs
-// a direct CPU dot, BIT-exact (see the call site for why exactness holds).
+// The classifier GEMV kernel on exact-arithmetic data: [d x n] Q8 rows (the 34B blob form —
+// half scale + 32 int8, mulmm_gate's layout) dot one f32 vector vs a direct CPU dot,
+// BIT-exact (see the call site for why exactness holds; pow2 scales are exact in f16).
 def private gemv_gate(t : T?; dev, queue; n, d : int) {
     var err : string
     var pso = pipeline_from_source(dev, metal_q8_gemv_msl, metal_q8_gemv_msl_entry, metal_q8_gemv_msl_fastmath, err)
@@ -469,16 +455,27 @@ def private gemv_gate(t : T?; dev, queue; n, d : int) {
         }
         want[r] = acc
     }
-    var bwq = buf_upload(dev, wq)
-    var bws = buf_upload(dev, ws)
+    // W blob: 34-byte blocks, built straight in the buffer (bound TWICE — half + byte views)
+    var bw = metal_new_buffer(dev, uint64(d * nblk * 34))
+    unsafe {
+        var base = reinterpret<int8?>(metal_buffer_contents(bw))
+        for (b in range(d * nblk)) {
+            let off = b * 34
+            var ph = reinterpret<float16?>(base + off)
+            ph[0] = float16(ws[b])
+            for (c in range(32)) {
+                base[off + 2 + c] = wq[b * 32 + c]
+            }
+        }
+    }
     var bx = buf_upload(dev, xv)
     var by = buf_fill(dev, d, -1000.0)
     var bn = buf_u32(dev, uint(n))
     var bd = buf_u32(dev, uint(d))
     let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso)
-        metal_set_buffer(enc, bwq, 0ul, 0)
-        metal_set_buffer(enc, bws, 0ul, 1)
+        metal_set_buffer(enc, bw, 0ul, 0)   // half-scale view
+        metal_set_buffer(enc, bw, 0ul, 1)   // byte view
         metal_set_buffer(enc, bx, 0ul, 2)
         metal_set_buffer(enc, by, 0ul, 3)
         metal_set_buffer(enc, bn, 0ul, 4)
@@ -487,8 +484,7 @@ def private gemv_gate(t : T?; dev, queue; n, d : int) {
     }
     t |> success(ran, "gemv dispatch n={n} d={d}: {err}")
     t |> equal(buf_mismatch_exact(by, want), 0)
-    metal_release(bwq)
-    metal_release(bws)
+    metal_release(bw)
     metal_release(bx)
     metal_release(by)
     metal_release(bn)

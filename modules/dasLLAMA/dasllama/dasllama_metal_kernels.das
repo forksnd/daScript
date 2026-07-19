@@ -35,8 +35,9 @@ class MetalSqAttnF16 {
     @uniform @binding = 7 kv_mul : uint
     @uniform @binding = 8 hs : uint         // head_size == threads per group
     @uniform @binding = 9 scale : float
+    @uniform @binding = 10 softcap : float  // > 0 = attention-logit soft cap (gemma2)
     @workgroup scores : float[128]  // >= ATTN_CHUNK_ROWS — the single-tg depth ceiling
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn16_msl")]
     def metal_sq_attn16 {
@@ -58,6 +59,18 @@ class MetalSqAttnF16 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = j * kv_dim + khoff + sl * epl
@@ -71,9 +84,36 @@ class MetalSqAttnF16 {
             if (epl > 3u) {
                 s += q3 * float(kc[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kc[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kc[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kc[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kc[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kc[kb + 8u])
+                s += q9 * float(kc[kb + 9u])
+                s += q10 * float(kc[kb + 10u])
+                s += q11 * float(kc[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kc[kb + 12u])
+                s += q13 * float(kc[kb + 13u])
+                s += q14 * float(kc[kb + 14u])
+                s += q15 * float(kc[kb + 15u])
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -158,8 +198,9 @@ class MetalSqAttnF32 {
     @uniform @binding = 7 kv_mul : uint
     @uniform @binding = 8 hs : uint
     @uniform @binding = 9 scale : float
+    @uniform @binding = 10 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn32_msl")]
     def metal_sq_attn32 {
@@ -178,6 +219,18 @@ class MetalSqAttnF32 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = j * kv_dim + khoff + sl * epl
@@ -191,9 +244,36 @@ class MetalSqAttnF32 {
             if (epl > 3u) {
                 s += q3 * kc[kb + 3u]
             }
+            if (epl > 4u) {
+                s += q4 * kc[kb + 4u]
+            }
+            if (epl > 5u) {
+                s += q5 * kc[kb + 5u]
+            }
+            if (epl > 6u) {
+                s += q6 * kc[kb + 6u]
+            }
+            if (epl > 7u) {
+                s += q7 * kc[kb + 7u]
+            }
+            if (epl > 8u) {
+                s += q8 * kc[kb + 8u]
+                s += q9 * kc[kb + 9u]
+                s += q10 * kc[kb + 10u]
+                s += q11 * kc[kb + 11u]
+            }
+            if (epl > 12u) {
+                s += q12 * kc[kb + 12u]
+                s += q13 * kc[kb + 13u]
+                s += q14 * kc[kb + 14u]
+                s += q15 * kc[kb + 15u]
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -279,8 +359,9 @@ class MetalSqAttnQ8 {
     @uniform @binding = 9 kv_mul : uint
     @uniform @binding = 10 hs : uint        // head_size == threads per group
     @uniform @binding = 11 scale : float
+    @uniform @binding = 12 softcap : float
     @workgroup scores : float[128]  // >= ATTN_CHUNK_ROWS — the single-tg depth ceiling
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_q8_msl")]
     def metal_sq_attn_q8 {
@@ -300,6 +381,18 @@ class MetalSqAttnQ8 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u               // lane's block within the head
         let ib = (sl * epl) % 32u               // lane's quant offset within the block
         var j = sg
@@ -317,9 +410,36 @@ class MetalSqAttnQ8 {
             if (epl > 3u) {
                 s += q3 * float(kqb[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kqb[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kqb[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kqb[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kqb[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kqb[kb + 8u])
+                s += q9 * float(kqb[kb + 9u])
+                s += q10 * float(kqb[kb + 10u])
+                s += q11 * float(kqb[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kqb[kb + 12u])
+                s += q13 * float(kqb[kb + 13u])
+                s += q14 * float(kqb[kb + 14u])
+                s += q15 * float(kqb[kb + 15u])
+            }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -414,8 +534,9 @@ class MetalSqAttnTq4 {
     @uniform @binding = 9 kv_mul : uint
     @uniform @binding = 10 hs : uint
     @uniform @binding = 11 scale : float
+    @uniform @binding = 12 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_tq4_msl")]
     def metal_sq_attn_tq4 {
@@ -434,6 +555,18 @@ class MetalSqAttnTq4 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u          // this lane's element offset inside its block
         var j = sg
@@ -454,10 +587,39 @@ class MetalSqAttnTq4 {
                     s += q2 * float(int(by1 & 15u) - 8)
                     s += q3 * float(int(by1 >> 4u) - 8)
                 }
+                if (epl > 4u) {
+                    let by2 = uint(kqb[kb + 2u])
+                    s += q4 * float(int(by2 & 15u) - 8)
+                    s += q5 * float(int(by2 >> 4u) - 8)
+                }
+                if (epl > 6u) {
+                    let by3 = uint(kqb[kb + 3u])
+                    s += q6 * float(int(by3 & 15u) - 8)
+                    s += q7 * float(int(by3 >> 4u) - 8)
+                }
+                if (epl > 8u) {
+                    let by4 = uint(kqb[kb + 4u])
+                    let by5 = uint(kqb[kb + 5u])
+                    s += q8 * float(int(by4 & 15u) - 8)
+                    s += q9 * float(int(by4 >> 4u) - 8)
+                    s += q10 * float(int(by5 & 15u) - 8)
+                    s += q11 * float(int(by5 >> 4u) - 8)
+                }
+                if (epl > 12u) {
+                    let by6 = uint(kqb[kb + 6u])
+                    let by7 = uint(kqb[kb + 7u])
+                    s += q12 * float(int(by6 & 15u) - 8)
+                    s += q13 * float(int(by6 >> 4u) - 8)
+                    s += q14 * float(int(by7 & 15u) - 8)
+                    s += q15 * float(int(by7 >> 4u) - 8)
+                }
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -539,8 +701,10 @@ class MetalSqAttnPartF16 {
     @uniform @binding = 8 hs : uint
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 nchunks : uint
+    @uniform @binding = 11 softcap : float  // > 0 = attention-logit soft cap (gemma2)
+    @uniform @binding = 12 window : uint    // > 0 = sliding span: rows < cnt - window are masked
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part16_msl")]
     def metal_sq_attn_part16 {
@@ -555,6 +719,12 @@ class MetalSqAttnPartF16 {
         let c0 = ci * 64u
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         // pass 1: simdgroup-cooperative score fill over this chunk's rows (coalesced K loads,
         // loop-invariant q hoisted to registers)
         let sg = gl_SubgroupID
@@ -565,6 +735,18 @@ class MetalSqAttnPartF16 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = (c0 + j) * kv_dim + khoff + sl * epl
@@ -578,14 +760,52 @@ class MetalSqAttnPartF16 {
             if (epl > 3u) {
                 s += q3 * float(kc[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kc[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kc[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kc[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kc[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kc[kb + 8u])
+                s += q9 * float(kc[kb + 9u])
+                s += q10 * float(kc[kb + 10u])
+                s += q11 * float(kc[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kc[kb + 12u])
+                s += q13 * float(kc[kb + 13u])
+                s += q14 * float(kc[kb + 14u])
+                s += q15 * float(kc[kb + 15u])
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
         barrier()
         // pass 2a: chunk max
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -671,8 +891,10 @@ class MetalSqAttnPartF32 {
     @uniform @binding = 8 hs : uint
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 nchunks : uint
+    @uniform @binding = 11 softcap : float
+    @uniform @binding = 12 window : uint
     @workgroup scores : float[64]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part32_msl")]
     def metal_sq_attn_part32 {
@@ -687,6 +909,12 @@ class MetalSqAttnPartF32 {
         let c0 = ci * 64u
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -695,6 +923,18 @@ class MetalSqAttnPartF32 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = (c0 + j) * kv_dim + khoff + sl * epl
@@ -708,13 +948,51 @@ class MetalSqAttnPartF32 {
             if (epl > 3u) {
                 s += q3 * kc[kb + 3u]
             }
+            if (epl > 4u) {
+                s += q4 * kc[kb + 4u]
+            }
+            if (epl > 5u) {
+                s += q5 * kc[kb + 5u]
+            }
+            if (epl > 6u) {
+                s += q6 * kc[kb + 6u]
+            }
+            if (epl > 7u) {
+                s += q7 * kc[kb + 7u]
+            }
+            if (epl > 8u) {
+                s += q8 * kc[kb + 8u]
+                s += q9 * kc[kb + 9u]
+                s += q10 * kc[kb + 10u]
+                s += q11 * kc[kb + 11u]
+            }
+            if (epl > 12u) {
+                s += q12 * kc[kb + 12u]
+                s += q13 * kc[kb + 13u]
+                s += q14 * kc[kb + 14u]
+                s += q15 * kc[kb + 15u]
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -801,8 +1079,10 @@ class MetalSqAttnPartQ8 {
     @uniform @binding = 10 hs : uint
     @uniform @binding = 11 scale : float
     @uniform @binding = 12 nchunks : uint
+    @uniform @binding = 13 softcap : float
+    @uniform @binding = 14 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_q8_msl")]
     def metal_sq_attn_part_q8 {
@@ -817,6 +1097,12 @@ class MetalSqAttnPartQ8 {
         let c0 = ci * 64u
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         // pass 1: simdgroup-cooperative score fill over this chunk's rows
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
@@ -826,6 +1112,18 @@ class MetalSqAttnPartQ8 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let ib = (sl * epl) % 32u
         var j = sg
@@ -843,14 +1141,52 @@ class MetalSqAttnPartQ8 {
             if (epl > 3u) {
                 s += q3 * float(kqb[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kqb[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kqb[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kqb[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kqb[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kqb[kb + 8u])
+                s += q9 * float(kqb[kb + 9u])
+                s += q10 * float(kqb[kb + 10u])
+                s += q11 * float(kqb[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kqb[kb + 12u])
+                s += q13 * float(kqb[kb + 13u])
+                s += q14 * float(kqb[kb + 14u])
+                s += q15 * float(kqb[kb + 15u])
+            }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
         barrier()
         // pass 2a: chunk max
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -946,8 +1282,10 @@ class MetalSqAttnPartTq4 {
     @uniform @binding = 10 hs : uint
     @uniform @binding = 11 scale : float
     @uniform @binding = 12 nchunks : uint
+    @uniform @binding = 13 softcap : float
+    @uniform @binding = 14 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_tq4_msl")]
     def metal_sq_attn_part_tq4 {
@@ -962,6 +1300,12 @@ class MetalSqAttnPartTq4 {
         let c0 = ci * 64u
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -970,6 +1314,18 @@ class MetalSqAttnPartTq4 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u
         var j = sg
@@ -990,14 +1346,54 @@ class MetalSqAttnPartTq4 {
                     s += q2 * float(int(by1 & 15u) - 8)
                     s += q3 * float(int(by1 >> 4u) - 8)
                 }
+                if (epl > 4u) {
+                    let by2 = uint(kqb[kb + 2u])
+                    s += q4 * float(int(by2 & 15u) - 8)
+                    s += q5 * float(int(by2 >> 4u) - 8)
+                }
+                if (epl > 6u) {
+                    let by3 = uint(kqb[kb + 3u])
+                    s += q6 * float(int(by3 & 15u) - 8)
+                    s += q7 * float(int(by3 >> 4u) - 8)
+                }
+                if (epl > 8u) {
+                    let by4 = uint(kqb[kb + 4u])
+                    let by5 = uint(kqb[kb + 5u])
+                    s += q8 * float(int(by4 & 15u) - 8)
+                    s += q9 * float(int(by4 >> 4u) - 8)
+                    s += q10 * float(int(by5 & 15u) - 8)
+                    s += q11 * float(int(by5 >> 4u) - 8)
+                }
+                if (epl > 12u) {
+                    let by6 = uint(kqb[kb + 6u])
+                    let by7 = uint(kqb[kb + 7u])
+                    s += q12 * float(int(by6 & 15u) - 8)
+                    s += q13 * float(int(by6 >> 4u) - 8)
+                    s += q14 * float(int(by7 & 15u) - 8)
+                    s += q15 * float(int(by7 >> 4u) - 8)
+                }
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -1072,6 +1468,7 @@ class MetalSqAttnComb {
     @uniform @binding = 2 nchunks : uint
     @uniform @binding = 3 nheads : uint
     @uniform @binding = 4 hs : uint
+    @uniform @binding = 5 chlo : uint       // first live chunk (sliding: chunks below the window are unwritten)
 
     [metal_kernel(name="metal_sq_attn_comb_msl")]
     def metal_sq_attn_comb {
@@ -1081,14 +1478,14 @@ class MetalSqAttnComb {
         let lid = gl_LocalInvocationID.x
         let base = (bb * nheads + h) * nchunks
         var mm = -3.0e38
-        var ci = 0u
+        var ci = chlo
         while (ci < nchunks) {
             mm = max(mm, part[(base + ci) * (hs + 2u) + hs])
             ci++
         }
         var acc = 0.0
         var l = 0.0
-        ci = 0u
+        ci = chlo
         while (ci < nchunks) {
             let pb = (base + ci) * (hs + 2u)
             let w = exp(part[pb + hs] - mm)
@@ -1100,12 +1497,13 @@ class MetalSqAttnComb {
     }
 }
 
-// Fused QKV GEMV + rope + KV-row store: element pairs (2r, 2r+1) of q/k ARE weight rows 2r, 2r+1
-// of the fused QKV region, so one simdgroup holds a whole rope pair in registers after its two
-// row dots. Deletes the separate rope_store dispatch entirely.
+// The 2-rows-per-simdgroup fused QKV GEMV + rope + KV-row store: the rope pair's two elements
+// of q/k ARE two weight rows of the fused region — adjacent (2p, 2p+1) under NORM, (r, r+hs/2)
+// within the head under NEOX. Deletes the separate rope_store dispatch entirely.
 class MetalQ8GemvQkvRsF16 {
-    @ssbo @binding = 0 wq : array<byte4>    // fused QKV rows (concat region)
-    @ssbo @binding = 1 ws : array<float16>  // fused scale planes, halfwords
+    @ssbo @binding = 0 wqbq : array<int8>   // wq blob, byte view @ the q tensor's byte offset
+    @ssbo @binding = 1 wshq : array<float16>   // ... half-scale view (same offset). Segments bind
+                                            // separately — kind-major layout keeps q/k/v apart
     @ssbo @binding = 2 x : array<float4>
     @ssbo @binding = 3 qo : array<float>    // q out, roped ([0, qd) of the QKV buffer)
     @ssbo @binding = 4 kd : array<float16>  // mirror K row (bound at the row offset)
@@ -1117,12 +1515,30 @@ class MetalQ8GemvQkvRsF16 {
     @uniform @binding = 10 qd : uint
     @uniform @binding = 11 kvd : uint
     @uniform @binding = 12 hs : uint
+    @uniform @binding = 13 neox : uint      // rope pair = rows (r, r+hs/2) instead of (2p, 2p+1)
+    @ssbo @binding = 14 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @uniform @binding = 15 has_bias : uint
+    @ssbo @binding = 16 wqbk : array<int8>  // wk blob views
+    @ssbo @binding = 17 wshk : array<float16>
+    @ssbo @binding = 18 wqbv : array<int8>  // wv blob views
+    @ssbo @binding = 19 wshv : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs16_msl")]
     def metal_q8_gemv_qkv_rs16 {
-        let row = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * 2u
-        if (row >= ddim) {
+        let pr = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (pr * 2u >= ddim) {
             return
+        }
+        // the simdgroup's two rows ARE the rope pair: adjacent under NORM; (r, r+half) within
+        // the row's head under NEOX for the q/k ranges (v rows stay adjacent — no rope)
+        let half = hs / 2u
+        var row = pr * 2u
+        var row2 = row + 1u
+        if (neox != 0u && row < qd + kvd) {
+            let lp = row < qd ? pr : pr - qd / 2u
+            let seg = row < qd ? 0u : qd
+            row = seg + (lp / half) * hs + lp % half
+            row2 = row + half
         }
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
@@ -1130,32 +1546,72 @@ class MetalQ8GemvQkvRsF16 {
         var acc0 = 0.0
         var acc1 = 0.0
         var k = lane
-        while (k < nb4) {
-            let x4 = x[k]
-            let w0 = float4(int4(wq[row * nb4 + k]))
-            let w1 = float4(int4(wq[(row + 1u) * nb4 + k]))
-            acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(ws[row * nb + k / 8u])
-            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[(row + 1u) * nb + k / 8u])
-            k += gl_SubgroupSize
+        // both pair rows sit in ONE segment (qd/kvd even, NEOX pairs stay in-head) — dot them
+        // off that segment's blob views with segment-LOCAL rows
+        if (row < qd) {
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (row * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (row2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbq[qb0]), float(wqbq[qb0 + 1u]), float(wqbq[qb0 + 2u]), float(wqbq[qb0 + 3u]))
+                let w1 = float4(float(wqbq[qb1]), float(wqbq[qb1 + 1u]), float(wqbq[qb1 + 2u]), float(wqbq[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshq[(row * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshq[(row2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
+        } elif (row < qd + kvd) {
+            let lr = row - qd
+            let lr2 = row2 - qd
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (lr * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (lr2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbk[qb0]), float(wqbk[qb0 + 1u]), float(wqbk[qb0 + 2u]), float(wqbk[qb0 + 3u]))
+                let w1 = float4(float(wqbk[qb1]), float(wqbk[qb1 + 1u]), float(wqbk[qb1 + 2u]), float(wqbk[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshk[(lr * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshk[(lr2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
+        } else {
+            let lr = row - qd - kvd
+            let lr2 = row2 - qd - kvd
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (lr * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (lr2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbv[qb0]), float(wqbv[qb0 + 1u]), float(wqbv[qb0 + 2u]), float(wqbv[qb0 + 3u]))
+                let w1 = float4(float(wqbv[qb1]), float(wqbv[qb1 + 1u]), float(wqbv[qb1 + 2u]), float(wqbv[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshv[(lr * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshv[(lr2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
         }
         acc0 = simd_sum(acc0)
         acc1 = simd_sum(acc1)
         if (lane != 0u) {
             return
         }
+        if (has_bias != 0u) {
+            acc0 += bias[row]
+            acc1 += bias[row2]
+        }
         if (row < qd) {
-            let j = (row % hs) / 2u
+            let j = neox != 0u ? row % hs : (row % hs) / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
             qo[row] = acc0 * fcr - acc1 * fci
-            qo[row + 1u] = acc0 * fci + acc1 * fcr
+            qo[row2] = acc0 * fci + acc1 * fcr
         } elif (row < qd + kvd) {
             let ik = row - qd
-            let j = (ik % hs) / 2u
+            let ik2 = row2 - qd
+            let j = neox != 0u ? ik % hs : (ik % hs) / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
             kd[ik] = float16(min(max(acc0 * fcr - acc1 * fci, -65504.0), 65504.0))   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
-            kd[ik + 1u] = float16(min(max(acc0 * fci + acc1 * fcr, -65504.0), 65504.0))   // nolint:STYLE019
+            kd[ik2] = float16(min(max(acc0 * fci + acc1 * fcr, -65504.0), 65504.0))   // nolint:STYLE019
         } else {
             let iv = row - qd - kvd
             vd[iv] = float16(min(max(acc0, -65504.0), 65504.0))   // nolint:STYLE019
@@ -1166,8 +1622,8 @@ class MetalQ8GemvQkvRsF16 {
 
 // f32-mirror twin — straight stores, no clamp.
 class MetalQ8GemvQkvRsF32 {
-    @ssbo @binding = 0 wq : array<byte4>
-    @ssbo @binding = 1 ws : array<float16>
+    @ssbo @binding = 0 wqbq : array<int8>   // per-segment blob views — the F16 twin's scheme
+    @ssbo @binding = 1 wshq : array<float16>
     @ssbo @binding = 2 x : array<float4>
     @ssbo @binding = 3 qo : array<float>
     @ssbo @binding = 4 kd : array<float>
@@ -1179,12 +1635,28 @@ class MetalQ8GemvQkvRsF32 {
     @uniform @binding = 10 qd : uint
     @uniform @binding = 11 kvd : uint
     @uniform @binding = 12 hs : uint
+    @uniform @binding = 13 neox : uint
+    @ssbo @binding = 14 bias : array<float>
+    @uniform @binding = 15 has_bias : uint
+    @ssbo @binding = 16 wqbk : array<int8>
+    @ssbo @binding = 17 wshk : array<float16>
+    @ssbo @binding = 18 wqbv : array<int8>
+    @ssbo @binding = 19 wshv : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs32_msl")]
     def metal_q8_gemv_qkv_rs32 {
-        let row = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * 2u
-        if (row >= ddim) {
+        let pr = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (pr * 2u >= ddim) {
             return
+        }
+        let half = hs / 2u
+        var row = pr * 2u
+        var row2 = row + 1u
+        if (neox != 0u && row < qd + kvd) {
+            let lp = row < qd ? pr : pr - qd / 2u
+            let seg = row < qd ? 0u : qd
+            row = seg + (lp / half) * hs + lp % half
+            row2 = row + half
         }
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
@@ -1192,32 +1664,70 @@ class MetalQ8GemvQkvRsF32 {
         var acc0 = 0.0
         var acc1 = 0.0
         var k = lane
-        while (k < nb4) {
-            let x4 = x[k]
-            let w0 = float4(int4(wq[row * nb4 + k]))
-            let w1 = float4(int4(wq[(row + 1u) * nb4 + k]))
-            acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(ws[row * nb + k / 8u])
-            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[(row + 1u) * nb + k / 8u])
-            k += gl_SubgroupSize
+        if (row < qd) {
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (row * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (row2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbq[qb0]), float(wqbq[qb0 + 1u]), float(wqbq[qb0 + 2u]), float(wqbq[qb0 + 3u]))
+                let w1 = float4(float(wqbq[qb1]), float(wqbq[qb1 + 1u]), float(wqbq[qb1 + 2u]), float(wqbq[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshq[(row * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshq[(row2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
+        } elif (row < qd + kvd) {
+            let lr = row - qd
+            let lr2 = row2 - qd
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (lr * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (lr2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbk[qb0]), float(wqbk[qb0 + 1u]), float(wqbk[qb0 + 2u]), float(wqbk[qb0 + 3u]))
+                let w1 = float4(float(wqbk[qb1]), float(wqbk[qb1 + 1u]), float(wqbk[qb1 + 2u]), float(wqbk[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshk[(lr * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshk[(lr2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
+        } else {
+            let lr = row - qd - kvd
+            let lr2 = row2 - qd - kvd
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (lr * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (lr2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbv[qb0]), float(wqbv[qb0 + 1u]), float(wqbv[qb0 + 2u]), float(wqbv[qb0 + 3u]))
+                let w1 = float4(float(wqbv[qb1]), float(wqbv[qb1 + 1u]), float(wqbv[qb1 + 2u]), float(wqbv[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshv[(lr * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshv[(lr2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
         }
         acc0 = simd_sum(acc0)
         acc1 = simd_sum(acc1)
         if (lane != 0u) {
             return
         }
+        if (has_bias != 0u) {
+            acc0 += bias[row]
+            acc1 += bias[row2]
+        }
         if (row < qd) {
-            let j = (row % hs) / 2u
+            let j = neox != 0u ? row % hs : (row % hs) / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
             qo[row] = acc0 * fcr - acc1 * fci
-            qo[row + 1u] = acc0 * fci + acc1 * fcr
+            qo[row2] = acc0 * fci + acc1 * fcr
         } elif (row < qd + kvd) {
             let ik = row - qd
-            let j = (ik % hs) / 2u
+            let ik2 = row2 - qd
+            let j = neox != 0u ? ik % hs : (ik % hs) / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
             kd[ik] = acc0 * fcr - acc1 * fci
-            kd[ik + 1u] = acc0 * fci + acc1 * fcr
+            kd[ik2] = acc0 * fci + acc1 * fcr
         } else {
             let iv = row - qd - kvd
             vd[iv] = acc0
@@ -1226,16 +1736,18 @@ class MetalQ8GemvQkvRsF32 {
     }
 }
 
-// The W1|W3 twin of the same shape: one simdgroup dots BOTH ffn rows of an output element —
-// gate row r and up row r + hidden of the fused region — and writes silu(g)·u directly.
-// Deletes the swiglu dispatch AND its serialization level.
+// The W1|W3 twin of the same shape: one simdgroup dots BOTH ffn rows of an output element (gate
+// off the w1 blob views, up off the w3 views — kind-major layout keeps them apart) and writes
+// silu(g)·u directly. Deletes the swiglu dispatch AND its serialization level.
 class MetalQ8GemvW13Sw {
-    @ssbo @binding = 0 wq : array<byte4>    // fused W1|W3 rows (concat region)
-    @ssbo @binding = 1 ws : array<float16>
+    @ssbo @binding = 0 wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
+    @ssbo @binding = 1 wsh1 : array<float16>   // ... half-scale view
     @ssbo @binding = 2 x : array<float4>
     @ssbo @binding = 3 ho : array<float>    // [hidden] silu(gate)·up
     @uniform @binding = 4 ndim : uint
     @uniform @binding = 5 hidden : uint
+    @ssbo @binding = 6 wqb3 : array<int8>   // w3 blob views
+    @ssbo @binding = 7 wsh3 : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_w13sw16_msl")]
     def metal_q8_gemv_w13sw16 {
@@ -1246,17 +1758,17 @@ class MetalQ8GemvW13Sw {
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
         let nb = ndim / 32u
-        let ubase = (r + hidden) * nb4
-        let usb = (r + hidden) * nb
         var acc0 = 0.0
         var acc1 = 0.0
         var k = lane
         while (k < nb4) {
             let x4 = x[k]
-            let w0 = float4(int4(wq[r * nb4 + k]))
-            let w1 = float4(int4(wq[ubase + k]))
-            acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(ws[r * nb + k / 8u])
-            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[usb + k / 8u])
+            let bi = r * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let w0 = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]), float(wqb1[qb + 3u]))
+            let w1 = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]), float(wqb3[qb + 3u]))
+            acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wsh1[bi * 17u])
+            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wsh3[bi * 17u])
             k += gl_SubgroupSize
         }
         acc0 = simd_sum(acc0)
@@ -1340,14 +1852,16 @@ class MetalArgmax {
     }
 }
 
-// Speculative embed gather: dequant the argmax winner's Q8 embedding row (the cls_q8 linear copy
-// at emb_q8_off) into the next step's residual input — the GPU chain's embed_row.
+// Speculative embed gather: dequant the argmax winner's Q8 embedding row (the cls_q8 linear
+// copy's slice of the whole-model 34B blob, bound at emb_q8_off's byte offset) into the next
+// step's residual input — the GPU chain's embed_row.
 class MetalEmbedQ8 {
-    @ssbo @binding = 0 q : array<int8>      // the whole linear embed plane
-    @ssbo @binding = 1 sc : array<float>    // its scale plane
+    @ssbo @binding = 0 q : array<int8>      // the embed blob slice, byte view (quants at 34*b + 2)
+    @ssbo @binding = 1 sc : array<float16>  // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 2 tok : array<uint>
     @ssbo @binding = 3 xo : array<float>    // [dim] residual input out
     @uniform @binding = 4 dim : uint
+    @uniform @binding = 5 escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere)
 
     [metal_kernel(name="metal_embed_q8_msl")]
     def metal_embed_q8 {
@@ -1355,27 +1869,52 @@ class MetalEmbedQ8 {
         if (gid >= dim) {
             return
         }
-        let base = tok[0] * dim + gid
-        xo[gid] = float(q[base]) * sc[base / 32u]
+        let e = tok[0] * dim + gid
+        let b = e / 32u
+        xo[gid] = (float(q[b * 34u + 2u + e % 32u]) * float(sc[b * 17u])) * escale
     }
 }
 
-// f16-scale twin (wscale_f16 models — the qscales16 halfword plane).
-class MetalEmbedQ8S16 {
-    @ssbo @binding = 0 q : array<int8>
-    @ssbo @binding = 1 sc : array<float16>
-    @ssbo @binding = 2 tok : array<uint>
-    @ssbo @binding = 3 xo : array<float>
-    @uniform @binding = 4 dim : uint
+// k6 twin (tied Q6_K classifiers — the spec chain for kq): dequant the winner's row from the
+// disk-order k6 planes, dequant_k6_plane_superblock's exact math — (d * sc16) * (q - 32), the
+// same split scale layout as MetalKqGemvK6 (16B sub-scale blocks @0, f16 d plane @nsb*16).
+class MetalEmbedK6 {
+    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
+    @ssbo @binding = 2 kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
+    @ssbo @binding = 3 tok : array<uint>
+    @ssbo @binding = 4 xo : array<float>    // [dim] residual input out
+    @uniform @binding = 5 dim : uint
+    @uniform @binding = 6 escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere)
 
-    [metal_kernel(name="metal_embed_q8_s16_msl")]
-    def metal_embed_q8_s16 {
+    [metal_kernel(name="metal_embed_k6_msl")]
+    def metal_embed_k6 {
         let gid = gl_GlobalInvocationID.x
         if (gid >= dim) {
             return
         }
-        let base = tok[0] * dim + gid
-        xo[gid] = float(q[base]) * float(sc[base / 32u])
+        let nb = dim / 256u
+        let ib = gid / 256u
+        let blk = tok[0] * nb + ib
+        let p = gid % 256u
+        let ip = p / 128u
+        let rr = p % 128u
+        let quarter = rr / 32u
+        let l = rr % 32u
+        let qlb = uint(kqb[blk * 192u + ip * 64u + l + ((quarter & 1u) != 0u ? 32u : 0u)])
+        let h = uint(kqb[blk * 192u + 128u + ip * 32u + l])
+        var qv = 0u
+        if (quarter == 0u) {
+            qv = (qlb & 0x0F) | ((h & 0x03) << 4u)
+        } elif (quarter == 1u) {
+            qv = (qlb & 0x0F) | ((h & 0x0C) << 2u)
+        } elif (quarter == 2u) {
+            qv = (qlb >> 4u) | (h & 0x30)
+        } else {
+            qv = (qlb >> 4u) | ((h & 0xC0) >> 2u)
+        }
+        let sc = float((int(kscb[blk * 16u + ip * 8u + l / 16u + quarter * 2u]) ^ 128) - 128)
+        xo[gid] = (float(kdh[blk]) * sc * (float(qv) - 32.0)) * escale
     }
 }
 
@@ -1389,6 +1928,8 @@ class MetalAddRms {
     @ssbo @binding = 3 y : array<float>     // [dim] normed out
     @uniform @binding = 4 dim : uint
     @uniform @binding = 5 eps : float
+    @uniform @binding = 6 ascale : float    // (x + a) * ascale — gemma4 layer_out_scale scales
+                                            // the whole layer output; every other site binds 1.0
     @workgroup xrow : float[4096]           // == ADD_RMS_MAX_DIM
     @workgroup partial : float[32]          // one per simdgroup at the 1024-thread dispatch
     @workgroup inv_sh : float
@@ -1399,7 +1940,7 @@ class MetalAddRms {
         var ss = 0.0
         var k = lid
         while (k < dim) {
-            let vv = x[k] + a[k]
+            let vv = (x[k] + a[k]) * ascale
             x[k] = vv
             xrow[k] = vv
             ss += vv * vv
@@ -1443,6 +1984,9 @@ class MetalRopeStoreF16 {
     @uniform @binding = 7 head_size : uint
     @uniform @binding = 8 npairs_q : uint   // qd/2 — the q half of the grid
     @uniform @binding = 9 npairs : uint     // + kvd/2 — grid guard
+    @uniform @binding = 10 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
+    @ssbo @binding = 11 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @uniform @binding = 12 has_bias : uint
 
     [metal_kernel(name="metal_rope_store16_msl")]
     def metal_rope_store16 {
@@ -1454,23 +1998,101 @@ class MetalRopeStoreF16 {
         let lgid = isK ? gid - npairs_q : gid
         let half = head_size / 2u
         let j = lgid % half
-        let i = (lgid / half) * head_size + 2u * j
+        let hbase = (lgid / half) * head_size
+        let i = neox != 0u ? hbase + j : hbase + 2u * j
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[j]
         let fci = tsin[j]
+        let kvd = npairs * 2u - qd   // grid = (qd + kvd)/2 pairs
         if (isK) {
-            let v0 = qk[qd + i]
-            let v1 = qk[qd + i + 1u]
+            let v0 = qk[qd + i] + (has_bias != 0u ? bias[qd + i] : 0.0)
+            let v1 = qk[qd + i2] + (has_bias != 0u ? bias[qd + i2] : 0.0)
             let r0 = v0 * fcr - v1 * fci
             let r1 = v0 * fci + v1 * fcr
             kd[i] = float16(min(max(r0, -65504.0), 65504.0))   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
-            kd[i + 1u] = float16(min(max(r1, -65504.0), 65504.0))   // nolint:STYLE019
-            vd[i] = float16(min(max(vs[i], -65504.0), 65504.0))   // nolint:STYLE019
-            vd[i + 1u] = float16(min(max(vs[i + 1u], -65504.0), 65504.0))   // nolint:STYLE019
+            kd[i2] = float16(min(max(r1, -65504.0), 65504.0))   // nolint:STYLE019
+            let b0 = has_bias != 0u ? bias[qd + kvd + i] : 0.0
+            let b1 = has_bias != 0u ? bias[qd + kvd + i2] : 0.0
+            vd[i] = float16(min(max(vs[i] + b0, -65504.0), 65504.0))   // nolint:STYLE019
+            vd[i2] = float16(min(max(vs[i2] + b1, -65504.0), 65504.0))   // nolint:STYLE019
         } else {
-            let v0 = qk[i]
-            let v1 = qk[i + 1u]
+            let v0 = qk[i] + (has_bias != 0u ? bias[i] : 0.0)
+            let v1 = qk[i2] + (has_bias != 0u ? bias[i2] : 0.0)
             qk[i] = v0 * fcr - v1 * fci
-            qk[i + 1u] = v0 * fci + v1 * fcr
+            qk[i2] = v0 * fci + v1 * fcr
+        }
+    }
+}
+
+// The head-cooperative fused form (QK-norm models): ONE threadgroup per head folds bias ->
+// per-head RMSNorm -> rope -> f16 store — the thread-per-pair kernels can't host the head-wide
+// reduction. Grid: nheads q + nkvh k + nkvh v; rope pairs via the tgmem-staged POST-NORM partner.
+class MetalRopeStoreHF16 {
+    @ssbo @binding = 0 qk : array<float>    // q at [0, qd) roped in place, k at [qd, qd + kvd)
+    @ssbo @binding = 1 vs : array<float>    // raw v (the QKV buffer at the v offset)
+    @ssbo @binding = 2 kd : array<float16>  // mirror K row (bound at the (layer, pos) row offset)
+    @ssbo @binding = 3 vd : array<float16>
+    @ssbo @binding = 4 tcos : array<float>  // [head_size/2] this position's rope row
+    @ssbo @binding = 5 tsin : array<float>
+    @ssbo @binding = 6 w : array<float>     // [qnorm | knorm] per-head RMS weights
+    @ssbo @binding = 7 bias : array<float>  // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @uniform @binding = 8 qd : uint
+    @uniform @binding = 9 head_size : uint
+    @uniform @binding = 10 nheads : uint
+    @uniform @binding = 11 kv_mul : uint
+    @uniform @binding = 12 neox : uint
+    @uniform @binding = 13 has_bias : uint
+    @uniform @binding = 14 has_norm : uint
+    @uniform @binding = 15 eps : float
+    @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
+    @workgroup part : float[16]
+
+    [metal_kernel(name="metal_rope_store_h16_msl")]
+    def metal_rope_store_h16 {
+        let tgid = gl_WorkGroupID.x
+        let lid = gl_LocalInvocationID.x
+        let hs = head_size
+        let half = hs / 2u
+        let nkvh = nheads / kv_mul
+        let kvd = nkvh * hs
+        let isQ = tgid < nheads
+        let isK = !isQ && tgid < nheads + nkvh
+        let hh = isQ ? tgid : (isK ? tgid - nheads : tgid - nheads - nkvh)
+        let base = isQ ? tgid * hs : (isK ? qd + hh * hs : hh * hs)
+        let bbase = isQ ? tgid * hs : (isK ? qd + hh * hs : qd + kvd + hh * hs)
+        var v = (isQ || isK ? qk[base + lid] : vs[base + lid]) + (has_bias != 0u ? bias[bbase + lid] : 0.0)
+        if (isQ || isK) {
+            if (has_norm != 0u) {
+                let s1 = simd_sum(v * v)
+                if (gl_SubgroupInvocationID == 0u) {
+                    part[gl_SubgroupID] = s1
+                }
+                barrier()
+                var total = 0.0
+                var sg = 0u
+                while (sg < gl_NumSubgroups) {
+                    total += part[sg]
+                    sg++
+                }
+                let inv = 1.0 / sqrt(total / float(hs) + eps)
+                v = w[(isK ? hs : 0u) + lid] * (v * inv)
+            }
+            // rope via the tgmem-staged partner (the whole head is resident in this tg)
+            buf[lid] = v
+            barrier()
+            let isHi = neox != 0u ? lid >= half : (lid & 1u) != 0u
+            let j = neox != 0u ? (isHi ? lid - half : lid) : lid / 2u
+            let fcr = tcos[j]
+            let fci = tsin[j]
+            let other = buf[neox != 0u ? (isHi ? lid - half : lid + half) : (lid ^ 1u)]
+            v = isHi ? other * fci + v * fcr : v * fcr - other * fci
+        }
+        if (isQ) {
+            qk[base + lid] = v
+        } elif (isK) {
+            kd[hh * hs + lid] = float16(min(max(v, -65504.0), 65504.0))   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
+        } else {
+            vd[hh * hs + lid] = float16(min(max(v, -65504.0), 65504.0))   // nolint:STYLE019
         }
     }
 }
@@ -1487,6 +2109,9 @@ class MetalRopeStoreF32 {
     @uniform @binding = 7 head_size : uint
     @uniform @binding = 8 npairs_q : uint
     @uniform @binding = 9 npairs : uint
+    @uniform @binding = 10 neox : uint
+    @ssbo @binding = 11 bias : array<float>
+    @uniform @binding = 12 has_bias : uint
 
     [metal_kernel(name="metal_rope_store32_msl")]
     def metal_rope_store32 {
@@ -1498,21 +2123,24 @@ class MetalRopeStoreF32 {
         let lgid = isK ? gid - npairs_q : gid
         let half = head_size / 2u
         let j = lgid % half
-        let i = (lgid / half) * head_size + 2u * j
+        let hbase = (lgid / half) * head_size
+        let i = neox != 0u ? hbase + j : hbase + 2u * j
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[j]
         let fci = tsin[j]
+        let kvd = npairs * 2u - qd
         if (isK) {
-            let v0 = qk[qd + i]
-            let v1 = qk[qd + i + 1u]
+            let v0 = qk[qd + i] + (has_bias != 0u ? bias[qd + i] : 0.0)
+            let v1 = qk[qd + i2] + (has_bias != 0u ? bias[qd + i2] : 0.0)
             kd[i] = v0 * fcr - v1 * fci
-            kd[i + 1u] = v0 * fci + v1 * fcr
-            vd[i] = vs[i]
-            vd[i + 1u] = vs[i + 1u]
+            kd[i2] = v0 * fci + v1 * fcr
+            vd[i] = vs[i] + (has_bias != 0u ? bias[qd + kvd + i] : 0.0)
+            vd[i2] = vs[i2] + (has_bias != 0u ? bias[qd + kvd + i2] : 0.0)
         } else {
-            let v0 = qk[i]
-            let v1 = qk[i + 1u]
+            let v0 = qk[i] + (has_bias != 0u ? bias[i] : 0.0)
+            let v1 = qk[i2] + (has_bias != 0u ? bias[i2] : 0.0)
             qk[i] = v0 * fcr - v1 * fci
-            qk[i + 1u] = v0 * fci + v1 * fcr
+            qk[i2] = v0 * fci + v1 * fcr
         }
     }
 }
@@ -1533,6 +2161,9 @@ class MetalRopeStoreQ8 {
     @uniform @binding = 9 head_size : uint
     @uniform @binding = 10 npairs_q : uint  // qd/2 — the q-rope half of the grid
     @uniform @binding = 11 nblk : uint      // kv_dim/32 — K blocks (V adds the same again)
+    @uniform @binding = 12 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
+    @ssbo @binding = 13 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @uniform @binding = 14 has_bias : uint
 
     [metal_kernel(name="metal_rope_store_q8_msl")]
     def metal_rope_store_q8 {
@@ -1543,15 +2174,18 @@ class MetalRopeStoreQ8 {
         let half = head_size / 2u
         if (gid < npairs_q) {
             let j = gid % half
-            let i = (gid / half) * head_size + 2u * j
+            let hbase = (gid / half) * head_size
+            let i = neox != 0u ? hbase + j : hbase + 2u * j
+            let i2 = neox != 0u ? i + half : i + 1u
             let fcr = tcos[j]
             let fci = tsin[j]
-            let v0 = qk[i]
-            let v1 = qk[i + 1u]
+            let v0 = qk[i] + (has_bias != 0u ? bias[i] : 0.0)
+            let v1 = qk[i2] + (has_bias != 0u ? bias[i2] : 0.0)
             qk[i] = v0 * fcr - v1 * fci
-            qk[i + 1u] = v0 * fci + v1 * fcr
+            qk[i2] = v0 * fci + v1 * fcr
             return
         }
+        let kvd = nblk * 32u
         let bi = gid - npairs_q
         let isV = bi >= nblk
         let blk = isV ? bi - nblk : bi
@@ -1560,7 +2194,24 @@ class MetalRopeStoreQ8 {
         if (isV) {
             var e = 0u
             while (e < 32u) {
-                vals[e] = vs[base + e]
+                vals[e] = vs[base + e] + (has_bias != 0u ? bias[qd + kvd + base + e] : 0.0)
+                e++
+            }
+        } elif (neox != 0u) {
+            // NEOX pairs straddle 32-blocks (partner at ±half) — rope per ELEMENT; partner
+            // reads come from qk, which no K/V thread writes, so cross-block reads are safe
+            var e = 0u
+            while (e < 32u) {
+                let ge = base + e
+                let hp = ge % head_size
+                let isHi = hp >= half
+                let j = isHi ? hp - half : hp
+                let fcr = tcos[j]
+                let fci = tsin[j]
+                let oi = isHi ? ge - half : ge + half
+                let mine = qk[qd + ge] + (has_bias != 0u ? bias[qd + ge] : 0.0)
+                let other = qk[qd + oi] + (has_bias != 0u ? bias[qd + oi] : 0.0)
+                vals[e] = isHi ? other * fci + mine * fcr : mine * fcr - other * fci
                 e++
             }
         } else {
@@ -1570,8 +2221,8 @@ class MetalRopeStoreQ8 {
                 let j = (ge % head_size) / 2u
                 let fcr = tcos[j]
                 let fci = tsin[j]
-                let v0 = qk[qd + ge]
-                let v1 = qk[qd + ge + 1u]
+                let v0 = qk[qd + ge] + (has_bias != 0u ? bias[qd + ge] : 0.0)
+                let v1 = qk[qd + ge + 1u] + (has_bias != 0u ? bias[qd + ge + 1u] : 0.0)
                 vals[2u * p] = v0 * fcr - v1 * fci
                 vals[2u * p + 1u] = v0 * fci + v1 * fcr
                 p++
@@ -1620,30 +2271,39 @@ class MetalRopeStoreTq4 {
     @uniform @binding = 10 head_size : uint
     @uniform @binding = 11 nheads : uint
     @uniform @binding = 12 kv_mul : uint
-    @workgroup buf : float[128]
+    @uniform @binding = 13 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
+    @ssbo @binding = 14 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @uniform @binding = 15 has_bias : uint
+    @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
 
     [metal_kernel(name="metal_rope_store_tq4_msl")]
     def metal_rope_store_tq4 {
         let tgid = gl_WorkGroupID.x
         let lid = gl_LocalInvocationID.x
         let hs = head_size
+        let half = hs / 2u
         let nkvh = nheads / kv_mul
+        let kvd = nkvh * hs
         let isQ = tgid < nheads
         let isK = !isQ && tgid < nheads + nkvh
         // this head's element run: q heads in the q region, k heads in the k region, v heads in vs
         let hh = isQ ? tgid : (isK ? tgid - nheads : tgid - nheads - nkvh)
         let base = isQ ? tgid * hs : (isK ? qd + hh * hs : hh * hs)
+        // the element's index in the [qd | kvd | kvd] qkv vector — the bias plane's layout
+        let bbase = isQ ? tgid * hs : (isK ? qd + hh * hs : qd + kvd + hh * hs)
         var v = 0.0
         if (isQ || isK) {
-            // rope via the pair partner (pairs are adjacent and never straddle threads' loads)
-            let j = lid / 2u
+            // rope via the pair partner (the whole head is resident in this tg either way)
+            let isHi = neox != 0u ? lid >= half : (lid & 1u) != 0u
+            let j = neox != 0u ? (isHi ? lid - half : lid) : lid / 2u
             let fcr = tcos[j]
             let fci = tsin[j]
-            let mine = qk[base + lid]
-            let other = qk[base + (lid ^ 1u)]
-            v = (lid & 1u) == 0u ? mine * fcr - other * fci : other * fci + mine * fcr
+            let po = neox != 0u ? (isHi ? lid - half : lid + half) : (lid ^ 1u)
+            let mine = qk[base + lid] + (has_bias != 0u ? bias[bbase + lid] : 0.0)
+            let other = qk[base + po] + (has_bias != 0u ? bias[bbase + po] : 0.0)
+            v = isHi ? other * fci + mine * fcr : mine * fcr - other * fci
         } else {
-            v = vs[base + lid]
+            v = vs[base + lid] + (has_bias != 0u ? bias[bbase + lid] : 0.0)
         }
         // fwht_signs_row: signs, then the orthonormal butterfly
         buf[lid] = v * signs[lid]
@@ -1709,7 +2369,7 @@ class MetalFwhtUnsign {
     @ssbo @binding = 1 signs : array<float>
     @uniform @binding = 2 head_size : uint
     @uniform @binding = 3 qstride : uint
-    @workgroup buf : float[128]
+    @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
 
     [metal_kernel(name="metal_fwht_unsign_msl")]
     def metal_fwht_unsign {
@@ -1739,14 +2399,13 @@ class MetalFwhtUnsign {
 // (cooperative load) instead of per-lane device reads (lab: B=2 +40-88%, B=4 ~2x; per-lane-
 // consecutive chunking measured 30-45% WORSE). Geometry pinned at 128 threads = 4 rows.
 class MetalGemvB2 {
-    @ssbo @binding = 0 wq : array<byte4>    // [d x n] Q8 rows, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // [d x n/32] scales, f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... the same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb : array<int8>    // 34B-block W blob, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 wsh : array<float16> // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 3 x : array<float4>    // [B x n] f32 rows, float4 view
     @ssbo @binding = 4 y : array<float>     // [B x d]
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
-    @uniform @binding = 7 s16 : uint
+    @uniform @binding = 7 ys : uint         // y ROW stride (== ddim dense)
     @workgroup txp : float4[128]            // [2 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_b2_msl")]
@@ -1755,8 +2414,7 @@ class MetalGemvB2 {
         let row = min(gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID, ddim - 1u)
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
-        let wbase = row * nb4
-        let sbase = row * (ndim / 32u)
+        let nb = ndim / 32u
         var acc : float[2]
         var cb = 0u
         while (cb + 64u <= nb4) {
@@ -1765,8 +2423,10 @@ class MetalGemvB2 {
             barrier()
             for [unroll_full] (i in range(2)) {
                 let k = cb + uint(i) * 32u + lane
-                let sv = s16 != 0u ? float(wsh[sbase + k / 8u]) : wsf[sbase + k / 8u]
-                let w4 = float4(int4(wq[wbase + k])) * sv
+                let bi = row * nb + k / 8u
+                let qb = bi * 34u + 2u + (k % 8u) * 4u
+                let w4 = float4(float(wqb[qb]), float(wqb[qb + 1u]), float(wqb[qb + 2u]),
+                    float(wqb[qb + 3u])) * float(wsh[bi * 17u])
                 let kt = uint(i) * 32u + lane
                 for [unroll_full] (b in range(2)) {
                     let xv = txp[uint(b) * 64u + kt]
@@ -1777,8 +2437,10 @@ class MetalGemvB2 {
         }
         var k = cb + lane
         while (k < nb4) {
-            let sv = s16 != 0u ? float(wsh[sbase + k / 8u]) : wsf[sbase + k / 8u]
-            let w4 = float4(int4(wq[wbase + k])) * sv
+            let bi = row * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let w4 = float4(float(wqb[qb]), float(wqb[qb + 1u]), float(wqb[qb + 2u]),
+                float(wqb[qb + 3u])) * float(wsh[bi * 17u])
             for [unroll_full] (b in range(2)) {
                 let xv = x[uint(b) * nb4 + k]
                 acc[b] += w4.x * xv.x + w4.y * xv.y + w4.z * xv.z + w4.w * xv.w
@@ -1788,21 +2450,20 @@ class MetalGemvB2 {
         for [unroll_full] (b in range(2)) {
             let s = simd_sum(acc[b])
             if (lane == 0u) {
-                y[uint(b) * ddim + row] = s
+                y[uint(b) * ys + row] = s
             }
         }
     }
 }
 
 class MetalGemvB4 {
-    @ssbo @binding = 0 wq : array<byte4>
-    @ssbo @binding = 1 wsf : array<float>
+    @ssbo @binding = 0 wqb : array<int8>
     @ssbo @binding = 2 wsh : array<float16>
     @ssbo @binding = 3 x : array<float4>
     @ssbo @binding = 4 y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
-    @uniform @binding = 7 s16 : uint
+    @uniform @binding = 7 ys : uint         // y ROW stride (== ddim dense)
     @workgroup txp : float4[256]            // [4 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_b4_msl")]
@@ -1811,8 +2472,7 @@ class MetalGemvB4 {
         let row = min(gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID, ddim - 1u)
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
-        let wbase = row * nb4
-        let sbase = row * (ndim / 32u)
+        let nb = ndim / 32u
         var acc : float[4]
         var cb = 0u
         while (cb + 64u <= nb4) {
@@ -1824,8 +2484,10 @@ class MetalGemvB4 {
             barrier()
             for [unroll_full] (i in range(2)) {
                 let k = cb + uint(i) * 32u + lane
-                let sv = s16 != 0u ? float(wsh[sbase + k / 8u]) : wsf[sbase + k / 8u]
-                let w4 = float4(int4(wq[wbase + k])) * sv
+                let bi = row * nb + k / 8u
+                let qb = bi * 34u + 2u + (k % 8u) * 4u
+                let w4 = float4(float(wqb[qb]), float(wqb[qb + 1u]), float(wqb[qb + 2u]),
+                    float(wqb[qb + 3u])) * float(wsh[bi * 17u])
                 let kt = uint(i) * 32u + lane
                 for [unroll_full] (b in range(4)) {
                     let xv = txp[uint(b) * 64u + kt]
@@ -1836,8 +2498,10 @@ class MetalGemvB4 {
         }
         var k = cb + lane
         while (k < nb4) {
-            let sv = s16 != 0u ? float(wsh[sbase + k / 8u]) : wsf[sbase + k / 8u]
-            let w4 = float4(int4(wq[wbase + k])) * sv
+            let bi = row * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let w4 = float4(float(wqb[qb]), float(wqb[qb + 1u]), float(wqb[qb + 2u]),
+                float(wqb[qb + 3u])) * float(wsh[bi * 17u])
             for [unroll_full] (b in range(4)) {
                 let xv = x[uint(b) * nb4 + k]
                 acc[b] += w4.x * xv.x + w4.y * xv.y + w4.z * xv.z + w4.w * xv.w
@@ -1847,7 +2511,7 @@ class MetalGemvB4 {
         for [unroll_full] (b in range(4)) {
             let s = simd_sum(acc[b])
             if (lane == 0u) {
-                y[uint(b) * ddim + row] = s
+                y[uint(b) * ys + row] = s
             }
         }
     }
@@ -1864,6 +2528,8 @@ class MetalQ8MvB2 {
     @uniform @binding = 4 ndim : uint
     @uniform @binding = 5 ddim : uint
     @uniform @binding = 6 xs4 : uint        // x row stride in float4s (ndim/4 = dense)
+    @uniform @binding = 7 ys : uint         // y ROW stride (== ddim dense; qkvd at the fused-QKV
+                                            // segment sites — the kq mv twins' bys contract)
 
     [metal_kernel(name="metal_q8_mv_b2_msl")]
     def metal_q8_mv_b2 {
@@ -1909,7 +2575,7 @@ class MetalQ8MvB2 {
             s += simd_shuffle_down(s, 2u)
             s += simd_shuffle_down(s, 1u)
             if (tx == 0u && row0 < ddim) {
-                y[uint(b) * ddim + row0] = s
+                y[uint(b) * ys + row0] = s
             }
         }
     }
@@ -1927,6 +2593,7 @@ class MetalQ8MvB4 {
     @uniform @binding = 5 ddim : uint
     @uniform @binding = 6 nrows : uint
     @uniform @binding = 7 xs4 : uint
+    @uniform @binding = 8 ys : uint         // y ROW stride (== ddim dense)
 
     [metal_kernel(name="metal_q8_mv_b4_msl")]
     def metal_q8_mv_b4 {
@@ -1978,7 +2645,7 @@ class MetalQ8MvB4 {
             s += simd_shuffle_down(s, 2u)
             s += simd_shuffle_down(s, 1u)
             if (tx == 0u && row0 < ddim && uint(b) < nrows) {
-                y[uint(b) * ddim + row0] = s
+                y[uint(b) * ys + row0] = s
             }
         }
     }
@@ -1988,14 +2655,14 @@ class MetalQ8MvB4 {
 // gate row r AND up row r+hidden, writing silu(gate)*up directly — replaces the w1/w3/swiglu
 // triple with one dispatch. B2 form serves B <= 2; B4 serves 3..4.
 class MetalGemvW13SwB2 {
-    @ssbo @binding = 0 wq : array<byte4>    // cat W1|W3 rows, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // scales, f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
+    @ssbo @binding = 2 wsh1 : array<float16>   // ... half-scale view
     @ssbo @binding = 3 x : array<float4>    // [B x ndim] f32 rows, float4 view
     @ssbo @binding = 4 y : array<float>     // [B x hidden] silu(gate)*up
     @uniform @binding = 5 ndim : uint
-    @uniform @binding = 6 hidden : uint     // output rows AND the gate/up row split
-    @uniform @binding = 7 s16 : uint
+    @uniform @binding = 6 hidden : uint     // output rows
+    @ssbo @binding = 8 wqb3 : array<int8>   // w3 blob views
+    @ssbo @binding = 9 wsh3 : array<float16>
     @workgroup txp : float4[128]            // [2 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_w13sw_b2_msl")]
@@ -2004,11 +2671,7 @@ class MetalGemvW13SwB2 {
         let row = min(gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID, hidden - 1u)
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
-        let ns = ndim / 32u
-        let wbg = row * nb4              // gate weight row (W1)
-        let wbu = (row + hidden) * nb4   // up weight row (W3)
-        let sbg = row * ns
-        let sbu = (row + hidden) * ns
+        let nb = ndim / 32u
         var accg : float[2]
         var accu : float[2]
         var cb = 0u
@@ -2018,10 +2681,12 @@ class MetalGemvW13SwB2 {
             barrier()
             for [unroll_full] (i in range(2)) {
                 let k = cb + uint(i) * 32u + lane
-                let svg = s16 != 0u ? float(wsh[sbg + k / 8u]) : wsf[sbg + k / 8u]
-                let svu = s16 != 0u ? float(wsh[sbu + k / 8u]) : wsf[sbu + k / 8u]
-                let wg = float4(int4(wq[wbg + k])) * svg
-                let wu = float4(int4(wq[wbu + k])) * svu
+                let bi = row * nb + k / 8u
+                let qb = bi * 34u + 2u + (k % 8u) * 4u
+                let wg = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]),
+                    float(wqb1[qb + 3u])) * float(wsh1[bi * 17u])
+                let wu = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]),
+                    float(wqb3[qb + 3u])) * float(wsh3[bi * 17u])
                 let kt = uint(i) * 32u + lane
                 for [unroll_full] (b in range(2)) {
                     let xv = txp[uint(b) * 64u + kt]
@@ -2033,10 +2698,12 @@ class MetalGemvW13SwB2 {
         }
         var k = cb + lane
         while (k < nb4) {
-            let svg = s16 != 0u ? float(wsh[sbg + k / 8u]) : wsf[sbg + k / 8u]
-            let svu = s16 != 0u ? float(wsh[sbu + k / 8u]) : wsf[sbu + k / 8u]
-            let wg = float4(int4(wq[wbg + k])) * svg
-            let wu = float4(int4(wq[wbu + k])) * svu
+            let bi = row * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let wg = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]),
+                float(wqb1[qb + 3u])) * float(wsh1[bi * 17u])
+            let wu = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]),
+                float(wqb3[qb + 3u])) * float(wsh3[bi * 17u])
             for [unroll_full] (b in range(2)) {
                 let xv = x[uint(b) * nb4 + k]
                 accg[b] += wg.x * xv.x + wg.y * xv.y + wg.z * xv.z + wg.w * xv.w
@@ -2055,14 +2722,14 @@ class MetalGemvW13SwB2 {
 }
 
 class MetalGemvW13SwB4 {
-    @ssbo @binding = 0 wq : array<byte4>
-    @ssbo @binding = 1 wsf : array<float>
-    @ssbo @binding = 2 wsh : array<float16>
+    @ssbo @binding = 0 wqb1 : array<int8>
+    @ssbo @binding = 2 wsh1 : array<float16>
     @ssbo @binding = 3 x : array<float4>
     @ssbo @binding = 4 y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 hidden : uint
-    @uniform @binding = 7 s16 : uint
+    @ssbo @binding = 8 wqb3 : array<int8>
+    @ssbo @binding = 9 wsh3 : array<float16>
     @workgroup txp : float4[256]            // [4 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_w13sw_b4_msl")]
@@ -2071,11 +2738,7 @@ class MetalGemvW13SwB4 {
         let row = min(gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID, hidden - 1u)
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
-        let ns = ndim / 32u
-        let wbg = row * nb4
-        let wbu = (row + hidden) * nb4
-        let sbg = row * ns
-        let sbu = (row + hidden) * ns
+        let nb = ndim / 32u
         var accg : float[4]
         var accu : float[4]
         var cb = 0u
@@ -2088,10 +2751,12 @@ class MetalGemvW13SwB4 {
             barrier()
             for [unroll_full] (i in range(2)) {
                 let k = cb + uint(i) * 32u + lane
-                let svg = s16 != 0u ? float(wsh[sbg + k / 8u]) : wsf[sbg + k / 8u]
-                let svu = s16 != 0u ? float(wsh[sbu + k / 8u]) : wsf[sbu + k / 8u]
-                let wg = float4(int4(wq[wbg + k])) * svg
-                let wu = float4(int4(wq[wbu + k])) * svu
+                let bi = row * nb + k / 8u
+                let qb = bi * 34u + 2u + (k % 8u) * 4u
+                let wg = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]),
+                    float(wqb1[qb + 3u])) * float(wsh1[bi * 17u])
+                let wu = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]),
+                    float(wqb3[qb + 3u])) * float(wsh3[bi * 17u])
                 let kt = uint(i) * 32u + lane
                 for [unroll_full] (b in range(4)) {
                     let xv = txp[uint(b) * 64u + kt]
@@ -2103,10 +2768,12 @@ class MetalGemvW13SwB4 {
         }
         var k = cb + lane
         while (k < nb4) {
-            let svg = s16 != 0u ? float(wsh[sbg + k / 8u]) : wsf[sbg + k / 8u]
-            let svu = s16 != 0u ? float(wsh[sbu + k / 8u]) : wsf[sbu + k / 8u]
-            let wg = float4(int4(wq[wbg + k])) * svg
-            let wu = float4(int4(wq[wbu + k])) * svu
+            let bi = row * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let wg = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]),
+                float(wqb1[qb + 3u])) * float(wsh1[bi * 17u])
+            let wu = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]),
+                float(wqb3[qb + 3u])) * float(wsh3[bi * 17u])
             for [unroll_full] (b in range(4)) {
                 let xv = x[uint(b) * nb4 + k]
                 accg[b] += wg.x * xv.x + wg.y * xv.y + wg.z * xv.z + wg.w * xv.w
@@ -2128,14 +2795,14 @@ class MetalGemvW13SwB4 {
 // 32x32 tile, 110 instr/k-block vs the old 235 (1.16-1.33x on every decode shape). Pad token rows
 // carry stale bytes by design — C rows are per-token independent, pad Y rows are never read back.
 class MetalQ8GemmB {
-    @ssbo @binding = 0 wq : array<byte4>    // W [d x n] row-major Q8 quants, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // W scales [d x n/32], f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... the same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb : array<int8>    // 34B-block W blob, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 wsh : array<float16> // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 3 x : array<float4>    // X [M' x n] f32 rows (M' = 32-padded B)
     @ssbo @binding = 4 y : array<float>     // Y [M' x d]
     @uniform @binding = 5 kdim : uint       // n (K)
     @uniform @binding = 6 ndim : uint       // d (N)
-    @uniform @binding = 7 s16 : uint
+    @uniform @binding = 7 ys : uint         // y TOKEN-row stride (== ndim dense; qkvd at the
+                                            // fused-QKV segment sites, y bound at the column offset)
     @workgroup tw : float16[1024]           // W: 4 k-tiles x 4 row-tiles of 8x8, (k row, wrow col)
     @workgroup tx : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, (token row, k col)
 
@@ -2158,19 +2825,18 @@ class MetalQ8GemmB {
         let tX0 = (il * 4u + lr / 8u) * 64u + (lr % 8u) * 8u
         let aQ = (sg % 2u) * 128u           // wrow tile-pair base within a k-tile slab
         let bQ = (sg / 2u) * 128u           // token tile-pair base
-        var wp = unsafe(addr(wq[(nBase + lr) * kdim4 + il * 2u]))
-        var spf = unsafe(addr(wsf[(nBase + lr) * nkb]))
-        var sph = unsafe(addr(wsh[(nBase + lr) * nkb]))
+        var qp = unsafe(addr(wqb[((nBase + lr) * nkb) * 34u + 2u + il * 8u]))
+        var sph = unsafe(addr(wsh[((nBase + lr) * nkb) * 17u]))
         var xp = unsafe(addr(x[(mBase + lr) * kdim4 + il * 2u]))
         var kb = 0u
         while (kb < nkb) {
-            let sA = s16 != 0u ? float(unsafe(sph[0])) : unsafe(spf[0])
-            let q0 = unsafe(wp[0])
-            let q1 = unsafe(wp[1])
+            let sA = float(unsafe(sph[0]))
             let b0 = unsafe(xp[0])
             let b1 = unsafe(xp[1])
-            let w40 = float4(int4(q0)) * sA
-            let w41 = float4(int4(q1)) * sA
+            let w40 = float4(float(unsafe(qp[0u])), float(unsafe(qp[1u])),
+                float(unsafe(qp[2u])), float(unsafe(qp[3u]))) * sA
+            let w41 = float4(float(unsafe(qp[4u])), float(unsafe(qp[5u])),
+                float(unsafe(qp[6u])), float(unsafe(qp[7u]))) * sA
             barrier()                       // previous math done reading the tiles
             tw[tW0] = float16(w40.x)
             tw[tW0 + 8u] = float16(w40.y)
@@ -2203,18 +2869,17 @@ class MetalQ8GemmB {
                 acur = unsafe(acur + 256)
                 bcur = unsafe(bcur + 256)
             }
-            wp = unsafe(wp + 8u)
-            spf = unsafe(spf + 1u)
-            sph = unsafe(sph + 1u)
+            qp = unsafe(qp + 34u)
+            sph = unsafe(sph + 17u)
             xp = unsafe(xp + 8u)
             kb++
         }
         let row0 = mBase + (sg / 2u) * 16u
         let col0 = nBase + (sg % 2u) * 16u
-        simdgroup_store(mc[0], y, row0 * ndim + col0, ndim)
-        simdgroup_store(mc[1], y, row0 * ndim + (col0 + 8u), ndim)
-        simdgroup_store(mc[2], y, (row0 + 8u) * ndim + col0, ndim)
-        simdgroup_store(mc[3], y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(mc[0], y, row0 * ys + col0, ys)
+        simdgroup_store(mc[1], y, row0 * ys + (col0 + 8u), ys)
+        simdgroup_store(mc[2], y, (row0 + 8u) * ys + col0, ys)
+        simdgroup_store(mc[3], y, (row0 + 8u) * ys + (col0 + 8u), ys)
     }
 }
 
@@ -2222,14 +2887,12 @@ class MetalQ8GemmB {
 // partial-C plane, and a separate MetalSkReduce dispatch sums them (no float atomics,
 // deterministic). At M-pad-32 this is the only way to grow the grid past d/32 on starved sites.
 class MetalQ8GemmBSk {
-    @ssbo @binding = 0 wq : array<byte4>    // W [d x n] row-major Q8 quants, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // W scales [d x n/32], f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... the same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb : array<int8>    // 34B-block W blob, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 wsh : array<float16> // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 3 x : array<float4>    // X [32 x n] f32 rows
     @ssbo @binding = 4 part : array<float>  // [ksplit x 32 x d] partial-C planes
     @uniform @binding = 5 kdim : uint       // n (K)
     @uniform @binding = 6 ndim : uint       // d (N)
-    @uniform @binding = 7 s16 : uint
     @uniform @binding = 8 ksplit : uint
     @workgroup tw : float16[1024]           // W: 4 k-tiles x 4 row-tiles of 8x8, (k row, wrow col)
     @workgroup tx : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, (token row, k col)
@@ -2256,19 +2919,18 @@ class MetalQ8GemmBSk {
         let tX0 = (il * 4u + lr / 8u) * 64u + (lr % 8u) * 8u
         let aQ = (sg % 2u) * 128u           // wrow tile-pair base within a k-tile slab
         let bQ = (sg / 2u) * 128u           // token tile-pair base
-        var wp = unsafe(addr(wq[(nBase + lr) * kdim4 + kb0 * 8u + il * 2u]))
-        var spf = unsafe(addr(wsf[(nBase + lr) * nkb + kb0]))
-        var sph = unsafe(addr(wsh[(nBase + lr) * nkb + kb0]))
+        var qp = unsafe(addr(wqb[((nBase + lr) * nkb + kb0) * 34u + 2u + il * 8u]))
+        var sph = unsafe(addr(wsh[((nBase + lr) * nkb + kb0) * 17u]))
         var xp = unsafe(addr(x[(mBase + lr) * kdim4 + kb0 * 8u + il * 2u]))
         var kb = 0u
         while (kb < kbn) {
-            let sA = s16 != 0u ? float(unsafe(sph[0])) : unsafe(spf[0])
-            let q0 = unsafe(wp[0])
-            let q1 = unsafe(wp[1])
+            let sA = float(unsafe(sph[0]))
             let b0 = unsafe(xp[0])
             let b1 = unsafe(xp[1])
-            let w40 = float4(int4(q0)) * sA
-            let w41 = float4(int4(q1)) * sA
+            let w40 = float4(float(unsafe(qp[0u])), float(unsafe(qp[1u])),
+                float(unsafe(qp[2u])), float(unsafe(qp[3u]))) * sA
+            let w41 = float4(float(unsafe(qp[4u])), float(unsafe(qp[5u])),
+                float(unsafe(qp[6u])), float(unsafe(qp[7u]))) * sA
             barrier()                       // previous math done reading the tiles
             tw[tW0] = float16(w40.x)
             tw[tW0 + 8u] = float16(w40.y)
@@ -2301,9 +2963,8 @@ class MetalQ8GemmBSk {
                 acur = unsafe(acur + 256)
                 bcur = unsafe(bcur + 256)
             }
-            wp = unsafe(wp + 8u)
-            spf = unsafe(spf + 1u)
-            sph = unsafe(sph + 1u)
+            qp = unsafe(qp + 34u)
+            sph = unsafe(sph + 17u)
             xp = unsafe(xp + 8u)
             kb++
         }
@@ -2345,14 +3006,12 @@ class MetalSkReduce {
 // instructions per element — wins where the grid stays fat (e.g. the vocab classifier). Each
 // simdgroup owns a 16x32 quadrant (2 token x 4 wrow tiles).
 class MetalQ8Gemm64B {
-    @ssbo @binding = 0 wq : array<byte4>    // W [d x n] row-major Q8 quants, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // W scales [d x n/32], f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... the same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb : array<int8>    // 34B-block W blob, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 wsh : array<float16> // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 3 x : array<float4>    // X [M' x n] f32 rows (M' = 32-padded B)
     @ssbo @binding = 4 y : array<float>     // Y [M' x d]
     @uniform @binding = 5 kdim : uint       // n (K)
     @uniform @binding = 6 ndim : uint       // d (N)
-    @uniform @binding = 7 s16 : uint
     @workgroup tw : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, (k row, wrow col)
     @workgroup tx : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, (token row, k col)
 
@@ -2379,21 +3038,16 @@ class MetalQ8Gemm64B {
         let tX0 = (il1 * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
         let aQ = (sg % 2u) * 256u           // wrow tile-quad base within a k-tile slab
         let bQ = (sg / 2u) * 128u           // token tile-pair base
-        var wp = unsafe(addr(wq[(nBase + lr0) * kdim4 + il0 * 4u]))
-        var spf = unsafe(addr(wsf[(nBase + lr0) * nkb]))
-        var sph = unsafe(addr(wsh[(nBase + lr0) * nkb]))
+        var qp = unsafe(addr(wqb[((nBase + lr0) * nkb) * 34u + 2u + il0 * 16u]))
+        var sph = unsafe(addr(wsh[((nBase + lr0) * nkb) * 17u]))
         var xp = unsafe(addr(x[(mBase + lr1) * kdim4 + il1 * 2u]))
         var kb = 0u
         while (kb < nkb) {
-            let sA = s16 != 0u ? float(unsafe(sph[0])) : unsafe(spf[0])
+            let sA = float(unsafe(sph[0]))
             let b0 = unsafe(xp[0])
             let b1 = unsafe(xp[1])
-            for [unroll_full] (g in range(4)) {
-                let w4 = float4(int4(unsafe(wp[uint(g)]))) * sA
-                va[g * 4] = float16(w4.x)
-                va[g * 4 + 1] = float16(w4.y)
-                va[g * 4 + 2] = float16(w4.z)
-                va[g * 4 + 3] = float16(w4.w)
+            for [unroll_full] (i in range(16)) {
+                va[i] = float16(float(unsafe(qp[i])) * sA)
             }
             barrier()                       // previous math done reading the tiles
             for [unroll_full] (i in range(16)) {
@@ -2423,9 +3077,8 @@ class MetalQ8Gemm64B {
                 acur = unsafe(acur + 512)
                 bcur = unsafe(bcur + 256)
             }
-            wp = unsafe(wp + 8u)
-            spf = unsafe(spf + 1u)
-            sph = unsafe(sph + 1u)
+            qp = unsafe(qp + 34u)
+            sph = unsafe(sph + 17u)
             xp = unsafe(xp + 8u)
             kb++
         }
@@ -2453,8 +3106,9 @@ class MetalSqAttnBF16 {
     @uniform @binding = 9 hs : uint
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
+    @uniform @binding = 12 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_b16_msl")]
     def metal_sq_attn_b16 {
@@ -2465,8 +3119,8 @@ class MetalSqAttnBF16 {
         let nt = gl_WorkGroupSize.x
         let rrow = rt[bb]
         let cnt = rrow.w
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let yoff = bb * (nheads * hs) + h * hs
@@ -2478,6 +3132,18 @@ class MetalSqAttnBF16 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = kb0 + j * kv_dim + khoff + sl * epl
@@ -2491,9 +3157,36 @@ class MetalSqAttnBF16 {
             if (epl > 3u) {
                 s += q3 * float(kc[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kc[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kc[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kc[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kc[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kc[kb + 8u])
+                s += q9 * float(kc[kb + 9u])
+                s += q10 * float(kc[kb + 10u])
+                s += q11 * float(kc[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kc[kb + 12u])
+                s += q13 * float(kc[kb + 13u])
+                s += q14 * float(kc[kb + 14u])
+                s += q15 * float(kc[kb + 15u])
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -2577,8 +3270,9 @@ class MetalSqAttnBF32 {
     @uniform @binding = 9 hs : uint
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
+    @uniform @binding = 12 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_b32_msl")]
     def metal_sq_attn_b32 {
@@ -2589,8 +3283,8 @@ class MetalSqAttnBF32 {
         let nt = gl_WorkGroupSize.x
         let rrow = rt[bb]
         let cnt = rrow.w
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let yoff = bb * (nheads * hs) + h * hs
@@ -2602,6 +3296,18 @@ class MetalSqAttnBF32 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < cnt) {
             let kb = kb0 + j * kv_dim + khoff + sl * epl
@@ -2615,9 +3321,36 @@ class MetalSqAttnBF32 {
             if (epl > 3u) {
                 s += q3 * kc[kb + 3u]
             }
+            if (epl > 4u) {
+                s += q4 * kc[kb + 4u]
+            }
+            if (epl > 5u) {
+                s += q5 * kc[kb + 5u]
+            }
+            if (epl > 6u) {
+                s += q6 * kc[kb + 6u]
+            }
+            if (epl > 7u) {
+                s += q7 * kc[kb + 7u]
+            }
+            if (epl > 8u) {
+                s += q8 * kc[kb + 8u]
+                s += q9 * kc[kb + 9u]
+                s += q10 * kc[kb + 10u]
+                s += q11 * kc[kb + 11u]
+            }
+            if (epl > 12u) {
+                s += q12 * kc[kb + 12u]
+                s += q13 * kc[kb + 13u]
+                s += q14 * kc[kb + 14u]
+                s += q15 * kc[kb + 15u]
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -2705,8 +3438,9 @@ class MetalSqAttnBQ8 {
     @uniform @binding = 11 hs : uint
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
+    @uniform @binding = 14 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_b_q8_msl")]
     def metal_sq_attn_b_q8 {
@@ -2717,9 +3451,8 @@ class MetalSqAttnBQ8 {
         let nt = gl_WorkGroupSize.x
         let rrow = rt[bb]
         let cnt = rrow.w
-        let rowb = nblk * 34u
-        let kb0b = rrow.x + lay * rrow.z * rowb   // layer slab base, BYTES (even)
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // layer slab base, BYTES (lay = the layer's row-BYTE prefix)
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u                      // ... and HALFWORDS for the scale view
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -2733,6 +3466,18 @@ class MetalSqAttnBQ8 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let ib = (sl * epl) % 32u
         var j = sg
@@ -2750,9 +3495,36 @@ class MetalSqAttnBQ8 {
             if (epl > 3u) {
                 s += q3 * float(kqb[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kqb[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kqb[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kqb[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kqb[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kqb[kb + 8u])
+                s += q9 * float(kqb[kb + 9u])
+                s += q10 * float(kqb[kb + 10u])
+                s += q11 * float(kqb[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kqb[kb + 12u])
+                s += q13 * float(kqb[kb + 13u])
+                s += q14 * float(kqb[kb + 14u])
+                s += q15 * float(kqb[kb + 15u])
+            }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -2846,8 +3618,9 @@ class MetalSqAttnBTq4 {
     @uniform @binding = 11 hs : uint
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
+    @uniform @binding = 14 softcap : float
     @workgroup scores : float[128]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_b_tq4_msl")]
     def metal_sq_attn_b_tq4 {
@@ -2858,9 +3631,8 @@ class MetalSqAttnBTq4 {
         let nt = gl_WorkGroupSize.x
         let rrow = rt[bb]
         let cnt = rrow.w
-        let rowb = nblk * 18u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -2874,6 +3646,18 @@ class MetalSqAttnBTq4 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u
         var j = sg
@@ -2894,10 +3678,39 @@ class MetalSqAttnBTq4 {
                     s += q2 * float(int(by1 & 15u) - 8)
                     s += q3 * float(int(by1 >> 4u) - 8)
                 }
+                if (epl > 4u) {
+                    let by2 = uint(kqb[kb + 2u])
+                    s += q4 * float(int(by2 & 15u) - 8)
+                    s += q5 * float(int(by2 >> 4u) - 8)
+                }
+                if (epl > 6u) {
+                    let by3 = uint(kqb[kb + 3u])
+                    s += q6 * float(int(by3 & 15u) - 8)
+                    s += q7 * float(int(by3 >> 4u) - 8)
+                }
+                if (epl > 8u) {
+                    let by4 = uint(kqb[kb + 4u])
+                    let by5 = uint(kqb[kb + 5u])
+                    s += q8 * float(int(by4 & 15u) - 8)
+                    s += q9 * float(int(by4 >> 4u) - 8)
+                    s += q10 * float(int(by5 & 15u) - 8)
+                    s += q11 * float(int(by5 >> 4u) - 8)
+                }
+                if (epl > 12u) {
+                    let by6 = uint(kqb[kb + 6u])
+                    let by7 = uint(kqb[kb + 7u])
+                    s += q12 * float(int(by6 & 15u) - 8)
+                    s += q13 * float(int(by6 >> 4u) - 8)
+                    s += q14 * float(int(by7 & 15u) - 8)
+                    s += q15 * float(int(by7 >> 4u) - 8)
+                }
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
@@ -2977,8 +3790,10 @@ class MetalSqAttnPartBF16 {
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
     @uniform @binding = 12 nchmax : uint
+    @uniform @binding = 13 softcap : float
+    @uniform @binding = 14 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_b16_msl")]
     def metal_sq_attn_part_b16 {
@@ -2994,12 +3809,18 @@ class MetalSqAttnPartBF16 {
         }
         let lid = gl_LocalInvocationID.x
         let nt = gl_WorkGroupSize.x
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -3008,6 +3829,18 @@ class MetalSqAttnPartBF16 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = kb0 + (c0 + j) * kv_dim + khoff + sl * epl
@@ -3021,13 +3854,51 @@ class MetalSqAttnPartBF16 {
             if (epl > 3u) {
                 s += q3 * float(kc[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kc[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kc[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kc[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kc[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kc[kb + 8u])
+                s += q9 * float(kc[kb + 9u])
+                s += q10 * float(kc[kb + 10u])
+                s += q11 * float(kc[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kc[kb + 12u])
+                s += q13 * float(kc[kb + 13u])
+                s += q14 * float(kc[kb + 14u])
+                s += q15 * float(kc[kb + 15u])
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -3113,8 +3984,10 @@ class MetalSqAttnPartBF32 {
     @uniform @binding = 10 scale : float
     @uniform @binding = 11 qstride : uint
     @uniform @binding = 12 nchmax : uint
+    @uniform @binding = 13 softcap : float
+    @uniform @binding = 14 window : uint
     @workgroup scores : float[64]
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_b32_msl")]
     def metal_sq_attn_part_b32 {
@@ -3130,12 +4003,18 @@ class MetalSqAttnPartBF32 {
         }
         let lid = gl_LocalInvocationID.x
         let nt = gl_WorkGroupSize.x
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -3144,6 +4023,18 @@ class MetalSqAttnPartBF32 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         var j = sg
         while (j < nrows) {
             let kb = kb0 + (c0 + j) * kv_dim + khoff + sl * epl
@@ -3157,13 +4048,51 @@ class MetalSqAttnPartBF32 {
             if (epl > 3u) {
                 s += q3 * kc[kb + 3u]
             }
+            if (epl > 4u) {
+                s += q4 * kc[kb + 4u]
+            }
+            if (epl > 5u) {
+                s += q5 * kc[kb + 5u]
+            }
+            if (epl > 6u) {
+                s += q6 * kc[kb + 6u]
+            }
+            if (epl > 7u) {
+                s += q7 * kc[kb + 7u]
+            }
+            if (epl > 8u) {
+                s += q8 * kc[kb + 8u]
+                s += q9 * kc[kb + 9u]
+                s += q10 * kc[kb + 10u]
+                s += q11 * kc[kb + 11u]
+            }
+            if (epl > 12u) {
+                s += q12 * kc[kb + 12u]
+                s += q13 * kc[kb + 13u]
+                s += q14 * kc[kb + 14u]
+                s += q15 * kc[kb + 15u]
+            }
             s = simd_sum(s)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -3252,8 +4181,10 @@ class MetalSqAttnPartBQ8 {
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
     @uniform @binding = 14 nchmax : uint
+    @uniform @binding = 15 softcap : float
+    @uniform @binding = 16 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_b_q8_msl")]
     def metal_sq_attn_part_b_q8 {
@@ -3269,15 +4200,20 @@ class MetalSqAttnPartBQ8 {
         }
         let lid = gl_LocalInvocationID.x
         let nt = gl_WorkGroupSize.x
-        let rowb = nblk * 34u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -3286,6 +4222,18 @@ class MetalSqAttnPartBQ8 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let ib = (sl * epl) % 32u
         var j = sg
@@ -3303,13 +4251,51 @@ class MetalSqAttnPartBQ8 {
             if (epl > 3u) {
                 s += q3 * float(kqb[kb + 3u])
             }
+            if (epl > 4u) {
+                s += q4 * float(kqb[kb + 4u])
+            }
+            if (epl > 5u) {
+                s += q5 * float(kqb[kb + 5u])
+            }
+            if (epl > 6u) {
+                s += q6 * float(kqb[kb + 6u])
+            }
+            if (epl > 7u) {
+                s += q7 * float(kqb[kb + 7u])
+            }
+            if (epl > 8u) {
+                s += q8 * float(kqb[kb + 8u])
+                s += q9 * float(kqb[kb + 9u])
+                s += q10 * float(kqb[kb + 10u])
+                s += q11 * float(kqb[kb + 11u])
+            }
+            if (epl > 12u) {
+                s += q12 * float(kqb[kb + 12u])
+                s += q13 * float(kqb[kb + 13u])
+                s += q14 * float(kqb[kb + 14u])
+                s += q15 * float(kqb[kb + 15u])
+            }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -3404,8 +4390,10 @@ class MetalSqAttnPartBTq4 {
     @uniform @binding = 12 scale : float
     @uniform @binding = 13 qstride : uint
     @uniform @binding = 14 nchmax : uint
+    @uniform @binding = 15 softcap : float
+    @uniform @binding = 16 window : uint
     @workgroup scores : float[64]   // == ATTN_CHUNK_ROWS
-    @workgroup red : float[4]
+    @workgroup red : float[16]
 
     [metal_kernel(name="metal_sq_attn_part_b_tq4_msl")]
     def metal_sq_attn_part_b_tq4 {
@@ -3421,15 +4409,20 @@ class MetalSqAttnPartBTq4 {
         }
         let lid = gl_LocalInvocationID.x
         let nt = gl_WorkGroupSize.x
-        let rowb = nblk * 18u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
         let qoff = bb * qstride + h * hs
         let c1 = min(c0 + 64u, cnt)
         let nrows = c1 - c0
+        // sliding window (gemma2): rows < wstart are outside the span. A chunk fully below the
+        // window exits whole-tg with its partial UNWRITTEN — the comb twin skips those chunks.
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        if (c1 <= wstart) {
+            return
+        }
         let sg = gl_SubgroupID
         let sl = gl_SubgroupInvocationID
         let epl = hs / 32u
@@ -3438,6 +4431,18 @@ class MetalSqAttnPartBTq4 {
         let q1 = epl > 1u ? q[qb + 1u] : 0.0
         let q2 = epl > 2u ? q[qb + 2u] : 0.0
         let q3 = epl > 3u ? q[qb + 3u] : 0.0
+        let q4 = epl > 4u ? q[qb + 4u] : 0.0
+        let q5 = epl > 5u ? q[qb + 5u] : 0.0
+        let q6 = epl > 6u ? q[qb + 6u] : 0.0
+        let q7 = epl > 7u ? q[qb + 7u] : 0.0
+        let q8 = epl > 8u ? q[qb + 8u] : 0.0
+        let q9 = epl > 9u ? q[qb + 9u] : 0.0
+        let q10 = epl > 10u ? q[qb + 10u] : 0.0
+        let q11 = epl > 11u ? q[qb + 11u] : 0.0
+        let q12 = epl > 12u ? q[qb + 12u] : 0.0
+        let q13 = epl > 13u ? q[qb + 13u] : 0.0
+        let q14 = epl > 14u ? q[qb + 14u] : 0.0
+        let q15 = epl > 15u ? q[qb + 15u] : 0.0
         let hb = (sl * epl) / 32u
         let inb = (sl * epl) % 32u
         var j = sg
@@ -3458,14 +4463,54 @@ class MetalSqAttnPartBTq4 {
                     s += q2 * float(int(by1 & 15u) - 8)
                     s += q3 * float(int(by1 >> 4u) - 8)
                 }
+                if (epl > 4u) {
+                    let by2 = uint(kqb[kb + 2u])
+                    s += q4 * float(int(by2 & 15u) - 8)
+                    s += q5 * float(int(by2 >> 4u) - 8)
+                }
+                if (epl > 6u) {
+                    let by3 = uint(kqb[kb + 3u])
+                    s += q6 * float(int(by3 & 15u) - 8)
+                    s += q7 * float(int(by3 >> 4u) - 8)
+                }
+                if (epl > 8u) {
+                    let by4 = uint(kqb[kb + 4u])
+                    let by5 = uint(kqb[kb + 5u])
+                    s += q8 * float(int(by4 & 15u) - 8)
+                    s += q9 * float(int(by4 >> 4u) - 8)
+                    s += q10 * float(int(by5 & 15u) - 8)
+                    s += q11 * float(int(by5 >> 4u) - 8)
+                }
+                if (epl > 12u) {
+                    let by6 = uint(kqb[kb + 6u])
+                    let by7 = uint(kqb[kb + 7u])
+                    s += q12 * float(int(by6 & 15u) - 8)
+                    s += q13 * float(int(by6 >> 4u) - 8)
+                    s += q14 * float(int(by7 & 15u) - 8)
+                    s += q15 * float(int(by7 >> 4u) - 8)
+                }
             }
             s = simd_sum(s * d)
             if (sl == 0u) {
-                scores[j] = s * scale
+                let sc = s * scale
+                // tanh via the exp identity (the CPU softcap4's form) — Metal tanh NaNs past
+                // ~44, while exp saturates: exp(INF) -> denom INF -> the term is 0
+                scores[j] = softcap > 0.0 ? softcap * (1.0 - 2.0 / (1.0 + exp(sc * 2.0 / softcap))) : sc
             }
             j += gl_NumSubgroups
         }
         barrier()
+        if (wstart > c0) {
+            // boundary chunk: mask rows below the window start (uniform branch — barrier is safe)
+            var jm = lid
+            while (jm < nrows) {
+                if (c0 + jm < wstart) {
+                    scores[jm] = -3.0e38
+                }
+                jm += nt
+            }
+            barrier()
+        }
         var m = -3.0e38
         j = lid
         while (j < nrows) {
@@ -3541,6 +4586,7 @@ class MetalSqAttnCombB {
     @uniform @binding = 3 nchmax : uint
     @uniform @binding = 4 nheads : uint
     @uniform @binding = 5 hs : uint
+    @uniform @binding = 6 window : uint     // > 0 = sliding span — this row's below-window chunks are unwritten
 
     [metal_kernel(name="metal_sq_attn_comb_b_msl")]
     def metal_sq_attn_comb_b {
@@ -3550,16 +4596,18 @@ class MetalSqAttnCombB {
         let lid = gl_LocalInvocationID.x
         let cnt = rt[bb].w
         let nch = (cnt + 63u) / 64u
+        let wstart = window > 0u && cnt > window ? cnt - window : 0u
+        let chlo = wstart / 64u
         let base = (bb * nheads + h) * nchmax
         var mm = -3.0e38
-        var ci = 0u
+        var ci = chlo
         while (ci < nch) {
             mm = max(mm, part[(base + ci) * (hs + 2u) + hs])
             ci++
         }
         var acc = 0.0
         var l = 0.0
-        ci = 0u
+        ci = chlo
         while (ci < nch) {
             let pb = (base + ci) * (hs + 2u)
             let w = exp(part[pb + hs] - mm)
@@ -3601,8 +4649,8 @@ class MetalSqAttnDF16 {
             return
         }
         let sl = gl_SubgroupInvocationID
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let kv4 = kv_dim / 4u
@@ -3712,8 +4760,8 @@ class MetalSqAttnDF32 {
             return
         }
         let sl = gl_SubgroupInvocationID
-        let kb0 = rrow.x + lay * rrow.z * kv_dim
-        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let kb0 = rrow.x + lay * rrow.z   // lay = the layer's KV-row ELEMENT prefix (Σ kv_dim below l)
+        let vb0 = rrow.y + lay * rrow.z
         let khoff = (h / kv_mul) * hs
         let qoff = bb * qstride + h * hs
         let kv4 = kv_dim / 4u
@@ -3875,6 +4923,9 @@ class MetalRopeStoreBF16 {
     @uniform @binding = 10 npairs_q : uint  // qd/2 — the q half of the pair grid
     @uniform @binding = 11 npairs : uint    // + kvd/2 — grid guard
     @uniform @binding = 12 qstride : uint
+    @uniform @binding = 13 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
+    @ssbo @binding = 14 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @uniform @binding = 15 has_bias : uint
 
     [metal_kernel(name="metal_rope_store_b16_msl")]
     def metal_rope_store_b16 {
@@ -3889,25 +4940,29 @@ class MetalRopeStoreBF16 {
         let isK = gid >= npairs_q
         let lgid = isK ? gid - npairs_q : gid
         let j = lgid % half
-        let i = (lgid / half) * head_size + 2u * j
+        let hbase = (lgid / half) * head_size
+        let i = neox != 0u ? hbase + j : hbase + 2u * j
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[bb * half + j]
         let fci = tsin[bb * half + j]
         if (isK) {
-            let kdst = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
-            let vdst = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
-            let v0 = qk[qbase + qd + i]
-            let v1 = qk[qbase + qd + i + 1u]
+            let kdst = rrow.x + lay * rrow.z + (rrow.w - 1u) * kv_dim   // lay = element prefix
+            let vdst = rrow.y + lay * rrow.z + (rrow.w - 1u) * kv_dim
+            let v0 = qk[qbase + qd + i] + (has_bias != 0u ? bias[qd + i] : 0.0)
+            let v1 = qk[qbase + qd + i2] + (has_bias != 0u ? bias[qd + i2] : 0.0)
             let r0 = v0 * fcr - v1 * fci
             let r1 = v0 * fci + v1 * fcr
             kd[kdst + i] = float16(min(max(r0, -65504.0), 65504.0))   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp
-            kd[kdst + i + 1u] = float16(min(max(r1, -65504.0), 65504.0))   // nolint:STYLE019
-            vd[vdst + i] = float16(min(max(qk[qbase + qd + kv_dim + i], -65504.0), 65504.0))   // nolint:STYLE019
-            vd[vdst + i + 1u] = float16(min(max(qk[qbase + qd + kv_dim + i + 1u], -65504.0), 65504.0))   // nolint:STYLE019
+            kd[kdst + i2] = float16(min(max(r1, -65504.0), 65504.0))   // nolint:STYLE019
+            let b0 = has_bias != 0u ? bias[qd + kv_dim + i] : 0.0
+            let b1 = has_bias != 0u ? bias[qd + kv_dim + i2] : 0.0
+            vd[vdst + i] = float16(min(max(qk[qbase + qd + kv_dim + i] + b0, -65504.0), 65504.0))   // nolint:STYLE019
+            vd[vdst + i2] = float16(min(max(qk[qbase + qd + kv_dim + i2] + b1, -65504.0), 65504.0))   // nolint:STYLE019
         } else {
-            let v0 = qk[qbase + i]
-            let v1 = qk[qbase + i + 1u]
+            let v0 = qk[qbase + i] + (has_bias != 0u ? bias[i] : 0.0)
+            let v1 = qk[qbase + i2] + (has_bias != 0u ? bias[i2] : 0.0)
             qk[qbase + i] = v0 * fcr - v1 * fci
-            qk[qbase + i + 1u] = v0 * fci + v1 * fcr
+            qk[qbase + i2] = v0 * fci + v1 * fcr
         }
     }
 }
@@ -3927,6 +4982,9 @@ class MetalRopeStoreBF32 {
     @uniform @binding = 10 npairs_q : uint
     @uniform @binding = 11 npairs : uint
     @uniform @binding = 12 qstride : uint
+    @uniform @binding = 13 neox : uint
+    @ssbo @binding = 14 bias : array<float>
+    @uniform @binding = 15 has_bias : uint
 
     [metal_kernel(name="metal_rope_store_b32_msl")]
     def metal_rope_store_b32 {
@@ -3941,23 +4999,25 @@ class MetalRopeStoreBF32 {
         let isK = gid >= npairs_q
         let lgid = isK ? gid - npairs_q : gid
         let j = lgid % half
-        let i = (lgid / half) * head_size + 2u * j
+        let hbase = (lgid / half) * head_size
+        let i = neox != 0u ? hbase + j : hbase + 2u * j
+        let i2 = neox != 0u ? i + half : i + 1u
         let fcr = tcos[bb * half + j]
         let fci = tsin[bb * half + j]
         if (isK) {
-            let kdst = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
-            let vdst = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * kv_dim
-            let v0 = qk[qbase + qd + i]
-            let v1 = qk[qbase + qd + i + 1u]
+            let kdst = rrow.x + lay * rrow.z + (rrow.w - 1u) * kv_dim   // lay = element prefix
+            let vdst = rrow.y + lay * rrow.z + (rrow.w - 1u) * kv_dim
+            let v0 = qk[qbase + qd + i] + (has_bias != 0u ? bias[qd + i] : 0.0)
+            let v1 = qk[qbase + qd + i2] + (has_bias != 0u ? bias[qd + i2] : 0.0)
             kd[kdst + i] = v0 * fcr - v1 * fci
-            kd[kdst + i + 1u] = v0 * fci + v1 * fcr
-            vd[vdst + i] = qk[qbase + qd + kv_dim + i]
-            vd[vdst + i + 1u] = qk[qbase + qd + kv_dim + i + 1u]
+            kd[kdst + i2] = v0 * fci + v1 * fcr
+            vd[vdst + i] = qk[qbase + qd + kv_dim + i] + (has_bias != 0u ? bias[qd + kv_dim + i] : 0.0)
+            vd[vdst + i2] = qk[qbase + qd + kv_dim + i2] + (has_bias != 0u ? bias[qd + kv_dim + i2] : 0.0)
         } else {
-            let v0 = qk[qbase + i]
-            let v1 = qk[qbase + i + 1u]
+            let v0 = qk[qbase + i] + (has_bias != 0u ? bias[i] : 0.0)
+            let v1 = qk[qbase + i2] + (has_bias != 0u ? bias[i2] : 0.0)
             qk[qbase + i] = v0 * fcr - v1 * fci
-            qk[qbase + i + 1u] = v0 * fci + v1 * fcr
+            qk[qbase + i2] = v0 * fci + v1 * fcr
         }
     }
 }
@@ -3994,9 +5054,8 @@ class MetalSqAttnDQ8 {
             return
         }
         let sl = gl_SubgroupInvocationID
-        let rowb = nblk * 34u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -4106,6 +5165,9 @@ class MetalRopeStoreBQ8 {
     @uniform @binding = 11 head_size : uint
     @uniform @binding = 12 npairs_q : uint  // qd/2 — the q-rope half of the grid
     @uniform @binding = 13 qstride : uint
+    @uniform @binding = 14 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
+    @ssbo @binding = 15 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @uniform @binding = 16 has_bias : uint
 
     [metal_kernel(name="metal_rope_store_b_q8_msl")]
     def metal_rope_store_b_q8 {
@@ -4119,16 +5181,19 @@ class MetalRopeStoreBQ8 {
         let half = head_size / 2u
         if (gid < npairs_q) {
             let j = gid % half
-            let i = (gid / half) * head_size + 2u * j
+            let hbase = (gid / half) * head_size
+            let i = neox != 0u ? hbase + j : hbase + 2u * j
+            let i2 = neox != 0u ? i + half : i + 1u
             let fcr = tcos[bb * half + j]
             let fci = tsin[bb * half + j]
-            let v0 = qk[qbase + i]
-            let v1 = qk[qbase + i + 1u]
+            let v0 = qk[qbase + i] + (has_bias != 0u ? bias[i] : 0.0)
+            let v1 = qk[qbase + i2] + (has_bias != 0u ? bias[i2] : 0.0)
             qk[qbase + i] = v0 * fcr - v1 * fci
-            qk[qbase + i + 1u] = v0 * fci + v1 * fcr
+            qk[qbase + i2] = v0 * fci + v1 * fcr
             return
         }
         let rowb = nblk * 34u
+        let kvd = nblk * 32u
         let bi = gid - npairs_q
         let isV = bi >= nblk
         let blk = isV ? bi - nblk : bi
@@ -4137,7 +5202,25 @@ class MetalRopeStoreBQ8 {
         if (isV) {
             var e = 0u
             while (e < 32u) {
-                vals[e] = qk[qbase + qd + nblk * 32u + base + e]   // the raw v third of the QKV row
+                // the raw v third of the QKV row
+                vals[e] = qk[qbase + qd + kvd + base + e] + (has_bias != 0u ? bias[qd + kvd + base + e] : 0.0)
+                e++
+            }
+        } elif (neox != 0u) {
+            // NEOX pairs straddle 32-blocks (partner at ±half) — rope per ELEMENT; partner
+            // reads come from qk, which no K/V thread writes, so cross-block reads are safe
+            var e = 0u
+            while (e < 32u) {
+                let ge = base + e
+                let hp = ge % head_size
+                let isHi = hp >= half
+                let j = isHi ? hp - half : hp
+                let fcr = tcos[bb * half + j]
+                let fci = tsin[bb * half + j]
+                let oi = isHi ? ge - half : ge + half
+                let mine = qk[qbase + qd + ge] + (has_bias != 0u ? bias[qd + ge] : 0.0)
+                let other = qk[qbase + qd + oi] + (has_bias != 0u ? bias[qd + oi] : 0.0)
+                vals[e] = isHi ? other * fci + mine * fcr : mine * fcr - other * fci
                 e++
             }
         } else {
@@ -4147,8 +5230,8 @@ class MetalRopeStoreBQ8 {
                 let j = (ge % head_size) / 2u
                 let fcr = tcos[bb * half + j]
                 let fci = tsin[bb * half + j]
-                let v0 = qk[qbase + qd + ge]
-                let v1 = qk[qbase + qd + ge + 1u]
+                let v0 = qk[qbase + qd + ge] + (has_bias != 0u ? bias[qd + ge] : 0.0)
+                let v1 = qk[qbase + qd + ge + 1u] + (has_bias != 0u ? bias[qd + ge + 1u] : 0.0)
                 vals[2u * p] = v0 * fcr - v1 * fci
                 vals[2u * p + 1u] = v0 * fci + v1 * fcr
                 p++
@@ -4163,7 +5246,7 @@ class MetalRopeStoreBQ8 {
         let d = amax / 127.0
         let id = d != 0.0 ? 1.0 / d : 0.0
         if (isV) {
-            let vb0b = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * rowb
+            let vb0b = rrow.y + lay * rrow.z + (rrow.w - 1u) * rowb   // lay = row-byte prefix
             vsh[vb0b / 2u + blk * 17u] = float16(d)
             k = 0u
             while (k < 32u) {
@@ -4171,7 +5254,7 @@ class MetalRopeStoreBQ8 {
                 k++
             }
         } else {
-            let kb0b = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * rowb
+            let kb0b = rrow.x + lay * rrow.z + (rrow.w - 1u) * rowb
             ksh[kb0b / 2u + blk * 17u] = float16(d)
             k = 0u
             while (k < 32u) {
@@ -4213,9 +5296,8 @@ class MetalSqAttnDTq4 {
             return
         }
         let sl = gl_SubgroupInvocationID
-        let rowb = nblk * 18u
-        let kb0b = rrow.x + lay * rrow.z * rowb
-        let vb0b = rrow.y + lay * rrow.z * rowb
+        let kb0b = rrow.x + lay * rrow.z   // lay = the layer's row-BYTE prefix
+        let vb0b = rrow.y + lay * rrow.z
         let kb0h = kb0b / 2u
         let vb0h = vb0b / 2u
         let khblk = (h / kv_mul) * (hs / 32u)
@@ -4338,7 +5420,10 @@ class MetalRopeStoreBTq4 {
     @uniform @binding = 12 nheads : uint
     @uniform @binding = 13 kv_mul : uint
     @uniform @binding = 14 qstride : uint
-    @workgroup buf : float[128]
+    @uniform @binding = 15 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
+    @ssbo @binding = 16 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @uniform @binding = 17 has_bias : uint
+    @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
 
     [metal_kernel(name="metal_rope_store_b_tq4_msl")]
     def metal_rope_store_b_tq4 {
@@ -4354,18 +5439,21 @@ class MetalRopeStoreBTq4 {
         let isQ = tgid < nheads
         let isK = !isQ && tgid < nheads + nkvh
         let hh = isQ ? tgid : (isK ? tgid - nheads : tgid - nheads - nkvh)
-        // q/k live in the fused QKV row; v is its third region
-        let base = qbase + (isQ ? tgid * hs : (isK ? qd + hh * hs : qd + kv_dim + hh * hs))
+        // q/k live in the fused QKV row; v is its third region (bbase = the bias-plane index)
+        let bbase = isQ ? tgid * hs : (isK ? qd + hh * hs : qd + kv_dim + hh * hs)
+        let base = qbase + bbase
         var v = 0.0
         if (isQ || isK) {
-            let j = lid / 2u
+            let isHi = neox != 0u ? lid >= half : (lid & 1u) != 0u
+            let j = neox != 0u ? (isHi ? lid - half : lid) : lid / 2u
             let fcr = tcos[bb * half + j]
             let fci = tsin[bb * half + j]
-            let mine = qk[base + lid]
-            let other = qk[base + (lid ^ 1u)]
-            v = (lid & 1u) == 0u ? mine * fcr - other * fci : other * fci + mine * fcr
+            let po = neox != 0u ? (isHi ? lid - half : lid + half) : (lid ^ 1u)
+            let mine = qk[base + lid] + (has_bias != 0u ? bias[bbase + lid] : 0.0)
+            let other = qk[base + po] + (has_bias != 0u ? bias[bbase + po] : 0.0)
+            v = isHi ? other * fci + mine * fcr : mine * fcr - other * fci
         } else {
-            v = qk[base + lid]
+            v = qk[base + lid] + (has_bias != 0u ? bias[bbase + lid] : 0.0)
         }
         buf[lid] = v * signs[lid]
         barrier()
@@ -4405,7 +5493,7 @@ class MetalRopeStoreBTq4 {
         let rowb = (kv_dim / 32u) * 18u
         let blk = hh * (hs / 32u) + lid / 32u   // block within the K/V row
         if (isK) {
-            let kb0b = rrow.x + (lay * rrow.z + (rrow.w - 1u)) * rowb
+            let kb0b = rrow.x + lay * rrow.z + (rrow.w - 1u) * rowb   // lay = row-byte prefix
             if (sl == 0u) {
                 ksh[kb0b / 2u + blk * 9u] = float16(d)
             }
@@ -4413,7 +5501,7 @@ class MetalRopeStoreBTq4 {
                 kqb[kb0b + blk * 18u + 2u + (lid % 32u) / 2u] = uint8(uint(qv) | (uint(qother) << 4u))
             }
         } else {
-            let vb0b = rrow.y + (lay * rrow.z + (rrow.w - 1u)) * rowb
+            let vb0b = rrow.y + lay * rrow.z + (rrow.w - 1u) * rowb
             if (sl == 0u) {
                 vsh[vb0b / 2u + blk * 9u] = float16(d)
             }
@@ -4434,6 +5522,8 @@ class MetalAddRmsB {
     @ssbo @binding = 3 y : array<float>     // [B x dim] normed out (y may alias a)
     @uniform @binding = 4 dim : uint
     @uniform @binding = 5 eps : float
+    @uniform @binding = 6 ascale : float    // (x + a) * ascale — gemma4 layer_out_scale scales
+                                            // the WHOLE layer output; every other site binds 1.0
     @workgroup xrow : float[4096]           // == ADD_RMS_MAX_DIM
     @workgroup partial : float[32]
     @workgroup inv_sh : float
@@ -4445,7 +5535,7 @@ class MetalAddRmsB {
         var ss = 0.0
         var k = lid
         while (k < dim) {
-            let vv = x[row * dim + k] + a[row * dim + k]
+            let vv = (x[row * dim + k] + a[row * dim + k]) * ascale
             x[row * dim + k] = vv
             xrow[k] = vv
             ss += vv * vv
@@ -4477,12 +5567,15 @@ class MetalAddRmsB {
 
 
 var g_pso_gemv : MetalComputePipeline?
-var g_pso_gemv16 : MetalComputePipeline?   // f16-scale twin (wscale_f16 models)
 var g_gemv_rows = 4l                       // rows (simdgroups) per GEMV threadgroup
 var g_pso_rms : MetalComputePipeline?
 var g_pso_add : MetalComputePipeline?
 var g_pso_addrms : MetalComputePipeline?
 var g_pso_swiglu : MetalComputePipeline?
+var g_pso_geglu : MetalComputePipeline?
+var g_pso_softcap : MetalComputePipeline?
+var g_pso_suppress : MetalComputePipeline?
+var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind
 var g_pso_attn16 : MetalComputePipeline?
 var g_pso_attn32 : MetalComputePipeline?
 var g_pso_attn_q8 : MetalComputePipeline?   // q8_0-mirror twin (dual-view block reads)
@@ -4493,20 +5586,23 @@ var g_pso_attnp_q8 : MetalComputePipeline?
 var g_pso_attnp_tq4 : MetalComputePipeline?
 var g_pso_attncomb : MetalComputePipeline?
 var g_pso_rpst16 : MetalComputePipeline?
+var g_pso_rpst_h16 : MetalComputePipeline?  // head-cooperative fused bias+norm+rope+store (QK-norm models)
 var g_pso_rpst32 : MetalComputePipeline?
 var g_pso_rpst_q8 : MetalComputePipeline?   // per-32-block quantizing store
 var g_pso_rpst_tq4 : MetalComputePipeline?  // threadgroup-per-head FWHT + quantizing store
 var g_pso_unsign : MetalComputePipeline?    // the tq4 attention-output un-rotate
+var g_pso_qknorm : MetalComputePipeline?    // per-head QK RMSNorm prepass (MSL owned by prefill)
 
 var g_pso_argmax : MetalComputePipeline?
 var g_pso_copy_row : MetalComputePipeline?   // zero-copy logits: staging row -> wrapped session storage
 var g_pso_emb : MetalComputePipeline?
-var g_pso_emb16 : MetalComputePipeline?
+var g_pso_emb_k6 : MetalComputePipeline?     // tied-k6 spec chain's embed gather
 var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
 var g_pso_qkvrs32 : MetalComputePipeline?
 var g_pso_w13sw : MetalComputePipeline?
 var g_pso_kq_k4 : MetalComputePipeline?
 var g_pso_kq_k5 : MetalComputePipeline?
+var g_pso_kq_k5c : MetalComputePipeline?   // the select-form nr0=1 twin — n < 3072 / small-d sites
 var g_pso_kq_k6 : MetalComputePipeline?
 var g_pso_kq_mvb2_k4 : MetalComputePipeline?   // batch B=2..8: the kq ext small-batch mv twins
 var g_pso_kq_mvb4_k4 : MetalComputePipeline?
@@ -4514,6 +5610,9 @@ var g_pso_kq_mvb2_k5 : MetalComputePipeline?
 var g_pso_kq_mvb4_k5 : MetalComputePipeline?
 var g_pso_kq_mvb2_k6 : MetalComputePipeline?
 var g_pso_kq_mvb4_k6 : MetalComputePipeline?
+var g_pso_kq_mvb8_k4 : MetalComputePipeline?   // B=5..8 single-pass twins (in-graph A/B vs 2 x B4 groups)
+var g_pso_kq_mvb8_k5 : MetalComputePipeline?
+var g_pso_kq_mvb8_k6 : MetalComputePipeline?
 var g_pso_kq_mm_b4 : MetalComputePipeline?   // batch B>=9: the prefill-owned kq mul_mm twins
 var g_pso_kq_mm_b5 : MetalComputePipeline?
 var g_pso_kq_mm_b6 : MetalComputePipeline?     // fused W1|W3+swiglu (s16 path)
@@ -4578,12 +5677,19 @@ def metal_decode_init : bool {
     var ok = true
     // the GEMV / rms / add / swiglu MSL sources are the prefill module's, verbatim (own PSOs)
     g_pso_gemv = compile_pso(metal_q8_gemv_msl, metal_q8_gemv_msl_entry, metal_q8_gemv_msl_fastmath, ok)
-    g_pso_gemv16 = compile_pso(metal_q8_gemv_s16_msl, metal_q8_gemv_s16_msl_entry, metal_q8_gemv_s16_msl_fastmath, ok)
     g_gemv_rows = clamp(int64(env_int("DASLLAMA_METAL_GEMV_TG", 4)), 1l, 32l)
     g_pso_rms = compile_pso(metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, ok)
     g_pso_add = compile_pso(metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath, ok)
     g_pso_addrms = compile_pso(metal_add_rms_msl, metal_add_rms_msl_entry, metal_add_rms_msl_fastmath, ok)
     g_pso_swiglu = compile_pso(metal_swiglu_msl, metal_swiglu_msl_entry, metal_swiglu_msl_fastmath, ok)
+    g_one = metal_new_buffer(g_dev, 4ul)
+    unsafe {
+        var onep = reinterpret<float?>(metal_buffer_contents(g_one))
+        onep[0] = 1.0
+    }
+    g_pso_geglu = compile_pso(metal_geglu_msl, metal_geglu_msl_entry, metal_geglu_msl_fastmath, ok)
+    g_pso_softcap = compile_pso(metal_softcap_row_msl, metal_softcap_row_msl_entry, metal_softcap_row_msl_fastmath, ok)
+    g_pso_suppress = compile_pso(metal_suppress_row_msl, metal_suppress_row_msl_entry, metal_suppress_row_msl_fastmath, ok)
     g_pso_attn16 = compile_pso(metal_sq_attn16_msl, metal_sq_attn16_msl_entry, metal_sq_attn16_msl_fastmath, ok)
     g_pso_attn32 = compile_pso(metal_sq_attn32_msl, metal_sq_attn32_msl_entry, metal_sq_attn32_msl_fastmath, ok)
     g_pso_attnp16 = compile_pso(metal_sq_attn_part16_msl, metal_sq_attn_part16_msl_entry, metal_sq_attn_part16_msl_fastmath, ok)
@@ -4594,19 +5700,22 @@ def metal_decode_init : bool {
     g_pso_attn_tq4 = compile_pso(metal_sq_attn_tq4_msl, metal_sq_attn_tq4_msl_entry, metal_sq_attn_tq4_msl_fastmath, ok)
     g_pso_attnp_tq4 = compile_pso(metal_sq_attn_part_tq4_msl, metal_sq_attn_part_tq4_msl_entry, metal_sq_attn_part_tq4_msl_fastmath, ok)
     g_pso_rpst16 = compile_pso(metal_rope_store16_msl, metal_rope_store16_msl_entry, metal_rope_store16_msl_fastmath, ok)
+    g_pso_rpst_h16 = compile_pso(metal_rope_store_h16_msl, metal_rope_store_h16_msl_entry, metal_rope_store_h16_msl_fastmath, ok)
     g_pso_rpst32 = compile_pso(metal_rope_store32_msl, metal_rope_store32_msl_entry, metal_rope_store32_msl_fastmath, ok)
     g_pso_rpst_q8 = compile_pso(metal_rope_store_q8_msl, metal_rope_store_q8_msl_entry, metal_rope_store_q8_msl_fastmath, ok)
     g_pso_rpst_tq4 = compile_pso(metal_rope_store_tq4_msl, metal_rope_store_tq4_msl_entry, metal_rope_store_tq4_msl_fastmath, ok)
     g_pso_unsign = compile_pso(metal_fwht_unsign_msl, metal_fwht_unsign_msl_entry, metal_fwht_unsign_msl_fastmath, ok)
+    g_pso_qknorm = compile_pso(metal_qk_norm_msl, metal_qk_norm_msl_entry, metal_qk_norm_msl_fastmath, ok)
     g_pso_argmax = compile_pso(metal_argmax_msl, metal_argmax_msl_entry, metal_argmax_msl_fastmath, ok)
     g_pso_copy_row = compile_pso(metal_copy_row_msl, metal_copy_row_msl_entry, metal_copy_row_msl_fastmath, ok)
     g_pso_emb = compile_pso(metal_embed_q8_msl, metal_embed_q8_msl_entry, metal_embed_q8_msl_fastmath, ok)
-    g_pso_emb16 = compile_pso(metal_embed_q8_s16_msl, metal_embed_q8_s16_msl_entry, metal_embed_q8_s16_msl_fastmath, ok)
+    g_pso_emb_k6 = compile_pso(metal_embed_k6_msl, metal_embed_k6_msl_entry, metal_embed_k6_msl_fastmath, ok)
     g_pso_qkvrs16 = compile_pso(metal_q8_gemv_qkv_rs16_msl, metal_q8_gemv_qkv_rs16_msl_entry, metal_q8_gemv_qkv_rs16_msl_fastmath, ok)
     g_pso_qkvrs32 = compile_pso(metal_q8_gemv_qkv_rs32_msl, metal_q8_gemv_qkv_rs32_msl_entry, metal_q8_gemv_qkv_rs32_msl_fastmath, ok)
     g_pso_w13sw = compile_pso(metal_q8_gemv_w13sw16_msl, metal_q8_gemv_w13sw16_msl_entry, metal_q8_gemv_w13sw16_msl_fastmath, ok)
     g_pso_kq_k4 = compile_pso(metal_kq_gemv_k4_msl, metal_kq_gemv_k4_msl_entry, metal_kq_gemv_k4_msl_fastmath, ok)
     g_pso_kq_k5 = compile_pso(metal_kq_gemv_k5_msl, metal_kq_gemv_k5_msl_entry, metal_kq_gemv_k5_msl_fastmath, ok)
+    g_pso_kq_k5c = compile_pso(metal_kq_gemv_k5c_msl, metal_kq_gemv_k5c_msl_entry, metal_kq_gemv_k5c_msl_fastmath, ok)
     g_pso_kq_k6 = compile_pso(metal_kq_gemv_k6_msl, metal_kq_gemv_k6_msl_entry, metal_kq_gemv_k6_msl_fastmath, ok)
     g_pso_kq_mvb2_k4 = compile_pso(metal_kq_mvb2_k4_msl, metal_kq_mvb2_k4_msl_entry, metal_kq_mvb2_k4_msl_fastmath, ok)
     g_pso_kq_mvb4_k4 = compile_pso(metal_kq_mvb4_k4_msl, metal_kq_mvb4_k4_msl_entry, metal_kq_mvb4_k4_msl_fastmath, ok)
@@ -4614,6 +5723,9 @@ def metal_decode_init : bool {
     g_pso_kq_mvb4_k5 = compile_pso(metal_kq_mvb4_k5_msl, metal_kq_mvb4_k5_msl_entry, metal_kq_mvb4_k5_msl_fastmath, ok)
     g_pso_kq_mvb2_k6 = compile_pso(metal_kq_mvb2_k6_msl, metal_kq_mvb2_k6_msl_entry, metal_kq_mvb2_k6_msl_fastmath, ok)
     g_pso_kq_mvb4_k6 = compile_pso(metal_kq_mvb4_k6_msl, metal_kq_mvb4_k6_msl_entry, metal_kq_mvb4_k6_msl_fastmath, ok)
+    g_pso_kq_mvb8_k4 = compile_pso(metal_kq_mvb8_k4_msl, metal_kq_mvb8_k4_msl_entry, metal_kq_mvb8_k4_msl_fastmath, ok)
+    g_pso_kq_mvb8_k5 = compile_pso(metal_kq_mvb8_k5_msl, metal_kq_mvb8_k5_msl_entry, metal_kq_mvb8_k5_msl_fastmath, ok)
+    g_pso_kq_mvb8_k6 = compile_pso(metal_kq_mvb8_k6_msl, metal_kq_mvb8_k6_msl_entry, metal_kq_mvb8_k6_msl_fastmath, ok)
     g_pso_kq_mm_b4 = compile_pso(metal_kq_mulmm_k4_msl, metal_kq_mulmm_k4_msl_entry, metal_kq_mulmm_k4_msl_fastmath, ok)
     g_pso_kq_mm_b5 = compile_pso(metal_kq_mulmm_k5_msl, metal_kq_mulmm_k5_msl_entry, metal_kq_mulmm_k5_msl_fastmath, ok)
     g_pso_kq_mm_b6 = compile_pso(metal_kq_mulmm_k6_msl, metal_kq_mulmm_k6_msl_entry, metal_kq_mulmm_k6_msl_fastmath, ok)
@@ -4665,10 +5777,10 @@ def metal_decode_init : bool {
 
 // ===== encoders =====
 
-def enc_gemv(enc : MetalComputeEncoder?; s16 : bool; bwq, bws, bx, by, bn, bd : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, s16 ? g_pso_gemv16 : g_pso_gemv)
-    metal_set_buffer(enc, bwq, 0ul, 0)
-    metal_set_buffer(enc, bws, 0ul, 1)
+def enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64; bx, by, bn, bd : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
+    metal_set_pipeline(enc, g_pso_gemv)
+    metal_set_buffer(enc, bw, boff, 0)   // half-scale view
+    metal_set_buffer(enc, bw, boff, 1)   // byte view — the same blob slice
     metal_set_buffer(enc, bx, 0ul, 2)
     metal_set_buffer(enc, by, yoff, 3)
     metal_set_buffer(enc, bn, 0ul, 4)
@@ -4680,65 +5792,96 @@ def enc_gemv(enc : MetalComputeEncoder?; s16 : bool; bwq, bws, bx, by, bn, bd : 
 // K-quant site GEMV — the per-format twin of enc_gemv over the kq plane pair
 // (kq_upload_quants + kq_upload_scales). k6 binds the scale buffer twice: the trailing packed
 // f16 d plane at byte nsb*16, the 16B sub-scale blocks at 0. Geometry: 64-thread tg, 4 rows.
-def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by, bn, bd : MetalBuffer?; rows, n : int64; yoff : uint64 = 0ul; xoff : uint64 = 0ul) {
+def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff : uint64;
+                bs : MetalBuffer?; soff, doff : uint64; bx, by, bn, bd : MetalBuffer?;
+                rows, n : int64; yoff : uint64 = 0ul; xoff : uint64 = 0ul) {
+    var groups = (rows + 3l) / 4l
     if (fmt == KqFmt.k6) {
         metal_set_pipeline(enc, g_pso_kq_k6)
-        metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
+        metal_set_buffer(enc, bs, doff, 0)   // the split plane's f16 d tail
+    } elif (fmt == KqFmt.k5 && (n < 3072l || rows <= 1024l)) {
+        // the select-form nr0=1 twin: wins every d at n < 3072 (gemv lab, 4B round) and the
+        // small-d kv shape (b2r under-occupied); 2 rows/tg instead of b2r's 4
+        metal_set_pipeline(enc, g_pso_kq_k5c)
+        metal_set_buffer(enc, bs, soff, 0)
+        groups = (rows + 1l) / 2l
     } else {
         metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_k4 : g_pso_kq_k5)
-        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bs, soff, 0)
     }
-    metal_set_buffer(enc, bs, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, bs, soff, 1)
+    metal_set_buffer(enc, bq, qoff, 2)
     metal_set_buffer(enc, bx, xoff, 3)
     metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bd, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), 1u, 1u), uint3(64u, 1u, 1u))
+    metal_dispatch_threadgroups(enc, uint3(uint(groups), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
-// K-quant small-batch mv (B = 2..8): the kq ext twins — R=4 column groups via grid.y (gcols),
-// R=2 via the B2 PSO at exactly two live columns. y binds at the site's column byte offset;
-// bys = the y ROW-stride uniform; bnr = live columns (stores gate).
-def enc_kq_mvb(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by : MetalBuffer?; yoff : uint64;
-               bn, bd, bys, bnr : MetalBuffer?; rows, n, nlive : int64) {
-    let two = nlive == 2l
-    if (fmt == KqFmt.k6) {
-        metal_set_pipeline(enc, two ? g_pso_kq_mvb2_k6 : g_pso_kq_mvb4_k6)
-        metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
-    } elif (fmt == KqFmt.k5) {
-        metal_set_pipeline(enc, two ? g_pso_kq_mvb2_k5 : g_pso_kq_mvb4_k5)
-        metal_set_buffer(enc, bs, 0ul, 0)
-    } else {
-        metal_set_pipeline(enc, two ? g_pso_kq_mvb2_k4 : g_pso_kq_mvb4_k4)
-        metal_set_buffer(enc, bs, 0ul, 0)
+// K-quant small-batch mv (B = 2..8): R=4 column groups via grid.y, R=2 via the B2 PSO; B = 5..8
+// rides the single-pass B8 twin (requires the mp == 8 pad the driver guarantees at nlive >= 5;
+// DASLLAMA_METAL_KQ_B8=0 = the A/B rail). bys = y ROW-stride; bnr = live columns (stores gate).
+var private g_kq_b8_mode = -1
+
+def private kq_b8_on : bool {
+    if (g_kq_b8_mode < 0) {
+        g_kq_b8_mode = env_int("DASLLAMA_METAL_KQ_B8", 1) != 0 ? 1 : 0
     }
-    metal_set_buffer(enc, bs, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
+    return g_kq_b8_mode == 1
+}
+
+def enc_kq_mvb(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff : uint64;
+               bs : MetalBuffer?; soff, doff : uint64; bx, by : MetalBuffer?; yoff : uint64;
+               bn, bd, bys, bnr : MetalBuffer?; rows, nlive : int64) {
+    let two = nlive == 2l
+    let b8 = nlive >= 5l && kq_b8_on()
+    if (fmt == KqFmt.k6) {
+        metal_set_pipeline(enc, b8 ? g_pso_kq_mvb8_k6 : (two ? g_pso_kq_mvb2_k6 : g_pso_kq_mvb4_k6))
+        if (b8) {
+            metal_set_threadgroup_memory_length(enc, metal_kq_mvb8_k6_msl_tgmem, 0)
+        }
+        metal_set_buffer(enc, bs, doff, 0)
+    } elif (fmt == KqFmt.k5) {
+        metal_set_pipeline(enc, b8 ? g_pso_kq_mvb8_k5 : (two ? g_pso_kq_mvb2_k5 : g_pso_kq_mvb4_k5))
+        if (b8) {
+            metal_set_threadgroup_memory_length(enc, metal_kq_mvb8_k5_msl_tgmem, 0)
+        }
+        metal_set_buffer(enc, bs, soff, 0)
+    } else {
+        metal_set_pipeline(enc, b8 ? g_pso_kq_mvb8_k4 : (two ? g_pso_kq_mvb2_k4 : g_pso_kq_mvb4_k4))
+        if (b8) {
+            metal_set_threadgroup_memory_length(enc, metal_kq_mvb8_k4_msl_tgmem, 0)
+        }
+        metal_set_buffer(enc, bs, soff, 0)
+    }
+    metal_set_buffer(enc, bs, soff, 1)
+    metal_set_buffer(enc, bq, qoff, 2)
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bd, 0ul, 6)
     metal_set_buffer(enc, bys, 0ul, 7)
     metal_set_buffer(enc, bnr, 0ul, 8)
-    let gcols = two ? 1l : (nlive + 3l) / 4l
+    let gcols = (two || b8) ? 1l : (nlive + 3l) / 4l
     metal_dispatch_threadgroups(enc, uint3(uint((rows + 7l) / 8l), uint(gcols), 1u), uint3(64u, 1u, 1u))
 }
 
 // the batched kq GEMM (B >= 9): the prefill-owned kq mul_mm twins over the padded x panel —
 // enc_gemm_mm_b's shape (grid mp/32 x rows/64, y bound at the site's column byte offset)
-def enc_kq_gemm_mm_b(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by : MetalBuffer?; yoff : uint64; bk, bn : MetalBuffer?; mp, rows, n : int64) {
+def enc_kq_gemm_mm_b(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff : uint64;
+                     bs : MetalBuffer?; soff, doff : uint64; bx, by : MetalBuffer?; yoff : uint64;
+                     bk, bn : MetalBuffer?; mp, rows : int64) {
     if (fmt == KqFmt.k6) {
         metal_set_pipeline(enc, g_pso_kq_mm_b6)
         metal_set_threadgroup_memory_length(enc, metal_kq_mulmm_k6_msl_tgmem, 0)
-        metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
+        metal_set_buffer(enc, bs, doff, 0)
     } else {
         metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_mm_b4 : g_pso_kq_mm_b5)
         metal_set_threadgroup_memory_length(enc, fmt == KqFmt.k4 ? metal_kq_mulmm_k4_msl_tgmem : metal_kq_mulmm_k5_msl_tgmem, 0)
-        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bs, soff, 0)
     }
-    metal_set_buffer(enc, bs, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, bs, soff, 1)
+    metal_set_buffer(enc, bq, qoff, 2)
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
@@ -4761,7 +5904,7 @@ def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?) {
 // fused rope + KV-row store: the v source binds the SAME QKV buffer at its v byte offset
 def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; vsoff : uint64;
                    kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                   bcos, bsin, bqd, bhs, bnpq, bnpall : MetalBuffer?; npairs : int64) {
+                   bcos, bsin, bqd, bhs, bnpq, bnpall, bneox, bbias, bhasb : MetalBuffer?; npairs : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_rpst16 : g_pso_rpst32)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, bqkv, vsoff, 1)
@@ -4773,7 +5916,37 @@ def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; 
     metal_set_buffer(enc, bhs, 0ul, 7)
     metal_set_buffer(enc, bnpq, 0ul, 8)
     metal_set_buffer(enc, bnpall, 0ul, 9)
+    metal_set_buffer(enc, bneox, 0ul, 10)
+    metal_set_buffer(enc, bbias, 0ul, 11)
+    metal_set_buffer(enc, bhasb, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
+// the head-cooperative fused rope-store (QK-norm models, f16 mirror): grid = nheads + 2*nkvh
+// threadgroups of head_size threads
+def enc_rope_store_h16(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : uint64;
+                       kmb, vmb : MetalBuffer?; koff, voff : uint64;
+                       bcos, bsin, bqkw, bbias, bqd, bhs, bnh, bkvm, bneox, bhasb, bhasn, beps : MetalBuffer?;
+                       ntg, head_size : int64) {
+    metal_set_pipeline(enc, g_pso_rpst_h16)
+    metal_set_threadgroup_memory_length(enc, metal_rope_store_h16_msl_tgmem, 0)
+    metal_set_buffer(enc, bqkv, 0ul, 0)
+    metal_set_buffer(enc, bqkv, vsoff, 1)
+    metal_set_buffer(enc, kmb, koff, 2)
+    metal_set_buffer(enc, vmb, voff, 3)
+    metal_set_buffer(enc, bcos, 0ul, 4)
+    metal_set_buffer(enc, bsin, 0ul, 5)
+    metal_set_buffer(enc, bqkw, 0ul, 6)
+    metal_set_buffer(enc, bbias, 0ul, 7)
+    metal_set_buffer(enc, bqd, 0ul, 8)
+    metal_set_buffer(enc, bhs, 0ul, 9)
+    metal_set_buffer(enc, bnh, 0ul, 10)
+    metal_set_buffer(enc, bkvm, 0ul, 11)
+    metal_set_buffer(enc, bneox, 0ul, 12)
+    metal_set_buffer(enc, bhasb, 0ul, 13)
+    metal_set_buffer(enc, bhasn, 0ul, 14)
+    metal_set_buffer(enc, beps, 0ul, 15)
+    metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // The tq4 rotation signs, uploaded once at max head size (smaller heads read a prefix — the
@@ -4781,7 +5954,7 @@ def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; 
 
 def enc_rope_store_tq4(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : uint64;
                        kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                       bcos, bsin, bqd, bhs, bnh, bkvm : MetalBuffer?; ntg, head_size : int64) {
+                       bcos, bsin, bqd, bhs, bnh, bkvm, bneox, bbias, bhasb : MetalBuffer?; ntg, head_size : int64) {
     metal_set_pipeline(enc, g_pso_rpst_tq4)
     metal_set_threadgroup_memory_length(enc, metal_rope_store_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, bqkv, 0ul, 0)
@@ -4797,7 +5970,27 @@ def enc_rope_store_tq4(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bnh, 0ul, 11)
     metal_set_buffer(enc, bkvm, 0ul, 12)
+    metal_set_buffer(enc, bneox, 0ul, 13)
+    metal_set_buffer(enc, bbias, 0ul, 14)
+    metal_set_buffer(enc, bhasb, 0ul, 15)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+}
+
+// per-head QK RMSNorm prepass over the fused QKV buffer — one grid covers the q heads then the
+// k heads (koffe = qd, [qnorm | knorm] weight plane at woffe = hs); grid.y = batch rows
+def enc_qk_norm(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps, bsoffe : MetalBuffer?; ntg, nrows, head_size : int64) {
+    metal_set_pipeline(enc, g_pso_qknorm)
+    metal_set_threadgroup_memory_length(enc, metal_qk_norm_msl_tgmem, 0)
+    metal_set_buffer(enc, bx, 0ul, 0)
+    metal_set_buffer(enc, bw, 0ul, 1)
+    metal_set_buffer(enc, bnq, 0ul, 2)
+    metal_set_buffer(enc, bkoffe, 0ul, 3)
+    metal_set_buffer(enc, brstride, 0ul, 4)
+    metal_set_buffer(enc, bhs, 0ul, 5)
+    metal_set_buffer(enc, bwoffe, 0ul, 6)
+    metal_set_buffer(enc, beps, 0ul, 7)
+    metal_set_buffer(enc, bsoffe, 0ul, 8)
+    metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // the tq4 attention-output un-rotate: one threadgroup per (head, row), row stride = qstride
@@ -4815,7 +6008,7 @@ def enc_fwht_unsign(enc : MetalComputeEncoder?; byo, bhs, bqs : MetalBuffer?; nh
 // same row offset); grid covers the q pairs + one thread per K/V 32-block
 def enc_rope_store_q8(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : uint64;
                       kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                      bcos, bsin, bqd, bhs, bnpq, bnblk : MetalBuffer?; nthreads : int64) {
+                      bcos, bsin, bqd, bhs, bnpq, bnblk, bneox, bbias, bhasb : MetalBuffer?; nthreads : int64) {
     metal_set_pipeline(enc, g_pso_rpst_q8)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, bqkv, vsoff, 1)
@@ -4829,16 +6022,23 @@ def enc_rope_store_q8(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : u
     metal_set_buffer(enc, bhs, 0ul, 9)
     metal_set_buffer(enc, bnpq, 0ul, 10)
     metal_set_buffer(enc, bnblk, 0ul, 11)
+    metal_set_buffer(enc, bneox, 0ul, 12)
+    metal_set_buffer(enc, bbias, 0ul, 13)
+    metal_set_buffer(enc, bhasb, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint((nthreads + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // the fused QKV+rope+store dispatch (2 rows per simdgroup — grid covers ddim/2 pairs)
-def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bwq, bws, bx, bq : MetalBuffer?;
-                    kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                    bcos, bsin, bn, bd, bqd, bkvd, bhs : MetalBuffer?; d : int64) {
+def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bw : MetalBuffer?; wqoff, wkoff, wvoff : uint64;
+                    bx, bq : MetalBuffer?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
+                    bcos, bsin, bn, bd, bqd, bkvd, bhs, bneox, bbias, bhasb : MetalBuffer?; d : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_qkvrs16 : g_pso_qkvrs32)
-    metal_set_buffer(enc, bwq, 0ul, 0)
-    metal_set_buffer(enc, bws, 0ul, 1)
+    metal_set_buffer(enc, bw, wqoff, 0)   // q segment: byte + half views
+    metal_set_buffer(enc, bw, wqoff, 1)
+    metal_set_buffer(enc, bw, wkoff, 16)  // k segment
+    metal_set_buffer(enc, bw, wkoff, 17)
+    metal_set_buffer(enc, bw, wvoff, 18)  // v segment
+    metal_set_buffer(enc, bw, wvoff, 19)
     metal_set_buffer(enc, bx, 0ul, 2)
     metal_set_buffer(enc, bq, 0ul, 3)
     metal_set_buffer(enc, kmb, koff, 4)
@@ -4850,15 +6050,20 @@ def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bwq, bws, bx, bq : M
     metal_set_buffer(enc, bqd, 0ul, 10)
     metal_set_buffer(enc, bkvd, 0ul, 11)
     metal_set_buffer(enc, bhs, 0ul, 12)
+    metal_set_buffer(enc, bneox, 0ul, 13)
+    metal_set_buffer(enc, bbias, 0ul, 14)
+    metal_set_buffer(enc, bhasb, 0ul, 15)
     let pairs = d / 2l
     metal_dispatch_threadgroups(enc, uint3(uint((pairs + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the fused W1|W3+swiglu dispatch (2 rows per simdgroup — gate + up of one output element)
-def enc_gemv_w13sw(enc : MetalComputeEncoder?; bwq, bws, bx, bh : MetalBuffer?; bn, bhid : MetalBuffer?; hidden : int64) {
+def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off : uint64; bx, bh : MetalBuffer?; bn, bhid : MetalBuffer?; hidden : int64) {
     metal_set_pipeline(enc, g_pso_w13sw)
-    metal_set_buffer(enc, bwq, 0ul, 0)
-    metal_set_buffer(enc, bws, 0ul, 1)
+    metal_set_buffer(enc, bw, w1off, 0)   // w1: byte + half views
+    metal_set_buffer(enc, bw, w1off, 1)
+    metal_set_buffer(enc, bw, w3off, 6)   // w3 views
+    metal_set_buffer(enc, bw, w3off, 7)
     metal_set_buffer(enc, bx, 0ul, 2)
     metal_set_buffer(enc, bh, 0ul, 3)
     metal_set_buffer(enc, bn, 0ul, 4)
@@ -4877,26 +6082,41 @@ def enc_argmax(enc : MetalComputeEncoder?; blg, btok, bn : MetalBuffer?) {
 
 // zero-copy logits scatter: one staging row (src at its byte offset) into a session's wrapped
 // logits storage — replaces that row's landing memcpy
-def enc_copy_row(enc : MetalComputeEncoder?; bsrc : MetalBuffer?; soff : uint64; bdst, bn : MetalBuffer?; n : int64) {
+def enc_copy_row(enc : MetalComputeEncoder?; bsrc : MetalBuffer?; soff : uint64; bdst, bn : MetalBuffer?; n : int64; doff : uint64 = 0ul) {
     metal_set_pipeline(enc, g_pso_copy_row)
     metal_set_buffer(enc, bsrc, soff, 0)
-    metal_set_buffer(enc, bdst, 0ul, 1)
+    metal_set_buffer(enc, bdst, doff, 1)
     metal_set_buffer(enc, bn, 0ul, 2)
     metal_dispatch_threadgroups(enc, uint3(uint((n + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
-def enc_embed(enc : MetalComputeEncoder?; s16 : bool; bq, bs, btok, bx, bdim : MetalBuffer?; dim : int64) {
-    metal_set_pipeline(enc, s16 ? g_pso_emb16 : g_pso_emb)
-    metal_set_buffer(enc, bq, 0ul, 0)
-    metal_set_buffer(enc, bs, 0ul, 1)
+def enc_embed(enc : MetalComputeEncoder?; bw : MetalBuffer?; eoff : uint64; btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
+    metal_set_pipeline(enc, g_pso_emb)
+    metal_set_buffer(enc, bw, eoff, 0)   // byte view of the embed blob slice
+    metal_set_buffer(enc, bw, eoff, 1)   // half-scale view
     metal_set_buffer(enc, btok, 0ul, 2)
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, bdim, 0ul, 4)
+    metal_set_buffer(enc, bescale != null ? bescale : g_one, 0ul, 5)   // embed_scale (identity 1.0)
+    metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
+// the tied-k6 spec embed gather: the scale buffer binds twice (f16 d plane @doff + sub-scale
+// strips @soff — kq_scales_of's whole-plane offsets), the quant plane once @qoff
+def enc_embed_k6(enc : MetalComputeEncoder?; bq : MetalBuffer?; qoff : uint64; bs : MetalBuffer?; soff, doff : uint64; btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
+    metal_set_pipeline(enc, g_pso_emb_k6)
+    metal_set_buffer(enc, bs, doff, 0)
+    metal_set_buffer(enc, bs, soff, 1)
+    metal_set_buffer(enc, bq, qoff, 2)
+    metal_set_buffer(enc, btok, 0ul, 3)
+    metal_set_buffer(enc, bx, 0ul, 4)
+    metal_set_buffer(enc, bdim, 0ul, 5)
+    metal_set_buffer(enc, bescale != null ? bescale : g_one, 0ul, 6)   // embed_scale (identity 1.0)
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // fused add + rms when dim fits the kernel's row slab, the unfused pair otherwise
-def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; dim : int64) {
+def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; dim : int64; bascale : MetalBuffer? = null) {
     if (dim <= ADD_RMS_MAX_DIM) {
         metal_set_pipeline(enc, g_pso_addrms)
         metal_set_threadgroup_memory_length(enc, metal_add_rms_msl_tgmem, 0)
@@ -4906,15 +6126,16 @@ def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Me
         metal_set_buffer(enc, by, 0ul, 3)
         metal_set_buffer(enc, bdim, 0ul, 4)
         metal_set_buffer(enc, beps, 0ul, 5)
+        metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 6)
         metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
     } else {
-        enc_ew2(enc, g_pso_add, bx, 0ul, ba, 0ul, bdim, dim)
+        enc_ew2(enc, g_pso_add, bx, 0ul, ba, 0ul, bdim, dim, bascale)
         enc_rms(enc, bx, bw, by, bdim, beps)
     }
 }
 
 def enc_attn(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-             bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale : MetalBuffer?; nheads, head_size : int64) {
+             bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_attn16 : g_pso_attn32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn16_msl_tgmem : metal_sq_attn32_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -4927,11 +6148,12 @@ def enc_attn(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; ko
     metal_set_buffer(enc, bkvm, 0ul, 7)
     metal_set_buffer(enc, bhs, 0ul, 8)
     metal_set_buffer(enc, bscale, 0ul, 9)
+    metal_set_buffer(enc, bcap, 0ul, 10)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_part(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                  bq, bpart, bcnt, bkvd, bnh, bkvm, bhs, bscale, bnch : MetalBuffer?; ntg, head_size : int64) {
+                  bq, bpart, bcnt, bkvd, bnh, bkvm, bhs, bscale, bnch, bcap, bwin : MetalBuffer?; ntg, head_size : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_attnp16 : g_pso_attnp32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_part16_msl_tgmem : metal_sq_attn_part32_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -4945,12 +6167,14 @@ def enc_attn_part(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer
     metal_set_buffer(enc, bhs, 0ul, 8)
     metal_set_buffer(enc, bscale, 0ul, 9)
     metal_set_buffer(enc, bnch, 0ul, 10)
+    metal_set_buffer(enc, bcap, 0ul, 11)
+    metal_set_buffer(enc, bwin, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // tq4-mirror attention twins — same dual-view shape as the q8_0 encoders below
 def enc_attn_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                 bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale : MetalBuffer?; nheads, head_size : int64) {
+                 bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attn_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -4965,11 +6189,12 @@ def enc_attn_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff
     metal_set_buffer(enc, bkvm, 0ul, 9)
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
+    metal_set_buffer(enc, bcap, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_part_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                      bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch : MetalBuffer?; ntg, head_size : int64) {
+                      bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch, bcap, bwin : MetalBuffer?; ntg, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnp_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -4985,13 +6210,15 @@ def enc_attn_part_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff,
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
     metal_set_buffer(enc, bnch, 0ul, 12)
+    metal_set_buffer(enc, bcap, 0ul, 13)
+    metal_set_buffer(enc, bwin, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // q8_0-mirror attention twins: the K/V slabs bind TWICE each (half-scale + byte views at the
 // same layer offset); nblk (blocks per row) replaces the kv_dim uniform
 def enc_attn_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale : MetalBuffer?; nheads, head_size : int64) {
+                bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attn_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_q8_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -5006,11 +6233,12 @@ def enc_attn_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff 
     metal_set_buffer(enc, bkvm, 0ul, 9)
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
+    metal_set_buffer(enc, bcap, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_part_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                     bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch : MetalBuffer?; ntg, head_size : int64) {
+                     bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch, bcap, bwin : MetalBuffer?; ntg, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnp_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_q8_msl_tgmem, 0)
     metal_set_buffer(enc, kmb, koff, 0)
@@ -5026,56 +6254,78 @@ def enc_attn_part_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, 
     metal_set_buffer(enc, bhs, 0ul, 10)
     metal_set_buffer(enc, bscale, 0ul, 11)
     metal_set_buffer(enc, bnch, 0ul, 12)
+    metal_set_buffer(enc, bcap, 0ul, 13)
+    metal_set_buffer(enc, bwin, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs : MetalBuffer?; nheads, head_size : int64) {
+def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs, bchlo : MetalBuffer?; nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attncomb)
     metal_set_buffer(enc, bpart, 0ul, 0)
     metal_set_buffer(enc, by, 0ul, 1)
     metal_set_buffer(enc, bnch, 0ul, 2)
     metal_set_buffer(enc, bnh, 0ul, 3)
     metal_set_buffer(enc, bhs, 0ul, 4)
+    metal_set_buffer(enc, bchlo, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
+// suppress-token pinning over a logits row in place (gemma4) — ids as a u32 buffer
+def enc_suppress_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64; bids, bn : MetalBuffer?; n : int64) {
+    metal_set_pipeline(enc, g_pso_suppress)
+    metal_set_buffer(enc, bx, xoff, 0)
+    metal_set_buffer(enc, bids, 0ul, 1)
+    metal_set_buffer(enc, bn, 0ul, 2)
+    metal_dispatch_threadgroups(enc, uint3(uint((n + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
+// logit soft-cap over a row in place (gemma2/gemma4 final_logit_softcap on the GPU classifier)
+def enc_softcap_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64; btot, bcap : MetalBuffer?; total : int64) {
+    metal_set_pipeline(enc, g_pso_softcap)
+    metal_set_buffer(enc, bx, xoff, 0)
+    metal_set_buffer(enc, btot, 0ul, 1)
+    metal_set_buffer(enc, bcap, 0ul, 2)
+    metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
 // swiglu and add share the (a, b, total) elementwise shape; offsets serve the fused-buffer binds
-def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalBuffer?; aoff : uint64; bb : MetalBuffer?; boff : uint64; btot : MetalBuffer?; total : int64) {
+def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalBuffer?; aoff : uint64; bb : MetalBuffer?; boff : uint64; btot : MetalBuffer?; total : int64; bascale : MetalBuffer? = null) {
     metal_set_pipeline(enc, pso)
     metal_set_buffer(enc, ba, aoff, 0)
     metal_set_buffer(enc, bb, boff, 1)
     metal_set_buffer(enc, btot, 0ul, 2)
+    metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 3)   // the add's ascale slot (unused by swiglu/geglu)
     metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // ===== the batched-step encoders (P4) =====
 
-// fixed-B batched GEMV: B2 form serves B <= 2, B4 serves 3..4 (pad streams read stale rows,
-// never consumed). Geometry pinned at 4 rows/tg with 128 threads baked in (g_gemv_rows knob
-// stays single-stream-only).
-def enc_gemv_b(enc : MetalComputeEncoder?; four : bool; bwq : MetalBuffer?; wqoff : uint64;
-               bws : MetalBuffer?; wsoff : uint64; bx, by, bn, bd, bs16 : MetalBuffer?; d : int64) {
+// fixed-B batched GEMV (B2 serves B <= 2, B4 3..4 — pad streams read stale rows, outputs never
+// consumed); the blob slice binds through both views at the tensor's byte offset. Pinned at
+// 4 rows/tg — the x-staged cooperative-load slot math bakes 128 threads in.
+def enc_gemv_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; boff : uint64;
+               bx, by, bn, bd, bys : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
     metal_set_pipeline(enc, four ? g_pso_gemv_b4 : g_pso_gemv_b2)
     metal_set_threadgroup_memory_length(enc, four ? metal_gemv_b4_msl_tgmem : metal_gemv_b2_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, wqoff, 0)
-    metal_set_buffer(enc, bws, wsoff, 1)
-    metal_set_buffer(enc, bws, wsoff, 2)
+    metal_set_buffer(enc, bw, boff, 0)   // byte view
+    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, 0ul, 4)
+    metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bd, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
+    metal_set_buffer(enc, bys, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((d + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the mul_mv-shape fixed-B GEMV on an interleaved 34B blob (dual views of the SAME buffer);
 // bxs = x row stride in float4s; bnr = the nrows uniform, four-form only; xoff/yoff = the
 // column-tile byte offsets (B > 4 streams the weights once per 4-column tile)
-def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob, bx, by, bn, bd, bxs : MetalBuffer?; d : int64;
+def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob : MetalBuffer?; wboff : uint64;
+             bx, by, bn, bd, bxs, bys : MetalBuffer?; d : int64;
              bnr : MetalBuffer? = null; xoff : uint64 = 0ul; yoff : uint64 = 0ul) {
     metal_set_pipeline(enc, four ? g_pso_mv_b4 : g_pso_mv_b2)
-    metal_set_buffer(enc, bwblob, 0ul, 0)
-    metal_set_buffer(enc, bwblob, 0ul, 1)
+    metal_set_buffer(enc, bwblob, wboff, 0)
+    metal_set_buffer(enc, bwblob, wboff, 1)
     metal_set_buffer(enc, bx, xoff, 2)
     metal_set_buffer(enc, by, yoff, 3)
     metal_set_buffer(enc, bn, 0ul, 4)
@@ -5083,8 +6333,10 @@ def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob, bx, by, bn, bd, bx
     if (four) {
         metal_set_buffer(enc, bnr, 0ul, 6)
         metal_set_buffer(enc, bxs, 0ul, 7)
+        metal_set_buffer(enc, bys, 0ul, 8)
     } else {
         metal_set_buffer(enc, bxs, 0ul, 6)
+        metal_set_buffer(enc, bys, 0ul, 7)
     }
     // b2 = 4 rows/tg (16 lanes/row); b4 = 8 rows/tg (8 lanes/row)
     metal_dispatch_threadgroups(enc, uint3(uint(four ? (d + 7l) / 8l : (d + 3l) / 4l), 1u, 1u), uint3(64u, 1u, 1u))
@@ -5093,40 +6345,45 @@ def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob, bx, by, bn, bd, bx
 // one mv GEMV site: a single form dispatch at B <= 4, two 4-column tiles at B = 5..8 (the
 // reference's own shape — it never switches to GEMM below B = 9; the weights stream twice but
 // stay the fast skinny form). xrowb = the x row stride in bytes; bnr/bnr2 = per-tile nrows.
-def enc_mv_site(enc : MetalComputeEncoder?; bwblob, bx, by, bn, bd, bxs : MetalBuffer?;
-                d, nrows : int64; xrowb : uint64; bnr, bnr2 : MetalBuffer?) {
-    enc_mv_b(enc, nrows > 2l, bwblob, bx, by, bn, bd, bxs, d, bnr)
+def enc_mv_site(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wboff : uint64;
+                bx, by, bn, bd, bxs, bys : MetalBuffer?;
+                d, nrows, ys : int64; xrowb : uint64; bnr, bnr2 : MetalBuffer?;
+                yoff : uint64 = 0ul) {
+    enc_mv_b(enc, nrows > 2l, bwblob, wboff, bx, by, bn, bd, bxs, bys, d, bnr, 0ul, yoff)
     if (nrows > 4l) {
-        enc_mv_b(enc, true, bwblob, bx, by, bn, bd, bxs, d, bnr2, 4ul * xrowb, uint64(4l * d * 4l))
+        // the rows-5..8 dispatch offsets y by 4 rows of the SITE's y row stride (the ys
+        // uniform's value — fused-buffer segment sites included)
+        enc_mv_b(enc, true, bwblob, wboff, bx, by, bn, bd, bxs, bys, d, bnr2, 4ul * xrowb, yoff + uint64(4l * ys * 4l))
     }
 }
 
-// fused fixed-B W1|W3 GEMV + swiglu — bwq/bws are the cat W1|W3 region at offset 0 (up rows sit
-// at +hidden internally), by is the [B x hidden] swiglu output. Replaces the w1 + w3 GEMVs + the
-// swiglu ew2 with one dispatch. Same 4-rows/tg geometry, gridded over the hidden output rows.
-def enc_gemv_w13sw_b(enc : MetalComputeEncoder?; four : bool; bwq, bws, bx, by, bn, bhid, bs16 : MetalBuffer?; hidden : int64) {
+// fused fixed-B W1|W3 GEMV + swiglu — the w1 and w3 blob slices bind separately (kind-major
+// layout), by is the [B x hidden] swiglu output. Replaces the w1 + w3 GEMVs + the swiglu ew2
+// with one dispatch. Same 4-rows/tg geometry, gridded over the hidden output rows.
+def enc_gemv_w13sw_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; w1off, w3off : uint64;
+                     bx, by, bn, bhid : MetalBuffer?; hidden : int64) {
     metal_set_pipeline(enc, four ? g_pso_w13sw_b4 : g_pso_w13sw_b2)
     metal_set_threadgroup_memory_length(enc, four ? metal_gemv_w13sw_b4_msl_tgmem : metal_gemv_w13sw_b2_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, 0ul, 0)
-    metal_set_buffer(enc, bws, 0ul, 1)
-    metal_set_buffer(enc, bws, 0ul, 2)
+    metal_set_buffer(enc, bw, w1off, 0)   // w1: byte view
+    metal_set_buffer(enc, bw, w1off, 2)   // w1: half-scale view
+    metal_set_buffer(enc, bw, w3off, 8)   // w3: byte view
+    metal_set_buffer(enc, bw, w3off, 9)   // w3: half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, 0ul, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bhid, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the production mul_mm dispatch (the prefill kernel: 34B-blob dual-view W, raw f32 X): y binds
 // at a byte offset so per-tensor tiles land inside a wider fused row — the ndim uniform is the
 // y ROW STRIDE while this tensor's output width d shapes the grid (d % 64 == 0, mp % 32 == 0)
-def enc_gemm_mm_b(enc : MetalComputeEncoder?; bwblob, bx, by : MetalBuffer?; yoff : uint64;
-                  bk, bn : MetalBuffer?; mp, d : int64) {
+def enc_gemm_mm_b(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wboff : uint64;
+                  bx, by : MetalBuffer?; yoff : uint64; bk, bn : MetalBuffer?; mp, d : int64) {
     metal_set_pipeline(enc, g_pso_mm)
     metal_set_threadgroup_memory_length(enc, metal_q8_mulmm_msl_tgmem, 0)
-    metal_set_buffer(enc, bwblob, 0ul, 0)
-    metal_set_buffer(enc, bwblob, 0ul, 1)
+    metal_set_buffer(enc, bwblob, wboff, 0)
+    metal_set_buffer(enc, bwblob, wboff, 1)
     metal_set_buffer(enc, bx, 0ul, 2)
     metal_set_buffer(enc, by, yoff, 3)
     metal_set_buffer(enc, bk, 0ul, 4)
@@ -5134,37 +6391,34 @@ def enc_gemm_mm_b(enc : MetalComputeEncoder?; bwblob, bx, by : MetalBuffer?; yof
     metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(d / 64l), 1u), uint3(128u, 1u, 1u))
 }
 
-// the M-pad-32 GEMM (B >= 5): raw f32 X, dual-view W scales
-def enc_gemm_b(enc : MetalComputeEncoder?; bwq : MetalBuffer?; wqoff : uint64;
-               bws : MetalBuffer?; wsoff : uint64; bx, by, bk, bn, bs16 : MetalBuffer?; mp32, d : int64) {
+// the M-pad-32 GEMM (B >= 5): raw f32 X, dual-view blob W at the tensor's byte offset
+def enc_gemm_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
+               bx, by, bk, bn, bys : MetalBuffer?; mp32, d : int64; yoff : uint64 = 0ul) {
     metal_set_pipeline(enc, g_pso_gemm_b)
     metal_set_threadgroup_memory_length(enc, metal_q8_gemm_b_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, wqoff, 0)
-    metal_set_buffer(enc, bws, wsoff, 1)
-    metal_set_buffer(enc, bws, wsoff, 2)
+    metal_set_buffer(enc, bw, boff, 0)   // byte view
+    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, 0ul, 4)
+    metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
     metal_set_buffer(enc, bn, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
+    metal_set_buffer(enc, bys, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((mp32 / 32l) * (d / 32l)), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the split-K pair (per-site policy): the GEMM's grid.y is the k-slice axis, partial planes land
 // in bpart, and the reduce sums them into y — the serial encoder orders the two dispatches.
 // Planes and grids assume mp == 32 (the policy gate).
-def enc_gemm_sk_b(enc : MetalComputeEncoder?; bwq : MetalBuffer?; wqoff : uint64;
-                  bws : MetalBuffer?; wsoff : uint64; bx, bpart, bk, bn, bs16, bsk : MetalBuffer?; d, nsk : int64) {
+def enc_gemm_sk_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
+                  bx, bpart, bk, bn, bsk : MetalBuffer?; d, nsk : int64) {
     metal_set_pipeline(enc, g_pso_gemm_b_sk)
     metal_set_threadgroup_memory_length(enc, metal_q8_gemm_b_sk_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, wqoff, 0)
-    metal_set_buffer(enc, bws, wsoff, 1)
-    metal_set_buffer(enc, bws, wsoff, 2)
+    metal_set_buffer(enc, bw, boff, 0)   // byte view
+    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, bpart, 0ul, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
     metal_set_buffer(enc, bn, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
     metal_set_buffer(enc, bsk, 0ul, 8)
     metal_dispatch_threadgroups(enc, uint3(uint(d / 32l), uint(nsk), 1u), uint3(128u, 1u, 1u))
 }
@@ -5179,18 +6433,16 @@ def enc_sk_reduce_b(enc : MetalComputeEncoder?; bpart, by, btot, bsk : MetalBuff
 }
 
 // the 64-wide N tile (classifier site): the caller gates d % 64 == 0
-def enc_gemm64_b(enc : MetalComputeEncoder?; bwq : MetalBuffer?; wqoff : uint64;
-                 bws : MetalBuffer?; wsoff : uint64; bx, by, bk, bn, bs16 : MetalBuffer?; mp32, d : int64) {
+def enc_gemm64_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
+                 bx, by, bk, bn : MetalBuffer?; mp32, d : int64) {
     metal_set_pipeline(enc, g_pso_gemm64_b)
     metal_set_threadgroup_memory_length(enc, metal_q8_gemm64_b_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, wqoff, 0)
-    metal_set_buffer(enc, bws, wsoff, 1)
-    metal_set_buffer(enc, bws, wsoff, 2)
+    metal_set_buffer(enc, bw, boff, 0)   // byte view
+    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, 0ul, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
     metal_set_buffer(enc, bn, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((mp32 / 32l) * (d / 64l)), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
@@ -5198,7 +6450,7 @@ def enc_gemm64_b(enc : MetalComputeEncoder?; bwq : MetalBuffer?; wqoff : uint64;
 // owns a bit; a barrier is inserted iff a dispatch's read hits a pending write (RAW), or its
 // write hits a pending write/read (WAW/WAR) — read-after-read runs concurrently.
 
-def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_attnb16 : g_pso_attnb32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_b16_msl_tgmem : metal_sq_attn_b32_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5213,10 +6465,11 @@ def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, 
     metal_set_buffer(enc, bhs, 0ul, 9)
     metal_set_buffer(enc, bscale, 0ul, 10)
     metal_set_buffer(enc, bqs, 0ul, 11)
+    metal_set_buffer(enc, bcap, 0ul, 12)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bnch : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
+def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_attnpb16 : g_pso_attnpb32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_part_b16_msl_tgmem : metal_sq_attn_part_b32_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5232,11 +6485,13 @@ def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay
     metal_set_buffer(enc, bscale, 0ul, 10)
     metal_set_buffer(enc, bqs, 0ul, 11)
     metal_set_buffer(enc, bnch, 0ul, 12)
+    metal_set_buffer(enc, bcap, 0ul, 13)
+    metal_set_buffer(enc, bwin, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // tq4-mirror batch attention twins — same four-way arena binding as the q8_0 encoders below
-def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnb_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_b_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5253,10 +6508,11 @@ def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bk
     metal_set_buffer(enc, bhs, 0ul, 11)
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
+    metal_set_buffer(enc, bcap, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_part_b_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
+def enc_attn_part_b_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnpb_tq4)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_b_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5274,6 +6530,8 @@ def enc_attn_part_b_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk,
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
     metal_set_buffer(enc, bnch, 0ul, 14)
+    metal_set_buffer(enc, bcap, 0ul, 15)
+    metal_set_buffer(enc, bwin, 0ul, 16)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -5301,7 +6559,7 @@ def enc_attn_d_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh,
 
 // q8_0-mirror batch attention twins: the arena binds FOUR times (half-scale + byte views for K
 // and V); the row table carries byte offsets and nblk replaces the kv_dim uniform
-def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnb_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_b_q8_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5318,10 +6576,11 @@ def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkv
     metal_set_buffer(enc, bhs, 0ul, 11)
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
+    metal_set_buffer(enc, bcap, 0ul, 14)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_part_b_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
+def enc_attn_part_b_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attnpb_q8)
     metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_b_q8_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
@@ -5339,6 +6598,8 @@ def enc_attn_part_b_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, 
     metal_set_buffer(enc, bscale, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
     metal_set_buffer(enc, bnch, 0ul, 14)
+    metal_set_buffer(enc, bcap, 0ul, 15)
+    metal_set_buffer(enc, bwin, 0ul, 16)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -5364,7 +6625,7 @@ def enc_attn_d_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, 
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
 }
 
-def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs : MetalBuffer?; nrows, nheads, head_size : int64) {
+def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs, bwin : MetalBuffer?; nrows, nheads, head_size : int64) {
     metal_set_pipeline(enc, g_pso_attncombb)
     metal_set_buffer(enc, bpart, 0ul, 0)
     metal_set_buffer(enc, by, 0ul, 1)
@@ -5372,6 +6633,7 @@ def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs :
     metal_set_buffer(enc, bnch, 0ul, 3)
     metal_set_buffer(enc, bnh, 0ul, 4)
     metal_set_buffer(enc, bhs, 0ul, 5)
+    metal_set_buffer(enc, bwin, 0ul, 6)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -5407,7 +6669,7 @@ def enc_attn_comb_d(enc : MetalComputeEncoder?; bpart, by, brt, bnsg, bnh, bhs :
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, brt, blay, bkvd, bqd, bhs, bnpq, bnpall, bqs : MetalBuffer?; npairs, nrows : int64) {
+def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, brt, blay, bkvd, bqd, bhs, bnpq, bnpall, bqs, bneox, bbias, bhasb : MetalBuffer?; npairs, nrows : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_rpstb16 : g_pso_rpstb32)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, g_arena, 0ul, 1)
@@ -5422,11 +6684,14 @@ def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, b
     metal_set_buffer(enc, bnpq, 0ul, 10)
     metal_set_buffer(enc, bnpall, 0ul, 11)
     metal_set_buffer(enc, bqs, 0ul, 12)
+    metal_set_buffer(enc, bneox, 0ul, 13)
+    metal_set_buffer(enc, bbias, 0ul, 14)
+    metal_set_buffer(enc, bhasb, 0ul, 15)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
 }
 
 // tq4-mirror batched rope+store: one threadgroup per (head, batch row), arena bound four ways
-def enc_rope_store_b_tq4(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bqd, bhs, bnh, bkvm, bqs : MetalBuffer?; ntg, nrows, head_size : int64) {
+def enc_rope_store_b_tq4(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bqd, bhs, bnh, bkvm, bqs, bneox, bbias, bhasb : MetalBuffer?; ntg, nrows, head_size : int64) {
     metal_set_pipeline(enc, g_pso_rpstb_tq4)
     metal_set_threadgroup_memory_length(enc, metal_rope_store_b_tq4_msl_tgmem, 0)
     metal_set_buffer(enc, bqkv, 0ul, 0)
@@ -5444,12 +6709,15 @@ def enc_rope_store_b_tq4(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay
     metal_set_buffer(enc, bnh, 0ul, 12)
     metal_set_buffer(enc, bkvm, 0ul, 13)
     metal_set_buffer(enc, bqs, 0ul, 14)
+    metal_set_buffer(enc, bneox, 0ul, 15)
+    metal_set_buffer(enc, bbias, 0ul, 16)
+    metal_set_buffer(enc, bhasb, 0ul, 17)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // q8_0-mirror batched rope+store: arena bound four ways (K/V x scale/byte views); grid covers
 // the q pairs + one thread per K/V 32-block, one grid row per batch row
-def enc_rope_store_b_q8(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bnblk, bqd, bhs, bnpq, bqs : MetalBuffer?; nthreads, nrows : int64) {
+def enc_rope_store_b_q8(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bnblk, bqd, bhs, bnpq, bqs, bneox, bbias, bhasb : MetalBuffer?; nthreads, nrows : int64) {
     metal_set_pipeline(enc, g_pso_rpstb_q8)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, g_arena, 0ul, 1)
@@ -5465,10 +6733,13 @@ def enc_rope_store_b_q8(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay,
     metal_set_buffer(enc, bhs, 0ul, 11)
     metal_set_buffer(enc, bnpq, 0ul, 12)
     metal_set_buffer(enc, bqs, 0ul, 13)
+    metal_set_buffer(enc, bneox, 0ul, 14)
+    metal_set_buffer(enc, bbias, 0ul, 15)
+    metal_set_buffer(enc, bhasb, 0ul, 16)
     metal_dispatch_threadgroups(enc, uint3(uint((nthreads + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
 }
 
-def enc_add_rms_b(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; nrows : int64) {
+def enc_add_rms_b(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; nrows : int64; bascale : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_addrmsb)
     metal_set_threadgroup_memory_length(enc, metal_add_rms_b_msl_tgmem, 0)
     metal_set_buffer(enc, bx, 0ul, 0)
@@ -5477,6 +6748,7 @@ def enc_add_rms_b(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Metal
     metal_set_buffer(enc, by, 0ul, 3)
     metal_set_buffer(enc, bdim, 0ul, 4)
     metal_set_buffer(enc, beps, 0ul, 5)
+    metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 6)   // the add's ascale slot
     metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(1024u, 1u, 1u))
 }
 
@@ -5500,12 +6772,9 @@ def metal_kernels_release {
         metal_release(g_pso_gemv)
         g_pso_gemv = null
     }
-    if (g_pso_gemv16 != null) {
-        metal_release(g_pso_gemv16)
-        g_pso_gemv16 = null
-    }
     release_pso(g_pso_kq_k4)
     release_pso(g_pso_kq_k5)
+    release_pso(g_pso_kq_k5c)
     release_pso(g_pso_kq_k6)
     release_pso(g_pso_kq_mvb2_k4)
     release_pso(g_pso_kq_mvb4_k4)
@@ -5513,6 +6782,9 @@ def metal_kernels_release {
     release_pso(g_pso_kq_mvb4_k5)
     release_pso(g_pso_kq_mvb2_k6)
     release_pso(g_pso_kq_mvb4_k6)
+    release_pso(g_pso_kq_mvb8_k4)
+    release_pso(g_pso_kq_mvb8_k5)
+    release_pso(g_pso_kq_mvb8_k6)
     release_pso(g_pso_kq_mm_b4)
     release_pso(g_pso_kq_mm_b5)
     release_pso(g_pso_kq_mm_b6)
@@ -5527,6 +6799,22 @@ def metal_kernels_release {
     if (g_pso_addrms != null) {
         metal_release(g_pso_addrms)
         g_pso_addrms = null
+    }
+    if (g_one != null) {
+        metal_release(g_one)
+        g_one = null
+    }
+    if (g_pso_geglu != null) {
+        metal_release(g_pso_geglu)
+        g_pso_geglu = null
+    }
+    if (g_pso_softcap != null) {
+        metal_release(g_pso_softcap)
+        g_pso_softcap = null
+    }
+    if (g_pso_suppress != null) {
+        metal_release(g_pso_suppress)
+        g_pso_suppress = null
     }
     if (g_pso_swiglu != null) {
         metal_release(g_pso_swiglu)
@@ -5555,6 +6843,7 @@ def metal_kernels_release {
     release_pso(g_pso_attnp_tq4)
     release_pso(g_pso_rpst_tq4)
     release_pso(g_pso_unsign)
+    release_pso(g_pso_qknorm)
     if (g_pso_attncomb != null) {
         metal_release(g_pso_attncomb)
         g_pso_attncomb = null
@@ -5563,6 +6852,7 @@ def metal_kernels_release {
         metal_release(g_pso_rpst16)
         g_pso_rpst16 = null
     }
+    release_pso(g_pso_rpst_h16)
     if (g_pso_rpst32 != null) {
         metal_release(g_pso_rpst32)
         g_pso_rpst32 = null
@@ -5579,10 +6869,7 @@ def metal_kernels_release {
         metal_release(g_pso_emb)
         g_pso_emb = null
     }
-    if (g_pso_emb16 != null) {
-        metal_release(g_pso_emb16)
-        g_pso_emb16 = null
-    }
+    release_pso(g_pso_emb_k6)
     if (g_pso_qkvrs16 != null) {
         metal_release(g_pso_qkvrs16)
         g_pso_qkvrs16 = null

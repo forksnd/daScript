@@ -25,7 +25,12 @@ require dasllama/dasllama_math   // active_kernel_backend — half the image ide
 // fields ride the meta blob via serialize_strings — raw string pointers can't be planes.
 
 // bump on ANY layout/serialization change — a mismatched image regenerates from the gguf
-let IMAGE_VERSION = 2
+let IMAGE_VERSION = 3
+
+//! The metal (blob-only) flavor's identity tag: q8 planes ride the 34B block_q8_0 blob and the
+//! kq scale planes their GPU forms (convert_model_to_metal_blob) — flavors are per-config and
+//! self-sufficient, so the tag keeps the two flavors' files and identities apart.
+let METAL_IMAGE_TAG = "metal"
 let IMAGE_PAGE = 16384l          // Apple-Silicon page: the bytesNoCopy alignment contract
 let IMAGE_HEADER_BYTES = 64l     // magic..identity, inside the first page
 let IMAGE_MAGIC = 0x314D4C44u    // 'DLM1'
@@ -191,7 +196,7 @@ def private serialize_tokenizer(var arch : Archive; var tk : Tokenizer) {
     if (!arch.reading) {
         merges |> resize(length(tk.bpe.merge_rank))
         for (k, v in keys(tk.bpe.merge_rank), values(tk.bpe.merge_rank)) {
-            merges[int(v)] := k
+            merges[int(v)] = k
         }
     }
     serialize_strings(arch, merges)
@@ -233,6 +238,7 @@ def private serialize_image_meta(var arch : Archive; var t : Model) {
     arch |> serialize_raw(t.ple_proj_off)
     arch |> serialize_raw(t.ple_post_off)
     arch |> serialize_raw(t.wscale_f16)
+    arch |> serialize_raw(t.metal_blob)
     arch |> serialize_raw(t.experts_mx4)
     arch |> serialize_raw(t.ple_model_bf16)
     arch |> serialize_raw(t.kquant_native)
@@ -279,9 +285,9 @@ def private serialize_image_meta(var arch : Archive; var t : Model) {
     arch |> serialize_raw(t.mtp_headnorm_off)
 }
 
-// the tripwire: serialize_image_meta(Model) covers 63 fields; blocks + image_map +
+// the tripwire: serialize_image_meta(Model) covers 64 fields; blocks + image_map +
 // image_bytes are deliberate skips. A new non-array Model field trips this until BOTH agree.
-let IMAGE_META_FIELDS = 63 + 3
+let IMAGE_META_FIELDS = 64 + 3
 
 //! Count of meta-carried fields of any struct: non-arrays plus string arrays (those cannot
 //! be raw planes — see serialize_strings). Pair with a per-type field-count constant to
@@ -430,8 +436,9 @@ def save_image(var t; path : string; tag : string = "") : bool {
 }
 
 //! Model entry point (the AudioTower one is load_audio_tower's cache in dasllama_audio).
-def save_model_image(var t : Model; path : string) : bool {
-    return save_image(t, path)
+//! `tag` names the flavor (METAL_IMAGE_TAG for blob-only metal-flavor models, "" planar).
+def save_model_image(var t : Model; path : string; tag : string = "") : bool {
+    return save_image(t, path, tag)
 }
 
 // ===== load =====
@@ -595,9 +602,9 @@ def load_image(path : string; var t; tag : string = "") : bool {
     return true
 }
 
-//! Model entry point — see load_image.
-def load_model_image(path : string; var t : Model) : bool {
-    if (!load_image(path, t)) {
+//! Model entry point — see load_image (`tag` = the flavor, like save_model_image).
+def load_model_image(path : string; var t : Model; tag : string = "") : bool {
+    if (!load_image(path, t, tag)) {
         return false
     }
     // AFTER the plane borrows (image_post_load runs before them, when every array is still
@@ -607,34 +614,66 @@ def load_model_image(path : string; var t : Model) : bool {
 }
 
 //! The image-cached model load — ``load_model``'s engine half, public for callers bypassing the
-//! full dasllama facade. ``.dlim`` maps directly (wrong identity panics); q8-mode gguf maps/saves
-//! a prepared image (``DASLLAMA_IMAGE=0`` disables); else plain gguf. Call inside ``with_job_que()``.
+//! facade. ``.dlim`` maps directly (wrong identity panics); q8-mode gguf maps/saves a prepared image
+//! (``DASLLAMA_IMAGE=0`` disables); under an active Metal mode the image is the BLOB-ONLY metal flavor (CPU inference against it panics) when servable, the planar CPU flavor otherwise. Call inside ``with_job_que()``.
 def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     if (path |> ends_with(".dlim")) {
+        // a prepared image named directly — first-class once the source gguf is gone. Try both
+        // identities, EXPECTED flavor first (metal under an active Metal mode, else planar) so
+        // the normal case loads without the wrong-tag decline warning; a dual mismatch panics
         apply_box_profile_runtime()
         let ts_img = ref_time_ticks()
         var t = Model()
-        if (!load_model_image(path, t)) {
-            panic("dasLLAMA: '{path}' is not a prepared image for this box/knobs (identity {image_identity()}) — regenerate it from the source gguf")
+        let metal_first = get_metal_mode() != MetalMode.off && has_decode_override("metal")
+        let loaded = (metal_first
+            ? load_model_image(path, t, METAL_IMAGE_TAG) || load_model_image(path, t)
+            : load_model_image(path, t) || load_model_image(path, t, METAL_IMAGE_TAG))
+        if (!loaded) {
+            panic("dasLLAMA: '{path}' is not a prepared image for this box/knobs (identity {image_identity()} / {image_identity(METAL_IMAGE_TAG)}) — regenerate it from the source gguf")
         }
         to_log(LOG_INFO, "dasLLAMA: prepared image mapped in {get_time_usec(ts_img) / 1000} ms — {path}\n")
         return <- t
     }
+    // metal mode at load time picks the image FLAVOR: blob-only metal when the drivers can
+    // serve the config, planar CPU otherwise (flavors are per-config and self-sufficient)
+    let want_metal = mode == QuantMode.q8 && get_metal_mode() != MetalMode.off && has_decode_override("metal")
     if (mode == QuantMode.q8 && get_env_variable("DASLLAMA_IMAGE") != "0") {
         apply_box_profile_runtime()   // a backend pin must precede the identity (it names the backend)
-        let img = image_path_for(path)
         let ts_img = ref_time_ticks()
         var t = Model()
+        if (want_metal) {
+            let img_m = image_path_for(path, METAL_IMAGE_TAG)
+            if (load_model_image(img_m, t, METAL_IMAGE_TAG)) {
+                to_log(LOG_INFO, "dasLLAMA: prepared image mapped in {get_time_usec(ts_img) / 1000} ms — {img_m}\n")
+                return <- t
+            }
+        }
+        let img = image_path_for(path)
         if (load_model_image(img, t)) {
-            to_log(LOG_INFO, "dasLLAMA: prepared image mapped in {get_time_usec(ts_img) / 1000} ms — {img}\n")
-            return <- t
+            if (!(want_metal && metal_model_servable(t))) {
+                to_log(LOG_INFO, "dasLLAMA: prepared image mapped in {get_time_usec(ts_img) / 1000} ms — {img}\n")
+                return <- t
+            }
+            // a planar image of a metal-servable config under metal mode — drop the mapping
+            // and regenerate the blob flavor (the planar file stays for CPU-mode loads)
+            delete t
         }
         var m <- load_model_(path, mode)
         let ts_save = ref_time_ticks()
-        if (save_model_image(m, img)) {
+        if (want_metal && metal_model_servable(m) && convert_model_to_metal_blob(m)) {
+            let img_m = image_path_for(path, METAL_IMAGE_TAG)
+            if (save_model_image(m, img_m, METAL_IMAGE_TAG)) {
+                to_log(LOG_INFO, "dasLLAMA: prepared image saved in {get_time_usec(ts_save) / 1000} ms — {img_m}\n")
+            }
+        } elif (save_model_image(m, img)) {
             to_log(LOG_INFO, "dasLLAMA: prepared image saved in {get_time_usec(ts_save) / 1000} ms — {img}\n")
         }
         return <- m
     }
-    return <- load_model_(path, mode)
+    var m <- load_model_(path, mode)
+    // no image cache: the metal drivers are blob-only, so metal mode still takes the in-RAM form
+    if (want_metal && metal_model_servable(m)) {
+        convert_model_to_metal_blob(m)
+    }
+    return <- m
 }

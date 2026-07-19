@@ -262,6 +262,23 @@ def register_decode_override(name : string; fn : DecodeOverrideFn) {
     g_decode_overrides[name] = fn
 }
 
+// "would the metal drivers serve this loaded model?" — the model-level gate, registered by the
+// metal driver module at [init] (it owns the path masks). load_model consults it to pick the
+// image flavor: servable -> the blob-only metal flavor, else the planar CPU flavor.
+typedef MetalServableFn = function<(t : Model) : bool>
+
+var private g_metal_servable : MetalServableFn
+var private g_metal_servable_set = false
+
+def register_metal_servable(fn : MetalServableFn) {
+    g_metal_servable = fn
+    g_metal_servable_set = true
+}
+
+def metal_model_servable(t : Model) : bool {
+    return g_metal_servable_set && invoke(g_metal_servable, t)
+}
+
 def register_batch_decode_override(name : string; fn : BatchDecodeOverrideFn) {
     g_batch_decode_overrides[name] = fn
 }
@@ -298,6 +315,36 @@ def active_decode_override : string {
 //! at [init]; other platforms have none.)
 def has_prefill_override(name : string) : bool {
     return key_exists(g_prefill_overrides, name)
+}
+
+// CPU batched prefill above this length on a Metal-capable build is a measurement hazard, not a
+// serving path — days of profiling time went to tools silently CPU-prefilling. forward_prefill_body
+// PANICS there unless the caller declares CPU intent (the API below or DASLLAMA_CPU_PREFILL=1).
+let CPU_PREFILL_PANIC_NPOS = 32l
+
+var private g_cpu_prefill_allowed = -1   // -1 = read DASLLAMA_CPU_PREFILL on first check
+
+//! Declare that this process runs CPU prefill ON PURPOSE — disarms the Metal-capable-build panic
+//! on batched prefills longer than ``CPU_PREFILL_PANIC_NPOS`` tokens. ``DASLLAMA_CPU_PREFILL=1``
+//! is the no-recompile equivalent (the test rail exports it).
+def allow_cpu_prefill(on : bool = true) {
+    g_cpu_prefill_allowed = on ? 1 : 0
+}
+
+def private cpu_prefill_allowed : bool {
+    if (g_cpu_prefill_allowed < 0) {
+        g_cpu_prefill_allowed = get_env_variable("DASLLAMA_CPU_PREFILL") == "1" ? 1 : 0
+    }
+    return g_cpu_prefill_allowed == 1
+}
+
+// The blob-only tripwire: a metal-flavor (blob-only) model carries no planar CPU planes — any
+// CPU inference against it is a wiring bug, never a fallback. (The gather paths — embed_row,
+// PLE — read the blob directly and stay legal.)
+def private blob_only_panic(t : Model; what : string) {
+    if (t.metal_blob) {
+        panic("dasLLAMA: CPU {what} on a blob-only metal-flavor model — serve it on the GPU (set_metal_mode / fix the declined gate) or load the CPU-flavor image (metal mode off at load_model)")
+    }
 }
 
 def has_decode_override(name : string) : bool {
@@ -363,11 +410,19 @@ def batch_decode_override_logits_done {
 
 //! Build one position's RoPE cos/sin row into caller arrays — bit-identical to the row forward()
 //! hands the decode override (an encode-ahead driver pre-builds the NEXT position's row; the
-//! global-rope class only — dual-rope configs carry a second row this does not cover).
+//! global-rope class only — dual-rope configs pre-build the swa row with the twin below).
 def public build_decode_rope_row(t : Model; pos : int64; var cos_tab, sin_tab : array<float>) {
     let c = t.config
     build_rope_table(cos_tab, sin_tab, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l,
                      c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
+}
+
+//! The sliding class's row (dual-rope configs) — bit-identical to forward()'s swa row build.
+def public build_decode_rope_row_swa(t : Model; pos : int64; var cos_tab, sin_tab : array<float>) {
+    let c = t.config
+    let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
+    build_rope_table(cos_tab, sin_tab, t, c.rope_freq_base_swa, c.rope_freq_scale_swa, pos, 1l,
+                     swa_hs, !c.rope_ff_global_only)
 }
 
 //! The copyable hot-path block pointers, resolved onto the Model at load and called per layer.
@@ -380,6 +435,9 @@ struct ArchBlocks {
     // batched-decode worker applies. An arch registering custom attention sets this false and
     // eval_batch falls back to per-row forward().
     attn_is_std : bool = true
+    // Metal gate: the FFN is the plain dense gated pair (ffn_dense_*). Block sets that route
+    // experts (or MAY, per file — gemma4) set this false and the GPU drivers decline `graph`.
+    ffn_is_dense : bool = true
 }
 
 //! The whole model. `fblob` holds the fp32 embedding + norm weights; the big 2D weights live in
@@ -437,6 +495,11 @@ struct Model {
     // then freed); exactly one of qscales/qscales16 is populated for a q8 model.
     qscales16 : array<uint16>
     wscale_f16 : bool = false
+    // Metal-flavor blob rail (blob-only .dlim): q8 weights as 34-byte block_q8_0 blocks populated
+    // INSTEAD of qblob + qscales/qscales16 (blob byte = (off/32)*34); k4s/k5s hold 16B compact
+    // scale strips, k6s the GPU split form. CPU inference on a blob-only model PANICS.
+    mblob : array<uint8>
+    metal_blob : bool = false
     q4blob : array<uint8>
     q4scales : array<float>
     // Native-MXFP4 expert stacks (valid when experts_mx4): the routed we1/we2/we3 stacks live here
@@ -1263,6 +1326,11 @@ def rebind_arch_blocks(var t : Model; arch : string) {
     }
     t.arch = arch
     t.blocks = g_arch_registry[arch].blocks
+    if (t.config.moe_optional && !t.config.moe && t.config.n_embd_per_layer == 0l) {
+        // the file-resolved dense flavor of a moe-optional arch (gemma4 12B/31B) — mirror the
+        // load_gguf patch so the GPU drivers' graph gate serves image loads too
+        t.blocks.ffn_is_dense = true
+    }
 }
 
 // The wscale_f16 rail's load-time switch: default ON — free at 16 lanes on the 3990X, +5.4% on
@@ -1974,6 +2042,139 @@ def moe_gpu_upload_resident(var t : Model) {
 //! Load a llama-architecture GGUF into the split layout at the requested precision.
 // RepackReg: one mr-aligned row-chunk of a weight region. fmt: 0=q8, 1=mx4, 4/5/6=kq planes.
 // Chunking splits huge regions (the classifier); 1024 is a multiple of every backend mr.
+
+// ===== metal-flavor blob transform (the blob-only .dlim redesign) =====
+
+def private metal_blob_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
+
+// A q8 region's blob bind offset (off/32)*34 lands 16B-aligned iff off % 256 == 0; a k6
+// region's d-plane bind (NSB*16 + (off/256)*2) needs 4B alignment iff off % 512 == 0.
+// k4/k5/q40 quant + scale binds are 16B-multiples by construction.
+def private metal_blob_off_ok(off : int64; fmt : KqFmt) : bool {
+    if (off < 0l) return true
+    if (fmt == KqFmt.q8) return off % 256l == 0l
+    if (fmt == KqFmt.k6) return off % 512l == 0l
+    return true
+}
+
+def private metal_blob_layout_ok(t : Model) : bool {
+    let c = t.config
+    if (int64(length(t.wq_offs)) < c.n_layers || int64(length(t.w1_offs)) < c.n_layers) {
+        return false
+    }
+    for (l in range64(c.n_layers)) {
+        if (!metal_blob_off_ok(t.wq_offs[l], metal_blob_fmt_at(t.wq_fmt, l)) ||
+                !metal_blob_off_ok(t.wk_offs[l], metal_blob_fmt_at(t.wk_fmt, l)) ||
+                !metal_blob_off_ok(t.wv_offs[l], metal_blob_fmt_at(t.wv_fmt, l)) ||
+                !metal_blob_off_ok(t.wo_offs[l], metal_blob_fmt_at(t.wo_fmt, l)) ||
+                !metal_blob_off_ok(t.w1_offs[l], metal_blob_fmt_at(t.w1_fmt, l)) ||
+                !metal_blob_off_ok(t.w2_offs[l], metal_blob_fmt_at(t.w2_fmt, l)) ||
+                !metal_blob_off_ok(t.w3_offs[l], metal_blob_fmt_at(t.w3_fmt, l))) {
+            return false
+        }
+    }
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    return (metal_blob_off_ok(t.wcls_off, cls_fmt) &&
+        (!t.cls_q8 || metal_blob_off_ok(t.emb_q8_off, KqFmt.q8)))
+}
+
+//! Convert a planar q8-mode Model to the metal-blob form IN PLACE (see the Model field doc).
+//! False = the model cannot take the blob form (not q8, repacked planes, or a bind-alignment
+//! violation) — the caller keeps the planar model. CPU inference on the converted model panics.
+def convert_model_to_metal_blob(var t : Model) : bool {
+    if (t.metal_blob) {
+        return true
+    }
+    if (t.quant != QuantMode.q8 || t.kq_repacked || kernel_backend_needs_repack(active_kernel_backend())) {
+        return false
+    }
+    if (t.image_map != null) {
+        // image-backed planes are borrowed READ-ONLY views — the in-place k4s/k5s/k6s
+        // rewrites would fault. Transform an owned load (load_model_ / DASLLAMA_IMAGE=0).
+        to_log(LOG_WARNING, "dasLLAMA: metal-blob transform declined — the model is image-mapped (borrowed planes); transform an owned gguf load\n")
+        return false
+    }
+    if (!metal_blob_layout_ok(t)) {
+        to_log(LOG_WARNING, "dasLLAMA: metal-blob transform declined — a weight offset violates the GPU bind alignment\n")
+        return false
+    }
+    let ts = ref_time_ticks()
+    let nb = long_length(t.qblob) / 32l
+    if (nb > 0l) {
+        t.mblob |> resize(nb * 34l)
+        let s16 = t.wscale_f16
+        unsafe {
+            var dp = addr(t.mblob[0])
+            let qp = addr < int8 const? >(t.qblob[0])
+            var sp : float const?
+            var sp16 : uint16 const?
+            if (s16) {
+                sp16 = addr(t.qscales16[0])
+            } else {
+                sp = addr(t.qscales[0])
+            }
+            let nch = int(clamp(nb / 262144l, 1l, 64l))
+            maybe_parallel_for(0, int(nb / 32l) + (nb % 32l != 0l ? 1 : 0), is_job_que_available() ? nch : 1) $(cb, ce) {
+                unsafe {
+                    for (b in range64(int64(cb) * 32l, min(int64(ce) * 32l, nb))) {
+                        var ph = reinterpret<uint16?>(dp + b * 34l)
+                        ph[0] = s16 ? sp16[b] : uint16(f32_to_f16(clamp(sp[b], -65504.0, 65504.0)))
+                        memcpy(reinterpret<void?>(dp + b * 34l + 2l), reinterpret<void const?>(qp + b * 32l), 32)
+                    }
+                }
+            }
+        }
+    }
+    delete t.qblob
+    delete t.qscales
+    delete t.qscales16
+    // k4/k5: the 16B verbatim disk scale block per superblock — the 4B pad is CPU-repack
+    // scratch (see the plane-layout comment in dasllama_gguf) and a blob model never repacks
+    if (!empty(t.k4s)) {
+        compact_kq_scale_strip(t.k4s)
+    }
+    if (!empty(t.k5s)) {
+        compact_kq_scale_strip(t.k5s)
+    }
+    // k6: the GPU split form — [nsb x 16B sub-scale strips][nsb x f16 d halfwords]
+    if (!empty(t.k6s)) {
+        var k6c : array<uint8>
+        let nsb = long_length(t.k6s) / K6_SSB
+        k6c |> resize(nsb * K6_SSB)
+        unsafe {
+            var dp = addr(k6c[0])
+            let sp = addr < uint8 const? >(t.k6s[0])
+            for (sb in range64(nsb)) {
+                memcpy(reinterpret<void?>(dp + sb * 16l), reinterpret<void const?>(sp + sb * 18l), 16)
+                dp[nsb * 16l + sb * 2l] = sp[sb * 18l + 16l]
+                dp[nsb * 16l + sb * 2l + 1l] = sp[sb * 18l + 17l]
+            }
+        }
+        t.k6s <- k6c
+    }
+    t.metal_blob = true
+    to_log(LOG_INFO, "dasLLAMA: metal-blob transform ({nb} blocks) in {get_time_usec(ts) / 1000} ms\n")
+    return true
+}
+
+// 20B -> 16B in place: keep bytes [0..16) of every superblock strip, then shrink. Forward
+// byte moves are safe — every destination sits below its source (regions can overlap).
+def private compact_kq_scale_strip(var ks : array<uint8>) {
+    let nsb = long_length(ks) / 20l
+    unsafe {
+        var p = addr(ks[0])
+        for (sb in range64(1l, nsb)) {   // sb 0 already sits at 0
+            for (i in range64(16l)) {
+                p[sb * 16l + i] = p[sb * 20l + i]
+            }
+        }
+    }
+    ks |> resize(nsb * 16l)
+}
+
+// A repack work item: one mr-aligned row-chunk of a weight region. fmt: 0 = q8 (qblob/qscales),
+// 1 = mx4 (mxq/mxs), 4/5/6 = the kq plane pairs. Chunking splits huge regions (the classifier) for
+// load balance; 1024 is a multiple of every backend mr, so row groups never straddle a boundary.
 struct private RepackReg {
     off : int64
     n : int64
@@ -2534,6 +2735,12 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         if (t.config.moe_optional
                 && gguf_has(m, "{arch}.expert_count") && gguf_int(m, bytes, "{arch}.expert_count") > 0l) {
             t.config.moe = true
+        }
+        if (t.config.moe_optional && !t.config.moe && t.config.n_embd_per_layer == 0l) {
+            // the moe-optional arch registers ffn_is_dense = false for the shared descriptor, but
+            // THIS file resolved dense with no PLE (12B/31B) — its ffn IS the std dense stack
+            // (+ out_scale), so the GPU drivers' graph gate may serve it
+            t.blocks.ffn_is_dense = true
         }
         if (t.config.moe) {
             // MoE geometry from metadata (qwen2moe A2.7B: 60 experts, top-4, 1408-wide experts
@@ -7151,6 +7358,21 @@ def private ffn_moe_decode(t : Model; var s : Session; l : int64) {
 // arithmetic gguf_read_tensor_f32 used to fill fblob, so the values are bit-identical to the
 // fp32 table this replaces.
 def private dequant_q8_row(t : Model; off, n : int64; var dst : float?) {
+    if (t.metal_blob) {
+        // blob layout: f16 scale + 32 int8 per 34-byte block at (off/32)*34
+        unsafe {
+            let bp = addr < uint8 const? >(t.mblob[(off / 32l) * 34l])
+            for (b in range64(n / 32l)) {
+                let sc = f16_to_f32(uint(bp[b * 34l]) | (uint(bp[b * 34l + 1l]) << 8u))
+                let qp = reinterpret<int8 const?>(bp + b * 34l + 2l)
+                let base = b * 32l
+                for (k in range64(32l)) {
+                    dst[base + k] = float(qp[k]) * sc
+                }
+            }
+        }
+        return
+    }
     unsafe {
         let qp = addr(t.qblob[off])
         if (t.wscale_f16) {
@@ -7209,13 +7431,20 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
             unsafe {
                 var row = temp_array(dst, dim, type<float>)
                 let sb0 = (t.wcls_off + token * dim) / 256l
+                // metal-blob planes: k4/k5 strips are 16B, k6 is the split GPU form (d in the tail)
+                let ssb45 = t.metal_blob ? 16l : K4_SSB
+                let k6d0 = t.metal_blob ? (long_length(t.k6s) / K6_SSB) * 16l : 0l
                 for (s in range64(dim / 256l)) {
                     if (t.emb_fmt == KqFmt.k4) {
-                        dequant_k4_plane_superblock(t.k4q, (sb0 + s) * K4_QSB, t.k4s, (sb0 + s) * K4_SSB, row, s * 256l)
+                        dequant_k4_plane_superblock(t.k4q, (sb0 + s) * K4_QSB, t.k4s, (sb0 + s) * ssb45, row, s * 256l)
                     } elif (t.emb_fmt == KqFmt.k5) {
-                        dequant_k5_plane_superblock(t.k5q, (sb0 + s) * K5_QSB, t.k5s, (sb0 + s) * K5_SSB, row, s * 256l)
+                        dequant_k5_plane_superblock(t.k5q, (sb0 + s) * K5_QSB, t.k5s, (sb0 + s) * ssb45, row, s * 256l)
                     } elif (t.emb_fmt == KqFmt.k6) {
-                        dequant_k6_plane_superblock(t.k6q, (sb0 + s) * K6_QSB, t.k6s, (sb0 + s) * K6_SSB, row, s * 256l)
+                        if (t.metal_blob) {
+                            dequant_k6_plane_superblock_at(t.k6q, (sb0 + s) * K6_QSB, t.k6s, (sb0 + s) * 16l, k6d0 + (sb0 + s) * 2l, row, s * 256l)
+                        } else {
+                            dequant_k6_plane_superblock(t.k6q, (sb0 + s) * K6_QSB, t.k6s, (sb0 + s) * K6_SSB, row, s * 256l)
+                        }
                     } elif (t.emb_fmt == KqFmt.q40) {
                         dequant_q40_plane_superblock(t.q40q, (sb0 + s) * Q40_QSB, t.q40s, (sb0 + s) * Q40_SSB, row, s * 256l)
                     } else {
@@ -7368,6 +7597,7 @@ def forward(t : Model; var s : Session; token, pos : int64) {
         stack_done = invoke(g_decode_override, t, s, token, pos)
     }
     if (!stack_done) {
+        blob_only_panic(t, "decode stack")
         for (l in range64(c.n_layers)) {
             t.blocks.attn_decode(t, s, l, pos)
             t.blocks.ffn_decode(t, s, l)
@@ -7377,6 +7607,7 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     return if (stack_done && g_decode_logits_done)   // the override already produced s.logits
 
     // final rmsnorm (into xb to avoid aliasing x as both in/out), then classifier
+    blob_only_panic(t, "final-norm/classifier step")
     let ts_final = ref_time_ticks()
     trace_tag(TRACE_TAG_CLS)
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
@@ -10005,7 +10236,10 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
 
 def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64) {
     let c = t.config
-    if (t.quant == QuantMode.q4_0 || npos <= 0l) {
+    if (npos <= 0l) {
+        return
+    }
+    if (t.quant == QuantMode.q4_0) {   // legacy per-row tier, no batched kernels: its prefill IS the decode loop
         for (p in range64(npos)) {
             forward(t, s, tokens[p], start_pos + p)
         }
@@ -10247,6 +10481,11 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
         stack_done = invoke(g_prefill_override, t, s, npos, start_pos)
     }
     if (!stack_done) {
+        blob_only_panic(t, "prefill stack")
+        // Metal-capable build about to chew a real prompt on the CPU stack — the silent profiling-time sink, not a serving path; fail loud unless CPU intent was declared
+        if (npos > CPU_PREFILL_PANIC_NPOS && has_prefill_override("metal") && !cpu_prefill_allowed()) {
+            panic("dasLLAMA: CPU batched prefill of {npos} tokens on a Metal-capable build (override `{g_prefill_override_name}` {empty(g_prefill_override_name) ? "not selected" : "declined"}) — select the metal prefill (set_metal_mode / DASLLAMA_PIN_PREFILL=metal), or declare CPU intent: allow_cpu_prefill() / DASLLAMA_CPU_PREFILL=1")
+        }
         for (l in range64(c.n_layers)) {
             trace_marker("layer", int(l))   // unit boundary for the timeline viewer (no-op untraced)
             trace_tag(TRACE_TAG_ATTN_STD)   // per-lane trace: color the prefill attention section
@@ -10258,6 +10497,7 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
 
     // final rmsnorm + classifier on the LAST position only (that's what we sample next)
     return if (stack_done && g_prefill_logits_done)   // the override already produced s.logits
+    blob_only_panic(t, "prefill final-norm/classifier step")
     let ts_final = ref_time_ticks()
     let last = npos - 1l
     rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
@@ -10513,7 +10753,8 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         if (sp.kv_pool != s0.kv_pool) {
             panic("eval_batch: sessions[{i}] KV pool differs from sessions[0] — one pool (or all-flat) per batch")
         }
-        if (s0.kv_pool == null && (length(sp.key_cache) != length(s0.key_cache) || length(sp.value_cache) != length(s0.value_cache))) {
+        // long_length: a full-seq 1B's flat f16 cache is exactly 2^31 bytes — length() throws
+        if (s0.kv_pool == null && (long_length(sp.key_cache) != long_length(s0.key_cache) || long_length(sp.value_cache) != long_length(s0.value_cache))) {
             panic("eval_batch: sessions[{i}] cache size differs from sessions[0] — same model + same seq_len required")
         }
     }
@@ -10587,6 +10828,7 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         stack_done = invoke(g_batch_decode_override, t, ws, sessions, nrows)
     }
     if (!stack_done) {
+        blob_only_panic(t, "batch-decode stack")
         for (l in range64(c.n_layers)) {
             attention_batch_decode(t, ws, sessions, l, nrows)
             t.blocks.ffn_prefill(t, ws.scr, l, nrows)
@@ -10596,6 +10838,7 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
     let ts_final = ref_time_ticks()
     let vocab = c.vocab_size
     if (!(stack_done && g_batch_decode_logits_done)) {
+        blob_only_panic(t, "batch-decode final-norm/classifier step")
         rms_batch(ws.scr.xb_b, ws.scr.x_b, t, t.rms_final_off, dim, nrows)
         ws.logits_b |> resize(nrows * vocab)
         let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
@@ -10971,14 +11214,16 @@ def std_blocks() : ArchBlocks {
 //! prefill). Arches whose configure sets `moe` register these instead of std_blocks.
 def moe_blocks() : ArchBlocks {
     return ArchBlocks(attn_decode = @@attention_std_decode, ffn_decode = @@ffn_moe_decode,
-                      attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_moe_prefill)
+                      attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_moe_prefill,
+                      ffn_is_dense = false)
 }
 
 //! gemma4's block set: standard attention + a FFN that dispatches per file — dense (12B/31B) or the
 //! parallel dense-shared + routed MoE (26B-A4B) by expert count, so ONE gemma4 registration covers both.
 def gemma4_blocks() : ArchBlocks {
     return ArchBlocks(attn_decode = @@attention_std_decode, ffn_decode = @@ffn_gemma4_decode,
-                      attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_gemma4_prefill)
+                      attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_gemma4_prefill,
+                      ffn_is_dense = false)
 }
 
 //! qwen35's block set: the hybrid Gated-DeltaNet / gated-attention dispatch + the dense FFN.
@@ -10995,5 +11240,5 @@ def qwen35_blocks() : ArchBlocks {
 def qwen35moe_blocks() : ArchBlocks {
     return ArchBlocks(attn_decode = @@attention_qwen35_decode, ffn_decode = @@ffn_moe_decode,
                       attn_prefill = @@attention_qwen35_prefill, ffn_prefill = @@ffn_moe_prefill,
-                      attn_is_std = false)
+                      attn_is_std = false, ffn_is_dense = false)
 }

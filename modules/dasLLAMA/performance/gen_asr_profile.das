@@ -184,6 +184,7 @@ def add_libri_sides(var sides : array<LibriStat>; var m : AsrModel; spec : AsrMo
 // tune_policy: an untuned box silently publishes fallback-tier numbers — see gen_profile.das
 [export, tune_policy(missing = "auto")]
 def main() {
+    allow_cpu_prefill()   // CPU rows are this tool's product — disarm the Metal-build tripwire
     if (!jit_enabled()) {
         print("gen_asr_profile is JIT-only — run with: daslang -jit <file>\n")
         return

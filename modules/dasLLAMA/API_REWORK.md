@@ -343,6 +343,85 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
+- **Small-model q8 single-stream GEMV: restore the vector quant load on the blob layout
+  (2026-07-18, the blob rewiring's one regression — TOP of the perf queue).** The planar
+  kernels loaded 4 quants as ONE byte4 vector; the 34B blob's +2 quant phase forced 4
+  scalar loads across the single-stream family (MetalQ8Gemv, the QkvRs twins, W13Sw).
+  Issue-bound models pay ~7-8% at B=1 (4B Q8 64.5 -> 59.5 = 0.88x, g3-1b 204.7 -> 190.3);
+  DRAM-bound 12B is flat; batch forms amortize over columns and IMPROVED (+5..24%).
+  Fix A: a third uint16 buffer view (the blob is 2-byte aligned everywhere) — 2 aligned
+  ushort loads + sign-extend unpack per chunk. Fix B (zero kernel changes, A/B-able at the
+  encoder): dispatch MetalQ8MvB2 at nrows=1 with ys=0/xs4=0 (the double-store is benign —
+  both columns compute and store the same value). Measure both at the 4B shapes.
+
+- **Per-config .dlim: map-only load, BLOB-ONLY metal flavor — SHIPPED (2026-07-18).** The
+  contract "no processing on load FOR THE CONFIG IT WAS BUILT FOR" holds: image v3 +
+  METAL_IMAGE_TAG identity flavor; the 34B block_q8_0 blob REPLACES the planar q8 planes
+  (one zero-copy MTLBuffer per plane via `metal_new_buffer_no_copy_untracked`, region byte
+  offsets at bind — kernel indices stay uint32-safe); k4s/k5s ride the 16B strips and k6s
+  the GPU split form; every q8 kernel is blob-addressed (the S16 scale twins collapsed),
+  the fused QKV/W13 kernels bind per-segment views (kind-major layout), the fixed-B
+  kernels grew the kq twins' `ys` y-row-stride uniform for fused-buffer writes, and the
+  cat-blob caches + the `metal_blob_region` repack are DELETED. CPU inference on a blob
+  model panics; the gathers (embed_row, dequant_q8_row, split-k6) read the blob directly;
+  `load_model` picks the flavor via the registered `metal_model_servable` hook. Measured:
+  1B transform 133ms / map 24ms; kq-pure transform 21ms / map 13ms; all three GPU paths
+  serve with 0 declines. Rewiring residue for the ledger (re-measure the q8 cells first):
+  the batch qkv site's split-K stands down (its reduce writes contiguous y — plain GemmB
+  serves per-segment), the B<=4 unfused single-decode qkv/w13 cats became per-tensor
+  dispatches (~2 extra dispatches/layer on those rails), and the legacy quantized-X
+  prefill rail is DELETED (the `!mm` serving arms, the fused add+rms+quant/swiglu+quant/
+  rope_qk kernels + PSOs, enc_gemm, and the X-quant pools — ~350 lines; the mulmm_legacy
+  knob survives as the required-mode forced-decline test switch, and dasllama_math_metal's
+  planar GEMM donor is untouched — it serves CPU-flavor models' batch offload).
+
+- **QK-norm rope-store fusion — the f16 single-stream H-form SHIPPED (wave A chase round 2);
+  the rest of the family is the residual (2026-07-17).** MetalRopeStoreHF16 folds bias +
+  per-head RMS + rope + store into one threadgroup-per-head dispatch on QK-norm x f16-mirror
+  single-stream decode (+~1% on the 4B board; Q6_K B=1 tied lcpp exactly). Residual scope,
+  build when a board shows the gap: the f32/q8_0/tq4 codec twins and the BATCH H twins
+  (those paths keep the MetalQkNorm prepass + flat rope-store — batch amortizes the extra
+  dispatch over B rows, so the gap is smaller there), and a norm-capable fused qkv_rs
+  two-pass form for the s16 path (fused qkv_rs still stands down under qk_norm).
+
+- **Gemma stage-1 Metal deferrals (wave B, 2026-07-17).** The gemma2 enablement chose
+  correctness-first shapes; each entry names today's cost on gemma-class models only (llama/qwen
+  paths untouched):
+  (1) *GeGLU fused-w13 stand-down* — the s16 w13sw fused GEMV (single) and the batch fuse13 rail
+  carry a hardcoded silu epilogue, so `ffn_act == gelu` falls back to unfused W1+W3 GEMVs + a
+  geglu ew pass (+1 dispatch/layer single, +1-2 batch). Fix: an `act` uniform (or gelu twin) on
+  the w13sw kernels. Same for prefill's legacy fused rail (`enc_swiglu_quant` has no gelu twin,
+  and the deferred-W2-add trick has no post-ffn-norm slot, so `fused` stands down entirely —
+  mm-path prefill, the default, is unaffected).
+  (2) *pre_post_norm sites are composed, not fused* — each post-norm is a separate in-place rms
+  dispatch before the residual add (+2 dispatches/layer on every path). Fix: a `post_add_rms`
+  kernel (rms(branch)·w_post + x, then the next pre-norm in the same tg — the row is already
+  staged for the add_rms reduction).
+  (3) *Sliding chunked dispatch is not compacted* — the single-stream part dispatch still grids
+  ALL context chunks; below-window chunks exit whole-tg on entry (the comb skips them via chlo).
+  At gemma2's 4096 window this only bites past 4K depth; fix = dispatch chunks [chlo, nchunks)
+  with a ch0 uniform. Batch shares the early-exit shape (per-row windows preclude one compact
+  range).
+  (4) *Spec-chain stands down on embed-scale models* — the greedy GPU-argmax chain requires
+  `embed_scale == 1.0`, so every gemma (sqrt-dim scale) eats the CPU next-token poke per step.
+  Fix: a scale uniform on the embed-gather kernels (enc_embed / enc_embed_k6). Revisit at the
+  gemma4-12B B=1 board — this was the 4B chase's biggest single lever.
+  (5) *Batch window-crossing parity has no dedicated test* — the fam-gemma2 masking row proves
+  single-decode + prefill past the window; the batch part/comb twins share the masked-kernel
+  code but no batch test drives depth > window. Add one when a batch harness with deep
+  per-row contexts exists.
+  (6) *Prefill V-from-K is two dispatches* (stage 3c, 2026-07-18) — the no-wv layers run a flat
+  panel copy (MetalPfCopy) then the ones-plane MetalQkNorm in place (+2 dispatches on gemma4's
+  8 global layers). Fix: a read-K-write-V weightless-RMS variant (the CPU fuses the copy into
+  rms_batch). Suppress adds one tiny classifier-tail dispatch — not worth fusing.
+  (7) *Batch mv + split-K rails stand down under hetero* (stage 3d, 2026-07-18) — the mul_mv
+  x-staging strides (u_xs4_*) and the split-K totals (u_skt_*, and the sk sites' u_qd k-dims)
+  bake ONE attention class, so hetero (gemma4) batch rides the cat-GEMV forms at B <= 4 and
+  the planar GEMM without sk at B >= 5. Fix when the gemma4 batch ladder says it matters:
+  per-class xs4/skt twins bound per layer, same shape as the attention uniform picks. The
+  batch V-from-K copy is also nrows tiny enc_copy_row dispatches — a strided-seg copy kernel
+  collapses them to one.
+
 - **Embeddings path (spotted building `/v1/embeddings`, 2026-07-06).** Two small items, neither
   chased: (1) `embed_forward` takes approach A — reuse `forward_prefill` then re-norm every
   position — which pays **one wasted last-position classifier GEMM** (vocab×dim) per embed call,

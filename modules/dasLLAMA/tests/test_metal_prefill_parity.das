@@ -11,6 +11,7 @@ require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — metal_live_obje
 require daslib/jobque_boost
 require daslib/fio  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
 require strings
+require math
 require _model_tier
 
 // End-to-end gate for the dasMetal whole-prefill override (Phase 6): greedy continuation of a
@@ -44,14 +45,14 @@ def private counting_prompt() : string {
 
 // chunked prompt-to-continuation: eval chunk 1, eval chunk 2 (start_pos > 0 on the second),
 // then n greedy steps — the M2.5 continuation arm's control/GPU shape (probe-proven)
-def private chunked_greedy(tr : Model; c1, c2 : array<int64>; kdt : KVDtype; nsteps : int) : array<int64> {
+def private chunked_greedy(trp, trd : Model; c1, c2 : array<int64>; kdt : KVDtype; nsteps : int) : array<int64> {
     var ids : array<int64>
     with_job_que() {
         setup_dasllama_jobque()
-        var s = make_run_state(tr.config, kdt, kdt)
-        eval_(tr, s, c1)
-        eval_(tr, s, c2)
-        let vocab = tr.config.vocab_size
+        var s = make_run_state(trp.config, kdt, kdt)
+        eval_(trp, s, c1)
+        eval_(trp, s, c2)
+        let vocab = trp.config.vocab_size
         var cur = 0l
         for (v in range64(1l, vocab)) {
             if (s.logits[v] > s.logits[cur]) {
@@ -61,7 +62,7 @@ def private chunked_greedy(tr : Model; c1, c2 : array<int64>; kdt : KVDtype; nst
         for (_i in range(nsteps)) {
             ids |> push(cur)
             var one <- [cur]
-            eval_(tr, s, one)
+            eval_(trd, s, one)
             delete one
             cur = 0l
             for (v in range64(1l, vocab)) {
@@ -75,18 +76,46 @@ def private chunked_greedy(tr : Model; c1, c2 : array<int64>; kdt : KVDtype; nst
     return <- ids
 }
 
-def private continuation(t : Model; prompt : array<int64>; n_gen : int) : array<int64> {
+// prompt-to-continuation: prefill on trp (the arm's subject — GPU when the override is
+// selected and trp is the blob twin), then n_gen greedy decode steps on trd (the planar
+// model = the shared CPU decode both runs ride, preserving the prefill-isolation property).
+def private continuation(trp, trd : Model; prompt : array<int64>; n_gen : int) : array<int64> {
     var got : array<int64>
     with_job_que() {
         setup_dasllama_jobque()
-        var s = make_run_state(t.config)
-        let steps = length(prompt) + n_gen
-        let ids <- generate(t, s, prompt, steps)
-        let echo = length(prompt) - 1
-        got <- [for (i in range(n_gen)); ids[echo + i]; where echo + i < length(ids)]
+        var s = make_run_state(trp.config)
+        eval_(trp, s, prompt)
+        let vocab = trp.config.vocab_size
+        var cur = 0l
+        for (v in range64(1l, vocab)) {
+            if (s.logits[v] > s.logits[cur]) {
+                cur = v
+            }
+        }
+        for (_i in range(n_gen)) {
+            got |> push(cur)
+            var one <- [cur]
+            eval_(trd, s, one)
+            delete one
+            cur = 0l
+            for (v in range64(1l, vocab)) {
+                if (s.logits[v] > s.logits[cur]) {
+                    cur = v
+                }
+            }
+        }
         delete s
     }
     return <- got
+}
+
+// the blob twin of a planar fixture (see test_metal_decode_parity's twin): an OWNED engine
+// load transformed to the GPU form — the drivers are blob-only
+def private blob_twin(t : T?; path : string; seq_cap : int64) : Model {
+    var tg <- load_model_(path, QuantMode.q8)
+    t |> success(convert_model_to_metal_blob(tg), "metal-blob transform")
+    tg.config.seq_len = min(tg.config.seq_len, seq_cap)
+    return <- tg
 }
 
 [test]
@@ -111,32 +140,30 @@ def test_metal_prefill_parity(t : T?) {
                 tr.config.seq_len = 2048l
             }
             let prompt <- encode(tr, counting_prompt(), true, false)
+            var trg <- blob_twin(t, path, 2048l)
             if (arm_on(t, "base")) {
-                let cpu <- continuation(tr, prompt, 40)
+                // the legacy quantized-GEMM arm is GONE: the drivers are blob-only mul_mm
+                // (a blob model carries no planar scale planes for the quantized-X rail)
+                let cpu <- continuation(tr, tr, prompt, 40)
                 t |> equal(length(cpu), 40)
                 t |> success(select_prefill_override("metal"), "override registered")
                 set_metal_prefill_min_npos(1l)
                 let before = metal_prefill_stats().prefills
-                let gpu <- continuation(tr, prompt, 40)         // default = lcpp mul_mm (f32 activations)
+                let gpu <- continuation(trg, tr, prompt, 40)    // GPU prefill (blob), CPU decode (planar)
                 let served = metal_prefill_stats().prefills - before
-                set_metal_prefill_mulmm_legacy(true)            // the quantized path — bit-identical to CPU
-                let before2 = metal_prefill_stats().prefills
-                let gpu_legacy <- continuation(tr, prompt, 40)
-                let served2 = metal_prefill_stats().prefills - before2
-                set_metal_prefill_mulmm_legacy(false)
                 select_prefill_override("")
                 set_metal_prefill_min_npos(64l)
                 clear_kernel_backend_pin()
                 select_kernel_backend(prior_backend)
                 set_wscale_f16(prior_wscale)
-                if (served == 0l || served2 == 0l) {
+                if (served == 0l) {
                     metal_prefill_shutdown()
                     delete tr
+                    delete trg
                     feint("metal prefill declined (no Metal device?); GPU parity skipped\n")
                     return
                 }
-                t |> success(same(cpu, gpu_legacy), "40-token continuation matches the CPU control (legacy quantized GEMM)")
-                t |> success(same(cpu, gpu), "40-token continuation matches the CPU control (lcpp mul_mm, f32 activations)")
+                t |> success(same(cpu, gpu), "40-token continuation matches the CPU control (blob mul_mm, f32 activations)")
             }
 
             // s16 arm (W2): the DEFAULT-load scale plane — blobs read raw f16 scales, the
@@ -149,11 +176,12 @@ def test_metal_prefill_parity(t : T?) {
                 if (tr16.config.seq_len > 2048l) {
                     tr16.config.seq_len = 2048l
                 }
-                let cpu16 <- continuation(tr16, prompt, 40)
+                var tr16g <- blob_twin(t, path, 2048l)
+                let cpu16 <- continuation(tr16, tr16, prompt, 40)
                 t |> success(select_prefill_override("metal"), "override registered (s16)")
                 set_metal_prefill_min_npos(1l)
                 let before16 = metal_prefill_stats().prefills
-                let gpu16 <- continuation(tr16, prompt, 40)
+                let gpu16 <- continuation(tr16g, tr16, prompt, 40)
                 t |> success(metal_prefill_stats().prefills - before16 > 0l, "wscale16 prefill served on the GPU")
                 select_prefill_override("")
                 set_metal_prefill_min_npos(64l)
@@ -162,6 +190,7 @@ def test_metal_prefill_parity(t : T?) {
                 set_wscale_f16(prior_wscale)
                 t |> success(same(cpu16, gpu16), "40-token wscale16 continuation matches the CPU control (s16 mul_mm + s16 classifier)")
                 delete tr16
+                delete tr16g
             }
 
             // kq arm (M2.3): K-quant prefill — the kq mul_mm twins (mixed k4/k6 tensors per
@@ -177,11 +206,12 @@ def test_metal_prefill_parity(t : T?) {
                 if (trk.config.seq_len > 2048l) {
                     trk.config.seq_len = 2048l
                 }
-                let cpuk <- continuation(trk, prompt, 40)
+                var trkg <- blob_twin(t, kpath, 2048l)
+                let cpuk <- continuation(trk, trk, prompt, 40)
                 t |> success(select_prefill_override("metal"), "override registered (kq)")
                 set_metal_prefill_min_npos(1l)
                 let beforek = metal_prefill_stats().prefills
-                let gpuk <- continuation(trk, prompt, 40)
+                let gpuk <- continuation(trkg, trk, prompt, 40)
                 t |> success(metal_prefill_stats().prefills - beforek > 0l, "kq prefill served on the GPU")
                 select_prefill_override("")
                 set_metal_prefill_min_npos(64l)
@@ -190,6 +220,7 @@ def test_metal_prefill_parity(t : T?) {
                 set_wscale_f16(prior_wscale)
                 t |> success(same(cpuk, gpuk), "40-token kq continuation matches the CPU control (kq mul_mm + kq classifier)")
                 delete trk
+                delete trkg
             } else {
                 feint("Llama-3.2-1B Q4_K_M not present (llama-quantize the Q8 source); kq prefill arm skipped\n")
             }
@@ -206,16 +237,17 @@ def test_metal_prefill_parity(t : T?) {
                 if (trc.config.seq_len > 2048l) {
                     trc.config.seq_len = 2048l
                 }
+                var trcg <- blob_twin(t, path, 2048l)
                 let nfull = int64(length(prompt))
                 let cut = int(nfull * 3l / 5l)
                 var ch1 <- [for (i in range(cut)); prompt[i]]
                 var ch2 <- [for (i in range(cut, int(nfull))); prompt[i]]
                 for (kdt in [KVDtype.f16, KVDtype.q8_0, KVDtype.tq4]) {
-                    var cpu_c <- chunked_greedy(trc, ch1, ch2, kdt, 24)
+                    var cpu_c <- chunked_greedy(trc, trc, ch1, ch2, kdt, 24)
                     select_prefill_override("metal")
                     set_metal_prefill_min_npos(1l)
                     let pfc0 = metal_prefill_stats().prefills
-                    var gpu_c <- chunked_greedy(trc, ch1, ch2, kdt, 24)
+                    var gpu_c <- chunked_greedy(trcg, trc, ch1, ch2, kdt, 24)
                     select_prefill_override("")
                     set_metal_prefill_min_npos(64l)
                     t |> success(metal_prefill_stats().prefills - pfc0 == 2l,
@@ -230,6 +262,7 @@ def test_metal_prefill_parity(t : T?) {
                 delete ch1
                 delete ch2
                 delete trc
+                delete trcg
             }
 
             // dim-4096 arm (M2.6): past the fused add+rms+quant slab (dim <= 3072) the prefill
@@ -244,11 +277,12 @@ def test_metal_prefill_parity(t : T?) {
                     if (tr8.config.seq_len > 2048l) {
                         tr8.config.seq_len = 2048l
                     }
-                    let cpu8 <- continuation(tr8, prompt, 40)
+                    var tr8g <- blob_twin(t, path8, 2048l)
+                    let cpu8 <- continuation(tr8, tr8, prompt, 40)
                     t |> success(select_prefill_override("metal"), "override registered (dim4096)")
                     set_metal_prefill_min_npos(1l)
                     let before8 = metal_prefill_stats().prefills
-                    let gpu8 <- continuation(tr8, prompt, 40)
+                    let gpu8 <- continuation(tr8g, tr8, prompt, 40)
                     t |> success(metal_prefill_stats().prefills - before8 > 0l, "dim-4096 prefill served on the GPU")
                     select_prefill_override("")
                     set_metal_prefill_min_npos(64l)
@@ -257,6 +291,7 @@ def test_metal_prefill_parity(t : T?) {
                     set_wscale_f16(prior_wscale)
                     t |> success(same(cpu8, gpu8), "40-token dim-4096 continuation matches the CPU control (unfused prefill set)")
                     delete tr8
+                    delete tr8g
                 }
             }
 
@@ -271,6 +306,7 @@ def test_metal_prefill_parity(t : T?) {
                 if (trq.config.seq_len > 2048l) {
                     trq.config.seq_len = 2048l
                 }
+                var trqg <- blob_twin(t, path, 2048l)
                 for (kdt in [KVDtype.q8_0, KVDtype.tq4]) {
                     var cpuq : array<int64>
                     var gpuq : array<int64>
@@ -284,7 +320,7 @@ def test_metal_prefill_parity(t : T?) {
                         select_decode_override("metal")
                         set_metal_prefill_min_npos(1l)
                         var sb = make_run_state(trq.config, kdt, kdt)
-                        let ids2 <- generate(trq, sb, prompt, length(prompt) + 24)
+                        let ids2 <- generate(trqg, sb, prompt, length(prompt) + 24)
                         gpuq := ids2
                         delete sb
                         select_prefill_override("")
@@ -299,12 +335,14 @@ def test_metal_prefill_parity(t : T?) {
                 select_kernel_backend(prior_backend)
                 set_wscale_f16(prior_wscale)
                 delete trq
+                delete trqg
             }
 
             metal_prefill_shutdown()
             metal_decode_shutdown()   // the kq uploads + the quantized-KV arm's decode steps live in the decode driver's caches
             t |> equal(metal_live_object_count(), 0l)
             delete tr
+            delete trg
         } else {
             feint("das_metal is not built on this platform; nothing to compare\n")
         }

@@ -4,6 +4,11 @@ options persistent_heap   // + explicit deletes below: each test frees its model
 
 require dastest/testing_boost public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
+
+[init]
+def private allow_cpu_prefill_intent() {
+    allow_cpu_prefill()   // CPU-correctness test — prefills on the CPU by design
+}
 require dasllama/dasllama_tokenizer
 require daslib/jobque_boost
 require daslib/fio
@@ -147,6 +152,31 @@ def test_prefill_q8(t : T?) {
             check_prefill(t, tr, long_prompt, mode)   // 200 tok trips g_attn_par_threshold (threaded arm)
         }
         clear_kernel_backend_pin()
+        delete tk
+        delete tr
+    }
+}
+
+[test]
+def test_prefill_q4_fallback(t : T?) {
+    t |> run("q4_0 prefill takes the per-token fallback and matches (needs stories15M.bin)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        if (!stat(MODEL_PATH).is_valid || !stat(TOKENIZER_PATH).is_valid) {
+            t |> skip("stories15M.bin not present")
+            return
+        }
+        // regression: the legacy per-row q4_0 tier has no batched kernels — forward_prefill must
+        // serve it via the per-token forward loop (generate()/eval() route every multi-token
+        // prompt through here), not panic
+        var tr <- load_checkpoint(MODEL_PATH)
+        quantize_weights_q4(tr)
+        var tk <- load_tokenizer(TOKENIZER_PATH, tr.config.vocab_size)
+        let prompt <- encode(tk, "Once upon a time, there was a little girl", true, false)
+        check_prefill(t, tr, prompt, AttnPrefillMode.classic)
+        check_continuation(t, tr, prompt, 4l, AttnPrefillMode.classic)
         delete tk
         delete tr
     }

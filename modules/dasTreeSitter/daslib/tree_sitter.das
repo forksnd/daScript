@@ -1,5 +1,6 @@
 options gen2
 options indenting = 4
+options no_aot   // no AOT gen exists for this module (native grammar lib is per-box) — test_aot interprets it
 
 module tree_sitter shared
 

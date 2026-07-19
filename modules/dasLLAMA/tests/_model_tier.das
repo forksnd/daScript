@@ -51,8 +51,8 @@ def arm_on(t : T?; name : string) : bool {
 }
 
 // Family filter for the model-loading suites: DASLLAMA_TEST_FAMILY = comma-separated family
-// tokens (llama, gemma, ultravox, whisper, voxtral) matched EXACTLY — not substrings, so
-// "llama" can never accidentally select a non-llama block. When set, only blocks tagged with a
+// tokens (llama, qwen2, qwen3, phi3, gemma, ultravox, whisper, voxtral) matched EXACTLY — not
+// substrings, so "llama" can never accidentally select a non-llama block. When set, only blocks tagged with a
 // listed family run; model-free blocks (kernel units, the image mechanics arm) carry no tag and
 // always run. Loud-skip contract identical to arm_on. Drive through run.das --family — the
 // profiling cadence gate: a llama-format round re-verifies the llama family only.

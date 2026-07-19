@@ -216,6 +216,28 @@ namespace das {
         }
     }
 
+    // the untracked twin: zero-copy wrap of GPU-read-only pages (the blob-only model images) —
+    // opts out of hazard tracking exactly like metal_new_buffer_untracked does for owned weights.
+    // deallocator:nil — the wrapped memory must OUTLIVE the MetalBuffer (never wrap short-lived allocations)
+    MetalBuffer * metal_new_buffer_no_copy_untracked ( MetalDevice * dev, void * data, uint64_t bytes, Context * ctx, LineInfoArg * at ) {
+        if ( !dev ) ctx->throw_error_at(at, "metal_new_buffer_no_copy_untracked: null device");
+        if ( !data ) ctx->throw_error_at(at, "metal_new_buffer_no_copy_untracked: null data");
+        if ( bytes == 0 ) ctx->throw_error_at(at, "metal_new_buffer_no_copy_untracked: zero size");
+        uint64_t page = uint64_t(getpagesize());
+        if ( (uintptr_t(data) % page) != 0 || (bytes % page) != 0 ) {
+            ctx->throw_error_at(at, "metal_new_buffer_no_copy_untracked: pointer and length must be page-aligned (%llu)",
+                (unsigned long long)page);
+        }
+        @autoreleasepool {
+            id<MTLDevice> d = (__bridge id<MTLDevice>)(void *) dev;
+            id<MTLBuffer> b = [d newBufferWithBytesNoCopy:data length:bytes
+                options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked
+                deallocator:nil];
+            if ( !b ) ctx->throw_error_at(at, "metal_new_buffer_no_copy_untracked: wrap failed (%llu bytes)", (unsigned long long)bytes);
+            return retain_handle<MetalBuffer>(b);
+        }
+    }
+
     uint64_t metal_max_buffer_length ( MetalDevice * dev, Context * ctx, LineInfoArg * at ) {
         if ( !dev ) ctx->throw_error_at(at, "metal_max_buffer_length: null device");
         id<MTLDevice> d = (__bridge id<MTLDevice>)(void *) dev;
@@ -545,6 +567,9 @@ namespace das {
                     ->args({"device", "bytes", "context", "at"});
             addExtern<DAS_BIND_FUN(metal_new_buffer_no_copy)>(*this, lib, "metal_new_buffer_no_copy",
                 SideEffects::modifyExternal, "metal_new_buffer_no_copy")
+                    ->args({"device", "data", "bytes", "context", "at"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(metal_new_buffer_no_copy_untracked)>(*this, lib, "metal_new_buffer_no_copy_untracked",
+                SideEffects::modifyExternal, "metal_new_buffer_no_copy_untracked")
                     ->args({"device", "data", "bytes", "context", "at"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(metal_max_buffer_length)>(*this, lib, "metal_max_buffer_length",
                 SideEffects::accessExternal, "metal_max_buffer_length")
