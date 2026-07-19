@@ -5778,10 +5778,10 @@ def metal_decode_init : bool {
 
 // ===== encoders =====
 
-def enc_gemv(enc : MetalComputeEncoder?; s16 : bool; bwq, bws, bx, by, bn, bd : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, s16 ? g_pso_gemv16 : g_pso_gemv)
-    metal_set_buffer(enc, bwq, 0ul, 0)
-    metal_set_buffer(enc, bws, 0ul, 1)
+def enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64; bx, by, bn, bd : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
+    metal_set_pipeline(enc, g_pso_gemv)
+    metal_set_buffer(enc, bw, boff, 0)   // half-scale view
+    metal_set_buffer(enc, bw, boff, 1)   // byte view — the same blob slice
     metal_set_buffer(enc, bx, 0ul, 2)
     metal_set_buffer(enc, by, yoff, 3)
     metal_set_buffer(enc, bn, 0ul, 4)
@@ -5793,23 +5793,25 @@ def enc_gemv(enc : MetalComputeEncoder?; s16 : bool; bwq, bws, bx, by, bn, bd : 
 // K-quant site GEMV — the per-format twin of enc_gemv over the kq plane pair
 // (kq_upload_quants + kq_upload_scales). k6 binds the scale buffer twice: the trailing packed
 // f16 d plane at byte nsb*16, the 16B sub-scale blocks at 0. Geometry: 64-thread tg, 4 rows.
-def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by, bn, bd : MetalBuffer?; rows, n : int64; yoff : uint64 = 0ul; xoff : uint64 = 0ul) {
+def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff : uint64;
+                bs : MetalBuffer?; soff, doff : uint64; bx, by, bn, bd : MetalBuffer?;
+                rows, n : int64; yoff : uint64 = 0ul; xoff : uint64 = 0ul) {
     var groups = (rows + 3l) / 4l
     if (fmt == KqFmt.k6) {
         metal_set_pipeline(enc, g_pso_kq_k6)
-        metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
+        metal_set_buffer(enc, bs, doff, 0)   // the split plane's f16 d tail
     } elif (fmt == KqFmt.k5 && (n < 3072l || rows <= 1024l)) {
         // the select-form nr0=1 twin: wins every d at n < 3072 (gemv lab, 4B round) and the
         // small-d kv shape (b2r under-occupied); 2 rows/tg instead of b2r's 4
         metal_set_pipeline(enc, g_pso_kq_k5c)
-        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bs, soff, 0)
         groups = (rows + 1l) / 2l
     } else {
         metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_k4 : g_pso_kq_k5)
-        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bs, soff, 0)
     }
-    metal_set_buffer(enc, bs, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, bs, soff, 1)
+    metal_set_buffer(enc, bq, qoff, 2)
     metal_set_buffer(enc, bx, xoff, 3)
     metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
@@ -5831,7 +5833,8 @@ def private kq_b8_on : bool {
     return g_kq_b8_mode == 1
 }
 
-def enc_kq_mvb(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by : MetalBuffer?; yoff : uint64;
+def enc_kq_mvb(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff : uint64;
+               bs : MetalBuffer?; soff, doff : uint64; bx, by : MetalBuffer?; yoff : uint64;
                bn, bd, bys, bnr : MetalBuffer?; rows, n, nlive : int64) {
     let two = nlive == 2l
     let b8 = nlive >= 5l && kq_b8_on()
@@ -5840,22 +5843,22 @@ def enc_kq_mvb(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by : MetalBu
         if (b8) {
             metal_set_threadgroup_memory_length(enc, metal_kq_mvb8_k6_msl_tgmem, 0)
         }
-        metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
+        metal_set_buffer(enc, bs, doff, 0)
     } elif (fmt == KqFmt.k5) {
         metal_set_pipeline(enc, b8 ? g_pso_kq_mvb8_k5 : (two ? g_pso_kq_mvb2_k5 : g_pso_kq_mvb4_k5))
         if (b8) {
             metal_set_threadgroup_memory_length(enc, metal_kq_mvb8_k5_msl_tgmem, 0)
         }
-        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bs, soff, 0)
     } else {
         metal_set_pipeline(enc, b8 ? g_pso_kq_mvb8_k4 : (two ? g_pso_kq_mvb2_k4 : g_pso_kq_mvb4_k4))
         if (b8) {
             metal_set_threadgroup_memory_length(enc, metal_kq_mvb8_k4_msl_tgmem, 0)
         }
-        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bs, soff, 0)
     }
-    metal_set_buffer(enc, bs, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, bs, soff, 1)
+    metal_set_buffer(enc, bq, qoff, 2)
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
@@ -5868,18 +5871,20 @@ def enc_kq_mvb(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by : MetalBu
 
 // the batched kq GEMM (B >= 9): the prefill-owned kq mul_mm twins over the padded x panel —
 // enc_gemm_mm_b's shape (grid mp/32 x rows/64, y bound at the site's column byte offset)
-def enc_kq_gemm_mm_b(enc : MetalComputeEncoder?; fmt : KqFmt; bq, bs, bx, by : MetalBuffer?; yoff : uint64; bk, bn : MetalBuffer?; mp, rows, n : int64) {
+def enc_kq_gemm_mm_b(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff : uint64;
+                     bs : MetalBuffer?; soff, doff : uint64; bx, by : MetalBuffer?; yoff : uint64;
+                     bk, bn : MetalBuffer?; mp, rows : int64) {
     if (fmt == KqFmt.k6) {
         metal_set_pipeline(enc, g_pso_kq_mm_b6)
         metal_set_threadgroup_memory_length(enc, metal_kq_mulmm_k6_msl_tgmem, 0)
-        metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
+        metal_set_buffer(enc, bs, doff, 0)
     } else {
         metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_mm_b4 : g_pso_kq_mm_b5)
         metal_set_threadgroup_memory_length(enc, fmt == KqFmt.k4 ? metal_kq_mulmm_k4_msl_tgmem : metal_kq_mulmm_k5_msl_tgmem, 0)
-        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bs, soff, 0)
     }
-    metal_set_buffer(enc, bs, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, bs, soff, 1)
+    metal_set_buffer(enc, bq, qoff, 2)
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
@@ -6027,12 +6032,16 @@ def enc_rope_store_q8(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : u
 }
 
 // the fused QKV+rope+store dispatch (2 rows per simdgroup — grid covers ddim/2 pairs)
-def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bwq, bws, bx, bq : MetalBuffer?;
-                    kmb, vmb : MetalBuffer?; koff, voff : uint64;
+def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bw : MetalBuffer?; wqoff, wkoff, wvoff : uint64;
+                    bx, bq : MetalBuffer?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
                     bcos, bsin, bn, bd, bqd, bkvd, bhs, bneox, bbias, bhasb : MetalBuffer?; d : int64) {
     metal_set_pipeline(enc, f16 ? g_pso_qkvrs16 : g_pso_qkvrs32)
-    metal_set_buffer(enc, bwq, 0ul, 0)
-    metal_set_buffer(enc, bws, 0ul, 1)
+    metal_set_buffer(enc, bw, wqoff, 0)   // q segment: byte + half views
+    metal_set_buffer(enc, bw, wqoff, 1)
+    metal_set_buffer(enc, bw, wkoff, 16)  // k segment
+    metal_set_buffer(enc, bw, wkoff, 17)
+    metal_set_buffer(enc, bw, wvoff, 18)  // v segment
+    metal_set_buffer(enc, bw, wvoff, 19)
     metal_set_buffer(enc, bx, 0ul, 2)
     metal_set_buffer(enc, bq, 0ul, 3)
     metal_set_buffer(enc, kmb, koff, 4)
@@ -6052,10 +6061,12 @@ def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bwq, bws, bx, bq : M
 }
 
 // the fused W1|W3+swiglu dispatch (2 rows per simdgroup — gate + up of one output element)
-def enc_gemv_w13sw(enc : MetalComputeEncoder?; bwq, bws, bx, bh : MetalBuffer?; bn, bhid : MetalBuffer?; hidden : int64) {
+def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off : uint64; bx, bh : MetalBuffer?; bn, bhid : MetalBuffer?; hidden : int64) {
     metal_set_pipeline(enc, g_pso_w13sw)
-    metal_set_buffer(enc, bwq, 0ul, 0)
-    metal_set_buffer(enc, bws, 0ul, 1)
+    metal_set_buffer(enc, bw, w1off, 0)   // w1: byte + half views
+    metal_set_buffer(enc, bw, w1off, 1)
+    metal_set_buffer(enc, bw, w3off, 6)   // w3 views
+    metal_set_buffer(enc, bw, w3off, 7)
     metal_set_buffer(enc, bx, 0ul, 2)
     metal_set_buffer(enc, bh, 0ul, 3)
     metal_set_buffer(enc, bn, 0ul, 4)
@@ -6082,10 +6093,10 @@ def enc_copy_row(enc : MetalComputeEncoder?; bsrc : MetalBuffer?; soff : uint64;
     metal_dispatch_threadgroups(enc, uint3(uint((n + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
-def enc_embed(enc : MetalComputeEncoder?; s16 : bool; bq, bs, btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
-    metal_set_pipeline(enc, s16 ? g_pso_emb16 : g_pso_emb)
-    metal_set_buffer(enc, bq, 0ul, 0)
-    metal_set_buffer(enc, bs, 0ul, 1)
+def enc_embed(enc : MetalComputeEncoder?; bw : MetalBuffer?; eoff : uint64; btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
+    metal_set_pipeline(enc, g_pso_emb)
+    metal_set_buffer(enc, bw, eoff, 0)   // byte view of the embed blob slice
+    metal_set_buffer(enc, bw, eoff, 1)   // half-scale view
     metal_set_buffer(enc, btok, 0ul, 2)
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, bdim, 0ul, 4)
@@ -6093,13 +6104,13 @@ def enc_embed(enc : MetalComputeEncoder?; s16 : bool; bq, bs, btok, bx, bdim, be
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
-// the tied-k6 spec embed gather: the scale buffer binds twice (f16 d plane @nsb*16 halfwords +
-// sub-scale byte blocks @0), the quant plane once — nsb = the plane's TOTAL superblock count
-def enc_embed_k6(enc : MetalComputeEncoder?; bq, bs, btok, bx, bdim, bescale : MetalBuffer?; dim, nsb : int64) {
+// the tied-k6 spec embed gather: the scale buffer binds twice (f16 d plane @doff + sub-scale
+// strips @soff — kq_scales_of's whole-plane offsets), the quant plane once @qoff
+def enc_embed_k6(enc : MetalComputeEncoder?; bq : MetalBuffer?; qoff : uint64; bs : MetalBuffer?; soff, doff : uint64; btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
     metal_set_pipeline(enc, g_pso_emb_k6)
-    metal_set_buffer(enc, bs, uint64(nsb * 16l), 0)
-    metal_set_buffer(enc, bs, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, bs, doff, 0)
+    metal_set_buffer(enc, bs, soff, 1)
+    metal_set_buffer(enc, bq, qoff, 2)
     metal_set_buffer(enc, btok, 0ul, 3)
     metal_set_buffer(enc, bx, 0ul, 4)
     metal_set_buffer(enc, bdim, 0ul, 5)
@@ -6292,32 +6303,32 @@ def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalB
 
 // ===== the batched-step encoders (P4) =====
 
-// fixed-B batched GEMV: B2 form serves B <= 2, B4 serves 3..4 (pad streams read stale rows,
-// never consumed). Geometry pinned at 4 rows/tg with 128 threads baked in (g_gemv_rows knob
-// stays single-stream-only).
-def enc_gemv_b(enc : MetalComputeEncoder?; four : bool; bwq : MetalBuffer?; wqoff : uint64;
-               bws : MetalBuffer?; wsoff : uint64; bx, by, bn, bd, bs16 : MetalBuffer?; d : int64) {
+// fixed-B batched GEMV (the B2 form serves B <= 2, B4 serves 3..4 — pad streams read stale rows,
+// whose outputs are never consumed); the blob slice binds through both views at the tensor's
+// byte offset. Geometry pinned at 4 rows/tg — the x-staged cooperative-load slot math bakes
+// 128 threads in (the g_gemv_rows knob stays single-stream-only).
+def enc_gemv_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; boff : uint64;
+               bx, by, bn, bd : MetalBuffer?; d : int64) {
     metal_set_pipeline(enc, four ? g_pso_gemv_b4 : g_pso_gemv_b2)
     metal_set_threadgroup_memory_length(enc, four ? metal_gemv_b4_msl_tgmem : metal_gemv_b2_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, wqoff, 0)
-    metal_set_buffer(enc, bws, wsoff, 1)
-    metal_set_buffer(enc, bws, wsoff, 2)
+    metal_set_buffer(enc, bw, boff, 0)   // byte view
+    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, 0ul, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bd, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((d + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the mul_mv-shape fixed-B GEMV on an interleaved 34B blob (dual views of the SAME buffer);
 // bxs = x row stride in float4s; bnr = the nrows uniform, four-form only; xoff/yoff = the
 // column-tile byte offsets (B > 4 streams the weights once per 4-column tile)
-def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob, bx, by, bn, bd, bxs : MetalBuffer?; d : int64;
+def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob : MetalBuffer?; wboff : uint64;
+             bx, by, bn, bd, bxs : MetalBuffer?; d : int64;
              bnr : MetalBuffer? = null; xoff : uint64 = 0ul; yoff : uint64 = 0ul) {
     metal_set_pipeline(enc, four ? g_pso_mv_b4 : g_pso_mv_b2)
-    metal_set_buffer(enc, bwblob, 0ul, 0)
-    metal_set_buffer(enc, bwblob, 0ul, 1)
+    metal_set_buffer(enc, bwblob, wboff, 0)
+    metal_set_buffer(enc, bwblob, wboff, 1)
     metal_set_buffer(enc, bx, xoff, 2)
     metal_set_buffer(enc, by, yoff, 3)
     metal_set_buffer(enc, bn, 0ul, 4)
@@ -6335,43 +6346,45 @@ def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob, bx, by, bn, bd, bx
 // one mv GEMV site: a single form dispatch at B <= 4, two 4-column tiles at B = 5..8 (the
 // reference's own shape — it never switches to GEMM below B = 9; the weights stream twice but
 // stay the fast skinny form). xrowb = the x row stride in bytes; bnr/bnr2 = per-tile nrows.
-def enc_mv_site(enc : MetalComputeEncoder?; bwblob, bx, by, bn, bd, bxs : MetalBuffer?;
+def enc_mv_site(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wboff : uint64;
+                bx, by, bn, bd, bxs : MetalBuffer?;
                 d, nrows : int64; xrowb : uint64; bnr, bnr2 : MetalBuffer?) {
-    enc_mv_b(enc, nrows > 2l, bwblob, bx, by, bn, bd, bxs, d, bnr)
+    enc_mv_b(enc, nrows > 2l, bwblob, wboff, bx, by, bn, bd, bxs, d, bnr)
     if (nrows > 4l) {
         // the rows-5..8 dispatch offsets y by 4 * d — valid only while d == the y row stride
         // (bd). The one d != stride site (the no-wv QKV cat) can't reach here: mv8 gates
         // dim <= 3072 and no-wv exists only on gemma4 (dim 3840)
-        enc_mv_b(enc, true, bwblob, bx, by, bn, bd, bxs, d, bnr2, 4ul * xrowb, uint64(4l * d * 4l))
+        enc_mv_b(enc, true, bwblob, wboff, bx, by, bn, bd, bxs, d, bnr2, 4ul * xrowb, uint64(4l * d * 4l))
     }
 }
 
-// fused fixed-B W1|W3 GEMV + swiglu — bwq/bws are the cat W1|W3 region at offset 0 (up rows sit
-// at +hidden internally), by is the [B x hidden] swiglu output. Replaces the w1 + w3 GEMVs + the
-// swiglu ew2 with one dispatch. Same 4-rows/tg geometry, gridded over the hidden output rows.
-def enc_gemv_w13sw_b(enc : MetalComputeEncoder?; four : bool; bwq, bws, bx, by, bn, bhid, bs16 : MetalBuffer?; hidden : int64) {
+// fused fixed-B W1|W3 GEMV + swiglu — the w1 and w3 blob slices bind separately (kind-major
+// layout), by is the [B x hidden] swiglu output. Replaces the w1 + w3 GEMVs + the swiglu ew2
+// with one dispatch. Same 4-rows/tg geometry, gridded over the hidden output rows.
+def enc_gemv_w13sw_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; w1off, w3off : uint64;
+                     bx, by, bn, bhid : MetalBuffer?; hidden : int64) {
     metal_set_pipeline(enc, four ? g_pso_w13sw_b4 : g_pso_w13sw_b2)
     metal_set_threadgroup_memory_length(enc, four ? metal_gemv_w13sw_b4_msl_tgmem : metal_gemv_w13sw_b2_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, 0ul, 0)
-    metal_set_buffer(enc, bws, 0ul, 1)
-    metal_set_buffer(enc, bws, 0ul, 2)
+    metal_set_buffer(enc, bw, w1off, 0)   // w1: byte view
+    metal_set_buffer(enc, bw, w1off, 2)   // w1: half-scale view
+    metal_set_buffer(enc, bw, w3off, 8)   // w3: byte view
+    metal_set_buffer(enc, bw, w3off, 9)   // w3: half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, 0ul, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bhid, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the production mul_mm dispatch (the prefill kernel: 34B-blob dual-view W, raw f32 X): y binds
 // at a byte offset so per-tensor tiles land inside a wider fused row — the ndim uniform is the
 // y ROW STRIDE while this tensor's output width d shapes the grid (d % 64 == 0, mp % 32 == 0)
-def enc_gemm_mm_b(enc : MetalComputeEncoder?; bwblob, bx, by : MetalBuffer?; yoff : uint64;
-                  bk, bn : MetalBuffer?; mp, d : int64) {
+def enc_gemm_mm_b(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wboff : uint64;
+                  bx, by : MetalBuffer?; yoff : uint64; bk, bn : MetalBuffer?; mp, d : int64) {
     metal_set_pipeline(enc, g_pso_mm)
     metal_set_threadgroup_memory_length(enc, metal_q8_mulmm_msl_tgmem, 0)
-    metal_set_buffer(enc, bwblob, 0ul, 0)
-    metal_set_buffer(enc, bwblob, 0ul, 1)
+    metal_set_buffer(enc, bwblob, wboff, 0)
+    metal_set_buffer(enc, bwblob, wboff, 1)
     metal_set_buffer(enc, bx, 0ul, 2)
     metal_set_buffer(enc, by, yoff, 3)
     metal_set_buffer(enc, bk, 0ul, 4)
@@ -6379,37 +6392,33 @@ def enc_gemm_mm_b(enc : MetalComputeEncoder?; bwblob, bx, by : MetalBuffer?; yof
     metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(d / 64l), 1u), uint3(128u, 1u, 1u))
 }
 
-// the M-pad-32 GEMM (B >= 5): raw f32 X, dual-view W scales
-def enc_gemm_b(enc : MetalComputeEncoder?; bwq : MetalBuffer?; wqoff : uint64;
-               bws : MetalBuffer?; wsoff : uint64; bx, by, bk, bn, bs16 : MetalBuffer?; mp32, d : int64) {
+// the M-pad-32 GEMM (B >= 5): raw f32 X, dual-view blob W at the tensor's byte offset
+def enc_gemm_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
+               bx, by, bk, bn : MetalBuffer?; mp32, d : int64) {
     metal_set_pipeline(enc, g_pso_gemm_b)
     metal_set_threadgroup_memory_length(enc, metal_q8_gemm_b_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, wqoff, 0)
-    metal_set_buffer(enc, bws, wsoff, 1)
-    metal_set_buffer(enc, bws, wsoff, 2)
+    metal_set_buffer(enc, bw, boff, 0)   // byte view
+    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, 0ul, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
     metal_set_buffer(enc, bn, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((mp32 / 32l) * (d / 32l)), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the split-K pair (per-site policy): the GEMM's grid.y is the k-slice axis, partial planes land
 // in bpart, and the reduce sums them into y — the serial encoder orders the two dispatches.
 // Planes and grids assume mp == 32 (the policy gate).
-def enc_gemm_sk_b(enc : MetalComputeEncoder?; bwq : MetalBuffer?; wqoff : uint64;
-                  bws : MetalBuffer?; wsoff : uint64; bx, bpart, bk, bn, bs16, bsk : MetalBuffer?; d, nsk : int64) {
+def enc_gemm_sk_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
+                  bx, bpart, bk, bn, bsk : MetalBuffer?; d, nsk : int64) {
     metal_set_pipeline(enc, g_pso_gemm_b_sk)
     metal_set_threadgroup_memory_length(enc, metal_q8_gemm_b_sk_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, wqoff, 0)
-    metal_set_buffer(enc, bws, wsoff, 1)
-    metal_set_buffer(enc, bws, wsoff, 2)
+    metal_set_buffer(enc, bw, boff, 0)   // byte view
+    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, bpart, 0ul, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
     metal_set_buffer(enc, bn, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
     metal_set_buffer(enc, bsk, 0ul, 8)
     metal_dispatch_threadgroups(enc, uint3(uint(d / 32l), uint(nsk), 1u), uint3(128u, 1u, 1u))
 }
@@ -6424,18 +6433,16 @@ def enc_sk_reduce_b(enc : MetalComputeEncoder?; bpart, by, btot, bsk : MetalBuff
 }
 
 // the 64-wide N tile (classifier site): the caller gates d % 64 == 0
-def enc_gemm64_b(enc : MetalComputeEncoder?; bwq : MetalBuffer?; wqoff : uint64;
-                 bws : MetalBuffer?; wsoff : uint64; bx, by, bk, bn, bs16 : MetalBuffer?; mp32, d : int64) {
+def enc_gemm64_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
+                 bx, by, bk, bn : MetalBuffer?; mp32, d : int64) {
     metal_set_pipeline(enc, g_pso_gemm64_b)
     metal_set_threadgroup_memory_length(enc, metal_q8_gemm64_b_msl_tgmem, 0)
-    metal_set_buffer(enc, bwq, wqoff, 0)
-    metal_set_buffer(enc, bws, wsoff, 1)
-    metal_set_buffer(enc, bws, wsoff, 2)
+    metal_set_buffer(enc, bw, boff, 0)   // byte view
+    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, 0ul, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
     metal_set_buffer(enc, bn, 0ul, 6)
-    metal_set_buffer(enc, bs16, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((mp32 / 32l) * (d / 64l)), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
