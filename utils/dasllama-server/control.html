@@ -1098,6 +1098,7 @@ const FIELDS = [
     { k: "asr_workers", t: "int" },
 ];
 let cfgSurface = null;
+let savedSnapshot = "";   // JSON of the last rendered/saved form — restart guards against unsaved edits
 
 function renderForm(surface, status) {
     const cfg = surface.config, src = surface.sources || {};
@@ -1169,6 +1170,7 @@ function renderForm(surface, status) {
     $("cfg-file").textContent =
         "saves to " + surface.save_path + (surface.authoritative ? " · authoritative (overrides CLI flags)" : "") +
         (status.dlim_rail ? " · serving from the prepared .dlim image" : "");
+    savedSnapshot = JSON.stringify(gatherConfig());
 }
 
 function renderGpu(status) {
@@ -1216,27 +1218,46 @@ function gatherConfig() {
     return out;
 }
 
-$("b-save").addEventListener("click", async () => {
-    $("b-save").disabled = true;
+async function saveConfig() {
+    const body = JSON.stringify(gatherConfig());
     try {
         const r = await fetch("/config", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(gatherConfig()),
+            body,
         });
-        const body = await r.json();
-        $("cfg-note").textContent = r.ok
-            ? "saved — restart to apply"
-            : "save failed: " + (body.error ? body.error.message : r.status);
+        const resp = await r.json();
+        if (!r.ok) {
+            $("cfg-note").textContent = "save failed: " + (resp.error ? resp.error.message : r.status);
+            return false;
+        }
+        savedSnapshot = body;
+        $("cfg-note").textContent = "saved — restart to apply";
+        return true;
     } catch (_e) {
         $("cfg-note").textContent = "save failed — server unreachable";
+        return false;
     }
+}
+
+$("b-save").addEventListener("click", async () => {
+    $("b-save").disabled = true;
+    await saveConfig();
     $("b-save").disabled = false;
 });
 
 $("b-restart").addEventListener("click", async () => {
-    if (!window.confirm("Drain accepted work and restart with the saved config?\n(needs the watchdog running — exit code 4 relaunches)")) return;
+    // a restart with unsaved edits silently discarding them is exactly the trap — save first
+    const dirty = JSON.stringify(gatherConfig()) !== savedSnapshot;
+    const msg = dirty
+        ? "Save the edited config, then drain and restart with it?\n(needs the watchdog running — exit code 4 relaunches)"
+        : "Drain accepted work and restart with the saved config?\n(needs the watchdog running — exit code 4 relaunches)";
+    if (!window.confirm(msg)) return;
     $("b-restart").disabled = true;
+    if (dirty && !(await saveConfig())) {
+        $("b-restart").disabled = false;   // save failed — the note says why; nothing restarted
+        return;
+    }
     try {
         await fetch("/restart", { method: "POST" });
         $("cfg-note").textContent = "draining, then restarting — the page reloads when the server is back";

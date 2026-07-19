@@ -66,7 +66,8 @@ struct private StreamWire {
 
 var g_wires : table<int64; StreamWire>
 var g_default_max_new = 256l
-var private g_started_at = 0l   // created_ts() at init_server; /v1/stats reports uptime_s from it
+var private g_started_at = 0l   // ref_time_ticks at init_server; /v1/stats derives uptime_s from it
+                                // (created_ts is a per-request monotone stand-in, NOT a clock)
 
 //! Move a loaded model into the server (call once, before run_server). ``name`` is the id reported
 //! by ``/v1/models`` and echoed back in responses.
@@ -1288,7 +1289,7 @@ struct private OaiStatsResponse {
 def private handle_stats(var resp : HttpResponse?) : http_status {
     let out = OaiStatsResponse(
         model = g_model_name, ctx = g_model.config.seq_len,
-        uptime_s = g_started_at > 0l ? created_ts() - g_started_at : 0l,
+        uptime_s = g_started_at > 0l ? get_time_nsec(g_started_at) / 1_000_000_000l : 0l,
         draining = g_shutdown_requested,
         active = n_active(g_sched), queued = n_queued(g_sched), peak_active = g_sched.peak_active,
         admitted = g_sched.n_admitted, finished = g_sched.n_finished, evicted = g_sched.n_evicted,
@@ -2015,7 +2016,7 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
         return false
     }
     g_server_started = true
-    g_started_at = created_ts()
+    g_started_at = ref_time_ticks()
     compose_hardware_line()
     let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
     let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
