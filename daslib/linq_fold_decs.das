@@ -926,7 +926,7 @@ def compute_decs_chain_info(var calls : array<tuple<ExprCall?; LinqCall?>>;
             curType = clone_type(peeled._type)
         } elif (opName != "where_") return null
     }
-    info.finalBind := curBind
+    info.finalBind = curBind
     info.finalType = curType
     if (info.finalType != null) {
         info.finalType.flags.constant = false

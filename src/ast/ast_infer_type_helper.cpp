@@ -1296,6 +1296,15 @@ namespace das {
         c2m->arguments.push_back(var->init);
         return c2m;
     }
+
+    ExpressionPtr InferTypes::promoteStringInitToClone(const VariablePtr &var) {
+        reportAstChanged();
+        var->init_via_clone = false;
+        var->init_via_move = false;
+        auto cloneString = new ExprCall(var->at, "clone_string");
+        cloneString->arguments.push_back(var->init);
+        return cloneString;
+    }
     bool InferTypes::canRelaxAssign(Expression *init) const {
         if (!relaxedAssign)
             return false;

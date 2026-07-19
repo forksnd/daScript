@@ -260,22 +260,22 @@ class PerfLintVisitor : AstVisitor {
         if (expr is ExprRef2Value) return find_expr_path((expr as ExprRef2Value.subexpr), path)
         if (expr is ExprField) {
             var field = expr as ExprField
-            path := ".{field.name}{path}"
+            path = ".{field.name}{path}"
             return find_expr_path(field.value, path)
         }
         if (expr is ExprSafeField) {
             var field = expr as ExprSafeField
-            path := ".{field.name}{path}"
+            path = ".{field.name}{path}"
             return find_expr_path(field.value, path)
         }
         if (expr is ExprAt) {
             var at = expr as ExprAt
-            path := "[*]{path}"
+            path = "[*]{path}"
             return find_expr_path(at.subexpr, path)
         }
         if (expr is ExprSafeAt) {
             var at = expr as ExprSafeAt
-            path := "[*]{path}"
+            path = "[*]{path}"
             return find_expr_path(at.subexpr, path)
         }
         if (expr is ExprSwizzle) {

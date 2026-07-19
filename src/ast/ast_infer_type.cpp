@@ -524,6 +524,9 @@ namespace das {
                       var->at, CompilationError::invalid_global_init_type);
             } else {
                 varT->ref = false;
+                if (var->init_via_clone && varT->isString()) {
+                    varT->temporary = false;
+                }
                 TypeDecl::applyAutoContracts(varT, var->type);
                 if (!relaxedPointerConst) { // var a = Foo? const -> var a : Foo const? = Foo? const
                     if (varT->isPointer() && !varT->constant && var->init->type->constant && varT->firstType) {
@@ -577,7 +580,9 @@ namespace das {
             }
         } else {
             if (var->init_via_clone) {
-                if (var->init->type->isWorkhorseType()) {
+                if (var->init->type->isString() && (var->init->type->isTemp() || multiContext)) {
+                    return promoteStringInitToClone(var);
+                } else if (var->init->type->isWorkhorseType()) {
                     var->init_via_clone = false;
                     var->init_via_move = false;
                     reportAstChanged();
@@ -5452,6 +5457,9 @@ namespace das {
                       var->at, CompilationError::invalid_local_init_type);
             } else {
                 varT->ref = false;
+                if (var->init_via_clone && varT->isString()) {
+                    varT->temporary = false;
+                }
                 TypeDecl::applyAutoContracts(varT, var->type);
                 if (!relaxedPointerConst) { // var a = Foo? const -> var a : Foo const? = Foo? const
                     if (varT->isPointer() && varT->firstType && !varT->constant && var->init->type->constant) {
@@ -5515,7 +5523,9 @@ namespace das {
             }
         } else {
             if (var->init_via_clone) {
-                if (var->init->type->isWorkhorseType()) {
+                if (var->init->type->isString() && (var->init->type->isTemp() || multiContext)) {
+                    return promoteStringInitToClone(var);
+                } else if (var->init->type->isWorkhorseType()) {
                     var->init_via_clone = false;
                     var->init_via_move = false;
                     reportAstChanged();

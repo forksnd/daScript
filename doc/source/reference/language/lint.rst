@@ -559,6 +559,41 @@ and unary, so a split binary ``a + b`` orphans as a valid unary statement.
 
 Wrap any multi-line arithmetic RHS in ``(...)``.
 
+LINT016 — ineffective string clone syntax
+===========================================
+
+In the default single-context mode, copying a regular ``string`` only copies
+its pointer. Consequently,
+``dst := src``, ``var dst := src``, and ``strings |> push_clone(src)`` do not
+clone the character data when ``src`` is an ordinary ``string``; their clone
+spelling is misleading.
+
+Use ordinary copy syntax for same-context storage, and make a cross-context
+copy explicit with ``clone_string`` in the receiving context:
+
+.. code-block:: das
+
+    dst = src
+    var local = src
+    strings |> push(src)
+
+    dst = clone_string(src)
+    var local_copy = clone_string(src)
+    strings |> push(clone_string(src))
+
+The rule stays silent in two cases where clone syntax has real semantics:
+
+* ``options multiple_contexts`` is enabled. The compiler then lowers string
+  ``:=`` — including variable initialization and the assignment inside
+  ``push_clone`` — to ``clone_string``.
+* The source expression has temporary type ``string#``. A real clone is
+  required to retain the borrowed characters beyond the temporary's lifetime,
+  and the compiler inserts it automatically.
+
+Only user-written, non-generated code is reported. Generic templates and their
+instantiated functions are skipped; a direct call from ordinary user code is
+still checked.
+
 .. _perf_lint:
 
 -----------------

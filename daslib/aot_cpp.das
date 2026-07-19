@@ -1021,12 +1021,12 @@ class public AotDebugInfoHelper {
             let bits = uint64(val.value)
             var cppLit : string
             if (bits == 0x8000000000000000ul) {
-                cppLit := "(-INT64_C(0x7fffffffffffffff) - INT64_C(1))"
+                cppLit = "(-INT64_C(0x7fffffffffffffff) - INT64_C(1))"
             } elif (val.value < 0l) {
                 let absBits = uint64(-val.value)
-                cppLit := "-INT64_C(0x{absBits:x})"
+                cppLit = "-INT64_C(0x{absBits:x})"
             } else {
-                cppLit := "INT64_C(0x{bits:x})"
+                cppLit = "INT64_C(0x{bits:x})"
             }
             write(*writer, "EnumValueInfo {enumInfoName(einfo)}_value_{v} = \{ \"{val.name}\", {cppLit} \};\n")
         }
