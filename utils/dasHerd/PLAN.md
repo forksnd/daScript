@@ -24,6 +24,9 @@ unambiguous and reliable.
   and UTF-8 byte or line range. Screen coordinates are never persisted.
 - Direct editing starts with the PR body in Markdown. Code views are initially
   read-only, selectable, and addressable.
+- Accessibility is a default, not a preference hidden in settings: terminal
+  text starts at 150%, exposes a visible 50-300% zoom control plus Ctrl+wheel,
+  and the desktop shell opens maximized.
 
 ## First vertical slice: terminal
 
@@ -313,3 +316,5 @@ Continue T1 from the working local terminal:
 - 2026-07-18: Gate terminal UI automation on observable geometry, focus,
   input/content revisions, and semantic screen text; never use frame counts or
   sleeps as interaction-success criteria.
+- 2026-07-18: Default dasHerd terminal typography to 150% with visible zoom and
+  Ctrl+wheel, and maximize the desktop terminal shell on launch.
