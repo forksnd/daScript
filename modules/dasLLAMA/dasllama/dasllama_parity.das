@@ -4,6 +4,7 @@ module dasllama_parity shared public
 
 require daslib/fio
 require daslib/strings_boost
+require daslib/strings_convert
 require strings
 require math
 
@@ -51,7 +52,12 @@ def load_ref_ids(path : string; var ids : array<int64>) : bool {
         for (line in split(fread(f), "\n")) {
             if (line |> starts_with("ids")) {
                 for (tk in split_by_chars(slice(line, 4), " ")) {
-                    ids |> push(to_int64(tk))
+                    let parsed = try_to_int64(tk)
+                    if (is_err(parsed)) {   // corrupt/truncated cache — reject it whole, the caller recomputes+resaves
+                        ids |> clear()
+                        return
+                    }
+                    ids |> push(unwrap(parsed))
                 }
             }
         }
@@ -95,7 +101,12 @@ def load_ref_vals(path : string; var vals : array<float>) : bool {
         for (line in split(fread(f), "\n")) {
             if (line |> starts_with("vals")) {
                 for (tk in split_by_chars(slice(line, 5), " ")) {
-                    vals |> push(to_float(tk))
+                    let parsed = try_to_float(tk)
+                    if (is_err(parsed)) {   // corrupt/truncated cache — reject it whole, the caller recomputes+resaves
+                        vals |> clear()
+                        return
+                    }
+                    vals |> push(unwrap(parsed))
                 }
             }
         }
