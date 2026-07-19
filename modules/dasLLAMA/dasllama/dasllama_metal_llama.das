@@ -1296,10 +1296,12 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     let mp = use_gemm ? ((nrows + 31l) / 32l) * 32l : (nrows <= 2l ? 2l : nrows <= 4l ? 4l : 8l)
     // the per-site GEMM policy (see g_bsk): each split-K site gates on its OWN K's nkb % S == 0
     // (and the partial planes assume mp == 32); an ineligible site stays on the planar v2.
-    // Hetero stands the sk sites down (the u_skt totals and u_qd k-dims bake one class)
-    let sk_ok = use_gemm && !use_mm && g_bsk && mp == 32l && !hetero
+    // Hetero serves via per-class twins: wo's k-dim rides the per-layer u_qd_l, qkv's reduce
+    // stride rides the u_skt_qkv/_sw pair; w2's dims are layer-uniform. The wo gate must hold
+    // for BOTH classes' qd.
+    let sk_ok = use_gemm && !use_mm && g_bsk && mp == 32l
     let qkv_sk = (sk_ok && (dim / 32l) % 2l == 0l) ? 2l : 0l
-    let wo_sk = (sk_ok && (qd / 32l) % 4l == 0l) ? 4l : 0l
+    let wo_sk = (sk_ok && (qd / 32l) % 4l == 0l && (!hetero || (qd_sw / 32l) % 4l == 0l)) ? 4l : 0l
     let w2_sk = (sk_ok && (hidden / 32l) % 8l == 0l) ? 8l : 0l
     let cls64 = use_gemm && !use_mm && g_bsk && (c.vocab_size % 64l) == 0l
     // the mul_mv rail owns the whole fixed-B path (w13 = two mv dispatches + the ew2 swiglu, so
@@ -1351,7 +1353,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     // w2's S8 x 32 x dim is 3MB at 3B); sites run serially, so reuse is free
     var bytes_sk = 0ul
     if (qkv_sk > 0l) {
-        bytes_sk = uint64(qkv_sk * 32l * qkvd * 4l)
+        bytes_sk = uint64(qkv_sk * 32l * qkvd_mx * 4l)   // hetero: sized for the wider class
     }
     if (wo_sk > 0l) {
         bytes_sk = max(bytes_sk, uint64(wo_sk * 32l * dim * 4l))
@@ -1437,6 +1439,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     var u_sk_wo = wo_sk > 0l ? uniform_u32(uint(wo_sk)) : null
     var u_sk_w2 = w2_sk > 0l ? uniform_u32(uint(w2_sk)) : null
     var u_skt_qkv = qkv_sk > 0l ? uniform_u32(uint(32l * qkvd)) : null
+    var u_skt_qkv_sw = (qkv_sk > 0l && hetero) ? uniform_u32(uint(32l * qkvd_sw)) : null   // the sliding class's reduce stride
     var u_skt_dim = (wo_sk > 0l || w2_sk > 0l) ? uniform_u32(uint(32l * dim)) : null
     // the batch kernels' `lay` = the layer's KV-row PREFIX (elements; row BYTES for block
     // codecs) — slab base = rrow.base + lay * cap. Uniform models compute the old
@@ -1550,7 +1553,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                         bar_dep(enc, haz, HZ_BXB, HZ_BPSK)
                         enc_gemm_sk_b(enc, bwqkv, 0ul, bwqkv_s, 0ul, bxb, bpsk, u_dim, u_qkd, u_s16, u_sk_qkv, qkd, qkv_sk)
                         bar_dep(enc, haz, HZ_BPSK, HZ_BQKV)
-                        enc_sk_reduce_b(enc, bpsk, bqkv, u_skt_qkv, u_sk_qkv, 32l * qkd)
+                        enc_sk_reduce_b(enc, bpsk, bqkv, het ? u_skt_qkv_sw : u_skt_qkv, u_sk_qkv, 32l * qkd)
                     } elif (use_gemm) {
                         bar_dep(enc, haz, HZ_BXB, HZ_BQKV)
                         enc_gemm_b(enc, bwqkv, 0ul, bwqkv_s, 0ul, bxb, bqkv, u_dim, u_qkd, u_s16, mp, qkd)
@@ -1687,7 +1690,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     var bwo_s = upload_scales(t, t.wo_offs[l], dim, qd_l)
                     if (wo_sk > 0l) {
                         bar_dep(enc, haz, HZ_BXB, HZ_BPSK)
-                        enc_gemm_sk_b(enc, bwo, 0ul, bwo_s, 0ul, bxb, bpsk, u_qd, u_dim, u_s16, u_sk_wo, dim, wo_sk)
+                        enc_gemm_sk_b(enc, bwo, 0ul, bwo_s, 0ul, bxb, bpsk, u_qd_l, u_dim, u_s16, u_sk_wo, dim, wo_sk)
                         bar_dep(enc, haz, HZ_BPSK, HZ_BXB2)
                         enc_sk_reduce_b(enc, bpsk, bxb2, u_skt_dim, u_sk_wo, 32l * dim)
                     } elif (use_gemm) {
@@ -1976,6 +1979,9 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     if (qkv_sk > 0l) {
         g_lp_upooled |> push((buf = u_sk_qkv, size = 4ul))
         g_lp_upooled |> push((buf = u_skt_qkv, size = 4ul))
+        if (u_skt_qkv_sw != null) {
+            g_lp_upooled |> push((buf = u_skt_qkv_sw, size = 4ul))
+        }
     }
     if (wo_sk > 0l) {
         g_lp_upooled |> push((buf = u_sk_wo, size = 4ul))
