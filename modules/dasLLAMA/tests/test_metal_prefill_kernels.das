@@ -756,6 +756,7 @@ def private moe_router_gate(t : T?; dev, queue; n, ne : int) {
     var bn = buf_u32(dev, uint(n))
     var bd = buf_u32(dev, uint(ne))
     var bxs = buf_u32(dev, uint(n))   // per-stream x stride (one stream here)
+    var bhb0 = buf_u32(dev, 0u)       // router bias off (identity)
     let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso)
         metal_set_buffer(enc, bw, 0ul, 0)
@@ -764,6 +765,8 @@ def private moe_router_gate(t : T?; dev, queue; n, ne : int) {
         metal_set_buffer(enc, bn, 0ul, 3)
         metal_set_buffer(enc, bd, 0ul, 4)
         metal_set_buffer(enc, bxs, 0ul, 5)
+        metal_set_buffer(enc, bhb0, 0ul, 6)
+        metal_set_buffer(enc, bhb0, 0ul, 7)
         metal_dispatch_threadgroups(enc, uint3(uint((ne + 3) / 4), 1u, 1u), uint3(128u, 1u, 1u))
     }
     t |> success(ran, "moe router dispatch n={n} ne={ne}: {err}")
@@ -774,6 +777,7 @@ def private moe_router_gate(t : T?; dev, queue; n, ne : int) {
     metal_release(bn)
     metal_release(bd)
     metal_release(bxs)
+    metal_release(bhb0)
     metal_release(pso)
     delete w
     delete xv

@@ -6137,8 +6137,9 @@ def enc_embed_k6(enc : MetalComputeEncoder?; bq : MetalBuffer?; qoff : uint64; b
 
 // ===== MoE routing encoders (Wave C) =====
 
-// nst = streams (grid.y; the batch's live rows — single decode passes 1)
-def enc_moe_router(enc : MetalComputeEncoder?; bw, bx, by, bn, bd, bxs : MetalBuffer?; ne, nst : int64) {
+// nst = streams (grid.y; the batch's live rows — single decode passes 1); brb/bhasb = the
+// optional router bias row (gpt-oss; identity = g_one + a zero uniform)
+def enc_moe_router(enc : MetalComputeEncoder?; bw, bx, by, bn, bd, bxs, brb, bhasb : MetalBuffer?; ne, nst : int64) {
     metal_set_pipeline(enc, g_pso_moe_router)
     metal_set_buffer(enc, bw, 0ul, 0)
     metal_set_buffer(enc, bx, 0ul, 1)
@@ -6146,6 +6147,8 @@ def enc_moe_router(enc : MetalComputeEncoder?; bw, bx, by, bn, bd, bxs : MetalBu
     metal_set_buffer(enc, bn, 0ul, 3)
     metal_set_buffer(enc, bd, 0ul, 4)
     metal_set_buffer(enc, bxs, 0ul, 5)
+    metal_set_buffer(enc, brb, 0ul, 6)
+    metal_set_buffer(enc, bhasb, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((ne + g_gemv_rows - 1l) / g_gemv_rows), uint(nst), 1u), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
 }
 

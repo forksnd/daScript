@@ -674,9 +674,9 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     if (g4) {
                         var bw_rs = upload_region(addr < void? >(t.fblob[t.moe_router_scale_off + l * dim]), uint64(dim * 4l))
                         enc_g4_router_norm(enc, r.bx, bw_rs, r.bmoe_rt, r.u_dim, r.u_eps, r.u_moe_invd, 1l)
-                        enc_moe_router(enc, bw_rt, r.bmoe_rt, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, c.n_expert, 1l)
+                        enc_moe_router(enc, bw_rt, r.bmoe_rt, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, g_one, r.u_zero32, c.n_expert, 1l)
                     } else {
-                        enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, c.n_expert, 1l)
+                        enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, g_one, r.u_zero32, c.n_expert, 1l)
                     }
                     enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_zero32, 1l)
                     if (g4) {
@@ -1863,10 +1863,10 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     bar_dep(enc, haz, HZ_BX, HZ_BMRT)
                     enc_g4_router_norm(enc, bx, bw_rs, bmg4rt, u_dim, u_eps, u_moe_invd, nrows)
                     bar_dep(enc, haz, HZ_BMRT, HZ_BMLG)
-                    enc_moe_router(enc, bw_rt, bmg4rt, bmlg, u_dim, u_moe_ne, u_dim, c.n_expert, nrows)
+                    enc_moe_router(enc, bw_rt, bmg4rt, bmlg, u_dim, u_moe_ne, u_dim, g_one, u_zero32, c.n_expert, nrows)
                 } else {
                     bar_dep(enc, haz, HZ_BXB, HZ_BMLG)
-                    enc_moe_router(enc, bw_rt, bxb, bmlg, u_dim, u_moe_ne, u_dim, c.n_expert, nrows)
+                    enc_moe_router(enc, bw_rt, bxb, bmlg, u_dim, u_moe_ne, u_dim, g_one, u_zero32, c.n_expert, nrows)
                 }
                 bar_dep(enc, haz, HZ_BMLG, HZ_BMSEL)
                 enc_moe_select(enc, bmlg, bmsel, u_moe_ne, u_moe_k, u_zero32, nrows)

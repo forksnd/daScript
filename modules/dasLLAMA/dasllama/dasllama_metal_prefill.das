@@ -4104,7 +4104,7 @@ def private pf_enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : ui
 
 // per-position router + select + the atomics-free CSR (count -> prefix -> bucket) for layer l
 def private pf_enc_moe_route(enc : MetalComputeEncoder?; t : Model; l : int64;
-                             bx, blg, bsel, bcnt, bbase, bbkt, binv, bdim, bne, bnk, bgm, btot : MetalBuffer?; npos : int64) {
+                             bx, blg, bsel, bcnt, bbase, bbkt, binv, bdim, bne, bnk, bgm, brb, bhasb, btot : MetalBuffer?; npos : int64) {
     let c = t.config
     var bw_rt = pf_upload_region(unsafe(addr < void? >(t.fblob[t.router_off + l * c.n_expert * c.dim])), uint64(c.n_expert * c.dim * 4l))
     metal_set_pipeline(enc, g_pf_pso_moe_router)
@@ -4114,6 +4114,8 @@ def private pf_enc_moe_route(enc : MetalComputeEncoder?; t : Model; l : int64;
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, bne, 0ul, 4)
     metal_set_buffer(enc, bdim, 0ul, 5)   // per-position x stride = dim
+    metal_set_buffer(enc, brb, 0ul, 6)
+    metal_set_buffer(enc, bhasb, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((c.n_expert + 3l) / 4l), uint(npos), 1u), uint3(128u, 1u, 1u))
     metal_set_pipeline(enc, g_pf_pso_moe_select)
     metal_set_buffer(enc, blg, 0ul, 0)
@@ -4801,7 +4803,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         pf_enc_g4_router_norm(enc, bx, bw_rs, bmg4rt, u_dim, u_eps, u_moe_invd, npos)
                     }
                     pf_enc_moe_route(enc, t, l, g4moe ? bmg4rt : bxb, bmlg, bmsel, bmcnt, bmbase, bmbkt, bminv,
-                        u_dim, u_moe_ne, u_moe_nk, u_moe_g0, u_moe_tot, npos)
+                        u_dim, u_moe_ne, u_moe_nk, u_moe_g0, g_pf_one, u_moe_g0, u_moe_tot, npos)
                     if (g4moe) {
                         var bw_ds = pf_upload_region(unsafe(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert])), uint64(c.n_expert * 4l))
                         pf_enc_moe_wscale(enc, bmsel, bw_ds, u_moe_nk, npos)
