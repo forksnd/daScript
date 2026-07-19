@@ -5564,7 +5564,6 @@ class MetalAddRmsB {
 
 
 var g_pso_gemv : MetalComputePipeline?
-var g_pso_gemv16 : MetalComputePipeline?   // f16-scale twin (wscale_f16 models)
 var g_gemv_rows = 4l                       // rows (simdgroups) per GEMV threadgroup
 var g_pso_rms : MetalComputePipeline?
 var g_pso_add : MetalComputePipeline?
@@ -5594,7 +5593,6 @@ var g_pso_qknorm : MetalComputePipeline?    // per-head QK RMSNorm prepass (MSL 
 var g_pso_argmax : MetalComputePipeline?
 var g_pso_copy_row : MetalComputePipeline?   // zero-copy logits: staging row -> wrapped session storage
 var g_pso_emb : MetalComputePipeline?
-var g_pso_emb16 : MetalComputePipeline?
 var g_pso_emb_k6 : MetalComputePipeline?     // tied-k6 spec chain's embed gather
 var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
 var g_pso_qkvrs32 : MetalComputePipeline?
@@ -5676,7 +5674,6 @@ def metal_decode_init : bool {
     var ok = true
     // the GEMV / rms / add / swiglu MSL sources are the prefill module's, verbatim (own PSOs)
     g_pso_gemv = compile_pso(metal_q8_gemv_msl, metal_q8_gemv_msl_entry, metal_q8_gemv_msl_fastmath, ok)
-    g_pso_gemv16 = compile_pso(metal_q8_gemv_s16_msl, metal_q8_gemv_s16_msl_entry, metal_q8_gemv_s16_msl_fastmath, ok)
     g_gemv_rows = clamp(int64(env_int("DASLLAMA_METAL_GEMV_TG", 4)), 1l, 32l)
     g_pso_rms = compile_pso(metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, ok)
     g_pso_add = compile_pso(metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath, ok)
@@ -5709,7 +5706,6 @@ def metal_decode_init : bool {
     g_pso_argmax = compile_pso(metal_argmax_msl, metal_argmax_msl_entry, metal_argmax_msl_fastmath, ok)
     g_pso_copy_row = compile_pso(metal_copy_row_msl, metal_copy_row_msl_entry, metal_copy_row_msl_fastmath, ok)
     g_pso_emb = compile_pso(metal_embed_q8_msl, metal_embed_q8_msl_entry, metal_embed_q8_msl_fastmath, ok)
-    g_pso_emb16 = compile_pso(metal_embed_q8_s16_msl, metal_embed_q8_s16_msl_entry, metal_embed_q8_s16_msl_fastmath, ok)
     g_pso_emb_k6 = compile_pso(metal_embed_k6_msl, metal_embed_k6_msl_entry, metal_embed_k6_msl_fastmath, ok)
     g_pso_qkvrs16 = compile_pso(metal_q8_gemv_qkv_rs16_msl, metal_q8_gemv_qkv_rs16_msl_entry, metal_q8_gemv_qkv_rs16_msl_fastmath, ok)
     g_pso_qkvrs32 = compile_pso(metal_q8_gemv_qkv_rs32_msl, metal_q8_gemv_qkv_rs32_msl_entry, metal_q8_gemv_qkv_rs32_msl_fastmath, ok)
@@ -6772,10 +6768,6 @@ def metal_kernels_release {
         metal_release(g_pso_gemv)
         g_pso_gemv = null
     }
-    if (g_pso_gemv16 != null) {
-        metal_release(g_pso_gemv16)
-        g_pso_gemv16 = null
-    }
     release_pso(g_pso_kq_k4)
     release_pso(g_pso_kq_k5)
     release_pso(g_pso_kq_k5c)
@@ -6872,10 +6864,6 @@ def metal_kernels_release {
     if (g_pso_emb != null) {
         metal_release(g_pso_emb)
         g_pso_emb = null
-    }
-    if (g_pso_emb16 != null) {
-        metal_release(g_pso_emb16)
-        g_pso_emb16 = null
     }
     release_pso(g_pso_emb_k6)
     if (g_pso_qkvrs16 != null) {

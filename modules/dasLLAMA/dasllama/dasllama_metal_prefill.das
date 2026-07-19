@@ -2472,7 +2472,6 @@ var private g_pso_kq_mm6 : MetalComputePipeline?
 var private g_pf_pso_kq4 : MetalComputePipeline?       // ... and the kq classifier GEMVs
 var private g_pf_pso_kq5 : MetalComputePipeline?
 var private g_pf_pso_kq6 : MetalComputePipeline?      // classifier GEMV (logits-on-GPU)
-var private g_pf_pso_gemv16 : MetalComputePipeline?    // ... its f16-scale twin (wscale_f16 models)
 var private g_mm_legacy = false             // set_metal_prefill_mulmm_legacy — tests' exact-parity rail
 var private g_pf_logits_cpu = false            // set_metal_prefill_logits_cpu — the logits A/B rail
 // timing-attribution knockout (DASLLAMA_METAL_PREFILL_SKIP=attn|gemm|ew|nongemm): skips encoding
@@ -2518,7 +2517,6 @@ def public metal_prefill_shutdown {
     unsafe {
         delete g_pf_regions
     }
-    metal_blob_regions_release()
     pool_drain(g_pf_pool)
     pool_drain(g_pf_upool)
     if (g_pso_gemm != null) {
@@ -2540,10 +2538,6 @@ def public metal_prefill_shutdown {
     if (g_pf_pso_gemv != null) {
         metal_release(g_pf_pso_gemv)
         g_pf_pso_gemv = null
-    }
-    if (g_pf_pso_gemv16 != null) {
-        metal_release(g_pf_pso_gemv16)
-        g_pf_pso_gemv16 = null
     }
     if (g_pso_rope != null) {
         metal_release(g_pso_rope)
@@ -2706,7 +2700,6 @@ def private metal_prefill_init : bool {
     g_pso_qkmm = pf_compile_pso(metal_attn_qk_mm_msl, metal_attn_qk_mm_msl_entry, metal_attn_qk_mm_msl_fastmath, ok)
     g_pso_avmm = pf_compile_pso(metal_attn_av_mm_msl, metal_attn_av_mm_msl_entry, metal_attn_av_mm_msl_fastmath, ok)
     g_pf_pso_gemv = pf_compile_pso(metal_q8_gemv_msl, metal_q8_gemv_msl_entry, metal_q8_gemv_msl_fastmath, ok)
-    g_pf_pso_gemv16 = pf_compile_pso(metal_q8_gemv_s16_msl, metal_q8_gemv_s16_msl_entry, metal_q8_gemv_s16_msl_fastmath, ok)
     if (!ok) {
         metal_prefill_shutdown()
         g_pf_failed = true
@@ -2731,13 +2724,9 @@ def private pf_upload_region(src : void?; bytes : uint64) : MetalBuffer? {
     return buf
 }
 
-// per-tensor block_q8_0 blob on THIS driver's device — picks the model's live scale plane
-// (f32, or the raw-f16 qscales16 under wscale_f16; the encoding is part of the cache identity)
-def private upload_blob_region(t : Model; off, rows, k : int64) : MetalBuffer? {
-    unsafe {
-        let s = t.wscale_f16 ? addr < void? >(t.qscales16[off / 32l]) : addr < void? >(t.qscales[off / 32l])
-        return metal_blob_region(g_pf_dev, addr < void? >(t.qblob[off]), s, rows, k, t.wscale_f16)
-    }
+// one tensor's slice of the whole-model blob on THIS driver's device (blob_of's pf twin)
+def private pf_blob_of(t : Model; off : int64) : tuple<buf : MetalBuffer?; boff : uint64> {
+    return blob_of(g_pf_dev, t, off)
 }
 
 def private pf_uniform_u32(v : uint) : MetalBuffer? {
@@ -2863,24 +2852,24 @@ def private enc_gemm_mm(enc : MetalComputeEncoder?; bwblob, bx, by, bk, bn : Met
 
 def private pf_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
 
-// one kq weight site on the prefill mul_mm path: the format's mul_mm twin over the kq plane
-// pair (k6 binds its scale buffer twice — sub-scale blocks at 0, the trailing f16 d plane at
-// byte nsb*16). Same grid/tgmem as enc_gemm_mm.
-def private pf_enc_kq_site_mm(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; woff, rows, n : int64;
+// one kq weight site on the prefill mul_mm path: the format's mul_mm twin over the whole-plane
+// binds (kq_quants_of / kq_scales_of — k6 binds its split scale plane twice, sub-scales at soff
+// + the f16 d tail at doff). Same grid/tgmem as enc_gemm_mm.
+def private pf_enc_kq_site_mm(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; woff, rows : int64;
                               bx, by, bk, bn : MetalBuffer?; mp : int64; yoff : uint64 = 0ul) {
-    var bq = kq_upload_quants(g_pf_dev, t, fmt, woff, rows, n)
-    var bs = kq_upload_scales(g_pf_dev, t, fmt, woff, rows, n)
+    let bq = kq_quants_of(g_pf_dev, t, fmt, woff)
+    let bs = kq_scales_of(g_pf_dev, t, fmt, woff)
     if (fmt == KqFmt.k6) {
         metal_set_pipeline(enc, g_pso_kq_mm6)
         metal_set_threadgroup_memory_length(enc, metal_kq_mulmm_k6_msl_tgmem, 0)
-        metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
+        metal_set_buffer(enc, bs.buf, bs.doff, 0)
     } else {
         metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_mm4 : g_pso_kq_mm5)
         metal_set_threadgroup_memory_length(enc, fmt == KqFmt.k4 ? metal_kq_mulmm_k4_msl_tgmem : metal_kq_mulmm_k5_msl_tgmem, 0)
-        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bs.buf, bs.soff, 0)
     }
-    metal_set_buffer(enc, bs, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, bs.buf, bs.soff, 1)
+    metal_set_buffer(enc, bq.buf, bq.qoff, 2)
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
@@ -2890,19 +2879,19 @@ def private pf_enc_kq_site_mm(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt
 
 // the kq classifier GEMV (one f32 row against the [vocab x dim] kq plane) — the moved decode
 // kernels' PSOs, prefill-owned twins
-def private pf_enc_kq_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; woff, rows, n : int64;
+def private pf_enc_kq_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; woff, rows : int64;
                            bx : MetalBuffer?; xoff : uint64; by, bn, bd : MetalBuffer?) {
-    var bq = kq_upload_quants(g_pf_dev, t, fmt, woff, rows, n)
-    var bs = kq_upload_scales(g_pf_dev, t, fmt, woff, rows, n)
+    let bq = kq_quants_of(g_pf_dev, t, fmt, woff)
+    let bs = kq_scales_of(g_pf_dev, t, fmt, woff)
     if (fmt == KqFmt.k6) {
         metal_set_pipeline(enc, g_pf_pso_kq6)
-        metal_set_buffer(enc, bs, uint64(((rows * n) / 256l) * 16l), 0)
+        metal_set_buffer(enc, bs.buf, bs.doff, 0)
     } else {
         metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pf_pso_kq4 : g_pf_pso_kq5)
-        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bs.buf, bs.soff, 0)
     }
-    metal_set_buffer(enc, bs, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
+    metal_set_buffer(enc, bs.buf, bs.soff, 1)
+    metal_set_buffer(enc, bq.buf, bq.qoff, 2)
     metal_set_buffer(enc, bx, xoff, 3)
     metal_set_buffer(enc, by, 0ul, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
@@ -2943,12 +2932,12 @@ def private enc_rms_last(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : u
     metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(256u, 1u, 1u))
 }
 
-// the classifier GEMV: d rows of logits, 4 rows (one simdgroup each) per threadgroup; s16 reads
-// the qscales16 halfword plane (wscale_f16 models)
-def private pf_enc_gemv(enc : MetalComputeEncoder?; s16 : bool; bwq, bws, bx, by, bn, bd : MetalBuffer?; d : int64) {
-    metal_set_pipeline(enc, s16 ? g_pf_pso_gemv16 : g_pf_pso_gemv)
-    metal_set_buffer(enc, bwq, 0ul, 0)
-    metal_set_buffer(enc, bws, 0ul, 1)
+// the classifier GEMV: d rows of logits, 4 rows (one simdgroup each) per threadgroup — the
+// blob slice binds through both views at the classifier's byte offset
+def private pf_enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64; bx, by, bn, bd : MetalBuffer?; d : int64) {
+    metal_set_pipeline(enc, g_pf_pso_gemv)
+    metal_set_buffer(enc, bw, boff, 0)   // half-scale view
+    metal_set_buffer(enc, bw, boff, 1)   // byte view
     metal_set_buffer(enc, bx, 0ul, 2)
     metal_set_buffer(enc, by, 0ul, 3)
     metal_set_buffer(enc, bn, 0ul, 4)
