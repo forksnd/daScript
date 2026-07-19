@@ -74,17 +74,16 @@ def private greedy_steps(tr : Model; var s : Session; n : int) : array<int64> {
     return <- ids
 }
 
-// prompt-to-continuation through the public generate() (its decode steps go through forward(),
-// where the decode override hooks); kdt picks the session KV codec = the GPU mirror dtype
-def private continuation(tr : Model; prompt : array<int64>; n_gen : int; kdt : KVDtype) : array<int64> {
+// prompt-to-continuation: prefill on trp, then n_gen greedy decode steps on trd (forward(), where
+// the decode override hooks). The drivers are blob-only, so callers pass the planar model for CPU
+// stages and the blob twin for GPU stages — sessions are geometry-bound, one session spans both.
+def private continuation(trp, trd : Model; prompt : array<int64>; n_gen : int; kdt : KVDtype) : array<int64> {
     var got : array<int64>
     with_job_que() {
         setup_dasllama_jobque()
-        var s = make_run_state(tr.config, kdt, kdt)
-        let steps = length(prompt) + n_gen
-        let ids <- generate(tr, s, prompt, steps)
-        let echo = length(prompt) - 1
-        got <- [for (i in range(n_gen)); ids[echo + i]; where echo + i < length(ids)]
+        var s = make_run_state(trp.config, kdt, kdt)
+        eval_(trp, s, prompt)
+        got <- greedy_steps(trd, s, n_gen)
         delete s
     }
     return <- got
@@ -148,8 +147,8 @@ def private kv_row_max_diff(sa, sb : Session; c : Config; pos : int64) : float {
 }
 
 // one CPU step and one GPU step from identical prefilled states: logits + stored-KV-row envelope
-[unused_argument(t, tr, prompt, kdt, tol_logits, tol_kv, tag)]   // off-Apple the gated body is empty
-def private single_step_gate(t : T?; tr : Model; prompt : array<int64>; kdt : KVDtype;
+[unused_argument(t, tr, trg, prompt, kdt, tol_logits, tol_kv, tag)]   // off-Apple the gated body is empty
+def private single_step_gate(t : T?; tr, trg : Model; prompt : array<int64>; kdt : KVDtype;
                              tol_logits, tol_kv : float; tag : string) {
     // whole-body gate: the stats rails only exist with das_metal, and every caller is already
     // inside the Apple half — off-Apple this helper just needs to compile
@@ -169,7 +168,7 @@ def private single_step_gate(t : T?; tr : Model; prompt : array<int64>; kdt : KV
             eval_(tr, sa, one)          // the CPU control step
             t |> success(select_decode_override("metal"), "{tag}: override registered")
             let before = metal_decode_stats().decodes
-            eval_(tr, sb, one)          // the GPU step
+            eval_(trg, sb, one)         // the GPU step (the blob twin — the drivers are blob-only)
             served = metal_decode_stats().decodes - before
             select_decode_override("")
             delete one
@@ -194,7 +193,7 @@ def private single_step_gate(t : T?; tr : Model; prompt : array<int64>; kdt : KV
 
 // interleaved-chunk prefill of two paged sessions (their page groups interleave, so the second
 // session's logical rows gather through MULTIPLE physical runs), then n greedy steps on it
-def private paged_greedy(tr : Model; prompt : array<int64>; page_rows : int64; n : int; gpu : bool) : array<int64> {
+def private paged_greedy(tr, trg : Model; prompt : array<int64>; page_rows : int64; n : int; gpu : bool) : array<int64> {
     var got : array<int64>
     with_job_que() {
         setup_dasllama_jobque()
@@ -212,7 +211,7 @@ def private paged_greedy(tr : Model; prompt : array<int64>; page_rows : int64; n
             at = hi
         }
         select_decode_override(gpu ? "metal" : "")
-        got <- greedy_steps(tr, sb, n)
+        got <- greedy_steps(gpu ? trg : tr, sb, n)
         select_decode_override("")
         release_kv_pages_(sa)
         release_kv_pages_(sb)
@@ -225,18 +224,18 @@ def private paged_greedy(tr : Model; prompt : array<int64>; page_rows : int64; n
 
 // GPU decode, rewind (n_past = 0 session reuse — the ASR pattern), CPU re-prefill of a SHORTER
 // different prompt, GPU decode again: stale mirror rows past the rewind would poison the tokens
-def private rewind_greedy(tr : Model; prompt, prompt2 : array<int64>; n : int) : array<int64> {
+def private rewind_greedy(tr, trg : Model; prompt, prompt2 : array<int64>; n : int) : array<int64> {
     var got : array<int64>
     with_job_que() {
         setup_dasllama_jobque()
         var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
         select_decode_override("metal")
-        eval_(tr, s, prompt)                    // CPU prefill
-        var warm <- greedy_steps(tr, s, 8)      // GPU decode advances the mirror watermark
+        eval_(tr, s, prompt)                    // CPU prefill (the planar model)
+        var warm <- greedy_steps(trg, s, 8)     // GPU decode advances the mirror watermark
         delete warm
         s.n_past = 0l                           // rewind: reuse the session from scratch
         eval_(tr, s, prompt2)                   // shorter prompt ⇒ first GPU pos < watermark
-        got <- greedy_steps(tr, s, n)
+        got <- greedy_steps(trg, s, n)
         select_decode_override("")
         delete s
     }

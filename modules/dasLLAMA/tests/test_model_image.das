@@ -367,6 +367,39 @@ def private counting_ids(tr : Model) : array<int64> {
     return <- encode(tr, "The numbers from one to ten are: one, two, three,")
 }
 
+// Teacher-forced max-logits-diff: both models step through the SAME token sequence and the
+// per-step logits compare — the valid cross-backend instrument for a 135M (greedy token
+// equality is not: the model rides genuine near-ties that flip on ~0.02 gaps, while real
+// breakage moves logits 15+; measured cross-backend noise here is ~0.75). With metal mode
+// on, the planar model CPU-serves (the gates decline `planar`) and the blob model GPU-serves
+// — no override juggling.
+def private forced_logits_maxd(tc, tg : Model; prompt, teach : array<int64>) : float {
+    var maxd = 0.0
+    with_job_que() {
+        setup_dasllama_jobque()
+        var sa = make_run_state(tc.config)
+        var sb = make_run_state(tg.config)
+        eval_(tc, sa, prompt)
+        eval_(tg, sb, prompt)
+        for (a, b in sa.logits, sb.logits) {
+            maxd = max(maxd, abs(a - b))
+        }
+        for (tok in teach) {
+            var one : array<int64>
+            one |> push(tok)
+            eval_(tc, sa, one)
+            eval_(tg, sb, one)
+            for (a, b in sa.logits, sb.logits) {
+                maxd = max(maxd, abs(a - b))
+            }
+            delete one
+        }
+        delete sa
+        delete sb
+    }
+    return maxd
+}
+
 [test]
 def test_metal_flavor_image(tst : T?) {
     tst |> run("SmolLM2 q8: metal flavor — blob mint + map + GPU serve + CPU tripwire") @(t : T?) {
@@ -406,8 +439,17 @@ def test_metal_flavor_image(tst : T?) {
             t |> success(stat(img_m).is_valid, "cold metal load saved the metal-flavor image")
             t |> success(length(tm.qblob) == 0, "planar q8 planes are gone")
             var g_mint <- gen_ids(tm, prompt, 16)   // a blob model CANNOT silently CPU-serve —
-            delete tm                               // completing at all proves the GPU served
-            t |> success(count_mismatch(g_cpu, g_mint) == 0l, "GPU tokens match the CPU control")
+                                                    // completing at all proves the GPU served
+            // teacher-forced parity vs a fresh planar CPU control (engine entry, no image
+            // cache) — probe-measured noise ~0.75, breakage class 15+; 4.0 = ~4x SNR
+            var tp <- load_model_(path, QuantMode.q8)
+            let np = int64(length(prompt))
+            var teach <- [for (i in range64(np, int64(length(g_cpu)))); g_cpu[i]]
+            let maxd = forced_logits_maxd(tp, tm, prompt, teach)
+            t |> success(maxd < 4.0, "teacher-forced GPU logits within 4.0 of the CPU control (maxd {maxd})")
+            delete teach
+            delete tp
+            delete tm
             // warm map + the direct-.dlim path form (both flavors' identities probed)
             var tw <- load_model(path, QuantMode.q8)
             t |> success(tw.image_map != null && tw.metal_blob, "warm metal load maps the blob image")
