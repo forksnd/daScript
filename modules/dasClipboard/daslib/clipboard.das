@@ -214,7 +214,7 @@ def public clipboard_get_content(var content : ClipboardContent) : ClipboardStat
 def public clipboard_get_text(var text : string&) : ClipboardStatus {
     //! Read UTF-8 text into `text`. The output is empty for every non-ok result.
     var raw_status = int(ClipboardStatus.failed)
-    text := _clipboard_get_text(raw_status)
+    text = _clipboard_get_text(raw_status)
     let status = unsafe(reinterpret<ClipboardStatus>(raw_status))
     if (status == ClipboardStatus.ok && !is_utf8_string_valid(text)) {
         text = ""
