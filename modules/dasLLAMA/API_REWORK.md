@@ -343,19 +343,21 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
-- **Per-config .dlim: map-only load, Metal planes baked (design ruling 2026-07-18).** The
-  image contract is "no processing on load FOR THE CONFIG IT WAS BUILT FOR" — an image is
-  box+backend-flavored already (identity hash), so the Metal flavor should carry the
-  METAL-ready forms in place of the CPU planar ones, not beside them: the 34-byte block_q8_0
-  blob (today a ~3s-per-model scalar repack in `metal_blob_region` at first mul_mm use), the
-  kq 16B compact scale strips (today repacked 20B→16B at upload), page-aligned sections
-  wrapped as no-copy MTLBuffers (`newBufferWithBytesNoCopy` — needs a small das_metal C++
-  binding), keeping only the genuinely-CPU smalls (embed rows, norm planes, tokenizer).
-  Size stays ~1x per flavor; every upload copy and load-time repack disappears; in-process
-  CPU inference on a Metal-flavor image stops being supported (the CPU-prefill tripwire and
-  the `dasllama_parity` ref caches already push that work to the CPU flavor). Costs today:
-  ~3s/model first-use repack + the one-time upload copies of every big plane. Image
-  serializer version gate + image-suite mechanics arm when built; half-day-class.
+- **Per-config .dlim: map-only load, BLOB-ONLY metal flavor (ruling FINAL 2026-07-18; the
+  next work block).** The image contract is "no processing on load FOR THE CONFIG IT WAS
+  BUILT FOR"; flavors are per-config and self-sufficient — a benchmark needing both sides
+  loads two flavors (mmap = msecs each). The metal flavor (image v3, own identity tag):
+  the 34-byte block_q8_0 blob section REPLACES the planar q8 qblob (34/32 = +6%, one
+  MTLBuffer for the whole blob, per-region offsets at bind — the q8 region cache and the
+  ~3s `metal_blob_region` repack both die); kq quant planes stay disk-layout (already
+  borrowable) with the 16B compact scale strips replacing the 20B planes; all big sections
+  page-aligned and wrapped via a new das_metal `newBufferWithBytesNoCopy` binding (C++,
+  capability absent das-side); fblob/tokenizer/meta smalls stay. `embed_row` gets a
+  blob-layout (stride-34) variant for metal-flavor models; any CPU-inference path against a
+  blob-only image PANICS (consistent with the CPU-prefill tripwire — CPU work belongs to
+  the CPU flavor). Serializer v3 gate + image-suite mechanics arm; regen per-config images
+  on first use. Half-day block, scheduled BEFORE the wave-a PR (Boris sequencing:
+  .dlim redesign → PR regardless of perf state → OS notifications w/ computed ETA → scope D).
 
 - **QK-norm rope-store fusion — the f16 single-stream H-form SHIPPED (wave A chase round 2);
   the rest of the family is the residual (2026-07-17).** MetalRopeStoreHF16 folds bias +
