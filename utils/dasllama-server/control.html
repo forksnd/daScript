@@ -394,7 +394,7 @@ function apply(s) {
         $("asr-section").style.display = "block";
     }
     $("cfg").innerHTML =
-        "model <b>" + s.model + "</b> · ctx <b>" + s.ctx + "</b> · streams <b>" + s.max_streams + "</b>" +
+        "model <b>" + esc(s.model) + "</b> · ctx <b>" + s.ctx + "</b> · streams <b>" + s.max_streams + "</b>" +
         " · prefill chunk <b>" + s.chunk_tokens + "</b> tok" +
         " · peak active <b>" + s.peak_active + "</b> · decode steps <b>" + fmt(s.decode_steps) + "</b>" +
         (s.asr_workers > 0 ? " · asr workers <b>" + s.asr_workers + "</b>" : "");
@@ -1232,10 +1232,10 @@ function renderGpu(status) {
                 (g.cls_resident ? " · cls" : "") +
                 " · " + (g.vram_bytes / 1e9).toFixed(2) + " GB VRAM — hybrid by layer type, not layer count";
         } else {
-            line.innerHTML = "gpu tier <b>vulkan</b> armed but idle — <span class=\"reason\">" + g.reason + "</span>";
+            line.innerHTML = "gpu tier <b>vulkan</b> armed but idle — <span class=\"reason\">" + esc(g.reason) + "</span>";
         }
     } else if (status.metal && status.metal !== "off") {
-        line.innerHTML = "gpu <b>metal</b> (" + status.metal + ")";
+        line.innerHTML = "gpu <b>metal</b> (" + esc(status.metal) + ")";
     } else {
         line.innerHTML = "gpu <b>off</b> — all kernels on CPU";
     }

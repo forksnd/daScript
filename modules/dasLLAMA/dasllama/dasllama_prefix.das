@@ -25,7 +25,8 @@ struct PrefixEntry {
 //! new page; an attach whose deepest matched page belongs to it bumps ``hits``.
 struct PrefixChain {
     id : int64
-    n_tokens : int64            // page-covered tokens of the donation
+    n_tokens : int64            // tokens the donation contributed as NEW pages (fixed at insert;
+                                // already-cached pages belong to their original chains)
     pages_live : int64          // its entries still held (evictions decrement; 0 removes the chain)
     hits : int64
     born_at : int64             // ref_time_ticks at insert
@@ -194,8 +195,7 @@ def prefix_insert_(var cache : PrefixCache; var pool : KVPool; s : Session; toke
         if (chain_id == 0l) {   // first NEW page: this donation gets a dashboard chain
             cache.next_chain_id ++
             chain_id = cache.next_chain_id
-            cache.chains[chain_id] <- PrefixChain(id = chain_id, n_tokens = pages * pr,
-                born_at = ref_time_ticks(), preview = preview)
+            cache.chains[chain_id] <- PrefixChain(id = chain_id, born_at = ref_time_ticks(), preview = preview)
         }
         var e <- PrefixEntry(group = s.block_table[i], last_use = cache.tick, chain = chain_id)
         e.tokens <- [for (j in range64(i * pr, (i + 1l) * pr)); tokens[j]]
@@ -203,6 +203,7 @@ def prefix_insert_(var cache : PrefixCache; var pool : KVPool; s : Session; toke
         pool.refcnt[s.block_table[i]] ++
         cache.n_insert_pages ++
         cache.chains[chain_id].pages_live ++
+        cache.chains[chain_id].n_tokens += pr   // NEW pages only — a partially-cached donation must not over-report
     }
     if (cache.max_groups > 0l) {
         while (int64(length(cache.entries)) > cache.max_groups) {

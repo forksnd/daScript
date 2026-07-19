@@ -22,7 +22,14 @@ require strings                                         // find (control-page co
 // and require the sibling module by BARE name (same convention as detect-dupe / find-dupe / mcp).
 
 let TEST_PORT = 18099
-let TEST_SAVE_PATH = "._test_dasllama_config.toml"   // POST /config target; removed after the round-trip check
+// POST /config target; under the platform temp dir so a mid-test failure leaves no stray file
+// in the repo. Module-level let evaluates per context, but the temp dir is stable — both agree.
+def private test_save_path() : string {
+    var err = ""
+    let d = temp_directory(err)
+    return path_join(empty(d) ? "/tmp" : d, "dasllama_test_config.toml")
+}
+let TEST_SAVE_PATH = test_save_path()
 
 def private models_dir() : string {
     return get_env_variable("DASLLAMA_MODELS_DIR")   // empty -> MODEL_PATH is relative -> the test skips
