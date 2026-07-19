@@ -18,6 +18,19 @@ struct PrefixEntry {
     group : int                 // page-group id in the pool (held: its refcnt includes this entry)
     tokens : array<int64>       // the page's P token ids — verified on every hit
     last_use : int64            // LRU clock value of the last attach/insert touch
+    chain : int64               // owning PrefixChain id (0 = none; duplicates keep their original)
+}
+
+//! One donated prefix chain, for dashboards: created when a donation contributes at least one
+//! new page; an attach whose deepest matched page belongs to it bumps ``hits``.
+struct PrefixChain {
+    id : int64
+    n_tokens : int64            // page-covered tokens of the donation
+    pages_live : int64          // its entries still held (evictions decrement; 0 removes the chain)
+    hits : int64
+    born_at : int64             // ref_time_ticks at insert
+    last_hit_at : int64         // 0 until the first hit
+    preview : string            // caller-provided detokenized head ("" when not given)
 }
 
 //! Page-granular prefix cache over the sessions of ONE ``KVPool`` (``create_prefix_cache_``).
@@ -25,6 +38,8 @@ struct PrefixEntry {
 //! struct without interior pointers. Not thread-safe; drive it from the pool's owning thread.
 struct PrefixCache {
     entries : table<uint64; PrefixEntry>   // chained page hash -> cached page
+    chains : table<int64; PrefixChain>     // chain id -> donation summary (dashboards)
+    next_chain_id : int64
     max_groups : int64          // held-page budget (LRU-evicts past it); 0 = unbounded
     tick : int64                // LRU clock
     n_hit_pages : int64         // pages attached across all lookups
@@ -93,6 +108,7 @@ def prefix_attach_(var cache : PrefixCache; var pool : KVPool; var s : Session; 
     let pages_max = np > 0l ? (np - 1l) / pr : 0l
     var h = 0ul
     var matched = 0l
+    var hit_chain = 0l
     for (i in range64(pages_max)) {
         h = chain_page_hash(h, prompt, i * pr, (i + 1l) * pr)
         if (!key_exists(cache.entries, h)) {
@@ -105,16 +121,24 @@ def prefix_attach_(var cache : PrefixCache; var pool : KVPool; var s : Session; 
         }
         cache.tick ++
         e.last_use = cache.tick
+        hit_chain = e.chain
         s.block_table |> push(e.group)
         pool.refcnt[e.group] ++
         matched += pr
         cache.n_hit_pages ++
     }
+    if (hit_chain != 0l) {
+        var c = unsafe(cache.chains?[hit_chain])
+        if (c != null) {
+            c.hits ++
+            c.last_hit_at = ref_time_ticks()
+        }
+    }
     s.n_past = matched
     return matched
 }
 
-// Drop the least-recently-used entry (release its group hold).
+// Drop the least-recently-used entry (release its group hold + its chain's live count).
 def private prefix_evict_lru(var cache : PrefixCache; var pool : KVPool) {
     var lru_key = 0ul
     var lru_use = 0l
@@ -126,15 +150,27 @@ def private prefix_evict_lru(var cache : PrefixCache; var pool : KVPool) {
             first = false
         }
     }
+    let ch = cache.entries[lru_key].chain
     kv_pool_release_group(pool, cache.entries[lru_key].group)
     delete cache.entries[lru_key]   // erase is a raw remove — finalize the owned tokens first
     cache.entries |> erase(lru_key)
     cache.n_evicted_pages ++
+    if (ch != 0l) {
+        var c = unsafe(cache.chains?[ch])
+        if (c != null) {
+            c.pages_live --
+            if (c.pages_live <= 0l) {
+                delete cache.chains[ch]
+                cache.chains |> erase(ch)
+            }
+        }
+    }
 }
 
 //! Donate a finished session's pages into the cache, bumping pool refcnt so they survive release;
-//! only tokens up to ``n_past`` are eligible, and pages past the budget LRU-drop. Call right before ``release_kv_pages``.
-def prefix_insert_(var cache : PrefixCache; var pool : KVPool; s : Session; tokens : array<int64>) {
+//! only tokens up to ``n_past`` are eligible, and pages past the budget LRU-drop. Call right before
+//! ``release_kv_pages``. ``preview`` labels the donation's chain on the dashboard surface.
+def prefix_insert_(var cache : PrefixCache; var pool : KVPool; s : Session; tokens : array<int64>; preview : string = "") {
     if (!empty(s.dn_state_prefix)) {
         return   // hybrid (deltanet): pages without recurrent state can never be attached — don't cache
     }
@@ -145,6 +181,7 @@ def prefix_insert_(var cache : PrefixCache; var pool : KVPool; s : Session; toke
     let covered = min(int64(length(tokens)), s.n_past)
     let pages = covered / pr
     var h = 0ul
+    var chain_id = 0l
     for (i in range64(pages)) {
         h = chain_page_hash(h, tokens, i * pr, (i + 1l) * pr)
         cache.tick ++
@@ -154,11 +191,18 @@ def prefix_insert_(var cache : PrefixCache; var pool : KVPool; s : Session; toke
             e.last_use = cache.tick
             continue
         }
-        var e <- PrefixEntry(group = s.block_table[i], last_use = cache.tick)
+        if (chain_id == 0l) {   // first NEW page: this donation gets a dashboard chain
+            cache.next_chain_id ++
+            chain_id = cache.next_chain_id
+            cache.chains[chain_id] <- PrefixChain(id = chain_id, n_tokens = pages * pr,
+                born_at = ref_time_ticks(), preview = preview)
+        }
+        var e <- PrefixEntry(group = s.block_table[i], last_use = cache.tick, chain = chain_id)
         e.tokens <- [for (j in range64(i * pr, (i + 1l) * pr)); tokens[j]]
         cache.entries[h] <- e
         pool.refcnt[s.block_table[i]] ++
         cache.n_insert_pages ++
+        cache.chains[chain_id].pages_live ++
     }
     if (cache.max_groups > 0l) {
         while (int64(length(cache.entries)) > cache.max_groups) {
@@ -174,4 +218,15 @@ def prefix_release_(var cache : PrefixCache; var pool : KVPool) {
         kv_pool_release_group(pool, e.group)
     }
     delete cache.entries
+    delete cache.chains
+}
+
+//! Snapshot of the donated chains for dashboards (order unspecified).
+def prefix_chain_list_(cache : PrefixCache) : array<PrefixChain> {
+    var out : array<PrefixChain>
+    out |> reserve(length(cache.chains))
+    for (c in values(cache.chains)) {
+        out |> push(c)
+    }
+    return <- out
 }

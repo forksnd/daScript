@@ -99,6 +99,15 @@ button.mini.on { border-color: var(--amber); color: var(--amber); }
 }
 .scard .txt .ph { color: var(--fg-faint); }
 
+.ctable { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 11.5px; }
+.ctable th {
+    text-align: left; font-weight: 400; font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.6px; color: var(--fg-faint); padding: 2px 10px 6px 0;
+}
+.ctable td { padding: 4px 10px 4px 0; border-top: 1px solid var(--rule); color: var(--fg-dim); }
+.ctable td.pv { color: var(--fg); max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctable td.hit { color: var(--green); }
+
 .gpu-line { font-family: var(--font-mono); font-size: 11.5px; margin-bottom: 12px; }
 .gpu-line .reason { color: var(--red); }
 .cfg-form {
@@ -190,10 +199,18 @@ button:disabled { opacity: 0.45; cursor: default; }
     <div id="cards" class="cards"><div class="ctl-note" id="cards-empty">no active streams — POST a chat completion and watch it flow</div></div>
     <div id="history" class="cards" style="display:none"><div class="ctl-note">nothing finished yet</div></div>
 
-    <div class="sec"><span>§ 03</span><span class="rule"></span><span>config</span></div>
+    <div class="sec"><span>§ 03</span><span class="rule"></span><span>prefix cache</span></div>
+    <div class="panel">
+        <table class="ctable" id="ctable">
+            <thead><tr><th>cached conversation</th><th>tok</th><th>pages</th><th>hits</th><th>age</th><th>idle</th></tr></thead>
+            <tbody id="ctable-body"><tr><td colspan="6" class="ctl-note">nothing cached yet — finish a &gt;1-page prompt and re-send it to watch TTFT collapse</td></tr></tbody>
+        </table>
+    </div>
+
+    <div class="sec"><span>§ 04</span><span class="rule"></span><span>config</span></div>
     <div class="panel cfg" id="cfg">…</div>
 
-    <div class="sec"><span>§ 04</span><span class="rule"></span><span>config editor</span></div>
+    <div class="sec"><span>§ 05</span><span class="rule"></span><span>config editor</span></div>
     <div class="panel">
         <div class="gpu-line" id="gpu-line" style="display:none"></div>
         <form id="cfg-form" class="cfg-form"></form>
@@ -206,7 +223,7 @@ button:disabled { opacity: 0.45; cursor: default; }
         <div class="cfg-file" id="cfg-file"></div>
     </div>
 
-    <div class="sec"><span>§ 05</span><span class="rule"></span><span>controls</span></div>
+    <div class="sec"><span>§ 06</span><span class="rule"></span><span>controls</span></div>
     <div class="panel controls">
         <button id="b-gc" type="button">collect garbage</button>
         <button id="b-drain" class="danger" type="button">drain + shutdown</button>
@@ -381,6 +398,36 @@ function applyStreams(p, queued) {
     drawLanes();
     renderCards(p.streams.filter(s => s.state === "queued"), active);
     renderHistory();
+    renderCache(p.cache || []);
+}
+
+function fmtAge(s) {
+    if (s >= 3600) return (s / 3600).toFixed(1) + "h";
+    if (s >= 60) return (s / 60).toFixed(1) + "m";
+    return s.toFixed(0) + "s";
+}
+
+function renderCache(entries) {
+    const body = $("ctable-body");
+    if (!entries.length) return;   // keep the hint row until something lands
+    entries.sort((a, b) => a.age_s - b.age_s);
+    body.textContent = "";
+    for (const e of entries) {
+        const tr = document.createElement("tr");
+        const pv = document.createElement("td");
+        pv.className = "pv";
+        pv.textContent = e.preview || "(untitled donation)";
+        tr.append(pv);
+        for (const [v, cls] of [[fmt(e.tokens), ""], [String(e.pages), ""],
+                                [String(e.hits), e.hits > 0 ? "hit" : ""],
+                                [fmtAge(e.age_s), ""], [fmtAge(e.idle_s), ""]]) {
+            const td = document.createElement("td");
+            if (cls) td.className = cls;
+            td.textContent = v;
+            tr.append(td);
+        }
+        body.append(tr);
+    }
 }
 
 function drawLanes() {

@@ -19,6 +19,14 @@ override); capability guard (`supported` + `reason` recorded at load); `gpu_tier
 Verified: toml 108/108, server 17/17 live, vulkan tier 12/12, e2e restart loop (CLI-beats-toml
 → save authoritative → exit 4 → relaunch → toml-beats-CLI), page behavior via mock+playwright.
 
+**S4 DONE (2026-07-19):** prefix cache grows a chain registry (`PrefixChain` per donation with
+≥1 new page: page-covered tokens, live pages, hits — bumped when an attach's deepest matched
+page belongs to it — born/last-hit ticks, preview); scheduler passes `st.prompt_head` as the
+preview at donation; `prefix_chain_list` facade; `/v1/streams` gains `cache`; page: prefix-cache
+table (preview / tok / pages / hits / age / idle). Verified: kv_prefix 7/7+1skip, scheduler
+12/12, server 17/17 (cache round trip: >1-page prompt donates → re-send hits → chain surfaced
+with preview), page via mock+playwright.
+
 **S3 DONE (2026-07-19):** Stream carries `prompt_head` (~160 chars, whole pieces) + `gen_tail`
 (240..480 chars, UTF-8-safe front trim); finished streams linger ~10 s in
 `Scheduler.recent_done` (bounded 32); `GET /v1/streams` serves state / counters / TTFT / tails

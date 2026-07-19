@@ -1308,9 +1308,20 @@ struct private OaiStreamInfo {
     gen_tail : string
 }
 
+// One prefix-cache donation chain: what a re-sent conversation would reuse.
+struct private OaiCacheEntry {
+    tokens : int64
+    pages : int64
+    hits : int64
+    age_s : float
+    idle_s : float       // since the last hit (age when never hit)
+    preview : string
+}
+
 struct private OaiStreamsResponse {
     max_streams : int64
     streams : array<OaiStreamInfo>
+    cache : array<OaiCacheEntry>
 }
 
 def private handle_streams(var resp : HttpResponse?) : http_status {
@@ -1339,6 +1350,16 @@ def private handle_streams(var resp : HttpResponse?) : http_status {
             ttft_ms = float(d.ttft_us) / 1000.0,
             prompt_head = d.prompt_head, gen_tail = d.gen_tail))
     }
+    var chains <- prefix_chain_list(g_sched.prefix)
+    out.cache |> reserve(length(chains))
+    for (c in chains) {
+        let age = float(get_time_usec(c.born_at)) / 1000000.0
+        out.cache |> push(OaiCacheEntry(
+            tokens = c.n_tokens, pages = c.pages_live, hits = c.hits, age_s = age,
+            idle_s = c.last_hit_at != 0l ? float(get_time_usec(c.last_hit_at)) / 1000000.0 : age,
+            preview = c.preview))
+    }
+    delete chains
     let body = sprint_json(out, false)
     delete out
     return resp |> JSON(body, http_status.OK)

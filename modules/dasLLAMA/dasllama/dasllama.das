@@ -87,11 +87,17 @@ def prefix_attach(var cache : PrefixCache; var pool : KVPool; var session : Sess
     return prefix_attach_(cache, pool, session, prompt)
 }
 
-def prefix_insert(var cache : PrefixCache; var pool : KVPool; session : Session; tokens : array<int64>) {
+def prefix_insert(var cache : PrefixCache; var pool : KVPool; session : Session; tokens : array<int64>; preview : string = "") {
     //! Donate a finished session's KV pages to the cache. ``tokens`` is the session's full EVALED
-    //! history (only the first ``n_past`` rows exist); every full page not already cached is
-    //! registered and survives ``release_kv_pages``. Call right before releasing.
-    prefix_insert_(cache, pool, session, tokens)
+    //! history (only the first ``n_past`` rows exist); every full page not already cached survives
+    //! ``release_kv_pages``. ``preview`` labels the chain on the ``prefix_chain_list`` surface.
+    prefix_insert_(cache, pool, session, tokens, preview)
+}
+
+def prefix_chain_list(cache : PrefixCache) : array<PrefixChain> {
+    //! Snapshot of the cache's donated chains for dashboards: per donation — page-covered token
+    //! count, live pages, hit count, born/last-hit ticks, and the caller-provided preview.
+    return <- prefix_chain_list_(cache)
 }
 
 def prefix_release(var cache : PrefixCache; var pool : KVPool) {

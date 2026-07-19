@@ -459,5 +459,5 @@ def private donate_stream(m : Model; var sch : Scheduler; var st : Stream) {
         sch.donate_toks |> push(st.prompt[k])
     }
     sch.donate_toks |> push_from(st.session.recent, st.close_toks)
-    prefix_insert(sch.prefix, sch.pool, st.session, sch.donate_toks)
+    prefix_insert(sch.prefix, sch.pool, st.session, sch.donate_toks, st.prompt_head)
 }

@@ -253,6 +253,29 @@ def test_openai_server(t : T?) {
                     }
                 }
             }
+            // prefix-cache round trip: a >1-page completion donates its pages at reap; the SAME
+            // prompt re-sent attaches them without prefill (the TTFT-collapse demo's backing)
+            var long_prompt = ""
+            for (_i in range(12)) {
+                long_prompt += "The quick brown fox jumps over the lazy dog. "
+            }
+            let cache_body = "\{\"prompt\":\"{long_prompt}\",\"max_tokens\":4}"
+            POST("{base_url}/v1/completions", cache_body) $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+            }
+            POST("{base_url}/v1/completions", cache_body) $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+            }
+            GET("{base_url}/v1/stats") $(resp) {
+                var err : string
+                var js = read_json(string(resp.body), err)
+                if (js != null) {
+                    t |> success((js?["cached_tokens"] ?? 0l) > 0l, "re-sent prompt hit the prefix cache")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
             // GET /config — launcher-registered surface + live status (model picker, gpu badge)
             GET("{base_url}/config") $(resp) {
                 t |> equal(int(resp.status_code), int(http_status.OK))
@@ -318,6 +341,19 @@ def test_openai_server(t : T?) {
                     }
                     t |> success(saw_finished, "finished streams linger on the poll surface")
                     t |> success(saw_tail, "a finished stream carries generated text tail")
+                    var cache_rows = 0l
+                    var cache_hit = false
+                    var cache_preview = false
+                    if (js?["cache"] != null && ((js?["cache"]).value is _array)) {
+                        for (e in ((js?["cache"]).value as _array)) {
+                            cache_rows ++
+                            cache_hit = cache_hit || (e?["hits"] ?? 0l) > 0l
+                            cache_preview = cache_preview || !empty(string(e?["preview"] ?? ""))
+                        }
+                    }
+                    t |> success(cache_rows > 0l, "prefix-cache chains surfaced")
+                    t |> success(cache_hit, "a cache chain records its hit")
+                    t |> success(cache_preview, "a cache chain carries a detokenized preview")
                     unsafe {
                         delete js
                     }
