@@ -965,7 +965,7 @@ def cmd_update_all(root : string; is_global : bool = false) {
     var names : array<string>
     names |> reserve(length(lf.packages))
     for (entry in lf.packages) {
-        names |> push_clone(entry.name)
+        names |> push(entry.name)
     }
     var rc = 0
     for (name in names) {
@@ -1530,7 +1530,7 @@ def private ship_dep_assets(pkg_dir, bundle_modules_dir : string; var shipped : 
     var dep_files : array<string>
     glob_filtered(pkg_dir, dep_spec.include_globs, dep_spec.exclude_globs) $(rel_path, is_dir) {
         if (!is_dir) {
-            dep_files |> push_clone(rel_path)
+            dep_files |> push(rel_path)
         }
     }
     shipped |> reserve(length(shipped) + length(dep_files))
@@ -1551,7 +1551,7 @@ def private ship_dep_assets(pkg_dir, bundle_modules_dir : string; var shipped : 
     var dep_starter_files : array<string>
     glob_filtered(pkg_dir, dep_spec.include_if_missing_globs, dep_spec.exclude_globs) $(rel_path, is_dir) {
         if (!is_dir) {
-            dep_starter_files |> push_clone(rel_path)
+            dep_starter_files |> push(rel_path)
         }
     }
     var dep_starter_copies = 0
@@ -1664,7 +1664,7 @@ def list_lc_rpaths(path : string) : array<string> {
             let after = slice(s, 5)
             let off = find(after, " (offset")
             let p = (off >= 0 ? slice(after, 0, off) : after)
-            rpaths |> push_clone(p)
+            rpaths |> push(p)
             in_rpath = false
         } elif (starts_with(s, "Load command ")) {
             in_rpath = false
@@ -1757,7 +1757,7 @@ def private scrub_external_rpaths(path : string) {
         let e = strip(entry)
         if (empty(e)) continue
         if (starts_with(e, "$ORIGIN")) {
-            kept |> push_clone(e)
+            kept |> push(e)
         }
     }
     var op_out : string
@@ -2017,6 +2017,13 @@ def cmd_release(root : string; out_dir : string; tune_fast = false) : int {
         to_log(LOG_ERROR, "release: {das_package} has no release() hook, or release() didn't call release_main(<script.das>)\n")
         return 1
     }
+    if (spec.requires_jit) {
+        // release_requires_jit(): a baked -exe drops the per-box JIT kernels/tune (and can
+        // mis-wire shared-module [init] globals), so it would ship a broken binary. Deploy the
+        // app as `daslang -jit {spec.main_script}` instead.
+        to_log(LOG_ERROR, "release: {das_package} declares release_requires_jit() — this app is JIT-only and cannot be baked into a standalone -exe. Deploy it as: daslang -jit {spec.main_script}\n")
+        return 1
+    }
 
     // Pick bundle name: explicit release_name() > package_name() > root dir name.
     var pkg : PackageMeta
@@ -2046,7 +2053,7 @@ def cmd_release(root : string; out_dir : string; tune_fast = false) : int {
     var preserve_project_files : array<string>
     glob_filtered(root, spec.include_if_missing_globs, spec.exclude_globs) $(rel_path, is_dir) {
         if (!is_dir) {
-            preserve_project_files |> push_clone(rel_path)
+            preserve_project_files |> push(rel_path)
         }
     }
     // The macOS .app is wholly daspkg-owned: full wipe. A flat bundle dir is NOT — it
@@ -2186,7 +2193,7 @@ def cmd_release(root : string; out_dir : string; tune_fast = false) : int {
         }
         log("  ship: {e.rel}\n")
         finalize_shipped_binary(e.abs, dst, shipped, e.rel)
-        shipped |> push_clone(e.rel)
+        shipped |> push(e.rel)
     }
 
     // 2.5 Ship daslang runtime dylibs next to the exe. Without these the bundle
@@ -2275,7 +2282,7 @@ def cmd_release(root : string; out_dir : string; tune_fast = false) : int {
     var asset_files : array<string>
     glob_filtered(root, spec.include_globs, spec.exclude_globs) $(rel_path, is_dir) {
         if (!is_dir) {
-            asset_files |> push_clone(rel_path)
+            asset_files |> push(rel_path)
         }
     }
     shipped |> reserve(length(shipped) + length(asset_files))
@@ -2288,7 +2295,7 @@ def cmd_release(root : string; out_dir : string; tune_fast = false) : int {
             to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
             return 1
         }
-        shipped |> push_clone(rel_path)
+        shipped |> push(rel_path)
     }
     if (!empty(asset_files)) {
         log("  shipped {length(asset_files)} project asset file(s)\n")
@@ -2299,7 +2306,7 @@ def cmd_release(root : string; out_dir : string; tune_fast = false) : int {
     var starter_files : array<string>
     glob_filtered(root, spec.include_if_missing_globs, spec.exclude_globs) $(rel_path, is_dir) {
         if (!is_dir) {
-            starter_files |> push_clone(rel_path)
+            starter_files |> push(rel_path)
         }
     }
     var starter_copies = 0
@@ -2599,7 +2606,7 @@ def private release_one_wasm_app(root, out_dir, app_name, main_script : string;
     var asset_files : array<string>
     glob_filtered(root, include_globs, exclude_globs) $(rel_path, is_dir) {
         if (!is_dir) {
-            asset_files |> push_clone(rel_path)
+            asset_files |> push(rel_path)
         }
     }
     for (rel_path in asset_files) {
