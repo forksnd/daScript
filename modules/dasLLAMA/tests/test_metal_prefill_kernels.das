@@ -7,13 +7,11 @@ require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — the P
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — device/pipeline/buffer plumbing + the leak gate
 require math
 
-// The Phase-6 GPU prefill kernels vs their dasLLAMA CPU twins on synthetic data. Quantize gets a
-// bit-exact scenario (planted ±127 per 32-block makes every scale exactly 1.0, so quants are
-// round(x) of integer values) plus an arbitrary-data scenario (scales compare within tolerance;
-// quants may sit on a rounding boundary, so one quantum of slack). rmsnorm / rope / swiglu /
-// attention compare within the shared fp tolerance (reduction order, hardware exp vs the CPU's
-// exp/exp4 — all inside 1e-4 relative); the residual add is bit-exact (one fadd both sides).
-// Off-Apple (or with no Metal device) everything feints cleanly.
+// The Phase-6 GPU prefill kernels vs their dasLLAMA CPU twins on synthetic data. rmsnorm /
+// rope / swiglu / attention compare within the shared fp tolerance (reduction order, hardware
+// exp vs the CPU's exp/exp4 — all inside 1e-4 relative); the residual add is bit-exact (one
+// fadd both sides); the blob GEMV gets exact-arithmetic data (pow2 scales). Off-Apple (or with
+// no Metal device) everything feints cleanly.
 
 // attention shape: GQA with 2 queries per kv head, small enough to hand-oracle; NPOS is
 // deliberately NOT a 32-multiple (np32 = 64) so the padded-slab rails are exercised
@@ -31,10 +29,6 @@ let NROWS = 6
 let DIM = 128
 let HIDDEN = 64
 let EPS = 1.0e-5
-
-// quantize shape
-let QN = 64                             // row width (2 blocks)
-let QTOK = 5
 
 def private approx(x, y : float) : bool {
     return abs(x - y) <= 1e-4 * max(1.0, max(abs(x), abs(y)))
@@ -206,65 +200,6 @@ def test_metal_prefill_kernels(t : T?) {
                 }
                 var queue = metal_new_command_queue(dev)
                 var err : string
-
-                // ===== quantize: exact scenario (planted ±127 -> d == 1.0) =====
-                var pso_quant = pipeline_from_source(dev, metal_q8_quant_msl, metal_q8_quant_msl_entry, metal_q8_quant_msl_fastmath, err)
-                t |> success(pso_quant != null, "quant pipeline: {err}")
-                var qx : array<float>
-                qx |> resize(QTOK * QN)
-                for (k in range(QTOK * QN)) {
-                    qx[k] = float(k * 37 % 231 - 115)           // integers in [-115, 115]
-                }
-                for (b in range(QTOK * QN / 32)) {
-                    qx[b * 32 + b % 32] = (b % 2 == 0) ? 127.0 : -127.0     // plant the amax
-                }
-                var want_q : array<int8>
-                var want_s : array<float>
-                want_q |> resize(QTOK * QN)
-                want_s |> resize(QTOK * QN / 32)
-                quantize_q8_0_into(qx, int64(QTOK * QN), want_q, want_s, 0l, 0l)    // one flat row == same per-32-block math
-                var bqx = buf_upload(dev, qx)
-                var bxq = buf_fill(dev, QTOK * QN, int8(0))
-                var bxs = buf_fill(dev, QTOK * QN / 32, 0.0)
-                var bqn = buf_u32(dev, uint(QN))
-                var bqblk = buf_u32(dev, uint(QTOK * QN / 32))
-                var qbufs <- [bqx, bxq, bxs, bqn, bqblk]
-                let qran = run_compute_1d(queue, pso_quant, qbufs, uint(QTOK * QN / 32), 64u, err)
-                t |> success(qran, "quant dispatch: {err}")
-                t |> equal(buf_mismatch_exact(bxq, want_q), 0)      // d == 1.0: quants bit-exact
-                t |> equal(buf_mismatch_exact(bxs, want_s), 0)      // scales exactly 1.0 both sides
-                // arbitrary data: scales within tolerance, quants within one rounding quantum
-                for (k in range(QTOK * QN)) {
-                    qx[k] = 0.37 * float(k % 53) - 9.5 + 0.013 * float(k % 7)
-                }
-                quantize_q8_0_into(qx, int64(QTOK * QN), want_q, want_s, 0l, 0l)
-                buf_store(bqx, qx)
-                let qran2 = run_compute_1d(queue, pso_quant, qbufs, uint(QTOK * QN / 32), 64u, err)
-                t |> success(qran2, "quant dispatch 2: {err}")
-                let got_q <- buf_download(bxq, QTOK * QN, type<int8>)
-                let got_s <- buf_download(bxs, QTOK * QN / 32, type<float>)
-                var bad = 0
-                for (k in range(QTOK * QN)) {
-                    if (abs(int(got_q[k]) - int(want_q[k])) > 1) {
-                        bad++
-                    }
-                }
-                for (k in range(QTOK * QN / 32)) {
-                    if (!approx(got_s[k], want_s[k])) {
-                        bad++
-                    }
-                }
-                t |> equal(bad, 0)
-                qbufs |> clear()
-                unsafe {
-                    delete qbufs
-                }
-                metal_release(bqx)
-                metal_release(bxq)
-                metal_release(bxs)
-                metal_release(bqn)
-                metal_release(bqblk)
-                metal_release(pso_quant)
 
                 // ===== rmsnorm =====
                 var pso_rms = pipeline_from_source(dev, metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, err)

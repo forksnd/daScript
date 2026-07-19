@@ -370,7 +370,10 @@ what it costs today and what the fix would change.
   the batch qkv site's split-K stands down (its reduce writes contiguous y — plain GemmB
   serves per-segment), the B<=4 unfused single-decode qkv/w13 cats became per-tensor
   dispatches (~2 extra dispatches/layer on those rails), and the legacy quantized-X
-  prefill rail is dead (blob forces mul_mm) pending its deletion sweep.
+  prefill rail is DELETED (the `!mm` serving arms, the fused add+rms+quant/swiglu+quant/
+  rope_qk kernels + PSOs, enc_gemm, and the X-quant pools — ~350 lines; the mulmm_legacy
+  knob survives as the required-mode forced-decline test switch, and dasllama_math_metal's
+  planar GEMM donor is untouched — it serves CPU-flavor models' batch offload).
 
 - **QK-norm rope-store fusion — the f16 single-stream H-form SHIPPED (wave A chase round 2);
   the rest of the family is the residual (2026-07-17).** MetalRopeStoreHF16 folds bias +
