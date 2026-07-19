@@ -25,7 +25,7 @@ def parity_refresh : bool {
 def save_ref_ids(path : string; ids : array<int64>) {
     fopen(path, "wb") $(f) {
         if (f == null) {
-            print("cannot write ref cache {path}\n")
+            to_log(LOG_ERROR, "cannot write ref cache {path}\n")
             return
         }
         fwrite(f, build_string() $(var w) {
@@ -63,7 +63,7 @@ def load_ref_ids(path : string; var ids : array<int64>) : bool {
 def save_ref_vals(path : string; vals : array<float>) {
     fopen(path, "wb") $(f) {
         if (f == null) {
-            print("cannot write ref cache {path}\n")
+            to_log(LOG_ERROR, "cannot write ref cache {path}\n")
             return
         }
         var at = 0
