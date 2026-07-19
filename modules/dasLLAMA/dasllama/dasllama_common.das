@@ -611,6 +611,19 @@ def finalize(var t : Model) {
     }
 }
 
+//! Resident weight bytes across every plane family (only the loaded quant's planes are
+//! non-empty; a mapped .dlim's borrowed views count their mapped extent).
+def model_weights_bytes(t : Model) : int64 {
+    // long_length throughout: big-model planes exceed INT_MAX elements (a 35B Q4_K plane is > 2 GB)
+    return (long_length(t.fblob) * 4l + long_length(t.wblob) * 4l
+        + long_length(t.qblob) + long_length(t.qscales) * 4l + long_length(t.qscales16) * 2l
+        + long_length(t.q4blob) + long_length(t.q4scales) * 4l
+        + long_length(t.mxq) + long_length(t.mxs)
+        + long_length(t.bf16blob) * 2l
+        + long_length(t.k4q) + long_length(t.k4s) + long_length(t.k5q) + long_length(t.k5s)
+        + long_length(t.k6q) + long_length(t.k6s) + long_length(t.q40q) + long_length(t.q40s))
+}
+
 // ===== Arch registry: per-architecture blocks + chat template =====
 
 //! A chat-template part: literal `text`, a `special`-token spelling (the chat layer resolves it to an
@@ -1677,17 +1690,34 @@ def private moe_gpu_gather_upload(t : Model; f : KqFmt; woff : int64; n, rows, s
 def moe_gpu_upload_resident(var t : Model) {
     set_moe_gpu_from_layer(t.config.n_layers)   // nothing resident until an upload lands
     set_moe_gpu_stream_from(t.config.n_layers)
+    set_moe_gpu_total_layers(t.config.n_layers)
     set_moe_gpu_cls_off(-1l)
     reset_moe_gpu_dense_offs()
     reset_moe_gpu_dn_layers()
     reset_moe_gpu_attn_layers()
-    // mx4/biased expert stacks never dispatch on the GPU, so they never upload either
-    let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
-    let dn_want = get_env_variable("DASLLAMA_GPU_DN") == "1"
-    let at_want = get_env_variable("DASLLAMA_GPU_ATTN") == "1"
-    if (t.quant != QuantMode.q8 || t.config.n_expert <= 0l
-            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want)
-            || t.experts_mx4 || t.config.moe_exps_bias) {
+    set_moe_gpu_model_support("")
+    let nstream = gpu_want_moe_stream()
+    let dn_want = gpu_want_dn()
+    let at_want = gpu_want_attn()
+    if (!moe_gpu_tier_installed()
+            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want)) {
+        return   // tier absent or nothing requested
+    }
+    // capability guard: the tier serves q8-mode MoE models only — record WHY for the status
+    // surface when it is armed but this model cannot ride it
+    var reason = ""
+    if (t.quant != QuantMode.q8) {
+        reason = "GPU tier needs q8 serving mode"
+    } elif (t.config.n_expert <= 0l) {
+        reason = "dense-only architecture — the GPU tier serves MoE models today"
+    } elif (t.experts_mx4) {
+        reason = "mx4 expert planes are not tier-servable"
+    } elif (t.config.moe_exps_bias) {
+        reason = "biased expert stacks are not tier-servable"
+    }
+    if (!empty(reason)) {
+        set_moe_gpu_model_support(reason)
+        to_log(LOG_WARNING, "dasLLAMA: GPU tier armed but idle — {reason}\n")
         return
     }
     let ts_gpu = ref_time_ticks()
@@ -1712,10 +1742,10 @@ def moe_gpu_upload_resident(var t : Model) {
             && moe_gpu_gather_upload(t, cls_fmt, t.wcls_off, dim, t.config.vocab_size, t.config.vocab_size, mr, kgroup, wbias, wq, ws)) {
         set_moe_gpu_cls_off(t.wcls_off)
     }
-    // dense (attention-side) planes second — DASLLAMA_GPU_DENSE=1 opt-in. Arch-agnostic: recurrent
-    // layers carry the deltanet triple, attention layers the q/o pair (k/v stay CPU — small).
+    // dense (attention-side) planes second — DASLLAMA_GPU_DENSE=1 / gpu_dense opt-in. Arch-agnostic:
+    // recurrent layers carry the deltanet triple, attention layers the q/o pair (k/v stay CPU — small).
     // Layer-ascending; each successful upload marks its plane, a budget stop ends the walk.
-    if (get_env_variable("DASLLAMA_GPU_DENSE") == "1") {
+    if (gpu_want_dense()) {
         var dense_marked = 0l
         var dense_stop = false
         for (l in range64(layers)) {
@@ -3152,6 +3182,19 @@ struct KVPool {
     vblobs : array<array<uint8>>
     free_groups : array<int>     // LIFO free list
     refcnt : array<int>          // per group; 0/1 today (the prefix cache bumps it later)
+}
+
+//! Allocated KV pool bytes (capacity, not just referenced pages) — the sum of every blob's
+//! K and V backing arrays. Empty (0) for flat serving, where KV lives inside each session.
+def kv_pool_bytes(pool : KVPool) : int64 {
+    var total = 0l
+    for (kb in pool.kblobs) {
+        total += long_length(kb)   // a grown blob can exceed INT_MAX bytes on big-ctx models
+    }
+    for (vb in pool.vblobs) {
+        total += long_length(vb)
+    }
+    return total
 }
 
 //! Per-step scratch buffers and the KV cache (allocated once, reused every token).

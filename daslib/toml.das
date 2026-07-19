@@ -26,6 +26,7 @@ module toml shared public
 //! return ``null`` with a descriptive message in the ``error`` out-param,
 //! matching ``daslib/json::read_json``.
 
+require math
 require strings
 require daslib/strings_boost
 require daslib/utf8_utils
@@ -1417,4 +1418,246 @@ def public read_toml(text : string implicit; var error : string&) : JsonValue? {
         }
     }
     return state.root
+}
+
+// ---------------------------------------------------------------------------
+// TOML writer
+// ---------------------------------------------------------------------------
+
+def private write_toml_string(var writer : StringBuilderWriter; s : string) {
+    // hand-rolled escaper: builtin escapeString emits \v (illegal in TOML) and leaves 0x7f raw
+    write_char(writer, '"')
+    peek_data(s) $(bytes) {
+        for (b in bytes) {
+            let c = int(b)
+            if (c == '"') {
+                write(writer, "\\\"")
+            } elif (c == '\\') {
+                write(writer, "\\\\")
+            } elif (c == 8) {
+                write(writer, "\\b")
+            } elif (c == 9) {
+                write(writer, "\\t")
+            } elif (c == 10) {
+                write(writer, "\\n")
+            } elif (c == 12) {
+                write(writer, "\\f")
+            } elif (c == 13) {
+                write(writer, "\\r")
+            } elif (c < 32 || c == 127) {
+                let hi = (c >> 4) & 15
+                let lo = c & 15
+                write(writer, "\\u00")
+                write_char(writer, hi < 10 ? '0' + hi : 'a' + hi - 10)
+                write_char(writer, lo < 10 ? '0' + lo : 'a' + lo - 10)
+            } else {
+                write_char(writer, c)
+            }
+        }
+    }
+    write_char(writer, '"')
+}
+
+def private write_toml_key(var writer : StringBuilderWriter; k : string) {
+    var bare = !empty(k)
+    peek_data(k) $(bytes) {
+        for (b in bytes) {
+            if (!is_bare_char(int(b))) {
+                bare = false
+            }
+        }
+    }
+    if (bare) {
+        write(writer, k)
+    } else {
+        write_toml_string(writer, k)
+    }
+}
+
+def private write_section_header(var writer : StringBuilderWriter; path : array<string>; dbl : bool) {
+    write(writer, dbl ? "[[" : "[")
+    for (i in range(length(path))) {
+        if (i > 0) {
+            write_char(writer, '.')
+        }
+        write_toml_key(writer, path[i])
+    }
+    write(writer, dbl ? "]]\n" : "]\n")
+}
+
+def private write_toml_float(var writer : StringBuilderWriter; v : double) {
+    if (is_nan(v)) {
+        write(writer, "nan")
+    } elif (v == DBL_POS_INF) {
+        write(writer, "inf")
+    } elif (v == DBL_NEG_INF) {
+        write(writer, "-inf")
+    } elif (v != 0.0lf && (abs(v) < 1e-4lf || abs(v) >= 1e17lf)) {
+        // exponent form: fixed-point truncates tiny magnitudes (|v| < ~1e-17 becomes 0.0)
+        var m = fmt(":.17e", v)
+        let e = find(m, "e")
+        if (e > 0) {
+            var mant = slice(m, 0, e) |> rtrim("0")
+            if (mant |> ends_with(".")) {
+                mant += "0"
+            }
+            m = mant + slice(m, e)
+        }
+        write(writer, m)
+    } else {
+        // keep a trailing digit after '.' so the value re-reads as a float, not an integer
+        let base = fmt(":.17f", v) |> rtrim("0")
+        write(writer, base)
+        if (base |> ends_with(".")) {
+            write_char(writer, '0')
+        }
+    }
+}
+
+def private is_table_array(v : JsonValue?) : bool {
+    if (v == null || !(v.value is _array) || empty(v.value as _array)) {
+        return false
+    }
+    for (e in v.value as _array) {
+        if (e == null || !(e.value is _object)) {
+            return false
+        }
+    }
+    return true
+}
+
+def private sorted_keys(tab : table<string; JsonValue?>) : array<string> {
+    var ks : array<string>
+    ks |> reserve(length(tab))
+    for (k in keys(tab)) {
+        ks |> push(k)
+    }
+    ks |> sort() $(a, b) => a < b
+    return <- ks
+}
+
+def private write_toml_inline(var writer : StringBuilderWriter; v : JsonValue?; var path : array<string>; var error : string&) : bool {
+    if (v == null || v.value is _null) {
+        error = "TOML has no null: key '{join(path, ".")}'"
+        return false
+    }
+    if (v.value is _string) {
+        write_toml_string(writer, v.value as _string)
+    } elif (v.value is _longint) {
+        write(writer, v.value as _longint)
+    } elif (v.value is _number) {
+        write_toml_float(writer, v.value as _number)
+    } elif (v.value is _bool) {
+        write(writer, (v.value as _bool) ? "true" : "false")
+    } elif (v.value is _array) {
+        write_char(writer, '[')
+        var idx = 0
+        path |> push("")
+        for (e in v.value as _array) {
+            if (idx > 0) {
+                write(writer, ", ")
+            }
+            path[length(path) - 1] = "{idx}"
+            if (!write_toml_inline(writer, e, path, error)) {
+                return false
+            }
+            idx++
+        }
+        path |> pop()
+        write_char(writer, ']')
+    } elif (v.value is _object) {
+        write_char(writer, '{')
+        var first = true
+        path |> push("")
+        for (k in sorted_keys(v.value as _object)) {
+            write(writer, first ? " " : ", ")
+            first = false
+            write_toml_key(writer, k)
+            write(writer, " = ")
+            path[length(path) - 1] = k
+            if (!write_toml_inline(writer, (v.value as _object)?[k] ?? null, path, error)) {
+                return false
+            }
+        }
+        path |> pop()
+        write(writer, first ? "}" : " }")
+    } else {
+        error = "unsupported value at '{join(path, ".")}'"
+        return false
+    }
+    return true
+}
+
+def private write_toml_table(var writer : StringBuilderWriter; tab : table<string; JsonValue?>; var path : array<string>; var error : string&; var wrote : bool&) : bool {
+    let ks <- sorted_keys(tab)
+    for (k in ks) {
+        let e = tab?[k] ?? null
+        continue if ((e != null && (e.value is _object)) || is_table_array(e))
+        write_toml_key(writer, k)
+        write(writer, " = ")
+        path |> push(k)
+        if (!write_toml_inline(writer, e, path, error)) {
+            return false
+        }
+        path |> pop()
+        write_char(writer, '\n')
+        wrote = true
+    }
+    for (k in ks) {
+        let e = tab?[k] ?? null
+        if (e == null || !(e.value is _object)) {
+            continue
+        }
+        path |> push(k)
+        if (wrote) {
+            write_char(writer, '\n')
+        }
+        write_section_header(writer, path, false)
+        wrote = true
+        if (!write_toml_table(writer, e.value as _object, path, error, wrote)) {
+            return false
+        }
+        path |> pop()
+    }
+    for (k in ks) {
+        let e = tab?[k] ?? null
+        continue if (!is_table_array(e))
+        path |> push(k)
+        for (el in e.value as _array) {
+            if (wrote) {
+                write_char(writer, '\n')
+            }
+            write_section_header(writer, path, true)
+            wrote = true
+            if (!write_toml_table(writer, el.value as _object, path, error, wrote)) {
+                return false
+            }
+        }
+        path |> pop()
+    }
+    return true
+}
+
+def public write_toml(root : JsonValue?; var error : string&) : string {
+    //! Serializes a ``read_toml``-shaped tree back to TOML 1.0 text: keys sorted per table,
+    //! sub-tables as ``[a.b]`` sections, all-table arrays as ``[[a.b]]``. Date-times round-trip
+    //! as quoted strings (the tree has no date type). Nulls are unrepresentable → ``""`` + ``error``.
+    error = ""
+    if (root == null || !(root.value is _object)) {
+        error = "TOML document must be a table"
+        return ""
+    }
+    var ok = true
+    let st = build_string() $(var writer) {
+        var path : array<string>
+        var wrote = false
+        ok = write_toml_table(writer, root.value as _object, path, error, wrote)
+    }
+    return ok ? st : ""
+}
+
+def public write_toml(root : JsonValue?) : string {
+    //! ``write_toml`` without the error out-param — returns ``""`` on unrepresentable input.
+    var err = ""
+    return write_toml(root, err)
 }

@@ -1521,6 +1521,134 @@ def public set_moe_gpu_attn_route(on : bool) {
     g_moe_gpu_attn_route = on
 }
 
+// ===== GPU tier programmatic config + status =====
+// The setter mirror of the DASLLAMA_GPU_* env vars (env stays the override) plus the status
+// surface dashboards read — what is actually resident after a load, not what was requested.
+
+//! Programmatic GPU tier request — the config-file mirror of the ``DASLLAMA_GPU_*`` env vars
+//! (an env var present in the environment overrides its field). Set BEFORE ``load_model``,
+//! then call ``moe_gpu_tier_arm`` so a backend can install its hooks.
+struct GpuTierWant {
+    moe_layers : int64   //!< resident expert-stack layers K, offloaded from the end
+    moe_stream : int64   //!< streamed prefill layers S below the resident set
+    vram_mb : int64      //!< resident-weight VRAM cap override in MB (0 = query the device)
+    dn : bool            //!< recurrent (deltanet) layers through the device chain
+    attn : bool          //!< full-attention layers through the device chain
+    dense : bool         //!< dense attention-side planes resident
+}
+
+var g_gpu_want = GpuTierWant()
+var g_moe_gpu_backend = ""            // name registered with the arm hook ("vulkan")
+var g_moe_gpu_unsupported = ""        // loader contract: why the loaded model can't ride the armed tier
+var g_moe_gpu_total_layers = 0l       // loader contract: n_layers of the loaded model (status math)
+
+def private moe_gpu_no_arm : bool => false
+def private moe_gpu_no_vram : int64 => 0l
+def private moe_gpu_no_device : string => ""
+var g_moe_gpu_arm = @@moe_gpu_no_arm
+var g_moe_gpu_vram_report = @@moe_gpu_no_vram
+var g_moe_gpu_device_report = @@moe_gpu_no_device
+
+def public set_gpu_tier_want(want : GpuTierWant) {
+    g_gpu_want = want
+}
+
+def private env_int64(name : string) : int64 => int64(to_int(get_env_variable(name)))
+
+//! Effective tier request, env-else-programmatic — the load walk and the GPU backends read
+//! these instead of the raw env vars.
+def public gpu_want_moe_layers : int64
+    => has_env_variable("DASLLAMA_GPU_MOE_LAYERS") ? env_int64("DASLLAMA_GPU_MOE_LAYERS") : g_gpu_want.moe_layers
+
+def public gpu_want_moe_stream : int64
+    => has_env_variable("DASLLAMA_GPU_MOE_STREAM") ? env_int64("DASLLAMA_GPU_MOE_STREAM") : g_gpu_want.moe_stream
+
+def public gpu_want_vram_mb : int64
+    => has_env_variable("DASLLAMA_GPU_VRAM_MB") ? env_int64("DASLLAMA_GPU_VRAM_MB") : g_gpu_want.vram_mb
+
+def public gpu_want_dn : bool
+    => has_env_variable("DASLLAMA_GPU_DN") ? get_env_variable("DASLLAMA_GPU_DN") == "1" : g_gpu_want.dn
+
+def public gpu_want_attn : bool
+    => has_env_variable("DASLLAMA_GPU_ATTN") ? get_env_variable("DASLLAMA_GPU_ATTN") == "1" : g_gpu_want.attn
+
+def public gpu_want_dense : bool
+    => has_env_variable("DASLLAMA_GPU_DENSE") ? get_env_variable("DASLLAMA_GPU_DENSE") == "1" : g_gpu_want.dense
+
+//! A GPU backend registers its arm probe here at ``[init]`` so config-driven arming works
+//! after module init (the env path arms at ``[init]`` directly).
+def public set_moe_gpu_arm(name : string; f : function<() : bool>) {
+    g_moe_gpu_backend = name
+    g_moe_gpu_arm = f
+}
+
+//! (Re-)arm the GPU tier from the current want. False = no GPU backend in this build,
+//! nothing requested, or the device probe failed.
+def public moe_gpu_tier_arm : bool {
+    return invoke(g_moe_gpu_arm)
+}
+
+//! The tier reports its resident VRAM bytes through this hook (registered beside the arm probe).
+def public set_moe_gpu_vram_report(f : function<() : int64>) {
+    g_moe_gpu_vram_report = f
+}
+
+//! The tier reports its device's marketing name through this hook ("" until the device exists).
+def public set_moe_gpu_device_report(f : function<() : string>) {
+    g_moe_gpu_device_report = f
+}
+
+def public moe_gpu_tier_installed : bool {
+    return g_moe_gpu_installed
+}
+
+//! Loader contract: total transformer layers of the loaded model (resident/streamed counts).
+def public set_moe_gpu_total_layers(n : int64) {
+    g_moe_gpu_total_layers = n
+}
+
+//! Loader contract: "" = the loaded model rides the armed tier; otherwise the human reason it
+//! cannot (reset per load; meaningless while the tier is unarmed).
+def public set_moe_gpu_model_support(reason : string) {
+    g_moe_gpu_unsupported = reason
+}
+
+//! Live GPU-tier status (the control-page badge): actual post-load residency and routing.
+struct GpuTierStatus {
+    backend : string          //!< tier backend name ("vulkan"); "" = no GPU tier installed
+    device : string           //!< GPU marketing name ("" until the device is created at first upload)
+    supported : bool          //!< tier installed AND the loaded model rides it
+    reason : string           //!< why not, when the tier is installed but ``supported`` is false
+    resident_layers : int64   //!< expert-stack layers resident (from the end)
+    streamed_layers : int64   //!< prefill-streamed layers below the resident set
+    dn_layers : int64         //!< recurrent layers running the device deltanet chain
+    attn_layers : int64       //!< full-attention layers running the device attention chain
+    dense_planes : int64      //!< dense attention-side planes resident
+    cls_resident : bool       //!< classifier plane resident
+    vram_bytes : int64        //!< resident weight bytes on the device
+}
+
+def public gpu_tier_status : GpuTierStatus {
+    if (!g_moe_gpu_installed) {
+        return GpuTierStatus(reason = "no GPU tier installed")
+    }
+    let total = g_moe_gpu_total_layers
+    let resident = total > 0l ? max(total - g_moe_gpu_from_layer, 0l) : 0l
+    let streamed = total > 0l ? max(min(g_moe_gpu_from_layer, total) - min(g_moe_gpu_stream_from, total), 0l) : 0l
+    return GpuTierStatus(
+        backend = g_moe_gpu_backend,
+        device = invoke(g_moe_gpu_device_report),
+        supported = empty(g_moe_gpu_unsupported),
+        reason = g_moe_gpu_unsupported,
+        resident_layers = resident,
+        streamed_layers = streamed,
+        dn_layers = int64(length(g_moe_gpu_dn_layers)),
+        attn_layers = int64(length(g_moe_gpu_attn_layers)),
+        dense_planes = int64(length(g_moe_gpu_dense_offs)),
+        cls_resident = g_moe_gpu_cls_off >= 0l,
+        vram_bytes = invoke(g_moe_gpu_vram_report))
+}
+
 //! Upload one weight stack ([rows x n] at woff) as the GPU tier's row-major planes — q8 (fmt 0):
 //! int8 quants + f16 scales; native K-quant (k4/k5/k6): superblock payloads + decoded scale rows.
 //! stream = pinned host mirror for DMA streaming vs resident VRAM; false = tier absent/budget hit.

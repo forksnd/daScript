@@ -1,0 +1,1353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>dasllama-server</title>
+<!-- Functional control page. Styling is a placeholder in daslang.io "forge" tokens —
+     the designed version comes from the Claude Design "daslang.io Forge" project. -->
+<style>
+:root {
+    --bg: #0d0c0a; --bg-2: #15130f; --bg-3: #1c1a14;
+    --fg: #e8e2d2; --fg-dim: #9b9281; --fg-faint: #5b5547;
+    --rule: #2a2620; --amber: #e8a13a; --amber-dim: #a87420;
+    --green: #9bc46a; --red: #d96d4f; --blue: #6aa9c4;
+    --font-sans: "Inter Tight", "Inter", -apple-system, system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
+    color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: var(--font-sans); font-size: 14px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 28px 48px; }
+header {
+    display: flex; align-items: center; gap: 14px; height: 56px;
+    border-bottom: 1px solid var(--rule); margin-bottom: 24px;
+}
+.mark { display: flex; align-items: center; gap: 9px; font-family: var(--font-mono); font-size: 15px; font-weight: 600; }
+.mark svg { width: 20px; height: 20px; color: var(--amber); }
+.mark .tld { color: var(--fg-faint); font-weight: 400; }
+.model { font-family: var(--font-mono); font-size: 12.5px; color: var(--fg-dim); }
+.spacer { flex: 1; }
+.badge {
+    font-family: var(--font-mono); font-size: 10px; font-weight: 600; letter-spacing: 0.6px;
+    text-transform: uppercase; padding: 2px 8px; border-radius: 3px; border: 1px solid var(--rule);
+    display: inline-flex; align-items: center; gap: 6px;
+}
+.badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--fg-faint); }
+.badge.ok    { border-color: var(--green); color: var(--green); }  .badge.ok::before    { background: var(--green); }
+.badge.warn  { border-color: var(--amber); color: var(--amber); }  .badge.warn::before  { background: var(--amber); }
+.badge.err   { border-color: var(--red);   color: var(--red); }    .badge.err::before   { background: var(--red); }
+.uptime { font-family: var(--font-mono); font-size: 12px; color: var(--fg-faint); }
+
+.hw { font-family: var(--font-mono); font-size: 11px; color: var(--fg-faint); margin: -14px 0 18px; }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.tile { background: var(--bg-2); border: 1px solid var(--rule); border-radius: 6px; padding: 12px 14px; }
+.tile .n { font-family: var(--font-mono); font-size: 22px; color: var(--fg); white-space: nowrap; }
+.tile.sm .n { font-size: 15px; line-height: 1.9; }
+.tile .l { font-family: var(--font-mono); font-size: 11px; color: var(--fg-faint); margin-top: 2px; }
+.tile.hide { display: none; }
+
+.sec {
+    display: flex; align-items: center; gap: 12px; margin: 28px 0 12px;
+    font-family: var(--font-mono); font-size: 11.5px; color: var(--amber);
+    text-transform: uppercase; letter-spacing: 1.4px;
+}
+.sec .rule { width: 36px; height: 1px; background: var(--amber-dim); }
+
+.panel { background: var(--bg-2); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; }
+.charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 760px) { .charts { grid-template-columns: 1fr; } }
+.chart-title { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-dim); margin-bottom: 6px; display: flex; justify-content: space-between; }
+.chart-now { color: var(--fg); }
+canvas { width: 100%; height: 96px; display: block; cursor: crosshair; }
+.legend { display: flex; gap: 14px; margin-top: 6px; font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dim); }
+.legend i { display: inline-block; width: 10px; height: 2px; vertical-align: middle; margin-right: 5px; }
+.tip {
+    position: fixed; pointer-events: none; display: none; z-index: 10;
+    background: var(--bg-3); border: 1px solid var(--rule); border-radius: 4px;
+    font-family: var(--font-mono); font-size: 11px; color: var(--fg); padding: 4px 8px;
+}
+
+.cfg { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-faint); line-height: 1.7; }
+.cfg b { color: var(--fg-dim); font-weight: 400; }
+
+.sec .spacer { flex: 1; }
+button.mini {
+    font-size: 10.5px; padding: 3px 10px; text-transform: uppercase; letter-spacing: 0.6px;
+    color: var(--fg-dim);
+}
+button.mini.on { border-color: var(--amber); color: var(--amber); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.scard { background: var(--bg-2); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; }
+.scard .head {
+    display: flex; gap: 10px; align-items: baseline; font-family: var(--font-mono);
+    font-size: 11px; color: var(--fg-dim); margin-bottom: 6px;
+}
+.scard .head .st { text-transform: uppercase; letter-spacing: 0.5px; font-size: 9.5px; }
+.scard .head .st.prefilling { color: var(--blue); }
+.scard .head .st.decoding { color: var(--amber); }
+.scard .head .st.queued { color: var(--fg-faint); }
+.scard .head .st.finished { color: var(--green); }
+.scard .txt {
+    font-family: var(--font-mono); font-size: 11px; line-height: 1.55; color: var(--fg);
+    max-height: 130px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+}
+.scard .txt .ph { color: var(--fg-faint); }
+
+#a-wave { height: 80px; background: var(--bg-3); border: 1px solid var(--rule); border-radius: 4px; }
+.segs { margin-top: 8px; max-height: 180px; overflow-y: auto; }
+.segs .seg {
+    display: flex; gap: 12px; padding: 3px 8px; cursor: pointer; border-radius: 4px;
+    font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-dim);
+}
+.segs .seg:hover { background: var(--bg-3); color: var(--fg); }
+.segs .seg .tm { color: var(--fg-faint); white-space: nowrap; }
+.segs .seg.playing { background: var(--bg-3); color: var(--amber); }
+#a-rec.rec { border-color: var(--red); color: var(--red); }
+
+.chat-log { display: flex; flex-direction: column; gap: 10px; max-height: 420px; overflow-y: auto; margin-bottom: 12px; }
+.msg { max-width: 85%; padding: 8px 12px; border-radius: 8px; font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.msg.user { align-self: flex-end; background: var(--bg-3); border: 1px solid var(--amber-dim); }
+.msg.assistant { align-self: flex-start; background: var(--bg-3); border: 1px solid var(--rule); }
+.msg .think { font-family: Georgia, "Times New Roman", serif; font-style: italic; color: var(--fg-dim); }
+.msg .meta { display: block; font-family: var(--font-mono); font-size: 10px; color: var(--fg-faint); margin-top: 6px; }
+.chat-input { display: flex; gap: 10px; align-items: stretch; }
+.chat-input textarea {
+    flex: 1; font-family: var(--font-sans); font-size: 13.5px; color: var(--fg);
+    background: var(--bg-3); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 8px 10px; resize: vertical;
+}
+.chat-input textarea:focus { outline: none; border-color: var(--amber-dim); }
+.chat-btns { display: flex; flex-direction: column; gap: 6px; }
+.chat-btns button { padding: 6px 14px; font-size: 12px; }
+#b-mic.rec { border-color: var(--red); color: var(--red); }
+.knobs { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 12px; align-items: center; }
+.knobs .knob { display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-faint); }
+.knobs input[type="number"] {
+    width: 64px; font-family: var(--font-mono); font-size: 11.5px; color: var(--fg);
+    background: var(--bg-3); border: 1px solid var(--rule); border-radius: 4px; padding: 3px 6px;
+}
+
+.ctable { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 11.5px; }
+.ctable th {
+    text-align: left; font-weight: 400; font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.6px; color: var(--fg-faint); padding: 2px 10px 6px 0;
+}
+.ctable td { padding: 4px 10px 4px 0; border-top: 1px solid var(--rule); color: var(--fg-dim); }
+.ctable td.pv { color: var(--fg); max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctable td.hit { color: var(--green); }
+
+.gpu-line { font-family: var(--font-mono); font-size: 11.5px; margin-bottom: 12px; }
+.gpu-line .reason { color: var(--red); }
+.cfg-form {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 10px 14px; margin: 0;
+}
+.field { display: flex; flex-direction: column; gap: 3px; }
+.field label {
+    font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-faint);
+    display: flex; justify-content: space-between; align-items: baseline;
+}
+.field .src { font-size: 9px; letter-spacing: 0.5px; text-transform: uppercase; color: var(--fg-faint); }
+.field .src.cli { color: var(--blue); }
+.field .src.toml { color: var(--green); }
+.field input[type="text"], .field input[type="number"], .field select {
+    font-family: var(--font-mono); font-size: 12.5px; color: var(--fg);
+    background: var(--bg-3); border: 1px solid var(--rule); border-radius: 4px;
+    padding: 6px 8px; width: 100%;
+}
+.field input:focus, .field select:focus { outline: none; border-color: var(--amber-dim); }
+.field.wide { grid-column: 1 / -1; }
+.field.check { flex-direction: row; align-items: center; gap: 8px; }
+.field.check label { flex: 1; }
+.cfg-actions { display: flex; gap: 12px; align-items: center; margin-top: 16px; }
+.cfg-file { font-family: var(--font-mono); font-size: 11px; color: var(--fg-faint); margin-top: 10px; }
+
+.reveal { margin-top: 20px; }
+.reveal p { font-size: 13px; line-height: 1.65; color: var(--fg-dim); max-width: 76ch; }
+.reveal a { color: var(--amber); text-decoration: none; }
+.reveal a:hover { text-decoration: underline; }
+.reveal code { font-family: var(--font-mono); font-size: 12px; color: var(--fg); }
+
+.controls { display: flex; gap: 12px; align-items: center; }
+button {
+    font-family: var(--font-mono); font-size: 13px; padding: 10px 16px; border-radius: 5px;
+    cursor: pointer; background: none; border: 1px solid var(--rule); color: var(--fg);
+}
+button:hover { border-color: var(--amber-dim); }
+button.danger { border-color: var(--red); color: var(--red); }
+button.danger:hover { background: rgba(217, 109, 79, 0.10); }
+button:disabled { opacity: 0.45; cursor: default; }
+.ctl-note { font-family: var(--font-mono); font-size: 11px; color: var(--fg-faint); }
+</style>
+</head>
+<body>
+<div class="wrap">
+    <header>
+        <span class="mark">
+            <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path fill="currentColor" d="M 19,2 C 6.848484,12.699956 12.591844,7.4593088 6.8243462,13.056243 16.852307,10.274014 6.8079126,19.737584 5,22 L 17.120536,11.596175 C 6.7139271,14.121239 17.627482,3.775356 19,2 Z m -7,1 c -5,0 -9,4 -9,9 0,2.5 0.9875,4.80625 2.6875,6.40625 L 7.09375,17 C 5.79375,15.8 5,14 5,12 5,8.1 8.1,5 12,5 12.4,5 12.69375,4.99375 13.09375,5.09375 L 14.8125,3.40625 C 13.9125,3.20625 13,3 12,3 Z M 18.3125,5.59375 16.90625,7 C 18.20625,8.2 19,10 19,12 c 0,3.9 -3.1,7 -7,7 -0.4,0 -0.69375,0.0063 -1.09375,-0.09375 L 9.1875,20.59375 C 10.0875,20.79375 11,21 12,21 c 5,0 9,-4 9,-9 0,-2.5 -0.9875,-4.80625 -2.6875,-6.40625 z"/></svg>
+            <span>dasllama</span><span class="tld">-server</span>
+        </span>
+        <span class="model" id="model">…</span>
+        <span class="spacer"></span>
+        <span class="badge" id="badge">connecting</span>
+        <span class="uptime" id="uptime"></span>
+    </header>
+    <div class="hw" id="hw"></div>
+
+    <div class="tiles">
+        <div class="tile"><div class="n" id="t-tps">—</div><div class="l">gen tok/s</div></div>
+        <div class="tile"><div class="n" id="t-streams">—</div><div class="l">active / max streams</div></div>
+        <div class="tile"><div class="n" id="t-queued">—</div><div class="l">queued</div></div>
+        <div class="tile"><div class="n" id="t-gen">—</div><div class="l">tokens generated</div></div>
+        <div class="tile sm"><div class="n" id="t-req">—</div><div class="l">admitted / finished / evicted</div></div>
+        <div class="tile"><div class="n" id="t-batch">—</div><div class="l">avg decode batch</div></div>
+        <div class="tile sm"><div class="n" id="t-prefix">—</div><div class="l">prefix cache: tokens / pages</div></div>
+        <div class="tile sm"><div class="n" id="t-ttft">—</div><div class="l">ttft last / avg (ms)</div></div>
+        <div class="tile sm"><div class="n" id="t-mem">—</div><div class="l">weights + kv (GB)</div></div>
+        <div class="tile sm hide" id="tile-mtp"><div class="n" id="t-mtp">—</div><div class="l">mtp accepted / drafted</div></div>
+        <div class="tile hide" id="tile-asr"><div class="n" id="t-asr">—</div><div class="l">asr ready·active·pending</div></div>
+    </div>
+
+    <div class="sec"><span>§ 01</span><span class="rule"></span><span>live</span></div>
+    <div class="charts">
+        <div class="panel">
+            <div class="chart-title"><span>generation tok/s · last 2 min</span><span class="chart-now" id="c-tps-now"></span></div>
+            <canvas id="c-tps" height="96"></canvas>
+        </div>
+        <div class="panel">
+            <div class="chart-title"><span>prefill tok/s · last 2 min</span><span class="chart-now" id="c-pf-now"></span></div>
+            <canvas id="c-pf" height="96"></canvas>
+        </div>
+        <div class="panel">
+            <div class="chart-title"><span>stream slots · last 2 min</span><span class="chart-now" id="c-str-now"></span></div>
+            <canvas id="c-lane" height="96"></canvas>
+            <div class="legend"><span><i style="background:var(--amber-dim)"></i>prefill</span><span><i style="background:var(--amber)"></i>decode</span><span><i style="background:var(--blue)"></i>queued (count)</span></div>
+        </div>
+    </div>
+
+    <div class="sec"><span>§ 02</span><span class="rule"></span><span>streams</span>
+        <span class="spacer"></span>
+        <button class="mini" id="b-demo" type="button" title="staged ramp 1→2→4→8 concurrent chats from this page — watch the swimlane fill and tok/s stair-step">run demo load</button>
+        <button class="mini" id="b-live" type="button">live</button>
+        <button class="mini" id="b-history" type="button">history</button>
+    </div>
+    <div id="cards" class="cards"><div class="ctl-note" id="cards-empty">no active streams — POST a chat completion and watch it flow</div></div>
+    <div id="history" class="cards" style="display:none"><div class="ctl-note">nothing finished yet</div></div>
+
+    <div class="sec"><span>§ 03</span><span class="rule"></span><span>prefix cache</span></div>
+    <div class="panel">
+        <table class="ctable" id="ctable">
+            <thead><tr><th>cached conversation</th><th>tok</th><th>pages</th><th>hits</th><th>age</th><th>idle</th></tr></thead>
+            <tbody id="ctable-body"><tr><td colspan="6" class="ctl-note">nothing cached yet — finish a &gt;1-page prompt and re-send it to watch TTFT collapse</td></tr></tbody>
+        </table>
+    </div>
+
+    <div class="sec"><span>§ 04</span><span class="rule"></span><span>chat</span></div>
+    <div class="panel">
+        <div class="chat-log" id="chat-log"><div class="ctl-note">talk to the served model — the conversation lives in this page only</div></div>
+        <div class="chat-input">
+            <textarea id="chat-text" rows="2" placeholder="message the model — Enter sends, Shift+Enter for a newline"></textarea>
+            <div class="chat-btns">
+                <button id="b-mic" type="button" style="display:none" title="record, click again to stop + transcribe">● mic</button>
+                <button id="b-send" type="button">send</button>
+                <button id="b-chat-clear" type="button">clear</button>
+            </div>
+        </div>
+        <div class="knobs" id="knobs"></div>
+    </div>
+
+    <div class="asr-only" id="asr-section" style="display:none">
+        <div class="sec"><span>§ 05</span><span class="rule"></span><span>asr studio</span></div>
+        <div class="panel">
+            <div class="controls" style="margin-bottom:10px">
+                <button id="a-rec" type="button">● record</button>
+                <button id="a-upload" type="button">upload audio</button>
+                <input type="file" id="a-file" accept="audio/*" style="display:none"/>
+                <button id="a-run" type="button" disabled>vad + transcribe</button>
+                <span class="ctl-note" id="a-note">record or upload a clip, then run — speech spans overlay the waveform, segments play back on click</span>
+            </div>
+            <canvas id="a-wave" height="80" style="cursor:default"></canvas>
+            <div id="a-segs" class="segs"></div>
+            <div class="charts" style="margin-top:12px">
+                <div class="panel" style="background:var(--bg-3)">
+                    <div class="chart-title"><span>rtf per job · audio s / wall s</span><span class="chart-now" id="c-rtf-now"></span></div>
+                    <canvas id="c-rtf" height="72"></canvas>
+                </div>
+                <div class="panel" style="background:var(--bg-3)">
+                    <div class="chart-title"><span>asr jobs</span><span class="chart-now" id="a-cum"></span></div>
+                    <table class="ctable"><tbody id="a-jobs"><tr><td class="ctl-note">no jobs yet</td></tr></tbody></table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="sec"><span>§ 06</span><span class="rule"></span><span>config</span></div>
+    <div class="panel cfg" id="cfg">…</div>
+
+    <div class="sec"><span>§ 07</span><span class="rule"></span><span>config editor</span></div>
+    <div class="panel">
+        <div class="gpu-line" id="gpu-line" style="display:none"></div>
+        <form id="cfg-form" class="cfg-form"></form>
+        <datalist id="model-files"></datalist>
+        <div class="cfg-actions">
+            <button id="b-save" type="button">save config</button>
+            <button id="b-restart" class="danger" type="button">restart to apply</button>
+            <span class="ctl-note" id="cfg-note"></span>
+        </div>
+        <div class="cfg-file" id="cfg-file"></div>
+    </div>
+
+    <div class="sec"><span>§ 08</span><span class="rule"></span><span>controls</span></div>
+    <div class="panel controls">
+        <button id="b-gc" type="button">collect garbage</button>
+        <button id="b-drain" class="danger" type="button">drain + shutdown</button>
+        <span class="ctl-note" id="ctl-note">gc runs at the next lifecycle safe point · shutdown drains accepted work, then exits</span>
+    </div>
+
+    <footer class="reveal">
+        <div class="sec"><span>§ 09</span><span class="rule"></span><span>how this works</span></div>
+        <p>
+            Everything above — the tokenizer, every matmul kernel, the continuous-batching
+            scheduler, the paged KV cache, this HTTP server — is written in
+            <a href="https://daslang.io">daslang</a>, a statically-typed scripting language for
+            games. No PyTorch, no llama.cpp, no CUDA: the LLM engine — kernels, IR generators,
+            tokenizer, loaders — is ~26&#8239;000 lines of <code>.das</code>, JIT-compiled to
+            native code through LLVM at startup, with its hot kernels auto-tuned per box on
+            first run. The speech-recognition stack adds ~7&#8239;000, the Metal and Vulkan GPU
+            backends ~15&#8239;000, and the server, scheduler, and this page ~4&#8239;000 more.
+            The GPU tier offloads MoE expert stacks over Vulkan compute — hybrid by layer
+            <i>type</i>, not layer count.
+        </p>
+        <p>
+            Source: <a href="https://github.com/GaijinEntertainment/daScript">GaijinEntertainment/daScript</a>
+            — the engine lives in <code>modules/dasLLAMA</code>, this server in
+            <code>utils/dasllama-server</code>.
+        </p>
+    </footer>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const HIST = 120;                  // ~2 min at 1s polling
+const tps = [], pf = [];           // rolling series
+let last = null, lastT = 0, failures = 0;
+let restartingSince = 0;           // set when THIS page initiated a restart — keeps the badge honest
+                                   // through the relaunch blackout (big models load for minutes)
+
+function fmt(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + "b";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "m";
+    if (n >= 1e4) return (n / 1e3).toFixed(1) + "k";
+    return String(n);
+}
+function fmtUptime(s) {
+    const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+    return (d ? d + "d " : "") + (h ? h + "h " : "") + m + "m up";
+}
+function push(arr, v) { arr.push(v); if (arr.length > HIST) arr.shift(); }
+
+function setBadge(cls, text) { const b = $("badge"); b.className = "badge " + cls; b.textContent = text; }
+
+function apply(s) {
+    $("model").textContent = s.model + " · ctx " + fmt(s.ctx);
+    $("uptime").textContent = fmtUptime(s.uptime_s);
+    setBadge(s.draining ? "warn" : "ok", s.draining ? "draining" : "serving");
+    const now = performance.now();
+    let rate = 0, pfRate = 0;
+    if (last !== null && now > lastT) {
+        const dt = (now - lastT) / 1000;
+        rate = Math.max(0, (s.gen_tokens - last.gen_tokens) / dt);
+        pfRate = Math.max(0, ((s.prefill_tokens || 0) - (last.prefill_tokens || 0)) / dt);
+    }
+    push(tps, rate); push(pf, pfRate);
+    last = s; lastT = now;
+
+    $("t-tps").textContent = rate.toFixed(1);
+    $("t-streams").textContent = s.active + " / " + s.max_streams;
+    $("t-queued").textContent = String(s.queued);
+    $("t-gen").textContent = fmt(s.gen_tokens);
+    $("t-req").textContent = fmt(s.admitted) + " / " + fmt(s.finished) + " / " + fmt(s.evicted);
+    $("t-batch").textContent = s.avg_batch.toFixed(2);
+    $("t-prefix").textContent = fmt(s.cached_tokens) + " / " + fmt(s.prefix_pages);
+    $("t-ttft").textContent = s.ttft_avg_ms > 0
+        ? s.ttft_last_ms.toFixed(0) + " / " + s.ttft_avg_ms.toFixed(0)
+        : "—";
+    $("t-mem").textContent = (s.weights_bytes / 1e9).toFixed(1) + " + " + (s.kv_bytes / 1e9).toFixed(1);
+    $("hw").textContent = s.hardware || "";
+    if (s.mtp_drafted > 0) {
+        $("tile-mtp").classList.remove("hide");
+        $("t-mtp").textContent = fmt(s.mtp_accepted) + " / " + fmt(s.mtp_drafted) +
+            " (" + (100 * s.mtp_accepted / s.mtp_drafted).toFixed(0) + "%)";
+    }
+    if (s.asr_workers > 0) {
+        $("tile-asr").classList.remove("hide");
+        $("t-asr").textContent = s.asr_ready + " · " + s.asr_active + " · " + s.asr_pending;
+        if (micRec === null) $("b-mic").style.display = "";
+        $("asr-section").style.display = "block";
+    }
+    $("cfg").innerHTML =
+        "model <b>" + esc(s.model) + "</b> · ctx <b>" + s.ctx + "</b> · streams <b>" + s.max_streams + "</b>" +
+        " · prefill chunk <b>" + s.chunk_tokens + "</b> tok" +
+        " · peak active <b>" + s.peak_active + "</b> · decode steps <b>" + fmt(s.decode_steps) + "</b>" +
+        (s.asr_workers > 0 ? " · asr workers <b>" + s.asr_workers + "</b>" : "");
+    $("c-tps-now").textContent = rate.toFixed(1);
+    $("c-pf-now").textContent = pfRate.toFixed(0);
+    $("c-str-now").textContent = s.active + " active · " + s.queued + " queued";
+    draw($("c-tps"), [{ data: tps, color: css("--amber") }]);
+    draw($("c-pf"), [{ data: pf, color: css("--green") }]);
+}
+
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+// minimal line chart: recessive baseline grid, 2px series lines, shared max scale per canvas
+function draw(cv, series) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    const max = Math.max(1e-6, ...series.flatMap(s => s.data));
+    g.strokeStyle = css("--rule"); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, h - 0.5); g.lineTo(w, h - 0.5); g.stroke();          // baseline
+    g.beginPath(); g.moveTo(0, 0.5); g.lineTo(w, 0.5); g.globalAlpha = 0.5; g.stroke(); g.globalAlpha = 1;
+    for (const s of series) {
+        if (s.data.length < 2) continue;
+        g.strokeStyle = s.color; g.lineWidth = 2; g.lineJoin = "round"; g.beginPath();
+        for (let i = 0; i < s.data.length; i++) {
+            const x = (HIST - s.data.length + i) / (HIST - 1) * w;
+            const y = h - 3 - (s.data[i] / max) * (h - 8);
+            i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+        }
+        g.stroke();
+    }
+    cv._series = series; cv._max = max;
+}
+
+// crosshair tooltip: nearest sample, value(s) + age
+for (const id of ["c-tps", "c-pf"]) {
+    const cv = $(id);
+    cv.addEventListener("mousemove", e => {
+        const s = cv._series; if (!s || !s[0].data.length) return;
+        const r = cv.getBoundingClientRect();
+        const i = Math.round((e.clientX - r.left) / r.width * (HIST - 1)) - (HIST - s[0].data.length);
+        if (i < 0 || i >= s[0].data.length) { $("tip").style.display = "none"; return; }
+        const age = s[0].data.length - 1 - i;
+        $("tip").textContent = s.map(x => (+x.data[i].toFixed(1))).join(" · ") + "  −" + age + "s";
+        const t = $("tip"); t.style.display = "block";
+        t.style.left = (e.clientX + 12) + "px"; t.style.top = (e.clientY - 28) + "px";
+    });
+    cv.addEventListener("mouseleave", () => { $("tip").style.display = "none"; });
+}
+
+// ===== streams: swimlane + live cards + history =====
+const laneHist = [];              // per poll tick: { states: Uint8Array(maxLanes) 0=idle 1=prefill 2=decode, queued }
+const laneOf = new Map();         // stream id -> lane index
+const transcripts = new Map();    // stream id -> { head, text, info }
+const doneHist = [];              // finished: { id, finish, head, text, info } newest first
+const lastSeenAt = new Map();     // stream id -> pollTick (sweeps ids whose finished state we missed)
+let pollTick = 0;
+let maxLanes = 4;
+let historyDirty = false;
+
+function mergeTail(text, tail) {
+    if (!tail) return text;
+    for (let k = Math.min(text.length, tail.length); k > 0; k--) {
+        if (text.endsWith(tail.slice(0, k))) return text + tail.slice(k);
+    }
+    // no overlap: generation outran the capped tail between polls — mark the gap honestly
+    // instead of silently splicing (the server keeps only the last ~240-480 chars)
+    if (text) return text + " […] " + tail;
+    return tail;
+}
+
+function applyStreams(p, queued) {
+    maxLanes = Math.max(1, p.max_streams || maxLanes);
+    const active = p.streams.filter(s => s.state === "prefilling" || s.state === "decoding");
+    const finished = p.streams.filter(s => s.state === "finished");
+    // lane assignment: stable per id, lowest free lane on first sight
+    const used = new Set([...laneOf.values()]);
+    for (const s of active) {
+        if (!laneOf.has(s.id)) {
+            let lane = 0;
+            while (used.has(lane)) lane++;
+            if (lane < maxLanes) { laneOf.set(s.id, lane); used.add(lane); }
+        }
+    }
+    const states = new Uint8Array(maxLanes);
+    for (const s of active) {
+        const lane = laneOf.get(s.id);
+        if (lane !== undefined && lane < maxLanes) states[lane] = s.state === "prefilling" ? 1 : 2;
+    }
+    laneHist.push({ states, queued });
+    if (laneHist.length > HIST) laneHist.shift();
+    // transcripts: accumulate the tail growth client-side (reload loses history — accepted)
+    for (const s of active) {
+        const t = transcripts.get(s.id) || { head: s.prompt_head, text: "", info: s };
+        t.text = mergeTail(t.text, s.gen_tail);
+        t.info = s;
+        transcripts.set(s.id, t);
+    }
+    for (const s of finished) {
+        const t = transcripts.get(s.id);
+        if (t) {
+            t.text = mergeTail(t.text, s.gen_tail);
+            doneHist.unshift({ id: s.id, finish: s.finish, head: t.head, text: t.text, info: s });
+            if (doneHist.length > 20) doneHist.pop();
+            historyDirty = true;
+            transcripts.delete(s.id);
+            laneOf.delete(s.id);
+            lastSeenAt.delete(s.id);
+        }
+    }
+    // sweep ids whose finished state we never observed (throttled background tab: a stream can
+    // start AND age out of the server's 10 s linger between two polls) — without this the lane
+    // stays occupied forever and the transcripts Map grows without bound
+    pollTick++;
+    for (const s of p.streams) lastSeenAt.set(s.id, pollTick);
+    for (const [id, seen] of lastSeenAt) {
+        if (pollTick - seen > 30) {
+            const t = transcripts.get(id);
+            if (t) {
+                doneHist.unshift({ id, finish: "lost", head: t.head, text: t.text, info: t.info });
+                if (doneHist.length > 20) doneHist.pop();
+                historyDirty = true;
+            }
+            transcripts.delete(id);
+            laneOf.delete(id);
+            lastSeenAt.delete(id);
+        }
+    }
+    drawLanes();
+    renderCards(p.streams.filter(s => s.state === "queued"), active);
+    renderHistory();
+    renderCache(p.cache || []);
+    renderAsrJobs(p.asr || [], last);
+}
+
+function fmtAge(s) {
+    if (s >= 3600) return (s / 3600).toFixed(1) + "h";
+    if (s >= 60) return (s / 60).toFixed(1) + "m";
+    return s.toFixed(0) + "s";
+}
+
+let hadCache = false;
+
+function renderCache(entries) {
+    const body = $("ctable-body");
+    if (!entries.length) {
+        // keep the first-run hint; but a cache that DRAINED (LRU evictions) must not keep
+        // showing stale rows with frozen ages
+        if (hadCache) {
+            body.innerHTML = "<tr><td colspan=\"6\" class=\"ctl-note\">cache drained — all chains evicted</td></tr>";
+            hadCache = false;
+        }
+        return;
+    }
+    hadCache = true;
+    entries.sort((a, b) => a.age_s - b.age_s);
+    body.textContent = "";
+    for (const e of entries) {
+        const tr = document.createElement("tr");
+        const pv = document.createElement("td");
+        pv.className = "pv";
+        pv.textContent = e.preview || "(untitled donation)";
+        tr.append(pv);
+        for (const [v, cls] of [[fmt(e.tokens), ""], [String(e.pages), ""],
+                                [String(e.hits), e.hits > 0 ? "hit" : ""],
+                                [fmtAge(e.age_s), ""], [fmtAge(e.idle_s), ""]]) {
+            const td = document.createElement("td");
+            if (cls) td.className = cls;
+            td.textContent = v;
+            tr.append(td);
+        }
+        body.append(tr);
+    }
+}
+
+function drawLanes() {
+    const cv = $("c-lane"), dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    const rowH = Math.min(16, (h - 4) / maxLanes), cellW = w / (HIST - 1);
+    const colors = [null, css("--amber-dim"), css("--amber")];
+    g.strokeStyle = css("--rule"); g.lineWidth = 1;
+    for (let l = 0; l <= maxLanes; l++) {
+        const y = Math.round(l * rowH) + 0.5;
+        g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.globalAlpha = 0.4; g.stroke(); g.globalAlpha = 1;
+    }
+    for (let i = 0; i < laneHist.length; i++) {
+        const x = (HIST - laneHist.length + i) * cellW;
+        const st = laneHist[i].states;
+        for (let l = 0; l < Math.min(st.length, maxLanes); l++) {
+            if (!st[l]) continue;
+            g.fillStyle = colors[st[l]];
+            g.fillRect(x, l * rowH + 1.5, Math.max(cellW, 1), rowH - 3);
+        }
+        if (laneHist[i].queued > 0) {   // queued depth as a thin blue baseline strip
+            g.fillStyle = css("--blue");
+            g.fillRect(x, h - 3, Math.max(cellW, 1), 2);
+        }
+    }
+}
+
+function esc(t) {
+    const d = document.createElement("span");
+    d.textContent = t;
+    return d.innerHTML;
+}
+
+function cardHtml(id, stateCls, stateTxt, meta, head, text) {
+    return '<div class="head"><b>#' + id + '</b><span class="st ' + stateCls + '">' + stateTxt + '</span>' +
+        '<span>' + meta + '</span></div>' +
+        '<div class="txt"><span class="ph">' + esc(head) + '</span>' + esc(text) + '</div>';
+}
+
+function renderCards(queuedStreams, active) {
+    const box = $("cards");
+    const want = new Set();
+    for (const s of [...active, ...queuedStreams]) {
+        want.add("sc-" + s.id);
+        let el = document.getElementById("sc-" + s.id);
+        if (!el) {
+            el = document.createElement("div");
+            el.id = "sc-" + s.id;
+            el.className = "scard";
+            box.append(el);
+        }
+        const t = transcripts.get(s.id);
+        const meta = s.state === "prefilling"
+            ? "prefill " + s.n_prefilled + "/" + s.n_prompt + (s.n_cached ? " (" + s.n_cached + " cached)" : "")
+            : s.state === "queued" ? s.n_prompt + " tok waiting"
+            : s.n_gen + "/" + s.max_new + " tok · ttft " + s.ttft_ms.toFixed(0) + "ms";
+        el.innerHTML = cardHtml(s.id, s.state, s.state, meta, (t ? t.head : s.prompt_head), t ? t.text : "");
+        const txt = el.querySelector(".txt");
+        txt.scrollTop = txt.scrollHeight;
+    }
+    for (const el of [...box.querySelectorAll(".scard")]) {
+        if (!want.has(el.id)) el.remove();
+    }
+    $("cards-empty").style.display = want.size ? "none" : "block";
+}
+
+function renderHistory() {
+    const box = $("history");
+    if (!doneHist.length || !historyDirty) return;   // only rebuild when something actually finished
+    historyDirty = false;
+    box.textContent = "";
+    for (const hh of doneHist) {
+        const el = document.createElement("div");
+        el.className = "scard";
+        el.innerHTML = cardHtml(hh.id, "finished", "finished · " + hh.finish,
+            hh.info.n_gen + " tok · ttft " + hh.info.ttft_ms.toFixed(0) + "ms", hh.head, hh.text);
+        box.append(el);
+    }
+}
+
+// ===== demo load: the staged ramp, run from the page itself =====
+// The continuous-batching money shot with zero terminal involvement: N concurrent buffered
+// chat completions per stage — the server batches them, the swimlane fills, tok/s stair-steps.
+const DEMO_PROMPTS = [
+    "Explain continuous batching in two sentences.",
+    "Write a four-line poem about memory bandwidth.",
+    "List three uses for a prefix cache in an LLM server.",
+    "What is speculative decoding? Keep it short.",
+    "Describe a transformer's KV cache to a beginner.",
+    "Give two reasons quantized weights speed up inference.",
+    "Summarize what a scheduler does in a token server.",
+    "Why does prefill parallelize better than decode?",
+];
+let demoRunning = false;
+
+async function demoWorker(wid, nreq) {
+    for (let i = 0; i < nreq; i++) {
+        const prompt = DEMO_PROMPTS[(wid * 7 + i) % DEMO_PROMPTS.length];
+        try {
+            await fetch("/v1/chat/completions", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ messages: [{ role: "user", content: prompt }], max_tokens: 64 }),
+            });
+        } catch (_e) { return; }
+    }
+}
+
+$("b-demo").addEventListener("click", async () => {
+    if (demoRunning) return;
+    demoRunning = true;
+    const btn = $("b-demo");
+    for (const n of [1, 2, 4, 8]) {
+        btn.textContent = "ramp: " + n + " worker" + (n > 1 ? "s" : "");
+        await Promise.all(Array.from({ length: n }, (_, w) => demoWorker(w, 2)));
+        if (last && last.draining) break;
+    }
+    btn.textContent = "run demo load";
+    demoRunning = false;
+});
+
+$("b-live").classList.add("on");
+$("b-live").addEventListener("click", () => {
+    $("cards").style.display = "grid"; $("history").style.display = "none";
+    $("b-live").classList.add("on"); $("b-history").classList.remove("on");
+});
+$("b-history").addEventListener("click", () => {
+    $("cards").style.display = "none"; $("history").style.display = "grid";
+    $("b-history").classList.add("on"); $("b-live").classList.remove("on");
+});
+
+async function poll() {
+    try {
+        const r = await fetch("/v1/stats", { cache: "no-store" });
+        if (!r.ok) throw new Error(String(r.status));
+        const s = await r.json();
+        apply(s);
+        const rs = await fetch("/v1/streams", { cache: "no-store" });
+        if (rs.ok) applyStreams(await rs.json(), s.queued);
+        failures = 0;
+    } catch (_e) {
+        if (restartingSince) {
+            setBadge("warn", "restarting · " + Math.round((performance.now() - restartingSince) / 1000) + "s");
+        } else if (++failures >= 3) {
+            setBadge("err", last && last.draining ? "stopped" : "unreachable");
+        }
+    }
+    setTimeout(poll, 1000);
+}
+
+// ===== chat mode =====
+// Conversation lives client-side only: the page renders it and replays the whole message list
+// on every send over the ordinary /v1/chat/completions SSE. <think> spans show inline in a
+// different font — this is a demo surface, not a working-tool replacement.
+const KNOBS = [
+    { k: "temperature", v: 0.7, step: 0.1 }, { k: "top_k", v: 40, step: 1 },
+    { k: "top_p", v: 0.9, step: 0.05 }, { k: "min_p", v: 0, step: 0.01 },
+    { k: "presence_penalty", v: 0, step: 0.1 }, { k: "frequency_penalty", v: 0, step: 0.1 },
+    { k: "max_tokens", v: 512, step: 32 },
+];
+const chatMsgs = [];   // {role, content} — replayed on every send
+let chatBusy = false;
+
+{
+    const box = $("knobs");
+    for (const kn of KNOBS) {
+        const wrap = document.createElement("label");
+        wrap.className = "knob";
+        wrap.textContent = kn.k;
+        const inp = document.createElement("input");
+        inp.type = "number";
+        inp.step = String(kn.step);
+        inp.value = String(kn.v);
+        inp.id = "kn-" + kn.k;
+        wrap.append(inp);
+        box.append(wrap);
+    }
+    const think = document.createElement("label");
+    think.className = "knob";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = true;
+    cb.id = "kn-thinking";
+    think.append(cb, document.createTextNode("thinking"));
+    box.append(think);
+}
+
+// render a message's content with <think>…</think> spans in the serif think font
+function renderMsgContent(el, text) {
+    el.textContent = "";
+    const re = /<think>([\s\S]*?)(<\/think>|$)/g;
+    let idx = 0, m;
+    while ((m = re.exec(text)) !== null) {
+        if (m.index > idx) el.append(document.createTextNode(text.slice(idx, m.index)));
+        const sp = document.createElement("span");
+        sp.className = "think";
+        sp.textContent = m[1];
+        el.append(sp);
+        idx = m.index + m[0].length;
+    }
+    if (idx < text.length) el.append(document.createTextNode(text.slice(idx)));
+}
+
+function addBubble(role) {
+    const log = $("chat-log");
+    const hint = log.querySelector(".ctl-note");
+    if (hint) hint.remove();
+    const el = document.createElement("div");
+    el.className = "msg " + role;
+    log.append(el);
+    log.scrollTop = log.scrollHeight;
+    return el;
+}
+
+async function sendChat() {
+    const ta = $("chat-text");
+    const text = ta.value.trim();
+    if (!text || chatBusy) return;
+    chatBusy = true;
+    $("b-send").disabled = true;
+    ta.value = "";
+    chatMsgs.push({ role: "user", content: text });
+    renderMsgContent(addBubble("user"), text);
+    const body = { messages: chatMsgs, stream: true };
+    for (const kn of KNOBS) {
+        const v = Number($("kn-" + kn.k).value);
+        if (Number.isFinite(v)) body[kn.k] = kn.k === "top_k" || kn.k === "max_tokens" ? Math.trunc(v) : v;
+    }
+    body.enable_thinking = $("kn-thinking").checked;
+    const el = addBubble("assistant");
+    let acc = "";
+    const t0 = performance.now();
+    try {
+        const r = await fetch("/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        if (!r.ok || !r.body) {
+            const e = await r.json().catch(() => null);
+            acc = "[error " + r.status + "] " + (e && e.error ? e.error.message : "");
+            renderMsgContent(el, acc);
+        } else {
+            const reader = r.body.getReader();
+            const dec = new TextDecoder();
+            let buf = "";
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += dec.decode(value, { stream: true });
+                const events = buf.split("\n\n");
+                buf = events.pop();
+                for (const ev of events) {
+                    for (const line of ev.split("\n")) {
+                        if (!line.startsWith("data: ")) continue;
+                        const data = line.slice(6);
+                        if (data === "[DONE]") continue;
+                        try {
+                            const j = JSON.parse(data);
+                            const d = j.choices && j.choices[0] && j.choices[0].delta;
+                            if (d && d.content) {
+                                acc += d.content;
+                                renderMsgContent(el, acc);
+                                $("chat-log").scrollTop = $("chat-log").scrollHeight;
+                            }
+                        } catch (_e) { /* keep-alive or partial frame */ }
+                    }
+                }
+            }
+        }
+    } catch (_e) {
+        acc = acc || "[request failed]";
+        renderMsgContent(el, acc);
+    }
+    // history carries the reply WITHOUT the think trace (it is not part of the conversation)
+    chatMsgs.push({ role: "assistant", content: acc.replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trim() });
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
+    el.append(meta);
+    chatBusy = false;
+    $("b-send").disabled = false;
+}
+
+$("b-send").addEventListener("click", sendChat);
+$("chat-text").addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
+$("b-chat-clear").addEventListener("click", () => {
+    chatMsgs.length = 0;
+    $("chat-log").innerHTML = "<div class=\"ctl-note\">cleared</div>";
+});
+
+// ===== mic input (shown when the server runs ASR workers) =====
+let micRec = null;   // { ctx, node, stream, chunks }
+
+function encodeWav(chunks, sampleRate) {
+    let n = 0;
+    for (const c of chunks) n += c.length;
+    const pcm = new Int16Array(n);
+    let o = 0;
+    for (const c of chunks) {
+        for (let i = 0; i < c.length; i++) {
+            pcm[o++] = Math.max(-32768, Math.min(32767, Math.round(c[i] * 32767)));
+        }
+    }
+    const buf = new ArrayBuffer(44 + pcm.length * 2);
+    const v = new DataView(buf);
+    const w = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+    w(0, "RIFF"); v.setUint32(4, 36 + pcm.length * 2, true); w(8, "WAVE");
+    w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, "data"); v.setUint32(40, pcm.length * 2, true);
+    new Int16Array(buf, 44).set(pcm);
+    return new Blob([buf], { type: "audio/wav" });
+}
+
+async function micToggle() {
+    const btn = $("b-mic");
+    if (micRec) {
+        const { ctx, node, stream, chunks } = micRec;
+        micRec = null;
+        btn.classList.remove("rec");
+        btn.textContent = "● mic";
+        node.disconnect();
+        stream.getTracks().forEach(t => t.stop());
+        const rate = ctx.sampleRate;
+        await ctx.close();
+        if (!chunks.length) return;
+        btn.disabled = true;
+        try {
+            const fd = new FormData();
+            fd.append("file", encodeWav(chunks, rate), "mic.wav");
+            const r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
+            const j = await r.json();
+            if (j && j.text) $("chat-text").value = ($("chat-text").value + " " + j.text).trim();
+        } catch (_e) { /* leave the input as-is */ }
+        btn.disabled = false;
+        return;
+    }
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const ctx = new AudioContext();
+        const src = ctx.createMediaStreamSource(stream);
+        const node = ctx.createScriptProcessor(4096, 1, 1);
+        const chunks = [];
+        node.onaudioprocess = e => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+        src.connect(node);
+        node.connect(ctx.destination);
+        micRec = { ctx, node, stream, chunks };
+        btn.classList.add("rec");
+        btn.textContent = "■ stop";
+    } catch (_e) {
+        btn.style.display = "none";   // no mic permission — hide the button
+    }
+}
+$("b-mic").addEventListener("click", micToggle);
+
+// ===== asr studio: waveform + vad overlay + segment playback + rtf =====
+let asrPcm = null, asrRate = 16000;   // mono Float32Array + its sample rate (record or upload)
+let asrVad = [], asrRec = null, asrCtx = null, asrSrc = null;
+const rtfSeries = [];
+const seenAsrJobs = new Set();
+
+function drawWave() {
+    const cv = $("a-wave"), dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    if (!asrPcm) return;
+    const dur = asrPcm.length / asrRate;
+    // vad spans under the envelope
+    g.fillStyle = "rgba(155, 196, 106, 0.18)";
+    for (const s of asrVad) {
+        g.fillRect(s.start / dur * w, 0, Math.max((s.end - s.start) / dur * w, 1), h);
+    }
+    g.strokeStyle = css("--amber"); g.lineWidth = 1;
+    g.beginPath();
+    const step = Math.max(1, Math.floor(asrPcm.length / w));
+    for (let x = 0; x < w; x++) {
+        let lo = 1, hi = -1;
+        const base = Math.floor(x / w * asrPcm.length);
+        for (let i = base; i < Math.min(base + step, asrPcm.length); i++) {
+            const v = asrPcm[i];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        if (hi < lo) continue;
+        g.moveTo(x + 0.5, h / 2 - hi * (h / 2 - 2));
+        g.lineTo(x + 0.5, h / 2 - lo * (h / 2 - 2) + 0.5);
+    }
+    g.stroke();
+}
+
+function setAsrClip(pcm, rate, label) {
+    asrPcm = pcm; asrRate = rate; asrVad = [];
+    $("a-run").disabled = false;
+    $("a-note").textContent = label + " · " + (pcm.length / rate).toFixed(1) + "s — run vad + transcribe";
+    $("a-segs").textContent = "";
+    drawWave();
+}
+
+$("a-rec").addEventListener("click", async () => {
+    const btn = $("a-rec");
+    if (asrRec) {
+        const { ctx, node, stream, chunks } = asrRec;
+        asrRec = null;
+        btn.classList.remove("rec");
+        btn.textContent = "● record";
+        node.disconnect();
+        stream.getTracks().forEach(t => t.stop());
+        const rate = ctx.sampleRate;
+        await ctx.close();
+        let n = 0;
+        for (const c of chunks) n += c.length;
+        const pcm = new Float32Array(n);
+        let o = 0;
+        for (const c of chunks) { pcm.set(c, o); o += c.length; }
+        if (n) setAsrClip(pcm, rate, "recorded");
+        return;
+    }
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const ctx = new AudioContext();
+        const src = ctx.createMediaStreamSource(stream);
+        const node = ctx.createScriptProcessor(4096, 1, 1);
+        const chunks = [];
+        node.onaudioprocess = e => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+        src.connect(node);
+        node.connect(ctx.destination);
+        asrRec = { ctx, node, stream, chunks };
+        btn.classList.add("rec");
+        btn.textContent = "■ stop";
+    } catch (_e) {
+        $("a-note").textContent = "no microphone access";
+    }
+});
+
+$("a-upload").addEventListener("click", () => $("a-file").click());
+$("a-file").addEventListener("change", async () => {
+    const f = $("a-file").files[0];
+    if (!f) return;
+    try {
+        const buf = await f.arrayBuffer();
+        const ctx = new AudioContext();
+        const ab = await ctx.decodeAudioData(buf);
+        setAsrClip(ab.getChannelData(0).slice(), ab.sampleRate, f.name);
+        await ctx.close();
+    } catch (_e) {
+        $("a-note").textContent = "could not decode that file";
+    }
+});
+
+function playSpan(start, end, row) {
+    if (!asrPcm) return;
+    if (asrSrc) { try { asrSrc.stop(); } catch (_e) {} asrSrc = null; }
+    if (!asrCtx) asrCtx = new AudioContext();
+    const ab = asrCtx.createBuffer(1, asrPcm.length, asrRate);
+    ab.copyToChannel(asrPcm, 0);
+    const src = asrCtx.createBufferSource();
+    src.buffer = ab;
+    src.connect(asrCtx.destination);
+    src.start(0, start, Math.max(end - start, 0.05));
+    asrSrc = src;
+    for (const el of document.querySelectorAll(".segs .seg")) el.classList.remove("playing");
+    if (row) row.classList.add("playing");
+    src.onended = () => { if (row) row.classList.remove("playing"); };
+}
+
+$("a-run").addEventListener("click", async () => {
+    if (!asrPcm) return;
+    $("a-run").disabled = true;
+    $("a-note").textContent = "running vad + transcription...";
+    const wav = encodeWav([asrPcm], asrRate);
+    try {
+        const fdv = new FormData();
+        fdv.append("file", wav, "clip.wav");
+        const rv = await fetch("/vad", { method: "POST", body: fdv });
+        if (rv.ok) {
+            asrVad = (await rv.json()).segments || [];
+            drawWave();
+        }
+        const fdt = new FormData();
+        fdt.append("file", wav, "clip.wav");
+        fdt.append("response_format", "verbose_json");
+        const rt = await fetch("/v1/audio/transcriptions", { method: "POST", body: fdt });
+        const j = await rt.json();
+        const box = $("a-segs");
+        box.textContent = "";
+        if (rt.ok && j.segments) {
+            for (const sg of j.segments) {
+                const row = document.createElement("div");
+                row.className = "seg";
+                const tm = document.createElement("span");
+                tm.className = "tm";
+                tm.textContent = sg.start.toFixed(2) + "–" + sg.end.toFixed(2) + "s";
+                const tx = document.createElement("span");
+                tx.textContent = sg.text;
+                row.append(tm, tx);
+                row.addEventListener("click", () => playSpan(sg.start, sg.end, row));
+                box.append(row);
+            }
+            $("a-note").textContent = "done — " + j.segments.length + " segment(s), " +
+                (asrVad.length ? asrVad.length + " speech span(s); " : "") + "click a segment to hear it";
+        } else {
+            $("a-note").textContent = "transcription failed: " + (j.error ? j.error.message : rt.status);
+        }
+    } catch (_e) {
+        $("a-note").textContent = "request failed";
+    }
+    $("a-run").disabled = false;
+});
+
+function renderAsrJobs(rows, stats) {
+    const body = $("a-jobs");
+    if (rows.length) {
+        body.textContent = "";
+        for (const r of rows) {
+            const tr = document.createElement("tr");
+            for (const [v, cls] of [["#" + r.id, "pv"], [r.state, r.state === "done" ? "hit" : ""],
+                                    [r.audio_s ? r.audio_s.toFixed(1) + "s" : "…", ""],
+                                    [r.wall_ms ? (r.wall_ms / 1000).toFixed(1) + "s" : "…", ""],
+                                    [r.rtf ? r.rtf.toFixed(1) + "x" : "…", ""]]) {
+                const td = document.createElement("td");
+                if (cls) td.className = cls;
+                td.textContent = v;
+                tr.append(td);
+            }
+            body.append(tr);
+        }
+    }
+    for (const r of rows) {
+        if (r.state === "done" && !seenAsrJobs.has(r.id)) {
+            seenAsrJobs.add(r.id);
+            rtfSeries.push(r.rtf);
+            if (rtfSeries.length > HIST) rtfSeries.shift();
+        }
+    }
+    if (rtfSeries.length) {
+        $("c-rtf-now").textContent = rtfSeries[rtfSeries.length - 1].toFixed(1) + "x";
+        draw($("c-rtf"), [{ data: rtfSeries, color: css("--green") }]);
+    }
+    if (stats) {
+        $("a-cum").textContent = stats.asr_done_jobs + " jobs · " + stats.asr_audio_s.toFixed(0) + "s audio";
+    }
+}
+
+// ===== config editor =====
+// field spec: k = config key, t = text|path|int|sel|bool, o = select options ("" = unset/legacy)
+const FIELDS = [
+    { k: "model", t: "path", wide: true },
+    { k: "quant", t: "sel", o: ["q8", "fp32", "q4", "q8_0", "q4_0", "q4_k", "q5_k", "q6_k", "mxfp4", "f16", "bf16"] },
+    { k: "kv_dtype", t: "sel", o: ["f16", "f32", "q8_0", "tq4"] },
+    { k: "ctx", t: "int" }, { k: "max_tokens", t: "int" },
+    { k: "streams", t: "int" }, { k: "port", t: "int" },
+    { k: "threads", t: "int" }, { k: "team_dispatch", t: "sel", o: ["hybrid", "team", "inline"] },
+    { k: "affinity", t: "int" }, { k: "chunk", t: "int" },
+    { k: "page_rows", t: "int" }, { k: "prefix", t: "int" },
+    { k: "flat", t: "bool" }, { k: "mtp", t: "bool" },
+    { k: "gpu", t: "sel", o: ["", "off", "metal", "metal-required", "vulkan"] },
+    { k: "gpu_layers", t: "int" }, { k: "gpu_stream", t: "int" },
+    { k: "gpu_vram_mb", t: "int" },
+    { k: "gpu_dn", t: "bool" }, { k: "gpu_attn", t: "bool" }, { k: "gpu_dense", t: "bool" },
+    { k: "metal", t: "sel", o: ["off", "auto", "required"] },
+    { k: "asr", t: "path", wide: true }, { k: "mmproj", t: "path", wide: true },
+    { k: "asr_workers", t: "int" },
+];
+let cfgSurface = null;
+let savedSnapshot = "";   // JSON of the last rendered/saved form — restart guards against unsaved edits
+
+function renderForm(surface, status) {
+    const cfg = surface.config, src = surface.sources || {};
+    const form = $("cfg-form");
+    form.textContent = "";
+    for (const f of FIELDS) {
+        const cell = document.createElement("div");
+        cell.className = "field" + (f.t === "bool" ? " check" : "") + (f.wide ? " wide" : "");
+        const label = document.createElement("label");
+        label.htmlFor = "f-" + f.k;
+        const name = document.createElement("span");
+        name.textContent = f.k;
+        const chip = document.createElement("span");
+        chip.className = "src " + (src[f.k] || "default");
+        chip.textContent = src[f.k] || "default";
+        label.append(name, chip);
+        let input;
+        if (f.t === "sel") {
+            input = document.createElement("select");
+            for (const o of f.o) {
+                const opt = document.createElement("option");
+                opt.value = String(o);
+                opt.textContent = o === "" ? "(unset)" : String(o);
+                input.append(opt);
+            }
+            input.value = String(cfg[f.k]);
+            if (input.value !== String(cfg[f.k])) input.value = f.o[0];   // unknown value fallback
+        } else if (f.t === "bool") {
+            input = document.createElement("input");
+            input.type = "checkbox";
+            input.checked = !!cfg[f.k];
+        } else {
+            input = document.createElement("input");
+            input.type = f.t === "int" ? "number" : "text";
+            if (f.t === "int") input.step = "1";
+            if (f.t === "path" && f.k === "model") input.setAttribute("list", "model-files");
+            input.value = cfg[f.k];
+        }
+        input.id = "f-" + f.k;
+        input.dataset.key = f.k;
+        input.dataset.type = f.t;
+        if (f.t === "bool") cell.append(input, label); else cell.append(label, input);
+        form.append(cell);
+    }
+    // switching gpu to vulkan while every detail knob still shows its raw unset sentinel would
+    // SAVE those zeros as explicit authoritative values and disarm the tier on restart — fill
+    // in the blessed serving shape (K=2 + S=35 + DN + ATTN) so the form shows what will run
+    $("f-gpu").addEventListener("change", () => {
+        if ($("f-gpu").value === "vulkan"
+            && Math.trunc(Number($("f-gpu_layers").value)) === 0
+            && Math.trunc(Number($("f-gpu_stream").value)) === 0
+            && !$("f-gpu_dn").checked && !$("f-gpu_attn").checked) {
+            $("f-gpu_layers").value = "2";
+            $("f-gpu_stream").value = "35";
+            $("f-gpu_dn").checked = true;
+            $("f-gpu_attn").checked = true;
+        }
+    });
+    // model picker: same-directory gguf/dlim files; picking one swaps the basename
+    const dl = $("model-files");
+    dl.textContent = "";
+    const dir = String(cfg.model).replace(/[^/\\]*$/, "");
+    for (const mf of (status.model_files || [])) {
+        const opt = document.createElement("option");
+        opt.value = dir + mf.name;
+        opt.label = mf.kind + " · " + (mf.size / 1e9).toFixed(2) + " GB";
+        dl.append(opt);
+    }
+    $("cfg-file").textContent =
+        "saves to " + surface.save_path + (surface.authoritative ? " · authoritative (overrides CLI flags)" : "") +
+        (status.dlim_rail ? " · serving from the prepared .dlim image" : "");
+    savedSnapshot = JSON.stringify(gatherConfig());
+}
+
+function renderGpu(status) {
+    const g = status.gpu || {}, line = $("gpu-line");
+    line.style.display = "block";
+    if (g.backend === "vulkan") {
+        if (g.supported) {
+            line.innerHTML = "gpu tier <b>vulkan</b> · experts K" + g.resident_layers + "+S" + g.streamed_layers +
+                " · dn " + g.dn_layers + " · attn " + g.attn_layers +
+                (g.dense_planes ? " · dense " + g.dense_planes : "") +
+                (g.cls_resident ? " · cls" : "") +
+                " · " + (g.vram_bytes / 1e9).toFixed(2) + " GB VRAM — hybrid by layer type, not layer count";
+        } else {
+            line.innerHTML = "gpu tier <b>vulkan</b> armed but idle — <span class=\"reason\">" + esc(g.reason) + "</span>";
+        }
+    } else if (status.metal && status.metal !== "off") {
+        line.innerHTML = "gpu <b>metal</b> (" + esc(status.metal) + ")";
+    } else {
+        line.innerHTML = "gpu <b>off</b> — all kernels on CPU";
+    }
+}
+
+async function loadConfig() {
+    try {
+        const r = await fetch("/config", { cache: "no-store" });
+        if (!r.ok) throw new Error(String(r.status));
+        const c = await r.json();
+        cfgSurface = c.surface;
+        renderForm(c.surface, c.status || {});
+        renderGpu(c.status || {});
+    } catch (_e) {
+        $("cfg-note").textContent = "could not load /config";
+    }
+}
+
+function gatherConfig() {
+    const out = {};
+    for (const f of FIELDS) {
+        const el = $("f-" + f.k);
+        if (!el) continue;
+        if (f.t === "bool") out[f.k] = el.checked;
+        else if (f.t === "int") out[f.k] = Math.trunc(Number(el.value) || 0);
+        else out[f.k] = el.value;
+    }
+    return out;
+}
+
+async function saveConfig() {
+    const body = JSON.stringify(gatherConfig());
+    try {
+        const r = await fetch("/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+        });
+        const resp = await r.json();
+        if (!r.ok) {
+            $("cfg-note").textContent = "save failed: " + (resp.error ? resp.error.message : r.status);
+            return false;
+        }
+        savedSnapshot = body;
+        $("cfg-note").textContent = "saved — restart to apply";
+        return true;
+    } catch (_e) {
+        $("cfg-note").textContent = "save failed — server unreachable";
+        return false;
+    }
+}
+
+$("b-save").addEventListener("click", async () => {
+    $("b-save").disabled = true;
+    await saveConfig();
+    $("b-save").disabled = false;
+});
+
+$("b-restart").addEventListener("click", async () => {
+    // a restart with unsaved edits silently discarding them is exactly the trap — save first
+    const dirty = JSON.stringify(gatherConfig()) !== savedSnapshot;
+    const msg = dirty
+        ? "Save the edited config, then drain and restart with it?\n(needs the watchdog running — exit code 4 relaunches)"
+        : "Drain accepted work and restart with the saved config?\n(needs the watchdog running — exit code 4 relaunches)";
+    if (!window.confirm(msg)) return;
+    $("b-restart").disabled = true;
+    if (dirty && !(await saveConfig())) {
+        $("b-restart").disabled = false;   // save failed — the note says why; nothing restarted
+        return;
+    }
+    try {
+        await fetch("/restart", { method: "POST" });
+        $("cfg-note").textContent = "draining, then relaunching with the saved config — a big model takes a minute or more to load; the page reloads when it's back";
+        restartingSince = performance.now();
+        setBadge("warn", "restarting");
+        waitForRestart();
+    } catch (_e) {
+        $("cfg-note").textContent = "restart request failed";
+        $("b-restart").disabled = false;
+    }
+});
+
+async function waitForRestart() {
+    let wasDown = false;
+    for (let i = 0; i < 600; i++) {
+        await new Promise(res => setTimeout(res, 1000));
+        try {
+            const r = await fetch("/v1/stats", { cache: "no-store" });
+            if (r.ok) {
+                const s = await r.json();
+                if (wasDown || s.uptime_s < 30) { restartingSince = 0; location.reload(); return; }
+            }
+        } catch (_e) { wasDown = true; }
+    }
+    restartingSince = 0;
+}
+
+$("b-gc").addEventListener("click", async () => {
+    $("b-gc").disabled = true;
+    try { await fetch("/gc", { method: "POST" }); $("ctl-note").textContent = "gc scheduled — watch the server log"; }
+    catch (_e) { $("ctl-note").textContent = "gc request failed"; }
+    setTimeout(() => { $("b-gc").disabled = false; }, 2000);
+});
+$("b-drain").addEventListener("click", async () => {
+    if (!window.confirm("Drain accepted work and shut the server down?")) return;
+    $("b-drain").disabled = true;
+    try { await fetch("/shutdown", { method: "POST" }); $("ctl-note").textContent = "draining — the process exits when active work completes"; }
+    catch (_e) { $("ctl-note").textContent = "shutdown request failed"; $("b-drain").disabled = false; }
+});
+
+poll();
+loadConfig();
+</script>
+</body>
+</html>

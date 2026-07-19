@@ -135,15 +135,29 @@ first — Windows locks the exe.
 
 | Method | Path | Notes |
 |---|---|---|
+| `GET`  | `/` | Control page: live stats + charts, stream swimlane + live text cards, prefix-cache table, a chat panel (all sampling knobs, `<think>` inline, mic input under `--asr`), config editor with save/restart, GC + drain buttons. Serves `control.html` from beside the server sources — polls `/v1/stats` + `/v1/streams` at 1 Hz |
 | `GET`  | `/v1/models` | Lists the served model (and `--asr` if loaded) |
 | `POST` | `/v1/chat/completions` | Chat; `stream: true` → SSE, else buffered; OpenAI function calling (`tools`) |
 | `POST` | `/v1/completions` | Raw completion; `stream: true` → SSE, else buffered |
 | `POST` | `/v1/embeddings` | Mean-pooled, L2-normalized sentence embeddings |
-| `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`) |
+| `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`). `response_format=verbose_json` adds timed segments |
 | `POST` | `/v1/audio/translations` | Speech→English text (needs `--asr`) |
-| `GET`  | `/v1/stats` | Scheduler counters plus `asr_workers`, `asr_ready`, `asr_active`, and `asr_pending` |
+| `POST` | `/vad` | Silero speech spans over an uploaded clip (the control page's waveform overlay; in-handler, ≤120 s, needs the in-repo `silero_vad.bin`) |
+| `GET`  | `/v1/stats` | Scheduler counters (`gen_tokens`, `prefill_tokens`, TTFT last/avg, …) plus `model`/`ctx`/`uptime_s`/`draining` identity fields, memory footprint (`weights_bytes`, `kv_bytes`, das heaps), a `hardware` line (CPU · lanes · GPU), and `asr_workers`, `asr_ready`, `asr_active`, `asr_pending` |
+| `GET`  | `/v1/streams` | Per-stream poll surface: state (`queued`/`prefilling`/`decoding`/`finished`), token counts, TTFT, and capped text tails (prompt head + generated tail); finished streams linger ~10 s flagged `finished`. Plus `cache`: the prefix-cache donation chains (tokens, live pages, hits, age, preview) and `asr`: recent ASR jobs (state, audio s, wall ms, RTF) |
+| `GET`  | `/config` | Effective config with per-key source (`default`/`cli`/`toml`), model files beside the served one, active rail (gguf vs prepared `.dlim`), GPU tier status (`supported` + `reason` when the loaded model can't ride it) |
+| `POST` | `/config` | Validate a `{key: value}` JSON body and write it as an **authoritative** TOML (`authoritative = true`) to the config path (or `dasllama-server.toml` beside the program on a config-less start). Applies on the next restart |
+| `POST` | `/restart` | Drain like `/shutdown`, then exit with code **4** — the watchdog relaunches, picking up the saved config (3 stays the tune-restart code) |
 | `POST` | `/gc` | Schedule a validated collection at the next lifecycle safe point; concurrent requests coalesce |
 | `POST` | `/shutdown` | Stop admitting new LLM/ASR work, drain accepted work, then exit |
+
+Config precedence: `defaults < config TOML < explicit CLI flags` — unless the TOML carries
+`authoritative = true` (what the control page saves), which flips the top: `defaults < CLI <
+authoritative TOML`. The `gpu` key (`off | metal | metal-required | vulkan`) is the first-class
+backend selector; `gpu = vulkan` arms the MoE tier with the blessed shape (K=2 resident + S=35
+streamed expert stacks + DN + ATTN) unless the `gpu_layers` / `gpu_stream` / `gpu_dn` / `gpu_attn`
+/ `gpu_dense` / `gpu_vram_mb` keys override it. The `DASLLAMA_GPU_*` env vars still override
+everything (they remain the A/B levers).
 
 ### Chat
 
@@ -152,6 +166,17 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
   "messages": [{"role": "user", "content": "Say hello in one word."}],
   "max_tokens": 16, "stream": false, "truncation": "auto"
 }'
+```
+
+### Demo load
+
+`demo_load.das` (a sibling of the server, dogfooding the dashv client) drives varied chat
+completions from worker threads — start it, then watch the control page's swimlane fill and the
+tok/s stair-step:
+
+```sh
+bin/daslang utils/dasllama-server/demo_load.das -- --url http://127.0.0.1:8080   # staged ramp 1 -> 2 -> 4 -> 8
+bin/daslang utils/dasllama-server/demo_load.das -- -n 4 -r 10                    # constant 4 workers
 ```
 
 ### Sampling parameters

@@ -9,7 +9,6 @@ require vulkan
 require vulkan/vulkan_boost
 require spirv/spirv_shader
 require spirv/spirv_builtins public
-require strings
 require math
 require daslib/fio
 
@@ -1845,14 +1844,12 @@ def private vk_moe_init : bool {
     g_gpu.queue = get_device_queue(g_gpu.device, g_gpu.fam, 0u)
     let sg = subgroup_properties(g_gpu.phys).subgroupSize
     g_gpu.rows_per_wg = int64((WG_X + sg - 1u) / sg)   // = gl_NumSubgroups for our 1D workgroup
-    // DASLLAMA_GPU_VRAM_MB wins outright; the queried heap budget only clamps DOWN (see WEIGHT_CAP)
+    // DASLLAMA_GPU_VRAM_MB / gpu_vram_mb wins outright; env PRESENCE alone skips the budget clamp (=0 pins WEIGHT_CAP — the misreporting-driver escape hatch)
     g_gpu.weight_budget = WEIGHT_CAP
-    let vram_override = has_env_variable("DASLLAMA_GPU_VRAM_MB")
-    if (vram_override) {
-        let mbv = int64(to_int(get_env_variable("DASLLAMA_GPU_VRAM_MB")))
-        if (mbv > 0l) {
-            g_gpu.weight_budget = mbv * 1_000_000l
-        }
+    let vram_mb = gpu_want_vram_mb()
+    let vram_override = vram_mb > 0l || has_env_variable("DASLLAMA_GPU_VRAM_MB")
+    if (vram_mb > 0l) {
+        g_gpu.weight_budget = vram_mb * 1_000_000l
     }
     if (device_extension_available(g_gpu.phys, "VK_EXT_memory_budget")) {
         var mb = VkPhysicalDeviceMemoryBudgetPropertiesEXT()   // sType pre-filled by the ctor
@@ -1875,7 +1872,7 @@ def private vk_moe_init : bool {
             to_log(LOG_INFO, "dasLLAMA vulkan tier: device heap budget {int64(mb.heapBudget[best]) / 1000000l} MB (used {int64(mb.heapUsage[best]) / 1000000l}), weight cap {g_gpu.weight_budget / 1000000l} MB\n")
         }
     }
-    if (to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")) > 0) {
+    if (gpu_want_moe_stream() > 0l) {
         g_gpu.weight_budget = max(g_gpu.weight_budget - STREAM_RESERVE, 0l)   // room for the 2 slots
     }
     var pci : CommandPoolCreateInfo
@@ -3410,17 +3407,42 @@ def private vulkan_no_group3(var y0p : float?; var y1p : float?; var y2p : float
 [unused_argument(wp, sp, n, d)]
 def private vulkan_repack_noop(var wp : int8?; var sp : float?; n, d : int64) {}
 
+def private vk_resident_bytes : int64 => g_gpu != null ? g_gpu.resident_bytes : 0l
+
+def private vk_device_name : string {
+    if (g_gpu == null) {
+        return ""
+    }
+    var props : VkPhysicalDeviceProperties
+    vkGetPhysicalDeviceProperties(g_gpu.phys, props)
+    unsafe {
+        return "{reinterpret<string>(addr(props.deviceName[0]))}"
+    }
+}
+
+//! Arm the vulkan MoE tier from the effective GPU want (env-else-programmatic). Registered as
+//! the ``moe_gpu_tier_arm`` probe; ``[init]`` also runs it directly for the env-only path.
+//! Idempotent — re-arming after ``set_gpu_tier_want`` just refreshes the layer count.
+def vulkan_moe_gpu_arm : bool {
+    let layers = gpu_want_moe_layers()
+    if ((layers <= 0l && gpu_want_moe_stream() <= 0l && !gpu_want_dn() && !gpu_want_attn())
+            || !vulkan_backend_available()) {
+        return false   // nothing requested (checked first — the device probe is not free)
+    }
+    set_moe_gpu_layer_count(layers)
+    if (!moe_gpu_tier_installed()) {
+        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+    }
+    return true
+}
+
 [init]
 def dasllama_math_vulkan_register() {
     register_kernel_backend(KernelBackend(name = "vulkan", mm = @@vulkan_no_gemv, batch = @@vulkan_no_batch,
         group3 = @@vulkan_no_group3, repack = @@vulkan_repack_noop,
         needs_repack = false, priority = -1, available = @@vulkan_backend_available))
-    let layers = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_LAYERS")))
-    let nstream = int64(to_int(get_env_variable("DASLLAMA_GPU_MOE_STREAM")))
-    let dn_on = get_env_variable("DASLLAMA_GPU_DN") == "1"
-    let at_on = get_env_variable("DASLLAMA_GPU_ATTN") == "1"
-    if ((layers > 0l || nstream > 0l || dn_on || at_on) && vulkan_backend_available()) {
-        set_moe_gpu_layer_count(layers)
-        install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
-    }
+    set_moe_gpu_arm("vulkan", @@vulkan_moe_gpu_arm)
+    set_moe_gpu_vram_report(@@vk_resident_bytes)
+    set_moe_gpu_device_report(@@vk_device_name)
+    vulkan_moe_gpu_arm()
 }
