@@ -19,6 +19,29 @@ override); capability guard (`supported` + `reason` recorded at load); `gpu_tier
 Verified: toml 108/108, server 17/17 live, vulkan tier 12/12, e2e restart loop (CLI-beats-toml
 → save authoritative → exit 4 → relaunch → toml-beats-CLI), page behavior via mock+playwright.
 
+**ENGINE CRASH FOUND VIA THE DEMO (2026-07-19, OPEN):** gemma-4-12B-it Q4_K under the staged
+ramp dies with EXCEPTION_ACCESS_VIOLATION reading 0x175d right after a stream finish, in the
+tick-loop handler path (JIT-fuzzy frames: chat render / wire completion; Context::to_out on
+top). Repro: full ramp's 8-worker stage final wave (96-tok streams, queue + admit-on-reap
+racing finishes) — 3/3 reproductions incl. a fresh cold child dying ~3 s after listening under
+the ramp tail. Does NOT repro: solo, 2-concurrent, constant-4 x 48 tok, cache donate+attach.
+tinyllama survived the identical ramp → gemma-specific (template/renderer or SWA path) or a
+window widened by slower decode. Minidumps + maps + JIT artifacts:
+logs/crashes/dasllama-20260718-22{5415,5448,5523,5834,5938}*. Batching-theory test that
+triggered it: dense 12B single 5.7 tok/s, scales with streams (vs 35B A3B flat 15.0 -> 14.8
+aggregate, marginal batch 3.91 — experts don't amortize).
+
+**LIVE-PLAY FIXES (2026-07-19, Boris driving):** restart-with-unsaved-form silently discarded
+edits → restart now auto-saves a dirty form (c56793510); uptime_s was counting REQUESTS
+(created_ts is a monotone stand-in, not a clock) → ref_time_ticks + get_time_nsec; `length()`
+panic in model_weights_bytes on a 35B Q4_K plane (> INT_MAX elements) killed the first stats
+poll after a big-model load → long_length (77d9697c8). **WATCHDOG GAP FOUND: a das panic in
+the tick loop WEDGES the child instead of killing it (ASR + libhv threads keep the process
+alive; port accepts, never answers) and the watchdog only acts on child EXIT — its health
+checks fail forever without action. Follow-up: terminate the child after N consecutive health
+failures.** Also: page cannot show "loading the model" while the server is down mid-restart
+(watchdog knows; page just says unreachable) — acceptable for now.
+
 **REVIEW PASS DONE (2026-07-19):** 8-angle fan-out over the branch diff, 29 candidates, 10
 findings reported, 8 fixed same-session (form saving GPU sentinels → gpu-select now fills the
 blessed shape; get_time_usec 35.8-min wrap → wrap-safe get_time_nsec ages everywhere on the
