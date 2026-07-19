@@ -15,7 +15,7 @@ rows use `--fixed-token 100` with `DASLLAMA_METAL_BATCH_PIPE=1`; zero-copy logit
 everywhere. lcpp baselines pinned in `baseline_metal_gemma_m1.tsv`, NOT re-measured.
 Ratio = das / llama.cpp, >1 = das faster; winners bold.
 
-## Apple M1 Max — daslang branch `bbatkin/dasllama-metal-wave-a`, llama.cpp 7642f1c, 2026-07-17/18 (quiet box)
+## Apple M1 Max — daslang branch `bbatkin/dasllama-metal-wave-a`, llama.cpp 7642f1c, 2026-07-17/18 (quiet box; 12B Q8 + q8 greedy rows re-measured 07-18 post blob-only .dlim — batch B>=4 up 2-10%, the B=8/16 REDs cleared to 0.93-0.96x; g3-1b greedy -7% = the small-model q8 GEMV scalar-load issue, fix ledgered; the 12B B=16 cell needs the DEFAULT 4096MB mirror ceiling)
 
 das rails: `batch_decode_perf.das --prefill 512 --ngen 128 --bmax 16 --kv f16
 --fixed-token 100 --seq once` (pins: decode=metal, backend=portable; B=1 rows from a
@@ -34,7 +34,7 @@ decode cells are prefill-method-independent). Q8 batch cells re-measured after s
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 1635.8 | 1654.1 | 0.99x |
-| tg128 B=1 | 118.8 | 112.9 | **1.05x** |
+| tg128 B=1 | 118.0 | 112.9 | **1.05x** |
 | tg128 B=2 | 166.1 | 121.9 | **1.36x** |
 | tg128 B=4 | 203.5 | 205.0 | 0.99x |
 | tg128 B=8 | 231.6 | 229.5 | **1.01x** |
@@ -64,7 +64,7 @@ mid-size Q8 cell — 90.0 with it adaptive-off), deferred to the end of the wave
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 4777.5 | 4974.6 | 0.96x |
-| tg128 B=1 | 204.7 | 155.8 | **1.31x** |
+| tg128 B=1 | 190.3 | 155.8 | **1.22x** |
 | tg128 B=2 | 336.7 | 314.5 | **1.07x** |
 | tg128 B=4 | 485.5 | 494.3 | 0.98x |
 | tg128 B=8 | 675.8 | 664.1 | **1.02x** |
@@ -139,12 +139,12 @@ big pure-k6 = open item; `DASLLAMA_METAL_SPEC=0` recovers the 0.95x class today.
 
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
-| pp512 | 362.7 | 356.0 | **1.02x** |
-| tg128 B=1 | 20.5 | 25.2 | **0.81x RED** |
-| tg128 B=2 | 36.0 | 38.0 | 0.95x |
-| tg128 B=4 | 58.8 | 63.8 | 0.92x |
-| tg128 B=8 | 54.3 | 62.0 | **0.88x RED** |
-| tg128 B=16 | 96.3 | 114.9 | **0.84x RED** |
+| pp512 | 359.4 | 356.0 | **1.01x** |
+| tg128 B=1 | 20.8 | 25.2 | **0.83x RED** |
+| tg128 B=2 | 36.9 | 38.0 | 0.97x |
+| tg128 B=4 | 59.9 | 63.8 | 0.94x |
+| tg128 B=8 | 59.8 | 62.0 | 0.96x |
+| tg128 B=16 | 106.4 | 114.9 | 0.93x |
 
 B=2/4 were 0.90/0.59 before the hetero mul_mv un-gate (the fixed-B forms streamed the
 12.2GB blob once PER TOKEN under hetero); B=4/8/16 gained +2/+6.5/+6% from scope C (the

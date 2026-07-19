@@ -343,6 +343,17 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
+- **Small-model q8 single-stream GEMV: restore the vector quant load on the blob layout
+  (2026-07-18, the blob rewiring's one regression — TOP of the perf queue).** The planar
+  kernels loaded 4 quants as ONE byte4 vector; the 34B blob's +2 quant phase forced 4
+  scalar loads across the single-stream family (MetalQ8Gemv, the QkvRs twins, W13Sw).
+  Issue-bound models pay ~7-8% at B=1 (4B Q8 64.5 -> 59.5 = 0.88x, g3-1b 204.7 -> 190.3);
+  DRAM-bound 12B is flat; batch forms amortize over columns and IMPROVED (+5..24%).
+  Fix A: a third uint16 buffer view (the blob is 2-byte aligned everywhere) — 2 aligned
+  ushort loads + sign-extend unpack per chunk. Fix B (zero kernel changes, A/B-able at the
+  encoder): dispatch MetalQ8MvB2 at nrows=1 with ys=0/xs4=0 (the double-store is benign —
+  both columns compute and store the same value). Measure both at the 4B shapes.
+
 - **Per-config .dlim: map-only load, BLOB-ONLY metal flavor — SHIPPED (2026-07-18).** The
   contract "no processing on load FOR THE CONFIG IT WAS BUILT FOR" holds: image v3 +
   METAL_IMAGE_TAG identity flavor; the 34B block_q8_0 blob REPLACES the planar q8 planes

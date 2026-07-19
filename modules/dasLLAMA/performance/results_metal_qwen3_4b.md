@@ -10,7 +10,7 @@ single-stream from `llama-bench -r 1`, batch ladder from `llama-batched-bench -n
 `baseline_metal_qwen3_4b_m1.tsv`, NOT re-measured. Ratio = das / llama.cpp, >1 = das
 faster; winners bold.
 
-## Apple M1 Max — daslang branch `bbatkin/dasllama-metal-wave-a`, llama.cpp 7642f1c, 2026-07-17 (Parsec off)
+## Apple M1 Max — daslang branch `bbatkin/dasllama-metal-wave-a`, llama.cpp 7642f1c, 2026-07-18 (Parsec off; Q8 re-measured post blob-only .dlim — kq cells 2026-07-17, spot-checked flat-or-better)
 
 das rails: `batch_decode_perf.das --prefill 512 --ngen 128 --bmax 16 --kv f16
 --fixed-token 100` (pins: decode=metal, backend=portable, mirror 3072MB; B=1 row from a
@@ -34,15 +34,21 @@ round 1) and the whole batch ladder. pp512 -1.6% — see the pp line note below.
 
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
-| pp512 | 1041.7 | 1064.9 | 0.98x |
-| tg128 B=1 | 64.5 | 67.7 | **0.95x RED** |
-| tg128 B=2 | 112.7 | 103.0 | **1.09x** |
-| tg128 B=4 | 182.7 | 159.6 | **1.14x** |
-| tg128 B=8 | 186.1 | 190.4 | 0.98x |
-| tg128 B=16 | 282.1 | 266.0 | **1.06x** |
+| pp512 | 1041.8 | 1064.9 | 0.98x |
+| tg128 B=1 | 59.5 | 67.7 | **0.88x RED** |
+| tg128 B=2 | 113.1 | 103.0 | **1.10x** |
+| tg128 B=4 | 192.3 | 159.6 | **1.20x** |
+| tg128 B=8 | 205.7 | 190.4 | **1.08x** |
+| tg128 B=16 | 350.6 | 266.0 | **1.32x** |
 
-B=1 0.95x = the 3B Q8 sequential-phase anomaly class (the 3B board sits at 0.97 with the
-same signature: the batched-B1 form beats the sequential loop on the same forward()).
+Blob-only .dlim rewiring (2026-07-18): B=4/8/16 UP +5/+10/+24% (whole-blob binds, the ys
+per-segment stores, qkv split-K stand-down); B=1 DOWN 64.5 -> 59.5 — the single-stream q8
+GEMV family's blob addressing replaced the planar kernels' one byte4 vector load with 4
+scalar loads (the 34B block's +2 quant phase), and the 1B-4B-class GEMVs are issue-bound
+(the 12B, DRAM-bound, is flat). Fix designed, ledgered top of the queue: a third uint16
+buffer view (2-byte-aligned in the blob) + sign-extend unpack, or the MvB2 shape at
+nrows=1 (ys=0/xs4=0 double-store trick, zero kernel changes). Was 0.95x = the sequential-
+phase anomaly class before the rewiring.
 
 ### Q6_K (pure k6)
 
@@ -50,7 +56,7 @@ same signature: the batched-B1 form beats the sequential loop on the same forwar
 | :--- | ---: | ---: | ---: |
 | pp512 | 918.3 | 916.3 | **1.00x** |
 | tg128 B=1 | 78.2 | 78.2 | **1.00x** |
-| tg128 B=2 | 106.9 | 83.7 | **1.28x** |
+| tg128 B=2 | 121.4 | 83.7 | **1.45x** |
 | tg128 B=4 | 142.0 | 124.2 | **1.14x** |
 | tg128 B=8 | 153.6 | 137.6 | **1.12x** |
 | tg128 B=16 | 232.2 | 230.8 | **1.01x** |
