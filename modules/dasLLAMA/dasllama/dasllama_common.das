@@ -614,13 +614,14 @@ def finalize(var t : Model) {
 //! Resident weight bytes across every plane family (only the loaded quant's planes are
 //! non-empty; a mapped .dlim's borrowed views count their mapped extent).
 def model_weights_bytes(t : Model) : int64 {
-    return (int64(length(t.fblob)) * 4l + int64(length(t.wblob)) * 4l
-        + int64(length(t.qblob)) + int64(length(t.qscales)) * 4l + int64(length(t.qscales16)) * 2l
-        + int64(length(t.q4blob)) + int64(length(t.q4scales)) * 4l
-        + int64(length(t.mxq)) + int64(length(t.mxs))
-        + int64(length(t.bf16blob)) * 2l
-        + int64(length(t.k4q)) + int64(length(t.k4s)) + int64(length(t.k5q)) + int64(length(t.k5s))
-        + int64(length(t.k6q)) + int64(length(t.k6s)) + int64(length(t.q40q)) + int64(length(t.q40s)))
+    // long_length throughout: big-model planes exceed INT_MAX elements (a 35B Q4_K plane is > 2 GB)
+    return (long_length(t.fblob) * 4l + long_length(t.wblob) * 4l
+        + long_length(t.qblob) + long_length(t.qscales) * 4l + long_length(t.qscales16) * 2l
+        + long_length(t.q4blob) + long_length(t.q4scales) * 4l
+        + long_length(t.mxq) + long_length(t.mxs)
+        + long_length(t.bf16blob) * 2l
+        + long_length(t.k4q) + long_length(t.k4s) + long_length(t.k5q) + long_length(t.k5s)
+        + long_length(t.k6q) + long_length(t.k6s) + long_length(t.q40q) + long_length(t.q40s))
 }
 
 // ===== Arch registry: per-architecture blocks + chat template =====
@@ -3188,10 +3189,10 @@ struct KVPool {
 def kv_pool_bytes(pool : KVPool) : int64 {
     var total = 0l
     for (kb in pool.kblobs) {
-        total += int64(length(kb))
+        total += long_length(kb)   // a grown blob can exceed INT_MAX bytes on big-ctx models
     }
     for (vb in pool.vblobs) {
-        total += int64(length(vb))
+        total += long_length(vb)
     }
     return total
 }
