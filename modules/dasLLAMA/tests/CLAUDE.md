@@ -43,10 +43,10 @@ arm6-churn arm7-q8kv arm7b-tq4kv arm8-s16 arm9-reload arm10-kq arm11-depth arm12
 batch test: `batch` (whole test), `batchB7-partd`, `batchB8-kq`. Prefill parity: `base s16
 kq cont dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b` + the
 family matrix `fam-qwen3 fam-qwen2 fam-phi3 fam-gemma2 fam-gemma3 fam-gemma4 fam-qwen3moe
-fam-gemma4moe` (needs-derivation pins + per-path cells; fam-gemma2 also carries the
-sliding-window masking parity row; fam-gemma4/fam-qwen3moe/fam-gemma4moe are
-DASLLAMA_PARITY_FULL-gated — 7.4/18.5/26.9GB; fam-gemma4moe is ENGAGE + shallow logits
-TOLERANCE cells only — token parity is not a valid instrument for the 26B, whose double-router
+fam-gemma4moe fam-gptoss` (needs-derivation pins + per-path cells; fam-gemma2 also carries the
+sliding-window masking parity row; fam-gemma4/fam-qwen3moe/fam-gemma4moe/fam-gptoss are
+DASLLAMA_PARITY_FULL-gated — 7.4/18.5/26.9/12.1GB; fam-gemma4moe and fam-gptoss are ENGAGE
++ shallow logits TOLERANCE cells only — token parity is not a valid instrument for the 26B, whose double-router
 CPU differs from any float implementation by ~2.5 logits/step by construction). The
 `kernels` suite (test_metal_prefill_kernels — model-less kernel units, ~80s) has no arms;
 remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
@@ -77,7 +77,7 @@ model blocks tagged with a listed family run — `family_on(t, name)` in
 `_model_tier.das`, EXACT token match, loud `t |> skip` like the arm filter. Model-free blocks
 (the `kernels` suite, the image `mechanics` arm) carry no tag and always run. Family tokens
 today: `llama` (all four metal suites + the image smol arm), `qwen2`, `qwen3`, `phi3`,
-`gemma2`, `gemma3`, `qwen3moe`, `gemma4moe` (the support-matrix family cells), `gemma`,
+`gemma2`, `gemma3`, `qwen3moe`, `gemma4moe`, `gptoss` (the support-matrix family cells), `gemma`,
 `ultravox`, `whisper`, `voxtral` (image suite arms).
 When profiling one family across formats, gate each round with
 `--arm <arms> --family <fam>` instead of the whole zoo. Tag every NEW model-loading block
