@@ -1,5 +1,6 @@
 options gen2
 options indenting = 4
+options no_aot   // no AOT gen exists for this module yet (module-move fallout) — test_aot interprets it
 
 module clipboard shared
 

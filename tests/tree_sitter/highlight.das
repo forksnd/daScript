@@ -1,5 +1,6 @@
 options gen2
 options indenting = 4
+options no_aot   // tests/tree_sitter has no AOT registration (module grammar is per-box) — runs interpreted in test_aot
 
 require dastest/testing_boost public
 require tree_sitter/tree_sitter
