@@ -7,6 +7,7 @@ require dasllama/dasllama            // the facade: load_model's image cache is 
 require dasllama/dasllama_whisper
 require dasllama/dasllama_gguf       // rd_u32/rd_u16 — the wav fixture reader
 require dasllama/dasllama_image
+require dasllama/dasllama_math   // pin_kernel_backend — the metal-flavor arm's donor contract
 require daslib/jobque_boost
 require daslib/archive
 require daslib/apply
@@ -356,6 +357,86 @@ def test_model_image_roundtrip(t : T?) {
             return
         }
         text_image_roundtrip(t, path, 24)
+    }
+}
+
+// ===== the metal (blob-only) flavor =====
+
+// counting prompt: confident continuations — the decode-parity suite's CPU-vs-GPU token bar
+def private counting_ids(tr : Model) : array<int64> {
+    return <- encode(tr, "The numbers from one to ten are: one, two, three,")
+}
+
+[test]
+def test_metal_flavor_image(tst : T?) {
+    tst |> run("SmolLM2 q8: metal flavor — blob mint + map + GPU serve + CPU tripwire") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            if (!family_on(t, "llama")) return
+            if (!arm_on(t, "metal")) {
+                return
+            }
+            if (!jit_enabled()) {
+                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+                return
+            }
+            if (!has_decode_override("metal")) {
+                t |> skip("metal overrides not registered")
+                return
+            }
+            let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
+            if (!model_available(t, path)) {
+                return
+            }
+            // CPU control on the portable backend (the metal donor contract) — planar flavor
+            let prior_backend = active_kernel_backend()
+            pin_kernel_backend("portable")
+            set_metal_mode(MetalMode.off)
+            var tc <- load_model(path, QuantMode.q8)
+            t |> success(!tc.metal_blob, "CPU-mode load stays planar")
+            var prompt <- counting_ids(tc)
+            var g_cpu <- gen_ids(tc, prompt, 16)
+            delete tc
+            // cold metal mint: the blob flavor regenerates + saves under its own identity tag
+            let img_m = image_path_for(path, METAL_IMAGE_TAG)
+            remove(img_m)
+            set_metal_mode(MetalMode.when_available)
+            var tm <- load_model(path, QuantMode.q8)
+            t |> success(tm.metal_blob, "metal-mode load is blob-form")
+            t |> success(tm.image_map == null, "cold metal load is gguf-backed")
+            t |> success(stat(img_m).is_valid, "cold metal load saved the metal-flavor image")
+            t |> success(length(tm.qblob) == 0, "planar q8 planes are gone")
+            var g_mint <- gen_ids(tm, prompt, 16)   // a blob model CANNOT silently CPU-serve —
+            delete tm                               // completing at all proves the GPU served
+            t |> success(count_mismatch(g_cpu, g_mint) == 0l, "GPU tokens match the CPU control")
+            // warm map + the direct-.dlim path form (both flavors' identities probed)
+            var tw <- load_model(path, QuantMode.q8)
+            t |> success(tw.image_map != null && tw.metal_blob, "warm metal load maps the blob image")
+            var g_map <- gen_ids(tw, prompt, 16)
+            t |> success(count_mismatch(g_mint, g_map) == 0l, "mint vs mapped tokens")
+            delete tw
+            var td <- load_model(img_m, QuantMode.q8)
+            t |> success(td.metal_blob, "direct .dlim load resolves the metal identity")
+            var g_dir <- gen_ids(td, prompt, 16)
+            t |> success(count_mismatch(g_mint, g_dir) == 0l, "direct-path tokens")
+            // the CPU tripwire: with the overrides off, any inference on a blob model panics
+            set_metal_mode(MetalMode.off)
+            var tripped = false
+            try {
+                var g_bad <- gen_ids(td, prompt, 2)
+                delete g_bad
+            } recover {
+                tripped = true
+            }
+            t |> success(tripped, "CPU inference on a blob model panics")
+            delete td
+            delete g_cpu
+            delete g_mint
+            delete g_map
+            delete g_dir
+            delete prompt
+            clear_kernel_backend_pin()
+            select_kernel_backend(prior_backend)
+        }
     }
 }
 

@@ -2064,6 +2064,12 @@ def convert_model_to_metal_blob(var t : Model) : bool {
     if (t.quant != QuantMode.q8 || t.kq_repacked || kernel_backend_needs_repack(active_kernel_backend())) {
         return false
     }
+    if (t.image_map != null) {
+        // image-backed planes are borrowed READ-ONLY views — the in-place k4s/k5s/k6s
+        // rewrites would fault. Transform an owned load (load_model_ / DASLLAMA_IMAGE=0).
+        to_log(LOG_WARNING, "dasLLAMA: metal-blob transform declined — the model is image-mapped (borrowed planes); transform an owned gguf load\n")
+        return false
+    }
     if (!metal_blob_layout_ok(t)) {
         to_log(LOG_WARNING, "dasLLAMA: metal-blob transform declined — a weight offset violates the GPU bind alignment\n")
         return false

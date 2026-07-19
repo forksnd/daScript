@@ -343,21 +343,23 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
-- **Per-config .dlim: map-only load, BLOB-ONLY metal flavor (ruling FINAL 2026-07-18; the
-  next work block).** The image contract is "no processing on load FOR THE CONFIG IT WAS
-  BUILT FOR"; flavors are per-config and self-sufficient — a benchmark needing both sides
-  loads two flavors (mmap = msecs each). The metal flavor (image v3, own identity tag):
-  the 34-byte block_q8_0 blob section REPLACES the planar q8 qblob (34/32 = +6%, one
-  MTLBuffer for the whole blob, per-region offsets at bind — the q8 region cache and the
-  ~3s `metal_blob_region` repack both die); kq quant planes stay disk-layout (already
-  borrowable) with the 16B compact scale strips replacing the 20B planes; all big sections
-  page-aligned and wrapped via a new das_metal `newBufferWithBytesNoCopy` binding (C++,
-  capability absent das-side); fblob/tokenizer/meta smalls stay. `embed_row` gets a
-  blob-layout (stride-34) variant for metal-flavor models; any CPU-inference path against a
-  blob-only image PANICS (consistent with the CPU-prefill tripwire — CPU work belongs to
-  the CPU flavor). Serializer v3 gate + image-suite mechanics arm; regen per-config images
-  on first use. Half-day block, scheduled BEFORE the wave-a PR (Boris sequencing:
-  .dlim redesign → PR regardless of perf state → OS notifications w/ computed ETA → scope D).
+- **Per-config .dlim: map-only load, BLOB-ONLY metal flavor — SHIPPED (2026-07-18).** The
+  contract "no processing on load FOR THE CONFIG IT WAS BUILT FOR" holds: image v3 +
+  METAL_IMAGE_TAG identity flavor; the 34B block_q8_0 blob REPLACES the planar q8 planes
+  (one zero-copy MTLBuffer per plane via `metal_new_buffer_no_copy_untracked`, region byte
+  offsets at bind — kernel indices stay uint32-safe); k4s/k5s ride the 16B strips and k6s
+  the GPU split form; every q8 kernel is blob-addressed (the S16 scale twins collapsed),
+  the fused QKV/W13 kernels bind per-segment views (kind-major layout), the fixed-B
+  kernels grew the kq twins' `ys` y-row-stride uniform for fused-buffer writes, and the
+  cat-blob caches + the `metal_blob_region` repack are DELETED. CPU inference on a blob
+  model panics; the gathers (embed_row, dequant_q8_row, split-k6) read the blob directly;
+  `load_model` picks the flavor via the registered `metal_model_servable` hook. Measured:
+  1B transform 133ms / map 24ms; kq-pure transform 21ms / map 13ms; all three GPU paths
+  serve with 0 declines. Rewiring residue for the ledger (re-measure the q8 cells first):
+  the batch qkv site's split-K stands down (its reduce writes contiguous y — plain GemmB
+  serves per-segment), the B<=4 unfused single-decode qkv/w13 cats became per-tensor
+  dispatches (~2 extra dispatches/layer on those rails), and the legacy quantized-X
+  prefill rail is dead (blob forces mul_mm) pending its deletion sweep.
 
 - **QK-norm rope-store fusion — the f16 single-stream H-form SHIPPED (wave A chase round 2);
   the rest of the family is the residual (2026-07-17).** MetalRopeStoreHF16 folds bias +
