@@ -485,6 +485,8 @@ class MetalMoeRouter {
     @uniform @binding = 3 ndim : uint       // dim (% 32)
     @uniform @binding = 4 ddim : uint       // ne
     @uniform @binding = 5 xs : uint         // per-stream x stride, elements
+    @ssbo @binding = 6 rb : array<float>    // [ne] router bias row (hasb models — gpt-oss)
+    @uniform @binding = 7 hasb : uint
 
     [metal_kernel(name="metal_moe_router_msl")]
     def metal_moe_router {
@@ -506,7 +508,7 @@ class MetalMoeRouter {
         }
         acc = simd_sum(acc)
         if (lane == 0u) {
-            y[st * ddim + row] = acc
+            y[st * ddim + row] = hasb != 0u ? acc + rb[row] : acc
         }
     }
 }
@@ -958,6 +960,199 @@ class MetalMoeGemvK6 {
     }
 }
 
+// Expert-indexed MXFP4 GEMV (gpt-oss): a 32-elem block = 16 nibble bytes (byte b holds elems
+// b LOW / b+16 HIGH — the split-half layout) + one E8M0 scale byte; value = doubled-e2m1
+// magnitude x halved scale (2^(e-128)). Optional per-expert bias rows — gpt-oss's biased MoE.
+class MetalMoeGemvMx4 {
+    @ssbo @binding = 0 mxn : array<uint8>   // nibble plane, bound at the layer stack's off/2
+    @ssbo @binding = 1 mxe : array<uint8>   // E8M0 plane, bound at off/32
+    @ssbo @binding = 2 x : array<float>
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 ndim : uint
+    @uniform @binding = 5 ddim : uint
+    @ssbo @binding = 6 sel : array<uint>    // [streams x 2k] selection rows (idx section read)
+    @uniform @binding = 7 eblk : uint       // 32-elem blocks per expert plane (ege / 32)
+    @uniform @binding = 8 xs : uint         // per-slot x stride, elements (0 = shared)
+    @uniform @binding = 9 ss : uint         // per-stream sel row stride, uints (2k; 0 single)
+    @uniform @binding = 10 bxs : uint       // per-stream x stride, elements (0 single)
+    @uniform @binding = 11 bys : uint       // per-stream y stride, elements (0 single)
+    @ssbo @binding = 12 wb : array<float>   // [ne x ddim] per-expert bias rows (hasb models)
+    @uniform @binding = 13 hasb : uint
+    @ssbo @binding = 14 etab : array<float> // [256] exact e8m0_half scales (host-built)
+
+    [metal_kernel(name="metal_moe_gemv_mx4_msl")]
+    def metal_moe_gemv_mx4 {
+        let row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (row >= ddim) {
+            return
+        }
+        let slot = gl_WorkGroupID.y
+        let st = gl_WorkGroupID.z
+        let e = sel[st * ss + slot]
+        let eb = e * eblk
+        let lane = gl_SubgroupInvocationID
+        let nb = ndim / 32u
+        let xoff = st * bxs + slot * xs
+        var acc = 0.0
+        var kb = lane
+        while (kb < nb) {
+            let blk = eb + row * nb + kb
+            let sc = uint(mxe[blk])
+            let d = etab[sc]   // host-built exact e8m0_half table (incl. the denormal e < 2)
+            let qb = blk * 16u
+            let xb = xoff + kb * 32u
+            var lo = 0.0
+            var hi = 0.0
+            for [unroll_full] (bi in range(16)) {
+                let nby = uint(mxn[qb + uint(bi)])
+                let nl = nby & 15u
+                let nh = nby >> 4u
+                let ml = nl & 7u
+                let mh = nh & 7u
+                let vl = float(ml <= 4u ? ml : (ml == 5u ? 6u : (ml == 6u ? 8u : 12u)))
+                let vh = float(mh <= 4u ? mh : (mh == 5u ? 6u : (mh == 6u ? 8u : 12u)))
+                lo += ((nl & 8u) != 0u ? -vl : vl) * x[xb + uint(bi)]
+                hi += ((nh & 8u) != 0u ? -vh : vh) * x[xb + 16u + uint(bi)]
+            }
+            acc += (lo + hi) * d
+            kb += gl_SubgroupSize
+        }
+        acc = simd_sum(acc)
+        if (lane == 0u) {
+            var outv = acc
+            if (hasb != 0u) {
+                outv += wb[e * ddim + row]
+            }
+            y[st * bys + slot * ddim + row] = outv
+        }
+    }
+}
+
+// Gathered MXFP4 mul_mm — the gathered-GEMM shape with the mx4 A stage: each thread's 16-elem
+// half IS one nibble half of the 32-block (il0 = 0 low, 1 high). Bias rides MetalMoeBiasRows.
+class MetalMoeMulMmMx4 {
+    @ssbo @binding = 0 mxn : array<uint8>
+    @ssbo @binding = 1 mxe : array<uint8>
+    @ssbo @binding = 2 xf : array<float4>
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 kdim : uint
+    @uniform @binding = 5 ndim : uint
+    @ssbo @binding = 6 cnt : array<uint>
+    @ssbo @binding = 7 basep : array<uint>
+    @ssbo @binding = 8 bkt : array<uint>
+    @uniform @binding = 9 eblk : uint       // 32-elem blocks per expert plane (ege / 32)
+    @uniform @binding = 10 nk : uint
+    @uniform @binding = 11 gather : uint
+    @ssbo @binding = 12 etab : array<float> // [256] exact e8m0_half scales (host-built)
+    @workgroup ta : float16[2048]
+    @workgroup tb : float16[1024]
+
+    [metal_kernel(name="metal_moe_mulmm_mx4_msl")]
+    def metal_moe_mulmm_mx4 {
+        let e = gl_WorkGroupID.z
+        let ce = cnt[e]
+        let mBase = gl_WorkGroupID.x * 32u
+        if (mBase >= (ce + 31u) / 32u * 32u) {
+            return
+        }
+        let rbase = basep[e]
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let nBase = gl_WorkGroupID.y * 64u
+        var mc : simdgroup_float8x8[8]
+        var ma : simdgroup_half8x8[4]
+        var mb : simdgroup_half8x8[2]
+        var va : float16[16]
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u
+        let bB = (sg / 2u) * 128u
+        let eb = e * eblk + (nBase + lr0) * nkb
+        var srcrow = rbase + mBase + lr1
+        if (gather != 0u) {
+            srcrow = bkt[rbase + min(mBase + lr1, ce - 1u)] / nk
+        }
+        var xcur = unsafe(addr(xf[srcrow * kdim4 + iy / 4u]))
+        var kb = 0u
+        while (kb < nkb) {
+            let blk = eb + kb
+            let b0 = unsafe(xcur[0])
+            let b1 = unsafe(xcur[1])
+            let sc = uint(mxe[blk])
+            let d = etab[sc]   // host-built exact e8m0_half table (incl. the denormal e < 2)
+            let qb = blk * 16u
+            for [unroll_full] (i in range(16)) {
+                let nby = uint(mxn[qb + uint(i)])
+                let nn = il0 == 0u ? (nby & 15u) : (nby >> 4u)
+                let m = nn & 7u
+                let mv = float(m <= 4u ? m : (m == 5u ? 6u : (m == 6u ? 8u : 12u)))
+                va[i] = float16((((nn & 8u) != 0u ? -mv : mv)) * d)
+            }
+            barrier()
+            for [unroll_full] (i in range(16)) {
+                ta[tA0 + uint(i / 8) * 512u + uint(i % 8) * 8u] = va[i]
+            }
+            tg_store_half4(tb, ibB, b0)
+            tg_store_half4(tb, ibB + 4u, b1)
+            barrier()
+            var acur = unsafe(addr(ta[aB]))
+            var bcur = unsafe(addr(tb[bB]))
+            for [unroll_full] (_ik in range(4)) {
+                for [unroll_full] (i in range(4)) {
+                    simdgroup_load(ma[i], acur, uint(i) * 64u, 8u)
+                }
+                for [unroll_full] (i in range(2)) {
+                    simdgroup_load(mb[i], bcur, uint(i) * 64u, 8u)
+                }
+                for [unroll_full] (i in range(8)) {
+                    simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i])
+                }
+                acur = unsafe(acur + 512)
+                bcur = unsafe(bcur + 256)
+            }
+            xcur = unsafe(xcur + 8)
+            kb++
+        }
+        let row0 = rbase + mBase + (sg / 2u) * 16u
+        let col0 = nBase + (sg % 2u) * 32u
+        for [unroll_full] (i in range(8)) {
+            simdgroup_store(mc[i], y, (row0 + uint(i / 4) * 8u) * ndim + col0 + uint(i % 4) * 8u, ndim)
+        }
+    }
+}
+
+// gpt-oss expert bias over the padded bucket rows (grid (cols, rows, experts)): rows past the
+// expert's live count exit — ggml_add_id order (bias precedes the routing-weight reduce).
+class MetalMoeBiasRows {
+    @ssbo @binding = 0 y : array<float>     // [padded rows x d] bucket-ordered panel
+    @ssbo @binding = 1 wb : array<float>    // [ne x d] this layer's per-expert bias rows
+    @ssbo @binding = 2 cnt : array<uint>
+    @ssbo @binding = 3 basep : array<uint>
+    @uniform @binding = 4 d : uint
+
+    [metal_kernel(name="metal_moe_bias_rows_msl")]
+    def metal_moe_bias_rows {
+        let col = gl_GlobalInvocationID.x
+        if (col >= d) {
+            return
+        }
+        let e = gl_WorkGroupID.z
+        let r = gl_WorkGroupID.y
+        if (r >= cnt[e]) {
+            return
+        }
+        y[(basep[e] + r) * d + col] += wb[e * d + col]
+    }
+}
+
 // Weighted top-k reduce per stream (grid.y): y[st*dim + i] = sum_j w[st][j] * dn[(st*k+j)*dim + i]
 // — the CPU slot-order axpy chain as one deterministic in-kernel loop. Overwrites y (the dense
 // w2 site's write shape).
@@ -1001,7 +1196,7 @@ class MetalSwigluOai {
             return
         }
         let x = min(g[gid], 7.0)
-        let y = min(max(u[gid], -7.0), 7.0)
+        let y = min(max(u[gid], -7.0), 7.0)   // nolint:STYLE019 — the MSL emitter doesn't lower clamp
         g[gid] = (x / (1.0 + exp(-1.702 * x))) * (y + 1.0)
     }
 }
