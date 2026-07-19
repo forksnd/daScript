@@ -25,8 +25,22 @@ unambiguous and reliable.
 - Direct editing starts with the PR body in Markdown. Code views are initially
   read-only, selectable, and addressable.
 - Accessibility is a default, not a preference hidden in settings: terminal
-  text starts at 150%, exposes a visible 50-300% zoom control plus Ctrl+wheel,
-  and the desktop shell opens maximized.
+  text starts at 150%, exposes a visible bottom 50-300% zoom control plus
+  Ctrl+wheel in 5% steps, provides Reset in the View menu, and the desktop
+  shell opens maximized.
+- Terminal history is retained and searchable. Search covers the complete
+  retained primary-screen scrollback, not only currently visible rows.
+- Copy, paste, select-all, and clear-selection are semantic terminal actions
+  reachable from the bottom Edit menu as well as keyboard bindings.
+- Any hovered token that a host resolver accepts is actionable even when it
+  is not pre-highlighted. OSC 8 and URI syntax are built-in resolvers;
+  workspace filenames and custom schemes are host-provided resolvers.
+- A protocol-requested blinking cursor actually blinks while the terminal is
+  focused; its style, visibility, and blink phase are observable to UI tests.
+- The default terminal font stack covers common scripts, symbols, CJK, and
+  emoji through platform fallbacks while terminal cell widths remain fixed.
+  Bidirectional layout and complex-script shaping are tracked separately from
+  glyph availability.
 
 ## First vertical slice: terminal
 
@@ -229,6 +243,12 @@ daScript. Mouse encoding joins the contract with the renderer/ConPTY slice.
   screen output; paste/scrollback/selection/clipboard coverage and
   terminal-specific selection polish remain)
 - Run a full-screen agent TUI rather than validating only line-oriented shells.
+- Add retained-history search with next/previous result navigation and visible
+  match counts.
+- Add the resolver-driven hover/click contract for OSC 8, fallback URIs, and
+  worktree filenames.
+- Add record-once/replay-twice semantic comparison against `@xterm/headless`;
+  use synchronized side-by-side rendering only as the human inspection layer.
 
 ### T2: attach and detach
 
@@ -274,6 +294,45 @@ daScript. Mouse encoding joins the contract with the renderer/ConPTY slice.
   bracketed paste, alternate screen, and resize during output.
 - Logs and abandoned probe artifacts are cleaned when work completes.
 
+## Structured UI inspection gate
+
+Terminal and rich-text correctness must be inspectable through live commands;
+`view_image` and screenshots are never the verdict. Screenshots remain useful
+only for the human before/after story.
+
+The terminal inspection surface must expose, for the visible viewport and a
+bounded requested history range:
+
+- each drawn cell's row, column, grapheme, terminal width, foreground,
+  background, attributes, selection/search state, and screen rectangle;
+- the actual cursor rectangle, style, visibility, blink request, and current
+  drawn blink phase;
+- viewport/scrollback mapping, clip rectangle, hover cell, and active resolved
+  OSC 8/URI/file payload;
+- the requested font role, actual fallback source used for each glyph run,
+  glyph availability, and an explicit missing-glyph marker;
+- stable content/layout/paint/hover revisions so tests can wait for effects
+  rather than frames or sleeps.
+
+`imgui_snapshot` should carry a concise terminal summary. A dedicated bounded
+live command may return the complete cell/run detail so large histories do not
+make every ordinary snapshot enormous.
+
+Rich-text and source views need the same generic contract over visible runs:
+display text, source byte range, semantic/style IDs, resolved color, requested
+and actual font role/source, glyph availability, screen rectangle, clipping,
+selection, hover, link/control payloads, and revisions. The Markdown viewer's
+current example-specific `markdown_probe_state` and `markdown_probe_fragment`
+commands cover useful geometry and interaction state, but not final glyph/font
+fallback or paint state; the shared source view has no equivalent generic live
+inspection surface yet.
+
+No terminal, Markdown, source-view, or future editor rendering fix is complete
+until the wrong value is reproducible and the corrected value is readable from
+this structured inspection layer. The oracle harness validates terminal
+semantics; live inspection independently validates how those semantics were
+painted and made interactive.
+
 ## Explicit non-goals for the first slice
 
 - SSH sessions; the protocol must permit a remote host in v2, but v1 is local.
@@ -288,11 +347,16 @@ daScript. Mouse encoding joins the contract with the renderer/ConPTY slice.
 
 Continue T1 from the working local terminal:
 
-1. extend deterministic headless interaction tests from the landed
-   resize/focus/typing flow to paste, scrollback, selection, and clipboard;
-2. run a full-screen agent TUI through the embedded-terminal example;
-3. close the emulator gaps that TUI exposes, then pin them as semantic tests;
-4. move PTY/emulator ownership into the first detachable session host.
+1. finish structured terminal-cell and rich-text-run inspection through live
+   commands, including actual font fallback and missing-glyph reporting;
+2. finish the bottom Edit/View menus, 5% zoom, cursor blink, and Unicode font
+   fallback with structured snapshot coverage;
+3. extend deterministic headless interaction tests to paste, scrollback,
+   selection, clipboard, retained-history search, and resolver hover/click;
+4. build the record-once/replay-twice `@xterm/headless` oracle harness;
+5. run a full-screen agent TUI through the embedded-terminal example and pin
+   every semantic discrepancy as a renderless regression test;
+6. move PTY/emulator ownership into the first detachable session host.
 
 ## Decision log
 
@@ -318,3 +382,12 @@ Continue T1 from the working local terminal:
   sleeps as interaction-success criteria.
 - 2026-07-18: Default dasHerd terminal typography to 150% with visible zoom and
   Ctrl+wheel, and maximize the desktop terminal shell on launch.
+- 2026-07-18: Put terminal Edit/View controls at the bottom, use 5% zoom steps,
+  expose Reset, and treat history/search, resolver-driven links, cursor blink,
+  and broad Unicode/emoji fallback as product requirements rather than polish.
+- 2026-07-18: Validate TUI rendering by replaying one recorded PTY stream into
+  dasTerminal and an independent semantic oracle; the renderer's own plain-text
+  projection is telemetry, never an oracle.
+- 2026-07-19: Treat terminal and rich-text live-command inspection as a product
+  gate. Structured state must expose the final drawn cells/runs, font fallback,
+  missing glyphs, paint, clipping, hover, and cursor; `view_image` is not proof.
