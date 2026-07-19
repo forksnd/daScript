@@ -217,7 +217,8 @@ namespace das {
     }
 
     // the untracked twin: zero-copy wrap of GPU-read-only pages (the blob-only model images) —
-    // opts out of hazard tracking exactly like metal_new_buffer_untracked does for owned weights
+    // opts out of hazard tracking exactly like metal_new_buffer_untracked does for owned weights.
+    // deallocator:nil — the wrapped memory must OUTLIVE the MetalBuffer (never wrap short-lived allocations)
     MetalBuffer * metal_new_buffer_no_copy_untracked ( MetalDevice * dev, void * data, uint64_t bytes, Context * ctx, LineInfoArg * at ) {
         if ( !dev ) ctx->throw_error_at(at, "metal_new_buffer_no_copy_untracked: null device");
         if ( !data ) ctx->throw_error_at(at, "metal_new_buffer_no_copy_untracked: null data");

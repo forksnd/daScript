@@ -8,6 +8,7 @@ require daslib/jobque_boost
 require daslib/clargs
 require daslib/fio
 require daslib/strings_boost
+require daslib/strings_convert
 require strings
 require math
 
@@ -186,11 +187,23 @@ def private load_truth(path : string; var feeds : array<int64>; var logits : arr
         for (line in split(text, "\n")) {
             if (starts_with(line, "feeds")) {
                 for (tk in split_by_chars(slice(line, 6), " ")) {
-                    feeds |> push(to_int64(tk))
+                    let parsed = try_to_int64(tk)
+                    if (is_err(parsed)) {   // corrupt/truncated cache — reject it whole, the caller recomputes+resaves
+                        feeds |> clear()
+                        logits |> clear()
+                        return
+                    }
+                    feeds |> push(unwrap(parsed))
                 }
             } elif (starts_with(line, "logits")) {
                 for (v in split_by_chars(slice(line, 7), " ")) {
-                    logits |> push(to_float(v))
+                    let parsed = try_to_float(v)
+                    if (is_err(parsed)) {
+                        feeds |> clear()
+                        logits |> clear()
+                        return
+                    }
+                    logits |> push(unwrap(parsed))
                 }
             }
         }
