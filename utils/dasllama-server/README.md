@@ -167,6 +167,17 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 }'
 ```
 
+### Demo load
+
+`demo_load.das` (a sibling of the server, dogfooding the dashv client) drives varied chat
+completions from worker threads — start it, then watch the control page's swimlane fill and the
+tok/s stair-step:
+
+```sh
+bin/daslang utils/dasllama-server/demo_load.das -- --url http://127.0.0.1:8080   # staged ramp 1 -> 2 -> 4 -> 8
+bin/daslang utils/dasllama-server/demo_load.das -- -n 4 -r 10                    # constant 4 workers
+```
+
 ### Sampling parameters
 
 Both completion routes accept the OpenAI sampling fields plus the llama.cpp-style extensions —

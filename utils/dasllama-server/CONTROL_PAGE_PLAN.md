@@ -19,6 +19,12 @@ override); capability guard (`supported` + `reason` recorded at load); `gpu_tier
 Verified: toml 108/108, server 17/17 live, vulkan tier 12/12, e2e restart loop (CLI-beats-toml
 → save authoritative → exit 4 → relaunch → toml-beats-CLI), page behavior via mock+playwright.
 
+**S7 + S10 DONE (2026-07-19):** `demo_load.das` (clargs; staged ramp 1→2→4→8 default, `-n`
+constant, `-r` per-stage requests; per-request status lines) — live run 15/15 × 200 against
+tinyllama with all 4 swimlane lanes lit + queued strip at the 8-worker stage. Reveal footer:
+daslang / JIT-via-LLVM / per-box tune story, honest line counts (~49k engine + ~4k
+server+page), repo links.
+
 **S5 DONE (2026-07-19):** page chat over the existing `/v1/chat/completions` SSE (fetch reader,
 frame-split, keep-alive tolerant) — conversation client-held, assistant history stripped of the
 think trace; `<think>` spans render inline in a serif think font; all sampling knobs
