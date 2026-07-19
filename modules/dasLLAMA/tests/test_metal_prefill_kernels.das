@@ -420,6 +420,7 @@ def test_metal_prefill_kernels(t : T?) {
                 moe_select_gate(t, dev, queue, 60, 4, 1, false)    // ne not a lane multiple — pad lanes
                 moe_select_gate(t, dev, queue, 256, 16, 1, false)  // the serve gate's caps
                 moe_select_gate(t, dev, queue, 128, 8, 3, false)   // batch: one stream row per tg
+                moe_select_gate(t, dev, queue, 32, 4, 1, false, 1)  // gpt-oss softmax_weight mode
                 moe_router_gate(t, dev, queue, 64, 128)
                 moe_gemv_gate(t, dev, queue, 96, 24, 5, 3, 1, false)   // shared x (the gate/up sites)
                 moe_gemv_gate(t, dev, queue, 64, 32, 7, 4, 1, true)    // per-slot x rows (the down site)
@@ -601,7 +602,7 @@ def private mulmm_gate(t : T?; dev, queue; k, d, m : int) {
 // one stream row per threadgroup ([k idx u32][k w f32] per row). idx must match EXACTLY — ties
 // are exact-equal logits, so both sides agree by the lowest-index rule; w compares within the
 // shared fp tolerance (hardware exp vs the CPU's exp).
-def private moe_select_gate(t : T?; dev, queue; ne, k, nst : int; ties : bool) {
+def private moe_select_gate(t : T?; dev, queue; ne, k, nst : int; ties : bool; gmode : int = 0) {
     var err : string
     var pso = pipeline_from_source(dev, metal_moe_select_msl, metal_moe_select_msl_entry, metal_moe_select_msl_fastmath, err)
     t |> success(pso != null, "moe select pipeline: {err}")
@@ -628,17 +629,19 @@ def private moe_select_gate(t : T?; dev, queue; ne, k, nst : int; ties : bool) {
         for (i in range(ne)) {
             p[i] = lg[s * ne + i]
         }
-        var mx = p[0]
-        for (i in range(ne)) {
-            mx = max(mx, p[i])
-        }
-        var sum = 0.0
-        for (i in range(ne)) {
-            p[i] = exp(max(p[i] - mx, -80.0))
-            sum += p[i]
-        }
-        for (i in range(ne)) {
-            p[i] /= sum
+        if (gmode == 0) {   // softmax over all ne first; mode 1 selects on the raw logits
+            var mx = p[0]
+            for (i in range(ne)) {
+                mx = max(mx, p[i])
+            }
+            var sum = 0.0
+            for (i in range(ne)) {
+                p[i] = exp(max(p[i] - mx, -80.0))
+                sum += p[i]
+            }
+            for (i in range(ne)) {
+                p[i] /= sum
+            }
         }
         var ws = 0.0
         let base = length(ww)
@@ -654,9 +657,24 @@ def private moe_select_gate(t : T?; dev, queue; ne, k, nst : int; ties : bool) {
             ws += p[best]
             p[best] = -FLT_MAX
         }
-        ws = max(ws, 6.103515625e-5)
-        for (j in range(k)) {
-            ww[base + j] /= ws
+        if (gmode == 1) {   // gpt-oss softmax_weight: softmax over just the selected k
+            var mxw = ww[base]
+            for (j in range(k)) {
+                mxw = max(mxw, ww[base + j])
+            }
+            var sw = 0.0
+            for (j in range(k)) {
+                ww[base + j] = exp(max(ww[base + j] - mxw, -80.0))
+                sw += ww[base + j]
+            }
+            for (j in range(k)) {
+                ww[base + j] /= sw
+            }
+        } else {
+            ws = max(ws, 6.103515625e-5)
+            for (j in range(k)) {
+                ww[base + j] /= ws
+            }
         }
         delete p
     }
@@ -664,6 +682,7 @@ def private moe_select_gate(t : T?; dev, queue; ne, k, nst : int; ties : bool) {
     var bsel = metal_new_buffer(dev, uint64(nst * 2 * k * 4))
     var bne = buf_u32(dev, uint(ne))
     var bnk = buf_u32(dev, uint(k))
+    var bgm = buf_u32(dev, uint(gmode))
     let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso)
         metal_set_buffer(enc, blg, 0ul, 0)
@@ -671,6 +690,7 @@ def private moe_select_gate(t : T?; dev, queue; ne, k, nst : int; ties : bool) {
         metal_set_buffer(enc, bsel, 0ul, 2)   // the float w view — row layout is in-kernel
         metal_set_buffer(enc, bne, 0ul, 3)
         metal_set_buffer(enc, bnk, 0ul, 4)
+        metal_set_buffer(enc, bgm, 0ul, 5)
         metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
     }
     t |> success(ran, "moe select dispatch ne={ne} k={k} nst={nst}: {err}")
@@ -696,6 +716,7 @@ def private moe_select_gate(t : T?; dev, queue; ne, k, nst : int; ties : bool) {
     metal_release(bsel)
     metal_release(bne)
     metal_release(bnk)
+    metal_release(bgm)
     metal_release(pso)
     delete lg
     delete widx

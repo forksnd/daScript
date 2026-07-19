@@ -520,6 +520,7 @@ class MetalMoeSelect {
     @ssbo @binding = 2 selw : array<float>   // the same buffer, float view — w of stream s at s*2k + k
     @uniform @binding = 3 ne : uint
     @uniform @binding = 4 nk : uint
+    @uniform @binding = 5 gmode : uint       // 0 = softmax + norm_topk; 1 = softmax_weight (gpt-oss)
 
     [metal_kernel(name="metal_moe_select_msl")]
     def metal_moe_select {
@@ -532,25 +533,28 @@ class MetalMoeSelect {
             let j = lane + uint(t) * 32u
             v[t] = j < ne ? lg[lg0 + j] : -3.0e38
         }
-        // softmax over all ne (the CPU order: max, exp with the -80 floor, sum, divide-all)
-        var mx = v[0]
-        for [unroll_full] (t in range(8)) {
-            mx = max(mx, v[t])
-        }
-        var bm = 16u
-        while (bm >= 1u) {
-            mx = max(mx, simd_shuffle_xor(mx, bm))
-            bm /= 2u
-        }
-        var psum = 0.0
-        for [unroll_full] (t in range(8)) {
-            let j = lane + uint(t) * 32u
-            v[t] = j < ne ? exp(max(v[t] - mx, -80.0)) : 0.0
-            psum += v[t]
-        }
-        let sum = simd_sum(psum)
-        for [unroll_full] (t in range(8)) {
-            v[t] /= sum
+        // gmode 0: softmax over all ne (the CPU order: max, exp with the -80 floor, sum,
+        // divide-all); gmode 1 (gpt-oss softmax_weight) selects on the RAW logits instead
+        if (gmode == 0u) {
+            var mx = v[0]
+            for [unroll_full] (t in range(8)) {
+                mx = max(mx, v[t])
+            }
+            var bm = 16u
+            while (bm >= 1u) {
+                mx = max(mx, simd_shuffle_xor(mx, bm))
+                bm /= 2u
+            }
+            var psum = 0.0
+            for [unroll_full] (t in range(8)) {
+                let j = lane + uint(t) * 32u
+                v[t] = j < ne ? exp(max(v[t] - mx, -80.0)) : 0.0
+                psum += v[t]
+            }
+            let sum = simd_sum(psum)
+            for [unroll_full] (t in range(8)) {
+                v[t] /= sum
+            }
         }
         var ws = 0.0
         var j = 0u
@@ -586,13 +590,38 @@ class MetalMoeSelect {
             }
             j++
         }
-        // norm_topk renorm to sum 1 (the CPU f16-min clamp)
-        ws = max(ws, 6.103515625e-5)
-        if (lane == 0u) {
-            var i = 0u
-            while (i < nk) {
-                selw[sel0 + nk + i] /= ws
-                i++
+        if (gmode == 1u) {
+            // gpt-oss: softmax over just the selected k raw logits
+            if (lane == 0u) {
+                var mxw = selw[sel0 + nk]
+                var i = 1u
+                while (i < nk) {
+                    mxw = max(mxw, selw[sel0 + nk + i])
+                    i++
+                }
+                var sw = 0.0
+                i = 0u
+                while (i < nk) {
+                    let ev = exp(max(selw[sel0 + nk + i] - mxw, -80.0))
+                    selw[sel0 + nk + i] = ev
+                    sw += ev
+                    i++
+                }
+                i = 0u
+                while (i < nk) {
+                    selw[sel0 + nk + i] /= sw
+                    i++
+                }
+            }
+        } else {
+            // norm_topk renorm to sum 1 (the CPU f16-min clamp)
+            ws = max(ws, 6.103515625e-5)
+            if (lane == 0u) {
+                var i = 0u
+                while (i < nk) {
+                    selw[sel0 + nk + i] /= ws
+                    i++
+                }
             }
         }
     }
@@ -955,6 +984,25 @@ class MetalMoeCombine {
             j++
         }
         y[st * dim + gid] = acc
+    }
+}
+
+// gpt-oss clamped swiglu (stage 4): x = min(g, 7), y = clamp(u, -7, 7),
+// g = (x / (1 + exp(-1.702 x))) * (y + 1) — the clamps and the +1 are trained weights' contract.
+class MetalSwigluOai {
+    @ssbo @binding = 0 g : array<float>
+    @ssbo @binding = 1 u : array<float>
+    @uniform @binding = 2 total : uint
+
+    [metal_kernel(name="metal_swiglu_oai_msl")]
+    def metal_swiglu_oai {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= total) {
+            return
+        }
+        let x = min(g[gid], 7.0)
+        let y = min(max(u[gid], -7.0), 7.0)
+        g[gid] = (x / (1.0 + exp(-1.702 * x))) * (y + 1.0)
     }
 }
 
@@ -3395,6 +3443,7 @@ var private g_pf_pso_moe_mm_k5 : MetalComputePipeline?
 var private g_pf_pso_moe_mm_k6 : MetalComputePipeline?
 var private g_pf_pso_g4rnorm : MetalComputePipeline?   // gemma4 MoE router-input norm (stage 3)
 var private g_pf_pso_moe_wscale : MetalComputePipeline?
+var private g_pf_pso_swiglu_oai : MetalComputePipeline?
 var private g_mm_legacy = false             // set_metal_prefill_mulmm_legacy — tests' exact-parity rail
 var private g_pf_logits_cpu = false            // set_metal_prefill_logits_cpu — the logits A/B rail
 // timing-attribution knockout (DASLLAMA_METAL_PREFILL_SKIP=attn|gemm|ew|nongemm): skips encoding
@@ -3517,7 +3566,7 @@ def public metal_prefill_shutdown {
     for (pso in [g_pso_kq_mm4, g_pso_kq_mm5, g_pso_kq_mm6, g_pf_pso_kq4, g_pf_pso_kq5, g_pf_pso_kq6,
                  g_pf_pso_moe_router, g_pf_pso_moe_select, g_pf_pso_moe_count, g_pf_pso_moe_prefix,
                  g_pf_pso_moe_bucket, g_pf_pso_moe_reduce, g_pf_pso_moe_mm_q8, g_pf_pso_moe_mm_k4,
-                 g_pf_pso_moe_mm_k5, g_pf_pso_moe_mm_k6, g_pf_pso_g4rnorm, g_pf_pso_moe_wscale]) {
+                 g_pf_pso_moe_mm_k5, g_pf_pso_moe_mm_k6, g_pf_pso_g4rnorm, g_pf_pso_moe_wscale, g_pf_pso_swiglu_oai]) {
         if (pso != null) {
             metal_release(pso)
         }
@@ -3540,6 +3589,7 @@ def public metal_prefill_shutdown {
     g_pf_pso_moe_mm_k6 = null
     g_pf_pso_g4rnorm = null
     g_pf_pso_moe_wscale = null
+    g_pf_pso_swiglu_oai = null
     if (g_pso_qkmm != null) {
         metal_release(g_pso_qkmm)
         g_pso_qkmm = null
@@ -3630,6 +3680,7 @@ def private metal_prefill_init : bool {
     g_pf_pso_moe_mm_k6 = pf_compile_pso(metal_moe_mulmm_k6_msl, metal_moe_mulmm_k6_msl_entry, metal_moe_mulmm_k6_msl_fastmath, ok)
     g_pf_pso_g4rnorm = pf_compile_pso(metal_g4_router_norm_msl, metal_g4_router_norm_msl_entry, metal_g4_router_norm_msl_fastmath, ok)
     g_pf_pso_moe_wscale = pf_compile_pso(metal_moe_wscale_msl, metal_moe_wscale_msl_entry, metal_moe_wscale_msl_fastmath, ok)
+    g_pf_pso_swiglu_oai = pf_compile_pso(metal_swiglu_oai_msl, metal_swiglu_oai_msl_entry, metal_swiglu_oai_msl_fastmath, ok)
     if (!ok) {
         metal_prefill_shutdown()
         g_pf_failed = true
@@ -3858,7 +3909,7 @@ def private pf_enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : ui
 
 // per-position router + select + the atomics-free CSR (count -> prefix -> bucket) for layer l
 def private pf_enc_moe_route(enc : MetalComputeEncoder?; t : Model; l : int64;
-                             bx, blg, bsel, bcnt, bbase, bbkt, binv, bdim, bne, bnk, btot : MetalBuffer?; npos : int64) {
+                             bx, blg, bsel, bcnt, bbase, bbkt, binv, bdim, bne, bnk, bgm, btot : MetalBuffer?; npos : int64) {
     let c = t.config
     var bw_rt = pf_upload_region(unsafe(addr < void? >(t.fblob[t.router_off + l * c.n_expert * c.dim])), uint64(c.n_expert * c.dim * 4l))
     metal_set_pipeline(enc, g_pf_pso_moe_router)
@@ -3875,6 +3926,7 @@ def private pf_enc_moe_route(enc : MetalComputeEncoder?; t : Model; l : int64;
     metal_set_buffer(enc, bsel, 0ul, 2)
     metal_set_buffer(enc, bne, 0ul, 3)
     metal_set_buffer(enc, bnk, 0ul, 4)
+    metal_set_buffer(enc, bgm, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(npos), 1u, 1u), uint3(32u, 1u, 1u))
     metal_set_pipeline(enc, g_pf_pso_moe_count)
     metal_set_buffer(enc, bsel, 0ul, 0)
@@ -4554,7 +4606,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         pf_enc_g4_router_norm(enc, bx, bw_rs, bmg4rt, u_dim, u_eps, u_moe_invd, npos)
                     }
                     pf_enc_moe_route(enc, t, l, g4moe ? bmg4rt : bxb, bmlg, bmsel, bmcnt, bmbase, bmbkt, bminv,
-                        u_dim, u_moe_ne, u_moe_nk, u_moe_tot, npos)
+                        u_dim, u_moe_ne, u_moe_nk, u_moe_g0, u_moe_tot, npos)
                     if (g4moe) {
                         var bw_ds = pf_upload_region(unsafe(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert])), uint64(c.n_expert * 4l))
                         pf_enc_moe_wscale(enc, bmsel, bw_ds, u_moe_nk, npos)

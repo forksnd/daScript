@@ -530,6 +530,7 @@ struct Model {
     // From then on every kq matmul MUST run the backend slots — disk-order portable kernels would
     // read garbage — and embed_row gathers rows through the grp layout too.
     kq_repacked : bool = false
+    mx4_repacked : bool = false   // repack_mx4_stacks ran (CPU laneq layout — no GPU carry)
     kq_repack_mr4 : int64 = 4l   // per-FORMAT repack interleaves (kq v2: the families tune separately)
     kq_repack_mr5 : int64 = 4l
     kq_repack_mr6 : int64 = 4l
@@ -2108,7 +2109,7 @@ def convert_model_to_metal_blob(var t : Model) : bool {
     if (t.metal_blob) {
         return true
     }
-    if (t.quant != QuantMode.q8 || t.kq_repacked || kernel_backend_needs_repack(active_kernel_backend())) {
+    if (t.quant != QuantMode.q8 || t.kq_repacked || t.mx4_repacked || kernel_backend_needs_repack(active_kernel_backend())) {
         return false
     }
     if (t.image_map != null) {
@@ -2366,6 +2367,7 @@ def private repack_q8_weights(var t : Model) {
         push_repack(regs, 0, t.mtp_ehproj_off, 2l * dim, dim)
     }
     repack_regions(t, regs)
+    t.mx4_repacked = true
     delete regs
 }
 

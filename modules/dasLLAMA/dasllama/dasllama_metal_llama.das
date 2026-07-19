@@ -678,7 +678,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     } else {
                         enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, c.n_expert, 1l)
                     }
-                    enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, 1l)
+                    enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_zero32, 1l)
                     if (g4) {
                         var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
                         enc_moe_wscale(enc, r.bmoe_sel, bw_ds, r.u_moe_k, 1l)
@@ -1869,7 +1869,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     enc_moe_router(enc, bw_rt, bxb, bmlg, u_dim, u_moe_ne, u_dim, c.n_expert, nrows)
                 }
                 bar_dep(enc, haz, HZ_BMLG, HZ_BMSEL)
-                enc_moe_select(enc, bmlg, bmsel, u_moe_ne, u_moe_k, nrows)
+                enc_moe_select(enc, bmlg, bmsel, u_moe_ne, u_moe_k, u_zero32, nrows)
                 if (g4moe) {
                     var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
                     bar_dep(enc, haz, HZ_BMSEL, HZ_BMSEL)
