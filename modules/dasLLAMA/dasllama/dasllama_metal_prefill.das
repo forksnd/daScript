@@ -513,6 +513,50 @@ class MetalMoeRouter {
     }
 }
 
+// Position-blocked prefill router: MetalMoeRouter's shape but each sg serves 8 positions per
+// weight load — slab SLC traffic /8 (the prefill router's entire cost); tails clamp, stores gate.
+// Per-lane k stride and per-position dot order match MetalMoeRouter, so logits stay bit-identical.
+class MetalMoeRouterB {
+    @ssbo @binding = 0 w : array<float4>    // [ne x dim] router weights, float4 view
+    @ssbo @binding = 1 x : array<float4>    // [streams x dim] activations, float4 view
+    @ssbo @binding = 2 y : array<float>     // [streams x ne] logits out
+    @uniform @binding = 3 ndim : uint       // dim (% 32)
+    @uniform @binding = 4 ddim : uint       // ne
+    @uniform @binding = 5 xs : uint         // per-stream x stride, elements
+    @ssbo @binding = 6 rb : array<float>    // [ne] router bias row (hasb models — gpt-oss)
+    @uniform @binding = 7 hasb : uint
+    @uniform @binding = 8 ns : uint         // stream count (npos)
+
+    [metal_kernel(name="metal_moe_router_b_msl")]
+    def metal_moe_router_b {
+        let row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        if (row >= ddim) {
+            return
+        }
+        let st0 = gl_WorkGroupID.y * 8u
+        let lane = gl_SubgroupInvocationID
+        let nb4 = ndim / 4u
+        let xs4 = xs / 4u
+        var acc : float[8]
+        var k = lane
+        while (k < nb4) {
+            let wv = w[row * nb4 + k]
+            for [unroll_full] (i in range(8)) {
+                let st = min(st0 + uint(i), ns - 1u)
+                let xv = x[st * xs4 + k]
+                acc[i] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w
+            }
+            k += gl_SubgroupSize
+        }
+        for [unroll_full] (i in range(8)) {
+            let s = simd_sum(acc[i])
+            if (lane == 0u && st0 + uint(i) < ns) {
+                y[(st0 + uint(i)) * ddim + row] = hasb != 0u ? s + rb[row] : s
+            }
+        }
+    }
+}
+
 // Router select — moe_select_core's softmax + top-k + norm_topk on one simdgroup per stream
 // (grid.x): per-lane strided ownership (ne <= 256), per-winner argmax butterfly with the CPU
 // tie-break (lowest index), register knockout. Stream row layout: [k idx u32][k w f32].
@@ -1341,13 +1385,33 @@ class MetalMoeBucket {
 
     [metal_kernel(name="metal_moe_bucket_msl")]
     def metal_moe_bucket {
-        if (gl_LocalInvocationID.x != 0u) {
-            return
-        }
+        // contiguous ascending per-lane chunks + exclusive scan of chunk counts reproduce the
+        // serial entry order exactly (a 1-lane scan here was ~0.7ms/layer of load latency)
         let e = gl_WorkGroupID.x
-        var b = basep[e]
-        var t = 0u
-        while (t < total) {
+        let lane = gl_SubgroupInvocationID
+        let chunk = (total + 31u) / 32u
+        let t0 = lane * chunk
+        let t1 = min(t0 + chunk, total)
+        var n = 0u
+        var t = t0
+        while (t < t1) {
+            if (seli[(t / nk) * 2u * nk + t % nk] == e) {
+                n++
+            }
+            t++
+        }
+        let mine = n
+        var off = 1u
+        while (off < 32u) {
+            let v = simd_shuffle_up(n, off)
+            if (lane >= off) {
+                n += v
+            }
+            off *= 2u
+        }
+        var b = basep[e] + n - mine
+        t = t0
+        while (t < t1) {
             if (seli[(t / nk) * 2u * nk + t % nk] == e) {
                 bkt[b] = t
                 inv[t] = b
@@ -3637,6 +3701,7 @@ var private g_pf_pso_kq4 : MetalComputePipeline?       // ... and the kq classif
 var private g_pf_pso_kq5 : MetalComputePipeline?
 var private g_pf_pso_kq6 : MetalComputePipeline?      // classifier GEMV (logits-on-GPU)
 var private g_pf_pso_moe_router : MetalComputePipeline?   // MoE prefill (Wave C stage 2b)
+var private g_pf_pso_moe_router_b : MetalComputePipeline?   // position-blocked prefill router
 var private g_pf_pso_moe_select : MetalComputePipeline?
 var private g_pf_pso_moe_count : MetalComputePipeline?
 var private g_pf_pso_moe_prefix : MetalComputePipeline?
@@ -3655,9 +3720,25 @@ var private g_pf_e8m0_tab : MetalBuffer?
 var private g_mm_legacy = false             // set_metal_prefill_mulmm_legacy — tests' exact-parity rail
 var private g_pf_logits_cpu = false            // set_metal_prefill_logits_cpu — the logits A/B rail
 // timing-attribution knockout (DASLLAMA_METAL_PREFILL_SKIP=attn|gemm|ew|nongemm|moe|moe_mm|
-// moe_act|moe_reduce): skips encoding that stage family (moe* = whole MoE block / gathered mul_mms
-// / act ew / reduce; route+CSR by subtraction) — output is GARBAGE. Debug rail only.
+// moe_act|moe_reduce|moe_only_router|moe_only_route|moe_no_mm_act): skips encoding that stage
+// family; consumers of skipped stages always skip too (no garbage OOB). Output GARBAGE, debug only.
 var private g_pf_skip = ""
+
+// composite skip predicates for the MoE stages (moe_only_* isolate the route chain per-kernel)
+def private pf_skip_moe_mm : bool {
+    return (g_pf_skip == "moe_mm" || g_pf_skip == "moe_only_route" || g_pf_skip == "moe_only_router" ||
+        g_pf_skip == "moe_only_sel" || g_pf_skip == "moe_no_mm_act")
+}
+
+def private pf_skip_moe_act : bool {
+    return (g_pf_skip == "moe_act" || g_pf_skip == "moe_only_route" || g_pf_skip == "moe_only_router" ||
+        g_pf_skip == "moe_only_sel" || g_pf_skip == "moe_no_mm_act")
+}
+
+def private pf_skip_moe_reduce : bool {
+    return (g_pf_skip == "moe_reduce" || g_pf_skip == "moe_only_route" || g_pf_skip == "moe_only_router" ||
+        g_pf_skip == "moe_only_sel")
+}
 
 //! Prefills below this npos decline to the CPU path (submit+readback overhead outweighs the win).
 //! Set 1 to force every prefill onto the GPU (tests).
@@ -3776,7 +3857,7 @@ def public metal_prefill_shutdown {
         g_pf_pso_mm = null
     }
     for (pso in [g_pso_kq_mm4, g_pso_kq_mm5, g_pso_kq_mm6, g_pf_pso_kq4, g_pf_pso_kq5, g_pf_pso_kq6,
-                 g_pf_pso_moe_router, g_pf_pso_moe_select, g_pf_pso_moe_count, g_pf_pso_moe_prefix,
+                 g_pf_pso_moe_router, g_pf_pso_moe_router_b, g_pf_pso_moe_select, g_pf_pso_moe_count, g_pf_pso_moe_prefix,
                  g_pf_pso_moe_bucket, g_pf_pso_moe_reduce, g_pf_pso_moe_mm_q8, g_pf_pso_moe_mm_k4,
                  g_pf_pso_moe_mm_k5, g_pf_pso_moe_mm_k6, g_pf_pso_g4rnorm, g_pf_pso_moe_wscale, g_pf_pso_swiglu_oai,
                  g_pf_pso_moe_mm_mx4, g_pf_pso_moe_bias_rows]) {
@@ -3791,6 +3872,7 @@ def public metal_prefill_shutdown {
     g_pf_pso_kq5 = null
     g_pf_pso_kq6 = null
     g_pf_pso_moe_router = null
+    g_pf_pso_moe_router_b = null
     g_pf_pso_moe_select = null
     g_pf_pso_moe_count = null
     g_pf_pso_moe_prefix = null
@@ -3893,6 +3975,7 @@ def private metal_prefill_init : bool {
     g_pso_avmm = pf_compile_pso(metal_attn_av_mm_msl, metal_attn_av_mm_msl_entry, metal_attn_av_mm_msl_fastmath, ok)
     g_pf_pso_gemv = pf_compile_pso(metal_q8_gemv_msl, metal_q8_gemv_msl_entry, metal_q8_gemv_msl_fastmath, ok)
     g_pf_pso_moe_router = pf_compile_pso(metal_moe_router_msl, metal_moe_router_msl_entry, metal_moe_router_msl_fastmath, ok)
+    g_pf_pso_moe_router_b = pf_compile_pso(metal_moe_router_b_msl, metal_moe_router_b_msl_entry, metal_moe_router_b_msl_fastmath, ok)
     g_pf_pso_moe_select = pf_compile_pso(metal_moe_select_msl, metal_moe_select_msl_entry, metal_moe_select_msl_fastmath, ok)
     g_pf_pso_moe_count = pf_compile_pso(metal_moe_count_msl, metal_moe_count_msl_entry, metal_moe_count_msl_fastmath, ok)
     g_pf_pso_moe_prefix = pf_compile_pso(metal_moe_prefix_msl, metal_moe_prefix_msl_entry, metal_moe_prefix_msl_fastmath, ok)
@@ -4142,10 +4225,10 @@ def private pf_enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : ui
 
 // per-position router + select + the atomics-free CSR (count -> prefix -> bucket) for layer l
 def private pf_enc_moe_route(enc : MetalComputeEncoder?; t : Model; l : int64;
-                             bx, blg, bsel, bcnt, bbase, bbkt, binv, bdim, bne, bnk, bgm, brb, bhasb, btot : MetalBuffer?; npos : int64) {
+                             bx, blg, bsel, bcnt, bbase, bbkt, binv, bdim, bne, bnk, bgm, brb, bhasb, btot, bnp : MetalBuffer?; npos : int64) {
     let c = t.config
     var bw_rt = pf_upload_region(unsafe(addr < void? >(t.fblob[t.router_off + l * c.n_expert * c.dim])), uint64(c.n_expert * c.dim * 4l))
-    metal_set_pipeline(enc, g_pf_pso_moe_router)
+    metal_set_pipeline(enc, g_pf_pso_moe_router_b)
     metal_set_buffer(enc, bw_rt, 0ul, 0)
     metal_set_buffer(enc, bx, 0ul, 1)
     metal_set_buffer(enc, blg, 0ul, 2)
@@ -4154,7 +4237,9 @@ def private pf_enc_moe_route(enc : MetalComputeEncoder?; t : Model; l : int64;
     metal_set_buffer(enc, bdim, 0ul, 5)   // per-position x stride = dim
     metal_set_buffer(enc, brb, 0ul, 6)
     metal_set_buffer(enc, bhasb, 0ul, 7)
-    metal_dispatch_threadgroups(enc, uint3(uint((c.n_expert + 3l) / 4l), uint(npos), 1u), uint3(128u, 1u, 1u))
+    metal_set_buffer(enc, bnp, 0ul, 8)
+    metal_dispatch_threadgroups(enc, uint3(uint((c.n_expert + 3l) / 4l), uint((npos + 7l) / 8l), 1u), uint3(128u, 1u, 1u))
+    return if (g_pf_skip == "moe_only_router")   // attribution: router GEMV alone, no select/CSR
     metal_set_pipeline(enc, g_pf_pso_moe_select)
     metal_set_buffer(enc, blg, 0ul, 0)
     metal_set_buffer(enc, bsel, 0ul, 1)
@@ -4163,6 +4248,7 @@ def private pf_enc_moe_route(enc : MetalComputeEncoder?; t : Model; l : int64;
     metal_set_buffer(enc, bnk, 0ul, 4)
     metal_set_buffer(enc, bgm, 0ul, 5)
     metal_dispatch_threadgroups(enc, uint3(uint(npos), 1u, 1u), uint3(32u, 1u, 1u))
+    return if (g_pf_skip == "moe_only_sel")   // attribution: router + select, no CSR
     metal_set_pipeline(enc, g_pf_pso_moe_count)
     metal_set_buffer(enc, bsel, 0ul, 0)
     metal_set_buffer(enc, bcnt, 0ul, 1)
@@ -4632,6 +4718,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     var u_total_h = pf_uniform_u32(uint(npos * hidden))
     var u_moe_ne = moe ? pf_uniform_u32(uint(c.n_expert)) : null
     var u_moe_nk = moe ? pf_uniform_u32(uint(c.n_expert_used)) : null
+    var u_moe_np = moe ? pf_uniform_u32(uint(npos)) : null
     var u_moe_tot = moe ? pf_uniform_u32(uint(mtot)) : null
     var u_moe_nfe = moe ? pf_uniform_u32(uint(c.n_ff_exp)) : null
     var u_moe_eblk = moe ? pf_uniform_u32(uint(dim * c.n_ff_exp / 32l)) : null
@@ -4896,12 +4983,12 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         bhrb = u_moe_gmode
                     }
                     pf_enc_moe_route(enc, t, l, g4moe ? bmg4rt : bxb, bmlg, bmsel, bmcnt, bmbase, bmbkt, bminv,
-                        u_dim, u_moe_ne, u_moe_nk, u_moe_gmode, brb, bhrb, u_moe_tot, npos)
+                        u_dim, u_moe_ne, u_moe_nk, u_moe_gmode, brb, bhrb, u_moe_tot, u_moe_np, npos)
                     if (g4moe) {
                         var bw_ds = pf_upload_region(unsafe(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert])), uint64(c.n_expert * 4l))
                         pf_enc_moe_wscale(enc, bmsel, bw_ds, u_moe_nk, npos)
                     }
-                    if (g_pf_skip != "moe_mm") {
+                    if (!pf_skip_moe_mm()) {
                         if (t.experts_mx4) {
                             var bwb1 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.web1_off + l * c.n_expert * c.n_ff_exp])), uint64(c.n_expert * c.n_ff_exp * 4l))
                             var bwb3 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.web3_off + l * c.n_expert * c.n_ff_exp])), uint64(c.n_expert * c.n_ff_exp * 4l))
@@ -4919,13 +5006,13 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         }
                     }
                 }
-                if (moe && g_pf_skip != "ew" && g_pf_skip != "nongemm" && g_pf_skip != "moe" && g_pf_skip != "moe_act") {
+                if (moe && g_pf_skip != "ew" && g_pf_skip != "nongemm" && g_pf_skip != "moe" && !pf_skip_moe_act()) {
                     let pso_act = c.ffn_act == FfnAct.swiglu_oai ? g_pf_pso_swiglu_oai : (g4moe ? g_pf_pso_geglu : g_pf_pso_swiglu)
                     pf_enc_ew2(enc, pso_act, bmg, bmg2, u_moe_ptot, mpad * c.n_ff_exp)
                 }
                 if (moe && g_pf_skip != "gemm" && g_pf_skip != "moe") {
                     let fe2 = pf_fmt_at(t.we2_fmt, l)
-                    if (g_pf_skip != "moe_mm") {
+                    if (!pf_skip_moe_mm()) {
                         if (t.experts_mx4) {
                             var bwb2 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.web2_off + l * c.n_expert * dim])), uint64(c.n_expert * dim * 4l))
                             pf_enc_moe_mm_mx4(enc, t, t.we2_offs[l], dim, npos, bmg, bmdn,
@@ -4936,7 +5023,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                                 u_moe_nfe, u_dim, bmcnt, bmbase, bmbkt, fe2 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g0)
                         }
                     }
-                    if (g_pf_skip != "moe_reduce") {
+                    if (!pf_skip_moe_reduce()) {
                         pf_enc_moe_reduce(enc, bmdn, bmsel, bminv, g4moe ? bmg4rt : bxb, u_dim, u_moe_nk, dim, npos)
                     }
                     if (g4moe && g_pf_skip != "ew" && g_pf_skip != "nongemm") {
@@ -5208,6 +5295,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     if (moe) {
         pool_release(g_pf_upool, u_moe_ne, 4ul)
         pool_release(g_pf_upool, u_moe_nk, 4ul)
+        pool_release(g_pf_upool, u_moe_np, 4ul)
         pool_release(g_pf_upool, u_moe_tot, 4ul)
         pool_release(g_pf_upool, u_moe_nfe, 4ul)
         pool_release(g_pf_upool, u_moe_eblk, 4ul)
