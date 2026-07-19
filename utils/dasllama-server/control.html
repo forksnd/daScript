@@ -99,6 +99,29 @@ button.mini.on { border-color: var(--amber); color: var(--amber); }
 }
 .scard .txt .ph { color: var(--fg-faint); }
 
+.chat-log { display: flex; flex-direction: column; gap: 10px; max-height: 420px; overflow-y: auto; margin-bottom: 12px; }
+.msg { max-width: 85%; padding: 8px 12px; border-radius: 8px; font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.msg.user { align-self: flex-end; background: var(--bg-3); border: 1px solid var(--amber-dim); }
+.msg.assistant { align-self: flex-start; background: var(--bg-3); border: 1px solid var(--rule); }
+.msg .think { font-family: Georgia, "Times New Roman", serif; font-style: italic; color: var(--fg-dim); }
+.msg .meta { display: block; font-family: var(--font-mono); font-size: 10px; color: var(--fg-faint); margin-top: 6px; }
+.chat-input { display: flex; gap: 10px; align-items: stretch; }
+.chat-input textarea {
+    flex: 1; font-family: var(--font-sans); font-size: 13.5px; color: var(--fg);
+    background: var(--bg-3); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 8px 10px; resize: vertical;
+}
+.chat-input textarea:focus { outline: none; border-color: var(--amber-dim); }
+.chat-btns { display: flex; flex-direction: column; gap: 6px; }
+.chat-btns button { padding: 6px 14px; font-size: 12px; }
+#b-mic.rec { border-color: var(--red); color: var(--red); }
+.knobs { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 12px; align-items: center; }
+.knobs .knob { display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-faint); }
+.knobs input[type="number"] {
+    width: 64px; font-family: var(--font-mono); font-size: 11.5px; color: var(--fg);
+    background: var(--bg-3); border: 1px solid var(--rule); border-radius: 4px; padding: 3px 6px;
+}
+
 .ctable { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 11.5px; }
 .ctable th {
     text-align: left; font-weight: 400; font-size: 10px; text-transform: uppercase;
@@ -207,10 +230,24 @@ button:disabled { opacity: 0.45; cursor: default; }
         </table>
     </div>
 
-    <div class="sec"><span>§ 04</span><span class="rule"></span><span>config</span></div>
+    <div class="sec"><span>§ 04</span><span class="rule"></span><span>chat</span></div>
+    <div class="panel">
+        <div class="chat-log" id="chat-log"><div class="ctl-note">talk to the served model — the conversation lives in this page only</div></div>
+        <div class="chat-input">
+            <textarea id="chat-text" rows="2" placeholder="message the model — Enter sends, Shift+Enter for a newline"></textarea>
+            <div class="chat-btns">
+                <button id="b-mic" type="button" style="display:none" title="record, click again to stop + transcribe">● mic</button>
+                <button id="b-send" type="button">send</button>
+                <button id="b-chat-clear" type="button">clear</button>
+            </div>
+        </div>
+        <div class="knobs" id="knobs"></div>
+    </div>
+
+    <div class="sec"><span>§ 05</span><span class="rule"></span><span>config</span></div>
     <div class="panel cfg" id="cfg">…</div>
 
-    <div class="sec"><span>§ 05</span><span class="rule"></span><span>config editor</span></div>
+    <div class="sec"><span>§ 06</span><span class="rule"></span><span>config editor</span></div>
     <div class="panel">
         <div class="gpu-line" id="gpu-line" style="display:none"></div>
         <form id="cfg-form" class="cfg-form"></form>
@@ -223,7 +260,7 @@ button:disabled { opacity: 0.45; cursor: default; }
         <div class="cfg-file" id="cfg-file"></div>
     </div>
 
-    <div class="sec"><span>§ 06</span><span class="rule"></span><span>controls</span></div>
+    <div class="sec"><span>§ 07</span><span class="rule"></span><span>controls</span></div>
     <div class="panel controls">
         <button id="b-gc" type="button">collect garbage</button>
         <button id="b-drain" class="danger" type="button">drain + shutdown</button>
@@ -287,6 +324,7 @@ function apply(s) {
     if (s.asr_workers > 0) {
         $("tile-asr").classList.remove("hide");
         $("t-asr").textContent = s.asr_ready + " · " + s.asr_active + " · " + s.asr_pending;
+        if (micRec === null) $("b-mic").style.display = "";
     }
     $("cfg").innerHTML =
         "model <b>" + s.model + "</b> · ctx <b>" + s.ctx + "</b> · streams <b>" + s.max_streams + "</b>" +
@@ -535,6 +573,215 @@ async function poll() {
     }
     setTimeout(poll, 1000);
 }
+
+// ===== chat mode =====
+// Conversation lives client-side only: the page renders it and replays the whole message list
+// on every send over the ordinary /v1/chat/completions SSE. <think> spans show inline in a
+// different font — this is a demo surface, not a working-tool replacement.
+const KNOBS = [
+    { k: "temperature", v: 0.7, step: 0.1 }, { k: "top_k", v: 40, step: 1 },
+    { k: "top_p", v: 0.9, step: 0.05 }, { k: "min_p", v: 0, step: 0.01 },
+    { k: "presence_penalty", v: 0, step: 0.1 }, { k: "frequency_penalty", v: 0, step: 0.1 },
+    { k: "max_tokens", v: 512, step: 32 },
+];
+const chatMsgs = [];   // {role, content} — replayed on every send
+let chatBusy = false;
+
+{
+    const box = $("knobs");
+    for (const kn of KNOBS) {
+        const wrap = document.createElement("label");
+        wrap.className = "knob";
+        wrap.textContent = kn.k;
+        const inp = document.createElement("input");
+        inp.type = "number";
+        inp.step = String(kn.step);
+        inp.value = String(kn.v);
+        inp.id = "kn-" + kn.k;
+        wrap.append(inp);
+        box.append(wrap);
+    }
+    const think = document.createElement("label");
+    think.className = "knob";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = true;
+    cb.id = "kn-thinking";
+    think.append(cb, document.createTextNode("thinking"));
+    box.append(think);
+}
+
+// render a message's content with <think>…</think> spans in the serif think font
+function renderMsgContent(el, text) {
+    el.textContent = "";
+    const re = /<think>([\s\S]*?)(<\/think>|$)/g;
+    let idx = 0, m;
+    while ((m = re.exec(text)) !== null) {
+        if (m.index > idx) el.append(document.createTextNode(text.slice(idx, m.index)));
+        const sp = document.createElement("span");
+        sp.className = "think";
+        sp.textContent = m[1];
+        el.append(sp);
+        idx = m.index + m[0].length;
+    }
+    if (idx < text.length) el.append(document.createTextNode(text.slice(idx)));
+}
+
+function addBubble(role) {
+    const log = $("chat-log");
+    const hint = log.querySelector(".ctl-note");
+    if (hint) hint.remove();
+    const el = document.createElement("div");
+    el.className = "msg " + role;
+    log.append(el);
+    log.scrollTop = log.scrollHeight;
+    return el;
+}
+
+async function sendChat() {
+    const ta = $("chat-text");
+    const text = ta.value.trim();
+    if (!text || chatBusy) return;
+    chatBusy = true;
+    $("b-send").disabled = true;
+    ta.value = "";
+    chatMsgs.push({ role: "user", content: text });
+    renderMsgContent(addBubble("user"), text);
+    const body = { messages: chatMsgs, stream: true };
+    for (const kn of KNOBS) {
+        const v = Number($("kn-" + kn.k).value);
+        if (Number.isFinite(v)) body[kn.k] = kn.k === "top_k" || kn.k === "max_tokens" ? Math.trunc(v) : v;
+    }
+    body.enable_thinking = $("kn-thinking").checked;
+    const el = addBubble("assistant");
+    let acc = "";
+    const t0 = performance.now();
+    try {
+        const r = await fetch("/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        if (!r.ok || !r.body) {
+            const e = await r.json().catch(() => null);
+            acc = "[error " + r.status + "] " + (e && e.error ? e.error.message : "");
+            renderMsgContent(el, acc);
+        } else {
+            const reader = r.body.getReader();
+            const dec = new TextDecoder();
+            let buf = "";
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += dec.decode(value, { stream: true });
+                const events = buf.split("\n\n");
+                buf = events.pop();
+                for (const ev of events) {
+                    for (const line of ev.split("\n")) {
+                        if (!line.startsWith("data: ")) continue;
+                        const data = line.slice(6);
+                        if (data === "[DONE]") continue;
+                        try {
+                            const j = JSON.parse(data);
+                            const d = j.choices && j.choices[0] && j.choices[0].delta;
+                            if (d && d.content) {
+                                acc += d.content;
+                                renderMsgContent(el, acc);
+                                $("chat-log").scrollTop = $("chat-log").scrollHeight;
+                            }
+                        } catch (_e) { /* keep-alive or partial frame */ }
+                    }
+                }
+            }
+        }
+    } catch (_e) {
+        acc = acc || "[request failed]";
+        renderMsgContent(el, acc);
+    }
+    // history carries the reply WITHOUT the think trace (it is not part of the conversation)
+    chatMsgs.push({ role: "assistant", content: acc.replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trim() });
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
+    el.append(meta);
+    chatBusy = false;
+    $("b-send").disabled = false;
+}
+
+$("b-send").addEventListener("click", sendChat);
+$("chat-text").addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
+$("b-chat-clear").addEventListener("click", () => {
+    chatMsgs.length = 0;
+    $("chat-log").innerHTML = "<div class=\"ctl-note\">cleared</div>";
+});
+
+// ===== mic input (shown when the server runs ASR workers) =====
+let micRec = null;   // { ctx, node, stream, chunks }
+
+function encodeWav(chunks, sampleRate) {
+    let n = 0;
+    for (const c of chunks) n += c.length;
+    const pcm = new Int16Array(n);
+    let o = 0;
+    for (const c of chunks) {
+        for (let i = 0; i < c.length; i++) {
+            pcm[o++] = Math.max(-32768, Math.min(32767, Math.round(c[i] * 32767)));
+        }
+    }
+    const buf = new ArrayBuffer(44 + pcm.length * 2);
+    const v = new DataView(buf);
+    const w = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+    w(0, "RIFF"); v.setUint32(4, 36 + pcm.length * 2, true); w(8, "WAVE");
+    w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, "data"); v.setUint32(40, pcm.length * 2, true);
+    new Int16Array(buf, 44).set(pcm);
+    return new Blob([buf], { type: "audio/wav" });
+}
+
+async function micToggle() {
+    const btn = $("b-mic");
+    if (micRec) {
+        const { ctx, node, stream, chunks } = micRec;
+        micRec = null;
+        btn.classList.remove("rec");
+        btn.textContent = "● mic";
+        node.disconnect();
+        stream.getTracks().forEach(t => t.stop());
+        const rate = ctx.sampleRate;
+        await ctx.close();
+        if (!chunks.length) return;
+        btn.disabled = true;
+        try {
+            const fd = new FormData();
+            fd.append("file", encodeWav(chunks, rate), "mic.wav");
+            const r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
+            const j = await r.json();
+            if (j && j.text) $("chat-text").value = ($("chat-text").value + " " + j.text).trim();
+        } catch (_e) { /* leave the input as-is */ }
+        btn.disabled = false;
+        return;
+    }
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const ctx = new AudioContext();
+        const src = ctx.createMediaStreamSource(stream);
+        const node = ctx.createScriptProcessor(4096, 1, 1);
+        const chunks = [];
+        node.onaudioprocess = e => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+        src.connect(node);
+        node.connect(ctx.destination);
+        micRec = { ctx, node, stream, chunks };
+        btn.classList.add("rec");
+        btn.textContent = "■ stop";
+    } catch (_e) {
+        btn.style.display = "none";   // no mic permission — hide the button
+    }
+}
+$("b-mic").addEventListener("click", micToggle);
 
 // ===== config editor =====
 // field spec: k = config key, t = text|path|int|sel|bool, o = select options ("" = unset/legacy)

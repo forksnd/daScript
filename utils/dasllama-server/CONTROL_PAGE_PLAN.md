@@ -19,6 +19,15 @@ override); capability guard (`supported` + `reason` recorded at load); `gpu_tier
 Verified: toml 108/108, server 17/17 live, vulkan tier 12/12, e2e restart loop (CLI-beats-toml
 → save authoritative → exit 4 → relaunch → toml-beats-CLI), page behavior via mock+playwright.
 
+**S5 DONE (2026-07-19):** page chat over the existing `/v1/chat/completions` SSE (fetch reader,
+frame-split, keep-alive tolerant) — conversation client-held, assistant history stripped of the
+think trace; `<think>` spans render inline in a serif think font; all sampling knobs
+(temperature / top_k / top_p / min_p / presence / frequency / max_tokens / enable_thinking);
+mic button (shown when `asr_workers > 0`) records via ScriptProcessor → 16-bit WAV → POST
+`/v1/audio/transcriptions` → transcript into the input. Verified: mock (knob/history/think
+assertions on the recorded request) + LIVE tinyllama end-to-end (real SSE chat bubble, real
+hardware line, history card, cache hint) via playwright.
+
 **S4 DONE (2026-07-19):** prefix cache grows a chain registry (`PrefixChain` per donation with
 ≥1 new page: page-covered tokens, live pages, hits — bumped when an attach's deepest matched
 page belongs to it — born/last-hit ticks, preview); scheduler passes `st.prompt_head` as the

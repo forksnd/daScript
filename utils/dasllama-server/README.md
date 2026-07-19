@@ -135,7 +135,7 @@ first — Windows locks the exe.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/` | Control page: live stats (tok/s, streams, prefix cache, MTP/ASR), config, GC + drain buttons. Serves `control.html` from beside the server sources — polls `/v1/stats` at 1 Hz |
+| `GET`  | `/` | Control page: live stats + charts, stream swimlane + live text cards, prefix-cache table, a chat panel (all sampling knobs, `<think>` inline, mic input under `--asr`), config editor with save/restart, GC + drain buttons. Serves `control.html` from beside the server sources — polls `/v1/stats` + `/v1/streams` at 1 Hz |
 | `GET`  | `/v1/models` | Lists the served model (and `--asr` if loaded) |
 | `POST` | `/v1/chat/completions` | Chat; `stream: true` → SSE, else buffered; OpenAI function calling (`tools`) |
 | `POST` | `/v1/completions` | Raw completion; `stream: true` → SSE, else buffered |
