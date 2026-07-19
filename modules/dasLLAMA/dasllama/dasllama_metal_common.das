@@ -61,6 +61,8 @@ enum MetalDecodeDecline {
     device              // metal_decode_init failed (no device / PSO build failure)
     mirror              // the mirror arena cannot hold the KV slice
     gpu_error           // dispatch failed at execution time
+    planar              // weights not in the blob-image form (the drivers are blob-only —
+                        // load_model under metal mode transforms/maps the metal flavor)
 }
 
 //! Layer-stack features a model's graph needs beyond the base llama dense block — ONE derivation
@@ -518,39 +520,49 @@ def upload_region_cat3(p0 : void?; b0 : uint64; p1 : void?; b1 : uint64; p2 : vo
     return buf
 }
 
-// one tensor's scale-plane region — the f32 plane or the wscale_f16 halfword plane, whichever
-// the model carries (the GEMV PSO twin is picked to match)
-def upload_scales(t : Model; off, rows, n : int64) : MetalBuffer? {
-    let cnt = rows * (n / 32l)
-    unsafe {
-        if (t.wscale_f16) {
-            return upload_region(addr < void? >(t.qscales16[off / 32l]), uint64(cnt * 2l))
-        }
-        return upload_region(addr < void? >(t.qscales[off / 32l]), uint64(cnt * 4l))
+// ===== the whole-plane resident buffers (blob-only models) =====
+// A metal_blob model's weight planes are GPU-ready on the CPU side already (the image contract:
+// no processing on load for the config it was built for). Each plane becomes ONE resident
+// buffer — a zero-copy page wrap when the plane is image-mapped (page-aligned view), else a
+// one-time untracked copy (the DASLLAMA_IMAGE=0 in-RAM transform) — and every tensor binds it
+// at a byte offset. Offsets keep in-kernel indices REGION-relative: a 13GB blob's absolute
+// byte indices overflow the kernels' uint32 index math, bind offsets never reach the kernel.
+
+def private plane_buffer(dev : MetalDevice?; base : void?; bytes : uint64) : MetalBuffer? {
+    let key = intptr(base)
+    if (key_exists(g_regions, key)) {
+        return g_regions[key]
     }
+    var buf : MetalBuffer?
+    if ((key & 16383ul) == 0ul) {
+        // page-aligned = an image-mapped plane view; the rounded-up tail stays inside the
+        // mapping (sections start page-aligned, the file pads to a page multiple)
+        buf = unsafe(metal_new_buffer_no_copy_untracked(dev, base, (bytes + 16383ul) & ~16383ul))
+    } else {
+        buf = metal_new_buffer_untracked(dev, bytes)
+        unsafe {
+            var d = reinterpret<uint8?>(metal_buffer_contents(buf))
+            let s = reinterpret<uint8 const?>(base)
+            var at = 0l
+            while (at < int64(bytes)) {   // memcpy takes int — chunk the >2GB planes
+                let chunk = min(int64(bytes) - at, 1073741824l)
+                memcpy(reinterpret<void?>(d + at), reinterpret<void const?>(s + at), int(chunk))
+                at += chunk
+            }
+        }
+    }
+    g_regions[key] = buf
+    return buf
 }
 
-// one tensor's resident 34B q8-block blob (the prefill module's cache — shared, repacked once)
-def blob_of(t : Model; off, rows, n : int64) : MetalBuffer? {
+//! The whole-model 34B-block q8 blob buffer (metal_blob models) + one tensor's byte offset
+//! within it — bind BOTH blob views (half-scale + byte) at this offset. Layout gate at the
+//! transform keeps every offset 16B-aligned.
+def blob_of(dev : MetalDevice?; t : Model; off : int64) : tuple<buf : MetalBuffer?; boff : uint64> {
+    assert(t.metal_blob)   // planar models decline at the gates — they never reach an upload
     unsafe {
-        let q = addr < void? >(t.qblob[off])
-        let s = t.wscale_f16 ? addr < void? >(t.qscales16[off / 32l]) : addr < void? >(t.qscales[off / 32l])
-        return metal_blob_region(g_dev, q, s, rows, n, t.wscale_f16)
-    }
-}
-
-// the concat twin for the fused QKV / W1|W3 scale planes (rows2 == 0 = two-piece)
-def upload_scales_cat3(t : Model; off0, rows0, off1, rows1, off2, rows2, n : int64) : MetalBuffer? {
-    let ssz = t.wscale_f16 ? 2l : 4l
-    let nb = n / 32l
-    unsafe {
-        let p0 = t.wscale_f16 ? addr < void? >(t.qscales16[off0 / 32l]) : addr < void? >(t.qscales[off0 / 32l])
-        let p1 = t.wscale_f16 ? addr < void? >(t.qscales16[off1 / 32l]) : addr < void? >(t.qscales[off1 / 32l])
-        var p2 : void?
-        if (rows2 > 0l) {
-            p2 = t.wscale_f16 ? addr < void? >(t.qscales16[off2 / 32l]) : addr < void? >(t.qscales[off2 / 32l])
-        }
-        return upload_region_cat3(p0, uint64(rows0 * nb * ssz), p1, uint64(rows1 * nb * ssz), p2, uint64(rows2 * nb * ssz))
+        return (buf = plane_buffer(dev, addr < void? >(t.mblob[0]), uint64(long_length(t.mblob))),
+                boff = uint64((off / 32l) * 34l))
     }
 }
 
@@ -624,73 +636,44 @@ def nc_logits_release {
     }
 }
 
-// One kq tensor's quant plane slice, uploaded BYTE-IDENTICAL (disk-order superblock payloads —
-// the backend_repack decline excludes grp-repacked loads, and the non-repack backends leave the
-// planes disk-order). Cached in g_regions by source address like every weight region.
-def kq_upload_quants(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
+//! One kq tensor's quant plane bind: the whole disk-layout plane as one resident buffer + the
+//! tensor's byte offset (superblock payloads verbatim — the backend_repack decline excludes
+//! grp-repacked loads). Serves BOTH resident drivers (prefill passes its own device handle).
+def kq_quants_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tuple<buf : MetalBuffer?; qoff : uint64> {
+    assert(t.metal_blob)
     let sb0 = off / 256l
-    let nsb = (rows * n) / 256l
     unsafe {
         if (fmt == KqFmt.k4) {
-            return kq_region(dev, addr < void? >(t.k4q[sb0 * 128l]), uint64(nsb * 128l))
+            return (buf = plane_buffer(dev, addr < void? >(t.k4q[0]), uint64(long_length(t.k4q))),
+                    qoff = uint64(sb0 * 128l))
         }
         if (fmt == KqFmt.k5) {
-            return kq_region(dev, addr < void? >(t.k5q[sb0 * 160l]), uint64(nsb * 160l))
+            return (buf = plane_buffer(dev, addr < void? >(t.k5q[0]), uint64(long_length(t.k5q))),
+                    qoff = uint64(sb0 * 160l))
         }
-        return kq_region(dev, addr < void? >(t.k6q[sb0 * 192l]), uint64(nsb * 192l))
+        return (buf = plane_buffer(dev, addr < void? >(t.k6q[0]), uint64(long_length(t.k6q))),
+                qoff = uint64(sb0 * 192l))
     }
 }
 
-// upload_region's device-parameterized twin (the kq helpers serve BOTH resident drivers — the
-// prefill driver owns its own device handle; same shared address-keyed cache)
-def private kq_region(dev : MetalDevice?; src : void?; bytes : uint64) : MetalBuffer? {
-    let key = intptr(src)
-    if (key_exists(g_regions, key)) {
-        return g_regions[key]
-    }
-    var buf = metal_new_buffer_untracked(dev, bytes)
-    unsafe {
-        memcpy(metal_buffer_contents(buf), src, int(bytes))
-    }
-    g_regions[key] = buf
-    return buf
-}
-
-// One kq tensor's GPU-form scale buffer: k4/k5 = 16B compact blocks (20B production block minus
-// pad — its varying mod-16 phase defeats vector-load merge); k6 = [16B sub-scale][packed f16 d]
-// in ONE buffer, d plane at byte nsb*16 (kernel binds the buffer twice with offsets).
-def kq_upload_scales(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
+//! One kq tensor's GPU-form scale bind (the gemv lab's layouts, pre-baked by the blob
+//! transform): k4/k5 = 16B compact blocks at soff; k6 = the split plane — sub-scale strips at
+//! soff, the packed f16 d plane at doff (the kernels bind the buffer twice, once per offset).
+def kq_scales_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tuple<buf : MetalBuffer?; soff : uint64; doff : uint64> {
+    assert(t.metal_blob)
     let sb0 = off / 256l
-    let nsb = (rows * n) / 256l
     unsafe {
         if (fmt == KqFmt.k6) {
-            let key = intptr(addr(t.k6s[sb0 * 18l]))
-            if (key_exists(g_regions, key)) {
-                return g_regions[key]
-            }
-            var buf = metal_new_buffer_untracked(dev, uint64(nsb * 18l))
-            var d = reinterpret<uint8?>(metal_buffer_contents(buf))
-            let src = addr < uint8 const? >(t.k6s[sb0 * 18l])
-            for (sb in range64(nsb)) {
-                memcpy(reinterpret<void?>(d + sb * 16l), reinterpret<void const?>(src + sb * 18l), 16)
-                d[nsb * 16l + sb * 2l] = src[sb * 18l + 16l]
-                d[nsb * 16l + sb * 2l + 1l] = src[sb * 18l + 17l]
-            }
-            g_regions[key] = buf
-            return buf
+            let plane_sb = long_length(t.k6s) / 18l   // split form keeps the 18B/sb total
+            return (buf = plane_buffer(dev, addr < void? >(t.k6s[0]), uint64(long_length(t.k6s))),
+                    soff = uint64(sb0 * 16l), doff = uint64(plane_sb * 16l + sb0 * 2l))
         }
-        let src = fmt == KqFmt.k4 ? addr < uint8 const? >(t.k4s[sb0 * 20l]) : addr < uint8 const? >(t.k5s[sb0 * 20l])
-        let key = intptr(src)
-        if (key_exists(g_regions, key)) {
-            return g_regions[key]
+        if (fmt == KqFmt.k4) {
+            return (buf = plane_buffer(dev, addr < void? >(t.k4s[0]), uint64(long_length(t.k4s))),
+                    soff = uint64(sb0 * 16l), doff = 0ul)
         }
-        var buf = metal_new_buffer_untracked(dev, uint64(nsb * 16l))
-        var d = reinterpret<uint8?>(metal_buffer_contents(buf))
-        for (sb in range64(nsb)) {
-            memcpy(reinterpret<void?>(d + sb * 16l), reinterpret<void const?>(src + sb * 20l), 16)
-        }
-        g_regions[key] = buf
-        return buf
+        return (buf = plane_buffer(dev, addr < void? >(t.k5s[0]), uint64(long_length(t.k5s))),
+                soff = uint64(sb0 * 16l), doff = 0ul)
     }
 }
 
@@ -989,55 +972,8 @@ def bar_dep(enc : MetalComputeEncoder?; var h : HazTrack; rmask, wmask : uint) {
 }
 
 
-// ===== fused-GEMV cat blobs + the pending-step (encode-ahead) machinery =====
+// ===== the pending-step (encode-ahead) machinery =====
 
-// fused-GEMV weight blobs: 2-3 tensors' q8 rows repacked into ONE contiguous block_q8_0 stream.
-// Own cache (NOT the per-tensor blob cache — different content under a colliding base address);
-// released in metal_decode_shutdown.
-var g_cat_blobs : table<uint64; MetalBuffer?>
-
-// one q8 region (rows x n) interleaved into `base` at block offset blk0 — the same 34B layout
-// as metal_blob_region, targeting a slice of a cat blob
-def repack_blocks(base : int8?; blk0 : int64; t : Model; off, rows, n : int64) {
-    let nblocks = rows * (n / 32l)
-    unsafe {
-        var qp = addr < int8? >(t.qblob[off])
-        if (t.wscale_f16) {
-            var sp16 = addr < uint16? >(t.qscales16[off / 32l])
-            for (b in range64(nblocks)) {
-                let o = (blk0 + b) * 34l
-                var pb = reinterpret<uint16?>(base + o)
-                pb[0] = sp16[b]
-                memcpy(reinterpret<void?>(base + o + 2l), reinterpret<void?>(qp + b * 32l), 32)
-            }
-        } else {
-            var sp = addr < float? >(t.qscales[off / 32l])
-            for (b in range64(nblocks)) {
-                let o = (blk0 + b) * 34l
-                var ph = reinterpret<float16?>(base + o)
-                ph[0] = float16(sp[b])
-                memcpy(reinterpret<void?>(base + o + 2l), reinterpret<void?>(qp + b * 32l), 32)
-            }
-        }
-    }
-}
-
-def blob_cat3(t : Model; off0, rows0, off1, rows1, off2, rows2, n : int64) : MetalBuffer? {
-    let key = intptr(unsafe(addr(t.qblob[off0])))
-    if (key_exists(g_cat_blobs, key)) {
-        return g_cat_blobs[key]
-    }
-    let nb = n / 32l
-    var buf = metal_new_buffer_untracked(g_dev, uint64((rows0 + rows1 + rows2) * nb * 34l))
-    var base = unsafe(reinterpret<int8?>(metal_buffer_contents(buf)))
-    repack_blocks(base, 0l, t, off0, rows0, n)
-    repack_blocks(base, rows0 * nb, t, off1, rows1, n)
-    if (rows2 > 0l) {
-        repack_blocks(base, (rows0 + rows1) * nb, t, off2, rows2, n)
-    }
-    g_cat_blobs[key] = buf
-    return buf
-}
 // the pending pipelined step (one deep): everything finish_pending_step needs to wait, read
 // back, and release AFTER the next step is committed behind it. Sessions are borrowed pointers
 // (caller-owned) — always cleared, never deleted.
@@ -1208,16 +1144,6 @@ def weight_caches_flush_on_reload {
         return
     }
     finish_pending_step()
-    metal_blob_regions_release()
-    for (buf in values(g_cat_blobs)) {
-        if (buf != null) {
-            metal_release(buf)
-        }
-        buf = null
-    }
-    unsafe {
-        delete g_cat_blobs
-    }
     for (buf in values(g_regions)) {
         if (buf != null) {
             metal_release(buf)
@@ -1232,16 +1158,6 @@ def weight_caches_flush_on_reload {
 
 def metal_common_release {
     nc_logits_release()
-    metal_blob_regions_release()   // the batch mm path creates blobs in the prefill module's cache
-    for (buf in values(g_cat_blobs)) {
-        if (buf != null) {
-            metal_release(buf)
-        }
-        buf = null
-    }
-    unsafe {
-        delete g_cat_blobs
-    }
     for (mr in values(g_mirrors)) {
         mirror_release(mr)
     }
@@ -1308,6 +1224,7 @@ enum MetalPrefillDecline {
     rope_rows           // the window's rope table not built
     device              // metal_prefill_init failed (no device / PSO build failure)
     gpu_error           // dispatch failed at execution time
+    planar              // weights not in the blob-image form (the drivers are blob-only)
 }
 
 var g_prefill_declines = 0l
@@ -1335,59 +1252,3 @@ def public metal_prefill_declines() : table<string; int64> {
     return clone_to_move(g_prefill_declines_by_reason)
 }
 
-var g_blob_regions : table<uint64; MetalBuffer?>    // quant base address -> resident block_q8_0 blob (lcpp mul_mm path)
-var g_repack_us = 0l
-
-//! Release the shared block_q8_0 blob cache — BOTH drivers' shutdowns call this (the prefill
-//! and batch-decode drivers create blobs here), and each shutdown must leave the count at zero
-//! for the leak gates. Blobs lazily rebuild on the next use.
-def public metal_blob_regions_release {
-    for (buf in values(g_blob_regions)) {
-        if (buf != null) {
-            metal_release(buf)
-        }
-        buf = null
-    }
-    unsafe {
-        delete g_blob_regions
-    }
-    g_repack_us = 0l
-}
-
-//! Resident block_q8_0 blob for one weight region — llama.cpp's mul_mm layout (34B blocks: half
-//! scale + 32 int8 quants), cached by quant base address, shared across prefill/batch-decode.
-//! `s16` reads raw f16 bits; f32->f16 narrowing is exact for GGUF-q8_0-sourced weights.
-def public metal_blob_region(dev : MetalDevice?; qsrc, ssrc : void?; rows, k : int64; s16 : bool) : MetalBuffer? {
-    // the scale encoding is part of the identity: the same quant region blobbed under f32 vs raw
-    // f16 scales must not share a cache slot (the top bit is never set in a user-space address)
-    let key = intptr(qsrc) | (s16 ? 0x8000000000000000ul : 0ul)
-    if (key_exists(g_blob_regions, key)) {
-        return g_blob_regions[key]
-    }
-    let ts = ref_time_ticks()
-    let nblocks = int(rows * (k / 32l))
-    var buf = metal_new_buffer_untracked(dev, uint64(nblocks) * 34ul)
-    var base = unsafe(reinterpret<int8?>(metal_buffer_contents(buf)))
-    var qp = unsafe(reinterpret<int8?>(qsrc))
-    var sp = unsafe(reinterpret<float?>(ssrc))
-    var sp16 = unsafe(reinterpret<uint16?>(ssrc))
-    for (b in range(nblocks)) {
-        let off = b * 34
-        unsafe {
-            if (s16) {
-                var pb = reinterpret<uint16?>(base + off)
-                pb[0] = sp16[b]
-            } else {
-                var ph = reinterpret<float16?>(base + off)
-                ph[0] = float16(sp[b])
-            }
-            let src = b * 32
-            for (c in range(32)) {
-                base[off + 2 + c] = qp[src + c]
-            }
-        }
-    }
-    g_blob_regions[key] = buf
-    g_repack_us += int64(get_time_usec(ts))
-    return buf
-}

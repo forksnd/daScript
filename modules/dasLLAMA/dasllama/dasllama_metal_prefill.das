@@ -508,14 +508,16 @@ class MetalKqMulMmK6 {
     }
 }
 
-// One simdgroup per output row: the classifier GEMV — a dim-long Q8 row dot one f32 vector.
-// Bandwidth-bound on the [vocab x dim] weight stream; x stays cache-resident across rows. Lanes
-// stride byte4s, each byte4's int dot rides its block's scale. 128 threads = 4 rows per group.
+// One simdgroup per output row over the whole-model 34B q8 blob (f16 scale + 32 int8 inline —
+// the SAME dual-view W the mul_mm reads, bound at the tensor's byte offset): lane owns chunk
+// lane%8 of every 4th block, 4 blocks in flight (16 blocks per simdgroup stripe — amortizes
+// the loop overhead on the bandwidth-bound weight stream), the scale rides the quants'
+// cacheline. x stays cache-resident across rows. 128 threads = 4 rows per group.
 class MetalQ8Gemv {
-    @ssbo @binding = 0 wq : array<byte4>    // [d x n] Q8 rows, byte4 view
-    @ssbo @binding = 1 ws : array<float>    // [d x n/32] scales
+    @ssbo @binding = 0 wsh : array<float16> // 34B-block W blob, half-scale view (block b at 17*b)
+    @ssbo @binding = 1 wqb : array<int8>    // the same blob buffer, byte view (quants at 34*b + 2)
     @ssbo @binding = 2 x : array<float4>    // [n] f32 vector, float4 view
-    @ssbo @binding = 3 y : array<float>     // [d] logits
+    @ssbo @binding = 3 y : array<float>     // [d] outputs
     @uniform @binding = 4 ndim : uint       // n (reduction dim, % 32)
     @uniform @binding = 5 ddim : uint       // d (output rows)
 
@@ -526,83 +528,38 @@ class MetalQ8Gemv {
             return
         }
         let lane = gl_SubgroupInvocationID
+        let nb = ndim / 32u
         let nb4 = ndim / 4u
-        let wbase = row * nb4
-        let sbase = row * (ndim / 32u)
+        var sp = unsafe(addr(wsh[(row * nb + lane / 8u) * 17u]))
+        var qp = unsafe(addr(wqb[(row * nb + lane / 8u) * 34u + 2u + (lane % 8u) * 4u]))
+        var x0 = unsafe(addr(x[lane]))
         var acc = 0.0
+        var lw : float4[4]
         var k = lane
-        // 4 blocks-in-flight per iteration (128 byte4s per simdgroup step) — amortizes the
-        // loop overhead on the bandwidth-bound weight stream; the plain loop drains the tail
         while (k + 96u < nb4) {
-            let wa = float4(int4(wq[wbase + k]))
-            let xa = x[k]
-            let wb = float4(int4(wq[wbase + (k + 32u)]))
-            let xb = x[k + 32u]
-            let wc = float4(int4(wq[wbase + (k + 64u)]))
-            let xc = x[k + 64u]
-            let wd = float4(int4(wq[wbase + (k + 96u)]))
-            let xd = x[k + 96u]
-            acc += (wa.x * xa.x + wa.y * xa.y + wa.z * xa.z + wa.w * xa.w) * ws[sbase + k / 8u]
-            acc += (wb.x * xb.x + wb.y * xb.y + wb.z * xb.z + wb.w * xb.w) * ws[sbase + (k + 32u) / 8u]
-            acc += (wc.x * xc.x + wc.y * xc.y + wc.z * xc.z + wc.w * xc.w) * ws[sbase + (k + 64u) / 8u]
-            acc += (wd.x * xd.x + wd.y * xd.y + wd.z * xd.z + wd.w * xd.w) * ws[sbase + (k + 96u) / 8u]
+            // all 4 chunk dequants batch AHEAD of the fma chains (the MvB2 load batching)
+            for [unroll_full] (c in range(4)) {
+                let d = float(unsafe(sp[uint(c) * 68u]))   // chunk c sits 4 blocks (68 halves) on
+                let qb = uint(c) * 136u                    // ... and 136 quant bytes
+                lw[c] = float4(float(unsafe(qp[qb])), float(unsafe(qp[qb + 1u])),
+                    float(unsafe(qp[qb + 2u])), float(unsafe(qp[qb + 3u]))) * d
+            }
+            for [unroll_full] (c in range(4)) {
+                let xv = unsafe(x0[uint(c) * 32u])
+                acc += lw[c].x * xv.x + lw[c].y * xv.y + lw[c].z * xv.z + lw[c].w * xv.w
+            }
+            sp = unsafe(sp + 272)           // 16 blocks x 17 halves per stripe
+            qp = unsafe(qp + 544)           // 16 blocks x 34 bytes
+            x0 = unsafe(x0 + 128)
             k += 128u
         }
         while (k < nb4) {
-            let w4 = float4(int4(wq[wbase + k]))
-            let x4 = x[k]
-            acc += (w4.x * x4.x + w4.y * x4.y + w4.z * x4.z + w4.w * x4.w) * ws[sbase + k / 8u]
-            k += gl_SubgroupSize
-        }
-        acc = simd_sum(acc)
-        if (lane == 0u) {
-            y[row] = acc
-        }
-    }
-}
-
-// The seed GEMV's f16-SCALE twin (wscale_f16 models — the qscales16 halfword plane): one
-// simdgroup per output row, 4 blocks in flight. 1.0625 vs 1.125 bytes/weight — ~5.6% less stream.
-// (A uint4 wide-load variant measured 0.5ms/token SLOWER on M1 — don't re-try without new silicon.)
-class MetalQ8GemvS16 {
-    @ssbo @binding = 0 wq : array<byte4>    // [d x n] Q8 rows, byte4 view
-    @ssbo @binding = 1 ws : array<float16>  // [d x n/32] scales, raw binary16
-    @ssbo @binding = 2 x : array<float4>    // [n] f32 vector, float4 view
-    @ssbo @binding = 3 y : array<float>     // [d]
-    @uniform @binding = 4 ndim : uint       // n (reduction dim, % 32)
-    @uniform @binding = 5 ddim : uint       // d (output rows)
-
-    [metal_kernel(name="metal_q8_gemv_s16_msl")]
-    def metal_q8_gemv_s16 {
-        let row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
-        if (row >= ddim) {
-            return
-        }
-        let lane = gl_SubgroupInvocationID
-        let nb4 = ndim / 4u
-        let wbase = row * nb4
-        let sbase = row * (ndim / 32u)
-        var acc = 0.0
-        var k = lane
-        while (k + 96u < nb4) {
-            let wa = float4(int4(wq[wbase + k]))
-            let xa = x[k]
-            let wb = float4(int4(wq[wbase + (k + 32u)]))
-            let xb = x[k + 32u]
-            let wc = float4(int4(wq[wbase + (k + 64u)]))
-            let xc = x[k + 64u]
-            let wd = float4(int4(wq[wbase + (k + 96u)]))
-            let xd = x[k + 96u]
-            acc += (wa.x * xa.x + wa.y * xa.y + wa.z * xa.z + wa.w * xa.w) * float(ws[sbase + k / 8u])
-            acc += (wb.x * xb.x + wb.y * xb.y + wb.z * xb.z + wb.w * xb.w) * float(ws[sbase + (k + 32u) / 8u])
-            acc += (wc.x * xc.x + wc.y * xc.y + wc.z * xc.z + wc.w * xc.w) * float(ws[sbase + (k + 64u) / 8u])
-            acc += (wd.x * xd.x + wd.y * xd.y + wd.z * xd.z + wd.w * xd.w) * float(ws[sbase + (k + 96u) / 8u])
-            k += 128u
-        }
-        while (k < nb4) {
-            let w4 = float4(int4(wq[wbase + k]))
-            let x4 = x[k]
-            acc += (w4.x * x4.x + w4.y * x4.y + w4.z * x4.z + w4.w * x4.w) * float(ws[sbase + k / 8u])
+            let bi = row * nb + k / 8u
+            let d = float(wsh[bi * 17u])
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let xv = x[k]
+            acc += (float(wqb[qb]) * xv.x + float(wqb[qb + 1u]) * xv.y +
+                float(wqb[qb + 2u]) * xv.z + float(wqb[qb + 3u]) * xv.w) * d
             k += gl_SubgroupSize
         }
         acc = simd_sum(acc)

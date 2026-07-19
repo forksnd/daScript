@@ -1501,8 +1501,9 @@ class MetalSqAttnComb {
 // of q/k ARE two weight rows of the fused region — adjacent (2p, 2p+1) under NORM, (r, r+hs/2)
 // within the head under NEOX. Deletes the separate rope_store dispatch entirely.
 class MetalQ8GemvQkvRsF16 {
-    @ssbo @binding = 0 wq : array<byte4>    // fused QKV rows (concat region)
-    @ssbo @binding = 1 ws : array<float16>  // fused scale planes, halfwords
+    @ssbo @binding = 0 wqbq : array<int8>   // wq blob, byte view @ the q tensor's byte offset
+    @ssbo @binding = 1 wshq : array<float16>   // ... half-scale view (same offset). Segments bind
+                                            // separately — kind-major layout keeps q/k/v apart
     @ssbo @binding = 2 x : array<float4>
     @ssbo @binding = 3 qo : array<float>    // q out, roped ([0, qd) of the QKV buffer)
     @ssbo @binding = 4 kd : array<float16>  // mirror K row (bound at the row offset)
@@ -1517,6 +1518,10 @@ class MetalQ8GemvQkvRsF16 {
     @uniform @binding = 13 neox : uint      // rope pair = rows (r, r+hs/2) instead of (2p, 2p+1)
     @ssbo @binding = 14 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 15 has_bias : uint
+    @ssbo @binding = 16 wqbk : array<int8>  // wk blob views
+    @ssbo @binding = 17 wshk : array<float16>
+    @ssbo @binding = 18 wqbv : array<int8>  // wv blob views
+    @ssbo @binding = 19 wshv : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs16_msl")]
     def metal_q8_gemv_qkv_rs16 {
@@ -1541,13 +1546,48 @@ class MetalQ8GemvQkvRsF16 {
         var acc0 = 0.0
         var acc1 = 0.0
         var k = lane
-        while (k < nb4) {
-            let x4 = x[k]
-            let w0 = float4(int4(wq[row * nb4 + k]))
-            let w1 = float4(int4(wq[row2 * nb4 + k]))
-            acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(ws[row * nb + k / 8u])
-            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[row2 * nb + k / 8u])
-            k += gl_SubgroupSize
+        // both pair rows sit in ONE segment (qd/kvd even, NEOX pairs stay in-head) — dot them
+        // off that segment's blob views with segment-LOCAL rows
+        if (row < qd) {
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (row * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (row2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbq[qb0]), float(wqbq[qb0 + 1u]), float(wqbq[qb0 + 2u]), float(wqbq[qb0 + 3u]))
+                let w1 = float4(float(wqbq[qb1]), float(wqbq[qb1 + 1u]), float(wqbq[qb1 + 2u]), float(wqbq[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshq[(row * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshq[(row2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
+        } elif (row < qd + kvd) {
+            let lr = row - qd
+            let lr2 = row2 - qd
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (lr * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (lr2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbk[qb0]), float(wqbk[qb0 + 1u]), float(wqbk[qb0 + 2u]), float(wqbk[qb0 + 3u]))
+                let w1 = float4(float(wqbk[qb1]), float(wqbk[qb1 + 1u]), float(wqbk[qb1 + 2u]), float(wqbk[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshk[(lr * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshk[(lr2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
+        } else {
+            let lr = row - qd - kvd
+            let lr2 = row2 - qd - kvd
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (lr * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (lr2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbv[qb0]), float(wqbv[qb0 + 1u]), float(wqbv[qb0 + 2u]), float(wqbv[qb0 + 3u]))
+                let w1 = float4(float(wqbv[qb1]), float(wqbv[qb1 + 1u]), float(wqbv[qb1 + 2u]), float(wqbv[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshv[(lr * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshv[(lr2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
         }
         acc0 = simd_sum(acc0)
         acc1 = simd_sum(acc1)
@@ -1582,8 +1622,8 @@ class MetalQ8GemvQkvRsF16 {
 
 // f32-mirror twin — straight stores, no clamp.
 class MetalQ8GemvQkvRsF32 {
-    @ssbo @binding = 0 wq : array<byte4>
-    @ssbo @binding = 1 ws : array<float16>
+    @ssbo @binding = 0 wqbq : array<int8>   // per-segment blob views — the F16 twin's scheme
+    @ssbo @binding = 1 wshq : array<float16>
     @ssbo @binding = 2 x : array<float4>
     @ssbo @binding = 3 qo : array<float>
     @ssbo @binding = 4 kd : array<float>
@@ -1598,6 +1638,10 @@ class MetalQ8GemvQkvRsF32 {
     @uniform @binding = 13 neox : uint
     @ssbo @binding = 14 bias : array<float>
     @uniform @binding = 15 has_bias : uint
+    @ssbo @binding = 16 wqbk : array<int8>
+    @ssbo @binding = 17 wshk : array<float16>
+    @ssbo @binding = 18 wqbv : array<int8>
+    @ssbo @binding = 19 wshv : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs32_msl")]
     def metal_q8_gemv_qkv_rs32 {
@@ -1620,13 +1664,46 @@ class MetalQ8GemvQkvRsF32 {
         var acc0 = 0.0
         var acc1 = 0.0
         var k = lane
-        while (k < nb4) {
-            let x4 = x[k]
-            let w0 = float4(int4(wq[row * nb4 + k]))
-            let w1 = float4(int4(wq[row2 * nb4 + k]))
-            acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(ws[row * nb + k / 8u])
-            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[row2 * nb + k / 8u])
-            k += gl_SubgroupSize
+        if (row < qd) {
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (row * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (row2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbq[qb0]), float(wqbq[qb0 + 1u]), float(wqbq[qb0 + 2u]), float(wqbq[qb0 + 3u]))
+                let w1 = float4(float(wqbq[qb1]), float(wqbq[qb1 + 1u]), float(wqbq[qb1 + 2u]), float(wqbq[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshq[(row * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshq[(row2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
+        } elif (row < qd + kvd) {
+            let lr = row - qd
+            let lr2 = row2 - qd
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (lr * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (lr2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbk[qb0]), float(wqbk[qb0 + 1u]), float(wqbk[qb0 + 2u]), float(wqbk[qb0 + 3u]))
+                let w1 = float4(float(wqbk[qb1]), float(wqbk[qb1 + 1u]), float(wqbk[qb1 + 2u]), float(wqbk[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshk[(lr * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshk[(lr2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
+        } else {
+            let lr = row - qd - kvd
+            let lr2 = row2 - qd - kvd
+            while (k < nb4) {
+                let x4 = x[k]
+                let co = (k % 8u) * 4u
+                let qb0 = (lr * nb + k / 8u) * 34u + 2u + co
+                let qb1 = (lr2 * nb + k / 8u) * 34u + 2u + co
+                let w0 = float4(float(wqbv[qb0]), float(wqbv[qb0 + 1u]), float(wqbv[qb0 + 2u]), float(wqbv[qb0 + 3u]))
+                let w1 = float4(float(wqbv[qb1]), float(wqbv[qb1 + 1u]), float(wqbv[qb1 + 2u]), float(wqbv[qb1 + 3u]))
+                acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wshv[(lr * nb + k / 8u) * 17u])
+                acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wshv[(lr2 * nb + k / 8u) * 17u])
+                k += gl_SubgroupSize
+            }
         }
         acc0 = simd_sum(acc0)
         acc1 = simd_sum(acc1)
@@ -1660,15 +1737,18 @@ class MetalQ8GemvQkvRsF32 {
 }
 
 // The W1|W3 twin of the same shape: one simdgroup dots BOTH ffn rows of an output element —
-// gate row r and up row r + hidden of the fused region — and writes silu(g)·u directly.
-// Deletes the swiglu dispatch AND its serialization level.
+// gate row r off the w1 blob views and up row r off the w3 views (kind-major layout keeps the
+// two tensors apart in the blob) — and writes silu(g)·u directly. Deletes the swiglu dispatch
+// AND its serialization level.
 class MetalQ8GemvW13Sw {
-    @ssbo @binding = 0 wq : array<byte4>    // fused W1|W3 rows (concat region)
-    @ssbo @binding = 1 ws : array<float16>
+    @ssbo @binding = 0 wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
+    @ssbo @binding = 1 wsh1 : array<float16>   // ... half-scale view
     @ssbo @binding = 2 x : array<float4>
     @ssbo @binding = 3 ho : array<float>    // [hidden] silu(gate)·up
     @uniform @binding = 4 ndim : uint
     @uniform @binding = 5 hidden : uint
+    @ssbo @binding = 6 wqb3 : array<int8>   // w3 blob views
+    @ssbo @binding = 7 wsh3 : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_w13sw16_msl")]
     def metal_q8_gemv_w13sw16 {
@@ -1679,17 +1759,17 @@ class MetalQ8GemvW13Sw {
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
         let nb = ndim / 32u
-        let ubase = (r + hidden) * nb4
-        let usb = (r + hidden) * nb
         var acc0 = 0.0
         var acc1 = 0.0
         var k = lane
         while (k < nb4) {
             let x4 = x[k]
-            let w0 = float4(int4(wq[r * nb4 + k]))
-            let w1 = float4(int4(wq[ubase + k]))
-            acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(ws[r * nb + k / 8u])
-            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(ws[usb + k / 8u])
+            let bi = r * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let w0 = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]), float(wqb1[qb + 3u]))
+            let w1 = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]), float(wqb3[qb + 3u]))
+            acc0 += (w0.x * x4.x + w0.y * x4.y + w0.z * x4.z + w0.w * x4.w) * float(wsh1[bi * 17u])
+            acc1 += (w1.x * x4.x + w1.y * x4.y + w1.z * x4.z + w1.w * x4.w) * float(wsh3[bi * 17u])
             k += gl_SubgroupSize
         }
         acc0 = simd_sum(acc0)
@@ -1773,11 +1853,12 @@ class MetalArgmax {
     }
 }
 
-// Speculative embed gather: dequant the argmax winner's Q8 embedding row (the cls_q8 linear copy
-// at emb_q8_off) into the next step's residual input — the GPU chain's embed_row.
+// Speculative embed gather: dequant the argmax winner's Q8 embedding row (the cls_q8 linear
+// copy's slice of the whole-model 34B blob, bound at emb_q8_off's byte offset) into the next
+// step's residual input — the GPU chain's embed_row.
 class MetalEmbedQ8 {
-    @ssbo @binding = 0 q : array<int8>      // the whole linear embed plane
-    @ssbo @binding = 1 sc : array<float>    // its scale plane
+    @ssbo @binding = 0 q : array<int8>      // the embed blob slice, byte view (quants at 34*b + 2)
+    @ssbo @binding = 1 sc : array<float16>  // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 2 tok : array<uint>
     @ssbo @binding = 3 xo : array<float>    // [dim] residual input out
     @uniform @binding = 4 dim : uint
@@ -1789,28 +1870,9 @@ class MetalEmbedQ8 {
         if (gid >= dim) {
             return
         }
-        let base = tok[0] * dim + gid
-        xo[gid] = (float(q[base]) * sc[base / 32u]) * escale
-    }
-}
-
-// f16-scale twin (wscale_f16 models — the qscales16 halfword plane).
-class MetalEmbedQ8S16 {
-    @ssbo @binding = 0 q : array<int8>
-    @ssbo @binding = 1 sc : array<float16>
-    @ssbo @binding = 2 tok : array<uint>
-    @ssbo @binding = 3 xo : array<float>
-    @uniform @binding = 4 dim : uint
-    @uniform @binding = 5 escale : float
-
-    [metal_kernel(name="metal_embed_q8_s16_msl")]
-    def metal_embed_q8_s16 {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= dim) {
-            return
-        }
-        let base = tok[0] * dim + gid
-        xo[gid] = (float(q[base]) * float(sc[base / 32u])) * escale
+        let e = tok[0] * dim + gid
+        let b = e / 32u
+        xo[gid] = (float(q[b * 34u + 2u + e % 32u]) * float(sc[b * 17u])) * escale
     }
 }
 
@@ -2341,14 +2403,12 @@ class MetalFwhtUnsign {
 // (cooperative load) instead of per-lane device reads (lab: B=2 +40-88%, B=4 ~2x; per-lane-
 // consecutive chunking measured 30-45% WORSE). Geometry pinned at 128 threads = 4 rows.
 class MetalGemvB2 {
-    @ssbo @binding = 0 wq : array<byte4>    // [d x n] Q8 rows, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // [d x n/32] scales, f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... the same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb : array<int8>    // 34B-block W blob, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 wsh : array<float16> // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 3 x : array<float4>    // [B x n] f32 rows, float4 view
     @ssbo @binding = 4 y : array<float>     // [B x d]
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
-    @uniform @binding = 7 s16 : uint
     @workgroup txp : float4[128]            // [2 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_b2_msl")]
@@ -2357,8 +2417,7 @@ class MetalGemvB2 {
         let row = min(gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID, ddim - 1u)
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
-        let wbase = row * nb4
-        let sbase = row * (ndim / 32u)
+        let nb = ndim / 32u
         var acc : float[2]
         var cb = 0u
         while (cb + 64u <= nb4) {
@@ -2367,8 +2426,10 @@ class MetalGemvB2 {
             barrier()
             for [unroll_full] (i in range(2)) {
                 let k = cb + uint(i) * 32u + lane
-                let sv = s16 != 0u ? float(wsh[sbase + k / 8u]) : wsf[sbase + k / 8u]
-                let w4 = float4(int4(wq[wbase + k])) * sv
+                let bi = row * nb + k / 8u
+                let qb = bi * 34u + 2u + (k % 8u) * 4u
+                let w4 = float4(float(wqb[qb]), float(wqb[qb + 1u]), float(wqb[qb + 2u]),
+                    float(wqb[qb + 3u])) * float(wsh[bi * 17u])
                 let kt = uint(i) * 32u + lane
                 for [unroll_full] (b in range(2)) {
                     let xv = txp[uint(b) * 64u + kt]
@@ -2379,8 +2440,10 @@ class MetalGemvB2 {
         }
         var k = cb + lane
         while (k < nb4) {
-            let sv = s16 != 0u ? float(wsh[sbase + k / 8u]) : wsf[sbase + k / 8u]
-            let w4 = float4(int4(wq[wbase + k])) * sv
+            let bi = row * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let w4 = float4(float(wqb[qb]), float(wqb[qb + 1u]), float(wqb[qb + 2u]),
+                float(wqb[qb + 3u])) * float(wsh[bi * 17u])
             for [unroll_full] (b in range(2)) {
                 let xv = x[uint(b) * nb4 + k]
                 acc[b] += w4.x * xv.x + w4.y * xv.y + w4.z * xv.z + w4.w * xv.w
@@ -2397,14 +2460,12 @@ class MetalGemvB2 {
 }
 
 class MetalGemvB4 {
-    @ssbo @binding = 0 wq : array<byte4>
-    @ssbo @binding = 1 wsf : array<float>
+    @ssbo @binding = 0 wqb : array<int8>
     @ssbo @binding = 2 wsh : array<float16>
     @ssbo @binding = 3 x : array<float4>
     @ssbo @binding = 4 y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
-    @uniform @binding = 7 s16 : uint
     @workgroup txp : float4[256]            // [4 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_b4_msl")]
@@ -2413,8 +2474,7 @@ class MetalGemvB4 {
         let row = min(gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID, ddim - 1u)
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
-        let wbase = row * nb4
-        let sbase = row * (ndim / 32u)
+        let nb = ndim / 32u
         var acc : float[4]
         var cb = 0u
         while (cb + 64u <= nb4) {
@@ -2426,8 +2486,10 @@ class MetalGemvB4 {
             barrier()
             for [unroll_full] (i in range(2)) {
                 let k = cb + uint(i) * 32u + lane
-                let sv = s16 != 0u ? float(wsh[sbase + k / 8u]) : wsf[sbase + k / 8u]
-                let w4 = float4(int4(wq[wbase + k])) * sv
+                let bi = row * nb + k / 8u
+                let qb = bi * 34u + 2u + (k % 8u) * 4u
+                let w4 = float4(float(wqb[qb]), float(wqb[qb + 1u]), float(wqb[qb + 2u]),
+                    float(wqb[qb + 3u])) * float(wsh[bi * 17u])
                 let kt = uint(i) * 32u + lane
                 for [unroll_full] (b in range(4)) {
                     let xv = txp[uint(b) * 64u + kt]
@@ -2438,8 +2500,10 @@ class MetalGemvB4 {
         }
         var k = cb + lane
         while (k < nb4) {
-            let sv = s16 != 0u ? float(wsh[sbase + k / 8u]) : wsf[sbase + k / 8u]
-            let w4 = float4(int4(wq[wbase + k])) * sv
+            let bi = row * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let w4 = float4(float(wqb[qb]), float(wqb[qb + 1u]), float(wqb[qb + 2u]),
+                float(wqb[qb + 3u])) * float(wsh[bi * 17u])
             for [unroll_full] (b in range(4)) {
                 let xv = x[uint(b) * nb4 + k]
                 acc[b] += w4.x * xv.x + w4.y * xv.y + w4.z * xv.z + w4.w * xv.w
@@ -2590,14 +2654,14 @@ class MetalQ8MvB4 {
 // gate row r AND up row r+hidden, writing silu(gate)*up directly — replaces the w1/w3/swiglu
 // triple with one dispatch. B2 form serves B <= 2; B4 serves 3..4.
 class MetalGemvW13SwB2 {
-    @ssbo @binding = 0 wq : array<byte4>    // cat W1|W3 rows, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // scales, f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
+    @ssbo @binding = 2 wsh1 : array<float16>   // ... half-scale view
     @ssbo @binding = 3 x : array<float4>    // [B x ndim] f32 rows, float4 view
     @ssbo @binding = 4 y : array<float>     // [B x hidden] silu(gate)*up
     @uniform @binding = 5 ndim : uint
-    @uniform @binding = 6 hidden : uint     // output rows AND the gate/up row split
-    @uniform @binding = 7 s16 : uint
+    @uniform @binding = 6 hidden : uint     // output rows
+    @ssbo @binding = 8 wqb3 : array<int8>   // w3 blob views
+    @ssbo @binding = 9 wsh3 : array<float16>
     @workgroup txp : float4[128]            // [2 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_w13sw_b2_msl")]
@@ -2606,11 +2670,7 @@ class MetalGemvW13SwB2 {
         let row = min(gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID, hidden - 1u)
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
-        let ns = ndim / 32u
-        let wbg = row * nb4              // gate weight row (W1)
-        let wbu = (row + hidden) * nb4   // up weight row (W3)
-        let sbg = row * ns
-        let sbu = (row + hidden) * ns
+        let nb = ndim / 32u
         var accg : float[2]
         var accu : float[2]
         var cb = 0u
@@ -2620,10 +2680,12 @@ class MetalGemvW13SwB2 {
             barrier()
             for [unroll_full] (i in range(2)) {
                 let k = cb + uint(i) * 32u + lane
-                let svg = s16 != 0u ? float(wsh[sbg + k / 8u]) : wsf[sbg + k / 8u]
-                let svu = s16 != 0u ? float(wsh[sbu + k / 8u]) : wsf[sbu + k / 8u]
-                let wg = float4(int4(wq[wbg + k])) * svg
-                let wu = float4(int4(wq[wbu + k])) * svu
+                let bi = row * nb + k / 8u
+                let qb = bi * 34u + 2u + (k % 8u) * 4u
+                let wg = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]),
+                    float(wqb1[qb + 3u])) * float(wsh1[bi * 17u])
+                let wu = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]),
+                    float(wqb3[qb + 3u])) * float(wsh3[bi * 17u])
                 let kt = uint(i) * 32u + lane
                 for [unroll_full] (b in range(2)) {
                     let xv = txp[uint(b) * 64u + kt]
@@ -2635,10 +2697,12 @@ class MetalGemvW13SwB2 {
         }
         var k = cb + lane
         while (k < nb4) {
-            let svg = s16 != 0u ? float(wsh[sbg + k / 8u]) : wsf[sbg + k / 8u]
-            let svu = s16 != 0u ? float(wsh[sbu + k / 8u]) : wsf[sbu + k / 8u]
-            let wg = float4(int4(wq[wbg + k])) * svg
-            let wu = float4(int4(wq[wbu + k])) * svu
+            let bi = row * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let wg = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]),
+                float(wqb1[qb + 3u])) * float(wsh1[bi * 17u])
+            let wu = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]),
+                float(wqb3[qb + 3u])) * float(wsh3[bi * 17u])
             for [unroll_full] (b in range(2)) {
                 let xv = x[uint(b) * nb4 + k]
                 accg[b] += wg.x * xv.x + wg.y * xv.y + wg.z * xv.z + wg.w * xv.w
@@ -2657,14 +2721,14 @@ class MetalGemvW13SwB2 {
 }
 
 class MetalGemvW13SwB4 {
-    @ssbo @binding = 0 wq : array<byte4>
-    @ssbo @binding = 1 wsf : array<float>
-    @ssbo @binding = 2 wsh : array<float16>
+    @ssbo @binding = 0 wqb1 : array<int8>
+    @ssbo @binding = 2 wsh1 : array<float16>
     @ssbo @binding = 3 x : array<float4>
     @ssbo @binding = 4 y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 hidden : uint
-    @uniform @binding = 7 s16 : uint
+    @ssbo @binding = 8 wqb3 : array<int8>
+    @ssbo @binding = 9 wsh3 : array<float16>
     @workgroup txp : float4[256]            // [4 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_w13sw_b4_msl")]
@@ -2673,11 +2737,7 @@ class MetalGemvW13SwB4 {
         let row = min(gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID, hidden - 1u)
         let lane = gl_SubgroupInvocationID
         let nb4 = ndim / 4u
-        let ns = ndim / 32u
-        let wbg = row * nb4
-        let wbu = (row + hidden) * nb4
-        let sbg = row * ns
-        let sbu = (row + hidden) * ns
+        let nb = ndim / 32u
         var accg : float[4]
         var accu : float[4]
         var cb = 0u
@@ -2690,10 +2750,12 @@ class MetalGemvW13SwB4 {
             barrier()
             for [unroll_full] (i in range(2)) {
                 let k = cb + uint(i) * 32u + lane
-                let svg = s16 != 0u ? float(wsh[sbg + k / 8u]) : wsf[sbg + k / 8u]
-                let svu = s16 != 0u ? float(wsh[sbu + k / 8u]) : wsf[sbu + k / 8u]
-                let wg = float4(int4(wq[wbg + k])) * svg
-                let wu = float4(int4(wq[wbu + k])) * svu
+                let bi = row * nb + k / 8u
+                let qb = bi * 34u + 2u + (k % 8u) * 4u
+                let wg = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]),
+                    float(wqb1[qb + 3u])) * float(wsh1[bi * 17u])
+                let wu = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]),
+                    float(wqb3[qb + 3u])) * float(wsh3[bi * 17u])
                 let kt = uint(i) * 32u + lane
                 for [unroll_full] (b in range(4)) {
                     let xv = txp[uint(b) * 64u + kt]
@@ -2705,10 +2767,12 @@ class MetalGemvW13SwB4 {
         }
         var k = cb + lane
         while (k < nb4) {
-            let svg = s16 != 0u ? float(wsh[sbg + k / 8u]) : wsf[sbg + k / 8u]
-            let svu = s16 != 0u ? float(wsh[sbu + k / 8u]) : wsf[sbu + k / 8u]
-            let wg = float4(int4(wq[wbg + k])) * svg
-            let wu = float4(int4(wq[wbu + k])) * svu
+            let bi = row * nb + k / 8u
+            let qb = bi * 34u + 2u + (k % 8u) * 4u
+            let wg = float4(float(wqb1[qb]), float(wqb1[qb + 1u]), float(wqb1[qb + 2u]),
+                float(wqb1[qb + 3u])) * float(wsh1[bi * 17u])
+            let wu = float4(float(wqb3[qb]), float(wqb3[qb + 1u]), float(wqb3[qb + 2u]),
+                float(wqb3[qb + 3u])) * float(wsh3[bi * 17u])
             for [unroll_full] (b in range(4)) {
                 let xv = x[uint(b) * nb4 + k]
                 accg[b] += wg.x * xv.x + wg.y * xv.y + wg.z * xv.z + wg.w * xv.w
@@ -2730,14 +2794,12 @@ class MetalGemvW13SwB4 {
 // 32x32 tile, 110 instr/k-block vs the old 235 (1.16-1.33x on every decode shape). Pad token rows
 // carry stale bytes by design — C rows are per-token independent, pad Y rows are never read back.
 class MetalQ8GemmB {
-    @ssbo @binding = 0 wq : array<byte4>    // W [d x n] row-major Q8 quants, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // W scales [d x n/32], f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... the same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb : array<int8>    // 34B-block W blob, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 wsh : array<float16> // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 3 x : array<float4>    // X [M' x n] f32 rows (M' = 32-padded B)
     @ssbo @binding = 4 y : array<float>     // Y [M' x d]
     @uniform @binding = 5 kdim : uint       // n (K)
     @uniform @binding = 6 ndim : uint       // d (N)
-    @uniform @binding = 7 s16 : uint
     @workgroup tw : float16[1024]           // W: 4 k-tiles x 4 row-tiles of 8x8, (k row, wrow col)
     @workgroup tx : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, (token row, k col)
 
@@ -2760,19 +2822,18 @@ class MetalQ8GemmB {
         let tX0 = (il * 4u + lr / 8u) * 64u + (lr % 8u) * 8u
         let aQ = (sg % 2u) * 128u           // wrow tile-pair base within a k-tile slab
         let bQ = (sg / 2u) * 128u           // token tile-pair base
-        var wp = unsafe(addr(wq[(nBase + lr) * kdim4 + il * 2u]))
-        var spf = unsafe(addr(wsf[(nBase + lr) * nkb]))
-        var sph = unsafe(addr(wsh[(nBase + lr) * nkb]))
+        var qp = unsafe(addr(wqb[((nBase + lr) * nkb) * 34u + 2u + il * 8u]))
+        var sph = unsafe(addr(wsh[((nBase + lr) * nkb) * 17u]))
         var xp = unsafe(addr(x[(mBase + lr) * kdim4 + il * 2u]))
         var kb = 0u
         while (kb < nkb) {
-            let sA = s16 != 0u ? float(unsafe(sph[0])) : unsafe(spf[0])
-            let q0 = unsafe(wp[0])
-            let q1 = unsafe(wp[1])
+            let sA = float(unsafe(sph[0]))
             let b0 = unsafe(xp[0])
             let b1 = unsafe(xp[1])
-            let w40 = float4(int4(q0)) * sA
-            let w41 = float4(int4(q1)) * sA
+            let w40 = float4(float(unsafe(qp[0u])), float(unsafe(qp[1u])),
+                float(unsafe(qp[2u])), float(unsafe(qp[3u]))) * sA
+            let w41 = float4(float(unsafe(qp[4u])), float(unsafe(qp[5u])),
+                float(unsafe(qp[6u])), float(unsafe(qp[7u]))) * sA
             barrier()                       // previous math done reading the tiles
             tw[tW0] = float16(w40.x)
             tw[tW0 + 8u] = float16(w40.y)
@@ -2805,9 +2866,8 @@ class MetalQ8GemmB {
                 acur = unsafe(acur + 256)
                 bcur = unsafe(bcur + 256)
             }
-            wp = unsafe(wp + 8u)
-            spf = unsafe(spf + 1u)
-            sph = unsafe(sph + 1u)
+            qp = unsafe(qp + 34u)
+            sph = unsafe(sph + 17u)
             xp = unsafe(xp + 8u)
             kb++
         }
@@ -2824,14 +2884,12 @@ class MetalQ8GemmB {
 // partial-C plane, and a separate MetalSkReduce dispatch sums them (no float atomics,
 // deterministic). At M-pad-32 this is the only way to grow the grid past d/32 on starved sites.
 class MetalQ8GemmBSk {
-    @ssbo @binding = 0 wq : array<byte4>    // W [d x n] row-major Q8 quants, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // W scales [d x n/32], f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... the same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb : array<int8>    // 34B-block W blob, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 wsh : array<float16> // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 3 x : array<float4>    // X [32 x n] f32 rows
     @ssbo @binding = 4 part : array<float>  // [ksplit x 32 x d] partial-C planes
     @uniform @binding = 5 kdim : uint       // n (K)
     @uniform @binding = 6 ndim : uint       // d (N)
-    @uniform @binding = 7 s16 : uint
     @uniform @binding = 8 ksplit : uint
     @workgroup tw : float16[1024]           // W: 4 k-tiles x 4 row-tiles of 8x8, (k row, wrow col)
     @workgroup tx : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, (token row, k col)
@@ -2858,19 +2916,18 @@ class MetalQ8GemmBSk {
         let tX0 = (il * 4u + lr / 8u) * 64u + (lr % 8u) * 8u
         let aQ = (sg % 2u) * 128u           // wrow tile-pair base within a k-tile slab
         let bQ = (sg / 2u) * 128u           // token tile-pair base
-        var wp = unsafe(addr(wq[(nBase + lr) * kdim4 + kb0 * 8u + il * 2u]))
-        var spf = unsafe(addr(wsf[(nBase + lr) * nkb + kb0]))
-        var sph = unsafe(addr(wsh[(nBase + lr) * nkb + kb0]))
+        var qp = unsafe(addr(wqb[((nBase + lr) * nkb + kb0) * 34u + 2u + il * 8u]))
+        var sph = unsafe(addr(wsh[((nBase + lr) * nkb + kb0) * 17u]))
         var xp = unsafe(addr(x[(mBase + lr) * kdim4 + kb0 * 8u + il * 2u]))
         var kb = 0u
         while (kb < kbn) {
-            let sA = s16 != 0u ? float(unsafe(sph[0])) : unsafe(spf[0])
-            let q0 = unsafe(wp[0])
-            let q1 = unsafe(wp[1])
+            let sA = float(unsafe(sph[0]))
             let b0 = unsafe(xp[0])
             let b1 = unsafe(xp[1])
-            let w40 = float4(int4(q0)) * sA
-            let w41 = float4(int4(q1)) * sA
+            let w40 = float4(float(unsafe(qp[0u])), float(unsafe(qp[1u])),
+                float(unsafe(qp[2u])), float(unsafe(qp[3u]))) * sA
+            let w41 = float4(float(unsafe(qp[4u])), float(unsafe(qp[5u])),
+                float(unsafe(qp[6u])), float(unsafe(qp[7u]))) * sA
             barrier()                       // previous math done reading the tiles
             tw[tW0] = float16(w40.x)
             tw[tW0 + 8u] = float16(w40.y)
@@ -2903,9 +2960,8 @@ class MetalQ8GemmBSk {
                 acur = unsafe(acur + 256)
                 bcur = unsafe(bcur + 256)
             }
-            wp = unsafe(wp + 8u)
-            spf = unsafe(spf + 1u)
-            sph = unsafe(sph + 1u)
+            qp = unsafe(qp + 34u)
+            sph = unsafe(sph + 17u)
             xp = unsafe(xp + 8u)
             kb++
         }
@@ -2947,14 +3003,12 @@ class MetalSkReduce {
 // instructions per element — wins where the grid stays fat (e.g. the vocab classifier). Each
 // simdgroup owns a 16x32 quadrant (2 token x 4 wrow tiles).
 class MetalQ8Gemm64B {
-    @ssbo @binding = 0 wq : array<byte4>    // W [d x n] row-major Q8 quants, byte4 view
-    @ssbo @binding = 1 wsf : array<float>   // W scales [d x n/32], f32 view
-    @ssbo @binding = 2 wsh : array<float16> // ... the same buffer, halfword view (wscale_f16)
+    @ssbo @binding = 0 wqb : array<int8>    // 34B-block W blob, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 wsh : array<float16> // the same buffer, half-scale view (block b at 17*b)
     @ssbo @binding = 3 x : array<float4>    // X [M' x n] f32 rows (M' = 32-padded B)
     @ssbo @binding = 4 y : array<float>     // Y [M' x d]
     @uniform @binding = 5 kdim : uint       // n (K)
     @uniform @binding = 6 ndim : uint       // d (N)
-    @uniform @binding = 7 s16 : uint
     @workgroup tw : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, (k row, wrow col)
     @workgroup tx : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, (token row, k col)
 
@@ -2981,21 +3035,16 @@ class MetalQ8Gemm64B {
         let tX0 = (il1 * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
         let aQ = (sg % 2u) * 256u           // wrow tile-quad base within a k-tile slab
         let bQ = (sg / 2u) * 128u           // token tile-pair base
-        var wp = unsafe(addr(wq[(nBase + lr0) * kdim4 + il0 * 4u]))
-        var spf = unsafe(addr(wsf[(nBase + lr0) * nkb]))
-        var sph = unsafe(addr(wsh[(nBase + lr0) * nkb]))
+        var qp = unsafe(addr(wqb[((nBase + lr0) * nkb) * 34u + 2u + il0 * 16u]))
+        var sph = unsafe(addr(wsh[((nBase + lr0) * nkb) * 17u]))
         var xp = unsafe(addr(x[(mBase + lr1) * kdim4 + il1 * 2u]))
         var kb = 0u
         while (kb < nkb) {
-            let sA = s16 != 0u ? float(unsafe(sph[0])) : unsafe(spf[0])
+            let sA = float(unsafe(sph[0]))
             let b0 = unsafe(xp[0])
             let b1 = unsafe(xp[1])
-            for [unroll_full] (g in range(4)) {
-                let w4 = float4(int4(unsafe(wp[uint(g)]))) * sA
-                va[g * 4] = float16(w4.x)
-                va[g * 4 + 1] = float16(w4.y)
-                va[g * 4 + 2] = float16(w4.z)
-                va[g * 4 + 3] = float16(w4.w)
+            for [unroll_full] (i in range(16)) {
+                va[i] = float16(float(unsafe(qp[i])) * sA)
             }
             barrier()                       // previous math done reading the tiles
             for [unroll_full] (i in range(16)) {
@@ -3025,9 +3074,8 @@ class MetalQ8Gemm64B {
                 acur = unsafe(acur + 512)
                 bcur = unsafe(bcur + 256)
             }
-            wp = unsafe(wp + 8u)
-            spf = unsafe(spf + 1u)
-            sph = unsafe(sph + 1u)
+            qp = unsafe(qp + 34u)
+            sph = unsafe(sph + 17u)
             xp = unsafe(xp + 8u)
             kb++
         }
