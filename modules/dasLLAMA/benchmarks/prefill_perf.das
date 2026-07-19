@@ -138,9 +138,18 @@ def main {
         let warm <- build_prompt(8l)
         forward_prefill(t, s, warm, 8l, 0l)
 
+        // extra timed reps per size before the instrumented final one (attribution sweeps want
+        // several samples per config; trace/team-prof/profile still capture only the last rep)
+        let reps = has_env_variable("DASLLAMA_PREFILL_REPS") ? max(to_int(get_env_variable("DASLLAMA_PREFILL_REPS")), 1) : 1
         let sizes <- [64l, 256l, 512l]
         for (n in sizes) {
             let prompt <- build_prompt(n)
+            for (rep in range(reps - 1)) {
+                let tr = ref_time_ticks()
+                forward_prefill(t, s, prompt, n, 0l)
+                let rus = get_time_usec(tr)
+                print("N={n} rep{rep}: prefill {rus}us {double(n) / (double(rus) * 1.0e-6lf)} tok/s\n")
+            }
             forward_profile_reset()   // per-section table over the LAST batched prefill only
             if (teamProf) {
                 set_jobque_team_prof(true)
