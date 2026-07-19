@@ -618,13 +618,17 @@ def load_model_image(path : string; var t : Model; tag : string = "") : bool {
 //! (``DASLLAMA_IMAGE=0`` disables); under an active Metal mode the image is the BLOB-ONLY metal flavor (CPU inference against it panics) when servable, the planar CPU flavor otherwise. Call inside ``with_job_que()``.
 def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     if (path |> ends_with(".dlim")) {
-        // a prepared image named directly — first-class once the source gguf is gone. The file
-        // is whichever flavor it was minted as: try both identities (the wrong-tag probe logs
-        // one loud decline; a real mismatch panics)
+        // a prepared image named directly — first-class once the source gguf is gone. Try both
+        // identities, EXPECTED flavor first (metal under an active Metal mode, else planar) so
+        // the normal case loads without the wrong-tag decline warning; a dual mismatch panics
         apply_box_profile_runtime()
         let ts_img = ref_time_ticks()
         var t = Model()
-        if (!load_model_image(path, t, METAL_IMAGE_TAG) && !load_model_image(path, t)) {
+        let metal_first = get_metal_mode() != MetalMode.off && has_decode_override("metal")
+        let loaded = (metal_first
+            ? load_model_image(path, t, METAL_IMAGE_TAG) || load_model_image(path, t)
+            : load_model_image(path, t) || load_model_image(path, t, METAL_IMAGE_TAG))
+        if (!loaded) {
             panic("dasLLAMA: '{path}' is not a prepared image for this box/knobs (identity {image_identity()} / {image_identity(METAL_IMAGE_TAG)}) — regenerate it from the source gguf")
         }
         to_log(LOG_INFO, "dasLLAMA: prepared image mapped in {get_time_usec(ts_img) / 1000} ms — {path}\n")
