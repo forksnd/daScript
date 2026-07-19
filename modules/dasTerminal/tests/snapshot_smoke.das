@@ -1,0 +1,126 @@
+options gen2
+
+require terminal/terminal
+require strings
+
+[export]
+def main {
+    var inscope state <- terminal_create(8, 2)
+    terminal_feed(state, "hello")
+
+    var snapshot = TerminalSnapshot()
+    terminal_snapshot(state, snapshot)
+
+    assert(snapshot.columns == 8)
+    assert(snapshot.rows == 2)
+    assert(length(snapshot.normal.cells) == 16)
+    assert(snapshot.normal.cells[0].grapheme == "h")
+    assert(snapshot.normal.cells[4].grapheme == "o")
+    assert(snapshot.normal.cursor.row == 0)
+    assert(snapshot.normal.cursor.column == 5)
+    assert(snapshot.modes.auto_wrap)
+
+    var inscope viewport_state <- terminal_create(4, 2)
+    let initial_revision = terminal_revision(viewport_state)
+    terminal_feed(viewport_state, "a\r\nb\r\nc\r\nd")
+    var viewport = TerminalViewportSnapshot()
+    terminal_viewport_snapshot(viewport_state, 0, viewport)
+    assert(viewport.revision > initial_revision)
+    assert(viewport.buffer.scrollback_rows == 2)
+    assert(empty(viewport.buffer.scrollback))
+    assert(empty(viewport.buffer.cells))
+    assert(viewport.screen_text == "c\nd")
+    assert(length(viewport.text_runs) == 2)
+    assert(viewport.text_runs[0].text == "c")
+    assert(viewport.text_runs[1].text == "d")
+
+    terminal_viewport_snapshot(viewport_state, 1, viewport)
+    assert(empty(viewport.buffer.scrollback))
+    assert(length(viewport.text_runs) == 3)
+    assert(viewport.text_runs[0].global_row == 1)
+    assert(viewport.text_runs[0].text == "b")
+    terminal_viewport_snapshot(viewport_state, 2, viewport)
+    assert(empty(viewport.buffer.scrollback))
+    assert(length(viewport.text_runs) == 4)
+    assert(viewport.text_runs[0].global_row == 0)
+    assert(viewport.text_runs[0].text == "a")
+
+    var inscope colored_state <- terminal_create(8, 2)
+    terminal_feed(colored_state, "{to_char(27)}[31mA{to_char(27)}[32mB{to_char(27)}[31mC{to_char(27)}[32mD")
+    terminal_viewport_snapshot(colored_state, 0, viewport)
+    assert(empty(viewport.buffer.cells))
+    assert(length(viewport.text_runs) == 2)
+    assert(viewport.text_runs[0].column == 0 && viewport.text_runs[0].text == "A C")
+    assert(viewport.text_runs[1].column == 1 && viewport.text_runs[1].text == "B D")
+    assert(viewport.text_runs[0].glyph_cells == 2)
+    assert(viewport.text_runs[1].glyph_cells == 2)
+
+    var inscope cached_text_state <- terminal_create(4, 3)
+    terminal_feed(cached_text_state, "{to_char(27)}[2;1HX")
+    terminal_viewport_snapshot(cached_text_state, 0, viewport)
+    assert(viewport.screen_text == "\nX")
+    terminal_viewport_snapshot(cached_text_state, 0, viewport)
+    assert(viewport.screen_text == "\nX")
+    terminal_feed(cached_text_state, "Y")
+    terminal_viewport_snapshot(cached_text_state, 0, viewport)
+    assert(viewport.screen_text == "\nXY")
+
+    var inscope special_state <- terminal_create(8, 2)
+    terminal_feed(special_state,
+        "{to_char(27)}[44mX{to_char(27)}[0m{to_char(27)}[4mU{to_char(27)}[0m中")
+    terminal_viewport_snapshot(special_state, 0, viewport)
+    assert(viewport.screen_text == "XU中")
+    assert(length(viewport.buffer.cells) == 3)
+    assert(viewport.buffer.cells[0].column == 0)
+    assert(viewport.buffer.cells[1].column == 1)
+    assert(viewport.buffer.cells[2].column == 2)
+    assert(viewport.buffer.cells[2].width == 2)
+    assert(length(viewport.text_runs) == 1)
+    assert(viewport.text_runs[0].text == "X")
+
+    var inscope metadata_state <- terminal_create(8, 2)
+    terminal_feed(metadata_state,
+        "{to_char(27)}[1mB{to_char(27)}[0m{to_char(27)}]8;;https://example.test{to_char(7)}H{to_char(27)}]8;;{to_char(7)}")
+    terminal_viewport_snapshot(metadata_state, 0, viewport)
+    assert(length(viewport.buffer.cells) == 2)
+    assert((viewport.buffer.cells[0].attributes & 1) != 0)
+    assert(viewport.buffer.cells[0].grapheme == "B")
+    assert(viewport.buffer.cells[1].grapheme == "H")
+    assert(viewport.buffer.cells[1].hyperlink == "https://example.test")
+    assert(empty(viewport.text_runs))
+
+    let up = terminal_encode_key(state, TerminalKeyEvent(key = TerminalKey.up))
+    let esc = to_char(27)
+    assert(length(up) == 3)
+    assert(up == "{esc}[A")
+
+    terminal_feed(state, "{esc}[?2004h")
+    let paste = terminal_encode_paste(state, "hello")
+    assert(length(paste) == 17)
+    assert(paste == "{esc}[200~hello{esc}[201~")
+
+    // Failed launch remains an inspectable terminal handle instead of losing
+    // the transport error at the native boundary.
+    var inscope failed <- terminal_launch("")
+    let process_id = terminal_process_id(failed)
+    assert(process_id == 0)
+    let poll_status = terminal_poll(failed)
+    let transport_error = terminal_transport_error(failed)
+    let process_exited = terminal_process_exited(failed)
+    let exit_code = terminal_exit_code(failed)
+    let terminated = terminal_terminate(failed)
+    assert(poll_status == TerminalPollStatus.error)
+    assert(!empty(transport_error))
+    assert(!process_exited)
+    assert(exit_code == -1l)
+    assert(!terminated)
+
+    terminal_dispose(failed)
+    terminal_dispose(special_state)
+    terminal_dispose(cached_text_state)
+    terminal_dispose(colored_state)
+    terminal_dispose(viewport_state)
+    terminal_dispose(state)
+    assert(failed == null)
+    assert(state == null)
+}
