@@ -26,7 +26,8 @@ batch V-copy/v_norm race fix + the hetero mul_mv un-gate (80fab16b6); small-mode
 rows are 2026-07-17 (that code is untouched by both fixes), their greedy B=1 rows
 re-measured post-embed-scale. gemma4 K-quant B=8 rows re-measured 2026-07-18 with the
 single-pass kq b8 twins (`DASLLAMA_METAL_KQ_B8`, cd88fd1ea; metal-mode rail — GPU prefill;
-decode cells are prefill-method-independent).
+decode cells are prefill-method-independent). Q8 batch cells re-measured after scope C
+(V-copy fusion d6a9a7a4b + hetero split-K cf991ccdf); Q4 b8/b16 re-verified unchanged.
 
 ### gemma2-2b Q4_K_M (native kq planes)
 
@@ -140,18 +141,21 @@ big pure-k6 = open item; `DASLLAMA_METAL_SPEC=0` recovers the 0.95x class today.
 | :--- | ---: | ---: | ---: |
 | pp512 | 362.7 | 356.0 | **1.02x** |
 | tg128 B=1 | 20.5 | 25.2 | **0.81x RED** |
-| tg128 B=2 | 35.7 | 38.0 | 0.94x |
-| tg128 B=4 | 57.6 | 63.8 | 0.90x |
-| tg128 B=8 | 51.0 | 62.0 | **0.82x RED** |
-| tg128 B=16 | 91.0 | 114.9 | **0.79x RED** |
+| tg128 B=2 | 36.0 | 38.0 | 0.95x |
+| tg128 B=4 | 58.8 | 63.8 | 0.92x |
+| tg128 B=8 | 54.3 | 62.0 | **0.88x RED** |
+| tg128 B=16 | 96.3 | 114.9 | **0.84x RED** |
 
 B=2/4 were 0.90/0.59 before the hetero mul_mv un-gate (the fixed-B forms streamed the
-12.2GB blob once PER TOKEN under hetero). The remaining column tail is structural and
-named: B=1 = the Q8 sequential class (the q8 GEMV itself measures ~352 GB/s — lcpp
-bandwidth class; the gap is the ~4.6 ms/step elementwise dispatch tail lcpp's norm-chain
-fusion avoids), B=8/16 = the M-pad-32 GEMM tier with split-K standing down under hetero
-(the per-class u_skt twins are the fix). lcpp's Q8 is its strongest Metal suite (ext
-kernels from B=2, highest bytes/weight), so this column's denominator is the hardest.
+12.2GB blob once PER TOKEN under hetero); B=4/8/16 gained +2/+6.5/+6% from scope C (the
+V-copy→ones-RMS fusion + split-K un-gated under hetero via the per-class twins). The
+remaining column tail is structural and named: B=1 = the Q8 sequential class (the q8 GEMV
+itself measures ~352 GB/s — lcpp bandwidth class; the gap is the ~4.6 ms/step elementwise
+dispatch tail lcpp's norm-chain fusion avoids), and the same dispatch-tail class plus
+GEMM-tier scheduling noise holds the B=8/16 residue (the K-quant ladders' B=8/16 are
+rep-stable to 0.1%; Q8's wobble 8-11% between reps — a scope D datapoint). lcpp's Q8 is
+its strongest Metal suite (ext kernels from B=2, highest bytes/weight), so this column's
+denominator is the hardest.
 
 ## Reading the board
 
@@ -161,9 +165,10 @@ K-quants (the single-pass kq b8 twins — ONE weight stream instead of two colum
 passes; the kernel lab could not see this win at SLC-resident shapes, only the in-graph
 A/B could). The remaining reds are structural and each has a named owner: the Q8
 sequential/dispatch-tail class (gemma2-q8 0.89, gemma3-4b 0.91, gemma4-q8 0.81 — the
-~4.6 ms/step elementwise tail; one combined deep-dive), the B=16 GEMM tier without
-split-K under hetero (all formats, Q8 hardest — Q8 B=8 rides the same tier), the
-K-quant B=4 cells (0.93-0.96 — the round-3 kernel lab REFUTED further kq-GEMV headroom
-at B=4: issue-bound at the wall; the recoverable gap is the shared per-step overhead,
-the V-copy barrier + elementwise tail), and the Q6-greedy spec inversion (open item;
-spec-off recovers 0.95x).
+~4.6 ms/step elementwise tail; one combined deep-dive), the Q8 B=8/16 GEMM-tier residue
+(0.88/0.84 after scope C's fusion + hetero split-K — the rest is the dispatch-tail class
+plus GEMM-tier scheduling noise), the K-quant B=16 cells (0.88-0.91 — the kq mul_mm tier
+itself: K-quant files never dispatch split-K, which is a q8-blob kernel; earlier boards
+misattributed this to the sk stand-down), the K-quant B=4 cells (0.93-0.96 — the round-3
+kernel lab REFUTED further kq-GEMV headroom at B=4: issue-bound at the wall), and the
+Q6-greedy spec inversion (open item; spec-off recovers 0.95x).
