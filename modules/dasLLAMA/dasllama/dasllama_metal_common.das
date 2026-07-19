@@ -521,14 +521,14 @@ def upload_region_cat3(p0 : void?; b0 : uint64; p1 : void?; b1 : uint64; p2 : vo
 // Each GPU-ready plane becomes ONE resident buffer (zero-copy page wrap when image-mapped, else a
 // one-time untracked copy); tensors bind at byte offsets, keeping in-kernel indices REGION-relative — a 13GB blob's absolute byte indices overflow the kernels' uint32 index math.
 
-def private plane_buffer(dev : MetalDevice?; base : void?; bytes : uint64) : MetalBuffer? {
+def private plane_buffer(dev : MetalDevice?; base : void?; bytes : uint64; mapped : bool) : MetalBuffer? {
     let key = intptr(base)
     if (key_exists(g_regions, key)) {
         return g_regions[key]
     }
     var buf : MetalBuffer?
-    if ((key & 16383ul) == 0ul) {
-        // page-aligned = an image-mapped plane view; the rounded-up tail stays inside the mapping (the file pads to a page multiple)
+    if (mapped) {
+        // the rounded-up tail is only guaranteed mapped for image sections (page-aligned, file pads to a page multiple) — owned planes always copy
         buf = unsafe(metal_new_buffer_no_copy_untracked(dev, base, (bytes + 16383ul) & ~16383ul))
     } else {
         buf = metal_new_buffer_untracked(dev, bytes)
@@ -553,7 +553,7 @@ def private plane_buffer(dev : MetalDevice?; base : void?; bytes : uint64) : Met
 def blob_of(dev : MetalDevice?; t : Model; off : int64) : tuple<buf : MetalBuffer?; boff : uint64> {
     assert(t.metal_blob)   // planar models decline at the gates — they never reach an upload
     unsafe {
-        return (buf = plane_buffer(dev, addr < void? >(t.mblob[0]), uint64(long_length(t.mblob))),
+        return (buf = plane_buffer(dev, addr < void? >(t.mblob[0]), uint64(long_length(t.mblob)), t.image_map != null),
                 boff = uint64((off / 32l) * 34l))
     }
 }
@@ -636,14 +636,14 @@ def kq_quants_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tupl
     let sb0 = off / 256l
     unsafe {
         if (fmt == KqFmt.k4) {
-            return (buf = plane_buffer(dev, addr < void? >(t.k4q[0]), uint64(long_length(t.k4q))),
+            return (buf = plane_buffer(dev, addr < void? >(t.k4q[0]), uint64(long_length(t.k4q)), t.image_map != null),
                     qoff = uint64(sb0 * 128l))
         }
         if (fmt == KqFmt.k5) {
-            return (buf = plane_buffer(dev, addr < void? >(t.k5q[0]), uint64(long_length(t.k5q))),
+            return (buf = plane_buffer(dev, addr < void? >(t.k5q[0]), uint64(long_length(t.k5q)), t.image_map != null),
                     qoff = uint64(sb0 * 160l))
         }
-        return (buf = plane_buffer(dev, addr < void? >(t.k6q[0]), uint64(long_length(t.k6q))),
+        return (buf = plane_buffer(dev, addr < void? >(t.k6q[0]), uint64(long_length(t.k6q)), t.image_map != null),
                 qoff = uint64(sb0 * 192l))
     }
 }
@@ -657,14 +657,14 @@ def kq_scales_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tupl
     unsafe {
         if (fmt == KqFmt.k6) {
             let plane_sb = long_length(t.k6s) / 18l   // split form keeps the 18B/sb total
-            return (buf = plane_buffer(dev, addr < void? >(t.k6s[0]), uint64(long_length(t.k6s))),
+            return (buf = plane_buffer(dev, addr < void? >(t.k6s[0]), uint64(long_length(t.k6s)), t.image_map != null),
                     soff = uint64(sb0 * 16l), doff = uint64(plane_sb * 16l + sb0 * 2l))
         }
         if (fmt == KqFmt.k4) {
-            return (buf = plane_buffer(dev, addr < void? >(t.k4s[0]), uint64(long_length(t.k4s))),
+            return (buf = plane_buffer(dev, addr < void? >(t.k4s[0]), uint64(long_length(t.k4s)), t.image_map != null),
                     soff = uint64(sb0 * 16l), doff = 0ul)
         }
-        return (buf = plane_buffer(dev, addr < void? >(t.k5s[0]), uint64(long_length(t.k5s))),
+        return (buf = plane_buffer(dev, addr < void? >(t.k5s[0]), uint64(long_length(t.k5s)), t.image_map != null),
                 soff = uint64(sb0 * 16l), doff = 0ul)
     }
 }
