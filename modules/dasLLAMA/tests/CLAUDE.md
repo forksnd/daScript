@@ -44,10 +44,7 @@ batch test: `batch` (whole test), `batchB7-partd`, `batchB8-kq`. Prefill parity:
 kq cont dim qkv`. Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b` + the
 family matrix `fam-qwen3 fam-qwen2 fam-phi3 fam-gemma2 fam-gemma3 fam-gemma4 fam-qwen3moe`
 (needs-derivation pins + per-path cells; fam-gemma2 also carries the sliding-window masking
-parity row; fam-gemma4 and fam-qwen3moe are DASLLAMA_PARITY_FULL-gated — 7.4GB / 18.5GB;
-fam-qwen3moe is decode-only for Wave C stage 1 — its planar row pins batch/prefill at `graph`
-and parity teacher-forces the prompt through GPU decode, a blob MoE model having no CPU
-prefill). The
+parity row; fam-gemma4 and fam-qwen3moe are DASLLAMA_PARITY_FULL-gated — 7.4GB / 18.5GB). The
 `kernels` suite (test_metal_prefill_kernels — model-less kernel units, ~80s) has no arms;
 remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
