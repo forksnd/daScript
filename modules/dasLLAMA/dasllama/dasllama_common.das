@@ -324,10 +324,9 @@ let CPU_PREFILL_PANIC_NPOS = 32l
 
 var private g_cpu_prefill_allowed = -1   // -1 = read DASLLAMA_CPU_PREFILL on first check
 
-//! Declare that this process runs CPU prefill ON PURPOSE (CPU truth mints, CPU boards,
-//! CPU-correctness tests) — disarms the Metal-capable-build panic on batched prefills longer
-//! than ``CPU_PREFILL_PANIC_NPOS`` tokens. The ``DASLLAMA_CPU_PREFILL=1`` env is the
-//! no-recompile equivalent (the test rail exports it).
+//! Declare that this process runs CPU prefill ON PURPOSE — disarms the Metal-capable-build panic
+//! on batched prefills longer than ``CPU_PREFILL_PANIC_NPOS`` tokens. ``DASLLAMA_CPU_PREFILL=1``
+//! is the no-recompile equivalent (the test rail exports it).
 def allow_cpu_prefill(on : bool = true) {
     g_cpu_prefill_allowed = on ? 1 : 0
 }
@@ -496,12 +495,9 @@ struct Model {
     // then freed); exactly one of qscales/qscales16 is populated for a q8 model.
     qscales16 : array<uint16>
     wscale_f16 : bool = false
-    // Metal-flavor blob rail (the blob-only .dlim redesign): q8 weights as 34-byte block_q8_0
-    // blocks (f16 scale + 32 int8, stride 34 — the GPU mul_mm/mul_mv layout), populated INSTEAD
-    // of qblob + qscales/qscales16 when metal_blob. Element offsets translate as
-    // blob byte = (off/32)*34. k4s/k5s then hold 16B compact scale strips (the 20B stride minus
-    // its CPU-repack pad) and k6s the GPU split form ([nsb x 16B sub-scales][nsb x f16 d]).
-    // CPU inference on a blob-only model PANICS — CPU work belongs to the CPU flavor image.
+    // Metal-flavor blob rail (blob-only .dlim): q8 weights as 34-byte block_q8_0 blocks populated
+    // INSTEAD of qblob + qscales/qscales16 (blob byte = (off/32)*34); k4s/k5s hold 16B compact
+    // scale strips, k6s the GPU split form. CPU inference on a blob-only model PANICS.
     mblob : array<uint8>
     metal_blob : bool = false
     q4blob : array<uint8>
@@ -2052,11 +2048,9 @@ def private metal_blob_layout_ok(t : Model) : bool {
         (!t.cls_q8 || metal_blob_off_ok(t.emb_q8_off, KqFmt.q8)))
 }
 
-//! Convert a planar q8-mode Model to the metal-blob form IN PLACE (see the Model field doc):
-//! qblob + qscales/qscales16 collapse into the 34-byte block_q8_0 blob, k4s/k5s compact to 16B
-//! scale strips, k6s splits into the GPU form. False = the model cannot take the blob form
-//! (not q8, repacked planes, or a bind-alignment violation) — the caller keeps the planar
-//! model. CPU inference on the converted model panics by design (the CPU flavor serves that).
+//! Convert a planar q8-mode Model to the metal-blob form IN PLACE (see the Model field doc).
+//! False = the model cannot take the blob form (not q8, repacked planes, or a bind-alignment
+//! violation) — the caller keeps the planar model. CPU inference on the converted model panics.
 def convert_model_to_metal_blob(var t : Model) : bool {
     if (t.metal_blob) {
         return true
@@ -2148,7 +2142,6 @@ def private compact_kq_scale_strip(var ks : array<uint8>) {
     ks |> resize(nsb * 16l)
 }
 
-//! Load a llama-architecture GGUF into the split layout at the requested precision. The big weights
 // A repack work item: one mr-aligned row-chunk of a weight region. fmt: 0 = q8 (qblob/qscales),
 // 1 = mx4 (mxq/mxs), 4/5/6 = the kq plane pairs. Chunking splits huge regions (the classifier) for
 // load balance; 1024 is a multiple of every backend mr, so row groups never straddle a boundary.
@@ -10443,8 +10436,7 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     }
     if (!stack_done) {
         blob_only_panic(t, "prefill stack")
-        // Metal-capable build about to chew a real prompt on the CPU stack: this is the silent
-        // profiling-time sink, not a serving path — fail loud unless CPU intent was declared
+        // Metal-capable build about to chew a real prompt on the CPU stack — the silent profiling-time sink, not a serving path; fail loud unless CPU intent was declared
         if (npos > CPU_PREFILL_PANIC_NPOS && has_prefill_override("metal") && !cpu_prefill_allowed()) {
             panic("dasLLAMA: CPU batched prefill of {npos} tokens on a Metal-capable build (override `{g_prefill_override_name}` {empty(g_prefill_override_name) ? "not selected" : "declined"}) — select the metal prefill (set_metal_mode / DASLLAMA_PIN_PREFILL=metal), or declare CPU intent: allow_cpu_prefill() / DASLLAMA_CPU_PREFILL=1")
         }

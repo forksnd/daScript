@@ -66,8 +66,7 @@ def private decode_shape_decline(t : Model; needs_ok : MetalNeed) : MetalDecodeD
     if (!kq_load_gpu_supported(t)) {   // a fmt without a GPU kernel (the q4_0 QAT tier, ...) must not dispatch
         return MetalDecodeDecline.kquant_native
     }
-    // the drivers encode the std dense stack; the block set declares the graph shape
-    // (attn_is_std / ffn_is_dense) — MoE, recurrent, and custom-attention arches decline here
+    // the drivers encode the std dense stack (attn_is_std / ffn_is_dense) — MoE, recurrent, and custom-attention arches decline here
     if (!t.blocks.attn_is_std || !t.blocks.ffn_is_dense) {
         return MetalDecodeDecline.graph
     }
@@ -82,15 +81,12 @@ def private decode_shape_decline(t : Model; needs_ok : MetalNeed) : MetalDecodeD
     }
     let c = t.config
     let hidden = layer_hidden(t, 0l)
-    // Sliding masking lives on the CHUNKED attention path only — wstart > 0 needs
-    // cnt > window, so window >= 128 (the single-form depth ceiling's clamp max) guarantees the
-    // single form never sees a masked row. No real model slides tighter; decline the hypothetical.
+    // sliding masking lives on the CHUNKED path only — window >= 128 (the single-form depth ceiling's clamp max) guarantees the single form never sees a masked row; decline tighter
     if (((c.dim % 32l) != 0l || (hidden % 32l) != 0l) ||
             (c.sliding_window > 0l && c.sliding_window < 128l)) {
         return MetalDecodeDecline.shape
     }
-    // per-layer (per-CLASS — the loader collapses to at most two): whole simdgroups, red[16] +
-    // the epl <= 16 q-register hoist cap the threadgroup width at 512 (gemma4's global class)
+    // per-CLASS: whole simdgroups; red[16] + the epl <= 16 q-register hoist cap the threadgroup width at 512 (gemma4's global class)
     for (l in range64(c.n_layers)) {
         let hs_l = layer_head_size(c, l)
         if ((hs_l % 32l) != 0l || hs_l > 512l || (layer_kv_dim(c, l) % 32l) != 0l) {
@@ -99,8 +95,7 @@ def private decode_shape_decline(t : Model; needs_ok : MetalNeed) : MetalDecodeD
         if (t.kv_src[l] != l || layer_hidden(t, l) != hidden) {
             return MetalDecodeDecline.layers
         }
-        // a missing attn_v (V = the pre-norm K projection) serves; without v_norm it is a raw
-        // copy — both encoded (the CPU mm_qkv shapes)
+        // a missing attn_v (V = the pre-norm K projection) serves — raw copy without v_norm; both encoded (the CPU mm_qkv shapes)
     }
     return MetalDecodeDecline.none
 }
@@ -121,13 +116,11 @@ def private decode_decline(t : Model; s : Session; pos : int64) : MetalDecodeDec
     if (shape != MetalDecodeDecline.none) {
         return shape
     }
-    // AFTER the capability gates: a planar model still reports its capability reason (the
-    // support matrix asserts those); only a fully-servable planar load declines `planar`
+    // AFTER the capability gates (the support matrix asserts those) — only a fully-servable planar load declines `planar`
     if (!t.metal_blob) {
         return MetalDecodeDecline.planar
     }
-    // forward() built this position's rope row(s) right before the hook (dual-rope: both
-    // classes, each at ITS class's width — gemma4 swa rows are hs_swa/2)
+    // forward() built this position's rope row(s) right before the hook (dual-rope: both classes, each at ITS class's width)
     let swa_hs = t.config.head_size_swa > 0l ? t.config.head_size_swa : t.config.head_size
     if (int64(length(s.rope_cos)) < t.config.head_size / 2l ||
             (has_dual_rope(t.config) && int64(length(s.rope_cos_swa)) < swa_hs / 2l)) {
@@ -138,10 +131,9 @@ def private decode_decline(t : Model; s : Session; pos : int64) : MetalDecodeDec
 
 def private kq_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
 
-// mint-time servability (register_metal_servable): would the resident drivers serve this
-// config once transformed to the blob form? Shape/graph/feature gates only — the planar
-// check is a RUNTIME gate. Tied-fp32 classifiers decline: the blob drivers force GPU
-// logits and have no fp32-table GEMV.
+// mint-time servability (register_metal_servable): shape/graph/feature gates only — the planar
+// check is a RUNTIME gate. Tied-fp32 classifiers decline: the blob drivers force GPU logits
+// and have no fp32-table GEMV.
 def private metal_model_servable_impl(t : Model) : bool {
     let cls_fmt = t.config.shared_weights ? t.emb_fmt : t.wcls_fmt
     if (t.config.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8) {
@@ -295,9 +287,8 @@ var private g_rope_cos_next_swa : array<float>   // the sliding class's twin (du
 var private g_rope_sin_next_swa : array<float>
 
 // geometry + pooled buffers + uniforms for one step at `pos` — no input bytes yet (poke_step).
-// Hetero models (gemma4) carry TWO attention classes: the config fields describe the GLOBAL
-// class, the _swa fields the SLIDING class (the loader guarantees at most two) — buffers size
-// to the class maxima and each layer binds its class's uniform set.
+// Hetero models (gemma4) carry TWO attention classes (global = config fields, sliding = _swa);
+// buffers size to the class maxima and each layer binds its class's uniform set.
 def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint64; cap : int64) : StepRes {
     let c = t.config
     let dim = c.dim
@@ -385,11 +376,7 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     // logits-on-GPU (default ON, DASLLAMA_METAL_LOGITS=0 pins the CPU classifier) mirrors the prefill gates
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
-    // q8 AND K-quant classifiers serve (the kq plane GEMVs — W4); only the tied-fp32 table stays
-    // CPU. n_layer_nextn: forward()'s early return on GPU logits would skip the CPU-side mtp_h
-    // stash an MTP draft head reads — those models keep the CPU classifier
-    // blob models FORCE the GPU classifier — the CPU tail has no planes to read (the
-    // logits-cpu rail and the skip knockouts are ignored; their configs stay CPU-flavor)
+    // tied-fp32 stays CPU; MTP (n_layer_nextn) keeps the CPU classifier (GPU logits would skip the mtp_h stash); blob models FORCE GPU logits — the CPU tail has no planes to read
     r.gpu_logits = ((t.metal_blob || (!g_logits_cpu && get_env_variable("DASLLAMA_METAL_LOGITS") != "0" && empty(g_skip))) &&
         !tied_f32 && c.n_layer_nextn == 0l &&
         t.wcls_off >= 0l)
@@ -461,10 +448,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     var cb = metal_new_command_buffer_unretained(g_queue)
     var enc = metal_new_compute_encoder(cb)
     if (r.spec) {
-        // the speculative head: greedy-pick the previous step's logits, gather the winner's
-        // embedding row into r.bx — the cls_q8 linear plane, or the tied-k6 kq planes
-        // (spec_cls_capable, gated in pre_encode_next). The escale slot applies embed_scale
-        // (gemma's sqrt(dim)) in the gather — the CPU embed_row + scale_inplace pair's math
+        // speculative head: argmax the previous step's logits, gather the winner's embedding row into r.bx (cls_q8 or tied-k6 planes); the escale slot applies embed_scale in the gather
         unsafe {
             enc_argmax(enc, prev_blog, r.btok, r.u_vocab)
             if (t.cls_q8) {
@@ -491,8 +475,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             let fk = kq_fmt_at(t.wk_fmt, l)
             let fv = kq_fmt_at(t.wv_fmt, l)
             let qkv_q8 = fq == KqFmt.q8 && fk == KqFmt.q8 && fv == KqFmt.q8
-            // sliding layers: the swa rope row (dual-rope configs) + the window/chlo binds below;
-            // hetero models (gemma4) also swap the whole class geometry — sizes, grids, uniforms
+            // sliding layers: the swa rope row + the window/chlo binds below; hetero models (gemma4) also swap the whole class geometry
             let lsl = layer_is_sliding(c, l)
             let het = r.hetero && lsl
             var bcos_l = lsl && r.bcos_swa != null ? r.bcos_swa : r.bcos
@@ -513,11 +496,9 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             var u_scale_l = het ? r.u_scale_sw : r.u_scale
             var u_npq_l = het ? r.u_npq_sw : r.u_npq
             var u_npall_l = het ? r.u_npall_sw : r.u_npall
-            // qk_norm needs the head-wide prepass between GEMV and rope — the fused form stands
-            // down (hetero too: its row map bakes one class geometry)
+            // qk_norm needs the head-wide prepass between GEMV and rope — the fused form stands down (hetero too: its row map bakes one class geometry)
             let fused_qkv = scalar_kv && qkv_q8 && !c.qk_norm && !r.hetero
-            // the [bq | bk | bv] bias plane matches the fused QKV index space; the rope-store /
-            // qkv_rs epilogues add it pre-rope. No bias -> the qkv buffer dummy-binds the slot
+            // the [bq | bk | bv] bias plane matches the fused QKV index space, added pre-rope; no bias -> the qkv buffer dummy-binds the slot
             var bbias = r.bqkv
             if (c.attn_qkv_bias) {
                 bbias = upload_region_cat3(
@@ -527,8 +508,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             }
             if (g_skip != "gemv") {
                 if (fused_qkv && t.wv_offs[l] >= 0l) {
-                    // one dispatch over all three segments — the kernel binds each tensor's
-                    // blob slice separately (kind-major layout keeps q/k/v apart)
+                    // one dispatch over all three segments — the kernel binds each tensor's blob slice separately (kind-major layout keeps q/k/v apart)
                     let bwq_ = blob_of(g_dev, t, t.wq_offs[l])
                     enc_gemv_qkv_rs(enc, f16v, bwq_.buf, bwq_.boff,
                         uint64((t.wk_offs[l] / 32l) * 34l), uint64((t.wv_offs[l] / 32l) * 34l),
@@ -545,17 +525,12 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 }
             }
             if (g_skip != "ew" && (t.wv_offs[l] < 0l || c.v_norm)) {
-                // gemma4 V: no-wv layers fill the v segment from the PRE-norm/PRE-rope K
-                // projection — the CPU mm_qkv order exactly, BEFORE qk_norm touches k. With
-                // v_norm the copy FUSES into the ones-RMS (soffe = the k slice, write = the v
-                // segment); a no-wv model without v_norm keeps the plain copy.
+                // gemma4 V: no-wv layers fill the v segment from the PRE-norm/PRE-rope K projection (the CPU mm_qkv order, BEFORE qk_norm touches k); with v_norm the copy FUSES into the ones-RMS
                 if (t.wv_offs[l] < 0l && !c.v_norm) {
                     enc_copy_row(enc, r.bqkv, uint64(qd * 4l), r.bqkv, u_kvd_l, kv_dim, uint64((qd + kv_dim) * 4l))
                 }
                 if (c.v_norm) {
-                    // MAX-width upload: the region cache is address-keyed, and gemma4's two
-                    // classes read this one plane at different widths — a per-layer-width first
-                    // upload starved the hs-512 class (Metal OOB tail reads are ZEROS, halving V)
+                    // MAX-width upload: the region cache is address-keyed and both classes read this one plane — a narrower first upload starved the hs-512 class (Metal OOB reads are ZEROS)
                     var bones = upload_region(addr < void? >(t.fblob[t.rms_ones_off]), uint64(max_head_size(c) * 4l))
                     enc_qk_norm(enc, r.bqkv, bones, r.u_zero32, het ? r.u_voffe_sw : r.u_voffe,
                         u_qkvd_l, u_hs_l, r.u_zero32, r.u_eps,
@@ -564,8 +539,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 }
             }
             if (c.qk_norm && g_skip != "ew" && !f16v) {
-                // per-head QK RMSNorm on the fused QKV buffer, before rope (qwen3) — the f16
-                // mirror rides the fused H-form rope-store below instead of this prepass
+                // per-head QK RMSNorm before rope (qwen3) — the f16 mirror rides the fused H-form rope-store instead of this prepass
                 var bqkw = upload_region_cat3(
                     addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(head_size * 4l),
                     addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(head_size * 4l), null, 0ul)
@@ -584,8 +558,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                         bcos_l, bsin_l, u_qd_l, u_hs_l, r.u_nh, u_kvm_l, r.u_neox, bbias, r.u_hasb,
                         n_heads + 2l * (kv_dim / head_size), head_size)
                 } elif (c.qk_norm && f16v) {
-                    // QK-norm x f16 mirror: bias + per-head RMS + rope + store fold into ONE
-                    // head-cooperative dispatch (no prepass, no flat rope-store)
+                    // QK-norm x f16 mirror: bias + per-head RMS + rope + store fold into ONE head-cooperative dispatch
                     var bqkw = upload_region_cat3(
                         addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(head_size * 4l),
                         addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(head_size * 4l), null, 0ul)
@@ -601,10 +574,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 }
             }
             if (g_skip != "attn") {
-                // sliding layers bind the span as `window` (kernels derive wstart = cnt - window)
-                // and the comb starts at the first live chunk; global layers bind 0 for both.
-                // Sliding only ever surfaces on the chunked path: wstart > 0 needs cnt > window,
-                // and the gate pins window >= 128 >= the single-form depth ceiling.
+                // sliding layers bind `window` (wstart = cnt - window) + the first-live-chunk comb start, global bind 0; sliding only surfaces chunked (the gate pins window >= 128 >= the single-form ceiling)
                 var bwin = lsl ? r.u_winsl : r.u_zero32
                 var bchlo = lsl ? r.u_chlo : r.u_zero32
                 if (r.chunked) {
@@ -639,9 +609,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             if (g_skip != "gemv") {
                 enc_site_gemv(enc, t, kq_fmt_at(t.wo_fmt, l), t.wo_offs[l], dim, qd, r.bxb, r.bxb2, u_qd_l, r.u_dim)
             }
-            // ffn: [post-attn norm ->] fused add+norm -> fused W1|W3 GEMV -> swiglu/geglu ->
-            // W2 GEMV [-> post-ffn norm] -> fused add + next layer's attention norm (gemma's
-            // pre_post_norm norms the branch IN PLACE before each residual add — the CPU order)
+            // ffn: [post-attn norm ->] fused add+norm -> W1|W3 -> swiglu/geglu -> W2 [-> post-ffn norm] -> fused add + next attn norm (pre_post_norm norms IN PLACE — the CPU order)
             if (g_skip != "ew") {
                 if (c.pre_post_norm) {
                     var bw_pa = upload_region(addr < void? >(t.fblob[t.rms_post_att_off + l * dim]), uint64(dim * 4l))
@@ -655,8 +623,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             let w13_q8 = f1 == KqFmt.q8 && f3 == KqFmt.q8
             if (g_skip != "gemv") {
                 if (w13_q8 && !geglu) {
-                    // fused gate+up dot with the swiglu epilogue — one dispatch over both
-                    // tensors' blob slices
+                    // fused gate+up dot with the swiglu epilogue — one dispatch over both tensors' blob slices
                     let bw1 = blob_of(g_dev, t, t.w1_offs[l])
                     enc_gemv_w13sw(enc, bw1.buf, bw1.boff, uint64((t.w3_offs[l] / 32l) * 34l),
                         r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
@@ -676,8 +643,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     var bw_pf = upload_region(addr < void? >(t.fblob[t.rms_post_ffn_off + l * dim]), uint64(dim * 4l))
                     enc_rms(enc, r.bxb, bw_pf, r.bxb, r.u_dim, r.u_eps)
                 }
-                // gemma4 layer_out_scale multiplies the WHOLE layer output — (x + branch) * s
-                // folds into the residual add (a 4-byte view straight into the weights blob)
+                // gemma4 layer_out_scale: (x + branch) * s folds into the residual add (a 4-byte view into the weights blob)
                 var bosc : MetalBuffer?
                 if (c.layer_out_scale) {
                     bosc = upload_region(addr < void? >(t.fblob[t.out_scale_off + l]), 4ul)
@@ -701,13 +667,11 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
         var bcls = r.bnc != null ? r.bnc : r.blog
         enc_site_gemv(enc, t, cls_fmt, t.wcls_off, c.vocab_size, dim, r.bxf, bcls, r.u_dim, r.u_vocab)
         if (r.u_flcap != null) {
-            // final-logit soft cap (gemma2/gemma4): cap*tanh in place — monotonic, so the spec
-            // argmax downstream is unaffected; sampled logits match the CPU classifier's
+            // final-logit soft cap (gemma2/gemma4): cap*tanh in place — monotonic, so the spec argmax is unaffected
             enc_softcap_row(enc, bcls, 0ul, r.u_vocab, r.u_flcap, c.vocab_size)
         }
         if (r.bsupp != null) {
-            // gemma4 suppressed ids pin to -1e30 AFTER the cap (the CPU order) — the spec argmax
-            // then reads pinned logits, matching greedy sampling exactly
+            // gemma4 suppressed ids pin to -1e30 AFTER the cap (the CPU order) — the spec argmax reads pinned logits
             enc_suppress_row(enc, bcls, 0ul, r.bsupp, r.u_nsupp, int64(r.bytes_supp / 4ul))
         }
         if (r.bnc != null && r.blog != null) {
@@ -1080,14 +1044,10 @@ var private g_b_ulays : array<MetalBuffer?>   // per-layer uniforms, pooled per 
 // attention depth cap with a real uid, per-row rope rows built, and dim within the add+rms row
 // slabs (GEMM path caps at 3072, fixed-B GEMV at ADD_RMS_MAX_DIM — B >= 5 on a wider model declines)
 def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : array<Session?>; nrows : int64) : MetalDecodeDecline {
-    // kquant batch: the interim path serves B <= 8 via per-stream plane GEMVs (the fused/GEMM
-    // kq twins are the W4 tail). Each fused site must be format-uniform in CLASS per layer
-    // (all-q8 or all-kq — real K-quant files are; a mixed qkv/w13 site has no batched form),
-    // and B >= 9 declines until the kq GEMM lands.
+    // kquant batch: B <= 8 rides per-stream plane GEMVs; each fused site must be format-uniform per layer (a mixed qkv/w13 site has no batched form)
     if (t.kquant_native) {
         if (nrows > 8l) {
-            // B >= 9 rides the kq mul_mm twins — needs the %64 GEMM shapes on BOTH attention
-            // classes (and vocab %64 for the batched kq classifier on the GPU-logits path)
+            // B >= 9 rides the kq mul_mm twins — needs %64 GEMM shapes on BOTH attention classes (+ vocab %64 for the batched kq classifier)
             let ck = t.config
             let hs2 = ck.head_size_swa > 0l ? ck.head_size_swa : ck.head_size
             let kvh2 = ck.n_kv_heads_swa > 0l ? ck.n_kv_heads_swa : ck.n_kv_heads
@@ -1304,11 +1264,9 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         (dim % 64l) == 0l && (qd % 64l) == 0l && (kv_dim % 64l) == 0l && (hidden % 64l) == 0l &&
         (qd_sw % 64l) == 0l && (kvd_sw % 64l) == 0l)
     let mp = use_gemm ? ((nrows + 31l) / 32l) * 32l : (nrows <= 2l ? 2l : nrows <= 4l ? 4l : 8l)
-    // the per-site GEMM policy (see g_bsk): each split-K site gates on its OWN K's nkb % S == 0
-    // (and the partial planes assume mp == 32); an ineligible site stays on the planar v2.
-    // Hetero serves via per-class twins: wo's k-dim rides the per-layer u_qd_l, qkv's reduce
-    // stride rides the u_skt_qkv/_sw pair; w2's dims are layer-uniform. The wo gate must hold
-    // for BOTH classes' qd.
+    // per-site GEMM policy (see g_bsk): each split-K site gates on its OWN K's nkb % S == 0 (the
+    // partial planes assume mp == 32); ineligible sites stay on the planar v2. Hetero serves via
+    // per-class twins; the wo gate must hold for BOTH classes' qd.
     let sk_ok = use_gemm && !use_mm && g_bsk && mp == 32l
     let qkv_sk = (sk_ok && (dim / 32l) % 2l == 0l) ? 2l : 0l
     let wo_sk = (sk_ok && (qd / 32l) % 4l == 0l && (!hetero || (qd_sw / 32l) % 4l == 0l)) ? 4l : 0l
@@ -1324,11 +1282,9 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     let fuse13 = g_bfuse && !mv && !use_gemm && !use_mm && empty(g_skip) && !t.kquant_native && !geglu
     let chunked = maxcnt > g_attn_single_max
     let nchmax = (maxcnt + ATTN_CHUNK_ROWS - 1l) / ATTN_CHUNK_ROWS
-    // partD (walkthrough kernel-2 winner): fused single-pass slice kernel + parallel comb —
-    // lane ownership assumes hs == 128 (32 lanes x half4 = one head); other head sizes keep
-    // the proven single/chunked pair. DASLLAMA_METAL_ATTN_D=0 = the A/B rail to the old path.
-    // The D kernels carry no softcap/window uniforms — softcap/sliding models stand down to
-    // the chunked pair, which implements both.
+    // partD (walkthrough kernel-2 winner): fused single-pass slice kernel + parallel comb — lane
+    // ownership assumes hs == 128 (32 lanes x half4 = one head); no softcap/window uniforms, so those
+    // models stand down to the chunked pair. DASLLAMA_METAL_ATTN_D=0 = the A/B rail to the old path.
     let use_attn_d = (head_size == 128l && !hetero && c.attn_logit_softcap <= 0.0 && c.sliding_window == 0l &&
         get_env_variable("DASLLAMA_METAL_ATTN_D") != "0")
     let d_nsgs = min((maxcnt + 31l) / 32l, 16l)
@@ -1578,13 +1534,9 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 }
             }
             if ((!has_wv || c.v_norm) && g_skip != "ew") {
-                // gemma4 V: no-wv layers fill the v segment from the PRE-norm/PRE-rope K slice
-                // — the CPU mm_qkv order, BEFORE qk_norm touches k. With v_norm the per-row
-                // copies FUSE into the ones-RMS (soffe reads the k slice, the write lands in the
-                // v segment): nrows copy dispatches + the copy->norm barrier both dissolve; the
-                // fused kernel's k-slice READ orders against qk_norm's k WRITE via the existing
-                // bar_dep below (the V-race class — the concurrent encoder orders ONLY via
-                // hazards). A no-wv model without v_norm keeps the plain copies.
+                // gemma4 V: no-wv layers fill the v segment from the PRE-norm/PRE-rope K slice (the
+                // CPU mm_qkv order); with v_norm the copies FUSE into the ones-RMS. The k-slice READ
+                // orders against qk_norm's k WRITE ONLY via the bar_dep below (the V-race class).
                 bar_dep(enc, haz, HZ_BQKV, HZ_BQKV)
                 if (!has_wv && !c.v_norm) {
                     for (i in range64(nrows)) {
@@ -1899,11 +1851,9 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 enc_suppress_row(enc, blog, uint64(i * c.vocab_size * 4l), bsupp, u_nsupp, nsupp)
             }
         }
-        // zero-copy logits: scatter each staging row into its session's wrapped storage ON the
-        // cb — the landing memcpy for logits disappears (the KV writeback stays). All-or-nothing
-        // per step: one unwrappable session keeps the whole step on the landing scatter. In pipe
-        // mode the in-flight step now writes s.logits ASYNCHRONOUSLY — the pipe stays
-        // fixed-token-only by its existing contract.
+        // zero-copy logits: scatter each staging row into its session's wrapped storage ON the cb
+        // (the KV writeback stays). All-or-nothing per step: one unwrappable session keeps the whole
+        // step on the landing scatter. Pipe mode writes s.logits ASYNCHRONOUSLY — fixed-token-only.
         nc_all = true
         for (i in range64(nrows)) {
             nc_all &&= nc_logits_for(g_dev, *sessions[i]) != null

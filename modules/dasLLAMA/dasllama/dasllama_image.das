@@ -196,7 +196,7 @@ def private serialize_tokenizer(var arch : Archive; var tk : Tokenizer) {
     if (!arch.reading) {
         merges |> resize(length(tk.bpe.merge_rank))
         for (k, v in keys(tk.bpe.merge_rank), values(tk.bpe.merge_rank)) {
-            merges[int(v)] := k
+            merges[int(v)] = k
         }
     }
     serialize_strings(arch, merges)
@@ -614,11 +614,8 @@ def load_model_image(path : string; var t : Model; tag : string = "") : bool {
 }
 
 //! The image-cached model load — ``load_model``'s engine half, public for callers bypassing the
-//! full dasllama facade. ``.dlim`` maps directly (wrong identity panics); q8-mode gguf maps/saves
-//! a prepared image (``DASLLAMA_IMAGE=0`` disables); else plain gguf. Under an active Metal mode
-//! the image is the BLOB-ONLY metal flavor (own identity tag; CPU inference against it panics)
-//! when the drivers can serve the config — the planar CPU flavor otherwise; the flavors are
-//! separate files. Call inside ``with_job_que()``.
+//! facade. ``.dlim`` maps directly (wrong identity panics); q8-mode gguf maps/saves a prepared image
+//! (``DASLLAMA_IMAGE=0`` disables); under an active Metal mode the image is the BLOB-ONLY metal flavor (CPU inference against it panics) when servable, the planar CPU flavor otherwise. Call inside ``with_job_que()``.
 def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     if (path |> ends_with(".dlim")) {
         // a prepared image named directly — first-class once the source gguf is gone. The file

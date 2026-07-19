@@ -472,11 +472,9 @@ class MetalKqMulMmK6 {
     }
 }
 
-// One simdgroup per output row over the whole-model 34B q8 blob (f16 scale + 32 int8 inline —
-// the SAME dual-view W the mul_mm reads, bound at the tensor's byte offset): lane owns chunk
-// lane%8 of every 4th block, 4 blocks in flight (16 blocks per simdgroup stripe — amortizes
-// the loop overhead on the bandwidth-bound weight stream), the scale rides the quants'
-// cacheline. x stays cache-resident across rows. 128 threads = 4 rows per group.
+// One simdgroup per output row over the 34B q8 blob (f16 scale + 32 int8 inline — the SAME
+// dual-view W the mul_mm reads, bound at the tensor's byte offset): lane owns chunk lane%8 of
+// every 4th block, 4 in flight; the scale rides the quants' cacheline. 128 threads = 4 rows/group.
 class MetalQ8Gemv {
     @ssbo @binding = 0 wsh : array<float16> // 34B-block W blob, half-scale view (block b at 17*b)
     @ssbo @binding = 1 wqb : array<int8>    // the same blob buffer, byte view (quants at 34*b + 2)
@@ -704,9 +702,8 @@ class MetalKqGemvK5 {
 }
 
 // Q5_K, select-form nr0=1 twin (the gemv-lab b1c winner): one row per simdgroup, lcpp's q5 lane
-// map, qh via mask-selects into a 16x accumulator pair instead of the int compose. Wins at
-// n < 3072 at EVERY d (4B round: -9..-11% vs b2r on qkv/w13/cls) and at the small-d kv shape
-// (b2r under-occupied); b2r keeps n >= 3072 (3B round). enc_kq_gemv picks per site.
+// map, qh via mask-selects. Wins at n < 3072 at EVERY d (-9..-11% vs b2r) and the small-d kv
+// shape (b2r under-occupied); b2r keeps n >= 3072. enc_kq_gemv picks per site.
 class MetalKqGemvK5C {
     @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
     @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
@@ -1316,15 +1313,9 @@ class MetalKqMvB4K5 {
     }
 }
 
-// ===== K-quant B=5..8 single-pass twins (the lab extx8 form) — ONE weight pass instead of two
-// 4-column grid.y groups. The gemv lab CANNOT rank this against 2 x B4 (every 12B shape is
-// SLC-resident there, so the halved DRAM weight traffic is invisible) — these twins exist for
-// the in-graph A/B; DASLLAMA_METAL_KQ_B8=0 falls back to the 2-group B4 path. Shape: the ext
-// lane geometry with the x panel STAGED through tgmem per superblock (8 rows x 64 float4 = 8KB,
-// cooperative 64-thread load — the kq x reads are scattered within the superblock, and at 8
-// columns the staging beat per-lane device loads 0.45 -> 0.317 ms in the lab) + float4
-// accumulators. Requires the mp-padded x panel: mp == 8 exactly when nlive >= 5 (the dispatch
-// gate) — the stage reads all 8 rows, stores gate on nr.
+// ===== K-quant B=5..8 single-pass twins (lab extx8 form): ONE weight pass vs two B4 groups; x panel
+// STAGED through tgmem per superblock (0.45 -> 0.317 ms; the SLC-resident lab can't rank this — in-graph
+// A/B decides, DASLLAMA_METAL_KQ_B8=0 falls back). REQUIRES mp == 8 (nlive >= 5): stage reads all 8 rows, stores gate on nr.
 
 class MetalKqMvB8K4 {
     @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
@@ -1572,10 +1563,9 @@ class MetalKqMvB8K6 {
     }
 }
 
-// One thread per rotation pair: NORM (adjacent elements 2j, 2j+1 within each head) or NEOX
-// (j, j+half) per the mode uniform — v0*c - v1*s / v0*s + v1*c with this position's precomputed
-// table row, rope_scaled_tab / rope_scaled_neox_tab exactly. One kernel serves q (n = qd) and
-// k (n = kv_dim) as two dispatches.
+// One thread per rotation pair: NORM (2j, 2j+1 within each head) or NEOX (j, j+half) per the
+// mode uniform, matching rope_scaled_tab / rope_scaled_neox_tab exactly via the position's
+// precomputed table row. One kernel serves q (n = qd) and k (n = kv_dim) as two dispatches.
 class MetalRope {
     @ssbo @binding = 0 v : array<float>     // [ntok x n], roped in place
     @ssbo @binding = 1 tcos : array<float>  // [ntok x head_size/2]
@@ -1626,12 +1616,9 @@ class MetalAddBiasRows {
     }
 }
 
-// Per-head RMSNorm on the Q/K projections before rope (qwen3-line QK-norm): one threadgroup =
-// hs threads per (head, row) — nq q heads then the k heads; q head h at row*rstride + h*hs, k
-// head h at row*rstride + koffe + h*hs; weight w[(k ? woffe : 0) + j]. The decode drivers cover
-// q+k in ONE grid over the fused QKV buffer (koffe = qd, woffe = hs on a [qnorm | knorm] cat
-// plane); prefill dispatches its separate q/k panels with per-plane w binds. rmsnorm's exact
-// math: w * (x * 1/sqrt(sum/hs + eps)). Fusing this into rope-store is a ledger item.
+// Per-head RMSNorm on Q/K before rope (qwen3-line QK-norm): one threadgroup = hs threads per
+// (head, row), nq q-head groups then the k heads, weight w[(k ? woffe : 0) + j]. Decode covers
+// q+k in ONE grid over the fused QKV buffer; prefill dispatches separate q/k panels per-plane.
 class MetalQkNorm {
     @ssbo @binding = 0 x : array<float>     // bound at the panel offset; normalized in place
     @ssbo @binding = 1 w : array<float>
@@ -2548,8 +2535,7 @@ def private pf_mm_shape64(t : Model) : bool {
 // existing rows gather into the K/V panels and the causal diagonal shifts by qoff — the gate
 // keeps the argument so future clauses can window it
 def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : MetalPrefillDecline {
-    // the npos window is a POLICY decline (short prefills were cheaper on the CPU) — a
-    // blob-only model has no CPU path, so the window collapses and the GPU serves any npos
+    // npos window is a POLICY decline (short prefills were cheaper on CPU); blob-only has no CPU path, so any npos serves
     if (!t.metal_blob && (npos < g_min_npos || npos > g_max_npos)) {
         return MetalPrefillDecline.npos_window
     }
@@ -2558,8 +2544,7 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
     }
     // kquant rides the mul_mm path only — mm pinned off or a shape the %64 gate rejects has no kq-capable GEMM and declines
     if (t.kquant_native) {
-        // ... and every fmt needs a GPU kernel: kq_load_gpu_supported rejects the q4_0 QAT
-        // tier (and future formats) instead of letting them dispatch a wrong-layout branch
+        // kq_load_gpu_supported rejects fmts without a GPU kernel (q4_0 QAT tier) before they dispatch a wrong-layout branch
         if (g_mm_legacy || get_env_variable("DASLLAMA_METAL_MULMM") == "0" ||
                 !pf_mm_shape64(t) || !kq_load_gpu_supported(t)) {
             return MetalPrefillDecline.kquant_native
@@ -2571,8 +2556,7 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
             return MetalPrefillDecline.wscale_f16
         }
     }
-    // the drivers encode the std dense stack; the block set declares the graph shape
-    // (attn_is_std / ffn_is_dense) — MoE, recurrent, and custom-attention arches decline here
+    // the drivers encode the std dense stack (attn_is_std / ffn_is_dense) — MoE, recurrent, and custom-attention arches decline here
     if (!t.blocks.attn_is_std || !t.blocks.ffn_is_dense) {
         return MetalPrefillDecline.graph
     }
@@ -2588,10 +2572,7 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
     if ((c.dim % 32l) != 0l || (hidden % 32l) != 0l) {
         return MetalPrefillDecline.shape
     }
-    // per-layer (per-CLASS — the loader collapses to at most two): head_size % 32 grids the AV
-    // kernel's d in 32-blocks, the QK kernel k-slabs any size (qd needs no own %32 clause).
-    // Hetero geometry (gemma4's sliding vs global class) serves; hidden + kv_src stay pinned.
-    // A missing attn_v (V = the pre-norm K projection) serves — copy [+ ones-norm] encoded.
+    // per-CLASS: head_size/kv_dim % 32 grid the AV kernel (QK k-slabs any size); hetero geometry and missing attn_v serve, hidden + kv_src stay pinned
     for (l in range64(c.n_layers)) {
         if ((layer_head_size(c, l) % 32l) != 0l || (layer_kv_dim(c, l) % 32l) != 0l) {
             return MetalPrefillDecline.shape
@@ -2600,16 +2581,12 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
             return MetalPrefillDecline.layers
         }
     }
-    // AFTER the capability gates (the support matrix asserts capability reasons): the drivers
-    // are BLOB-ONLY — a planar q8 model has no upload path (load through metal-mode load_model
-    // or convert_model_to_metal_blob), and a blob model rides the mul_mm rail exclusively
-    // (the legacy quantized-X rail read the planar scale planes a blob model no longer carries)
+    // AFTER the capability gates (the support matrix asserts those reasons): drivers are BLOB-ONLY — planar q8 has no upload path, and a blob model rides the mul_mm rail exclusively
     if (!t.metal_blob || g_mm_legacy || get_env_variable("DASLLAMA_METAL_MULMM") == "0" ||
             !pf_mm_shape64(t)) {
         return MetalPrefillDecline.planar
     }
-    // the rope table(s) are the kernel's input — forward_prefill_body builds them right before
-    // the hook (dual-rope: the sliding class's rows too, at THAT class's width)
+    // rope tables are the kernel's input — forward_prefill_body builds them right before the hook (dual-rope: the sliding class's rows at ITS width)
     let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
     if (int64(length(s.rope_cos)) < npos * (c.head_size / 2l) ||
             (has_dual_rope(c) && int64(length(s.rope_cos_swa)) < npos * (swa_hs / 2l))) {
@@ -2920,8 +2897,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     let nk64 = ((nk + 63l) / 64l) * 64l
     // the K/V GEMMs write mp FULL M-tile rows at the start_pos row offset — a continuation's
     // panel must hold [0, start_pos + mp) rows or the pad rows write PAST the pool buffer
-    // (silent neighbor corruption; whether it bites depends on pool layout — the qd != dim
-    // families' logits went wrong while llama's allocation order happened to survive)
+    // (silent neighbor corruption; whether it bites depends on pool layout)
     let kvrows = max(nk64, start_pos + mp)
     // pooled per-prefill buffers (activations sized mp rows — the GEMM has no edge masking; rows
     // past npos are never read by the norm/rope/attention/elementwise kernels, and stale bytes in
@@ -3034,11 +3010,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     // the V-from-K panel copy's grid guards (npos rows of the class's kv width)
     var u_vtot = vfromk ? pf_uniform_u32(uint(npos * kv_dim)) : null
     var u_vtot_sw = (vfromk && hetero) ? pf_uniform_u32(uint(npos * kvd_sw)) : null
-    // logits-on-GPU (default ON, DASLLAMA_METAL_LOGITS=0 pins the CPU classifier): the final
-    // rmsnorm on the last position + the classifier GEMV ride the last command buffer, and the
-    // caller's CPU final step is skipped (prefill_override_logits_done). Mirrors the CPU q8
-    // `mm` path only — non-q8 classifiers decline to the CPU step; softcap + suppress ride
-    // their epilogue kernels (the single-decode gates' shape).
+    // logits-on-GPU (default ON, DASLLAMA_METAL_LOGITS=0 pins the CPU classifier): last-position
+    // rmsnorm + classifier GEMV ride the last command buffer (prefill_override_logits_done skips
+    // the CPU final step); q8 classifiers only, softcap + suppress ride epilogue kernels
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
     let gpu_logits = (!g_pf_logits_cpu && get_env_variable("DASLLAMA_METAL_LOGITS") != "0" && empty(g_pf_skip) &&

@@ -1736,10 +1736,9 @@ class MetalQ8GemvQkvRsF32 {
     }
 }
 
-// The W1|W3 twin of the same shape: one simdgroup dots BOTH ffn rows of an output element —
-// gate row r off the w1 blob views and up row r off the w3 views (kind-major layout keeps the
-// two tensors apart in the blob) — and writes silu(g)·u directly. Deletes the swiglu dispatch
-// AND its serialization level.
+// The W1|W3 twin of the same shape: one simdgroup dots BOTH ffn rows of an output element (gate
+// off the w1 blob views, up off the w3 views — kind-major layout keeps them apart) and writes
+// silu(g)·u directly. Deletes the swiglu dispatch AND its serialization level.
 class MetalQ8GemvW13Sw {
     @ssbo @binding = 0 wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
     @ssbo @binding = 1 wsh1 : array<float16>   // ... half-scale view
@@ -2025,12 +2024,9 @@ class MetalRopeStoreF16 {
     }
 }
 
-// The head-cooperative fused form (QK-norm models): ONE threadgroup per head (hs threads, the
-// tq4 kernel's shape) folds bias -> per-head RMSNorm -> rope -> f16 store into a single
-// dispatch — the thread-per-pair kernels can't host the head-wide reduction, and the separate
-// norm prepass costs a dispatch gap + a q/k round trip per layer. Grid: nheads q + nkvh k +
-// nkvh v threadgroups. rmsnorm's exact math (w * (x * 1/sqrt(sum/hs + eps))); rope pairs via
-// the tgmem-staged partner (post-norm values).
+// The head-cooperative fused form (QK-norm models): ONE threadgroup per head folds bias ->
+// per-head RMSNorm -> rope -> f16 store — the thread-per-pair kernels can't host the head-wide
+// reduction. Grid: nheads q + nkvh k + nkvh v; rope pairs via the tgmem-staged POST-NORM partner.
 class MetalRopeStoreHF16 {
     @ssbo @binding = 0 qk : array<float>    // q at [0, qd) roped in place, k at [qd, qd + kvd)
     @ssbo @binding = 1 vs : array<float>    // raw v (the QKV buffer at the v offset)
@@ -5822,11 +5818,9 @@ def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff
     metal_dispatch_threadgroups(enc, uint3(uint(groups), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
-// K-quant small-batch mv (B = 2..8): the kq ext twins — R=4 column groups via grid.y (gcols),
-// R=2 via the B2 PSO at exactly two live columns; B = 5..8 rides the single-pass B8 twin (ONE
-// weight stream + tgmem x panel; requires the mp == 8 pad the driver guarantees at nlive >= 5).
-// DASLLAMA_METAL_KQ_B8=0 = the A/B rail back to two B4 column groups. y binds at the site's
-// column byte offset; bys = the y ROW-stride uniform; bnr = live columns (stores gate).
+// K-quant small-batch mv (B = 2..8): R=4 column groups via grid.y, R=2 via the B2 PSO; B = 5..8
+// rides the single-pass B8 twin (requires the mp == 8 pad the driver guarantees at nlive >= 5;
+// DASLLAMA_METAL_KQ_B8=0 = the A/B rail). bys = y ROW-stride; bnr = live columns (stores gate).
 var private g_kq_b8_mode = -1
 
 def private kq_b8_on : bool {
@@ -6306,10 +6300,9 @@ def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalB
 
 // ===== the batched-step encoders (P4) =====
 
-// fixed-B batched GEMV (the B2 form serves B <= 2, B4 serves 3..4 — pad streams read stale rows,
-// whose outputs are never consumed); the blob slice binds through both views at the tensor's
-// byte offset. Geometry pinned at 4 rows/tg — the x-staged cooperative-load slot math bakes
-// 128 threads in (the g_gemv_rows knob stays single-stream-only).
+// fixed-B batched GEMV (B2 serves B <= 2, B4 3..4 — pad streams read stale rows, outputs never
+// consumed); the blob slice binds through both views at the tensor's byte offset. Pinned at
+// 4 rows/tg — the x-staged cooperative-load slot math bakes 128 threads in.
 def enc_gemv_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; boff : uint64;
                bx, by, bn, bd, bys : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
     metal_set_pipeline(enc, four ? g_pso_gemv_b4 : g_pso_gemv_b2)

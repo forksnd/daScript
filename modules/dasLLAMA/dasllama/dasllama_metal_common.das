@@ -66,9 +66,8 @@ enum MetalDecodeDecline {
 }
 
 //! Layer-stack features a model's graph needs beyond the base llama dense block — ONE derivation
-//! (`metal_needs`) feeds every GPU gate; each path (single decode / batch decode / prefill) holds
-//! its own implemented-set mask and declines `feature` on the difference, recording a `need_*`
-//! key per missing bit. Flags the drivers implement move into the path masks wave by wave.
+//! (`metal_needs`) feeds every GPU gate; each path holds its own implemented-set mask and declines
+//! `feature` on the difference, recording a `need_*` key per missing bit.
 bitfield MetalNeed {
     neox            // NEOX rope pairing (j, j+hs/2) — qwen2/qwen3/phi3/gemma/gptoss
     qkv_bias        // additive bias on the Q/K/V projections — qwen2/glm4moe/gptoss
@@ -89,9 +88,8 @@ bitfield MetalNeed {
 }
 
 //! The feature set model `t` needs from a resident GPU driver — derived from the loaded config
-//! (per-file truth: loader-detected flags included). Graph-shape needs (MoE routing, recurrent
-//! layers, custom attention) are NOT bits here — the block set declares those (`attn_is_std` /
-//! `ffn_is_dense`) and the gates decline `graph` before consulting the feature mask.
+//! (per-file truth: loader-detected flags included). Graph-shape needs are NOT bits here — the
+//! block set declares those (`attn_is_std` / `ffn_is_dense`) and the gates decline `graph` first.
 def metal_needs(t : Model) : MetalNeed {
     let c = t.config
     var n : MetalNeed
@@ -413,10 +411,9 @@ def public metal_decode_mirror_stats() : tuple<mirrors : int64; bytes : uint64> 
     return (mirrors = int64(length(g_mirrors)), bytes = g_mirror_bytes)
 }
 
-//! Arm the per-step single-stream decode trace for the next `cap` retired steps (0 disarms) —
-//! the bimodality diagnostic. Capacity is reserved here; recording stops when full, batch and
-//! prefill steps are never recorded, and a spec mispredict retires TWICE at the same pos
-//! (the wrong-token spec entry, then the slow rerun).
+//! Arm the per-step single-stream decode trace for the next `cap` retired steps (0 disarms) — the
+//! bimodality diagnostic. Recording stops when full; batch/prefill steps are never recorded; a spec
+//! mispredict retires TWICE at the same pos (the wrong-token spec entry, then the slow rerun).
 def public metal_decode_trace_arm(cap : int64) {
     g_step_trace |> clear()
     g_step_trace |> reserve(int(cap))
@@ -521,12 +518,8 @@ def upload_region_cat3(p0 : void?; b0 : uint64; p1 : void?; b1 : uint64; p2 : vo
 }
 
 // ===== the whole-plane resident buffers (blob-only models) =====
-// A metal_blob model's weight planes are GPU-ready on the CPU side already (the image contract:
-// no processing on load for the config it was built for). Each plane becomes ONE resident
-// buffer — a zero-copy page wrap when the plane is image-mapped (page-aligned view), else a
-// one-time untracked copy (the DASLLAMA_IMAGE=0 in-RAM transform) — and every tensor binds it
-// at a byte offset. Offsets keep in-kernel indices REGION-relative: a 13GB blob's absolute
-// byte indices overflow the kernels' uint32 index math, bind offsets never reach the kernel.
+// Each GPU-ready plane becomes ONE resident buffer (zero-copy page wrap when image-mapped, else a
+// one-time untracked copy); tensors bind at byte offsets, keeping in-kernel indices REGION-relative — a 13GB blob's absolute byte indices overflow the kernels' uint32 index math.
 
 def private plane_buffer(dev : MetalDevice?; base : void?; bytes : uint64) : MetalBuffer? {
     let key = intptr(base)
@@ -535,8 +528,7 @@ def private plane_buffer(dev : MetalDevice?; base : void?; bytes : uint64) : Met
     }
     var buf : MetalBuffer?
     if ((key & 16383ul) == 0ul) {
-        // page-aligned = an image-mapped plane view; the rounded-up tail stays inside the
-        // mapping (sections start page-aligned, the file pads to a page multiple)
+        // page-aligned = an image-mapped plane view; the rounded-up tail stays inside the mapping (the file pads to a page multiple)
         buf = unsafe(metal_new_buffer_no_copy_untracked(dev, base, (bytes + 16383ul) & ~16383ul))
     } else {
         buf = metal_new_buffer_untracked(dev, bytes)
