@@ -315,11 +315,13 @@ button:disabled { opacity: 0.45; cursor: default; }
             Everything above — the tokenizer, every matmul kernel, the continuous-batching
             scheduler, the paged KV cache, this HTTP server — is written in
             <a href="https://daslang.io">daslang</a>, a statically-typed scripting language for
-            games. No PyTorch, no llama.cpp, no CUDA: the inference engine is ~49&#8239;000 lines
-            of <code>.das</code>, JIT-compiled to native code through LLVM at startup, with its
-            hot kernels auto-tuned per box on first run. The server, scheduler, and this page add
-            ~4&#8239;000 more. The optional GPU tier offloads MoE expert stacks over Vulkan
-            compute — hybrid by layer <i>type</i>, not layer count.
+            games. No PyTorch, no llama.cpp, no CUDA: the LLM engine — kernels, IR generators,
+            tokenizer, loaders — is ~26&#8239;000 lines of <code>.das</code>, JIT-compiled to
+            native code through LLVM at startup, with its hot kernels auto-tuned per box on
+            first run. The speech-recognition stack adds ~7&#8239;000, the Metal and Vulkan GPU
+            backends ~15&#8239;000, and the server, scheduler, and this page ~4&#8239;000 more.
+            The GPU tier offloads MoE expert stacks over Vulkan compute — hybrid by layer
+            <i>type</i>, not layer count.
         </p>
         <p>
             Source: <a href="https://github.com/GaijinEntertainment/daScript">GaijinEntertainment/daScript</a>
