@@ -59,49 +59,6 @@ let DECODE_NEEDS_OK = (MetalNeed.neox | MetalNeed.qkv_bias | MetalNeed.qk_norm |
     MetalNeed.v_norm | MetalNeed.attn_scale | MetalNeed.out_scale)
 let BATCH_NEEDS_OK = DECODE_NEEDS_OK
 
-// one MoE weight stack's (fmt, offset) serve check — the expert-indexed GEMV twins address the
-// stack via 256-superblock plane offsets (k6 additionally needs the 512-element d-plane pair)
-def private moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
-    if (fmt != KqFmt.q8 && fmt != KqFmt.k4 && fmt != KqFmt.k5 && fmt != KqFmt.k6) {
-        return false
-    }
-    let al = fmt == KqFmt.k6 ? 512l : 256l
-    return off >= 0l && (off % al) == 0l && (ege % al) == 0l
-}
-
-// Wave C stage 1: the decode MoE serve gate — the shapes the routing kernels cover today
-// (softmax + norm_topk, no shared expert / biases / mx4 / dense-lead; q8-mode expert stacks
-// in q8/k4/k5/k6 with aligned expert planes). Everything else keeps the graph decline.
-def private moe_metal_ok(t : Model) : bool {
-    let c = t.config
-    if (!c.moe || c.n_ff_shexp > 0l || c.moe_dense_shexp || c.n_layer_dense_lead > 0l ||
-            c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
-            c.moe_router_bias || c.moe_exps_bias || c.moe_exp_probs || t.experts_mx4 ||
-            (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0) ||
-            c.ffn_act != FfnAct.silu) {
-        return false
-    }
-    let ne = c.n_expert
-    let k = c.n_expert_used
-    let nfe = c.n_ff_exp
-    let ege = c.dim * nfe
-    // select kernel holds 8 logits per lane (ne <= 256); kq GEMVs need superblock dims both ways
-    if (ne < 1l || ne > 256l || k < 1l || k > 16l || k > ne || nfe <= 0l ||
-            (c.dim % 256l) != 0l || (nfe % 256l) != 0l ||
-            ne * ege > 3800000000l ||   // uint32 in-kernel indices (q8 byte view = elements * 34/32)
-            t.router_off < 0l || empty(t.we1_offs) || empty(t.we2_offs) || empty(t.we3_offs)) {
-        return false
-    }
-    for (l in range64(c.n_layers)) {
-        if (!moe_site_ok(kq_fmt_at(t.we1_fmt, l), t.we1_offs[l], ege) ||
-                !moe_site_ok(kq_fmt_at(t.we2_fmt, l), t.we2_offs[l], ege) ||
-                !moe_site_ok(kq_fmt_at(t.we3_fmt, l), t.we3_offs[l], ege)) {
-            return false
-        }
-    }
-    return true
-}
-
 def private decode_shape_decline(t : Model; needs_ok : MetalNeed; allow_moe : bool = false) : MetalDecodeDecline {
     if (t.quant != QuantMode.q8) {
         return MetalDecodeDecline.quant_mode
@@ -182,8 +139,8 @@ def private metal_model_servable_impl(t : Model) : bool {
     if (t.config.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8) {
         return false
     }
-    // allow_moe stays FALSE: blob loads can't fall back to CPU — MoE waits for batch+prefill (stage 2)
-    return decode_shape_decline(t, DECODE_NEEDS_OK) == MetalDecodeDecline.none
+    // MoE included since stage 2b (all three paths serve; the gate's %256 dims imply the prefill %64)
+    return decode_shape_decline(t, DECODE_NEEDS_OK, true) == MetalDecodeDecline.none
 }
 
 // Can the speculative chain feed itself on this model? It needs a GPU embed gather for the

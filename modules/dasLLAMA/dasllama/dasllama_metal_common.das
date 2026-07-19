@@ -932,6 +932,52 @@ def signs_buffer() : MetalBuffer? {
 // tq4-mirror rope+store: one threadgroup per head (the FWHT spans it); mirror rows bind twice
 // each (half-scale + byte views at the same row offset)
 
+def private moe_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
+
+// one MoE weight stack's (fmt, offset) serve check — the expert-indexed GEMV twins address the
+// stack via 256-superblock plane offsets (k6 additionally needs the 512-element d-plane pair)
+def moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
+    if (fmt != KqFmt.q8 && fmt != KqFmt.k4 && fmt != KqFmt.k5 && fmt != KqFmt.k6) {
+        return false
+    }
+    let al = fmt == KqFmt.k6 ? 512l : 256l
+    return off >= 0l && (off % al) == 0l && (ege % al) == 0l
+}
+
+// Wave C stage 1: the decode MoE serve gate — the shapes the routing kernels cover today
+// (softmax + norm_topk, no shared expert / biases / mx4 / dense-lead; q8-mode expert stacks
+// in q8/k4/k5/k6 with aligned expert planes). Everything else keeps the graph decline.
+def moe_metal_ok(t : Model) : bool {
+    let c = t.config
+    if (!c.moe || c.n_ff_shexp > 0l || c.moe_dense_shexp || c.n_layer_dense_lead > 0l ||
+            c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
+            c.moe_router_bias || c.moe_exps_bias || c.moe_exp_probs || t.experts_mx4 ||
+            (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0) ||
+            c.ffn_act != FfnAct.silu) {
+        return false
+    }
+    let ne = c.n_expert
+    let k = c.n_expert_used
+    let nfe = c.n_ff_exp
+    let ege = c.dim * nfe
+    // select kernel holds 8 logits per lane (ne <= 256); kq GEMVs need superblock dims both ways
+    if (ne < 1l || ne > 256l || k < 1l || k > 16l || k > ne || nfe <= 0l ||
+            (c.dim % 256l) != 0l || (nfe % 256l) != 0l ||
+            ne * ege > 3800000000l ||   // uint32 in-kernel indices (q8 byte view = elements * 34/32)
+            t.router_off < 0l || empty(t.we1_offs) || empty(t.we2_offs) || empty(t.we3_offs)) {
+        return false
+    }
+    for (l in range64(c.n_layers)) {
+        if (!moe_site_ok(moe_fmt_at(t.we1_fmt, l), t.we1_offs[l], ege) ||
+                !moe_site_ok(moe_fmt_at(t.we2_fmt, l), t.we2_offs[l], ege) ||
+                !moe_site_ok(moe_fmt_at(t.we3_fmt, l), t.we3_offs[l], ege)) {
+            return false
+        }
+    }
+    return true
+}
+
+
 let HZ_BX     = 1u
 let HZ_BXB    = 2u
 let HZ_BXB2   = 4u
