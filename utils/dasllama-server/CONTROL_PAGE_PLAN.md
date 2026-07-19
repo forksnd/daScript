@@ -28,7 +28,14 @@ the ramp tail. Does NOT repro: solo, 2-concurrent, constant-4 x 48 tok, cache do
 tinyllama survived the identical ramp. **UPDATE: crashed on Qwen too (23:06 bundle) with the
 IDENTICAL address/instruction/frames, only the garbage pointer differs (0x7a vs 0x1735) —
 MODEL-INDEPENDENT, one deterministic site in the serving path. Boris suspects team-mode
-dispatch or config interplay.** Minidumps + maps + JIT artifacts:
+dispatch or config interplay. BREAKTHROUGH 23:16: a third occurrence surfaced as a SYMBOLIZED
+das panic — `array index out of range at dasllama_common.das:7155` = `addr(t.qblob[off])` in
+dequant_q8_row, the token-embedding row gather → a GARBAGE TOKEN ID reached embedding lookup
+(matches the AV's r9=0x1735 token-id-sized value in a pointer slot). ONE corruption, two
+manifestations: das bounds check → panic (then WEDGES the process — panic unwinds the tick
+loop, libhv/ASR threads keep it alive, port accepts but never answers); unchecked JIT read →
+AV. Entry point for the debug session: how a corrupted cur_tok/token flows into the batch
+gather under admit/reap pressure.** Minidumps + maps + JIT artifacts:
 logs/crashes/dasllama-20260718-22{5415,5448,5523,5834,5938}*. CDB QUICK LOOK (pid16432 dump):
 faulting instr `mov r10,[r9+28h]` with r9=0x1735 (5941 — token-id-sized int in a pointer slot,
 field read at +0x28); frame[1] = Context::to_out → the crash SITE is the runtime's out/log
