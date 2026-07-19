@@ -10709,7 +10709,8 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         if (sp.kv_pool != s0.kv_pool) {
             panic("eval_batch: sessions[{i}] KV pool differs from sessions[0] — one pool (or all-flat) per batch")
         }
-        if (s0.kv_pool == null && (length(sp.key_cache) != length(s0.key_cache) || length(sp.value_cache) != length(s0.value_cache))) {
+        // long_length: a full-seq 1B's flat f16 cache is exactly 2^31 bytes — length() throws
+        if (s0.kv_pool == null && (long_length(sp.key_cache) != long_length(s0.key_cache) || long_length(sp.value_cache) != long_length(s0.value_cache))) {
             panic("eval_batch: sessions[{i}] cache size differs from sessions[0] — same model + same seq_len required")
         }
     }
