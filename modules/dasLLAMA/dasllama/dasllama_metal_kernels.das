@@ -2409,6 +2409,7 @@ class MetalGemvB2 {
     @ssbo @binding = 4 y : array<float>     // [B x d]
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
+    @uniform @binding = 7 ys : uint         // y ROW stride (== ddim dense)
     @workgroup txp : float4[128]            // [2 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_b2_msl")]
@@ -2453,7 +2454,7 @@ class MetalGemvB2 {
         for [unroll_full] (b in range(2)) {
             let s = simd_sum(acc[b])
             if (lane == 0u) {
-                y[uint(b) * ddim + row] = s
+                y[uint(b) * ys + row] = s
             }
         }
     }
@@ -2466,6 +2467,7 @@ class MetalGemvB4 {
     @ssbo @binding = 4 y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
+    @uniform @binding = 7 ys : uint         // y ROW stride (== ddim dense)
     @workgroup txp : float4[256]            // [4 streams x 64 float4] X panel chunk
 
     [metal_kernel(name="metal_gemv_b4_msl")]
@@ -2513,7 +2515,7 @@ class MetalGemvB4 {
         for [unroll_full] (b in range(4)) {
             let s = simd_sum(acc[b])
             if (lane == 0u) {
-                y[uint(b) * ddim + row] = s
+                y[uint(b) * ys + row] = s
             }
         }
     }
@@ -2530,6 +2532,8 @@ class MetalQ8MvB2 {
     @uniform @binding = 4 ndim : uint
     @uniform @binding = 5 ddim : uint
     @uniform @binding = 6 xs4 : uint        // x row stride in float4s (ndim/4 = dense)
+    @uniform @binding = 7 ys : uint         // y ROW stride (== ddim dense; qkvd at the fused-QKV
+                                            // segment sites — the kq mv twins' bys contract)
 
     [metal_kernel(name="metal_q8_mv_b2_msl")]
     def metal_q8_mv_b2 {
@@ -2575,7 +2579,7 @@ class MetalQ8MvB2 {
             s += simd_shuffle_down(s, 2u)
             s += simd_shuffle_down(s, 1u)
             if (tx == 0u && row0 < ddim) {
-                y[uint(b) * ddim + row0] = s
+                y[uint(b) * ys + row0] = s
             }
         }
     }
@@ -2593,6 +2597,7 @@ class MetalQ8MvB4 {
     @uniform @binding = 5 ddim : uint
     @uniform @binding = 6 nrows : uint
     @uniform @binding = 7 xs4 : uint
+    @uniform @binding = 8 ys : uint         // y ROW stride (== ddim dense)
 
     [metal_kernel(name="metal_q8_mv_b4_msl")]
     def metal_q8_mv_b4 {
@@ -2644,7 +2649,7 @@ class MetalQ8MvB4 {
             s += simd_shuffle_down(s, 2u)
             s += simd_shuffle_down(s, 1u)
             if (tx == 0u && row0 < ddim && uint(b) < nrows) {
-                y[uint(b) * ddim + row0] = s
+                y[uint(b) * ys + row0] = s
             }
         }
     }
@@ -2800,6 +2805,8 @@ class MetalQ8GemmB {
     @ssbo @binding = 4 y : array<float>     // Y [M' x d]
     @uniform @binding = 5 kdim : uint       // n (K)
     @uniform @binding = 6 ndim : uint       // d (N)
+    @uniform @binding = 7 ys : uint         // y TOKEN-row stride (== ndim dense; qkvd at the
+                                            // fused-QKV segment sites, y bound at the column offset)
     @workgroup tw : float16[1024]           // W: 4 k-tiles x 4 row-tiles of 8x8, (k row, wrow col)
     @workgroup tx : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, (token row, k col)
 
@@ -2873,10 +2880,10 @@ class MetalQ8GemmB {
         }
         let row0 = mBase + (sg / 2u) * 16u
         let col0 = nBase + (sg % 2u) * 16u
-        simdgroup_store(mc[0], y, row0 * ndim + col0, ndim)
-        simdgroup_store(mc[1], y, row0 * ndim + (col0 + 8u), ndim)
-        simdgroup_store(mc[2], y, (row0 + 8u) * ndim + col0, ndim)
-        simdgroup_store(mc[3], y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(mc[0], y, row0 * ys + col0, ys)
+        simdgroup_store(mc[1], y, row0 * ys + (col0 + 8u), ys)
+        simdgroup_store(mc[2], y, (row0 + 8u) * ys + col0, ys)
+        simdgroup_store(mc[3], y, (row0 + 8u) * ys + (col0 + 8u), ys)
     }
 }
 
@@ -5831,7 +5838,7 @@ def private kq_b8_on : bool {
 
 def enc_kq_mvb(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff : uint64;
                bs : MetalBuffer?; soff, doff : uint64; bx, by : MetalBuffer?; yoff : uint64;
-               bn, bd, bys, bnr : MetalBuffer?; rows, n, nlive : int64) {
+               bn, bd, bys, bnr : MetalBuffer?; rows, nlive : int64) {
     let two = nlive == 2l
     let b8 = nlive >= 5l && kq_b8_on()
     if (fmt == KqFmt.k6) {
@@ -6304,15 +6311,16 @@ def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalB
 // byte offset. Geometry pinned at 4 rows/tg — the x-staged cooperative-load slot math bakes
 // 128 threads in (the g_gemv_rows knob stays single-stream-only).
 def enc_gemv_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; boff : uint64;
-               bx, by, bn, bd : MetalBuffer?; d : int64) {
+               bx, by, bn, bd, bys : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
     metal_set_pipeline(enc, four ? g_pso_gemv_b4 : g_pso_gemv_b2)
     metal_set_threadgroup_memory_length(enc, four ? metal_gemv_b4_msl_tgmem : metal_gemv_b2_msl_tgmem, 0)
     metal_set_buffer(enc, bw, boff, 0)   // byte view
     metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, 0ul, 4)
+    metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bd, 0ul, 6)
+    metal_set_buffer(enc, bys, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((d + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
@@ -6320,7 +6328,7 @@ def enc_gemv_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; boff 
 // bxs = x row stride in float4s; bnr = the nrows uniform, four-form only; xoff/yoff = the
 // column-tile byte offsets (B > 4 streams the weights once per 4-column tile)
 def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob : MetalBuffer?; wboff : uint64;
-             bx, by, bn, bd, bxs : MetalBuffer?; d : int64;
+             bx, by, bn, bd, bxs, bys : MetalBuffer?; d : int64;
              bnr : MetalBuffer? = null; xoff : uint64 = 0ul; yoff : uint64 = 0ul) {
     metal_set_pipeline(enc, four ? g_pso_mv_b4 : g_pso_mv_b2)
     metal_set_buffer(enc, bwblob, wboff, 0)
@@ -6332,8 +6340,10 @@ def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob : MetalBuffer?; wbo
     if (four) {
         metal_set_buffer(enc, bnr, 0ul, 6)
         metal_set_buffer(enc, bxs, 0ul, 7)
+        metal_set_buffer(enc, bys, 0ul, 8)
     } else {
         metal_set_buffer(enc, bxs, 0ul, 6)
+        metal_set_buffer(enc, bys, 0ul, 7)
     }
     // b2 = 4 rows/tg (16 lanes/row); b4 = 8 rows/tg (8 lanes/row)
     metal_dispatch_threadgroups(enc, uint3(uint(four ? (d + 7l) / 8l : (d + 3l) / 4l), 1u, 1u), uint3(64u, 1u, 1u))
@@ -6343,14 +6353,14 @@ def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob : MetalBuffer?; wbo
 // reference's own shape — it never switches to GEMM below B = 9; the weights stream twice but
 // stay the fast skinny form). xrowb = the x row stride in bytes; bnr/bnr2 = per-tile nrows.
 def enc_mv_site(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wboff : uint64;
-                bx, by, bn, bd, bxs : MetalBuffer?;
-                d, nrows : int64; xrowb : uint64; bnr, bnr2 : MetalBuffer?) {
-    enc_mv_b(enc, nrows > 2l, bwblob, wboff, bx, by, bn, bd, bxs, d, bnr)
+                bx, by, bn, bd, bxs, bys : MetalBuffer?;
+                d, nrows, ys : int64; xrowb : uint64; bnr, bnr2 : MetalBuffer?;
+                yoff : uint64 = 0ul) {
+    enc_mv_b(enc, nrows > 2l, bwblob, wboff, bx, by, bn, bd, bxs, bys, d, bnr, 0ul, yoff)
     if (nrows > 4l) {
-        // the rows-5..8 dispatch offsets y by 4 * d — valid only while d == the y row stride
-        // (bd). The one d != stride site (the no-wv QKV cat) can't reach here: mv8 gates
-        // dim <= 3072 and no-wv exists only on gemma4 (dim 3840)
-        enc_mv_b(enc, true, bwblob, wboff, bx, by, bn, bd, bxs, d, bnr2, 4ul * xrowb, uint64(4l * d * 4l))
+        // the rows-5..8 dispatch offsets y by 4 rows of the SITE's y row stride (the ys
+        // uniform's value — fused-buffer segment sites included)
+        enc_mv_b(enc, true, bwblob, wboff, bx, by, bn, bd, bxs, bys, d, bnr2, 4ul * xrowb, yoff + uint64(4l * ys * 4l))
     }
 }
 
@@ -6390,15 +6400,16 @@ def enc_gemm_mm_b(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wboff : uin
 
 // the M-pad-32 GEMM (B >= 5): raw f32 X, dual-view blob W at the tensor's byte offset
 def enc_gemm_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
-               bx, by, bk, bn : MetalBuffer?; mp32, d : int64) {
+               bx, by, bk, bn, bys : MetalBuffer?; mp32, d : int64; yoff : uint64 = 0ul) {
     metal_set_pipeline(enc, g_pso_gemm_b)
     metal_set_threadgroup_memory_length(enc, metal_q8_gemm_b_msl_tgmem, 0)
     metal_set_buffer(enc, bw, boff, 0)   // byte view
     metal_set_buffer(enc, bw, boff, 2)   // half-scale view
     metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, 0ul, 4)
+    metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bk, 0ul, 5)
     metal_set_buffer(enc, bn, 0ul, 6)
+    metal_set_buffer(enc, bys, 0ul, 7)
     metal_dispatch_threadgroups(enc, uint3(uint((mp32 / 32l) * (d / 32l)), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
