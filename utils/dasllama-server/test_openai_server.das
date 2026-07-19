@@ -298,6 +298,31 @@ def test_openai_server(t : T?) {
             POST("{base_url}/config", "\{\"port\":\"eight\"}") $(resp) {
                 t |> equal(int(resp.status_code), int(http_status.BAD_REQUEST))
             }
+            // /v1/streams — finished chat streams linger ~10 s with counters + text tails
+            GET("{base_url}/v1/streams") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "streams JSON parses")
+                if (js != null) {
+                    t |> success((js?["max_streams"] ?? 0l) > 0l, "streams reports max_streams")
+                    var saw_finished = false
+                    var saw_tail = false
+                    if (js?["streams"] != null && ((js?["streams"]).value is _array)) {
+                        for (e in ((js?["streams"]).value as _array)) {
+                            if (string(e?["state"] ?? "") == "finished") {
+                                saw_finished = true
+                                saw_tail = saw_tail || ((e?["n_gen"] ?? 0l) > 0l && !empty(string(e?["gen_tail"] ?? "")))
+                            }
+                        }
+                    }
+                    t |> success(saw_finished, "finished streams linger on the poll surface")
+                    t |> success(saw_tail, "a finished stream carries generated text tail")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
             // /v1/stats S2 depth — after real work went through the scheduler
             GET("{base_url}/v1/stats") $(resp) {
                 var err : string

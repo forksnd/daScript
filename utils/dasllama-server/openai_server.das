@@ -1291,6 +1291,59 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
     return resp |> JSON(sprint_json(out, false), http_status.OK)
 }
 
+// /v1/streams: the poll surface behind the page's swimlane + stream cards — per-stream state,
+// token counts, TTFT, and capped text tails. Finished streams linger ~10 s flagged "finished".
+struct private OaiStreamInfo {
+    id : int64
+    state : string       // "queued" | "prefilling" | "decoding" | "finished"
+    finish : string      // finished only: "stop" | "length" | "evicted"
+    age_s : float
+    n_prompt : int64
+    n_cached : int64
+    n_prefilled : int64
+    n_gen : int64
+    max_new : int64
+    ttft_ms : float
+    prompt_head : string
+    gen_tail : string
+}
+
+struct private OaiStreamsResponse {
+    max_streams : int64
+    streams : array<OaiStreamInfo>
+}
+
+def private handle_streams(var resp : HttpResponse?) : http_status {
+    var out = OaiStreamsResponse(max_streams = g_sched.max_streams)
+    out.streams |> reserve(length(g_sched.streams) + length(g_sched.queue) + length(g_sched.recent_done))
+    for (st in g_sched.streams) {
+        out.streams |> push(OaiStreamInfo(
+            id = st.id,
+            state = st.state == StreamState.prefilling ? "prefilling" : "decoding",
+            age_s = float(get_time_usec(st.t_admit)) / 1000000.0,
+            n_prompt = int64(length(st.prompt)), n_cached = st.n_cached,
+            n_prefilled = st.n_prefilled, n_gen = st.n_gen, max_new = st.max_new,
+            ttft_ms = float(st.ttft_us) / 1000.0,
+            prompt_head = st.prompt_head, gen_tail = st.gen_tail))
+    }
+    for (q in g_sched.queue) {
+        out.streams |> push(OaiStreamInfo(
+            id = q.id, state = "queued",
+            age_s = q.t_submit != 0l ? float(get_time_usec(q.t_submit)) / 1000000.0 : 0.0,
+            n_prompt = int64(length(q.prompt)), max_new = q.max_new))
+    }
+    for (d in g_sched.recent_done) {
+        out.streams |> push(OaiStreamInfo(
+            id = d.id, state = "finished", finish = d.finish,
+            n_prompt = d.n_prompt, n_cached = d.n_cached, n_prefilled = d.n_prompt, n_gen = d.n_gen,
+            ttft_ms = float(d.ttft_us) / 1000.0,
+            prompt_head = d.prompt_head, gen_tail = d.gen_tail))
+    }
+    let body = sprint_json(out, false)
+    delete out
+    return resp |> JSON(body, http_status.OK)
+}
+
 // key -> expected JSON kind for POST /config bodies: "s"tring | "i"nteger | "b"ool. The one
 // schema the save endpoint validates against — mirrors ServerArgs (main.das CONFIG_KEYS).
 let private CONFIG_KEY_KINDS <- {
@@ -1702,6 +1755,9 @@ class OpenAiServer : HvWebServer {
         }
         GET("/v1/stats") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_stats(resp)
+        }
+        GET("/v1/streams") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_streams(resp)
         }
         GET("/") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             // the control page ships beside the server sources; libhv sets text/html from the extension

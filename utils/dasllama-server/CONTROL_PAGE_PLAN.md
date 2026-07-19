@@ -19,6 +19,15 @@ override); capability guard (`supported` + `reason` recorded at load); `gpu_tier
 Verified: toml 108/108, server 17/17 live, vulkan tier 12/12, e2e restart loop (CLI-beats-toml
 → save authoritative → exit 4 → relaunch → toml-beats-CLI), page behavior via mock+playwright.
 
+**S3 DONE (2026-07-19):** Stream carries `prompt_head` (~160 chars, whole pieces) + `gen_tail`
+(240..480 chars, UTF-8-safe front trim); finished streams linger ~10 s in
+`Scheduler.recent_done` (bounded 32); `GET /v1/streams` serves state / counters / TTFT / tails
+for active + queued + finished. Page: slot swimlane replaces the streams chart (prefill/decode
+shades per lane, queued depth as the baseline strip), live stream cards with client-side
+transcript accumulation (overlap-merge of capped tails — verified exact against a scripted
+mock), History view (last 20). Verified: scheduler 12/12, server 17/17 live (finished-linger +
+tail assertions), page via mock+playwright.
+
 **S2 DONE (2026-07-19):** scheduler `prefill_tokens` (computed tokens only, cache hits
 excluded) + TTFT aggregate (sum/count/last at reap; per-stream `ttft_us` predated); /v1/stats
 grows prefill/ttft/memory (`model_weights_bytes` + `kv_pool_bytes` engine helpers, das heaps)

@@ -76,6 +76,29 @@ canvas { width: 100%; height: 96px; display: block; cursor: crosshair; }
 .cfg { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-faint); line-height: 1.7; }
 .cfg b { color: var(--fg-dim); font-weight: 400; }
 
+.sec .spacer { flex: 1; }
+button.mini {
+    font-size: 10.5px; padding: 3px 10px; text-transform: uppercase; letter-spacing: 0.6px;
+    color: var(--fg-dim);
+}
+button.mini.on { border-color: var(--amber); color: var(--amber); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.scard { background: var(--bg-2); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; }
+.scard .head {
+    display: flex; gap: 10px; align-items: baseline; font-family: var(--font-mono);
+    font-size: 11px; color: var(--fg-dim); margin-bottom: 6px;
+}
+.scard .head .st { text-transform: uppercase; letter-spacing: 0.5px; font-size: 9.5px; }
+.scard .head .st.prefilling { color: var(--blue); }
+.scard .head .st.decoding { color: var(--amber); }
+.scard .head .st.queued { color: var(--fg-faint); }
+.scard .head .st.finished { color: var(--green); }
+.scard .txt {
+    font-family: var(--font-mono); font-size: 11px; line-height: 1.55; color: var(--fg);
+    max-height: 130px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+}
+.scard .txt .ph { color: var(--fg-faint); }
+
 .gpu-line { font-family: var(--font-mono); font-size: 11.5px; margin-bottom: 12px; }
 .gpu-line .reason { color: var(--red); }
 .cfg-form {
@@ -153,16 +176,24 @@ button:disabled { opacity: 0.45; cursor: default; }
             <canvas id="c-pf" height="96"></canvas>
         </div>
         <div class="panel">
-            <div class="chart-title"><span>streams · last 2 min</span><span class="chart-now" id="c-str-now"></span></div>
-            <canvas id="c-str" height="96"></canvas>
-            <div class="legend"><span><i style="background:var(--amber)"></i>active</span><span><i style="background:var(--blue)"></i>queued</span></div>
+            <div class="chart-title"><span>stream slots · last 2 min</span><span class="chart-now" id="c-str-now"></span></div>
+            <canvas id="c-lane" height="96"></canvas>
+            <div class="legend"><span><i style="background:var(--amber-dim)"></i>prefill</span><span><i style="background:var(--amber)"></i>decode</span><span><i style="background:var(--blue)"></i>queued (count)</span></div>
         </div>
     </div>
 
-    <div class="sec"><span>§ 02</span><span class="rule"></span><span>config</span></div>
+    <div class="sec"><span>§ 02</span><span class="rule"></span><span>streams</span>
+        <span class="spacer"></span>
+        <button class="mini" id="b-live" type="button">live</button>
+        <button class="mini" id="b-history" type="button">history</button>
+    </div>
+    <div id="cards" class="cards"><div class="ctl-note" id="cards-empty">no active streams — POST a chat completion and watch it flow</div></div>
+    <div id="history" class="cards" style="display:none"><div class="ctl-note">nothing finished yet</div></div>
+
+    <div class="sec"><span>§ 03</span><span class="rule"></span><span>config</span></div>
     <div class="panel cfg" id="cfg">…</div>
 
-    <div class="sec"><span>§ 03</span><span class="rule"></span><span>config editor</span></div>
+    <div class="sec"><span>§ 04</span><span class="rule"></span><span>config editor</span></div>
     <div class="panel">
         <div class="gpu-line" id="gpu-line" style="display:none"></div>
         <form id="cfg-form" class="cfg-form"></form>
@@ -175,7 +206,7 @@ button:disabled { opacity: 0.45; cursor: default; }
         <div class="cfg-file" id="cfg-file"></div>
     </div>
 
-    <div class="sec"><span>§ 04</span><span class="rule"></span><span>controls</span></div>
+    <div class="sec"><span>§ 05</span><span class="rule"></span><span>controls</span></div>
     <div class="panel controls">
         <button id="b-gc" type="button">collect garbage</button>
         <button id="b-drain" class="danger" type="button">drain + shutdown</button>
@@ -247,10 +278,9 @@ function apply(s) {
         (s.asr_workers > 0 ? " · asr workers <b>" + s.asr_workers + "</b>" : "");
     $("c-tps-now").textContent = rate.toFixed(1);
     $("c-pf-now").textContent = pfRate.toFixed(0);
-    $("c-str-now").textContent = s.active + " · " + s.queued;
+    $("c-str-now").textContent = s.active + " active · " + s.queued + " queued";
     draw($("c-tps"), [{ data: tps, color: css("--amber") }]);
     draw($("c-pf"), [{ data: pf, color: css("--green") }]);
-    draw($("c-str"), [{ data: act, color: css("--amber") }, { data: que, color: css("--blue") }]);
 }
 
 function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
@@ -281,7 +311,7 @@ function draw(cv, series) {
 }
 
 // crosshair tooltip: nearest sample, value(s) + age
-for (const id of ["c-tps", "c-pf", "c-str"]) {
+for (const id of ["c-tps", "c-pf"]) {
     const cv = $(id);
     cv.addEventListener("mousemove", e => {
         const s = cv._series; if (!s || !s[0].data.length) return;
@@ -296,11 +326,162 @@ for (const id of ["c-tps", "c-pf", "c-str"]) {
     cv.addEventListener("mouseleave", () => { $("tip").style.display = "none"; });
 }
 
+// ===== streams: swimlane + live cards + history =====
+const laneHist = [];              // per poll tick: { states: Uint8Array(maxLanes) 0=idle 1=prefill 2=decode, queued }
+const laneOf = new Map();         // stream id -> lane index
+const transcripts = new Map();    // stream id -> { head, text, info }
+const doneHist = [];              // finished: { id, finish, head, text, info } newest first
+let maxLanes = 4;
+
+function mergeTail(text, tail) {
+    if (!tail) return text;
+    for (let k = Math.min(text.length, tail.length); k > 0; k--) {
+        if (text.endsWith(tail.slice(0, k))) return text + tail.slice(k);
+    }
+    return text + tail;
+}
+
+function applyStreams(p, queued) {
+    maxLanes = Math.max(1, p.max_streams || maxLanes);
+    const active = p.streams.filter(s => s.state === "prefilling" || s.state === "decoding");
+    const finished = p.streams.filter(s => s.state === "finished");
+    // lane assignment: stable per id, lowest free lane on first sight
+    const used = new Set([...laneOf.values()]);
+    for (const s of active) {
+        if (!laneOf.has(s.id)) {
+            let lane = 0;
+            while (used.has(lane)) lane++;
+            if (lane < maxLanes) { laneOf.set(s.id, lane); used.add(lane); }
+        }
+    }
+    const states = new Uint8Array(maxLanes);
+    for (const s of active) {
+        const lane = laneOf.get(s.id);
+        if (lane !== undefined && lane < maxLanes) states[lane] = s.state === "prefilling" ? 1 : 2;
+    }
+    laneHist.push({ states, queued });
+    if (laneHist.length > HIST) laneHist.shift();
+    // transcripts: accumulate the tail growth client-side (reload loses history — accepted)
+    for (const s of active) {
+        const t = transcripts.get(s.id) || { head: s.prompt_head, text: "", info: s };
+        t.text = mergeTail(t.text, s.gen_tail);
+        t.info = s;
+        transcripts.set(s.id, t);
+    }
+    for (const s of finished) {
+        const t = transcripts.get(s.id);
+        if (t) {
+            t.text = mergeTail(t.text, s.gen_tail);
+            doneHist.unshift({ id: s.id, finish: s.finish, head: t.head, text: t.text, info: s });
+            if (doneHist.length > 20) doneHist.pop();
+            transcripts.delete(s.id);
+            laneOf.delete(s.id);
+        }
+    }
+    drawLanes();
+    renderCards(p.streams.filter(s => s.state === "queued"), active);
+    renderHistory();
+}
+
+function drawLanes() {
+    const cv = $("c-lane"), dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    const rowH = Math.min(16, (h - 4) / maxLanes), cellW = w / (HIST - 1);
+    const colors = [null, css("--amber-dim"), css("--amber")];
+    g.strokeStyle = css("--rule"); g.lineWidth = 1;
+    for (let l = 0; l <= maxLanes; l++) {
+        const y = Math.round(l * rowH) + 0.5;
+        g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.globalAlpha = 0.4; g.stroke(); g.globalAlpha = 1;
+    }
+    for (let i = 0; i < laneHist.length; i++) {
+        const x = (HIST - laneHist.length + i) * cellW;
+        const st = laneHist[i].states;
+        for (let l = 0; l < Math.min(st.length, maxLanes); l++) {
+            if (!st[l]) continue;
+            g.fillStyle = colors[st[l]];
+            g.fillRect(x, l * rowH + 1.5, Math.max(cellW, 1), rowH - 3);
+        }
+        if (laneHist[i].queued > 0) {   // queued depth as a thin blue baseline strip
+            g.fillStyle = css("--blue");
+            g.fillRect(x, h - 3, Math.max(cellW, 1), 2);
+        }
+    }
+}
+
+function esc(t) {
+    const d = document.createElement("span");
+    d.textContent = t;
+    return d.innerHTML;
+}
+
+function cardHtml(id, stateCls, stateTxt, meta, head, text) {
+    return '<div class="head"><b>#' + id + '</b><span class="st ' + stateCls + '">' + stateTxt + '</span>' +
+        '<span>' + meta + '</span></div>' +
+        '<div class="txt"><span class="ph">' + esc(head) + '</span>' + esc(text) + '</div>';
+}
+
+function renderCards(queuedStreams, active) {
+    const box = $("cards");
+    const want = new Set();
+    for (const s of [...active, ...queuedStreams]) {
+        want.add("sc-" + s.id);
+        let el = document.getElementById("sc-" + s.id);
+        if (!el) {
+            el = document.createElement("div");
+            el.id = "sc-" + s.id;
+            el.className = "scard";
+            box.append(el);
+        }
+        const t = transcripts.get(s.id);
+        const meta = s.state === "prefilling"
+            ? "prefill " + s.n_prefilled + "/" + s.n_prompt + (s.n_cached ? " (" + s.n_cached + " cached)" : "")
+            : s.state === "queued" ? s.n_prompt + " tok waiting"
+            : s.n_gen + "/" + s.max_new + " tok · ttft " + s.ttft_ms.toFixed(0) + "ms";
+        el.innerHTML = cardHtml(s.id, s.state, s.state, meta, (t ? t.head : s.prompt_head), t ? t.text : "");
+        const txt = el.querySelector(".txt");
+        txt.scrollTop = txt.scrollHeight;
+    }
+    for (const el of [...box.querySelectorAll(".scard")]) {
+        if (!want.has(el.id)) el.remove();
+    }
+    $("cards-empty").style.display = want.size ? "none" : "block";
+}
+
+function renderHistory() {
+    const box = $("history");
+    if (!doneHist.length) return;
+    box.textContent = "";
+    for (const hh of doneHist) {
+        const el = document.createElement("div");
+        el.className = "scard";
+        el.innerHTML = cardHtml(hh.id, "finished", "finished · " + hh.finish,
+            hh.info.n_gen + " tok · ttft " + hh.info.ttft_ms.toFixed(0) + "ms", hh.head, hh.text);
+        box.append(el);
+    }
+}
+
+$("b-live").classList.add("on");
+$("b-live").addEventListener("click", () => {
+    $("cards").style.display = "grid"; $("history").style.display = "none";
+    $("b-live").classList.add("on"); $("b-history").classList.remove("on");
+});
+$("b-history").addEventListener("click", () => {
+    $("cards").style.display = "none"; $("history").style.display = "grid";
+    $("b-history").classList.add("on"); $("b-live").classList.remove("on");
+});
+
 async function poll() {
     try {
         const r = await fetch("/v1/stats", { cache: "no-store" });
         if (!r.ok) throw new Error(String(r.status));
-        apply(await r.json());
+        const s = await r.json();
+        apply(s);
+        const rs = await fetch("/v1/streams", { cache: "no-store" });
+        if (rs.ok) applyStreams(await rs.json(), s.queued);
         failures = 0;
     } catch (_e) {
         if (++failures >= 3) setBadge("err", last && last.draining ? "stopped" : "unreachable");

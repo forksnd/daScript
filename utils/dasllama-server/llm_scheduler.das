@@ -4,6 +4,7 @@ module llm_scheduler
 
 require dasllama/dasllama   // the public facade — the scheduler reaches no engine internals
 require math
+require strings             // tail bookkeeping for the poll surface (length / slice / peek_data)
 
 // Continuous-batching scheduler over the dasLLAMA facade. One thread, synchronous: each
 // scheduler_step admits queued requests, runs ONE eval_batch decode step over every decoding
@@ -72,6 +73,23 @@ struct Stream {
     t_admit : int64                         // ref_time_ticks at admit
     t_first : int64                         // ref_time_ticks at the first sampled token (0 until then)
     ttft_us : int64
+    prompt_head : string = ""               // poll surface: first ~160 chars of the detokenized prompt
+    gen_tail : string = ""                  // poll surface: last ~240..480 chars generated (piece-appended)
+}
+
+//! A finished stream's summary, kept ~10 s on the scheduler for the poll surface (the page
+//! moves it to its history), then dropped.
+struct DoneStream {
+    id : int64
+    finish : string
+    n_prompt : int64
+    n_cached : int64
+    n_gen : int64
+    ttft_us : int64
+    gen_us : int64
+    prompt_head : string
+    gen_tail : string
+    done_at : int64                         // ref_time_ticks at reap
 }
 
 //! The continuous-batching scheduler: active streams, the admission queue, the shared eval_batch
@@ -106,6 +124,7 @@ struct Scheduler {
     sum_batch : int64                       // Σ decode batch size (avg batch = sum_batch / decode_steps)
     peak_active : int64
     cached_tokens : int64                   // prefix-cache hits (tokens attached instead of prefilled)
+    recent_done : array<DoneStream>         // finished-stream linger for the poll surface (~10 s)
     prefill_tokens : int64                  // prompt tokens actually computed (cache hits excluded)
     ttft_sum_us : int64                     // Σ ttft over reaped streams that produced a token
     ttft_count : int64
@@ -184,6 +203,22 @@ def private finish_stream(var st : Stream; finish : string; var events : array<S
 // step (generate_'s ordering). Returns true when a piece was emitted (the caller counts it).
 // Shared emit bookkeeping for one FINAL token (freshly sampled, or a verified spec draft):
 // ttft stamp, stop-token finish, event + repetition window + budget accounting.
+// Trim `s` to its last `keep` bytes without cutting a UTF-8 codepoint in half: the cut point
+// advances past continuation bytes to the next character start.
+def private trim_tail_utf8(s : string; keep : int) : string {
+    let n = length(s)
+    if (n <= keep) {
+        return s
+    }
+    var cut = n - keep
+    peek_data(s) $(bytes) {
+        while (cut < n && (int(bytes[cut]) & 0xC0) == 0x80) {
+            cut ++
+        }
+    }
+    return slice(s, cut)
+}
+
 def private advance_with(m : Model; var st : Stream; tok : int64; var events : array<SchedEvent>) : bool {
     if (st.t_first == 0l) {
         st.t_first = ref_time_ticks()
@@ -196,7 +231,12 @@ def private advance_with(m : Model; var st : Stream; tok : int64; var events : a
             return false
         }
     }
-    events |> push(SchedEvent(stream = st.id, token = tok, text = piece(m, tok)))
+    let ptxt = piece(m, tok)
+    st.gen_tail += ptxt
+    if (length(st.gen_tail) > 480) {
+        st.gen_tail = trim_tail_utf8(st.gen_tail, 240)
+    }
+    events |> push(SchedEvent(stream = st.id, token = tok, text = ptxt))
     st.session.recent |> push(tok)
     st.n_gen ++
     st.cur_tok = tok
@@ -240,6 +280,12 @@ def evict(var sch : Scheduler; id : int64; var events : array<SchedEvent>) : boo
 //! logits sample the first token inline), then reap finished streams. Events append to `events`
 //! (the caller drains it). Returns true while any stream or queued request remains.
 def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent>) : bool {
+    // (0) drop finished-stream linger entries past their poll window (bounded backstop at 32)
+    while (!empty(sch.recent_done)
+           && (int64(get_time_usec(sch.recent_done[0].done_at)) > 10_000_000l || length(sch.recent_done) > 32)) {
+        delete sch.recent_done[0]
+        sch.recent_done |> erase(0)
+    }
     // (1) admit FIFO while under the cap — sessions (KV memory) exist only from this point on.
     // Paged mode also attaches the longest prefix-cache hit: those positions never prefill.
     while (!empty(sch.queue) && int64(length(sch.streams)) < sch.max_streams) {
@@ -266,6 +312,11 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         }
         let wait_ms = sch.queue[0].t_submit != 0l ? int64(get_time_usec(sch.queue[0].t_submit)) / 1000l : 0l
         to_log(LOG_INFO, "[stream {st.id}] start: prompt={length(st.prompt)} tok (cached={st.n_cached}), queue_wait={wait_ms}ms, active={length(sch.streams) + 1}/{sch.max_streams}\n")
+        for (tk in st.prompt) {   // poll-surface preview: whole pieces up to the head cap
+            let p = piece(m, tk)
+            break if (length(st.prompt_head) + length(p) > 160)
+            st.prompt_head += p
+        }
         sch.streams |> emplace(st)
         delete sch.queue[0]   // erase is a raw memmove — finalize what the move-out left behind
         sch.queue |> erase(0)
@@ -362,6 +413,13 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
                 sch.ttft_count ++
                 sch.last_ttft_us = sch.streams[i].ttft_us
             }
+            sch.recent_done |> push(DoneStream(
+                id = sch.streams[i].id, finish = sch.streams[i].finish,
+                n_prompt = int64(length(sch.streams[i].prompt)), n_cached = sch.streams[i].n_cached,
+                n_gen = sch.streams[i].n_gen, ttft_us = sch.streams[i].ttft_us,
+                gen_us = sch.streams[i].t_first != 0l ? int64(get_time_usec(sch.streams[i].t_first)) : 0l,
+                prompt_head = sch.streams[i].prompt_head, gen_tail = sch.streams[i].gen_tail,
+                done_at = ref_time_ticks()))
             if (sch.paged) {
                 donate_stream(m, sch, sch.streams[i])
                 release_kv_pages(sch.streams[i].session)
