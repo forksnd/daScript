@@ -19,6 +19,18 @@ override); capability guard (`supported` + `reason` recorded at load); `gpu_tier
 Verified: toml 108/108, server 17/17 live, vulkan tier 12/12, e2e restart loop (CLI-beats-toml
 → save authoritative → exit 4 → relaunch → toml-beats-CLI), page behavior via mock+playwright.
 
+**S6 DONE (2026-07-19):** `POST /vad` (silero preview in-handler: lazy `load_vad_model` from
+the in-repo `silero_vad.bin`, 120 s cap, honest 501 without a source tree); AsrEvent carries
+`audio_s`; drain-side ASR job tracking (running/done/failed, wall ms, RTF = audio s per wall s,
+~30 s linger bounded at 16) + cumulative `asr_done_jobs`/`asr_audio_s` in stats; `/v1/streams`
+gains `asr`. Page ASR studio (shown when `asr_workers > 0`): record/upload → waveform envelope →
+VAD spans overlaid → verbose transcription → clickable segment timeline with in-browser span
+playback; RTF-per-job chart + job table + cumulative line. Verified LIVE (tinyllama +
+ggml-tiny + jfk.wav via playwright: 5 silero spans, correct segment text, job card 11.0 s
+audio / 1.5 s wall / 7.6x RTF); server 17/17. NOTE: das-side upload e2e blocked on a dashv
+client gap (no multipart/binary request body helper) — browser path is the covered one.
+Log-mel spectrogram stays PARKED per plan.
+
 **S8 DEFERRED TO ITS OWN PR (Boris 2026-07-19):** the bench button was fully built (lcpp_bin
 config key, quiesced-only POST /bench + worker thread + child benches, GET /bench, page A/B
 panel — commit 0e944bfac) but the server dies silently seconds after the worker's SECOND

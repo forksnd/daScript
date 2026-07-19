@@ -99,6 +99,17 @@ button.mini.on { border-color: var(--amber); color: var(--amber); }
 }
 .scard .txt .ph { color: var(--fg-faint); }
 
+#a-wave { height: 80px; background: var(--bg-3); border: 1px solid var(--rule); border-radius: 4px; }
+.segs { margin-top: 8px; max-height: 180px; overflow-y: auto; }
+.segs .seg {
+    display: flex; gap: 12px; padding: 3px 8px; cursor: pointer; border-radius: 4px;
+    font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-dim);
+}
+.segs .seg:hover { background: var(--bg-3); color: var(--fg); }
+.segs .seg .tm { color: var(--fg-faint); white-space: nowrap; }
+.segs .seg.playing { background: var(--bg-3); color: var(--amber); }
+#a-rec.rec { border-color: var(--red); color: var(--red); }
+
 .chat-log { display: flex; flex-direction: column; gap: 10px; max-height: 420px; overflow-y: auto; margin-bottom: 12px; }
 .msg { max-width: 85%; padding: 8px 12px; border-radius: 8px; font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
 .msg.user { align-self: flex-end; background: var(--bg-3); border: 1px solid var(--amber-dim); }
@@ -250,10 +261,35 @@ button:disabled { opacity: 0.45; cursor: default; }
         <div class="knobs" id="knobs"></div>
     </div>
 
-    <div class="sec"><span>§ 05</span><span class="rule"></span><span>config</span></div>
+    <div class="asr-only" id="asr-section" style="display:none">
+        <div class="sec"><span>§ 05</span><span class="rule"></span><span>asr studio</span></div>
+        <div class="panel">
+            <div class="controls" style="margin-bottom:10px">
+                <button id="a-rec" type="button">● record</button>
+                <button id="a-upload" type="button">upload audio</button>
+                <input type="file" id="a-file" accept="audio/*" style="display:none"/>
+                <button id="a-run" type="button" disabled>vad + transcribe</button>
+                <span class="ctl-note" id="a-note">record or upload a clip, then run — speech spans overlay the waveform, segments play back on click</span>
+            </div>
+            <canvas id="a-wave" height="80" style="cursor:default"></canvas>
+            <div id="a-segs" class="segs"></div>
+            <div class="charts" style="margin-top:12px">
+                <div class="panel" style="background:var(--bg-3)">
+                    <div class="chart-title"><span>rtf per job · audio s / wall s</span><span class="chart-now" id="c-rtf-now"></span></div>
+                    <canvas id="c-rtf" height="72"></canvas>
+                </div>
+                <div class="panel" style="background:var(--bg-3)">
+                    <div class="chart-title"><span>asr jobs</span><span class="chart-now" id="a-cum"></span></div>
+                    <table class="ctable"><tbody id="a-jobs"><tr><td class="ctl-note">no jobs yet</td></tr></tbody></table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="sec"><span>§ 06</span><span class="rule"></span><span>config</span></div>
     <div class="panel cfg" id="cfg">…</div>
 
-    <div class="sec"><span>§ 06</span><span class="rule"></span><span>config editor</span></div>
+    <div class="sec"><span>§ 07</span><span class="rule"></span><span>config editor</span></div>
     <div class="panel">
         <div class="gpu-line" id="gpu-line" style="display:none"></div>
         <form id="cfg-form" class="cfg-form"></form>
@@ -266,7 +302,7 @@ button:disabled { opacity: 0.45; cursor: default; }
         <div class="cfg-file" id="cfg-file"></div>
     </div>
 
-    <div class="sec"><span>§ 07</span><span class="rule"></span><span>controls</span></div>
+    <div class="sec"><span>§ 08</span><span class="rule"></span><span>controls</span></div>
     <div class="panel controls">
         <button id="b-gc" type="button">collect garbage</button>
         <button id="b-drain" class="danger" type="button">drain + shutdown</button>
@@ -274,7 +310,7 @@ button:disabled { opacity: 0.45; cursor: default; }
     </div>
 
     <footer class="reveal">
-        <div class="sec"><span>§ 08</span><span class="rule"></span><span>how this works</span></div>
+        <div class="sec"><span>§ 09</span><span class="rule"></span><span>how this works</span></div>
         <p>
             Everything above — the tokenizer, every matmul kernel, the continuous-batching
             scheduler, the paged KV cache, this HTTP server — is written in
@@ -350,6 +386,7 @@ function apply(s) {
         $("tile-asr").classList.remove("hide");
         $("t-asr").textContent = s.asr_ready + " · " + s.asr_active + " · " + s.asr_pending;
         if (micRec === null) $("b-mic").style.display = "";
+        $("asr-section").style.display = "block";
     }
     $("cfg").innerHTML =
         "model <b>" + s.model + "</b> · ctx <b>" + s.ctx + "</b> · streams <b>" + s.max_streams + "</b>" +
@@ -462,6 +499,7 @@ function applyStreams(p, queued) {
     renderCards(p.streams.filter(s => s.state === "queued"), active);
     renderHistory();
     renderCache(p.cache || []);
+    renderAsrJobs(p.asr || [], last);
 }
 
 function fmtAge(s) {
@@ -807,6 +845,197 @@ async function micToggle() {
     }
 }
 $("b-mic").addEventListener("click", micToggle);
+
+// ===== asr studio: waveform + vad overlay + segment playback + rtf =====
+let asrPcm = null, asrRate = 16000;   // mono Float32Array + its sample rate (record or upload)
+let asrVad = [], asrRec = null, asrCtx = null, asrSrc = null;
+const rtfSeries = [];
+const seenAsrJobs = new Set();
+
+function drawWave() {
+    const cv = $("a-wave"), dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    if (!asrPcm) return;
+    const dur = asrPcm.length / asrRate;
+    // vad spans under the envelope
+    g.fillStyle = "rgba(155, 196, 106, 0.18)";
+    for (const s of asrVad) {
+        g.fillRect(s.start / dur * w, 0, Math.max((s.end - s.start) / dur * w, 1), h);
+    }
+    g.strokeStyle = css("--amber"); g.lineWidth = 1;
+    g.beginPath();
+    const step = Math.max(1, Math.floor(asrPcm.length / w));
+    for (let x = 0; x < w; x++) {
+        let lo = 1, hi = -1;
+        const base = Math.floor(x / w * asrPcm.length);
+        for (let i = base; i < Math.min(base + step, asrPcm.length); i++) {
+            const v = asrPcm[i];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        if (hi < lo) continue;
+        g.moveTo(x + 0.5, h / 2 - hi * (h / 2 - 2));
+        g.lineTo(x + 0.5, h / 2 - lo * (h / 2 - 2) + 0.5);
+    }
+    g.stroke();
+}
+
+function setAsrClip(pcm, rate, label) {
+    asrPcm = pcm; asrRate = rate; asrVad = [];
+    $("a-run").disabled = false;
+    $("a-note").textContent = label + " · " + (pcm.length / rate).toFixed(1) + "s — run vad + transcribe";
+    $("a-segs").textContent = "";
+    drawWave();
+}
+
+$("a-rec").addEventListener("click", async () => {
+    const btn = $("a-rec");
+    if (asrRec) {
+        const { ctx, node, stream, chunks } = asrRec;
+        asrRec = null;
+        btn.classList.remove("rec");
+        btn.textContent = "● record";
+        node.disconnect();
+        stream.getTracks().forEach(t => t.stop());
+        const rate = ctx.sampleRate;
+        await ctx.close();
+        let n = 0;
+        for (const c of chunks) n += c.length;
+        const pcm = new Float32Array(n);
+        let o = 0;
+        for (const c of chunks) { pcm.set(c, o); o += c.length; }
+        if (n) setAsrClip(pcm, rate, "recorded");
+        return;
+    }
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const ctx = new AudioContext();
+        const src = ctx.createMediaStreamSource(stream);
+        const node = ctx.createScriptProcessor(4096, 1, 1);
+        const chunks = [];
+        node.onaudioprocess = e => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+        src.connect(node);
+        node.connect(ctx.destination);
+        asrRec = { ctx, node, stream, chunks };
+        btn.classList.add("rec");
+        btn.textContent = "■ stop";
+    } catch (_e) {
+        $("a-note").textContent = "no microphone access";
+    }
+});
+
+$("a-upload").addEventListener("click", () => $("a-file").click());
+$("a-file").addEventListener("change", async () => {
+    const f = $("a-file").files[0];
+    if (!f) return;
+    try {
+        const buf = await f.arrayBuffer();
+        const ctx = new AudioContext();
+        const ab = await ctx.decodeAudioData(buf);
+        setAsrClip(ab.getChannelData(0).slice(), ab.sampleRate, f.name);
+        await ctx.close();
+    } catch (_e) {
+        $("a-note").textContent = "could not decode that file";
+    }
+});
+
+function playSpan(start, end, row) {
+    if (!asrPcm) return;
+    if (asrSrc) { try { asrSrc.stop(); } catch (_e) {} asrSrc = null; }
+    if (!asrCtx) asrCtx = new AudioContext();
+    const ab = asrCtx.createBuffer(1, asrPcm.length, asrRate);
+    ab.copyToChannel(asrPcm, 0);
+    const src = asrCtx.createBufferSource();
+    src.buffer = ab;
+    src.connect(asrCtx.destination);
+    src.start(0, start, Math.max(end - start, 0.05));
+    asrSrc = src;
+    for (const el of document.querySelectorAll(".segs .seg")) el.classList.remove("playing");
+    if (row) row.classList.add("playing");
+    src.onended = () => { if (row) row.classList.remove("playing"); };
+}
+
+$("a-run").addEventListener("click", async () => {
+    if (!asrPcm) return;
+    $("a-run").disabled = true;
+    $("a-note").textContent = "running vad + transcription...";
+    const wav = encodeWav([asrPcm], asrRate);
+    try {
+        const fdv = new FormData();
+        fdv.append("file", wav, "clip.wav");
+        const rv = await fetch("/vad", { method: "POST", body: fdv });
+        if (rv.ok) {
+            asrVad = (await rv.json()).segments || [];
+            drawWave();
+        }
+        const fdt = new FormData();
+        fdt.append("file", wav, "clip.wav");
+        fdt.append("response_format", "verbose_json");
+        const rt = await fetch("/v1/audio/transcriptions", { method: "POST", body: fdt });
+        const j = await rt.json();
+        const box = $("a-segs");
+        box.textContent = "";
+        if (rt.ok && j.segments) {
+            for (const sg of j.segments) {
+                const row = document.createElement("div");
+                row.className = "seg";
+                const tm = document.createElement("span");
+                tm.className = "tm";
+                tm.textContent = sg.start.toFixed(2) + "–" + sg.end.toFixed(2) + "s";
+                const tx = document.createElement("span");
+                tx.textContent = sg.text;
+                row.append(tm, tx);
+                row.addEventListener("click", () => playSpan(sg.start, sg.end, row));
+                box.append(row);
+            }
+            $("a-note").textContent = "done — " + j.segments.length + " segment(s), " +
+                (asrVad.length ? asrVad.length + " speech span(s); " : "") + "click a segment to hear it";
+        } else {
+            $("a-note").textContent = "transcription failed: " + (j.error ? j.error.message : rt.status);
+        }
+    } catch (_e) {
+        $("a-note").textContent = "request failed";
+    }
+    $("a-run").disabled = false;
+});
+
+function renderAsrJobs(rows, stats) {
+    const body = $("a-jobs");
+    if (rows.length) {
+        body.textContent = "";
+        for (const r of rows) {
+            const tr = document.createElement("tr");
+            for (const [v, cls] of [["#" + r.id, "pv"], [r.state, r.state === "done" ? "hit" : ""],
+                                    [r.audio_s ? r.audio_s.toFixed(1) + "s" : "…", ""],
+                                    [r.wall_ms ? (r.wall_ms / 1000).toFixed(1) + "s" : "…", ""],
+                                    [r.rtf ? r.rtf.toFixed(1) + "x" : "…", ""]]) {
+                const td = document.createElement("td");
+                if (cls) td.className = cls;
+                td.textContent = v;
+                tr.append(td);
+            }
+            body.append(tr);
+        }
+    }
+    for (const r of rows) {
+        if (r.state === "done" && !seenAsrJobs.has(r.id)) {
+            seenAsrJobs.add(r.id);
+            rtfSeries.push(r.rtf);
+            if (rtfSeries.length > HIST) rtfSeries.shift();
+        }
+    }
+    if (rtfSeries.length) {
+        $("c-rtf-now").textContent = rtfSeries[rtfSeries.length - 1].toFixed(1) + "x";
+        draw($("c-rtf"), [{ data: rtfSeries, color: css("--green") }]);
+    }
+    if (stats) {
+        $("a-cum").textContent = stats.asr_done_jobs + " jobs · " + stats.asr_audio_s.toFixed(0) + "s audio";
+    }
+}
 
 // ===== config editor =====
 // field spec: k = config key, t = text|path|int|sel|bool, o = select options ("" = unset/legacy)

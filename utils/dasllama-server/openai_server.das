@@ -19,6 +19,7 @@ require daslib/module_path      // get_this_module_dir: control.html ships besid
 require strings
 require math
 require dasllama/dasllama_audio_io   // load_audio_16k_mono: any uploaded audio format -> 16 kHz mono f32
+require dasllama/dasllama_vad        // POST /vad: silero speech spans for the page's waveform overlay
 
 // An OpenAI-compatible HTTP server over the dasLLAMA facade. It reaches only public facade verbs —
 // no engine internals — which is the acceptance test for the API: if a full OpenAI surface builds
@@ -336,12 +337,28 @@ struct private AsrEvent {
     status : int
     content_type : string
     body : string
+    audio_s : float      // completed: decoded clip length in seconds (0 on failures)
+}
+
+//! One ASR job on the poll surface: running while the worker holds it, then done/failed with
+//! its wall time and RTF (audio seconds per wall second) — lingers ~30 s like finished streams.
+struct private AsrJobInfo {
+    id : int64
+    state : string       // "running" | "done" | "failed"
+    audio_s : float
+    wall_ms : float
+    rtf : float
+    started_at : int64   // ref_time_ticks at the started event
+    done_at : int64      // 0 while running
 }
 
 struct private AsrWire {
     @do_not_delete writer : HttpResponseWriter?
 }
 
+var g_asr_recent : array<AsrJobInfo>   // running + lingering done jobs for the poll surface
+var g_asr_done_jobs = 0l               // cumulative completed transcriptions
+var g_asr_audio_s = 0.0                // cumulative audio seconds transcribed
 var g_asr_jobs : Channel?
 var g_asr_events : Channel?
 var g_asr_wires : table<int64; AsrWire>
@@ -1264,6 +1281,8 @@ struct private OaiStatsResponse {
     heap_bytes : int64
     string_heap_bytes : int64
     hardware : string
+    asr_done_jobs : int64
+    asr_audio_s : float
 }
 
 def private handle_stats(var resp : HttpResponse?) : http_status {
@@ -1287,7 +1306,8 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         kv_bytes = kv_pool_bytes(g_sched.pool),
         heap_bytes = int64(heap_bytes_allocated()),
         string_heap_bytes = int64(string_heap_bytes_allocated()),
-        hardware = g_hardware_line)
+        hardware = g_hardware_line,
+        asr_done_jobs = g_asr_done_jobs, asr_audio_s = g_asr_audio_s)
     return resp |> JSON(sprint_json(out, false), http_status.OK)
 }
 
@@ -1318,10 +1338,21 @@ struct private OaiCacheEntry {
     preview : string
 }
 
+// One ASR job row on the poll surface (drain-side tracking; RTF = audio s per wall s).
+struct private OaiAsrRow {
+    id : int64
+    state : string
+    audio_s : float
+    wall_ms : float
+    rtf : float
+    age_s : float
+}
+
 struct private OaiStreamsResponse {
     max_streams : int64
     streams : array<OaiStreamInfo>
     cache : array<OaiCacheEntry>
+    asr : array<OaiAsrRow>
 }
 
 def private handle_streams(var resp : HttpResponse?) : http_status {
@@ -1360,6 +1391,12 @@ def private handle_streams(var resp : HttpResponse?) : http_status {
             preview = c.preview))
     }
     delete chains
+    out.asr |> reserve(length(g_asr_recent))
+    for (j in g_asr_recent) {
+        out.asr |> push(OaiAsrRow(
+            id = j.id, state = j.state, audio_s = j.audio_s, wall_ms = j.wall_ms, rtf = j.rtf,
+            age_s = float(get_time_usec(j.started_at)) / 1000000.0))
+    }
     let body = sprint_json(out, false)
     delete out
     return resp |> JSON(body, http_status.OK)
@@ -1374,6 +1411,63 @@ let private CONFIG_KEY_KINDS <- {
     "ctx" => "i", "max_tokens" => "i", "streams" => "i", "threads" => "i", "team_dispatch" => "s",
     "affinity" => "i", "chunk" => "i", "page_rows" => "i", "prefix" => "i", "flat" => "b",
     "mtp" => "b"
+}
+
+// POST /vad: the page's waveform-overlay preview — silero speech spans over an uploaded clip.
+// Buffered + in-handler: silero is a tiny RNN, preview clips are capped, no worker needed.
+var private g_vad_loaded = false
+var private g_vad = VadModel()
+let private VAD_PREVIEW_CAP_S = 120
+
+def private handle_vad(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    if (!g_vad_loaded) {
+        let path = path_join(get_das_root(), "modules/dasLLAMA/models/silero_vad.bin")
+        if (!stat(path).is_valid) {
+            return resp |> JSON(
+                error_body("silero_vad.bin not found ({path}) — the VAD preview needs a source tree", "server_error"),
+                http_status.NOT_IMPLEMENTED)
+        }
+        g_vad <- load_vad_model(path)
+        g_vad_loaded = true
+    }
+    var fname = ""
+    each_form_field(req) $(name, _content, filename) {
+        if (name == "file" && !empty(filename)) {
+            fname = filename
+        }
+    }
+    if (empty(fname)) {
+        return resp |> JSON(
+            error_body("multipart form must include a 'file' audio upload", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    let temppath = path_join(tmpdir(), "dasllama_vad_{next_id()}_{base_name(fname)}")
+    save_form_file(req, "file", temppath)
+    var samples <- load_audio_16k_mono(temppath)
+    remove(temppath)
+    defer() {
+        delete samples
+    }
+    if (empty(samples)) {
+        return resp |> JSON(
+            error_body("could not decode the uploaded audio", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    if (length(samples) > 16000 * VAD_PREVIEW_CAP_S) {
+        return resp |> JSON(
+            error_body("clip too long for the VAD preview (cap {VAD_PREVIEW_CAP_S} s)", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    var segs <- find_speech_timestamps(g_vad, samples, default_vad_opts())
+    var parts : array<string>
+    parts |> reserve(length(segs))
+    for (sg in segs) {
+        parts |> push("\{\"start\":{float(sg.start) / 16000.0},\"end\":{float(sg.end) / 16000.0}}")
+    }
+    let body = "\{\"duration\":{float(length(samples)) / 16000.0},\"segments\":[{join(parts, ",")}]}"
+    delete segs
+    delete parts
+    return resp |> JSON(body, http_status.OK)
 }
 
 def private json_str(s : string) : string {
@@ -1560,7 +1654,8 @@ def private process_asr_job(
         vt.language = session.detected_lang
         emit_asr_event(events, AsrEvent(
             kind = AsrEventKind.completed, id = job.id, status = int(http_status.OK),
-            content_type = "application/json", body = sprint_json(vt, false)))
+            content_type = "application/json", body = sprint_json(vt, false),
+            audio_s = float(length(samples)) / 16000.0))
         delete full
         delete vt
         return
@@ -1570,7 +1665,8 @@ def private process_asr_job(
     let body = job.response_format == "text" ? text : sprint_json(OaiTranscription(text = text), false)
     emit_asr_event(events, AsrEvent(
         kind = AsrEventKind.completed, id = job.id, status = int(http_status.OK),
-        content_type = content_type, body = body))
+        content_type = content_type, body = body,
+        audio_s = float(length(samples)) / 16000.0))
 }
 
 def private asr_worker_main(
@@ -1708,9 +1804,24 @@ def private drain_asr_events(srv : WebSocketServer) {
         draining = g_asr_events |> try_pop_clone() $(event : AsrEvent#) {
             if (event.kind == AsrEventKind.started) {
                 g_asr_active++
+                g_asr_recent |> push(AsrJobInfo(id = event.id, state = "running", started_at = ref_time_ticks()))
             } elif (event.kind == AsrEventKind.completed) {
                 g_asr_active = max(g_asr_active - 1, 0)
                 g_asr_pending = max(g_asr_pending - 1, 0)
+                for (i in range(length(g_asr_recent))) {
+                    continue if (g_asr_recent[i].id != event.id)
+                    let wall_ms = float(get_time_usec(g_asr_recent[i].started_at)) / 1000.0
+                    g_asr_recent[i].state = event.status == int(http_status.OK) ? "done" : "failed"
+                    g_asr_recent[i].audio_s = event.audio_s
+                    g_asr_recent[i].wall_ms = wall_ms
+                    g_asr_recent[i].rtf = wall_ms > 0.0 ? event.audio_s * 1000.0 / wall_ms : 0.0
+                    g_asr_recent[i].done_at = ref_time_ticks()
+                    break
+                }
+                if (event.status == int(http_status.OK)) {
+                    g_asr_done_jobs ++
+                    g_asr_audio_s += event.audio_s
+                }
                 var wire = unsafe(g_asr_wires?[event.id])
                 if (wire != null) {
                     if (is_writer_connected(srv, wire.writer)) {
@@ -1725,6 +1836,13 @@ def private drain_asr_events(srv : WebSocketServer) {
                 to_log(LOG_INFO, "[req {event.id}] asr: completed (pending={g_asr_pending}, active={g_asr_active})\n")
             }
         }
+    }
+    // finished jobs linger ~30 s on the poll surface, then drop (bounded backstop at 16)
+    while (!empty(g_asr_recent)
+           && g_asr_recent[0].done_at != 0l
+           && (int64(get_time_usec(g_asr_recent[0].done_at)) > 30_000_000l || length(g_asr_recent) > 16)) {
+        delete g_asr_recent[0]
+        g_asr_recent |> erase(0)
     }
 }
 
@@ -1786,6 +1904,9 @@ class OpenAiServer : HvWebServer {
         }
         GET("/config") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_config_get(resp)
+        }
+        POST("/vad") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_vad(req, resp)
         }
         POST("/config") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_config_save(req, resp)

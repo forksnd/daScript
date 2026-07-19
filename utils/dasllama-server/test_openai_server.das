@@ -354,6 +354,7 @@ def test_openai_server(t : T?) {
                     t |> success(cache_rows > 0l, "prefix-cache chains surfaced")
                     t |> success(cache_hit, "a cache chain records its hit")
                     t |> success(cache_preview, "a cache chain carries a detokenized preview")
+                    t |> success(js?["asr"] != null && ((js?["asr"]).value is _array), "asr job array present (empty without --asr)")
                     unsafe {
                         delete js
                     }
@@ -370,6 +371,7 @@ def test_openai_server(t : T?) {
                     t |> success((js?["kv_bytes"] ?? 0l) > 0l, "kv pool bytes reported")
                     t |> success((js?["ttft_avg_ms"] ?? 0.0lf) > 0.0lf, "ttft aggregate reported")
                     t |> success(!empty(string(js?["hardware"] ?? "")), "hardware line composed")
+                    t |> equal(js?["asr_done_jobs"] ?? -1l, 0l)
                     unsafe {
                         delete js
                     }
