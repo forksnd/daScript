@@ -2072,7 +2072,14 @@ def private metal_blob_off_ok(off : int64; fmt : KqFmt) : bool {
 
 def private metal_blob_layout_ok(t : Model) : bool {
     let c = t.config
-    if (int64(length(t.wq_offs)) < c.n_layers || int64(length(t.w1_offs)) < c.n_layers) {
+    if (int64(length(t.wq_offs)) < c.n_layers) {
+        return false
+    }
+    // a pure-MoE file (qwen3moe) carries no dense FFN arrays — its expert stacks bind instead
+    let has_ffn = int64(length(t.w1_offs)) >= c.n_layers
+    let has_exps = (c.moe && int64(length(t.we1_offs)) >= c.n_layers &&
+        int64(length(t.we2_offs)) >= c.n_layers && int64(length(t.we3_offs)) >= c.n_layers)
+    if (!has_ffn && !has_exps) {
         return false
     }
     for (l in range64(c.n_layers)) {
@@ -2080,9 +2087,12 @@ def private metal_blob_layout_ok(t : Model) : bool {
                 !metal_blob_off_ok(t.wk_offs[l], metal_blob_fmt_at(t.wk_fmt, l)) ||
                 !metal_blob_off_ok(t.wv_offs[l], metal_blob_fmt_at(t.wv_fmt, l)) ||
                 !metal_blob_off_ok(t.wo_offs[l], metal_blob_fmt_at(t.wo_fmt, l)) ||
-                !metal_blob_off_ok(t.w1_offs[l], metal_blob_fmt_at(t.w1_fmt, l)) ||
-                !metal_blob_off_ok(t.w2_offs[l], metal_blob_fmt_at(t.w2_fmt, l)) ||
-                !metal_blob_off_ok(t.w3_offs[l], metal_blob_fmt_at(t.w3_fmt, l))) {
+                (has_ffn && (!metal_blob_off_ok(t.w1_offs[l], metal_blob_fmt_at(t.w1_fmt, l)) ||
+                    !metal_blob_off_ok(t.w2_offs[l], metal_blob_fmt_at(t.w2_fmt, l)) ||
+                    !metal_blob_off_ok(t.w3_offs[l], metal_blob_fmt_at(t.w3_fmt, l)))) ||
+                (has_exps && (!metal_blob_off_ok(t.we1_offs[l], metal_blob_fmt_at(t.we1_fmt, l)) ||
+                    !metal_blob_off_ok(t.we2_offs[l], metal_blob_fmt_at(t.we2_fmt, l)) ||
+                    !metal_blob_off_ok(t.we3_offs[l], metal_blob_fmt_at(t.we3_fmt, l))))) {
             return false
         }
     }
