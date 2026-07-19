@@ -22,10 +22,45 @@ int32_t colorKind(const Color & color) {
     return static_cast<int32_t>(color.kind);
 }
 
+bool refreshProcessStatus(TerminalHandle & terminal) {
+    if (terminal.process_exited) return true;
+    if (!terminal.process) {
+        if (terminal.transport_error.empty())
+            terminal.transport_error = "terminal has no PTY process";
+        return false;
+    }
+    std::string error;
+    uint32_t exit_code = 0;
+    if (terminal.process->wait(0, exit_code, error)) {
+        terminal.process_exited = true;
+        terminal.process_exit_code = exit_code;
+        terminal.transport_error.clear();
+        return true;
+    }
+    if (!error.empty()) terminal.transport_error = error;
+    return false;
+}
+
 } // namespace
 
 das::smart_ptr<TerminalHandle> builtin_terminal_create(int32_t columns, int32_t rows) {
     return das::make_smart<TerminalHandle>(columns, rows);
+}
+
+das::smart_ptr<TerminalHandle> builtin_terminal_launch(
+    const char * command_line, int32_t command_count,
+    const char * working_directory, int32_t directory_count,
+    int32_t columns, int32_t rows) {
+    das::smart_ptr<TerminalHandle> terminal = das::make_smart<TerminalHandle>(columns, rows);
+    PtyProcessOptions options;
+    if (command_line && command_count > 0)
+        options.command_line.assign(command_line, static_cast<size_t>(command_count));
+    if (working_directory && directory_count > 0)
+        options.working_directory.assign(working_directory, static_cast<size_t>(directory_count));
+    options.columns = columns;
+    options.rows = rows;
+    terminal->process = launchPtyProcess(options, terminal->transport_error);
+    return terminal;
 }
 
 void builtin_terminal_feed(
@@ -36,7 +71,116 @@ void builtin_terminal_feed(
 
 void builtin_terminal_resize(
     const das::smart_ptr<TerminalHandle> & terminal, int32_t columns, int32_t rows) {
-    if (terminal) terminal->state.resize(columns, rows);
+    if (!terminal) return;
+    terminal->state.resize(columns, rows);
+    if (terminal->process) {
+        if (!terminal->process->resize(columns, rows, terminal->transport_error)) return;
+        terminal->transport_error.clear();
+    }
+}
+
+int32_t builtin_terminal_poll(
+    const das::smart_ptr<TerminalHandle> & terminal, int32_t maximum_bytes) {
+    if (!terminal) return static_cast<int32_t>(PtyReadStatus::error);
+    if (!terminal->process) {
+        if (terminal->transport_error.empty())
+            terminal->transport_error = "terminal has no PTY process";
+        return static_cast<int32_t>(PtyReadStatus::error);
+    }
+    terminal->transport_error.clear();
+    std::string bytes;
+    const PtyReadStatus status = terminal->process->read(
+        bytes, terminal->transport_error,
+        static_cast<size_t>(std::max(1, maximum_bytes)));
+    if (status != PtyReadStatus::data) return static_cast<int32_t>(status);
+    terminal->state.feed(bytes);
+    const std::vector<std::string> replies = terminal->state.drainReplies();
+    for (const std::string & reply : replies) {
+        if (!terminal->process->write(reply, terminal->transport_error))
+            return static_cast<int32_t>(PtyReadStatus::error);
+    }
+    terminal->transport_error.clear();
+    return static_cast<int32_t>(status);
+}
+
+bool builtin_terminal_write(
+    const das::smart_ptr<TerminalHandle> & terminal, const char * bytes, int32_t count) {
+    if (!terminal) return false;
+    if (!terminal->process) {
+        if (terminal->transport_error.empty())
+            terminal->transport_error = "terminal has no PTY process";
+        return false;
+    }
+    if (count < 0 || (!bytes && count)) {
+        terminal->transport_error = "terminal input bytes are invalid";
+        return false;
+    }
+    if (!terminal->process->write(
+            reinterpret_cast<const uint8_t *>(bytes), static_cast<size_t>(count),
+            terminal->transport_error)) return false;
+    terminal->transport_error.clear();
+    return true;
+}
+
+int32_t builtin_terminal_process_id(const das::smart_ptr<TerminalHandle> & terminal) {
+    return terminal && terminal->process
+        ? static_cast<int32_t>(terminal->process->processId()) : 0;
+}
+
+bool builtin_terminal_process_exited(const das::smart_ptr<TerminalHandle> & terminal) {
+    return terminal && refreshProcessStatus(*terminal);
+}
+
+int64_t builtin_terminal_exit_code(const das::smart_ptr<TerminalHandle> & terminal) {
+    if (!terminal || !refreshProcessStatus(*terminal)) return -1;
+    return static_cast<int64_t>(terminal->process_exit_code);
+}
+
+bool builtin_terminal_terminate(
+    const das::smart_ptr<TerminalHandle> & terminal, int32_t exit_code) {
+    if (!terminal) return false;
+    if (!terminal->process) {
+        if (terminal->transport_error.empty())
+            terminal->transport_error = "terminal has no PTY process";
+        return false;
+    }
+    if (refreshProcessStatus(*terminal)) return true;
+    terminal->transport_error.clear();
+    if (!terminal->process->terminate(static_cast<uint32_t>(exit_code),
+                                      terminal->transport_error)) return false;
+    refreshProcessStatus(*terminal);
+    return true;
+}
+
+char * builtin_terminal_transport_error(
+    const das::smart_ptr<TerminalHandle> & terminal,
+    das::Context * context, das::LineInfoArg * at) {
+    const std::string value = terminal ? terminal->transport_error : std::string();
+    return context->allocateString(value.data(), value.size(), at);
+}
+
+char * builtin_terminal_encode_key(
+    const das::smart_ptr<TerminalHandle> & terminal, int32_t key,
+    const char * text, int32_t count, bool shift, bool alt, bool control,
+    das::Context * context, das::LineInfoArg * at) {
+    std::string value;
+    if (terminal && key >= static_cast<int32_t>(Key::text) &&
+        key <= static_cast<int32_t>(Key::f12)) {
+        const std::string key_text = text && count > 0
+            ? std::string(text, static_cast<size_t>(count)) : std::string();
+        value = terminal->state.encodeKey(KeyEvent(
+            static_cast<Key>(key), key_text, shift, alt, control));
+    }
+    return context->allocateString(value.data(), value.size(), at);
+}
+
+char * builtin_terminal_encode_paste(
+    const das::smart_ptr<TerminalHandle> & terminal, const char * text, int32_t count,
+    das::Context * context, das::LineInfoArg * at) {
+    const std::string paste = text && count > 0
+        ? std::string(text, static_cast<size_t>(count)) : std::string();
+    const std::string value = terminal ? terminal->state.encodePaste(paste) : std::string();
+    return context->allocateString(value.data(), value.size(), at);
 }
 
 int32_t builtin_terminal_columns(const das::smart_ptr<TerminalHandle> & terminal) {
@@ -175,12 +319,48 @@ public:
         addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_create)>(*this, lib,
             "_terminal_create", SideEffects::modifyExternal,
             "das_terminal::builtin_terminal_create")->args({"columns", "rows"});
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_launch)>(*this, lib,
+            "_terminal_launch", SideEffects::modifyExternal,
+            "das_terminal::builtin_terminal_launch")
+                ->args({"command_line", "command_count", "working_directory",
+                    "directory_count", "columns", "rows"});
         addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_feed)>(*this, lib,
             "_terminal_feed", SideEffects::modifyArgument,
             "das_terminal::builtin_terminal_feed")->args({"terminal", "bytes", "count"});
         addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_resize)>(*this, lib,
             "_terminal_resize", SideEffects::modifyArgument,
             "das_terminal::builtin_terminal_resize")->args({"terminal", "columns", "rows"});
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_poll)>(*this, lib,
+            "_terminal_poll", SideEffects::modifyArgument,
+            "das_terminal::builtin_terminal_poll")->args({"terminal", "maximum_bytes"});
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_write)>(*this, lib,
+            "_terminal_write", SideEffects::modifyArgument,
+            "das_terminal::builtin_terminal_write")->args({"terminal", "bytes", "count"});
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_process_id)>(*this, lib,
+            "_terminal_process_id", SideEffects::none,
+            "das_terminal::builtin_terminal_process_id")->arg("terminal");
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_process_exited)>(*this, lib,
+            "_terminal_process_exited", SideEffects::modifyArgument,
+            "das_terminal::builtin_terminal_process_exited")->arg("terminal");
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_exit_code)>(*this, lib,
+            "_terminal_exit_code", SideEffects::modifyArgument,
+            "das_terminal::builtin_terminal_exit_code")->arg("terminal");
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_terminate)>(*this, lib,
+            "_terminal_terminate", SideEffects::modifyArgument,
+            "das_terminal::builtin_terminal_terminate")->args({"terminal", "exit_code"});
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_transport_error)>(*this, lib,
+            "_terminal_transport_error", SideEffects::modifyExternal,
+            "das_terminal::builtin_terminal_transport_error")
+                ->args({"terminal", "context", "at"});
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_encode_key)>(*this, lib,
+            "_terminal_encode_key", SideEffects::modifyExternal,
+            "das_terminal::builtin_terminal_encode_key")
+                ->args({"terminal", "key", "text", "count", "shift", "alt", "control",
+                    "context", "at"});
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_encode_paste)>(*this, lib,
+            "_terminal_encode_paste", SideEffects::modifyExternal,
+            "das_terminal::builtin_terminal_encode_paste")
+                ->args({"terminal", "text", "count", "context", "at"});
         addExtern<DAS_BIND_FUN(das_terminal::builtin_terminal_columns)>(*this, lib,
             "_terminal_columns", SideEffects::none,
             "das_terminal::builtin_terminal_columns")->arg("terminal");

@@ -198,7 +198,8 @@ The canonical test surface is:
 create(columns, rows)
 feed(bytes)
 resize(columns, rows)
-send_key(event)
+encode_key(event)
+encode_paste(text)
 send_mouse(event)
 snapshot()
 drain_replies()
@@ -207,14 +208,21 @@ take_events()
 
 The first implementation already covers create/feed/resize/snapshot/replies/
 events and tests one-shot, byte-at-a-time, and seeded random chunk equivalence.
-Key and mouse encoding join the contract with the ConPTY slice.
+The semantic table pins the selected Core cursor, erase, and SGR controls,
+including wide-cell invariants when erasing or overwriting a continuation cell.
+Normalized key and paste encoding is mode-sensitive and covered in both C++ and
+daScript. Mouse encoding joins the contract with the renderer/ConPTY slice.
 
-### T1: local interactive terminal
+### T1: local interactive terminal (in progress)
 
-- Launch PowerShell through ConPTY on Windows.
-- Render it through the dasImgui terminal view.
+- Launch PowerShell through ConPTY on Windows. (implemented and covered by a
+  semantic-handshake process test; `pwsh` is preferred with Windows PowerShell
+  fallback)
+- Render it through the dasImgui terminal view. (implemented as
+  `imgui/imgui_terminal` with a runnable headless/windowed PowerShell example)
 - Support typing, paste, resize, selection, clipboard, colors, cursor, and
-  scrollback.
+  scrollback. (first interactive slice implemented; deterministic interaction
+  tests and terminal-specific selection polish remain)
 - Run a full-screen agent TUI rather than validating only line-oriented shells.
 
 ### T2: attach and detach
@@ -273,15 +281,13 @@ Key and mouse encoding join the contract with the ConPTY slice.
 
 ## Immediate next step
 
-Finish T0, then enter T1 through the process boundary:
+Continue T1 from the working local terminal:
 
-1. expand the semantic table through the selected Core cursor/erase/SGR probes;
-2. add normalized key and paste encoding plus reply routing;
-3. implement the Windows ConPTY transport behind a platform-neutral session
-   interface;
-4. prove a deterministic `pwsh -NoLogo -NoProfile` process test using semantic
-   waits;
-5. render the live snapshot in the dasImgui embedded-terminal example.
+1. add deterministic headless interaction tests for resize, focus, typing,
+   paste, scrollback, selection, and clipboard;
+2. run a full-screen agent TUI through the embedded-terminal example;
+3. close the emulator gaps that TUI exposes, then pin them as semantic tests;
+4. move PTY/emulator ownership into the first detachable session host.
 
 ## Decision log
 
@@ -296,3 +302,9 @@ Finish T0, then enter T1 through the process boundary:
 - 2026-07-18: Start T0 with an in-tree C++11 state machine behind a replaceable
   canonical snapshot API; reconsider a library when measured coverage demands
   it.
+- 2026-07-18: Keep the first live daScript adapter thin: one terminal handle
+  pumps a separately implemented PTY into the emulator and automatically routes
+  terminal replies, while exposing process status and explicit termination.
+- 2026-07-18: Land the first dasImgui terminal view with snapshot-owned cell
+  geometry, semantic input encoding, scrollback, and clipboard selection before
+  introducing the detachable host boundary.

@@ -5,11 +5,16 @@
 #include "daScript/simulate/simulate.h"
 
 #include "terminal.h"
+#include "pty.h"
 
 namespace das_terminal {
 
 struct TerminalHandle : das::ptr_ref_count {
     Terminal state;
+    std::unique_ptr<PtyProcess> process;
+    std::string transport_error;
+    bool process_exited = false;
+    uint32_t process_exit_code = 0;
 
     TerminalHandle(int columns, int rows) : state(columns, rows) {}
 };
@@ -21,10 +26,33 @@ using CellBlock = das::TBlock<void,
     das::TTemporary<const char *>>;
 
 das::smart_ptr<TerminalHandle> builtin_terminal_create(int32_t columns, int32_t rows);
+das::smart_ptr<TerminalHandle> builtin_terminal_launch(
+    const char * command_line, int32_t command_count,
+    const char * working_directory, int32_t directory_count,
+    int32_t columns, int32_t rows);
 void builtin_terminal_feed(
     const das::smart_ptr<TerminalHandle> & terminal, const char * bytes, int32_t count);
 void builtin_terminal_resize(
     const das::smart_ptr<TerminalHandle> & terminal, int32_t columns, int32_t rows);
+int32_t builtin_terminal_poll(
+    const das::smart_ptr<TerminalHandle> & terminal, int32_t maximum_bytes);
+bool builtin_terminal_write(
+    const das::smart_ptr<TerminalHandle> & terminal, const char * bytes, int32_t count);
+int32_t builtin_terminal_process_id(const das::smart_ptr<TerminalHandle> & terminal);
+bool builtin_terminal_process_exited(const das::smart_ptr<TerminalHandle> & terminal);
+int64_t builtin_terminal_exit_code(const das::smart_ptr<TerminalHandle> & terminal);
+bool builtin_terminal_terminate(
+    const das::smart_ptr<TerminalHandle> & terminal, int32_t exit_code);
+char * builtin_terminal_transport_error(
+    const das::smart_ptr<TerminalHandle> & terminal,
+    das::Context * context, das::LineInfoArg * at);
+char * builtin_terminal_encode_key(
+    const das::smart_ptr<TerminalHandle> & terminal, int32_t key,
+    const char * text, int32_t count, bool shift, bool alt, bool control,
+    das::Context * context, das::LineInfoArg * at);
+char * builtin_terminal_encode_paste(
+    const das::smart_ptr<TerminalHandle> & terminal, const char * text, int32_t count,
+    das::Context * context, das::LineInfoArg * at);
 int32_t builtin_terminal_columns(const das::smart_ptr<TerminalHandle> & terminal);
 int32_t builtin_terminal_rows(const das::smart_ptr<TerminalHandle> & terminal);
 bool builtin_terminal_alternate_active(const das::smart_ptr<TerminalHandle> & terminal);

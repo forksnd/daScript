@@ -12,6 +12,51 @@ enum public TerminalColorKind {
     rgb
 }
 
+enum public TerminalKey {
+    text
+    enter
+    tab
+    backspace
+    escape
+    up
+    down
+    right
+    left
+    home
+    end
+    insert
+    delete_key
+    page_up
+    page_down
+    f1
+    f2
+    f3
+    f4
+    f5
+    f6
+    f7
+    f8
+    f9
+    f10
+    f11
+    f12
+}
+
+enum public TerminalPollStatus {
+    data
+    idle
+    closed
+    error
+}
+
+struct public TerminalKeyEvent {
+    key : TerminalKey = TerminalKey.text
+    text : string
+    shift : bool
+    alt : bool
+    control : bool
+}
+
 struct public TerminalColor {
     kind : TerminalColorKind = TerminalColorKind.default_color
     index : int
@@ -74,12 +119,77 @@ def public terminal_create(columns : int = 80; rows : int = 25) : Terminal {
     return <- _terminal_create(columns, rows)
 }
 
+def public terminal_launch(command_line : string;
+                           working_directory : string = "";
+                           columns : int = 80; rows : int = 25) : Terminal {
+    return <- _terminal_launch(
+        command_line, length(command_line),
+        working_directory, length(working_directory),
+        columns, rows)
+}
+
 def public terminal_feed(terminal : Terminal const; bytes : string) {
     _terminal_feed(terminal, bytes, length(bytes))
 }
 
 def public terminal_resize(terminal : Terminal const; columns, rows : int) {
     _terminal_resize(terminal, columns, rows)
+}
+
+def public terminal_poll(terminal : Terminal const;
+                         maximum_bytes : int = 64 * 1024) : TerminalPollStatus {
+    return unsafe(reinterpret<TerminalPollStatus>(
+        _terminal_poll(terminal, maximum_bytes)))
+}
+
+def public terminal_write(terminal : Terminal const; bytes : string) : bool {
+    return _terminal_write(terminal, bytes, length(bytes))
+}
+
+def public terminal_process_id(terminal : Terminal const) : int {
+    return _terminal_process_id(terminal)
+}
+
+def public terminal_process_exited(terminal : Terminal const) : bool {
+    return _terminal_process_exited(terminal)
+}
+
+//! Returns ``-1`` while the root process is still running or status cannot be read.
+def public terminal_exit_code(terminal : Terminal const) : int64 {
+    return _terminal_exit_code(terminal)
+}
+
+def public terminal_terminate(terminal : Terminal const; exit_code : int = 1) : bool {
+    return _terminal_terminate(terminal, exit_code)
+}
+
+def public terminal_transport_error(terminal : Terminal const) : string {
+    return _terminal_transport_error(terminal)
+}
+
+def public terminal_encode_key(terminal : Terminal const;
+                               event : TerminalKeyEvent const) : string {
+    return _terminal_encode_key(
+        terminal,
+        unsafe(reinterpret<int>(event.key)),
+        event.text,
+        length(event.text),
+        event.shift,
+        event.alt,
+        event.control)
+}
+
+def public terminal_encode_paste(terminal : Terminal const; text : string) : string {
+    return _terminal_encode_paste(terminal, text, length(text))
+}
+
+def public terminal_send_key(terminal : Terminal const;
+                             event : TerminalKeyEvent const) : bool {
+    return terminal_write(terminal, terminal_encode_key(terminal, event))
+}
+
+def public terminal_send_paste(terminal : Terminal const; text : string) : bool {
+    return terminal_write(terminal, terminal_encode_paste(terminal, text))
 }
 
 def private collect_cells(terminal : Terminal const; screen : int; scrollback : bool;

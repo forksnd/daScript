@@ -98,6 +98,46 @@ Color rgbColor(int red, int green, int blue) {
     return color;
 }
 
+int keyModifierParameter(const KeyEvent & event) {
+    return 1 + (event.shift ? 1 : 0) + (event.alt ? 2 : 0) + (event.control ? 4 : 0);
+}
+
+std::string csiKey(char final_byte, int modifier) {
+    std::ostringstream result;
+    result << "\x1b[1;" << modifier << final_byte;
+    return result.str();
+}
+
+std::string tildeKey(int code, int modifier) {
+    std::ostringstream result;
+    result << "\x1b[" << code;
+    if (modifier != 1) result << ';' << modifier;
+    result << '~';
+    return result.str();
+}
+
+std::string altPrefix(const std::string & bytes, bool alt) {
+    return alt && !bytes.empty() ? std::string("\x1b") + bytes : bytes;
+}
+
+std::string controlText(const std::string & text) {
+    if (text.size() != 1) return text;
+    const unsigned char value = static_cast<unsigned char>(text[0]);
+    if (value >= 'a' && value <= 'z') return std::string(1, static_cast<char>(value - 'a' + 1));
+    if (value >= 'A' && value <= 'Z') return std::string(1, static_cast<char>(value - 'A' + 1));
+    switch (value) {
+    case ' ':
+    case '@': return std::string(1, '\0');
+    case '[': return std::string(1, '\x1b');
+    case '\\': return std::string(1, '\x1c');
+    case ']': return std::string(1, '\x1d');
+    case '^': return std::string(1, '\x1e');
+    case '_': return std::string(1, '\x1f');
+    case '?': return std::string(1, '\x7f');
+    default: return text;
+    }
+}
+
 } // namespace
 
 bool Color::operator==(const Color & other) const {
@@ -338,7 +378,9 @@ void Terminal::processCsi(uint8_t final_byte) {
     case 'J': eraseDisplay(parameters[0] < 0 ? 0 : parameters[0]); break;
     case 'K': eraseLine(parameters[0] < 0 ? 0 : parameters[0]); break;
     case 'X': eraseCells(first); break;
+    case 'a': buffer.cursor.column = std::min(columns_ - 1, buffer.cursor.column + first); break;
     case 'd': setCursor(first - 1, buffer.cursor.column); break;
+    case 'e': buffer.cursor.row = std::min(rows_ - 1, buffer.cursor.row + first); break;
     case 'm': selectGraphicRendition(parameters); break;
     case 'n':
         if (private_marker == 0 && parameters[0] == 5) replies_.push_back("\x1b[0n");
@@ -413,6 +455,8 @@ void Terminal::putGrapheme(const std::string & grapheme, int width, bool combini
     }
     const int row = buffer.cursor.row;
     const int column = buffer.cursor.column;
+    clearCell(buffer, row, column);
+    if (width == 2 && column + 1 < columns_) clearCell(buffer, row, column + 1);
     Cell cell = buffer.pen;
     cell.grapheme = grapheme;
     cell.width = static_cast<uint8_t>(width);
@@ -486,18 +530,31 @@ void Terminal::eraseDisplay(int mode) {
 
 void Terminal::eraseLine(int mode) {
     Buffer & buffer = activeBuffer();
-    std::vector<Cell> & row = buffer.rows[static_cast<size_t>(buffer.cursor.row)];
     int first = mode == 0 ? buffer.cursor.column : 0;
     int last = mode == 1 ? buffer.cursor.column : columns_ - 1;
     if (mode == 2) { first = 0; last = columns_ - 1; }
-    for (int column = first; column <= last; ++column) row[static_cast<size_t>(column)] = blankCell();
+    for (int column = first; column <= last; ++column)
+        clearCell(buffer, buffer.cursor.row, column);
 }
 
 void Terminal::eraseCells(int count) {
     Buffer & buffer = activeBuffer();
-    std::vector<Cell> & row = buffer.rows[static_cast<size_t>(buffer.cursor.row)];
     const int last = std::min(columns_, buffer.cursor.column + std::max(1, count));
-    for (int column = buffer.cursor.column; column < last; ++column) row[static_cast<size_t>(column)] = blankCell();
+    for (int column = buffer.cursor.column; column < last; ++column)
+        clearCell(buffer, buffer.cursor.row, column);
+}
+
+void Terminal::clearCell(Buffer & buffer, int row, int column) {
+    if (row < 0 || row >= rows_ || column < 0 || column >= columns_) return;
+    std::vector<Cell> & cells = buffer.rows[static_cast<size_t>(row)];
+    int first = column;
+    while (first > 0 && cells[static_cast<size_t>(first)].width == 0) --first;
+    if (cells[static_cast<size_t>(first)].width == 2 && first + 1 >= column) {
+        cells[static_cast<size_t>(first)] = blankCell();
+        if (first + 1 < columns_) cells[static_cast<size_t>(first + 1)] = blankCell();
+    } else {
+        cells[static_cast<size_t>(column)] = blankCell();
+    }
 }
 
 void Terminal::setCursor(int row, int column) {
@@ -548,9 +605,11 @@ void Terminal::selectGraphicRendition(const std::vector<int> & parameters) {
         case 3: pen.attributes |= attr_italic; break;
         case 4: pen.attributes |= attr_underline; break;
         case 5: pen.attributes |= attr_blink; break;
+        case 6: pen.attributes |= attr_blink; break;
         case 7: pen.attributes |= attr_inverse; break;
         case 8: pen.attributes |= attr_hidden; break;
         case 9: pen.attributes |= attr_strike; break;
+        case 21: pen.attributes |= attr_underline; break;
         case 22: pen.attributes &= static_cast<uint16_t>(~(attr_bold | attr_faint)); break;
         case 23: pen.attributes &= static_cast<uint16_t>(~attr_italic); break;
         case 24: pen.attributes &= static_cast<uint16_t>(~attr_underline); break;
@@ -600,6 +659,60 @@ void Terminal::resize(int columns, int rows) {
         buffer.saved_cursor.column = std::min(buffer.saved_cursor.column, columns_ - 1);
         buffer.wrap_pending = false;
     }
+}
+
+std::string Terminal::encodeKey(const KeyEvent & event) const {
+    const int modifier = keyModifierParameter(event);
+    switch (event.key) {
+    case Key::text:
+        return altPrefix(event.control ? controlText(event.text) : event.text, event.alt);
+    case Key::enter: return altPrefix("\r", event.alt);
+    case Key::tab:
+        if (event.shift) return event.alt
+            ? std::string("\x1b\x1b[Z") : std::string("\x1b[Z");
+        return altPrefix("\t", event.alt);
+    case Key::backspace: return altPrefix("\x7f", event.alt);
+    case Key::escape: return altPrefix("\x1b", event.alt);
+    case Key::up:
+    case Key::down:
+    case Key::right:
+    case Key::left:
+    case Key::home:
+    case Key::end: {
+        const char finals[] = {'A', 'B', 'C', 'D', 'H', 'F'};
+        const size_t index = static_cast<size_t>(event.key) - static_cast<size_t>(Key::up);
+        const char final_byte = finals[index];
+        if (modifier != 1) return csiKey(final_byte, modifier);
+        return std::string(modes_.application_cursor_keys ? "\x1bO" : "\x1b[") + final_byte;
+    }
+    case Key::insert: return tildeKey(2, modifier);
+    case Key::delete_key: return tildeKey(3, modifier);
+    case Key::page_up: return tildeKey(5, modifier);
+    case Key::page_down: return tildeKey(6, modifier);
+    case Key::f1:
+    case Key::f2:
+    case Key::f3:
+    case Key::f4: {
+        const char final_byte = static_cast<char>('P' +
+            static_cast<int>(event.key) - static_cast<int>(Key::f1));
+        if (modifier != 1) return csiKey(final_byte, modifier);
+        return std::string("\x1bO") + final_byte;
+    }
+    case Key::f5: return tildeKey(15, modifier);
+    case Key::f6: return tildeKey(17, modifier);
+    case Key::f7: return tildeKey(18, modifier);
+    case Key::f8: return tildeKey(19, modifier);
+    case Key::f9: return tildeKey(20, modifier);
+    case Key::f10: return tildeKey(21, modifier);
+    case Key::f11: return tildeKey(23, modifier);
+    case Key::f12: return tildeKey(24, modifier);
+    }
+    return std::string();
+}
+
+std::string Terminal::encodePaste(const std::string & text) const {
+    if (!modes_.bracketed_paste) return text;
+    return std::string("\x1b[200~") + text + "\x1b[201~";
 }
 
 Snapshot Terminal::snapshot() const {

@@ -1,14 +1,22 @@
 #include <doctest/doctest.h>
 
 #include "../../modules/dasTerminal/src/terminal.h"
+#include "../../modules/dasTerminal/src/pty.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using das_terminal::Snapshot;
+using das_terminal::Key;
+using das_terminal::KeyEvent;
+using das_terminal::PtyProcess;
+using das_terminal::PtyProcessOptions;
+using das_terminal::PtyReadStatus;
 using das_terminal::Terminal;
 
 namespace {
@@ -24,8 +32,9 @@ std::string rowText(const Snapshot & snapshot, int row, bool alternate = false) 
     return result;
 }
 
-Snapshot feedInChunks(const std::string & bytes, const std::vector<size_t> & chunks) {
-    Terminal terminal(12, 4);
+Snapshot feedInChunks(const std::string & bytes, const std::vector<size_t> & chunks,
+                      int columns = 12, int rows = 4) {
+    Terminal terminal(columns, rows);
     size_t offset = 0;
     for (size_t chunk : chunks) {
         const size_t count = std::min(chunk, bytes.size() - offset);
@@ -37,6 +46,102 @@ Snapshot feedInChunks(const std::string & bytes, const std::vector<size_t> & chu
         terminal.feed(reinterpret_cast<const uint8_t *>(bytes.data() + offset), bytes.size() - offset);
     return terminal.snapshot();
 }
+
+struct SemanticCase {
+    const char * name;
+    int columns;
+    int rows;
+    std::string bytes;
+    std::vector<std::string> expected_rows;
+    int cursor_row;
+    int cursor_column;
+};
+
+void checkSemanticCase(const SemanticCase & test) {
+    CAPTURE(test.name);
+    const Snapshot expected = feedInChunks(test.bytes, {test.bytes.size()}, test.columns, test.rows);
+    REQUIRE(expected.normal.rows.size() == test.expected_rows.size());
+    for (size_t row = 0; row != test.expected_rows.size(); ++row)
+        CHECK(rowText(expected, static_cast<int>(row)) == test.expected_rows[row]);
+    CHECK(expected.normal.cursor.row == test.cursor_row);
+    CHECK(expected.normal.cursor.column == test.cursor_column);
+    CHECK(expected.unknown_sequences.empty());
+
+    CHECK(feedInChunks(test.bytes, std::vector<size_t>(test.bytes.size(), 1),
+                       test.columns, test.rows) == expected);
+
+    std::mt19937 random(0x5eedu);
+    for (int run = 0; run != 20; ++run) {
+        std::vector<size_t> chunks;
+        size_t remaining = test.bytes.size();
+        while (remaining) {
+            const size_t chunk = std::min<size_t>(remaining, 1u + random() % 7u);
+            chunks.push_back(chunk);
+            remaining -= chunk;
+        }
+        CHECK(feedInChunks(test.bytes, chunks, test.columns, test.rows) == expected);
+    }
+}
+
+bool snapshotContains(const Snapshot & snapshot, const std::string & needle) {
+    std::string text;
+    const auto append_rows = [&text](const std::vector<std::vector<das_terminal::Cell>> & rows) {
+        for (const auto & row : rows) {
+            for (const auto & cell : row)
+                if (cell.width != 0) text += cell.grapheme;
+            text.push_back('\n');
+        }
+    };
+    append_rows(snapshot.normal.scrollback);
+    append_rows(snapshot.normal.rows);
+    append_rows(snapshot.alternate.scrollback);
+    append_rows(snapshot.alternate.rows);
+    return text.find(needle) != std::string::npos;
+}
+
+bool waitForTerminalText(PtyProcess & process, Terminal & terminal,
+                         const std::string & needle, uint32_t timeout_ms,
+                         std::string & error) {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::string bytes;
+        const PtyReadStatus status = process.read(bytes, error);
+        if (status == PtyReadStatus::data) {
+            terminal.feed(bytes);
+            if (snapshotContains(terminal.snapshot(), needle)) return true;
+            continue;
+        }
+        if (status == PtyReadStatus::error) return false;
+        if (status == PtyReadStatus::closed) {
+            if (snapshotContains(terminal.snapshot(), needle)) return true;
+            error = "ConPTY closed before terminal snapshot contained '" + needle + "'";
+            return false;
+        }
+        if (snapshotContains(terminal.snapshot(), needle)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    error = "timed out waiting for terminal snapshot to contain '" + needle + "'";
+    return false;
+}
+
+struct PtyProcessGuard {
+    explicit PtyProcessGuard(PtyProcess * value) : process(value) {}
+
+    ~PtyProcessGuard() {
+        if (!process) return;
+        uint32_t exit_code = 0;
+        std::string error;
+        if (!process->wait(0, exit_code, error)) {
+            error.clear();
+            process->terminate(99, error);
+            error.clear();
+            process->wait(5000, exit_code, error);
+        }
+    }
+
+    PtyProcess * process;
+};
 
 } // namespace
 
@@ -64,6 +169,46 @@ TEST_CASE("terminal: cursor movement and erase are semantic") {
     CHECK(snapshot.normal.cursor.column == 3);
 }
 
+TEST_CASE("terminal: Core cursor controls have exact chunk-invariant semantics") {
+    const std::vector<SemanticCase> cases = {
+        {"CUU defaults and clamps", 8, 4, "0\r\n1\r\n2\x1b[A\x1b[99A@",
+            {"0@", "1", "2", ""}, 0, 2},
+        {"CUD CUF and CUB clamp", 8, 4, "\x1b[2;2HA\x1b[99B\x1b[99C\x1b[2DB",
+            {"", " A", "", "     B"}, 3, 6},
+        {"CNL and CPL reset the column", 8, 4, "a\r\nb\x1b[Ec\x1b[Fd",
+            {"a", "d", "c", ""}, 1, 1},
+        {"CHA VPA and HVP are one-based", 8, 4, "\x1b[2;3HA\x1b[6GB\x1b[4dC",
+            {"", "  A  B", "", "      C"}, 3, 7},
+        {"HPR and VPR move relative and clamp", 8, 4, "\x1b[2;2H\x1b[3a\x1b[9eQ",
+            {"", "", "", "    Q"}, 3, 5},
+        {"CUP defaults home", 8, 4, "\x1b[4;8H!\x1b[H@",
+            {"@", "", "", "       !"}, 0, 1},
+    };
+    for (const SemanticCase & test : cases) checkSemanticCase(test);
+}
+
+TEST_CASE("terminal: Core erase controls have exact chunk-invariant semantics") {
+    const std::vector<SemanticCase> cases = {
+        {"EL erases through the end", 6, 3, "abcdef\x1b[1;3H\x1b[K",
+            {"ab", "", ""}, 0, 2},
+        {"EL 1 erases through the cursor", 6, 3, "abcdef\x1b[1;3H\x1b[1K",
+            {"   def", "", ""}, 0, 2},
+        {"EL 2 erases the whole line", 6, 3, "abcdef\x1b[1;3H\x1b[2K",
+            {"", "", ""}, 0, 2},
+        {"ED erases through the end", 6, 3, "abcdef\r\nghijkl\r\nmnopqr\x1b[2;3H\x1b[J",
+            {"abcdef", "gh", ""}, 1, 2},
+        {"ED 1 erases through the cursor", 6, 3, "abcdef\r\nghijkl\r\nmnopqr\x1b[2;3H\x1b[1J",
+            {"", "   jkl", "mnopqr"}, 1, 2},
+        {"ED 2 erases the display", 6, 3, "abcdef\r\nghijkl\r\nmnopqr\x1b[2;3H\x1b[2J",
+            {"", "", ""}, 1, 2},
+        {"ECH erases without moving", 6, 3, "abcdef\x1b[1;3H\x1b[2X",
+            {"ab  ef", "", ""}, 0, 2},
+        {"ECH preserves wide-cell invariants", 6, 3, "A\xe7\x95\x8c" "B\x1b[1;3H\x1b[X",
+            {"A  B", "", ""}, 0, 2},
+    };
+    for (const SemanticCase & test : cases) checkSemanticCase(test);
+}
+
 TEST_CASE("terminal: SGR snapshot preserves indexed, RGB, and attributes") {
     Terminal terminal(8, 2);
     terminal.feed("\x1b[1;31mA\x1b[38;2;1;2;3;48;5;200mB\x1b[0mC");
@@ -81,6 +226,48 @@ TEST_CASE("terminal: SGR snapshot preserves indexed, RGB, and attributes") {
     CHECK(row[1].background.index == 200);
     CHECK(row[2].attributes == das_terminal::attr_none);
     CHECK(row[2].foreground.kind == das_terminal::ColorKind::default_color);
+}
+
+TEST_CASE("terminal: Core SGR set and reset forms are explicit") {
+    struct SgrCase {
+        const char * name;
+        std::string bytes;
+        uint16_t attributes;
+        das_terminal::ColorKind foreground_kind;
+        int foreground_index;
+        das_terminal::ColorKind background_kind;
+        int background_index;
+    };
+    const uint16_t all_attributes = das_terminal::attr_bold | das_terminal::attr_faint |
+        das_terminal::attr_italic | das_terminal::attr_underline | das_terminal::attr_blink |
+        das_terminal::attr_inverse | das_terminal::attr_hidden | das_terminal::attr_strike;
+    const std::vector<SgrCase> cases = {
+        {"set attributes", "\x1b[1;2;3;4;5;7;8;9mX", all_attributes,
+            das_terminal::ColorKind::default_color, 0, das_terminal::ColorKind::default_color, 0},
+        {"rapid blink and double underline map to canonical flags", "\x1b[6;21mX",
+            das_terminal::attr_blink | das_terminal::attr_underline,
+            das_terminal::ColorKind::default_color, 0, das_terminal::ColorKind::default_color, 0},
+        {"reset attributes", "\x1b[1;2;3;4;5;7;8;9m\x1b[22;23;24;25;27;28;29mX",
+            das_terminal::attr_none, das_terminal::ColorKind::default_color, 0,
+            das_terminal::ColorKind::default_color, 0},
+        {"bright indexed colors", "\x1b[91;104mX", das_terminal::attr_none,
+            das_terminal::ColorKind::indexed, 9, das_terminal::ColorKind::indexed, 12},
+        {"default colors", "\x1b[31;44m\x1b[39;49mX", das_terminal::attr_none,
+            das_terminal::ColorKind::default_color, 0, das_terminal::ColorKind::default_color, 0},
+    };
+
+    for (const SgrCase & test : cases) {
+        CAPTURE(test.name);
+        const Snapshot expected = feedInChunks(test.bytes, {test.bytes.size()});
+        const auto & cell = expected.normal.rows[0][0];
+        CHECK(cell.attributes == test.attributes);
+        CHECK(cell.foreground.kind == test.foreground_kind);
+        CHECK(cell.foreground.index == test.foreground_index);
+        CHECK(cell.background.kind == test.background_kind);
+        CHECK(cell.background.index == test.background_index);
+        CHECK(expected.unknown_sequences.empty());
+        CHECK(feedInChunks(test.bytes, std::vector<size_t>(test.bytes.size(), 1)) == expected);
+    }
 }
 
 TEST_CASE("terminal: title, CWD, alternate screen, modes, and replies are observable") {
@@ -118,6 +305,19 @@ TEST_CASE("terminal: UTF-8 wide and combining cells are explicit") {
     CHECK(row[3].grapheme == "B");
 }
 
+TEST_CASE("terminal: overwriting a wide-cell continuation clears the whole grapheme") {
+    Terminal terminal(6, 2);
+    terminal.feed(std::string("A") + "\xe7\x95\x8c" + "B\x1b[1;3H@");
+    const Snapshot snapshot = terminal.snapshot();
+    const auto & row = snapshot.normal.rows[0];
+
+    CHECK(rowText(snapshot, 0) == "A @B");
+    CHECK(row[1].grapheme == " ");
+    CHECK(row[1].width == 1);
+    CHECK(row[2].grapheme == "@");
+    CHECK(row[2].width == 1);
+}
+
 TEST_CASE("terminal: parsing is invariant under arbitrary byte chunks") {
     const std::string stream =
         "hello\r\n\x1b[1;34mblue\x1b[0m \xe7\x95\x8c\r\n"
@@ -137,4 +337,102 @@ TEST_CASE("terminal: parsing is invariant under arbitrary byte chunks") {
         }
         CHECK(feedInChunks(stream, chunks) == expected);
     }
+}
+
+TEST_CASE("terminal: normalized key encoding follows VT modes and modifiers") {
+    struct KeyCase {
+        const char * name;
+        KeyEvent event;
+        std::string expected;
+    };
+    Terminal terminal(8, 2);
+    const std::vector<KeyCase> normal_cases = {
+        {"text", KeyEvent(Key::text, "x"), "x"},
+        {"Alt text", KeyEvent(Key::text, "x", false, true), "\x1bx"},
+        {"Control text", KeyEvent(Key::text, "c", false, false, true), "\x03"},
+        {"Control space", KeyEvent(Key::text, " ", false, false, true), std::string(1, '\0')},
+        {"Enter", KeyEvent(Key::enter), "\r"},
+        {"Alt Enter", KeyEvent(Key::enter, "", false, true), "\x1b\r"},
+        {"Shift Tab", KeyEvent(Key::tab, "", true), "\x1b[Z"},
+        {"Backspace", KeyEvent(Key::backspace), "\x7f"},
+        {"Up", KeyEvent(Key::up), "\x1b[A"},
+        {"Shift Left", KeyEvent(Key::left, "", true), "\x1b[1;2D"},
+        {"Control Alt Right", KeyEvent(Key::right, "", false, true, true), "\x1b[1;7C"},
+        {"Control Delete", KeyEvent(Key::delete_key, "", false, false, true), "\x1b[3;5~"},
+        {"F1", KeyEvent(Key::f1), "\x1bOP"},
+        {"Shift F4", KeyEvent(Key::f4, "", true), "\x1b[1;2S"},
+        {"Alt F12", KeyEvent(Key::f12, "", false, true), "\x1b[24;3~"},
+    };
+    for (const KeyCase & test : normal_cases) {
+        CAPTURE(test.name);
+        CHECK(terminal.encodeKey(test.event) == test.expected);
+    }
+
+    terminal.feed("\x1b[?1h");
+    CHECK(terminal.encodeKey(KeyEvent(Key::up)) == "\x1bOA");
+    CHECK(terminal.encodeKey(KeyEvent(Key::home)) == "\x1bOH");
+    CHECK(terminal.encodeKey(KeyEvent(Key::down, "", false, false, true)) == "\x1b[1;5B");
+    terminal.feed("\x1b[?1l");
+    CHECK(terminal.encodeKey(KeyEvent(Key::home)) == "\x1b[H");
+}
+
+TEST_CASE("terminal: paste encoding and terminal replies remain separate") {
+    Terminal terminal(8, 2);
+    const std::string paste = std::string("one\r\n") + "\xe7\x95\x8c";
+
+    CHECK(terminal.encodePaste(paste) == paste);
+    terminal.feed("\x1b[?2004h");
+    CHECK(terminal.encodePaste(paste) == std::string("\x1b[200~") + paste + "\x1b[201~");
+
+    terminal.feed("\x1b[5n");
+    CHECK(terminal.drainReplies() == std::vector<std::string>{"\x1b[0n"});
+    CHECK(terminal.drainReplies().empty());
+    CHECK(terminal.encodePaste(paste) == std::string("\x1b[200~") + paste + "\x1b[201~");
+
+    terminal.feed("\x1b[?2004l");
+    CHECK(terminal.encodePaste(paste) == paste);
+}
+
+TEST_CASE("terminal: ConPTY PowerShell process uses semantic handshakes") {
+#if defined(_WIN32)
+    PtyProcessOptions options;
+    options.columns = 40;
+    options.rows = 10;
+    const std::string arguments =
+        " -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass"
+        " -File \"modules/dasTerminal/tests/conpty_probe.ps1\"";
+    options.command_line = "pwsh.exe" + arguments;
+
+    std::string error;
+    std::unique_ptr<PtyProcess> process = das_terminal::launchPtyProcess(options, error);
+    if (!process) {
+        INFO("pwsh.exe unavailable, exercising the same fixture with Windows PowerShell: " << error);
+        error.clear();
+        options.command_line = "powershell.exe" + arguments;
+        process = das_terminal::launchPtyProcess(options, error);
+    }
+    INFO(error);
+    REQUIRE(process);
+    PtyProcessGuard guard{process.get()};
+    CHECK(process->processId() != 0);
+
+    Terminal terminal(options.columns, options.rows);
+    REQUIRE(waitForTerminalText(*process, terminal, "DASHERD_READY:", 10000, error));
+    INFO(error);
+
+    REQUIRE(process->resize(100, 30, error));
+    terminal.resize(100, 30);
+    REQUIRE(process->write(std::string("semantic-probe") +
+        terminal.encodeKey(KeyEvent(Key::enter)), error));
+    REQUIRE(waitForTerminalText(
+        *process, terminal, "DASHERD_ECHO:semantic-probe", 10000, error));
+    INFO(error);
+
+    uint32_t exit_code = 0;
+    REQUIRE(process->wait(10000, exit_code, error));
+    INFO(error);
+    CHECK(exit_code == 23);
+#else
+    MESSAGE("PTY transport is not implemented on this platform yet");
+#endif
 }

@@ -93,6 +93,49 @@ struct Snapshot {
     bool operator!=(const Snapshot & other) const { return !(*this == other); }
 };
 
+enum class Key : uint8_t {
+    text,
+    enter,
+    tab,
+    backspace,
+    escape,
+    up,
+    down,
+    right,
+    left,
+    home,
+    end,
+    insert,
+    delete_key,
+    page_up,
+    page_down,
+    f1,
+    f2,
+    f3,
+    f4,
+    f5,
+    f6,
+    f7,
+    f8,
+    f9,
+    f10,
+    f11,
+    f12,
+};
+
+struct KeyEvent {
+    Key key;
+    std::string text;
+    bool shift;
+    bool alt;
+    bool control;
+
+    explicit KeyEvent(Key code = Key::text, const std::string & value = std::string(),
+                      bool shift_down = false, bool alt_down = false,
+                      bool control_down = false)
+        : key(code), text(value), shift(shift_down), alt(alt_down), control(control_down) {}
+};
+
 class Terminal {
 public:
     Terminal(int columns, int rows);
@@ -105,6 +148,9 @@ public:
         feed(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size());
     }
     void resize(int columns, int rows);
+
+    std::string encodeKey(const KeyEvent & event) const;
+    std::string encodePaste(const std::string & text) const;
 
     Snapshot snapshot() const;
     std::vector<std::string> drainReplies();
@@ -135,6 +181,7 @@ private:
     void eraseDisplay(int mode);
     void eraseLine(int mode);
     void eraseCells(int count);
+    void clearCell(Buffer & buffer, int row, int column);
     void setCursor(int row, int column);
     void setPrivateMode(int mode, bool enabled);
     void selectGraphicRendition(const std::vector<int> & parameters);
