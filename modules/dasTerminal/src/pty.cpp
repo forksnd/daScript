@@ -108,9 +108,12 @@ private:
 
 ConPtyProcess::~ConPtyProcess() {
     closeHandle(input_write_);
+    // Close our read end before the synchronous pseudoconsole close. ConHost
+    // may still be flushing final output; leaving the reader open here can
+    // make ClosePseudoConsole wait forever when no thread is draining it.
+    closeHandle(output_read_);
     if (pseudo_console_) api_.close(pseudo_console_);
     pseudo_console_ = nullptr;
-    closeHandle(output_read_);
     closeHandle(process_);
 }
 

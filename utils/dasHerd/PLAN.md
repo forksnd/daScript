@@ -222,7 +222,9 @@ daScript. Mouse encoding joins the contract with the renderer/ConPTY slice.
   `imgui/imgui_terminal` with a runnable headless/windowed PowerShell example)
 - Support typing, paste, resize, selection, clipboard, colors, cursor, and
   scrollback. (first interactive slice implemented; deterministic interaction
-  tests and terminal-specific selection polish remain)
+  now covers measured resize, click-to-focus, synthesized typing, and semantic
+  screen output; paste/scrollback/selection/clipboard coverage and
+  terminal-specific selection polish remain)
 - Run a full-screen agent TUI rather than validating only line-oriented shells.
 
 ### T2: attach and detach
@@ -283,8 +285,8 @@ daScript. Mouse encoding joins the contract with the renderer/ConPTY slice.
 
 Continue T1 from the working local terminal:
 
-1. add deterministic headless interaction tests for resize, focus, typing,
-   paste, scrollback, selection, and clipboard;
+1. extend deterministic headless interaction tests from the landed
+   resize/focus/typing flow to paste, scrollback, selection, and clipboard;
 2. run a full-screen agent TUI through the embedded-terminal example;
 3. close the emulator gaps that TUI exposes, then pin them as semantic tests;
 4. move PTY/emulator ownership into the first detachable session host.
@@ -308,3 +310,6 @@ Continue T1 from the working local terminal:
 - 2026-07-18: Land the first dasImgui terminal view with snapshot-owned cell
   geometry, semantic input encoding, scrollback, and clipboard selection before
   introducing the detachable host boundary.
+- 2026-07-18: Gate terminal UI automation on observable geometry, focus,
+  input/content revisions, and semantic screen text; never use frame counts or
+  sleeps as interaction-success criteria.

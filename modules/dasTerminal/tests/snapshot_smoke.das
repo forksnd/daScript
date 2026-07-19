@@ -33,7 +33,8 @@ def main {
     // Failed launch remains an inspectable terminal handle instead of losing
     // the transport error at the native boundary.
     var inscope failed <- terminal_launch("")
-    assert(terminal_process_id(failed) == 0)
+    let process_id = terminal_process_id(failed)
+    assert(process_id == 0)
     let poll_status = terminal_poll(failed)
     let transport_error = terminal_transport_error(failed)
     let process_exited = terminal_process_exited(failed)
@@ -44,4 +45,9 @@ def main {
     assert(!process_exited)
     assert(exit_code == -1l)
     assert(!terminated)
+
+    terminal_dispose(failed)
+    terminal_dispose(state)
+    assert(failed == null)
+    assert(state == null)
 }

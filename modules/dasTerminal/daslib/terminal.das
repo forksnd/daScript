@@ -119,6 +119,10 @@ def public terminal_create(columns : int = 80; rows : int = 25) : Terminal {
     return <- _terminal_create(columns, rows)
 }
 
+def public terminal_dispose(var terminal : Terminal&) {
+    terminal := default<Terminal>
+}
+
 def public terminal_launch(command_line : string;
                            working_directory : string = "";
                            columns : int = 80; rows : int = 25) : Terminal {
