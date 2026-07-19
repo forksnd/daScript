@@ -5604,6 +5604,8 @@ var g_pso_moe_kq_k4 : MetalComputePipeline?
 var g_pso_moe_kq_k5 : MetalComputePipeline?
 var g_pso_moe_kq_k6 : MetalComputePipeline?
 var g_pso_moe_combine : MetalComputePipeline?  // weighted top-k reduce into the w2 write shape
+var g_pso_g4rnorm : MetalComputePipeline?      // gemma4 MoE router-input norm (stage 3)
+var g_pso_moe_wscale : MetalComputePipeline?   // gemma4 per-expert down-scale fold
 var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
 var g_pso_qkvrs32 : MetalComputePipeline?
 var g_pso_w13sw : MetalComputePipeline?
@@ -5721,6 +5723,8 @@ def metal_decode_init : bool {
     g_pso_moe_kq_k5 = compile_pso(metal_moe_gemv_k5_msl, metal_moe_gemv_k5_msl_entry, metal_moe_gemv_k5_msl_fastmath, ok)
     g_pso_moe_kq_k6 = compile_pso(metal_moe_gemv_k6_msl, metal_moe_gemv_k6_msl_entry, metal_moe_gemv_k6_msl_fastmath, ok)
     g_pso_moe_combine = compile_pso(metal_moe_combine_msl, metal_moe_combine_msl_entry, metal_moe_combine_msl_fastmath, ok)
+    g_pso_g4rnorm = compile_pso(metal_g4_router_norm_msl, metal_g4_router_norm_msl_entry, metal_g4_router_norm_msl_fastmath, ok)
+    g_pso_moe_wscale = compile_pso(metal_moe_wscale_msl, metal_moe_wscale_msl_entry, metal_moe_wscale_msl_fastmath, ok)
     g_pso_copy_row = compile_pso(metal_copy_row_msl, metal_copy_row_msl_entry, metal_copy_row_msl_fastmath, ok)
     g_pso_emb = compile_pso(metal_embed_q8_msl, metal_embed_q8_msl_entry, metal_embed_q8_msl_fastmath, ok)
     g_pso_emb_k6 = compile_pso(metal_embed_k6_msl, metal_embed_k6_msl_entry, metal_embed_k6_msl_fastmath, ok)
@@ -6199,6 +6203,29 @@ def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, 
         metal_set_buffer(enc, bbys, 0ul, 12)
         metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
     }
+}
+
+// gemma4 router-input norm: one tg per stream row (weightless rms * 1/sqrt(dim) * rscale)
+def enc_g4_router_norm(enc : MetalComputeEncoder?; bx, brs, by, bdim, beps, binvd : MetalBuffer?; nst : int64) {
+    metal_set_pipeline(enc, g_pso_g4rnorm)
+    metal_set_threadgroup_memory_length(enc, metal_g4_router_norm_msl_tgmem, 0)
+    metal_set_buffer(enc, bx, 0ul, 0)
+    metal_set_buffer(enc, brs, 0ul, 1)
+    metal_set_buffer(enc, by, 0ul, 2)
+    metal_set_buffer(enc, bdim, 0ul, 3)
+    metal_set_buffer(enc, beps, 0ul, 4)
+    metal_set_buffer(enc, binvd, 0ul, 5)
+    metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(256u, 1u, 1u))
+}
+
+// gemma4 per-expert down-scale fold: selw[row][j] *= ds[seli[row][j]]
+def enc_moe_wscale(enc : MetalComputeEncoder?; bsel, bds, bnk : MetalBuffer?; nst : int64) {
+    metal_set_pipeline(enc, g_pso_moe_wscale)
+    metal_set_buffer(enc, bsel, 0ul, 0)
+    metal_set_buffer(enc, bsel, 0ul, 1)
+    metal_set_buffer(enc, bds, 0ul, 2)
+    metal_set_buffer(enc, bnk, 0ul, 3)
+    metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
 }
 
 def enc_moe_combine(enc : MetalComputeEncoder?; bdn, bsel, by, bdim, bnk : MetalBuffer?; dim, nst : int64) {
@@ -6973,6 +7000,8 @@ def metal_kernels_release {
     release_pso(g_pso_moe_kq_k5)
     release_pso(g_pso_moe_kq_k6)
     release_pso(g_pso_moe_combine)
+    release_pso(g_pso_g4rnorm)
+    release_pso(g_pso_moe_wscale)
     if (g_pso_qkvrs16 != null) {
         metal_release(g_pso_qkvrs16)
         g_pso_qkvrs16 = null

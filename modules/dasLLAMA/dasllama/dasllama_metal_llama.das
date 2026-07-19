@@ -280,6 +280,8 @@ struct private StepRes {
     u_moe_eblk : MetalBuffer?  // q8 blocks per expert plane (ege / 32)
     u_moe_esb : MetalBuffer?   // kq superblocks per expert plane (ege / 256)
     u_moe_xs_dn : MetalBuffer? // the down site's per-slot x stride (nfe)
+    bmoe_rt : MetalBuffer?     // gemma4: router-input row, reused as the routed-branch acc
+    u_moe_invd : MetalBuffer?  // gemma4: 1/sqrt(dim) router scale
     bytes_moe_lg : uint64
     bytes_moe_dn : uint64
     bytes_supp : uint64
@@ -404,6 +406,10 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
         r.u_moe_eblk = uniform_u32(uint(ege / 32l))
         r.u_moe_esb = uniform_u32(uint(ege / 256l))
         r.u_moe_xs_dn = uniform_u32(uint(c.n_ff_exp))
+        if (c.moe_dense_shexp) {   // gemma4: router-input scratch + the 1/sqrt(dim) scale
+            r.bmoe_rt = pool_acquire(g_pool, g_dev, r.bytes_x)
+            r.u_moe_invd = uniform_f32(1.0 / sqrt(float(dim)))
+        }
     }
     // logits-on-GPU (default ON, DASLLAMA_METAL_LOGITS=0 pins the CPU classifier) mirrors the prefill gates
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
@@ -651,30 +657,69 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 enc_add_rms_site(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, dim)
             }
             if (r.moe) {
-                // router -> select -> expert gate/up -> swiglu(k rows) -> expert down -> combine
+                // router -> select -> experts -> combine; g4 = gemma4's parallel-dense form
                 let knfe = c.n_expert_used * c.n_ff_exp
+                let g4 = c.moe_dense_shexp
                 let fe1 = kq_fmt_at(t.we1_fmt, l)
                 let fe3 = kq_fmt_at(t.we3_fmt, l)
                 let fe2 = kq_fmt_at(t.we2_fmt, l)
+                var bmx = r.bxb   // expert input: plain = the rms_ffn norm-out; g4 = pre_ffn2
+                if (g4 && g_skip != "ew") {
+                    var bw_p2 = upload_region(addr < void? >(t.fblob[t.rms_pre_ffn2_off + l * dim]), uint64(dim * 4l))
+                    enc_rms(enc, r.bx, bw_p2, r.bxb2, r.u_dim, r.u_eps)
+                    bmx = r.bxb2
+                }
                 if (g_skip != "gemv") {
                     var bw_rt = upload_region(addr < void? >(t.fblob[t.router_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
-                    enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, c.n_expert, 1l)
+                    if (g4) {
+                        var bw_rs = upload_region(addr < void? >(t.fblob[t.moe_router_scale_off + l * dim]), uint64(dim * 4l))
+                        enc_g4_router_norm(enc, r.bx, bw_rs, r.bmoe_rt, r.u_dim, r.u_eps, r.u_moe_invd, 1l)
+                        enc_moe_router(enc, bw_rt, r.bmoe_rt, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, c.n_expert, 1l)
+                    } else {
+                        enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, c.n_expert, 1l)
+                    }
                     enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, 1l)
-                    enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, 1l, r.bxb, r.bh12,
+                    if (g4) {
+                        var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
+                        enc_moe_wscale(enc, r.bmoe_sel, bw_ds, r.u_moe_k, 1l)
+                    }
+                    enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
                         r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
                         r.u_zero32, r.u_zero32, r.u_zero32)
-                    enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, 1l, r.bxb, r.bh12,
+                    enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
                         r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
                         r.u_zero32, r.u_zero32, r.u_zero32, uint64(knfe * 4l))
                 }
                 if (g_skip != "ew") {
-                    enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(knfe * 4l), r.u_moe_knfe, knfe)
+                    enc_ew2(enc, g4 ? g_pso_geglu : g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(knfe * 4l), r.u_moe_knfe, knfe)
                 }
                 if (g_skip != "gemv") {
                     enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, 1l, r.bh12, r.bmoe_dn,
                         r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
                         r.u_zero32, r.u_zero32, r.u_zero32)
-                    enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, r.bxb, r.u_dim, r.u_moe_k, dim, 1l)
+                    enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, g4 ? r.bmoe_rt : r.bxb, r.u_dim, r.u_moe_k, dim, 1l)
+                }
+                if (g4) {
+                    // routed post-norm + the dense shared branch, summed into bxb for the epilogue
+                    if (g_skip != "ew") {
+                        var bw_pf2 = upload_region(addr < void? >(t.fblob[t.rms_post_ffn2_off + l * dim]), uint64(dim * 4l))
+                        enc_rms(enc, r.bmoe_rt, bw_pf2, r.bmoe_rt, r.u_dim, r.u_eps)
+                    }
+                    if (g_skip != "gemv") {
+                        enc_site_gemv(enc, t, kq_fmt_at(t.w1_fmt, l), t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
+                        enc_site_gemv(enc, t, kq_fmt_at(t.w3_fmt, l), t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
+                    }
+                    if (g_skip != "ew") {
+                        enc_ew2(enc, g_pso_geglu, r.bh12, 0ul, r.bh12, uint64(hidden * 4l), r.u_hidden, hidden)
+                    }
+                    if (g_skip != "gemv") {
+                        enc_site_gemv(enc, t, kq_fmt_at(t.w2_fmt, l), t.w2_offs[l], dim, hidden, r.bh12, r.bxb, r.u_hidden, r.u_dim)
+                    }
+                    if (g_skip != "ew") {
+                        var bw_pf1 = upload_region(addr < void? >(t.fblob[t.rms_post_ffn1_off + l * dim]), uint64(dim * 4l))
+                        enc_rms(enc, r.bxb, bw_pf1, r.bxb, r.u_dim, r.u_eps)
+                        enc_ew2(enc, g_pso_add, r.bxb, 0ul, r.bmoe_rt, 0ul, r.u_dim, dim)
+                    }
                 }
             } else {
                 let f1 = kq_fmt_at(t.w1_fmt, l)
@@ -902,6 +947,10 @@ def private release_step(var r : StepRes) {
         pool_release(g_upool, r.u_moe_eblk, 4ul)
         pool_release(g_upool, r.u_moe_esb, 4ul)
         pool_release(g_upool, r.u_moe_xs_dn, 4ul)
+        if (r.bmoe_rt != null) {
+            pool_release(g_pool, r.bmoe_rt, r.bytes_x)
+            pool_release(g_upool, r.u_moe_invd, 4ul)
+        }
     }
     r.valid = false
 }

@@ -958,6 +958,83 @@ class MetalMoeCombine {
     }
 }
 
+// gemma4 MoE router input (stage 3): y = x * rsqrt(mean(x^2) + eps) * (1/sqrt(dim)) * rscale[k],
+// one tg per row. f32 accumulation (the CPU runs this sum in double for top-8 tie stability;
+// no GPU doubles — rare tie flips ride the tolerance methodology, per the wave ruling).
+class MetalG4RouterNorm {
+    @ssbo @binding = 0 x : array<float>     // [rows x dim]
+    @ssbo @binding = 1 rs : array<float>    // [dim] per-channel router scale
+    @ssbo @binding = 2 y : array<float>     // [rows x dim]
+    @uniform @binding = 3 dim : uint
+    @uniform @binding = 4 eps : float
+    @uniform @binding = 5 invd : float      // 1/sqrt(dim)
+    @workgroup partial : float[32]
+    @workgroup inv_sh : float
+
+    [metal_kernel(name="metal_g4_router_norm_msl")]
+    def metal_g4_router_norm {
+        let row = gl_WorkGroupID.x
+        let lid = gl_LocalInvocationID.x
+        // the norm scale is an inverse TEMPERATURE on the router softmax (selection is
+        // scale-invariant; the expert WEIGHTS are not) — Kahan-compensated f32 tracks the
+        // CPU's double sum to f32 rounding, and 1/sqrt avoids the fast-rsqrt ulp error
+        var ss = 0.0
+        var comp = 0.0
+        var k = lid
+        while (k < dim) {
+            let vv = x[row * dim + k]
+            let yv = vv * vv - comp
+            let tt = ss + yv
+            comp = (tt - ss) - yv
+            ss = tt
+            k += gl_WorkGroupSize.x
+        }
+        ss = simd_sum(ss)
+        if (gl_SubgroupInvocationID == 0u) {
+            partial[gl_SubgroupID] = ss
+        }
+        barrier()
+        if (lid == 0u) {
+            var tot = 0.0
+            var tc = 0.0
+            var sgi = 0u
+            while (sgi < gl_NumSubgroups) {
+                let yv = partial[sgi] - tc
+                let tt = tot + yv
+                tc = (tt - tot) - yv
+                tot = tt
+                sgi++
+            }
+            inv_sh = (1.0 / sqrt(tot / float(dim) + eps)) * invd
+        }
+        barrier()
+        let inv = inv_sh
+        k = lid
+        while (k < dim) {
+            y[row * dim + k] = x[row * dim + k] * inv * rs[k]
+            k += gl_WorkGroupSize.x
+        }
+    }
+}
+
+// gemma4 per-expert down-scale fold (stage 3): selw[row][j] *= ds[seli[row][j]] — the CPU
+// folds ffn_down_exps_s into the selection weights right after select.
+class MetalMoeWScale {
+    @ssbo @binding = 0 seli : array<uint>   // selection rows, uint view (idx of row r at r*2k)
+    @ssbo @binding = 1 selw : array<float>  // the same buffer, float view (w of row r at r*2k + k)
+    @ssbo @binding = 2 ds : array<float>    // [ne] this layer's per-expert down scales
+    @uniform @binding = 3 nk : uint
+
+    [metal_kernel(name="metal_moe_wscale_msl")]
+    def metal_moe_wscale {
+        let row = gl_WorkGroupID.x
+        let j = gl_LocalInvocationID.x
+        if (j < nk) {
+            selw[row * 2u * nk + nk + j] *= ds[seli[row * 2u * nk + j]]
+        }
+    }
+}
+
 // ===== MoE prefill CSR + gathered mul_mm (Wave C stage 2b) =====
 // Atomics-free CSR: count (tg/expert) -> serial prefix (1 tg) -> bucket fill (tg/expert,
 // thread-0 serial walk in row order = the CPU moe_bkt order); buckets PAD to 32-row tiles.

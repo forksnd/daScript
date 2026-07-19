@@ -934,43 +934,63 @@ def signs_buffer() : MetalBuffer? {
 
 def private moe_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
 
-// one MoE weight stack's (fmt, offset) serve check — the expert-indexed GEMV twins address the
-// stack via 256-superblock plane offsets (k6 additionally needs the 512-element d-plane pair)
+// one MoE weight stack's (fmt, offset) serve check: base offset = the format's BIND alignment
+// (q8/k4/k5 %256, k6's d-plane pair %512); per-expert stride = the in-kernel index unit
+// (q8 32-blocks, kq 256-superblocks — the expert shift is index math, no base multiple)
 def moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
-    if (fmt != KqFmt.q8 && fmt != KqFmt.k4 && fmt != KqFmt.k5 && fmt != KqFmt.k6) {
-        return false
+    if (fmt == KqFmt.q8) {
+        return off >= 0l && (off % 256l) == 0l && (ege % 32l) == 0l
     }
-    let al = fmt == KqFmt.k6 ? 512l : 256l
-    return off >= 0l && (off % al) == 0l && (ege % al) == 0l
+    if (fmt == KqFmt.k4 || fmt == KqFmt.k5) {
+        return off >= 0l && (off % 256l) == 0l && (ege % 256l) == 0l
+    }
+    if (fmt == KqFmt.k6) {
+        return off >= 0l && (off % 512l) == 0l && (ege % 256l) == 0l
+    }
+    return false
 }
 
-// Wave C stage 1: the decode MoE serve gate — the shapes the routing kernels cover today
-// (softmax + norm_topk, no shared expert / biases / mx4 / dense-lead; q8-mode expert stacks
-// in q8/k4/k5/k6 with aligned expert planes). Everything else keeps the graph decline.
+// The MoE serve gate — the covered graph shapes (Wave C): the plain routed FFN (qwen3moe,
+// silu) and gemma4's parallel dense-shared + routed form (gelu, custom router norm,
+// per-expert down scales); softmax + norm_topk gating, no biases / mx4 / dense-lead.
 def moe_metal_ok(t : Model) : bool {
     let c = t.config
-    if (!c.moe || c.n_ff_shexp > 0l || c.moe_dense_shexp || c.n_layer_dense_lead > 0l ||
+    if (!c.moe || c.n_ff_shexp > 0l || c.n_layer_dense_lead > 0l ||
             c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
             c.moe_router_bias || c.moe_exps_bias || c.moe_exp_probs || t.experts_mx4 ||
-            (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0) ||
-            c.ffn_act != FfnAct.silu) {
+            (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0)) {
+        return false
+    }
+    if (c.moe_dense_shexp) {
+        if (c.ffn_act != FfnAct.gelu || t.moe_router_scale_off < 0l || t.moe_down_scale_off < 0l ||
+                t.rms_pre_ffn2_off < 0l || t.rms_post_ffn1_off < 0l || t.rms_post_ffn2_off < 0l ||
+                int64(length(t.w1_offs)) < c.n_layers) {
+            return false
+        }
+    } elif (c.ffn_act != FfnAct.silu) {
         return false
     }
     let ne = c.n_expert
     let k = c.n_expert_used
     let nfe = c.n_ff_exp
     let ege = c.dim * nfe
-    // select kernel holds 8 logits per lane (ne <= 256); kq GEMVs need superblock dims both ways
+    // select holds 8 logits per lane (ne <= 256); %64 dims = the gathered mul_mm C tiles
     if (ne < 1l || ne > 256l || k < 1l || k > 16l || k > ne || nfe <= 0l ||
-            (c.dim % 256l) != 0l || (nfe % 256l) != 0l ||
+            (c.dim % 64l) != 0l || (nfe % 64l) != 0l ||
             ne * ege > 3800000000l ||   // uint32 in-kernel indices (q8 byte view = elements * 34/32)
             t.router_off < 0l || empty(t.we1_offs) || empty(t.we2_offs) || empty(t.we3_offs)) {
         return false
     }
     for (l in range64(c.n_layers)) {
-        if (!moe_site_ok(moe_fmt_at(t.we1_fmt, l), t.we1_offs[l], ege) ||
-                !moe_site_ok(moe_fmt_at(t.we2_fmt, l), t.we2_offs[l], ege) ||
-                !moe_site_ok(moe_fmt_at(t.we3_fmt, l), t.we3_offs[l], ege)) {
+        let f1 = moe_fmt_at(t.we1_fmt, l)
+        let f2 = moe_fmt_at(t.we2_fmt, l)
+        let f3 = moe_fmt_at(t.we3_fmt, l)
+        // per-site alignment + (kq kernels iterate whole superblock rows) reduction dims %256
+        if (!moe_site_ok(f1, t.we1_offs[l], ege) ||
+                !moe_site_ok(f2, t.we2_offs[l], ege) ||
+                !moe_site_ok(f3, t.we3_offs[l], ege) ||
+                ((f1 != KqFmt.q8 || f3 != KqFmt.q8) && (c.dim % 256l) != 0l) ||
+                (f2 != KqFmt.q8 && (nfe % 256l) != 0l)) {
             return false
         }
     }
