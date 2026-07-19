@@ -41,7 +41,9 @@ def setup_dasllama_jobque() {
 def load_model(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     //! Load a model AND its tokenizer from a GGUF file — architecture and tokenizer backend are
     //! auto-selected from GGUF metadata; ``mode`` picks the weight quantization. Q8 loads cache a
-    //! PREPARED IMAGE beside the gguf (box-specific, ``DASLLAMA_IMAGE=0`` disables) for millisecond reloads.
+    //! PREPARED IMAGE beside the gguf (box-specific, ``DASLLAMA_IMAGE=0`` disables) for millisecond
+    //! reloads; under an active Metal mode the image is the BLOB-ONLY metal flavor (GPU-native
+    //! weight forms; CPU inference against it panics) when the drivers can serve the config.
     return <- load_model_cached(path, mode)
 }
 

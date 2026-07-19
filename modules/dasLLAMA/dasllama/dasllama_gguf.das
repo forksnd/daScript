@@ -842,7 +842,14 @@ def dequant_k5_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<u
 //! Reference dequant of one k6-plane superblock: w = (d*sc16)*(q - 32) — bit-identical to the
 //! disk dequant (the k6 planes are verbatim).
 def dequant_k6_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
-    let d = f16_to_f32(rd_u16(ks, kso + 16l))
+    dequant_k6_plane_superblock_at(kq, kqo, ks, kso, kso + 16l, dst, doff)
+}
+
+//! The split-layout twin: `dso` names the f16 d halfword's byte offset within ks independently
+//! of the 16B sub-scale strip at kso — metal-blob models keep k6s in the GPU split form
+//! ([nsb x 16B sub-scales][nsb x f16 d]) where d lives in the plane's tail.
+def dequant_k6_plane_superblock_at(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso, dso : int64; var dst : array<float> | #; doff : int64) {
+    let d = f16_to_f32(rd_u16(ks, dso))
     var qlo = kqo
     var qho = kqo + 128l
     var sco = kso
