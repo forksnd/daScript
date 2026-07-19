@@ -1307,9 +1307,10 @@ def document_module_lint_config(_root : string) {
 def document_module_toml(_root : string) {
     var mod = find_module("toml")
     var groups <- array<DocGroup>(
-        group_by_regex("Parsing", mod, %regex~(read_toml)$%%)
+        group_by_regex("Parsing", mod, %regex~(read_toml)$%%),
+        group_by_regex("Writing", mod, %regex~(write_toml)$%%)
     )
-    document("TOML 1.0 parser", mod, "toml.rst", groups)
+    document("TOML 1.0 parser and writer", mod, "toml.rst", groups)
 }
 
 def document_module_logger(_root : string) {

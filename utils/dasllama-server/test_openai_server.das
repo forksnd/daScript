@@ -9,7 +9,9 @@ require dasllama/dasllama                               // load_model / QuantMod
 require daslib/jobque_boost                             // with_job_status (server-thread lifecycle)
 require daslib/json_boost                               // read_json / from_JV
 require daslib/fio                                      // get_env_variable / stat / path_join / sleep / base_name
+require daslib/toml                                     // read_toml: POST /config round-trip check
 require math                                            // sqrt
+require strings                                         // find (control-page content-type/body checks)
 
 // End-to-end conformance for the OpenAI-compatible server: spin it up on its own thread (a separate
 // context — so the model loads INSIDE that thread, since g_model is a per-context module global),
@@ -20,6 +22,7 @@ require math                                            // sqrt
 // and require the sibling module by BARE name (same convention as detect-dupe / find-dupe / mcp).
 
 let TEST_PORT = 18099
+let TEST_SAVE_PATH = "._test_dasllama_config.toml"   // POST /config target; removed after the round-trip check
 
 def private models_dir() : string {
     return get_env_variable("DASLLAMA_MODELS_DIR")   // empty -> MODEL_PATH is relative -> the test skips
@@ -66,6 +69,19 @@ def private with_llama_server(model_path : string; port : int; mode : MetalMode 
             var m <- load_model(model_path, QuantMode.q8)
             set_model(m, "test-llm")
             set_default_max_tokens(4l)   // per-context global — exercised by the default-budget completion test
+            // the /config surface as main.das registers it (per-context globals — set in-thread)
+            var surf <- {
+                "config" => JV((port = port, model = model_path, streams = 4)),
+                "sources" => JV((port = "cli")),
+                "authoritative" => JV(false),
+                "config_path" => JV(""),
+                "save_path" => JV(TEST_SAVE_PATH)
+            }
+            var sdoc = JV(surf)
+            set_config_surface(write_json_compact(sdoc), TEST_SAVE_PATH, model_path)
+            unsafe {
+                delete sdoc
+            }
             run_server(port)   // blocks (with_job_que + tick loop) until POST /shutdown
             finished |> notify_and_release
         }
@@ -111,6 +127,28 @@ def test_openai_server(t : T?) {
                 t |> success(js != null, "models JSON parses")
                 if (js != null) {
                     t |> equal(string(js?["object"] ?? ""), "list")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            // GET / — the control page ships beside the server sources and serves as text/html
+            GET("{base_url}/") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                t |> success(find(string(get_header(resp, "Content-Type")), "text/html") >= 0, "control page is text/html")
+                t |> success(find(string(resp.body), "dasllama-server") >= 0, "control page body served")
+            }
+            // /v1/stats — identity fields the control page polls
+            GET("{base_url}/v1/stats") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "stats JSON parses")
+                if (js != null) {
+                    t |> equal(string(js?["model"] ?? ""), "test-llm")
+                    t |> success((js?["ctx"] ?? 0l) > 0l, "stats reports ctx")
+                    t |> success(!(js?["draining"] ?? true), "not draining while serving")
+                    t |> success((js?["max_streams"] ?? 0l) > 0l, "stats reports max_streams")
                     unsafe {
                         delete js
                     }
@@ -214,6 +252,57 @@ def test_openai_server(t : T?) {
                         delete js
                     }
                 }
+            }
+            // GET /config — launcher-registered surface + live status (model picker, gpu badge)
+            GET("{base_url}/config") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "config JSON parses")
+                if (js != null) {
+                    t |> equal(js?["surface"]?["config"]?["port"] ?? 0l, int64(TEST_PORT))
+                    t |> equal(string(js?["surface"]?["sources"]?["port"] ?? ""), "cli")
+                    t |> success(js?["status"]?["gpu"] != null, "gpu status object present")
+                    t |> success(find(string(resp.body), "model_files") >= 0, "model files enumerated")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            // POST /config — validated body writes an authoritative TOML to the registered path
+            POST("{base_url}/config", "\{\"model\":\"m.gguf\",\"port\":8123,\"mtp\":true,\"gpu\":\"vulkan\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                t |> success(find(string(resp.body), "restart_required") >= 0, "save response flags restart")
+            }
+            {
+                let saved = fread(TEST_SAVE_PATH)
+                t |> success(!empty(saved), "saved config readable")
+                var terr : string
+                var troot = read_toml(saved, terr)
+                t |> success(troot != null, "saved config re-parses as TOML")
+                if (troot != null) {
+                    t |> success(troot?["authoritative"] ?? false, "saved config is authoritative")
+                    t |> equal(troot?["port"] ?? 0l, 8123l)
+                    t |> equal(string(troot?["model"] ?? ""), "m.gguf")
+                    t |> success(troot?["mtp"] ?? false, "bool key round-trips")
+                    unsafe {
+                        delete troot
+                    }
+                }
+                remove(TEST_SAVE_PATH)
+            }
+            // POST /config validation — unknown keys and wrong types are honest 400s
+            POST("{base_url}/config", "\{\"bogus\":1}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.BAD_REQUEST))
+            }
+            POST("{base_url}/config", "\{\"port\":\"eight\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.BAD_REQUEST))
+            }
+            // POST /restart — LAST in the block: the server starts draining after this. The exit-4
+            // half of the contract lives in main.das + watchdog.py (not exercisable here).
+            POST("{base_url}/restart", "") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                t |> success(find(string(resp.body), "\"restarting\":true") >= 0, "restart response flags restarting")
             }
         }
     }

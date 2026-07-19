@@ -2,9 +2,10 @@
 """Supervise dasllama-server under JIT, or a standalone program such as Cadmus.
 
 The first untuned invocation exits with code 3 after writing the tune sidecar;
-that is an expected bootstrap event and is relaunched immediately. Exit 0 is an
-intentional shutdown. Other exits are reported, notified, and restarted with
-bounded exponential backoff. Standalone programs can use a stop-file handshake
+that is an expected bootstrap event and is relaunched immediately. Exit 4 is a
+config restart (the control page saved a new config and asked for a relaunch)
+and is also relaunched immediately. Exit 0 is an intentional shutdown. Other
+exits are reported, notified, and restarted with bounded exponential backoff. Standalone programs can use a stop-file handshake
 to finish their current update and run shutdown before exiting.
 """
 from __future__ import annotations
@@ -37,6 +38,7 @@ DEFAULT_CWD = (
     else SCRIPT_DIR
 )
 TUNE_RESTART_EXIT = 3
+CONFIG_RESTART_EXIT = 4
 JIT_ARTIFACT_SUFFIXES = {".dll", ".exp", ".lib", ".map", ".o", ".obj", ".pdb"}
 WER_LOCAL_DUMPS = r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
 
@@ -752,6 +754,10 @@ def main() -> int:
             if (args.program is None and return_code == TUNE_RESTART_EXIT and
                     tune_restart_seen.is_set()):
                 emit(logger, "tune_bootstrap_complete")
+                failures = 0
+                continue
+            if return_code == CONFIG_RESTART_EXIT:
+                emit(logger, "config_restart_relaunch")
                 failures = 0
                 continue
 

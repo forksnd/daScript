@@ -8,11 +8,14 @@ require dasllama/dasllama       // the public facade — the main dasLLAMA surfa
 require llm_scheduler           // continuous-batching scheduler (sibling — bare require, hyphenated dir)
 require dashv/dashv_boost public
 require daslib/json_boost
+require daslib/toml             // write_toml: POST /config persists the authoritative config
+require dasllama/dasllama_math  // gpu_tier_status: the GET /config GPU badge
 require daslib/defer            // defer() { delete js } — free the parsed request JSON on every exit path
 require daslib/jobque_boost
 require daslib/rtti             // this_context().last_exception inside ASR worker recovery
 require daslib/strings_boost    // join()
 require daslib/fio              // sleep(), path_join, base_name, remove, get_env_variable
+require daslib/module_path      // get_this_module_dir: control.html ships beside the server sources
 require strings
 require math
 require dasllama/dasllama_audio_io   // load_audio_16k_mono: any uploaded audio format -> 16 kHz mono f32
@@ -61,6 +64,7 @@ struct private StreamWire {
 
 var g_wires : table<int64; StreamWire>
 var g_default_max_new = 256l
+var private g_started_at = 0l   // created_ts() at init_server; /v1/stats reports uptime_s from it
 
 //! Move a loaded model into the server (call once, before run_server). ``name`` is the id reported
 //! by ``/v1/models`` and echoed back in responses.
@@ -88,6 +92,27 @@ def configure_asr_workers(path, mmproj : string; workers : int = 1) {
 //! ``POST /shutdown``.
 def request_stop() {
     g_shutdown_requested = true
+}
+
+var private g_restart_requested = false
+var private g_config_surface_json = ""   // main's pre-serialized {config, sources, ...} object
+var private g_config_save_path = ""
+var private g_config_model_path = ""
+
+//! Register the ``/config`` surface (call before run_server): ``surface_json`` is the launcher's
+//! pre-serialized effective-config object (values + per-key provenance), ``save_path`` where
+//! ``POST /config`` writes the authoritative TOML, ``model_path`` the served model file (its
+//! directory feeds the model picker).
+def set_config_surface(surface_json : string; save_path : string; model_path : string) {
+    g_config_surface_json = surface_json
+    g_config_save_path = save_path
+    g_config_model_path = model_path
+}
+
+//! True when the drain was started by ``POST /restart`` — the lifecycle host exits with the
+//! watchdog's config-restart code (4) instead of 0 so it relaunches with the saved config.
+def server_restart_requested : bool {
+    return g_restart_requested
 }
 
 //! Consume a coalesced request from POST /gc. The lifecycle loop calls this only after update()
@@ -1158,6 +1183,10 @@ def private flush_events(srv : WebSocketServer) {
 
 // /v1/stats: the scheduler's counters as JSON (buffered — cheap enough to run in-handler).
 struct private OaiStatsResponse {
+    model : string
+    ctx : int64
+    uptime_s : int64
+    draining : bool
     active : int64
     queued : int64
     peak_active : int64
@@ -1181,6 +1210,9 @@ struct private OaiStatsResponse {
 
 def private handle_stats(var resp : HttpResponse?) : http_status {
     let out = OaiStatsResponse(
+        model = g_model_name, ctx = g_model.config.seq_len,
+        uptime_s = g_started_at > 0l ? created_ts() - g_started_at : 0l,
+        draining = g_shutdown_requested,
         active = n_active(g_sched), queued = n_queued(g_sched), peak_active = g_sched.peak_active,
         admitted = g_sched.n_admitted, finished = g_sched.n_finished, evicted = g_sched.n_evicted,
         decode_steps = g_sched.decode_steps, gen_tokens = g_sched.gen_tokens,
@@ -1191,6 +1223,136 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         asr_active = g_asr_active, asr_pending = g_asr_pending,
         mtp_drafted = g_sched.mtp_drafted, mtp_accepted = g_sched.mtp_accepted)
     return resp |> JSON(sprint_json(out, false), http_status.OK)
+}
+
+// key -> expected JSON kind for POST /config bodies: "s"tring | "i"nteger | "b"ool. The one
+// schema the save endpoint validates against — mirrors ServerArgs (main.das CONFIG_KEYS).
+let private CONFIG_KEY_KINDS <- {
+    "model" => "s", "port" => "i", "quant" => "s", "kv_dtype" => "s", "metal" => "s",
+    "gpu" => "s", "gpu_layers" => "i", "gpu_stream" => "i", "gpu_dn" => "b", "gpu_attn" => "b",
+    "gpu_dense" => "b", "gpu_vram_mb" => "i", "asr" => "s", "mmproj" => "s", "asr_workers" => "i",
+    "ctx" => "i", "max_tokens" => "i", "streams" => "i", "threads" => "i", "team_dispatch" => "s",
+    "affinity" => "i", "chunk" => "i", "page_rows" => "i", "prefix" => "i", "flat" => "b",
+    "mtp" => "b"
+}
+
+def private json_str(s : string) : string {
+    var v = JV(s)
+    let text = write_json_compact(v)
+    unsafe {
+        delete v
+    }
+    return text
+}
+
+def private kind_name(kind : string) : string {
+    if (kind == "s") {
+        return "string"
+    }
+    return kind == "i" ? "whole number" : "bool"
+}
+
+// GET /config: the launcher-registered surface (effective values + per-key provenance) plus
+// live status — model files beside the served one, the active rail, and the GPU tier badge.
+def private handle_config_get(var resp : HttpResponse?) : http_status {
+    var entries : array<JsonValue?>
+    let mdir = dir_name(g_config_model_path)
+    if (!empty(mdir)) {
+        dir(mdir) $(fname) {
+            let lower = to_lower(fname)
+            if (ends_with(lower, ".gguf") || ends_with(lower, ".dlim")) {
+                let st = stat(path_join(mdir, fname))
+                entries |> push(JV((name = fname, size = int64(st.size),
+                    kind = ends_with(lower, ".dlim") ? "dlim" : "gguf")))
+            }
+        }
+    }
+    let tier = gpu_tier_status()
+    var extras <- {
+        "model_files" => JV(entries),
+        "active_model" => JV(base_name(g_config_model_path)),
+        "dlim_rail" => JV(g_model.image_map != null),
+        "metal" => JV("{get_metal_mode()}"),
+        "gpu" => JV((
+            backend = tier.backend, supported = tier.supported, reason = tier.reason,
+            resident_layers = tier.resident_layers, streamed_layers = tier.streamed_layers,
+            dn_layers = tier.dn_layers, attn_layers = tier.attn_layers,
+            dense_planes = tier.dense_planes, cls_resident = tier.cls_resident,
+            vram_bytes = tier.vram_bytes))
+    }
+    var extras_doc = JV(extras)
+    let extras_json = write_json_compact(extras_doc)
+    unsafe {
+        delete extras_doc
+    }
+    let surface = empty(g_config_surface_json) ? "null" : g_config_surface_json
+    return resp |> JSON("\{\"surface\":{surface},\"status\":{extras_json}}", http_status.OK)
+}
+
+// POST /config: validate a {key: value} JSON body against the schema, rebuild it as an
+// explicitly-typed tree + `authoritative = true`, and write it as TOML to the save path.
+// The running server keeps its config — POST /restart applies the saved one.
+def private handle_config_save(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    var jerr = ""
+    var body = read_json(string(req.body), jerr)
+    defer() {
+        unsafe {
+            delete body
+        }
+    }
+    if (body == null || !(body.value is _object)) {
+        return resp |> JSON(
+            error_body("config body must be a JSON object: {jerr}", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    var out_tab : table<string; JsonValue?>
+    var verr = ""
+    for (k, v in keys(body.value as _object), values(body.value as _object)) {
+        let kind = CONFIG_KEY_KINDS?[k] ?? ""
+        if (empty(kind)) {
+            continue if (k == "authoritative")   // server-owned marker; re-added below
+            verr = "unknown config key '{k}'"
+            break
+        }
+        if (v == null) {
+            verr = "config key '{k}' is null"
+            break
+        }
+        if (kind == "s" && (v.value is _string)) {
+            out_tab |> insert(k, JV(v.value as _string))
+        } elif (kind == "i" && (v.value is _longint)) {
+            out_tab |> insert(k, JV(v.value as _longint))
+        } elif (kind == "i" && (v.value is _number) && (v.value as _number) == floor(v.value as _number)) {
+            out_tab |> insert(k, JV(int64(v.value as _number)))
+        } elif (kind == "b" && (v.value is _bool)) {
+            out_tab |> insert(k, JV(v.value as _bool))
+        } else {
+            verr = "config key '{k}' must be a {kind_name(kind)}"
+            break
+        }
+    }
+    if (!empty(verr)) {
+        var junk = JV(out_tab)
+        unsafe {
+            delete junk
+        }
+        return resp |> JSON(error_body(verr, "invalid_request_error"), http_status.BAD_REQUEST)
+    }
+    out_tab |> insert("authoritative", JV(true))
+    var doc = JV(out_tab)
+    var werr = ""
+    let toml = write_toml(doc, werr)
+    unsafe {
+        delete doc
+    }
+    if (!empty(werr)) {
+        return resp |> JSON(error_body("config not TOML-representable: {werr}", "invalid_request_error"), http_status.BAD_REQUEST)
+    }
+    if (!fwrite(g_config_save_path, toml)) {
+        return resp |> JSON(error_body("could not write '{g_config_save_path}'", "server_error"), http_status.INTERNAL_SERVER_ERROR)
+    }
+    to_log(LOG_INFO, "dasllama-server: authoritative config saved to {g_config_save_path} ({length(toml)} bytes)\n")
+    return resp |> JSON("\{\"saved\":{json_str(g_config_save_path)},\"restart_required\":true}", http_status.OK)
 }
 
 def private emit_asr_event(events : Channel?; event : AsrEvent) {
@@ -1475,6 +1637,26 @@ class OpenAiServer : HvWebServer {
         GET("/v1/stats") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_stats(resp)
         }
+        GET("/") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            // the control page ships beside the server sources; libhv sets text/html from the extension
+            return resp |> SERVE_FILE(path_join(get_this_module_dir(), "control.html"))
+        }
+        GET("/config") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_config_get(resp)
+        }
+        POST("/config") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_config_save(req, resp)
+        }
+        POST("/restart") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!g_shutdown_requested) {
+                to_log(
+                    LOG_INFO,
+                    "dasllama-server: restart requested; draining llm_active={n_active(g_sched)}, llm_queued={n_queued(g_sched)}, asr_pending={g_asr_pending}\n")
+            }
+            g_shutdown_requested = true
+            g_restart_requested = true
+            return resp |> JSON("\{\"ok\":true,\"draining\":true,\"restarting\":true}", http_status.OK)
+        }
         POST("/shutdown") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!g_shutdown_requested) {
                 to_log(
@@ -1526,6 +1708,7 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
         return false
     }
     g_shutdown_requested = false   // reset so a restart in the same context after /shutdown doesn't drain at once
+    g_restart_requested = false    // NOT reset in shutdown_server — the lifecycle host reads it after
     g_gc_requested = false
     create_job_que()
     g_jobque_owned = true
@@ -1561,6 +1744,7 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
         return false
     }
     g_server_started = true
+    g_started_at = created_ts()
     let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
     let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
     let spec_desc = spec ? ", mtp: on" : ""

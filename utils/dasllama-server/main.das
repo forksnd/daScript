@@ -9,7 +9,9 @@ options stack = 262144   // the forward chain runs deep under the HTTP tick + C+
 //                                                       [--config server.toml] [--tune]
 //
 // --config points at a TOML file whose keys mirror the long flag names (model = "...", port = 8080,
-// kv_dtype = "tq4", ...); explicit CLI flags override it.
+// kv_dtype = "tq4", ...); explicit CLI flags override it. A config carrying `authoritative = true`
+// (what the control page's POST /config writes) flips the top of that precedence instead:
+// defaults < CLI < authoritative TOML.
 //
 // Then point any OpenAI client at http://127.0.0.1:<port>/v1 (opencode, Open WebUI, the `llm` CLI, …).
 //
@@ -55,6 +57,27 @@ struct ServerArgs {
 
     @clarg_doc = "Metal (GPU) serving mode: off | auto | required (default off). auto = GPU when a path's gates pass, CPU fallback otherwise; required = a call the GPU cannot serve is a hard failure"
     metal : string
+
+    @clarg_doc = "GPU backend: off | metal | metal-required | vulkan (unset = legacy --metal flag + DASLLAMA_GPU_* env vars)"
+    gpu : string
+
+    @clarg_doc = "vulkan: resident MoE expert-stack layers K, offloaded from the end (default 2 under --gpu vulkan)"
+    gpu_layers : int
+
+    @clarg_doc = "vulkan: streamed prefill MoE layers below the resident set (default 35 under --gpu vulkan)"
+    gpu_stream : int
+
+    @clarg_doc = "vulkan: deltanet (recurrent) layers through the device chain (default on under --gpu vulkan)"
+    gpu_dn : bool
+
+    @clarg_doc = "vulkan: full-attention layers through the device chain (default on under --gpu vulkan)"
+    gpu_attn : bool
+
+    @clarg_doc = "vulkan: dense attention-side planes resident (default off)"
+    gpu_dense : bool
+
+    @clarg_doc = "vulkan: resident-weight VRAM cap override in MB (default: query the device)"
+    gpu_vram_mb : int
 
     @clarg_short = "a"
     @clarg_doc = "Path to an ASR model — enables /v1/audio/transcriptions"
@@ -160,8 +183,134 @@ def private cli_has_flag(flag : string) : bool {
     return false
 }
 
-// fill CLI-unset fields (zero / empty / false — the same sentinels the guards below use) from the
-// TOML config, so precedence is defaults < config file < explicit flags
+// per-key config provenance for the GET /config surface: "cli" | "toml"; absent = default.
+// Filled by mark_cli_sources after arg parsing, then by apply_config as TOML keys land.
+var private g_cfg_sources : table<string; string>
+var private g_cfg_authoritative = false
+
+let CONFIG_KEYS = fixed_array("model", "port", "quant", "kv_dtype", "metal", "gpu", "gpu_layers",
+    "gpu_stream", "gpu_dn", "gpu_attn", "gpu_dense", "gpu_vram_mb", "asr", "mmproj", "asr_workers",
+    "ctx", "max_tokens", "streams", "threads", "team_dispatch", "affinity", "chunk", "page_rows",
+    "prefix", "flat", "mtp")
+
+def private from_cli(key : string) : bool
+    => (g_cfg_sources?[key] ?? "") == "cli"
+
+def private toml_has(root : JsonValue?; key : string) : bool {
+    if (root == null || !(root.value is _object)) {
+        return false
+    }
+    return key_exists(root.value as _object, key)
+}
+
+def private cfg_from_toml(root : JsonValue?; key : string; var field : string&; auth : bool) {
+    if (toml_has(root, key) && (auth || !from_cli(key))) {
+        field = root?[key] ?? ""
+        g_cfg_sources[key] = "toml"
+    }
+}
+
+def private cfg_from_toml(root : JsonValue?; key : string; var field : int&; auth : bool) {
+    if (toml_has(root, key) && (auth || !from_cli(key))) {
+        field = int(root?[key] ?? 0l)
+        g_cfg_sources[key] = "toml"
+    }
+}
+
+def private cfg_from_toml(root : JsonValue?; key : string; var field : bool&; auth : bool) {
+    if (toml_has(root, key) && (auth || !from_cli(key))) {
+        field = root?[key] ?? false
+        g_cfg_sources[key] = "toml"
+    }
+}
+
+// which keys the command line set explicitly — the fill-if-unset sentinels, plus flag-presence
+// probes for the keys where 0 is a meaningful explicit value (--threads / --affinity / --prefix
+// and the vulkan detail knobs)
+def private mark_cli_sources(cfg : ServerArgs) {
+    if (!empty(cfg.model)) {
+        g_cfg_sources["model"] = "cli"
+    }
+    if (cfg.port > 0) {
+        g_cfg_sources["port"] = "cli"
+    }
+    if (!empty(cfg.quant)) {
+        g_cfg_sources["quant"] = "cli"
+    }
+    if (!empty(cfg.kv_dtype)) {
+        g_cfg_sources["kv_dtype"] = "cli"
+    }
+    if (!empty(cfg.metal)) {
+        g_cfg_sources["metal"] = "cli"
+    }
+    if (!empty(cfg.gpu)) {
+        g_cfg_sources["gpu"] = "cli"
+    }
+    if (cfg.gpu_layers != 0 || cli_has_flag("--gpu-layers")) {
+        g_cfg_sources["gpu_layers"] = "cli"
+    }
+    if (cfg.gpu_stream != 0 || cli_has_flag("--gpu-stream")) {
+        g_cfg_sources["gpu_stream"] = "cli"
+    }
+    if (cfg.gpu_dn) {
+        g_cfg_sources["gpu_dn"] = "cli"
+    }
+    if (cfg.gpu_attn) {
+        g_cfg_sources["gpu_attn"] = "cli"
+    }
+    if (cfg.gpu_dense) {
+        g_cfg_sources["gpu_dense"] = "cli"
+    }
+    if (cfg.gpu_vram_mb > 0) {
+        g_cfg_sources["gpu_vram_mb"] = "cli"
+    }
+    if (!empty(cfg.asr)) {
+        g_cfg_sources["asr"] = "cli"
+    }
+    if (!empty(cfg.mmproj)) {
+        g_cfg_sources["mmproj"] = "cli"
+    }
+    if (cfg.asr_workers > 0) {
+        g_cfg_sources["asr_workers"] = "cli"
+    }
+    if (cfg.ctx > 0) {
+        g_cfg_sources["ctx"] = "cli"
+    }
+    if (cfg.max_tokens > 0) {
+        g_cfg_sources["max_tokens"] = "cli"
+    }
+    if (cfg.streams > 0) {
+        g_cfg_sources["streams"] = "cli"
+    }
+    if (cfg.threads != 0 || cli_has_flag("--threads") || cli_has_flag("-t")) {
+        g_cfg_sources["threads"] = "cli"
+    }
+    if (!empty(cfg.team_dispatch)) {
+        g_cfg_sources["team_dispatch"] = "cli"
+    }
+    if (cfg.affinity != 0 || cli_has_flag("--affinity")) {
+        g_cfg_sources["affinity"] = "cli"
+    }
+    if (cfg.chunk > 0) {
+        g_cfg_sources["chunk"] = "cli"
+    }
+    if (cfg.page_rows > 0) {
+        g_cfg_sources["page_rows"] = "cli"
+    }
+    if (cfg.prefix != 0 || cli_has_flag("--prefix")) {
+        g_cfg_sources["prefix"] = "cli"
+    }
+    if (cfg.flat) {
+        g_cfg_sources["flat"] = "cli"
+    }
+    if (cfg.mtp) {
+        g_cfg_sources["mtp"] = "cli"
+    }
+}
+
+// fill fields from the TOML config. Default precedence: defaults < config file < explicit CLI
+// flags. A config carrying `authoritative = true` (what the control page writes) flips the top:
+// its keys override CLI flags too (defaults < CLI < authoritative TOML).
 def apply_config(var cfg : ServerArgs) : bool {
     let body = fread(cfg.config)
     if (empty(body)) {
@@ -174,65 +323,34 @@ def apply_config(var cfg : ServerArgs) : bool {
         to_log(LOG_ERROR, "dasllama-server: bad TOML in '{cfg.config}': {terr}\n")
         return false
     }
-    if (empty(cfg.model)) {
-        cfg.model = root?["model"] ?? ""
-    }
-    if (cfg.port <= 0) {
-        cfg.port = int(root?["port"] ?? 0l)
-    }
-    if (empty(cfg.quant)) {
-        cfg.quant = root?["quant"] ?? ""
-    }
-    if (empty(cfg.kv_dtype)) {
-        cfg.kv_dtype = root?["kv_dtype"] ?? ""
-    }
-    if (empty(cfg.metal)) {
-        cfg.metal = root?["metal"] ?? ""
-    }
-    if (empty(cfg.asr)) {
-        cfg.asr = root?["asr"] ?? ""
-    }
-    if (empty(cfg.mmproj)) {
-        cfg.mmproj = root?["mmproj"] ?? ""
-    }
-    if (cfg.asr_workers <= 0) {
-        cfg.asr_workers = int(root?["asr_workers"] ?? 0l)
-    }
-    if (cfg.ctx <= 0) {
-        cfg.ctx = int(root?["ctx"] ?? 0l)
-    }
-    if (cfg.max_tokens <= 0) {
-        cfg.max_tokens = int(root?["max_tokens"] ?? 0l)
-    }
-    if (cfg.streams <= 0) {
-        cfg.streams = int(root?["streams"] ?? 0l)
-    }
-    if (cfg.chunk <= 0) {
-        cfg.chunk = int(root?["chunk"] ?? 0l)
-    }
-    if (cfg.page_rows <= 0) {
-        cfg.page_rows = int(root?["page_rows"] ?? 0l)
-    }
-    if (cfg.threads == 0 && !cli_has_flag("--threads")) {
-        cfg.threads = int(root?["threads"] ?? 0l)
-    }
-    if (empty(cfg.team_dispatch)) {
-        cfg.team_dispatch = root?["team_dispatch"] ?? ""
-    }
-    if (cfg.affinity == 0 && !cli_has_flag("--affinity")) {
-        cfg.affinity = int(root?["affinity"] ?? 0l)
-    }
-    // --prefix is the one flag where 0 is a meaningful EXPLICIT value (auto-sizing), so the
-    // zero-sentinel isn't enough: only fill from TOML when the flag is truly absent from argv
-    if (cfg.prefix == 0 && !cli_has_flag("--prefix")) {
-        cfg.prefix = int(root?["prefix"] ?? 0l)
-    }
-    if (!cfg.flat) {
-        cfg.flat = root?["flat"] ?? false
-    }
-    if (!cfg.mtp) {
-        cfg.mtp = root?["mtp"] ?? false
-    }
+    let auth = root?["authoritative"] ?? false
+    g_cfg_authoritative = auth
+    cfg_from_toml(root, "model", cfg.model, auth)
+    cfg_from_toml(root, "port", cfg.port, auth)
+    cfg_from_toml(root, "quant", cfg.quant, auth)
+    cfg_from_toml(root, "kv_dtype", cfg.kv_dtype, auth)
+    cfg_from_toml(root, "metal", cfg.metal, auth)
+    cfg_from_toml(root, "gpu", cfg.gpu, auth)
+    cfg_from_toml(root, "gpu_layers", cfg.gpu_layers, auth)
+    cfg_from_toml(root, "gpu_stream", cfg.gpu_stream, auth)
+    cfg_from_toml(root, "gpu_dn", cfg.gpu_dn, auth)
+    cfg_from_toml(root, "gpu_attn", cfg.gpu_attn, auth)
+    cfg_from_toml(root, "gpu_dense", cfg.gpu_dense, auth)
+    cfg_from_toml(root, "gpu_vram_mb", cfg.gpu_vram_mb, auth)
+    cfg_from_toml(root, "asr", cfg.asr, auth)
+    cfg_from_toml(root, "mmproj", cfg.mmproj, auth)
+    cfg_from_toml(root, "asr_workers", cfg.asr_workers, auth)
+    cfg_from_toml(root, "ctx", cfg.ctx, auth)
+    cfg_from_toml(root, "max_tokens", cfg.max_tokens, auth)
+    cfg_from_toml(root, "streams", cfg.streams, auth)
+    cfg_from_toml(root, "threads", cfg.threads, auth)
+    cfg_from_toml(root, "team_dispatch", cfg.team_dispatch, auth)
+    cfg_from_toml(root, "affinity", cfg.affinity, auth)
+    cfg_from_toml(root, "chunk", cfg.chunk, auth)
+    cfg_from_toml(root, "page_rows", cfg.page_rows, auth)
+    cfg_from_toml(root, "prefix", cfg.prefix, auth)
+    cfg_from_toml(root, "flat", cfg.flat, auth)
+    cfg_from_toml(root, "mtp", cfg.mtp, auth)
     unsafe {
         delete root
     }
@@ -256,6 +374,84 @@ def pick_quant(s : string) : QuantMode {
         to_log(LOG_WARNING, "dasllama-server: unknown --quant '{s}', using q8 (valid: fp32 | q8 | q8_0 | q4_0 | q4_k | q5_k | q6_k | mxfp4 | f16 | bf16 | q4 = legacy requant)\n")
     }
     return QuantMode.q8
+}
+
+// --gpu selector: one knob over the metal mode and the vulkan tier. Unset falls back to the
+// legacy --metal flag + DASLLAMA_GPU_* env vars.
+def private effective_gpu(cfg : ServerArgs) : string {
+    let l = to_lower(cfg.gpu)
+    if (l == "off" || l == "metal" || l == "metal-required" || l == "vulkan") {
+        return l
+    }
+    if (!empty(l)) {
+        to_log(LOG_WARNING, "dasllama-server: unknown --gpu '{cfg.gpu}', ignoring (valid: off | metal | metal-required | vulkan)\n")
+    }
+    return ""
+}
+
+def private cfg_sourced(key : string) : bool
+    => key_exists(g_cfg_sources, key)
+
+// vulkan detail knobs — explicit config/CLI wins; unset gets the blessed serving shape
+// (K=2 resident + S=35 streamed + DN + ATTN) under gpu = vulkan
+def private gpu_detail_layers(cfg : ServerArgs) : int64
+    => int64(cfg_sourced("gpu_layers") ? cfg.gpu_layers : 2)
+
+def private gpu_detail_stream(cfg : ServerArgs) : int64
+    => int64(cfg_sourced("gpu_stream") ? cfg.gpu_stream : 35)
+
+def private gpu_detail_dn(cfg : ServerArgs) : bool
+    => cfg_sourced("gpu_dn") ? cfg.gpu_dn : true
+
+def private gpu_detail_attn(cfg : ServerArgs) : bool
+    => cfg_sourced("gpu_attn") ? cfg.gpu_attn : true
+
+// The GET /config surface: RESOLVED effective values (what init actually uses) + per-key
+// provenance. Sentinel-is-meaning keys stay raw: ctx 0 = model default, prefix 0 = auto /
+// -1 = unbounded, threads -1 = all cores, gpu "" = legacy metal/env path.
+def private build_config_surface(cfg : ServerArgs; save_path : string) : string {
+    let gpu = effective_gpu(cfg)
+    var config = JV((
+        model = cfg.model,
+        port = cfg.port > 0 ? cfg.port : 8080,
+        quant = empty(cfg.quant) ? "q8" : cfg.quant,
+        kv_dtype = empty(cfg.kv_dtype) ? "f16" : cfg.kv_dtype,
+        metal = empty(cfg.metal) ? "off" : cfg.metal,
+        gpu = cfg.gpu,
+        gpu_layers = gpu == "vulkan" ? int(gpu_detail_layers(cfg)) : cfg.gpu_layers,
+        gpu_stream = gpu == "vulkan" ? int(gpu_detail_stream(cfg)) : cfg.gpu_stream,
+        gpu_dn = gpu == "vulkan" ? gpu_detail_dn(cfg) : cfg.gpu_dn,
+        gpu_attn = gpu == "vulkan" ? gpu_detail_attn(cfg) : cfg.gpu_attn,
+        gpu_dense = cfg.gpu_dense,
+        gpu_vram_mb = cfg.gpu_vram_mb,
+        asr = cfg.asr,
+        mmproj = cfg.mmproj,
+        asr_workers = cfg.asr_workers > 0 ? cfg.asr_workers : 1,
+        ctx = cfg.ctx,
+        max_tokens = cfg.max_tokens > 0 ? cfg.max_tokens : 256,
+        streams = cfg.streams > 0 ? cfg.streams : 4,
+        threads = cfg.threads == 0 ? 16 : cfg.threads,
+        team_dispatch = empty(cfg.team_dispatch) ? "hybrid" : cfg.team_dispatch,
+        affinity = cfg.affinity,
+        chunk = cfg.chunk > 0 ? cfg.chunk : 64,
+        page_rows = cfg.page_rows > 0 ? cfg.page_rows : 64,
+        prefix = cfg.prefix,
+        flat = cfg.flat,
+        mtp = cfg.mtp))
+    var sources <- { for (k in CONFIG_KEYS); k => JV(g_cfg_sources?[k] ?? "default") }
+    var top <- {
+        "config" => config,
+        "sources" => JV(sources),
+        "authoritative" => JV(g_cfg_authoritative),
+        "config_path" => JV(cfg.config),
+        "save_path" => JV(save_path)
+    }
+    var doc = JV(top)
+    let text = write_json_compact(doc)
+    unsafe {
+        delete doc
+    }
+    return text
 }
 
 // Parse into global lifecycle state. The no-argument overload intentionally wraps clargs'
@@ -284,6 +480,7 @@ def parse_args() {
         request_exit()
         return
     }
+    mark_cli_sources(g_cfg)
     if (empty(g_cfg.config)) {
         // dictation-bot convention: a same-name config next to the program (or in cwd) loads
         // automatically, so a release bundle configures itself with no flags at all
@@ -417,10 +614,30 @@ def init() {
     to_log(LOG_INFO, "dasllama-server: logging to {get_das_root()}/logs/dasllama-server.log\n")
 
     log_tune_status("dasllama-server")
-    // metal mode lands BEFORE the load: != off pins the row-major backend the GPU kernels read
-    let metal_mode = pick_metal_mode(g_cfg.metal)
+    // GPU backend lands BEFORE the load: the metal mode pins the row-major backend the GPU
+    // kernels read, and the vulkan tier want must be armed before the load walk uploads stacks
+    let gpu = effective_gpu(g_cfg)
+    var metal_mode = pick_metal_mode(g_cfg.metal)
+    if (gpu == "metal") {
+        metal_mode = MetalMode.when_available
+    } elif (gpu == "metal-required") {
+        metal_mode = MetalMode.required
+    } elif (!empty(gpu)) {
+        metal_mode = MetalMode.off   // gpu = off | vulkan both keep metal out
+    }
     set_metal_mode(metal_mode)
     to_log(LOG_INFO, "dasllama-server: metal mode {get_metal_mode()}\n")
+    if (gpu == "vulkan") {
+        set_gpu_tier_want(GpuTierWant(
+            moe_layers = gpu_detail_layers(g_cfg), moe_stream = gpu_detail_stream(g_cfg),
+            vram_mb = int64(g_cfg.gpu_vram_mb), dn = gpu_detail_dn(g_cfg),
+            attn = gpu_detail_attn(g_cfg), dense = g_cfg.gpu_dense))
+        if (moe_gpu_tier_arm()) {
+            to_log(LOG_INFO, "dasllama-server: vulkan GPU tier armed (K={gpu_detail_layers(g_cfg)}, S={gpu_detail_stream(g_cfg)}, dn={gpu_detail_dn(g_cfg)}, attn={gpu_detail_attn(g_cfg)})\n")
+        } else {
+            to_log(LOG_WARNING, "dasllama-server: gpu = vulkan requested but the tier did not arm (no vulkan device, or this build lacks the vulkan module)\n")
+        }
+    }
     print("loading {g_cfg.model} ...\n")
     var m <- load_model(g_cfg.model, pick_quant(g_cfg.quant))
     if (ctx > 0l) {
@@ -434,6 +651,11 @@ def init() {
     if (!empty(g_cfg.asr)) {
         configure_asr_workers(g_cfg.asr, g_cfg.mmproj, g_cfg.asr_workers > 0 ? g_cfg.asr_workers : 1)
     }
+
+    // the /config surface: a config-less start saves beside the program (the same spot the
+    // auto-discovery in parse_args looks)
+    let save_path = !empty(g_cfg.config) ? g_cfg.config : path_join(get_this_module_dir(), "dasllama-server.toml")
+    set_config_surface(build_config_surface(g_cfg, save_path), save_path, g_cfg.model)
 
     g_server_ready = init_server(
         port, streams,
@@ -472,5 +694,8 @@ def main : int {
         maybe_collect_gc()
     }
     shutdown()
+    if (g_exit_code == 0 && server_restart_requested()) {
+        g_exit_code = 4   // watchdog contract: config-restart relaunch (3 stays tune-restart)
+    }
     return g_exit_code
 }

@@ -135,15 +135,27 @@ first — Windows locks the exe.
 
 | Method | Path | Notes |
 |---|---|---|
+| `GET`  | `/` | Control page: live stats (tok/s, streams, prefix cache, MTP/ASR), config, GC + drain buttons. Serves `control.html` from beside the server sources — polls `/v1/stats` at 1 Hz |
 | `GET`  | `/v1/models` | Lists the served model (and `--asr` if loaded) |
 | `POST` | `/v1/chat/completions` | Chat; `stream: true` → SSE, else buffered; OpenAI function calling (`tools`) |
 | `POST` | `/v1/completions` | Raw completion; `stream: true` → SSE, else buffered |
 | `POST` | `/v1/embeddings` | Mean-pooled, L2-normalized sentence embeddings |
 | `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`) |
 | `POST` | `/v1/audio/translations` | Speech→English text (needs `--asr`) |
-| `GET`  | `/v1/stats` | Scheduler counters plus `asr_workers`, `asr_ready`, `asr_active`, and `asr_pending` |
+| `GET`  | `/v1/stats` | Scheduler counters plus `model`/`ctx`/`uptime_s`/`draining` identity fields and `asr_workers`, `asr_ready`, `asr_active`, `asr_pending` |
+| `GET`  | `/config` | Effective config with per-key source (`default`/`cli`/`toml`), model files beside the served one, active rail (gguf vs prepared `.dlim`), GPU tier status (`supported` + `reason` when the loaded model can't ride it) |
+| `POST` | `/config` | Validate a `{key: value}` JSON body and write it as an **authoritative** TOML (`authoritative = true`) to the config path (or `dasllama-server.toml` beside the program on a config-less start). Applies on the next restart |
+| `POST` | `/restart` | Drain like `/shutdown`, then exit with code **4** — the watchdog relaunches, picking up the saved config (3 stays the tune-restart code) |
 | `POST` | `/gc` | Schedule a validated collection at the next lifecycle safe point; concurrent requests coalesce |
 | `POST` | `/shutdown` | Stop admitting new LLM/ASR work, drain accepted work, then exit |
+
+Config precedence: `defaults < config TOML < explicit CLI flags` — unless the TOML carries
+`authoritative = true` (what the control page saves), which flips the top: `defaults < CLI <
+authoritative TOML`. The `gpu` key (`off | metal | metal-required | vulkan`) is the first-class
+backend selector; `gpu = vulkan` arms the MoE tier with the blessed shape (K=2 resident + S=35
+streamed expert stacks + DN + ATTN) unless the `gpu_layers` / `gpu_stream` / `gpu_dn` / `gpu_attn`
+/ `gpu_dense` / `gpu_vram_mb` keys override it. The `DASLLAMA_GPU_*` env vars still override
+everything (they remain the A/B levers).
 
 ### Chat
 

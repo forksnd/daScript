@@ -583,11 +583,8 @@ def test_ok_inline_dotted_keys_share_implicit(t : T?) {
 
 [test]
 def test_fail_plus_prefix_identifier(t : T?) {
-    // F13: `+foo = 1` previously emitted an empty `_bare` token because the
-    // rewind-to-bare path lands the cursor on the '+' (which is not a
-    // bare-key char) and `read_bare_key` consumes nothing. '+' is not a valid
-    // bare-key prefix per TOML ABNF, so the correct outcome is a parse error
-    // that mentions the stray sign.
+    // F13: rewind-to-bare lands on '+' (not a bare-key char) — must be a parse
+    // error naming the stray sign, not an empty `_bare` token.
     t |> run("`+foo = 1` is rejected (stray '+', not empty bare key)") @@(t : T?) {
         expect_fail_with(t, "plus_prefix_bare", "+foo = 1\n", "'+'")
     }
@@ -595,10 +592,8 @@ def test_fail_plus_prefix_identifier(t : T?) {
 
 [test]
 def test_fail_plus_inf_with_bare_tail(t : T?) {
-    // F13 cousin: `+infinity_count = 1` enters classify_number_or_datetime
-    // via the value-continuation gate, consumes '+inf', sees a bare-char
-    // continuation, then rewinds. Because the rewind lands on '+' the bare
-    // scan would be empty — must error instead.
+    // F13 cousin: classifier consumes '+inf', sees a bare-char tail, rewinds
+    // onto '+' — the empty bare scan must error instead.
     t |> run("`+infinity_count = 1` is rejected (stray '+')") @@(t : T?) {
         expect_fail_with(t, "plus_inf_bare_tail", "+infinity_count = 1\n", "'+'")
     }
@@ -620,5 +615,62 @@ def test_fail_time_trailing_colon(t : T?) {
     // dedicated message anchored at the time value.
     t |> run("`x = 12:34:56:` errors with a time-specific message") @@(t : T?) {
         expect_fail_with(t, "time_trailing_colon", "x = 12:34:56:\n", "trailing ':'")
+    }
+}
+
+// ===== write_toml =====
+
+[test]
+def test_write_toml_exact(t : T?) {
+    t |> run("canonical emit: sorted keys, sections, array-of-tables") @@(t : T?) {
+        var v = expect_ok(t, "wt_exact", "b = 2\na = 1\n[s]\nk = \"v\"\n[[j]]\nn = 1\n[[j]]\nn = 2\n")
+        var err : string
+        let out = write_toml(v, err)
+        t |> equal(out, "a = 1\nb = 2\n\n[s]\nk = \"v\"\n\n[[j]]\nn = 1\n\n[[j]]\nn = 2\n")
+        t |> success(empty(err), "no write error")
+    }
+}
+
+[test]
+def test_write_toml_round_trip(t : T?) {
+    t |> run("write ∘ read is stable across value classes") @@(t : T?) {
+        let src = "i = 9007199254740993\nf = 4.0\npi = 3.141592653589793\nneg = -3\non = true\ns = \"a\\tb \\\"q\\\" \\u0001\"\narr = [\"a\", 3, 4.5, \{ nested = true }]\nempty_arr = []\ndate = 2024-01-15T10:00:00Z\n[tab.sub]\n\"weird key\" = \"x\"\n[[jobs]]\nsub = \{ a = 1, b = [1, 2] }\n"
+        var v = expect_ok(t, "wt_rt", src)
+        var err : string
+        let out1 = write_toml(v, err)
+        t |> success(empty(err), "first write clean")
+        var v2 = expect_ok(t, "wt_rt_reparse", out1)
+        let out2 = write_toml(v2, err)
+        t |> equal(out1, out2)
+        // int64 fidelity past double range; float-ness survives; datetime re-emits quoted
+        t |> success(find(out1, "i = 9007199254740993") >= 0, "int64 exact")
+        t |> success(find(out1, "f = 4.0") >= 0, "whole float keeps .0")
+        t |> success(find(out1, "date = \"2024-01-15T10:00:00Z\"") >= 0, "datetime becomes quoted string")
+    }
+}
+
+[test]
+def test_write_toml_non_finite(t : T?) {
+    t |> run("inf / -inf / nan emit as TOML keywords") @@(t : T?) {
+        var v = expect_ok(t, "wt_inf", "a = inf\nb = -inf\nc = nan\n")
+        var err : string
+        let out = write_toml(v, err)
+        t |> equal(out, "a = inf\nb = -inf\nc = nan\n")
+    }
+}
+
+[test]
+def test_write_toml_rejects(t : T?) {
+    t |> run("null values and non-table roots are unrepresentable") @@(t : T?) {
+        var nul = JVNull()
+        var tab <- { "k" => nul }
+        var doc = JV(tab)
+        var err : string
+        t |> success(empty(write_toml(doc, err)), "null value returns empty")
+        t |> success(find(err, "no null") >= 0, "null error names the problem")
+        var not_a_table = JV(3l)
+        t |> success(empty(write_toml(not_a_table, err)), "scalar root returns empty")
+        t |> success(find(err, "must be a table") >= 0, "root error names the problem")
+        t |> success(empty(write_toml(null, err)), "null root returns empty")
     }
 }
