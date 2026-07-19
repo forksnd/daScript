@@ -5,6 +5,7 @@ options stack = 131072   // several by-value Sessions per cell (test_batch_decod
 require dastest/testing_boost public
 require dasllama/dasllama   // nolint:STYLE029 — the public facade (engine + arch registrations + the metal overrides); off-Apple the static_if halves compile out and only its dasllama_common re-export stays referenced
 require dasllama/dasllama_math   // set_wscale_f16 — the wscale matrix axis
+require dasllama/dasllama_parity   // cached_ids/cached_vals — CPU references mapped like .dlim images
 require ?das_metal dasllama/dasllama_metal_llama  // nolint:STYLE030 — stats/declines/shutdown rails
 require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — prefill stats/declines rails
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — device probe + metal_live_object_count
@@ -755,18 +756,24 @@ def private gemma4_hetero_q8_row(t : T?; path : string) {
         var d4 = 0.0
         with_job_que() {
             setup_dasllama_jobque()
-            var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
-            let ids <- generate(tr, s, count_prompt, length(count_prompt) + 8)
-            cpu_ids := ids
-            delete s
+            cpu_ids <- cached_ids(path, "gen_c1_30_n8") $ {
+                var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                var ids <- generate(tr, s, count_prompt, length(count_prompt) + 8)
+                delete s
+                return <- ids
+            }
             select_decode_override("metal")
             var s2 = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
             let ids2 <- generate(tr, s2, count_prompt, length(count_prompt) + 8)
             gpu_ids := ids2
             delete s2
             select_decode_override("")
-            cpu_b2 <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)
-            var cpu_bl <- batch_quad_forced_logits(tr, count_prompt, count_prompt2, count_prompt3, count_prompt4, 4)
+            cpu_b2 <- cached_ids(path, "b2pair_c1c7_n4") $ {
+                return <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)
+            }
+            var cpu_bl <- cached_vals(path, "b4forced_n4") $ {
+                return <- batch_quad_forced_logits(tr, count_prompt, count_prompt2, count_prompt3, count_prompt4, 4)
+            }
             let ba0 = metal_batch_decode_stats().steps
             select_decode_override("metal")
             gpu_b2 <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)
@@ -834,14 +841,18 @@ def private gemma4_hetero_row(t : T?; path : string) {
         var served_bat = 0l
         with_job_que() {
             setup_dasllama_jobque()
-            var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
-            let ids <- generate(tr, s, prompt, length(prompt) + 24)
-            cpu_ids := ids
-            delete s
-            var sc = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
-            let idsc <- generate(tr, sc, count_prompt, length(count_prompt) + 8)
-            cpu_cnt_ids := idsc
-            delete sc
+            cpu_ids <- cached_ids(path, "gen_free_n24") $ {
+                var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                var ids <- generate(tr, s, prompt, length(prompt) + 24)
+                delete s
+                return <- ids
+            }
+            cpu_cnt_ids <- cached_ids(path, "gen_c1_30_n8") $ {
+                var sc = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+                var idsc <- generate(tr, sc, count_prompt, length(count_prompt) + 8)
+                delete sc
+                return <- idsc
+            }
             select_decode_override("metal")
             var s2 = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
             let ids2 <- generate(tr, s2, prompt, length(prompt) + 24)
@@ -860,7 +871,9 @@ def private gemma4_hetero_row(t : T?; path : string) {
             served_pf = metal_prefill_stats().prefills - pf0
             // B=2 batched-decode parity (counting margins — see the header note): CPU truth
             // then the batched metal override, 4 steps per stream over CPU-prefilled state
-            cpu_bat <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)
+            cpu_bat <- cached_ids(path, "b2pair_c1c7_n4") $ {
+                return <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)
+            }
             let ba0 = metal_batch_decode_stats().steps
             select_decode_override("metal")
             gpu_bat <- batch_pair_steps(tr, count_prompt, count_prompt2, 4)

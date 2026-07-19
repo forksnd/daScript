@@ -343,6 +343,20 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
+- **Per-config .dlim: map-only load, Metal planes baked (design ruling 2026-07-18).** The
+  image contract is "no processing on load FOR THE CONFIG IT WAS BUILT FOR" — an image is
+  box+backend-flavored already (identity hash), so the Metal flavor should carry the
+  METAL-ready forms in place of the CPU planar ones, not beside them: the 34-byte block_q8_0
+  blob (today a ~3s-per-model scalar repack in `metal_blob_region` at first mul_mm use), the
+  kq 16B compact scale strips (today repacked 20B→16B at upload), page-aligned sections
+  wrapped as no-copy MTLBuffers (`newBufferWithBytesNoCopy` — needs a small das_metal C++
+  binding), keeping only the genuinely-CPU smalls (embed rows, norm planes, tokenizer).
+  Size stays ~1x per flavor; every upload copy and load-time repack disappears; in-process
+  CPU inference on a Metal-flavor image stops being supported (the CPU-prefill tripwire and
+  the `dasllama_parity` ref caches already push that work to the CPU flavor). Costs today:
+  ~3s/model first-use repack + the one-time upload copies of every big plane. Image
+  serializer version gate + image-suite mechanics arm when built; half-day-class.
+
 - **QK-norm rope-store fusion — the f16 single-stream H-form SHIPPED (wave A chase round 2);
   the rest of the family is the residual (2026-07-17).** MetalRopeStoreHF16 folds bias +
   per-head RMS + rope + store into one threadgroup-per-head dispatch on QK-norm x f16-mirror

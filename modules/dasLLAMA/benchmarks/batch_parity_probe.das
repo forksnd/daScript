@@ -223,7 +223,7 @@ def main() : int {
     let nsteps = max(int64(cfg.steps), 1l)
     print("loading {cfg.model}\n")
     var t <- load_model(cfg.model, QuantMode.q8)
-    t.config.seq_len = min(t.config.seq_len, 512l)
+    t.config.seq_len = min(t.config.seq_len, 1024l)   // B=16's deepest stream (30+7*15 numbers) needs ~500 + steps
     print("config: dim={t.config.dim} layers={t.config.n_layers} vocab={t.config.vocab_size}  backend {active_kernel_backend()}\n")
     var rc = 0
     with_job_que() {
@@ -255,9 +255,14 @@ def main() : int {
                 delete truth
                 continue
             }
+            // the replay's prompt prefills ride the GPU too — CPU-portable prefill of the deep
+            // streams (~4300 tokens at B=16) was minutes per run vs seconds of actual replay,
+            // and sharing the GPU prefill across A/B arms keeps rail-on/off diffs prefill-free
+            select_prefill_override("metal")
             select_decode_override("metal")
             var sink2 : array<int64>
             var gpu <- teacher_logits(t, nb, nsteps, feeds, sink2)
+            select_prefill_override("")
             select_decode_override("")
             delete sink2
             var d = 0.0f
