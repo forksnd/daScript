@@ -56,7 +56,8 @@ def public metal_decode_shutdown {
 // what each decode path's kernels implement beyond the base llama dense block — grows wave by wave.
 let DECODE_NEEDS_OK = (MetalNeed.neox | MetalNeed.qkv_bias | MetalNeed.qk_norm | MetalNeed.qd_neq_dim |
     MetalNeed.softcap | MetalNeed.sliding | MetalNeed.pre_post_norm | MetalNeed.geglu |
-    MetalNeed.v_norm | MetalNeed.attn_scale | MetalNeed.out_scale)
+    MetalNeed.v_norm | MetalNeed.attn_scale | MetalNeed.out_scale |
+    MetalNeed.sinks | MetalNeed.out_bias)
 let BATCH_NEEDS_OK = DECODE_NEEDS_OK
 
 def private decode_shape_decline(t : Model; needs_ok : MetalNeed; allow_moe : bool = false) : MetalDecodeDecline {
@@ -1585,6 +1586,8 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     var u_moe_kdim = moe ? uniform_u32(uint(c.n_expert_used * dim)) : null
     var u_moe_tot = moe ? uniform_u32(uint(nrows * knfe)) : null
     var u_moe_invd = g4moe ? uniform_f32(1.0 / sqrt(float(dim))) : null
+    var u_moe_gmode = moe ? uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : 0u) : null
+    var u_hass = c.attn_sinks ? uniform_u32(1u) : null
     var u_xs4_dim = mv ? uniform_u32(uint(dim / 4l)) : null
     var u_xs4_qd = mv ? uniform_u32(uint(qd / 4l)) : null
     var u_xs4_qd_sw = (mv && hetero) ? uniform_u32(uint(qd_sw / 4l)) : null   // the wo x stride's sliding-class twin
@@ -1786,6 +1789,10 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 }
             }
             if (g_skip != "attn") {
+                var bsnk : MetalBuffer?   // null = the enc defaults bind the identity
+                if (c.attn_sinks) {
+                    bsnk = upload_region(addr < void? >(t.fblob[t.sinks_off + l * n_heads]), uint64(n_heads * 4l))
+                }
                 if (use_attn_d) {
                     bar_dep(enc, haz, HZ_BQKV | HZ_ARENA, HZ_BPART)
                     if (tq4) {
@@ -1816,18 +1823,18 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                             u_softcap, bwin, nrows, nchmax, n_heads, hs_l)
                     }
                     bar_dep(enc, haz, HZ_BPART, HZ_BXB)
-                    enc_attn_comb_b(enc, bpart, bxb, brt, u_nch, u_nh, u_hs_l, bwin, nrows, n_heads, hs_l)
+                    enc_attn_comb_b(enc, bpart, bxb, brt, u_nch, u_nh, u_hs_l, bwin, nrows, n_heads, hs_l, bsnk, u_hass)
                 } else {
                     bar_dep(enc, haz, HZ_BQKV | HZ_ARENA, HZ_BXB)
                     if (tq4) {
                         enc_attn_b_tq4(enc, bqkv, bxb, brt, ulay, u_nblk_l, u_nh, u_kvm_l, u_hs_l, u_scale_l, u_qkvd_l,
-                            u_softcap, nrows, n_heads, hs_l)
+                            u_softcap, nrows, n_heads, hs_l, bsnk, u_hass)
                     } elif (blockc) {
                         enc_attn_b_q8(enc, bqkv, bxb, brt, ulay, u_nblk_l, u_nh, u_kvm_l, u_hs_l, u_scale_l, u_qkvd_l,
-                            u_softcap, nrows, n_heads, hs_l)
+                            u_softcap, nrows, n_heads, hs_l, bsnk, u_hass)
                     } else {
                         enc_attn_b(enc, f16, bqkv, bxb, brt, ulay, u_kvd_l, u_nh, u_kvm_l, u_hs_l, u_scale_l, u_qkvd_l,
-                            u_softcap, nrows, n_heads, hs_l)
+                            u_softcap, nrows, n_heads, hs_l, bsnk, u_hass)
                     }
                 }
                 if (tq4) {
@@ -1865,6 +1872,11 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     }
                 }
             }
+            if (c.attn_out_bias && g_skip != "gemv") {
+                var bwo_b = upload_region(addr < void? >(t.bo[l * dim]), uint64(dim * 4l))
+                bar_dep(enc, haz, HZ_BXB2, HZ_BXB2)
+                enc_ew2(enc, g_pso_add, bxb2, 0ul, bwo_b, 0ul, u_total_dim, nrows * dim)
+            }
             // ffn: [post-attn norm ->] fused add+norm -> W1 / W3 (the cat region at byte offsets)
             // -> swiglu/geglu -> W2 [-> post-ffn norm] -> fused add + the NEXT layer's attention
             // norm (plain add on the last). pre_post_norm norms the branch output in place first.
@@ -1900,6 +1912,12 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 let fe1 = kq_fmt_at(t.we1_fmt, l)
                 let fe3 = kq_fmt_at(t.we3_fmt, l)
                 var bw_rt = upload_region(addr < void? >(t.fblob[t.router_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
+                var brb : MetalBuffer? = g_one
+                var bhrb = u_zero32
+                if (c.moe_router_bias) {
+                    brb = upload_region(addr < void? >(t.fblob[t.router_b_off + l * c.n_expert]), uint64(c.n_expert * 4l))
+                    bhrb = u_moe_gmode
+                }
                 if (g4moe) {
                     var bw_p2 = upload_region(addr < void? >(t.fblob[t.rms_pre_ffn2_off + l * dim]), uint64(dim * 4l))
                     bar_dep(enc, haz, HZ_BX, HZ_BMG4X)
@@ -1908,36 +1926,55 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     bar_dep(enc, haz, HZ_BX, HZ_BMRT)
                     enc_g4_router_norm(enc, bx, bw_rs, bmg4rt, u_dim, u_eps, u_moe_invd, nrows)
                     bar_dep(enc, haz, HZ_BMRT, HZ_BMLG)
-                    enc_moe_router(enc, bw_rt, bmg4rt, bmlg, u_dim, u_moe_ne, u_dim, g_one, u_zero32, c.n_expert, nrows)
+                    enc_moe_router(enc, bw_rt, bmg4rt, bmlg, u_dim, u_moe_ne, u_dim, brb, bhrb, c.n_expert, nrows)
                 } else {
                     bar_dep(enc, haz, HZ_BXB, HZ_BMLG)
-                    enc_moe_router(enc, bw_rt, bxb, bmlg, u_dim, u_moe_ne, u_dim, g_one, u_zero32, c.n_expert, nrows)
+                    enc_moe_router(enc, bw_rt, bxb, bmlg, u_dim, u_moe_ne, u_dim, brb, bhrb, c.n_expert, nrows)
                 }
                 bar_dep(enc, haz, HZ_BMLG, HZ_BMSEL)
-                enc_moe_select(enc, bmlg, bmsel, u_moe_ne, u_moe_k, u_zero32, nrows)
+                enc_moe_select(enc, bmlg, bmsel, u_moe_ne, u_moe_k, u_moe_gmode, nrows)
                 if (g4moe) {
                     var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
                     bar_dep(enc, haz, HZ_BMSEL, HZ_BMSEL)
                     enc_moe_wscale(enc, bmsel, bw_ds, u_moe_k, nrows)
                 }
                 bar_dep(enc, haz, hz_ex | HZ_BMSEL, hz_gh | hz_gh2)
-                enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bex, bgh,
-                    u_dim, u_moe_nfe, bmsel, fe1 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_zero32,
-                    u_moe_ss, u_dim, u_moe_knfe)
-                enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bex, bgh2,
-                    u_dim, u_moe_nfe, bmsel, fe3 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_zero32,
-                    u_moe_ss, u_dim, u_moe_knfe)
+                if (t.experts_mx4) {
+                    var bwb1 = upload_region(addr < void? >(t.fblob[t.web1_off + l * c.n_expert * c.n_ff_exp]), uint64(c.n_expert * c.n_ff_exp * 4l))
+                    var bwb3 = upload_region(addr < void? >(t.fblob[t.web3_off + l * c.n_expert * c.n_ff_exp]), uint64(c.n_expert * c.n_ff_exp * 4l))
+                    enc_moe_gemv_mx4(enc, t, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bex, bgh,
+                        u_dim, u_moe_nfe, bmsel, u_moe_eblk, u_zero32,
+                        u_moe_ss, u_dim, u_moe_knfe, bwb1, u_moe_gmode)
+                    enc_moe_gemv_mx4(enc, t, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bex, bgh2,
+                        u_dim, u_moe_nfe, bmsel, u_moe_eblk, u_zero32,
+                        u_moe_ss, u_dim, u_moe_knfe, bwb3, u_moe_gmode)
+                } else {
+                    enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bex, bgh,
+                        u_dim, u_moe_nfe, bmsel, fe1 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_zero32,
+                        u_moe_ss, u_dim, u_moe_knfe)
+                    enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, nrows, bex, bgh2,
+                        u_dim, u_moe_nfe, bmsel, fe3 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_zero32,
+                        u_moe_ss, u_dim, u_moe_knfe)
+                }
             }
             if (moe && g_skip != "ew") {
                 bar_dep(enc, haz, hz_gh | hz_gh2, hz_gh)
-                enc_ew2(enc, g4moe ? g_pso_geglu : g_pso_swiglu, bgh, 0ul, bgh2, 0ul, u_moe_tot, nrows * knfe)
+                let pso_act = c.ffn_act == FfnAct.swiglu_oai ? g_pso_swiglu_oai : (g4moe ? g_pso_geglu : g_pso_swiglu)
+                enc_ew2(enc, pso_act, bgh, 0ul, bgh2, 0ul, u_moe_tot, nrows * knfe)
             }
             if (moe && g_skip != "gemv") {
                 let fe2 = kq_fmt_at(t.we2_fmt, l)
                 bar_dep(enc, haz, hz_gh | HZ_BMSEL, HZ_BMDN)
-                enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, nrows, bgh, bmdn,
-                    u_moe_nfe, u_dim, bmsel, fe2 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_xs_dn,
-                    u_moe_ss, u_moe_knfe, u_moe_kdim)
+                if (t.experts_mx4) {
+                    var bwb2 = upload_region(addr < void? >(t.fblob[t.web2_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
+                    enc_moe_gemv_mx4(enc, t, t.we2_offs[l], dim, c.n_expert_used, nrows, bgh, bmdn,
+                        u_moe_nfe, u_dim, bmsel, u_moe_eblk, u_moe_xs_dn,
+                        u_moe_ss, u_moe_knfe, u_moe_kdim, bwb2, u_moe_gmode)
+                } else {
+                    enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, nrows, bgh, bmdn,
+                        u_moe_nfe, u_dim, bmsel, fe2 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_xs_dn,
+                        u_moe_ss, u_moe_knfe, u_moe_kdim)
+                }
                 bar_dep(enc, haz, HZ_BMDN | HZ_BMSEL, g4moe ? HZ_BMRT : HZ_BXB)
                 enc_moe_combine(enc, bmdn, bmsel, g4moe ? bmg4rt : bxb, u_dim, u_moe_k, dim, nrows)
                 if (g4moe && g_skip != "ew") {
@@ -2183,6 +2220,10 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
             g_lp_pooled |> push((buf = bmgh2, size = bytes_mgh))
             g_lp_upooled |> push((buf = u_moe_invd, size = 4ul))
         }
+        g_lp_upooled |> push((buf = u_moe_gmode, size = 4ul))
+    }
+    if (u_hass != null) {
+        g_lp_upooled |> push((buf = u_hass, size = 4ul))
     }
     if (use_attn_d) {
         g_lp_upooled |> push((buf = u_nsgs, size = 4ul))

@@ -968,19 +968,28 @@ def moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
 // per-expert down scales); softmax + norm_topk gating, no biases / mx4 / dense-lead.
 def moe_metal_ok(t : Model) : bool {
     let c = t.config
-    if (!c.moe || c.n_ff_shexp > 0l || c.n_layer_dense_lead > 0l ||
-            c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
-            c.moe_router_bias || c.moe_exps_bias || c.moe_exp_probs || t.experts_mx4 ||
+    if (!c.moe || c.n_ff_shexp > 0l || c.n_layer_dense_lead > 0l || c.moe_exp_probs ||
             (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0)) {
         return false
     }
-    if (c.moe_dense_shexp) {
-        if (c.ffn_act != FfnAct.gelu || t.moe_router_scale_off < 0l || t.moe_down_scale_off < 0l ||
+    if (t.experts_mx4) {
+        // gpt-oss: softmax_weight top-k on raw logits, router + per-expert biases, clamped
+        // swiglu, disk-order mx4 stacks (the CPU laneq repack has no GPU carry)
+        if (c.moe_gate != MoeGate.softmax_weight || c.ffn_act != FfnAct.swiglu_oai ||
+                !c.moe_router_bias || !c.moe_exps_bias || c.moe_dense_shexp || t.mx4_repacked ||
+                t.router_b_off < 0l || t.web1_off < 0l || t.web2_off < 0l || t.web3_off < 0l) {
+            return false
+        }
+    } elif (c.moe_dense_shexp) {
+        if (c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
+                c.moe_router_bias || c.moe_exps_bias ||
+                c.ffn_act != FfnAct.gelu || t.moe_router_scale_off < 0l || t.moe_down_scale_off < 0l ||
                 t.rms_pre_ffn2_off < 0l || t.rms_post_ffn1_off < 0l || t.rms_post_ffn2_off < 0l ||
                 int64(length(t.w1_offs)) < c.n_layers) {
             return false
         }
-    } elif (c.ffn_act != FfnAct.silu) {
+    } elif (c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
+            c.moe_router_bias || c.moe_exps_bias || c.ffn_act != FfnAct.silu) {
         return false
     }
     let ne = c.n_expert
@@ -993,6 +1002,20 @@ def moe_metal_ok(t : Model) : bool {
             ne * ege > 3800000000l ||   // uint32 in-kernel indices (q8 byte view = elements * 34/32)
             t.router_off < 0l || empty(t.we1_offs) || empty(t.we2_offs) || empty(t.we3_offs)) {
         return false
+    }
+    if (t.experts_mx4) {
+        // mx4 binds: nibble bytes at off/2 (%4 => off %8), E8M0 at off/32 (%4 => off %128)
+        if ((ege % 32l) != 0l) {
+            return false
+        }
+        for (l in range64(c.n_layers)) {
+            if (t.we1_offs[l] < 0l || (t.we1_offs[l] % 128l) != 0l ||
+                    t.we2_offs[l] < 0l || (t.we2_offs[l] % 128l) != 0l ||
+                    t.we3_offs[l] < 0l || (t.we3_offs[l] % 128l) != 0l) {
+                return false
+            }
+        }
+        return true
     }
     for (l in range64(c.n_layers)) {
         let f1 = moe_fmt_at(t.we1_fmt, l)

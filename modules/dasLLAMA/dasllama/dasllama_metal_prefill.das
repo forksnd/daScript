@@ -3603,7 +3603,8 @@ var private g_pf_upool : MetalBufferPool     // UNTRACKED pool: uniforms + rope 
 // what the prefill kernels implement beyond the base llama dense block — grows wave by wave
 let PF_NEEDS_OK = (MetalNeed.neox | MetalNeed.qkv_bias | MetalNeed.qk_norm | MetalNeed.qd_neq_dim |
     MetalNeed.softcap | MetalNeed.sliding | MetalNeed.pre_post_norm | MetalNeed.geglu |
-    MetalNeed.v_norm | MetalNeed.attn_scale | MetalNeed.out_scale)
+    MetalNeed.v_norm | MetalNeed.attn_scale | MetalNeed.out_scale |
+    MetalNeed.sinks | MetalNeed.out_bias)
 
 var private g_min_npos = 64l
 var private g_max_npos = 2048l          // naive-attention P footprint cap: heads x npos^2 floats
@@ -4639,6 +4640,8 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     var u_moe_g1 = moe ? pf_uniform_u32(1u) : null
     var u_moe_ptot = moe ? pf_uniform_u32(uint(mpad * c.n_ff_exp)) : null
     var u_moe_invd = g4moe ? pf_uniform_f32(1.0 / sqrt(float(dim))) : null
+    var u_moe_gmode = moe ? pf_uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : 0u) : null
+    var u_hass = c.attn_sinks ? pf_uniform_u32(1u) : null
     var u_scale = pf_uniform_f32(scale)
     var u_eps = pf_uniform_f32(c.norm_eps)
     var u_softcap = pf_uniform_f32(c.attn_logit_softcap)
@@ -4834,7 +4837,11 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         }
                     }
                     if (g_pf_skip != "attn_sm") {
-                        enc_softmax(enc, batt, u_np32, u_qoff, u_qrows, bwin, u_softcap, npos, n_heads)
+                        var bsnk : MetalBuffer?
+                        if (c.attn_sinks) {
+                            bsnk = pf_upload_region(unsafe(addr < void? >(t.fblob[t.sinks_off + l * n_heads])), uint64(n_heads * 4l))
+                        }
+                        enc_softmax(enc, batt, u_np32, u_qoff, u_qrows, bwin, u_softcap, npos, n_heads, bsnk, u_hass)
                     }
                     if (g_pf_skip != "attn_av") {
                         if (mmattn) {
@@ -4851,6 +4858,10 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     } else {
                         let bwob = pf_blob_of(t, t.wo_offs[l])
                         enc_gemm_mm(enc, bwob.buf, bwob.boff, bxb, bxb2, u_qd_l, u_dim, mp, dim)
+                    }
+                    if (c.attn_out_bias) {
+                        var bwo_b = pf_upload_region(unsafe(addr < void? >(t.bo[l * dim])), uint64(dim * 4l))
+                        enc_add_bias_rows(enc, bxb2, bwo_b, u_dim, u_total_dim, npos * dim)
                     }
                 }
                 // ffn: [post-attn norm ->] [WO residual +] norm -> [requant ->] W1/W3 ->
@@ -4876,24 +4887,49 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         var bw_rs = pf_upload_region(unsafe(addr < void? >(t.fblob[t.moe_router_scale_off + l * dim])), uint64(dim * 4l))
                         pf_enc_g4_router_norm(enc, bx, bw_rs, bmg4rt, u_dim, u_eps, u_moe_invd, npos)
                     }
+                    var brb : MetalBuffer? = g_pf_one
+                    var bhrb = u_moe_g0
+                    if (c.moe_router_bias) {
+                        brb = pf_upload_region(unsafe(addr < void? >(t.fblob[t.router_b_off + l * c.n_expert])), uint64(c.n_expert * 4l))
+                        bhrb = u_moe_gmode
+                    }
                     pf_enc_moe_route(enc, t, l, g4moe ? bmg4rt : bxb, bmlg, bmsel, bmcnt, bmbase, bmbkt, bminv,
-                        u_dim, u_moe_ne, u_moe_nk, u_moe_g0, g_pf_one, u_moe_g0, u_moe_tot, npos)
+                        u_dim, u_moe_ne, u_moe_nk, u_moe_gmode, brb, bhrb, u_moe_tot, npos)
                     if (g4moe) {
                         var bw_ds = pf_upload_region(unsafe(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert])), uint64(c.n_expert * 4l))
                         pf_enc_moe_wscale(enc, bmsel, bw_ds, u_moe_nk, npos)
                     }
-                    pf_enc_moe_mm(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg,
-                        u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe1 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
-                    pf_enc_moe_mm(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg2,
-                        u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe3 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
+                    if (t.experts_mx4) {
+                        var bwb1 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.web1_off + l * c.n_expert * c.n_ff_exp])), uint64(c.n_expert * c.n_ff_exp * 4l))
+                        var bwb3 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.web3_off + l * c.n_expert * c.n_ff_exp])), uint64(c.n_expert * c.n_ff_exp * 4l))
+                        pf_enc_moe_mm_mx4(enc, t, t.we1_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg,
+                            u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, u_moe_eblk, u_moe_nk, u_moe_g1)
+                        pf_enc_moe_mm_mx4(enc, t, t.we3_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg2,
+                            u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, u_moe_eblk, u_moe_nk, u_moe_g1)
+                        pf_enc_moe_bias_rows(enc, bmg, bwb1, bmcnt, bmbase, u_moe_nfe, c.n_ff_exp, npos, c.n_expert)
+                        pf_enc_moe_bias_rows(enc, bmg2, bwb3, bmcnt, bmbase, u_moe_nfe, c.n_ff_exp, npos, c.n_expert)
+                    } else {
+                        pf_enc_moe_mm(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg,
+                            u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe1 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
+                        pf_enc_moe_mm(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg2,
+                            u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe3 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
+                    }
                 }
                 if (moe && g_pf_skip != "ew" && g_pf_skip != "nongemm") {
-                    pf_enc_ew2(enc, g4moe ? g_pf_pso_geglu : g_pf_pso_swiglu, bmg, bmg2, u_moe_ptot, mpad * c.n_ff_exp)
+                    let pso_act = c.ffn_act == FfnAct.swiglu_oai ? g_pf_pso_swiglu_oai : (g4moe ? g_pf_pso_geglu : g_pf_pso_swiglu)
+                    pf_enc_ew2(enc, pso_act, bmg, bmg2, u_moe_ptot, mpad * c.n_ff_exp)
                 }
                 if (moe && g_pf_skip != "gemm") {
                     let fe2 = pf_fmt_at(t.we2_fmt, l)
-                    pf_enc_moe_mm(enc, t, fe2, t.we2_offs[l], dim, npos, bmg, bmdn,
-                        u_moe_nfe, u_dim, bmcnt, bmbase, bmbkt, fe2 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g0)
+                    if (t.experts_mx4) {
+                        var bwb2 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.web2_off + l * c.n_expert * dim])), uint64(c.n_expert * dim * 4l))
+                        pf_enc_moe_mm_mx4(enc, t, t.we2_offs[l], dim, npos, bmg, bmdn,
+                            u_moe_nfe, u_dim, bmcnt, bmbase, bmbkt, u_moe_eblk, u_moe_nk, u_moe_g0)
+                        pf_enc_moe_bias_rows(enc, bmdn, bwb2, bmcnt, bmbase, u_dim, dim, npos, c.n_expert)
+                    } else {
+                        pf_enc_moe_mm(enc, t, fe2, t.we2_offs[l], dim, npos, bmg, bmdn,
+                            u_moe_nfe, u_dim, bmcnt, bmbase, bmbkt, fe2 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g0)
+                    }
                     pf_enc_moe_reduce(enc, bmdn, bmsel, bminv, g4moe ? bmg4rt : bxb, u_dim, u_moe_nk, dim, npos)
                     if (g4moe && g_pf_skip != "ew" && g_pf_skip != "nongemm") {
                         var bw_pf2 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.rms_post_ffn2_off + l * dim])), uint64(dim * 4l))
@@ -5174,6 +5210,10 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
         if (g4moe) {
             pool_release(g_pf_upool, u_moe_invd, 4ul)
         }
+        pool_release(g_pf_upool, u_moe_gmode, 4ul)
+    }
+    if (u_hass != null) {
+        pool_release(g_pf_upool, u_hass, 4ul)
     }
     pool_release(g_pf_upool, u_scale, 4ul)
     pool_release(g_pf_upool, u_eps, 4ul)
