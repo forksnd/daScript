@@ -75,18 +75,18 @@ def public float3x3(c0, c1, c2 : float3) : float3x3 {
 // ===== row-vector times matrix =====
 // GLSL's `v * m` (a ROW vector times m) that math lacks: component j is dot(v, column j), exactly
 // SPIR-V's OpVectorTimesMatrix, which the emitter lowers to -- so this CPU body runs only on the host.
-def public operator * (v : float4; m : float4x4) : float4 {
+def public operator *(v : float4; m : float4x4) : float4 {
     return float4(dot(v, m[0]), dot(v, m[1]), dot(v, m[2]), dot(v, m[3]))
 }
 
-def public operator * (v : float3; m : float3x3) : float3 {
+def public operator *(v : float3; m : float3x3) : float3 {
     return float3(dot(v, m[0]), dot(v, m[1]), dot(v, m[2]))
 }
 
 // ===== vector integer modulo =====
 // GLSL's `uvec3 % uvec3` that daslang lacks -> one native OpUMod (the emitter lowers it). Unsigned,
 // 3-lane only; signed `%` stays absent since daslang's OpSRem and GLSL's OpSMod differ on sign.
-def public operator % (a, b : uint3) : uint3 {
+def public operator %(a, b : uint3) : uint3 {
     return uint3(a.x % b.x, a.y % b.y, a.z % b.z)
 }
 

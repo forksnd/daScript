@@ -54,9 +54,9 @@ def mvarloc {
 // column form `m * v` beside it stays OpMatrixTimesVector, so the two spellings are not conflated.
 let MC_BASIS = float4x4(
     float4(-0.16666667f,  0.5f, -0.5f, 0.16666667f),
-    float4( 0.5f, -1.0f,  0.0f, 0.6666667f),
+    float4(0.5f, -1.0f,  0.0f, 0.6666667f),
     float4(-0.5f,  0.5f,  0.5f, 0.16666667f),
-    float4( 0.16666667f,  0.0f,  0.0f, 0.0f))
+    float4(0.16666667f,  0.0f,  0.0f, 0.0f))
 
 [vertex_shader(name="mvtm_spv"), marker(no_coverage)]
 def mvtm {
