@@ -194,7 +194,8 @@ def public watcher_find_session(session_id : string) : int {
 
 def public watcher_accepts_input(session_id : string) : bool {
     let index = watcher_find_session(session_id)
-    return index >= 0 && g_sessions[index] != null && g_sessions[index].state == "running"
+    return (index >= 0 && g_sessions[index] != null &&
+        g_sessions[index].state == "running" && !g_sessions[index].drained)
 }
 
 def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult {
@@ -290,9 +291,15 @@ def public watcher_tick(maximum_bytes_per_session : int = 64 * 1024) {
     for (index in range(length(g_sessions))) {
         var session = g_sessions[index]
         if (session == null) continue
-        if (session.drained) continue
-        let status = terminal_poll(session.terminal, bounded_bytes)
         let now_ms = elapsed_ms(session)
+        if (session.drained) {
+            // Pipe closure can race slightly ahead of the process handle. Keep
+            // observing lifecycle/timeout state after output is fully drained.
+            observe_exit(session, now_ms)
+            enforce_timeout(session, now_ms)
+            continue
+        }
+        let status = terminal_poll(session.terminal, bounded_bytes)
         if (status == TerminalPollStatus.data) {
             session.last_data_ms = now_ms
             session.output_bytes += int64(length(session.terminal.read_buffer))
@@ -345,7 +352,7 @@ def public watcher_output_since(session_id : string; requested_offset : int64;
 
 def private input_session(session : WatcherSession?; text : string; client_id : int) : string {
     if (session.controller_id != 0 && session.controller_id != client_id) return "controller lease is held by another client"
-    if (session.state != "running") return "session is not running"
+    if (session.state != "running" || session.drained) return "session is not running"
     if (!terminal_write(session.terminal, text)) return terminal_transport_error(session.terminal)
     return ""
 }

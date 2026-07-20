@@ -46,6 +46,15 @@ def test_watcher_process_lifecycle(t : T?) {
         t |> success(fexist(path_join(path_join(path_join(root, "sessions"), quick.session_id), "output.raw")),
             "raw output log exists")
 
+        for (iteration in range(6)) {
+            let close_race = watcher_launch(WatcherLaunchRequest(
+                command_line = "cmd.exe /d /c exit 0", cwd = root,
+                columns = 80, rows = 20, timeout_ms = 5000l))
+            t |> success(close_race.ok, close_race.error)
+            t |> success(wait_for(close_race.session_id, "exited", 5000l),
+                "pipe closure still converges to process exit ({iteration})")
+        }
+
         let hung = watcher_launch(WatcherLaunchRequest(
             command_line = "powershell.exe -NoProfile -Command \"Start-Sleep -Seconds 30\"",
             cwd = root, columns = 80, rows = 20, timeout_ms = 250l))
