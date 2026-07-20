@@ -134,6 +134,34 @@ The legacy `prompt` key is still accepted for deployed configs, but new configs 
 `dictation_prompt`. Keeping it separate from `assistant_prompt` prevents conversational personality
 from changing dictation.
 
+## Live control and prompt testing
+
+The bundled watchdog serves a localhost-only Cadmus control page at
+`http://127.0.0.1:8091/`. It shows bot/server state and recent structured activity, and provides:
+
+- live switches for transcription, cleanup, assistant replies, history retrieval, summaries,
+  web search, and background history import;
+- per-stage temperature, top-k, top-p, min-p, presence/frequency/repeat penalties, token budget,
+  and thinking controls;
+- live prompt overrides for cleanup, retrieval planning, assistant answers, and summaries;
+- a direct model playground which never writes chat history or sends a Telegram message; and
+- a model picker backed by dasllama-server's existing config/restart API.
+
+Live values are stored in `cadmus-runtime.json` next to the executable and are reloaded before new
+work without restarting Cadmus. The release does not own this file, so it survives upgrades. An
+empty prompt override selects that stage's built-in prompt, which the page shows as placeholder
+text. Thinking defaults to off for every bot stage; enable it deliberately per stage or in the
+playground.
+
+Cadmus owns its own defaults: at startup it writes `cadmus-defaults.json` (feature flags, per-stage
+generation settings, and built-in prompt text) beside the executable, and the watchdog and control
+page read it from there rather than restating those values. Both fall back to their own defaults
+while the file is absent, so a first run before the bot has ever started still works.
+
+The control API is same-origin only. It requires a loopback `Host`, rejects a foreign `Origin`, and
+requires `Content-Type: application/json` on writes, so a page in another tab cannot drive the bot
+through the control port; violations return 403.
+
 ## Importing older Telegram history
 
 The HTTP Bot API cannot fetch arbitrary pre-existing chat or channel history. `getUpdates` exposes
@@ -173,39 +201,22 @@ Telegram Desktop produces more pages; use `--include-last-page` only after the e
 bin/daslang utils/daspkg/main.das -- release --root examples/telegram/dictation --out <staging>
 ```
 
-The release contains a standalone executable, runtime DLLs, required shared modules, and initializes
-the config template only when `dictation.toml` is absent. Re-releasing preserves the deployed
-`dictation.toml`; `cadmus.db` is not release-owned and is preserved as well.
+The release contains a standalone executable, `watchdog.py`, `control.html`, runtime DLLs, required shared modules,
+and initializes the config template only when `dictation.toml` is absent. Re-releasing preserves the
+deployed `dictation.toml`; `cadmus.db` and logs are not release-owned and are preserved as well.
 
-For a supervised deployment, use the watchdog shipped by the dasllama-server release to run the
-released bot without an HTTP health probe. It records process memory, shows a Windows notification
-after a crash, and restarts with bounded backoff. Relative log, PID, dump, crash-bundle, and stop
-paths resolve against `--cwd`, so Cadmus keeps all of its operational files under
-`E:/dictation-bot`. On watchdog shutdown it creates the stop file; Cadmus finishes its current poll
-or request, observes the file between work items, flushes its logger, and exits normally.
+The bundled watchdog has the Cadmus executable, config, working directory, logs, dump directory,
+and graceful-stop handshake built in. It shows a Windows notification after a crash, saves a crash
+bundle, and restarts with bounded backoff. Start it from the released directory with no arguments:
 
 ```powershell
-Set-Location E:/dasllama-server
-
-# Run once from an elevated PowerShell for the bot executable name.
-python ./watchdog.py `
-  --name cadmus `
-  --program E:/dictation-bot/dictation-bot.exe `
-  --cwd E:/dictation-bot `
-  --install-local-dumps
-
-# Normal day-to-day launch.
-python ./watchdog.py `
-  --name cadmus `
-  --program E:/dictation-bot/dictation-bot.exe `
-  --cwd E:/dictation-bot `
-  --log logs/cadmus-watchdog.log `
-  --pid-file logs/cadmus-watchdog.pid `
-  --no-health `
-  --stop-file logs/cadmus.stop `
-  --require-dumps `
-  -- --config E:/dictation-bot/dictation.toml
+Set-Location E:/dictation-bot
+python watchdog.py
 ```
 
-Creating `logs/cadmus.stop` also requests the same lifecycle-safe shutdown directly. The watchdog
-treats the bot's resulting exit code 0 as intentional and stops instead of restarting it.
+Then open `http://127.0.0.1:8091/` for the debugging console.
+
+Pressing Ctrl+C or creating `logs/cadmus.stop` requests a lifecycle-safe shutdown. Cadmus finishes
+its current poll or request, flushes its logger, and exits normally; the watchdog treats exit code 0
+as intentional and does not restart it. On Windows the watchdog uses the effective WER LocalDumps
+policy for `dictation-bot.exe` when one is installed and logs `wer_not_ready` when it is absent.

@@ -11,6 +11,9 @@ require math
 let CADMUS_ROLE_USER = "user"
 let CADMUS_ROLE_ASSISTANT = "assistant"
 
+// Import ASR retries across bot restarts; past this many failures a row is left alone.
+let IMPORT_MAX_ATTEMPTS = 5
+
 [sql_table(name = "cadmus_messages"),
  sql_index(fields = ("ChatId", "TelegramMessageId"), unique = true),
  sql_index(fields = ("ChatId", "MessageDate")),
@@ -498,13 +501,26 @@ def has_pending_cadmus_import_media(path : string) : bool {
     return ready
 }
 
-def requeue_failed_cadmus_import_media(path : string) {
+// Requeue only rows that still have attempts left. Without the bound a row that can never succeed
+// (audio the ASR model refuses, a corrupt file) is retried once per bot start, forever.
+def requeue_failed_cadmus_import_media(path : string; max_attempts : int) {
     with_cadmus_database(path) $(db) {
         db |> _sql_update(
             type<CadmusImportMedia>,
-            _.Status == "failed",
+            _.Status == "failed" && _.Attempts < max_attempts,
             (Status = "pending", LastError = ""))
     }
+}
+
+def count_exhausted_cadmus_import_media(path : string; max_attempts : int) : int {
+    var total = 0
+    with_cadmus_database(path) $(db) {
+        total = _sql(
+            db |> select_from(type<CadmusImportMedia>)
+               |> _where(_.Status == "failed" && _.Attempts >= max_attempts)
+               |> count())
+    }
+    return total
 }
 
 def finish_cadmus_import_transcription(
@@ -535,13 +551,14 @@ def finish_cadmus_import_transcription(
 def fail_cadmus_import_transcription(
                                      path : string;
                                      item : CadmusImportMedia;
-                                     error : string
+                                     error : string;
+                                     attempts : int
                                      ) {
     with_cadmus_database(path) $(db) {
         db |> _sql_update(
             type<CadmusImportMedia>,
             _.ChatId == item.ChatId && _.TelegramMessageId == item.TelegramMessageId,
-            (Status = "failed", Attempts = item.Attempts + 1, LastError = error))
+            (Status = "failed", Attempts = attempts, LastError = error))
     }
 }
 

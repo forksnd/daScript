@@ -157,3 +157,14 @@ def parse_cadmus_local_date(value : string; var from_time, until_time : int64&) 
     until_time = int64(mktime(year, month, day + 1, 0, 0, 0))
     return format_time(mktime(year, month, day, 12, 0, 0), "%Y-%m-%d") == value
 }
+
+// An ASR refusal that describes the input itself, not a transient server condition. Retrying one of
+// these re-runs the same rejected audio through the same model for the same answer, so the queue
+// spends its whole budget at once instead of re-attempting on every bot restart.
+def is_permanent_asr_failure(error : string) : bool {
+    let lower = to_lower(error)
+    return (lower |> contains("crosses the local-attention switch") ||
+            lower |> contains("clip audio to under") ||
+            lower |> contains("unsupported audio format") ||
+            lower |> contains("audio is empty"))
+}

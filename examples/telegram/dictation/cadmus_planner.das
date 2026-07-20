@@ -4,8 +4,10 @@ options gen2
 
 require daslib/defer
 require daslib/json_boost
+require daslib/strings_convert
 require strings
 require daslib/strings_boost
+require math                          // trunc/abs — integrality test for a JSON _number id
 
 struct CadmusRetrievalPlan {
     @rename = "action"
@@ -64,7 +66,38 @@ def private append_cadmus_query(var queries : array<string>&; value : string) {
             return
         }
     }
-    queries |> push_clone(query)
+    queries |> push(query)
+}
+
+def private parse_optional_plan_int64(value : JsonValue?; field : string;
+                                      var result : int64&; var error : string&) : bool {
+    if (value == null || value.value is _null) {
+        result = 0l
+        return true
+    }
+    if (value.value is _longint) {
+        result = value.value as _longint
+        return true
+    }
+    // The tokenizer only yields _longint for a bare integer; a fraction or exponent lands in _number.
+    // Accept only a value that is exactly an integer and fits int64 — truncating 63042.5 would
+    // silently anchor retrieval on a different row than the planner named.
+    if (value.value is _number) {
+        let number = value.value as _number
+        if (number == trunc(number) && abs(number) < 9.0e18lf) {
+            result = int64(number)
+            return true
+        }
+    }
+    if (value.value is _string) {
+        let parsed = try_to_int64(strip(value.value as _string))
+        if (!(parsed |> is_err)) {
+            result = parsed |> unwrap
+            return true
+        }
+    }
+    error = "planner field '{field}' must be an integer"
+    return false
 }
 
 def parse_cadmus_retrieval_plan(
@@ -90,15 +123,20 @@ def parse_cadmus_retrieval_plan(
         return false
     }
     delete plan.Queries
-    plan.Action := action
-    plan.Query := strip(js?["query"] ?? "")
-    plan.Sender := strip(js?["sender"] ?? "")
-    plan.AnswerLanguage := to_lower(strip(js?["answer_language"] ?? ""))
+    plan.Action = action
+    plan.Query = strip(js?["query"] ?? "")
+    plan.Sender = strip(js?["sender"] ?? "")
+    plan.AnswerLanguage = to_lower(strip(js?["answer_language"] ?? ""))
     plan.Limit = js?["limit"] ?? 0
-    plan.MessageId = js?["message_id"] ?? 0l
+    if (!parse_optional_plan_int64(js?["message_id"], "message_id", plan.MessageId, error)) {
+        return false
+    }
     plan.Before = js?["before"] ?? 5
     plan.After = js?["after"] ?? 5
-    plan.BeforeMessageId = js?["before_message_id"] ?? 0l
+    if (!parse_optional_plan_int64(
+            js?["before_message_id"], "before_message_id", plan.BeforeMessageId, error)) {
+        return false
+    }
     let queries_json = js?["queries"]
     if (queries_json != null && queries_json.value is _array) {
         for (item in queries_json.value as _array) {
@@ -109,7 +147,7 @@ def parse_cadmus_retrieval_plan(
     }
     append_cadmus_query(plan.Queries, plan.Query)
     if (empty(plan.Query) && !empty(plan.Queries)) {
-        plan.Query := plan.Queries[0]
+        plan.Query = plan.Queries[0]
     }
     if ((action == "search_messages" || action == "message_timeline" || action == "search_web") &&
         empty(plan.Query)) {

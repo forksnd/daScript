@@ -9,6 +9,7 @@ require daslib/strings_convert
 require sqlite/sqlite_migrate
 require math
 require cadmus_history
+require cadmus_rules                  // permanent-vs-transient ASR failure classification
 require telegram_history_import
 
 [CommandLineArgs]
@@ -161,8 +162,12 @@ def private transcribe_import_queue(
                     print("done ({length(result.transcript)} bytes; source #{result.index + 1})\n")
                 } else {
                     failures++
-                    fail_cadmus_import_transcription(args.database, result.item, result.error)
-                    print("FAILED: {result.error} (source #{result.index + 1})\n")
+                    let permanent = is_permanent_asr_failure(result.error)
+                    fail_cadmus_import_transcription(
+                        args.database, result.item, result.error,
+                        permanent ? IMPORT_MAX_ATTEMPTS : result.item.Attempts + 1)
+                    let verdict = permanent ? "FAILED permanently" : "FAILED"
+                    print("{verdict}: {result.error} (source #{result.index + 1})\n")
                 }
                 delete result
             }
