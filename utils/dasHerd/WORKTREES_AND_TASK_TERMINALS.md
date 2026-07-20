@@ -12,6 +12,12 @@ and settle each section before implementing the stage that depends on it.
 
 ## Established direction
 
+- A detachable command host is the foundation beneath dasHerd. Callers do not
+  own launched OS processes directly: JIT invocations, Git commands, setup
+  scripts, shells, tests, and agents all execute as hosted command sessions.
+- Every hosted command session has process state, a terminal, and a durable
+  log whether or not its terminal is currently visible. The UI and automation
+  attach to the session; detaching or closing the UI does not stop it.
 - Git observation is asynchronous from the first implementation. No Git
   command runs on the UI/render thread.
 - The application lists the main checkout and linked worktrees, and inspects
@@ -33,6 +39,54 @@ and settle each section before implementing the stage that depends on it.
 - Execution is not assumed to be local forever. A repository, worktree, Git
   process, setup task, shell, or agent may live behind SSH. The UI must always
   provide a route to the terminal that owns or can repair the operation.
+
+## Section 0: detachable command host
+
+Discussion status: foundational direction agreed; contract details open
+
+The host is not an agent-specific service added late in the product. It is the
+single execution building block used whenever dasHerd calls something. A JIT
+compiler run, a Git query, a setup recipe, a test, an interactive PowerShell,
+and a long-lived coding agent differ in profile and lifetime, not in whether
+they receive a hosted session.
+
+The caller supplies a target, working directory, structured command and
+arguments, environment additions, terminal geometry, and retention policy.
+The host owns:
+
+- process creation and lifetime;
+- the PTY and renderless terminal emulator;
+- input serialization;
+- terminal revisions, scrollback, title, CWD hints, and process status;
+- an append-only session log and bounded retained terminal state;
+- attach/detach and recovery after the UI disconnects;
+- explicit termination and final exit status.
+
+The same session remains inspectable while running and after exit. A terminal
+window is one client of that state, not its owner. Live commands, the human UI,
+and future agent routing attach through the same session contract.
+
+Structured callers such as the Git observer still receive an explicit command
+result and raw/captured output suitable for parsing. They do not reconstruct a
+result by scraping rendered cells. Their hosted terminal and log remain
+available for diagnostics even when the normal UI shows only structured state.
+
+The host must survive dasHerd UI exit from its first useful version. The later
+SSH design decides where the host process physically runs, but not whether the
+session has this contract.
+
+Questions to settle before implementation:
+
+- Host topology: one OS host process per command session, a supervisor with
+  child sessions, or a small supervisor plus isolated per-session hosts.
+- The local attach protocol, discovery records, versioning, and authentication.
+- Log format, rotation, crash consistency, terminal replay, and input-payload
+  privacy.
+- Whether very short structured commands allocate a PTY or use a capture mode
+  that still exposes the same terminal/log/session API.
+- Session retention after successful exit, failed exit, and explicit cleanup.
+- What state can be reconstructed after the command host itself crashes; a PTY
+  cannot be recovered if its owning process is gone.
 
 ## Section 1: repository, base, and worktree identity
 
@@ -67,11 +121,11 @@ Questions to settle:
 
 Discussion status: open
 
-Background observation needs structured, non-interactive results. It should
-use Git's porcelain/plumbing output without color and publish versioned
-snapshots to the UI. This path is separate from the human-facing task terminal:
-terminal text is useful diagnostics but is never the authority for repository
-state.
+Background observation needs structured, non-interactive results. It submits
+commands through the detachable host, uses Git's porcelain/plumbing output
+without color, and publishes versioned snapshots to the UI. Its hosted
+terminal and log remain addressable for diagnostics, but terminal text is
+never the authority for repository state.
 
 The initial observer covers:
 
@@ -91,7 +145,8 @@ Unicode remain supported.
 
 Worker rules:
 
-- invoke Git with argument arrays, never interpolated shell commands;
+- invoke Git through hosted sessions with argument arrays, never interpolated
+  shell commands;
 - send immutable/versioned results back to the UI thread;
 - discard stale generations and coalesce redundant refresh requests;
 - allow independent reads while serializing repository mutations;
@@ -339,14 +394,16 @@ Questions to settle later:
 
 This order is a discussion aid, not an approved implementation schedule:
 
-1. Settle Sections 1-3: identity, asynchronous observation, execution target.
-2. Implement the tested Git observer and the basic worktree/inspection app.
-3. Settle Sections 4-6: task terminals, live control, and UI navigation.
-4. Add worktree PowerShell terminals, Git activity/debug terminals, and the
+1. Settle Section 0 and the core of Section 5: host, log, terminal, attach, and
+   live-command contracts.
+2. Implement and stress the minimal local detachable host before building
+   worktree or agent policy on it.
+3. Settle Sections 1-3: identity, asynchronous observation, execution target.
+4. Implement the tested hosted Git observer and basic worktree/inspection app.
+5. Settle Sections 4 and 6: task-terminal behavior and UI navigation.
+6. Add worktree PowerShell terminals, Git activity/debug terminals, and the
    live-command terminal surface.
-5. Decide whether the detachable host must land before long-running setup.
-6. Settle and implement Section 7 creation/setup.
-7. Settle and implement Section 8 safe removal/recovery.
-8. Settle Section 9 before one-click durable agent launching and any
+7. Settle and implement Section 7 creation/setup.
+8. Settle and implement Section 8 safe removal/recovery.
+9. Settle Section 9 before one-click durable agent launching and any
    cross-agent or self-prompt automation.
-
