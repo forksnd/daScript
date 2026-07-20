@@ -42,7 +42,14 @@ def main {
 
     var server = new DasHerdWatcherServer()
     server.token = token
-    server.control_html = path_join(get_this_module_dir(), "control.html")
+    let watcher_dir = get_this_module_dir()
+    let vendor_dir = path_join(watcher_dir, "vendor/xterm")
+    server.control_html = path_join(watcher_dir, "control.html")
+    server.xterm_js = path_join(vendor_dir, "xterm.js")
+    server.xterm_css = path_join(vendor_dir, "xterm.css")
+    server.xterm_fit_js = path_join(vendor_dir, "addon-fit.js")
+    server.xterm_unicode_js = path_join(vendor_dir, "addon-unicode11.js")
+    server.xterm_web_links_js = path_join(vendor_dir, "addon-web-links.js")
     server->init(port)
     if (!server->set_bind_host("127.0.0.1")) {
         print("dasHerd watcher: could not select loopback bind address\n")

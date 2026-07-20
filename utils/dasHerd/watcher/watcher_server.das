@@ -24,6 +24,7 @@ struct private WatcherWsMessage {
     columns : int
     rows : int
     control : bool
+    raw : bool
 }
 
 class private WatcherClient {
@@ -34,6 +35,8 @@ class private WatcherClient {
     controls : bool
     last_heartbeat : int64
     last_update_key : string
+    raw : bool
+    raw_offset : int64
 }
 
 struct private WatcherOk {
@@ -69,6 +72,11 @@ def private query_value(url, key : string) : string {
 class DasHerdWatcherServer : HvWebServer {
     token : string
     control_html : string
+    xterm_js : string
+    xterm_css : string
+    xterm_fit_js : string
+    xterm_unicode_js : string
+    xterm_web_links_js : string
     clients : array<WatcherClient?>
     next_client_id : int
 
@@ -90,6 +98,26 @@ class DasHerdWatcherServer : HvWebServer {
         GET("/") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
             return resp |> SERVE_FILE(self.control_html)
+        }
+        GET("/vendor/xterm.js") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_js)
+        }
+        GET("/vendor/xterm.css") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_css)
+        }
+        GET("/vendor/addon-fit.js") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_fit_js)
+        }
+        GET("/vendor/addon-unicode11.js") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_unicode_js)
+        }
+        GET("/vendor/addon-web-links.js") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_web_links_js)
         }
         GET("/api/v1/health") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
@@ -179,6 +207,23 @@ class DasHerdWatcherServer : HvWebServer {
             ws_opcode.WS_OPCODE_TEXT, true)
     }
 
+    def send_raw_output(var client : WatcherClient?) {
+        if (client == null || !client.raw || empty(client.session_id)) return
+        var chunk <- watcher_output_since(client.session_id, client.raw_offset)
+        if (chunk.reset) {
+            let start_offset = chunk.next_offset - int64(length(chunk.bytes))
+            send(client.channel, "\{\"type\":\"raw_reset\",\"offset\":{start_offset}\}",
+                ws_opcode.WS_OPCODE_TEXT, true)
+        }
+        client.raw_offset = chunk.next_offset
+        if (!empty(chunk.bytes)) {
+            unsafe {
+                send(client.channel, reinterpret<string#>(addr(chunk.bytes[0])), length(chunk.bytes),
+                    ws_opcode.WS_OPCODE_BINARY, true)
+            }
+        }
+    }
+
     def detach(var client : WatcherClient?; detail : string) {
         if (client == null) return
         if (client.controls && !empty(client.session_id)) {
@@ -187,6 +232,8 @@ class DasHerdWatcherServer : HvWebServer {
         client.session_id = ""
         client.controls = false
         client.last_update_key = ""
+        client.raw = false
+        client.raw_offset = 0l
     }
 
     def override onWsOpen(channel : WebSocketChannel; url : string#) {
@@ -232,12 +279,15 @@ class DasHerdWatcherServer : HvWebServer {
             detach(client, "reattach")
             client.session_id = incoming.session_id
             client.controls = incoming.control && watcher_claim_controller(incoming.session_id, client.id)
+            client.raw = incoming.raw
+            client.raw_offset = 0l
             if (incoming.control && !client.controls) {
                 send_error(channel, "controller lease is held by another client")
             }
             send(channel, "\{\"type\":\"attached\",\"session_id\":{sprint_json(client.session_id, false)},\"controls\":{client.controls}\}",
                 ws_opcode.WS_OPCODE_TEXT, true)
             send_snapshot(client, true)
+            send_raw_output(client)
         } elif (incoming.op == "detach") {
             detach(client, "client_detached")
             send(channel, "\{\"type\":\"detached\"\}", ws_opcode.WS_OPCODE_TEXT, true)
@@ -271,6 +321,7 @@ class DasHerdWatcherServer : HvWebServer {
                 send_error(client.channel, "controller lease expired")
             }
             send_snapshot(client)
+            send_raw_output(client)
         }
     }
 

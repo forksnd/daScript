@@ -15,6 +15,8 @@ require math
 let private DEFAULT_DRAIN_QUIET_MS = 250l
 let private MAX_COMMAND_BYTES = 32 * 1024
 let private MAX_INPUT_BYTES = 1024 * 1024
+let private MAX_RAW_HISTORY_BYTES = 8 * 1024 * 1024
+let private RAW_HISTORY_TRIM_SLACK = 1024 * 1024
 
 struct public WatcherLaunchRequest {
     command_line : string
@@ -82,6 +84,12 @@ struct public WatcherLaunchResult {
     error : string
 }
 
+struct public WatcherOutputChunk {
+    bytes : array<uint8>
+    next_offset : int64
+    reset : bool
+}
+
 class private WatcherSession {
     id : string
     command_line : string
@@ -100,6 +108,8 @@ class private WatcherSession {
     exit_seen_ms : int64 = -1l
     exit_code : int64 = -1l
     output_bytes : int64
+    raw_history : array<uint8>
+    raw_history_start : int64
     status_revision : int64
     controller_id : int
     drained : bool
@@ -115,6 +125,20 @@ class private WatcherSession {
             events_file = null
         }
         terminal_dispose(terminal)
+    }
+}
+
+def private retain_raw_output(var session : WatcherSession?; bytes : array<uint8> const) {
+    if (empty(bytes)) return
+    let old_length = length(session.raw_history)
+    session.raw_history |> resize(old_length + length(bytes))
+    unsafe {
+        memcpy(addr(session.raw_history[old_length]), addr(bytes[0]), length(bytes))
+    }
+    if (length(session.raw_history) > MAX_RAW_HISTORY_BYTES + RAW_HISTORY_TRIM_SLACK) {
+        let discard = length(session.raw_history) - MAX_RAW_HISTORY_BYTES
+        session.raw_history |> erase(0, discard)
+        session.raw_history_start += int64(discard)
     }
 }
 
@@ -267,6 +291,7 @@ def public watcher_tick(maximum_bytes_per_session : int = 64 * 1024) {
         if (status == TerminalPollStatus.data) {
             session.last_data_ms = now_ms
             session.output_bytes += int64(length(session.terminal.read_buffer))
+            retain_raw_output(session, session.terminal.read_buffer)
             if (session.output_file != null) {
                 let _ = fwrite(session.output_file, session.terminal.read_buffer)
                 fflush(session.output_file)
@@ -287,6 +312,30 @@ def public watcher_tick(maximum_bytes_per_session : int = 64 * 1024) {
             finish_drain(session, "quiet_interval")
         }
     }
+}
+
+def public watcher_output_since(session_id : string; requested_offset : int64;
+        maximum_bytes : int = 256 * 1024) : WatcherOutputChunk {
+    var result = WatcherOutputChunk()
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return <- result
+    let session = g_sessions[index]
+    var offset = requested_offset
+    if (offset < session.raw_history_start || offset > session.output_bytes) {
+        offset = session.raw_history_start
+        result.reset = true
+    }
+    let available = session.output_bytes - offset
+    let count = min(int64(clamp(maximum_bytes, 1024, 1024 * 1024)), available)
+    if (count > 0l) {
+        let source = int(offset - session.raw_history_start)
+        result.bytes |> resize(int(count))
+        unsafe {
+            memcpy(addr(result.bytes[0]), addr(session.raw_history[source]), int(count))
+        }
+    }
+    result.next_offset = offset + count
+    return <- result
 }
 
 def private input_session(session : WatcherSession?; text : string; client_id : int) : string {

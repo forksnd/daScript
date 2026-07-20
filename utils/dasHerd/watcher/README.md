@@ -2,7 +2,8 @@
 
 The watcher is dasHerd's local detachable terminal host. One persistent JIT
 process owns multiple PTYs, terminal emulators, and durable session logs while
-browser and future native/live-command surfaces attach as clients.
+native/live-command surfaces attach as clients. The browser panel is an
+interactive debug and recovery fallback; the ImGui client remains the primary UI.
 
 Run it from the repository root:
 
@@ -19,8 +20,14 @@ authentication design. Do not expose this port through a proxy or tunnel.
 
 HTTP endpoints under `/api/v1/` provide health, session listing, launch,
 input, resize, and termination. `/ws` provides attach/detach, controller
-leases, heartbeats, input, resize, and terminal snapshots. Every request must
-include the startup token as the `token` query parameter.
+leases, heartbeats, input, resize, terminal snapshots, and bounded raw PTY replay.
+Raw output is delivered as binary WebSocket frames, so the browser can render
+the same color and control sequences and send keyboard input back to the PTY.
+Every request must include the startup token as the `token` query parameter.
+
+The browser terminal vendors xterm.js 5.5.0 with the matching fit 0.10.0,
+Unicode 11 0.8.0, and web-links 0.11.0 addons under `vendor/xterm/`. It works
+offline; the corresponding MIT license files are kept beside the assets.
 
 Session logs are stored under
 `logs/dasHerd/watcher/sessions/<session-id>/`. Closing a client releases its
