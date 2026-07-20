@@ -496,9 +496,9 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     // logits-on-GPU (default ON, DASLLAMA_METAL_LOGITS=0 pins the CPU classifier) mirrors the prefill gates
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
-    // tied-fp32 stays CPU; MTP (n_layer_nextn) keeps the CPU classifier (GPU logits would skip the mtp_h stash); blob models FORCE GPU logits — the CPU tail has no planes to read
+    // tied-fp32 stays CPU; blob models FORCE GPU logits (no CPU planes); MTP serves — finish_step stashes mtp_h from bxf
     r.gpu_logits = ((t.metal_blob || (!g_logits_cpu && get_env_variable("DASLLAMA_METAL_LOGITS") != "0" && empty(g_skip))) &&
-        !tied_f32 && c.n_layer_nextn == 0l &&
+        !tied_f32 &&
         t.wcls_off >= 0l)
     if (r.gpu_logits) {
         if (c.final_logit_softcap > 0.0) {   // cap*tanh epilogue rides after the classifier GEMV
@@ -1012,6 +1012,13 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
             if (r.gpu_logits && r.bnc == null) {   // zero-copy steps: the GPU already wrote s.logits
                 memcpy(addr < void? >(s.logits[0]), metal_buffer_contents(r.blog), int(r.bytes_log))
             }
+            if (r.gpu_logits && c.n_layer_nextn > 0l) {
+                // forward()'s mtp_h stash contract — bxf holds the post-final-norm hidden this row
+                memcpy(addr < void? >(s.mtp_h[0]), metal_buffer_contents(r.bxf), int(r.bytes_x))
+            }
+        }
+        if (r.gpu_logits && c.n_layer_nextn > 0l) {
+            s.mtp_h_pos1 = r.pos + 1l
         }
         if (r.gpu_logits) {
             decode_override_logits_done()
