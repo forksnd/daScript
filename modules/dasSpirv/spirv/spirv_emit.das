@@ -539,7 +539,7 @@ def private classify_mesh_output(var m : SpirvModule; var ctx : EmitCtx; v : Var
 // matrix / fixed array); returns 0 + a pushed error otherwise.
 def private build_plain_struct(var m : SpirvModule; sname : string; st : Structure?; var errors : array<string>) : uint {
     if (st == null || empty(st.fields)) {
-        errors |> push("@task_payload '{sname}' must be a struct with at least one field")
+        errors |> push("plain struct '{sname}' must be a struct with at least one field")
         return 0u
     }
     var members : array<uint>
@@ -548,7 +548,7 @@ def private build_plain_struct(var m : SpirvModule; sname : string; st : Structu
         // Offset / ArrayStride). Nested-struct fields would need a recursive PLAIN struct (build_block_struct
         // adds offsets, which TaskPayloadWorkgroupEXT must not have), so reject those fail-closed for now.
         if (!is_emittable_value_type(fld._type)) {
-            errors |> push("@task_payload '{sname}': field '{fld.name}' must be a scalar / vector / matrix / fixed array of those (nested-struct payload fields are not yet supported)")
+            errors |> push("plain struct '{sname}': field '{fld.name}' must be a scalar / vector / matrix / fixed array of those (nested-struct fields are not yet supported)")
             delete members
             return 0u
         }
@@ -561,6 +561,102 @@ def private build_plain_struct(var m : SpirvModule; sname : string; st : Structu
     delete ops
     delete members
     return id
+}
+
+// The undecorated OpTypeStruct behind a struct VALUE -- a struct-typed function parameter, result, or
+// local. Deduped by Structure identity, which build_plain_struct itself does not do: a payload emits
+// its type once, but a value struct is named by every signature and every construction that mentions
+// it, and each would otherwise mint a fresh (and, to spirv-val, distinct) OpTypeStruct.
+def private value_struct_type(var m : SpirvModule; st : Structure?; var errors : array<string>) : uint {
+    if (st == null) {
+        errors |> push("struct value: missing structure type")
+        return 0u
+    }
+    let key = "vstruct_{intptr(st)}"
+    let ex = m.type_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let id = build_plain_struct(m, "{st.name}", st, errors)
+    if (id != 0u) {
+        m.type_pool |> insert(key, id)
+    }
+    return id
+}
+
+// emit_type, plus the struct case it panics on. Only the sites that legitimately carry a struct VALUE
+// (function signatures, struct construction) go through this; everywhere else keeps emit_type, so a
+// struct still cannot slip into a std140 block layout or a @workgroup variable.
+def private emit_value_type(var m : SpirvModule; t : TypeDecl?; var errors : array<string>) : uint {
+    if (t != null && t.baseType == Type.tStructure) {
+        return value_struct_type(m, t.structType, errors)
+    }
+    return emit_type(m, t)
+}
+
+// ===== named layout-index constant resolution: @binding / @set / @location /
+// @input_attachment_index accept a module-scope `let` int constant by name, not only a literal =====
+
+// Fold a module-scope `let NAME = <int/uint const>` to its value. The layout annotations store an
+// identifier argument as a STRING, so `@binding = NAME` is resolved here by scanning the compiling
+// program's globals for a constant `let` of that name. The returned `found` is false when no such
+// int-constant global exists, letting the caller error instead of silently using the fallback.
+def private const_int_by_name(name : string) : tuple<found : bool; value : int> {
+    var result = 0
+    var got = false
+    program_for_each_module(compiling_program()) $(mod) {
+        for_each_global(mod) $(gv) {
+            if (!got && gv.name == name && gv._type != null && gv._type.flags.constant && gv.init != null) {
+                let ci = gv.init ?as ExprConstInt
+                if (ci != null) {
+                    result = ci.value
+                    got = true
+                } else {
+                    let cu = gv.init ?as ExprConstUInt
+                    if (cu != null) {
+                        result = int(cu.value)
+                        got = true
+                    } else {
+                        // A bool const folds to 0/1 -- lets a named boolean `let` (a config flag
+                        // in its das form) resolve where an int constant is expected.
+                        let cb = gv.init ?as ExprConstBool
+                        if (cb != null) {
+                            result = cb.value ? 1 : 0
+                            got = true
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return (found = got, value = result)
+}
+
+// Read an integer annotation arg. A literal int/uint is used as-is; an identifier (stored as a string
+// arg) resolves to a module-scope constant `let` of that name; an absent or wrong-typed arg yields
+// `deflt` (the historical `?as tInt ?? deflt` fallback). An unresolvable name is a hard error.
+// Used by the layout indices (@binding / @set / @location / @input_attachment_index / @enabled) and by
+// the [<stage>_shader] macro for local_size_{x,y,z}, so a shader names a platform-configured workgroup
+// size instead of hardcoding it. Public for spirv_shader.
+def public annotation_int(ann : AnnotationArgumentList; argn : string; deflt : int; var errors : array<string>) : int {
+    let rv = ann |> find_arg(argn)
+    if (rv is tInt) {
+        return rv as tInt
+    }
+    if (rv is tUInt) {
+        return int(rv as tUInt)
+    }
+    if (rv is tBool) {              // a literal bool arg (e.g. @enabled = false) -> 0/1
+        return (rv as tBool) ? 1 : 0
+    }
+    if (rv is tString) {
+        let nm = rv as tString
+        let r = const_int_by_name(nm)
+        if (!r.found) {
+            errors |> push("@{argn} = {nm}: not an integer constant `let` in scope")
+            return deflt
+        }
+        return r.value
+    }
+    return deflt
 }
 
 // ===== global variable classification + emission =====
@@ -600,12 +696,18 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         }
         // gl_PrimitiveID in a fragment of a mesh pipeline: the id is not fixed-function-generated, so
         // reading it pulls in MeshShadingEXT + SPV_EXT_mesh_shader (→ SPIR-V 1.4), same as the mesh stage.
-        // It is an integer fragment Input, so it MUST be Flat (no interpolation for ints; VUID-…-Flat-04744).
-        // In a CLOSEST-HIT shader the same builtin is the hit triangle's index: no interpolation happens
-        // there (Flat is fragment-interface-only) and the capability is RayTracingKHR, already enabled
-        // by the stage itself -- so the fragment-side extras are fragment-gated.
+        // In a CLOSEST-HIT shader the same builtin is the hit triangle's index, and the capability is
+        // RayTracingKHR, already enabled by the stage itself -- so this extra is fragment-gated.
         if (bi.bi == SpvBuiltIn.PrimitiveId && stage == ShaderStage.Fragment) {
             ensure_per_primitive(m, ctx)
+        }
+        // An integer-typed fragment Input cannot be interpolated, so SPIR-V requires it to be Flat
+        // (VUID-StandaloneSpirv-Flat-04744) -- gl_PrimitiveID is the int/uint-typed fragment Input
+        // emitted here. Flat is a fragment-interface rule: the same builtin in a closest-hit stage
+        // takes no decoration.
+        let builtin_cls = scalar_class(v._type.baseType)
+        if (stage == ShaderStage.Fragment && bi.storage == SpvStorageClass.Input &&
+            builtin_cls >= 0 && builtin_cls <= 1) {
             emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.Flat))
         }
         // The subgroup builtins are the GroupNonUniform feature's data plane, not part of the base
@@ -636,7 +738,7 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
             errors |> push("stage variable '{vname}' cannot be both @in and @out")
             return
         }
-        let loc = v.annotation |> find_arg("location") ?as tInt ?? -1
+        let loc = annotation_int(v.annotation, "location", -1, errors)
         if (loc < 0) {
             errors |> push("stage variable '{vname}' must specify a non-negative @location (e.g. @in @location = 0)")
             return
@@ -755,8 +857,8 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
             let pt = type_pointer(m, SpvStorageClass.UniformConstant, arr)
             let vid = alloc_id(m)
             emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.UniformConstant))
-            let set = v.annotation |> find_arg("set") ?as tInt ?? 0
-            let binding = v.annotation |> find_arg("binding") ?as tInt ?? 0
+            let set = annotation_int(v.annotation, "set", 0, errors)
+            let binding = annotation_int(v.annotation, "binding", 0, errors)
             if (set < 0 || binding < 0) {
                 errors |> push("sampler descriptor array '{vname}' set/binding must be non-negative (got set={set}, binding={binding})")
                 return
@@ -780,8 +882,8 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         let pt = type_pointer(m, SpvStorageClass.UniformConstant, simg)
         let vid = alloc_id(m)
         emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.UniformConstant))
-        let set = v.annotation |> find_arg("set") ?as tInt ?? 0
-        let binding = v.annotation |> find_arg("binding") ?as tInt ?? 0
+        let set = annotation_int(v.annotation, "set", 0, errors)
+        let binding = annotation_int(v.annotation, "binding", 0, errors)
         if (set < 0 || binding < 0) {
             errors |> push("sampler '{vname}' set/binding must be non-negative (got set={set}, binding={binding})")
             return
@@ -812,8 +914,8 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         let pt = type_pointer(m, SpvStorageClass.UniformConstant, img)
         let vid = alloc_id(m)
         emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.UniformConstant))
-        let set = v.annotation |> find_arg("set") ?as tInt ?? 0
-        let binding = v.annotation |> find_arg("binding") ?as tInt ?? 0
+        let set = annotation_int(v.annotation, "set", 0, errors)
+        let binding = annotation_int(v.annotation, "binding", 0, errors)
         if (set < 0 || binding < 0) {
             errors |> push("storage image '{vname}' set/binding must be non-negative (got set={set}, binding={binding})")
             return
@@ -844,9 +946,9 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         let pt = type_pointer(m, SpvStorageClass.UniformConstant, img)
         let vid = alloc_id(m)
         emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.UniformConstant))
-        let set = v.annotation |> find_arg("set") ?as tInt ?? 0
-        let binding = v.annotation |> find_arg("binding") ?as tInt ?? 0
-        let iax = v.annotation |> find_arg("input_attachment_index") ?as tInt ?? -1
+        let set = annotation_int(v.annotation, "set", 0, errors)
+        let binding = annotation_int(v.annotation, "binding", 0, errors)
+        let iax = annotation_int(v.annotation, "input_attachment_index", -1, errors)
         if (set < 0 || binding < 0) {
             errors |> push("subpassInput '{vname}' set/binding must be non-negative (got set={set}, binding={binding})")
             return
@@ -877,8 +979,8 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
             errors |> push("accelerationStructureEXT '{vname}' is only valid in a raygen / miss / closest-hit shader (ray queries from other stages are not supported yet)")
             return
         }
-        let set = v.annotation |> find_arg("set") ?as tInt ?? 0
-        let binding = v.annotation |> find_arg("binding") ?as tInt ?? 0
+        let set = annotation_int(v.annotation, "set", 0, errors)
+        let binding = annotation_int(v.annotation, "binding", 0, errors)
         if (set < 0 || binding < 0) {
             errors |> push("accelerationStructureEXT '{vname}' set/binding must be non-negative (got set={set}, binding={binding})")
             return
@@ -896,8 +998,8 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         return
     }
     if (stn == "texture2D" || stn == "sampler") {
-        let set = v.annotation |> find_arg("set") ?as tInt ?? 0
-        let binding = v.annotation |> find_arg("binding") ?as tInt ?? 0
+        let set = annotation_int(v.annotation, "set", 0, errors)
+        let binding = annotation_int(v.annotation, "binding", 0, errors)
         if (set < 0 || binding < 0) {
             errors |> push("'{vname}' set/binding must be non-negative (got set={set}, binding={binding})")
             return
@@ -934,8 +1036,8 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         let pt = type_pointer(m, SpvStorageClass.StorageBuffer, st)
         let vid = alloc_id(m)
         emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.StorageBuffer))
-        let set = v.annotation |> find_arg("set") ?as tInt ?? 0
-        let binding = v.annotation |> find_arg("binding") ?as tInt ?? 0
+        let set = annotation_int(v.annotation, "set", 0, errors)
+        let binding = annotation_int(v.annotation, "binding", 0, errors)
         if (set < 0 || binding < 0) {
             errors |> push("ssbo '{vname}' set/binding must be non-negative (got set={set}, binding={binding})")
             return
@@ -959,8 +1061,8 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         let pt = type_pointer(m, SpvStorageClass.Uniform, bs.type_id)
         let vid = alloc_id(m)
         emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.Uniform))
-        let set = v.annotation |> find_arg("set") ?as tInt ?? 0
-        let binding = v.annotation |> find_arg("binding") ?as tInt ?? 0
+        let set = annotation_int(v.annotation, "set", 0, errors)
+        let binding = annotation_int(v.annotation, "binding", 0, errors)
         if (set < 0 || binding < 0) {
             errors |> push("uniform '{vname}' set/binding must be non-negative (got set={set}, binding={binding})")
             return
@@ -1419,6 +1521,17 @@ def private vector_ctor(name : string) : tuple<ok : bool; n : int; cls : int; wi
     return (ok = false, n = 0, cls = -1, width = 0)
 }
 
+// matrix constructor name (float4x4/float3x3/float3x4) -> column-vector width + column count, else
+// ok=false. GLSL's `matCxR(col0, col1, ...)` column form takes `cols` column vectors, each a
+// floatW. daslang matrices are column-major (m[i] is column i), so the constituents map straight
+// onto OpCompositeConstruct's column operands. Mirrors matrix_info's name->dims table.
+def private matrix_ctor(name : string) : tuple<ok : bool; width : int; cols : int> {
+    if (name == "float4x4") return (ok = true, width = 4, cols = 4)
+    if (name == "float3x3") return (ok = true, width = 3, cols = 3)
+    if (name == "float3x4") return (ok = true, width = 3, cols = 4)
+    return (ok = false, width = 0, cols = 0)
+}
+
 // OpExtInstImport "GLSL.std.450" once per module; returns the cached set id.
 def private ensure_glsl_ext(var m : SpirvModule; var ctx : EmitCtx) : uint {
     if (ctx.glsl_ext != 0u) return ctx.glsl_ext
@@ -1610,6 +1723,9 @@ def private glsl_ext_op(name : string; cls : int) : tuple<ok : bool; op : GLSLst
         if (cls == 0) return (ok = true, op = GLSLstd450.SSign)
         return (ok = false, op = GLSLstd450.Round)
     }
+    // unpackHalf2x16 is the one op classified by an operand that is NOT a float: it takes the uint
+    // side of the pack and yields a float2, so it has to be named above the float-only cutoff.
+    if (name == "unpackHalf2x16") return (ok = true, op = GLSLstd450.UnpackHalf2x16)
     if (cls != 2) return (ok = false, op = GLSLstd450.Round)   // the rest are float-only
     if (name == "sqrt") return (ok = true, op = GLSLstd450.Sqrt)
     if (name == "rsqrt") return (ok = true, op = GLSLstd450.InverseSqrt)   // daslang rsqrt == GLSL inversesqrt
@@ -1648,6 +1764,7 @@ def private glsl_ext_op(name : string; cls : int) : tuple<ok : bool; op : GLSLst
     if (name == "normalize") return (ok = true, op = GLSLstd450.Normalize)
     if (name == "reflect") return (ok = true, op = GLSLstd450.Reflect)
     if (name == "refract") return (ok = true, op = GLSLstd450.Refract)
+    if (name == "packHalf2x16") return (ok = true, op = GLSLstd450.PackHalf2x16)   // float2 -> uint (two 16-bit halfs)
     return (ok = false, op = GLSLstd450.Round)
 }
 
@@ -1750,9 +1867,34 @@ def private emit_const(var m : SpirvModule; e : ExpressionPtr; var errors : arra
         let v = cu4.value
         return (ok = true, id = const_composite(m, emit_type(m, e._type), [const_uint(m, v.x), const_uint(m, v.y), const_uint(m, v.z), const_uint(m, v.w)]))
     }
-    // all-constant vector constructor -> OpConstantComposite
+    // all-constant vector / matrix constructor -> OpConstantComposite
     let call = e ?as ExprCall
     if (call != null) {
+        // matCxR(col0, ...) of constant columns: an OpConstantComposite of the column constants,
+        // which is what glslang folds a `const mat4` global to. Gated on the argument count like
+        // the emit path's matrix ctor, so a matrix-RETURNING user function stays not-a-constant.
+        let mc = matrix_ctor("{call.name}")
+        if (mc.ok && length(call.arguments) == mc.cols) {
+            var cols : array<uint>
+            cols |> reserve(mc.cols)
+            for (a in call.arguments) {
+                if (component_count(a._type.baseType) != mc.width || scalar_class(a._type.baseType) != 2) {
+                    errors |> push("{call.name}: constant column of type {a._type.baseType} is not a float{mc.width}")
+                    delete cols
+                    return (ok = false, id = 0u)
+                }
+                let cr = emit_const(m, a, errors)
+                if (!cr.ok) {
+                    errors |> push("{call.name}: constructor column is not a compile-time constant")
+                    delete cols
+                    return (ok = false, id = 0u)
+                }
+                cols |> push(cr.id)
+            }
+            let mid = const_composite(m, emit_type(m, e._type), cols)
+            delete cols
+            return (ok = true, id = mid)
+        }
         let vc = vector_ctor("{call.name}")
         if (!vc.ok) return (ok = false, id = 0u)
         var total = 0
@@ -1866,22 +2008,31 @@ def private splat_to_vec(var m : SpirvModule; vec_type : uint; scalar_id : uint;
     return res
 }
 
+// The vector type a scalar OPERAND splats to: `n` lanes of that operand's own component type, NOT of
+// the binop's result type. The two agree for arithmetic, but a shift's Shift operand only has to
+// match Base's component COUNT -- `uint4 >> 8` (the only vector-shift spelling daslang has, the
+// shift count being an int) would otherwise build a v4uint out of int constituents, which compiles
+// and fails spirv-val.
+def private splat_type(var m : SpirvModule; scalar : TypeDecl?; n : int) : uint {
+    return type_vector(m, emit_type(m, scalar), n)
+}
+
 // ===== `*` over matrices / vectors / scalars =====
 // SPIR-V splits multiplication by operand shape: OpMatrixTimesMatrix / OpMatrixTimesVector /
 // OpVectorTimesScalar. Plain component-wise FMul/IMul (the scalar binop path) only works when both
 // operands have the SAME shape, so the mixed cases are routed here first. Returns handled=false for
 // same-shape operands (let binop_code emit FMul/IMul); handled=true with id=0 on an unsupported mix
 // (error already pushed). Operands l/r are pre-emitted result-ids. Handled: matrix*matrix,
-// matrix*vector, float vector*scalar (OpVectorTimesScalar, either order), and integer vector*scalar
-// (splat + OpIMul, either order). daslang has no matrix*scalar or vector*matrix operator, so those
-// SPIR-V ops are intentionally absent.
+// matrix*vector, vector*matrix, float vector*scalar (OpVectorTimesScalar, either order), and integer
+// vector*scalar (splat + OpIMul, either order). daslang has no matrix*scalar operator, so that
+// SPIR-V op is intentionally absent.
 def private emit_mul(var m : SpirvModule; op2 : ExprOp2?; e : ExpressionPtr; l, r : uint; var errors : array<string>) : tuple<handled : bool; id : uint> {
     let lmat = matrix_info(op2.left._type)
     let rmat = matrix_info(op2.right._type)
-    let lcc = component_count(op2.left._type.baseType)
-    let rcc = component_count(op2.right._type.baseType)
-    let lcls = scalar_class(op2.left._type.baseType)
-    let rcls = scalar_class(op2.right._type.baseType)
+    let lcc = arith_lanes(op2.left._type.baseType)
+    let rcc = arith_lanes(op2.right._type.baseType)
+    let lcls = arith_class(op2.left._type.baseType)
+    let rcls = arith_class(op2.right._type.baseType)
     // same-shape (scalar*scalar or equal-width vector*vector): component-wise, defer to binop_code
     if (!lmat.ok && !rmat.ok && lcc == rcc) return (handled = false, id = 0u)
     let rt = emit_type(m, e._type)
@@ -1890,6 +2041,8 @@ def private emit_mul(var m : SpirvModule; op2 : ExprOp2?; e : ExpressionPtr; l, 
         emit(m, SEC_FUNCS, SpvOp.MatrixTimesMatrix, rt, res, l, r)
     } elif (lmat.ok && rcc > 1) {
         emit(m, SEC_FUNCS, SpvOp.MatrixTimesVector, rt, res, l, r)
+    } elif (rmat.ok && lcc > 1) {
+        emit(m, SEC_FUNCS, SpvOp.VectorTimesMatrix, rt, res, l, r)
     } elif (lcc > 1 && rcc == 1 && lcls == 2 && rcls == 2) {
         emit(m, SEC_FUNCS, SpvOp.VectorTimesScalar, rt, res, l, r)
     } elif (rcc > 1 && lcc == 1 && lcls == 2 && rcls == 2) {
@@ -1915,16 +2068,22 @@ def private emit_mul(var m : SpirvModule; op2 : ExprOp2?; e : ExpressionPtr; l, 
 def private declare_local_var(var m : SpirvModule; var ctx : EmitCtx; v : VariablePtr; var errors : array<string>) {
     if (key_exists(ctx.local_vars, intptr(v))) return
     let bt = v._type.baseType
-    if (scalar_class(bt) < 0 && bt != Type.tBool && bt != Type.tFixedArray) {
+    // a matrix is a tHandle, so numeric_info does not see it -- emit_type lowers it to OpTypeMatrix,
+    // which is a perfectly good Function-storage pointee (glslang gives a local `mat4` an OpVariable too)
+    if (!is_emittable_value_type(v._type) && bt != Type.tFixedArray && bt != Type.tStructure &&
+        !matrix_info(v._type).ok) {
         // emit_type would panic on an unsupported base type; reject with a clean error instead.
         if (cpu_only_lattice_width(bt)) {
             errors |> push("local '{v.name}': type {bt} is CPU-only (8/16-lane lattice forms do not exist in shaders — vectors cap at 4 lanes)")
         } else {
-            errors |> push("local '{v.name}': type {bt} is not supported yet (only int/uint/float scalars+vectors, bool, and fixed arrays)")
+            errors |> push("local '{v.name}': type {bt} is not supported yet (only int/uint/float scalars+vectors+matrices, bool, fixed arrays, and structs of those)")
         }
         return
     }
-    let vt = emit_type(m, v._type)
+    // a struct local takes the same undecorated type id its by-value signatures use, so passing one
+    // to a helper needs no relayout; emit_value_type returns 0 when a field has no lowering.
+    let vt = emit_value_type(m, v._type, errors)
+    if (vt == 0u) return
     let pt = type_pointer(m, SpvStorageClass.Function, vt)
     let pid = alloc_id(m)
     emit(m, SEC_FUNCS, SpvOp.Variable, pt, pid, uint(SpvStorageClass.Function))
@@ -2020,6 +2179,7 @@ class SpirvEmit : AstVisitor {
     ite_ids : table<uint64; IteIds>      // intptr(ExprIfThenElse) -> its {merge, then, else} labels
     loop_ids : table<uint64; LoopIds>    // intptr(ExprWhile/ExprFor) -> its 5 loop-skeleton labels
     for_src : table<uint64>              // for-source range() call ptrs to intercept in visitExprCall (6.3)
+    copy_dst : uint64                    // intptr(ExprCopy.left) while that destination subtree is walked
     errs    : array<string>
 
     // coerce a visited child to an rvalue id: a value passes through; a pointer is OpLoad'd here (the
@@ -2041,6 +2201,21 @@ class SpirvEmit : AstVisitor {
         }
         errs |> push("internal: no rvalue available for {e.__rtti}")
         return 0u
+    }
+    // Does this expression name MEMORY -- something an OpAccessChain can chain a component off?
+    // A `var` local (its OpVariable), an already-chained pointer (an ssbo element, a block member),
+    // or a global with an OpVariable. A `let` local, a parameter and a call result are SSA VALUES,
+    // and a folded module-scope `let` global is an OpConstant: none of them has a pointer, so a
+    // component of one has to be extracted rather than chained.
+    def is_addressable(e : ExpressionPtr) : bool {
+        if (key_exists(e2ptr, intptr(e))) return true
+        let gv = global_var_of(e)
+        if (gv != null) return !(ctx.globals?[intptr(gv)] ?? GlobalInfo()).is_constant
+        let ev = e ?as ExprVar
+        if (ev != null && (ev.varFlags.local || ev.varFlags.argument || ev.varFlags._block)) {
+            return (ctx.local_vars?[intptr(ev.variable)] ?? LocalVar()).ptr_id != 0u
+        }
+        return false
     }
     // Resolve a sampler/sampler-array argument to a loaded sampled-image SSA id. Handles BOTH
     // the scalar form `texture(my_sampler, uv)` (gi.is_sampler) AND the descriptor-array form
@@ -2103,14 +2278,42 @@ class SpirvEmit : AstVisitor {
         }
         return (sg = arr_g, sg_type = arr_g._type.firstType, simg = simg_id, ok = true)
     }
+    // The storage class of the memory an addressable expression chains into: the root global's for a
+    // global-rooted chain, Function for one rooted at a `var` local (its OpVariable is Function-storage).
+    // An OpAccessChain result type must name the storage class it chains INTO, so a field of a struct
+    // local and a field of an SSBO element cannot share one default.
+    def root_storage_of(e : ExpressionPtr) : SpvStorageClass {
+        let rv = root_global_of(e)
+        let rgi = rv != null ? (ctx.globals?[intptr(rv)] ?? GlobalInfo()) : GlobalInfo()
+        return rgi.var_id != 0u ? rgi.storage : SpvStorageClass.Function
+    }
+
     def ptr_of(e : ExpressionPtr) : tuple<id : uint; pty : uint> {
         let k = intptr(e)
         if (key_exists(e2ptr, k)) return (id = e2ptr?[k] ?? 0u, pty = e2pty?[k] ?? 0u)
-        // a swizzle that produced a value (not a pointer) used as a write target: a multi-component
-        // swizzle (`v.xy = …`) or a single-component swizzle of a value. Fail-closed with a clear
-        // message rather than the generic "internal: not an lvalue".
+        // ONE component of a vector that is itself addressable (ssbo[i].x, block.field.y, shared[i].z):
+        // chain a component index off the base pointer. Emitted HERE rather than in visitExprSwizzle
+        // because only a pointer CONSUMER (a store, a compound assign, an atomic target) needs it --
+        // a read stays the CompositeExtract off the loaded vector that visitExprSwizzle already emits,
+        // so no body that compiles today gains an instruction.
+        let sw = e ?as ExprSwizzle
+        if (sw != null && length(sw.fields) == 1 && key_exists(e2ptr, intptr(sw.value))) {
+            var bm & = unsafe(*m)
+            let base = ptr_of(sw.value)
+            let storage = root_storage_of(sw.value)
+            let pointee = emit_type(bm, e._type)
+            let ptr_t = type_pointer(bm, storage, pointee)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, base.id, const_uint(bm, uint(sw.fields[0])))
+            e2ptr[k] = res
+            e2pty[k] = pointee
+            return (id = res, pty = pointee)
+        }
+        // a swizzle of a VALUE used as a pointer: the base has no OpVariable to chain a component off
+        // (a swizzle of a swizzle, a call result). A multi-lane assignment target lands in
+        // emit_write_swizzle instead, and reports the same thing there.
         if (e is ExprSwizzle) {
-            errs |> push("cannot assign through a swizzle — write-swizzle (e.g. `v.xy = …`) is not supported; assign the whole vector instead")
+            errs |> push("cannot assign through a swizzle of a value — a write-swizzle target must be addressable (a global, a `var` local, or an SSBO / UBO element)")
             return (id = 0u, pty = 0u)
         }
         // a module-scope constant (`let` fold or @constant_id spec constant) used as a write target:
@@ -2146,6 +2349,9 @@ class SpirvEmit : AstVisitor {
         e2id[intptr(expr)] = const_bool(bm, expr.value)
         return expr
     }
+    // daslang folds a narrowing convert of a literal (`int16(64)`, `2.0h`) to a 16-bit constant NODE,
+    // so it never reaches the ExprCall convert path -- it is a leaf here. The lattice VECTORS have no
+    // such leaf by design, so half4(2.0h) stays an OpCompositeConstruct splat of this one constant.
     def override visitExprConstFloat16(var expr : ExprConstFloat16?) : ExpressionPtr {
         var bm & = unsafe(*m)
         e2id[intptr(expr)] = const_float16(bm, float_to_half_bits(float(expr.value)))
@@ -2256,9 +2462,16 @@ class SpirvEmit : AstVisitor {
     def override visitExprSwizzle(var expr : ExprSwizzle?) : ExpressionPtr {
         var bm & = unsafe(*m)
         let k = intptr(expr)
+        // an assignment DESTINATION whose base is addressable: ptr_of (one lane) or emit_write_swizzle
+        // (several) chains the component pointer off that base. Emitting a value here would be an
+        // OpLoad of the whole destination that nothing reads.
+        if (k == copy_dst && key_exists(e2ptr, intptr(expr.value))) return expr
         let gv = global_var_of(expr.value)
-        // single-component global -> AccessChain to that one component (keeps it an lvalue: g.x = …)
-        if (gv != null && length(expr.fields) == 1) {
+        // single-component global -> AccessChain to that one component (keeps it an lvalue: g.x = …).
+        // A CONSTANT global (gl_WorkGroupSize, a module-scope `let`) has no OpVariable to chain
+        // through, so it takes the value path below: CompositeExtract off the folded OpConstant.
+        if (gv != null && length(expr.fields) == 1 &&
+            !(ctx.globals?[intptr(gv)] ?? GlobalInfo()).is_constant) {
             let gi = ctx.globals?[intptr(gv)] ?? GlobalInfo()
             if (gi.var_id == 0u) {   // global not classified -> never AccessChain through a 0 base
                 errs |> push("swizzle target global '{gv.name}' is not classified")
@@ -2296,6 +2509,50 @@ class SpirvEmit : AstVisitor {
     def override visitExprAt(var expr : ExprAt?) : ExpressionPtr {
         var bm & = unsafe(*m)
         let k = intptr(expr)
+        // A matrix COLUMN read (m[i], GLSL's mat[i]): a matrix is an emittable VALUE here, not an
+        // addressable composite, so there is no OpVariable to chain through -- extract the column off
+        // the loaded matrix. OpCompositeExtract takes LITERAL indices, so the column must be a
+        // compile-time constant; a dynamic one is rejected rather than lowered into a blob that only
+        // spirv-val would catch. Must precede the local-variable branch below: a value-`let` matrix is
+        // an ExprVar with no ptr_id, which that branch would reject as non-indexable.
+        let mi = matrix_info(expr.subexpr._type)
+        if (mi.ok) {
+            let mci = expr.index ?as ExprConstInt
+            if (mci == null) {
+                errs |> push("indexing a matrix with a non-constant column index is not supported")
+                return expr
+            }
+            let mbase = value_of(expr.subexpr)
+            if (mbase == 0u) return expr   // operand failed to lower (error already pushed)
+            let mrt = emit_type(bm, expr._type)
+            let mres = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.CompositeExtract, mrt, mres, mbase, uint(mci.value))
+            e2id[k] = mres
+            return expr
+        }
+        // A vector component under an index (GLSL's v[i]) on a base that is a pure VALUE -- a call
+        // result, a `let` local, a parameter, a folded constant global -- has no OpVariable to chain a
+        // component pointer off, so the component comes off the LOADED vector: OpVectorExtractDynamic,
+        // which is exactly what glslang gives `textureLod(...)[i]`. A vector that IS addressable (a
+        // `var` local, an ssbo element, a block member) keeps the pointer path below, which is what
+        // glslang gives `h_min[i]` -- so this must test addressability, not merely vector-ness.
+        // A constant index takes OpCompositeExtract, the literal-operand form, like the swizzle read.
+        if (arith_lanes(expr.subexpr._type.baseType) >= 2 && !is_addressable(expr.subexpr)) {
+            let vbase = value_of(expr.subexpr)
+            if (vbase == 0u) return expr   // operand failed to lower (error already pushed)
+            let vrt = emit_type(bm, expr._type)
+            let vres = alloc_id(bm)
+            let vci = expr.index ?as ExprConstInt
+            if (vci != null) {
+                emit(bm, SEC_FUNCS, SpvOp.CompositeExtract, vrt, vres, vbase, uint(vci.value))
+            } else {
+                let vidx = value_of(expr.index)
+                if (vidx == 0u) return expr   // index failed to lower (error already pushed)
+                emit(bm, SEC_FUNCS, SpvOp.VectorExtractDynamic, vrt, vres, vbase, vidx)
+            }
+            e2id[k] = vres
+            return expr
+        }
         let lev = expr.subexpr ?as ExprVar
         if (lev != null && (lev.varFlags.local || lev.varFlags.argument || lev.varFlags._block)) {
             let lv = ctx.local_vars?[intptr(lev.variable)] ?? LocalVar()
@@ -2315,9 +2572,10 @@ class SpirvEmit : AstVisitor {
         }
         let bv = global_var_of(expr.subexpr)
         if (bv == null) {
-            // PR-G: indexing a fixed-array field inside a Block (ubo.lights[i] / ubo.material.kernel[i]).
-            // The subexpr is a chained ExprField whose e2ptr is a pointer to the array. Chain a
-            // single index off it; the storage class is inherited from the root global. For a
+            // Indexing a fixed-array field inside a Block (ubo.lights[i] / ubo.material.kernel[i]) or
+            // inside a struct local (s.arr[i]). The subexpr is a chained ExprField whose e2ptr is a
+            // pointer to the array. Chain a single index off it, in the storage class the chain roots
+            // in -- a Function-storage struct local's array must not be chained as StorageBuffer. For a
             // struct element, plain emit_type would panic (it doesn't lower tStructure) and would
             // also not return the laid-out (deduped) type — so re-acquire it via build_block_struct,
             // which is idempotent under the type/decoration dedup pools.
@@ -2326,8 +2584,7 @@ class SpirvEmit : AstVisitor {
                 if (idx == 0u) return expr   // index failed to lower (error already pushed)
                 let base = ptr_of(expr.subexpr)
                 let rv = root_global_of(expr.subexpr)
-                let rgi = rv != null ? (ctx.globals?[intptr(rv)] ?? GlobalInfo()) : GlobalInfo()
-                let storage = rgi.var_id != 0u ? rgi.storage : SpvStorageClass.StorageBuffer
+                let storage = root_storage_of(expr.subexpr)
                 let rname = rv != null ? string(rv.name) : "(?)"
                 let pointee = field_pointee_type(bm, expr._type, "{rname}[]", storage)
                 if (pointee == 0u) return expr
@@ -2397,6 +2654,8 @@ class SpirvEmit : AstVisitor {
         var bm & = unsafe(*m)
         let op = "{expr.op}"
         if (op == "++" || op == "--") {
+            // scalar_class, NOT arith_class: the increment is const_one, which only ever emits a
+            // 32-bit constant, so a 16-bit ++ would build OpIAdd(%short, %int_1). Fail it closed.
             let cls = scalar_class(expr.subexpr._type.baseType)
             let bo = binop_code(op == "++" ? "+" : "-", cls)
             if (!bo.ok) {
@@ -2423,7 +2682,7 @@ class SpirvEmit : AstVisitor {
             e2id[intptr(expr)] = res
             return expr
         }
-        let uo = unop_code(op, scalar_class(expr.subexpr._type.baseType))
+        let uo = unop_code(op, arith_class(expr.subexpr._type.baseType))
         if (!uo.ok) {
             errs |> push("unsupported unary op '{expr.op}' on {expr.subexpr._type.baseType}")
             return expr
@@ -2457,16 +2716,16 @@ class SpirvEmit : AstVisitor {
                     }
                 }
                 if (res == 0u) {
-                    let bo = binop_code(compound_base(op), scalar_class(expr.left._type.baseType))
+                    let bo = binop_code(compound_base(op), arith_class(expr.left._type.baseType))
                     if (!bo.ok) {
                         errs |> push("unsupported compound assignment '{expr.op}'")
                         return expr
                     }
                     // vector <op>= scalar: splat the scalar rhs (SPIR-V arithmetic operands must match)
                     var rhs2 = rhs
-                    let dn = component_count(expr.left._type.baseType)
-                    if (dn > 1 && component_count(expr.right._type.baseType) == 1) {
-                        rhs2 = splat_to_vec(bm, p.pty, rhs, dn)
+                    let dn = arith_lanes(expr.left._type.baseType)
+                    if (dn > 1 && arith_lanes(expr.right._type.baseType) == 1) {
+                        rhs2 = splat_to_vec(bm, splat_type(bm, expr.right._type, dn), rhs, dn)
                     }
                     res = alloc_id(bm)
                     emit(bm, SEC_FUNCS, bo.code, p.pty, res, cur, rhs2)
@@ -2475,7 +2734,7 @@ class SpirvEmit : AstVisitor {
             }
             return expr
         }
-        let cls = scalar_class(expr.left._type.baseType)
+        let cls = arith_class(expr.left._type.baseType)
         let l = value_of(expr.left)
         let r = value_of(expr.right)
         if (l == 0u || r == 0u) return expr
@@ -2491,6 +2750,20 @@ class SpirvEmit : AstVisitor {
         let cc = cmp_code(op, cls)
         if (cc.ok) {
             let bt = type_bool(bm)
+            // Whole-vector `==` / `!=` yields a SCALAR bool in daslang (and GLSL), but the SPIR-V
+            // component-wise compare op produces a bvecN — reduce it to the scalar with OpAll
+            // (`==`: all lanes equal) / OpAny (`!=`: any lane differs), matching what glslang emits.
+            // A scalar-bool-typed OpFOrdEqual on vector operands is invalid SPIR-V (drivers reject it).
+            let dn = arith_lanes(expr.left._type.baseType)
+            if (dn > 1) {
+                let bvec = type_vector(bm, bt, dn)
+                let cmp = alloc_id(bm)
+                emit(bm, SEC_FUNCS, cc.code, bvec, cmp, l, r)
+                let res = alloc_id(bm)
+                emit(bm, SEC_FUNCS, op == "!=" ? SpvOp.Any : SpvOp.All, bt, res, cmp)
+                e2id[intptr(expr)] = res
+                return expr
+            }
             let res = alloc_id(bm)
             emit(bm, SEC_FUNCS, cc.code, bt, res, l, r)
             e2id[intptr(expr)] = res
@@ -2513,13 +2786,13 @@ class SpirvEmit : AstVisitor {
         // vector one (daslang broadcasts vec <op> scalar; `*` already went through emit_mul above)
         var lid = l
         var rid = r
-        let rn = component_count(expr._type.baseType)
+        let rn = arith_lanes(expr._type.baseType)
         if (rn > 1) {
-            if (component_count(expr.left._type.baseType) == 1) {
-                lid = splat_to_vec(bm, rt, l, rn)
+            if (arith_lanes(expr.left._type.baseType) == 1) {
+                lid = splat_to_vec(bm, splat_type(bm, expr.left._type, rn), l, rn)
             }
-            if (component_count(expr.right._type.baseType) == 1) {
-                rid = splat_to_vec(bm, rt, r, rn)
+            if (arith_lanes(expr.right._type.baseType) == 1) {
+                rid = splat_to_vec(bm, splat_type(bm, expr.right._type, rn), r, rn)
             }
         }
         let res = alloc_id(bm)
@@ -2569,8 +2842,22 @@ class SpirvEmit : AstVisitor {
     }
 
     // ----- store: dst = rhs -----
+    // The destination subtree is marked while it is walked, so a swizzle target emits no value: it is
+    // a pointer its consumer builds, and the value path would spend an OpLoad of the whole destination
+    // that nothing reads. glslang emits neither.
+    def override preVisitExprCopy(var expr : ExprCopy?) : void {
+        copy_dst = intptr(expr.left)
+    }
+    def override preVisitExprCopyRight(var expr : ExprCopy?; right : ExpressionPtr) : void {
+        copy_dst = 0ul
+    }
     def override visitExprCopy(var expr : ExprCopy?) : ExpressionPtr {
         var bm & = unsafe(*m)
+        let sw = expr.left ?as ExprSwizzle
+        if (sw != null && length(sw.fields) > 1) {
+            emit_write_swizzle(sw, expr.right)
+            return expr
+        }
         let p = ptr_of(expr.left)
         let val = value_of(expr.right)
         if (p.id != 0u && val != 0u) {
@@ -2579,11 +2866,48 @@ class SpirvEmit : AstVisitor {
         return expr
     }
 
+    // GLSL's write swizzle (`buf[i].xyz = pos`). SPIR-V has no partial store, and glslang
+    // does NOT load-shuffle-store it: it chains ONE component pointer per lane and stores the matching
+    // lane of the rhs. Lower it the same way, so the port comes out instruction for instruction.
+    // daslang only takes a CONTIGUOUS ascending mask as a reference (`.xz` is error[30915]), so the
+    // lanes are distinct and each is written exactly once -- the order of the stores cannot matter.
+    def emit_write_swizzle(sw : ExprSwizzle?; rhs : ExpressionPtr) : void {
+        var bm & = unsafe(*m)
+        if (!key_exists(e2ptr, intptr(sw.value))) {
+            errs |> push("cannot assign through a swizzle of a value — a write-swizzle target must be addressable (a global, a `var` local, or an SSBO / UBO element)")
+            return
+        }
+        let val = value_of(rhs)
+        if (val == 0u) return
+        let base = ptr_of(sw.value)
+        if (base.id == 0u) return
+        let storage = root_storage_of(sw.value)
+        let comp = emit_component_type(bm, sw._type)
+        let ptr_t = type_pointer(bm, storage, comp)
+        for (i in range(length(sw.fields))) {
+            let cptr = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, cptr, base.id, const_uint(bm, uint(sw.fields[i])))
+            let lane = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.CompositeExtract, comp, lane, val, uint(i))
+            emit(bm, SEC_FUNCS, SpvOp.Store, cptr, lane)
+        }
+    }
+
     // ----- let: memory local -> store init; value-let -> bind SSA id -----
     def override visitExprLetVariable(cexpr : ExprLet?; var arg : VariablePtr; lastArg : bool) : VariablePtr {
         var bm & = unsafe(*m)
         if (arg.init == null) {
-            errs |> push("uninitialized local '{arg.name}' is not supported (every let/var must have an initializer)")
+            // daslang DROPS an initializer it proves dead -- a `var` that every path assigns before
+            // it is ever read (`var l = 0.0; if (..) { l = a } else { l = b }`) reaches us with no
+            // init at all. das still zero-initializes such a local, so lower it to that zero instead
+            // of refusing it; a value-let cannot get here (it has nowhere to store one).
+            let vk0 = intptr(arg)
+            if (!key_exists(ctx.local_vars, vk0)) {
+                errs |> push("uninitialized local '{arg.name}' is not supported (every let/var must have an initializer)")
+                return arg
+            }
+            let lv0 = ctx.local_vars?[vk0] ?? LocalVar()
+            emit(bm, SEC_FUNCS, SpvOp.Store, lv0.ptr_id, const_null(bm, lv0.value_type))
             return arg
         }
         let vk = intptr(arg)
@@ -2631,11 +2955,12 @@ class SpirvEmit : AstVisitor {
             errs |> push("internal: null field type at {sname}")
             return 0u
         }
-        // TaskPayloadWorkgroupEXT is a PLAIN logical storage class (no Block / Offset / ArrayStride), so a
-        // field type lowers via emit_type -- the SAME id build_plain_struct used for the member, so the
-        // OpAccessChain types match. (Block storages below take the std140/std430 strided path.)
-        if (storage == SpvStorageClass.TaskPayloadWorkgroupEXT) {
-            return emit_type(bm, ft)
+        // TaskPayloadWorkgroupEXT (a @task_payload) and Function (a struct local) are PLAIN logical
+        // storage classes -- no Block / Offset / ArrayStride -- so a field type lowers via
+        // emit_value_type: the SAME id build_plain_struct gave the member, so the OpAccessChain types
+        // match. (Block storages below take the std140/std430 strided path.)
+        if (storage == SpvStorageClass.TaskPayloadWorkgroupEXT || storage == SpvStorageClass.Function) {
+            return emit_value_type(bm, ft, errs)
         }
         // The packing rules follow the root global's storage class: an @ssbo member access rebuilds
         // its member types under std430 (tight, width-aware strides), everything else under std140.
@@ -2707,14 +3032,9 @@ class SpirvEmit : AstVisitor {
                     errs |> push("member access '.{expr.name}': no such field")
                     return expr
                 }
-                // chain the field pointer in the root global's storage class (StorageBuffer for an
-                // SSBO, Uniform for a UBO, PushConstant for @push_constant). Walking the whole chain
-                // via root_global_of catches deeply nested forms (ubo.outer.inner under PR-G); the
-                // pre-PR-G code only handled ExprAt-rooted chains and defaulted everything else to
-                // StorageBuffer, which mismatched the base pointer's type for Uniform/PushConstant.
-                let rv = root_global_of(expr.value)
-                let rgi = rv != null ? (ctx.globals?[intptr(rv)] ?? GlobalInfo()) : GlobalInfo()
-                let storage = rgi.var_id != 0u ? rgi.storage : SpvStorageClass.StorageBuffer
+                // chain the field pointer in the storage class the chain roots in (StorageBuffer for an
+                // SSBO, Uniform for a UBO, PushConstant for @push_constant, Function for a struct local).
+                let storage = root_storage_of(expr.value)
                 let pointee = field_pointee_type(bm, expr._type, "{est.name}.{expr.name}", storage)
                 if (pointee == 0u) return expr
                 let ptr_t = type_pointer(bm, storage, pointee)
@@ -2785,7 +3105,7 @@ class SpirvEmit : AstVisitor {
         var ops <- [uf.ret_type, res, uf.fn_id]
         var ref_temps : array<tuple<temp : uint; orig : uint; vt : uint>>
         for (arg, i in expr.arguments, count()) {
-            let is_ref = i < length(f.arguments) && f.arguments[i]._type.flags.ref && !f.arguments[i]._type.flags.constant
+            let is_ref = i < length(f.arguments) && is_out_param(f.arguments[i]._type)
             if (is_ref) {
                 let ct = ctx.call_temps?[intptr(arg)] ?? CallTemp()
                 if (ct.ptr_id == 0u) {
@@ -3469,14 +3789,15 @@ class SpirvEmit : AstVisitor {
         let dst = scalar_type_name_class(name)
         if (dst.cls >= 0 && length(expr.arguments) == 1) {
             let a0 = expr.arguments[0]
-            if (component_count(a0._type.baseType) != 1) {
-                errs |> push("{name}: vector conversion is not supported (scalar only)")
+            let sn = numeric_info(a0._type.baseType)
+            if (!sn.ok || sn.lanes != 1) {
+                errs |> push("{name}: cannot convert from {a0._type.baseType} (numeric scalar only)")
                 return expr
             }
             let aid = value_of(a0)
             if (aid == 0u) return expr
-            let src_cls = scalar_class(a0._type.baseType)
-            let src_w = scalar_width(a0._type.baseType)
+            let src_cls = sn.cls
+            let src_w = sn.width
             if (src_cls == dst.cls && src_w == dst.width) {  // same class+width no-op, e.g. float(someFloat)
                 e2id[k] = aid
                 return expr
@@ -3516,9 +3837,10 @@ class SpirvEmit : AstVisitor {
                             return expr
                         }
                     }
-                    // splat-with-same-class-convert: half4(floatScalar) — convert the scalar
-                    // (single rounding, matches the CPU float16_t(float) RNE), then splat
-                    if (cc == 1 && src_cls == vc.cls) {
+                    // splat-with-convert: half4(floatScalar) same-class narrows, float3(intScalar)
+                    // crosses class (ConvertSToF) — convert the scalar once (a single rounding, matching
+                    // the CPU ctor), then splat. convert_op covers both, so any numeric scalar splats.
+                    if (cc == 1 && src_cls >= 0) {
                         let cv = convert_op(src_cls, src_w, vc.cls, vc.width)
                         if (cv.ok) {
                             let aid = value_of(a0)
@@ -3575,7 +3897,11 @@ class SpirvEmit : AstVisitor {
                 }
                 let a_cls = scalar_class(a._type.baseType)
                 let a_w = scalar_width(a._type.baseType)
-                if (a_cls != vc.cls || (a_w != vc.width && !(cc == 1 && a_cls == vc.cls))) {
+                let needs_conv = a_cls != vc.cls || a_w != vc.width
+                // a SCALAR constituent of a different component kind/width converts to the vector's
+                // component type (float2(intX, y) -> ConvertSToF the int lane); a vector constituent
+                // must already match, since a per-lane vector cross-component convert is not lowered here
+                if (a_cls < 0 || (needs_conv && cc != 1)) {
                     errs |> push("{name}: constituent of type {a._type.baseType} has a different component kind (conversion not supported yet)")
                     delete cons
                     return expr
@@ -3586,9 +3912,9 @@ class SpirvEmit : AstVisitor {
                     delete cons
                     return expr
                 }
-                if (a_w != vc.width) {
-                    // per-lane scalar constituent of a narrower/wider ctor (the CPU per-lane
-                    // registrations take int32/float args): same-class convert, one scalar op
+                if (needs_conv) {
+                    // scalar constituent of a different class/width: convert once (the CPU per-lane
+                    // registrations take int32/float args), int -> float via ConvertSToF, etc.
                     let cv = convert_op(a_cls, a_w, vc.cls, vc.width)
                     if (!cv.ok) {
                         errs |> push("{name}: constituent of type {a._type.baseType} cannot convert to the component type")
@@ -3612,6 +3938,37 @@ class SpirvEmit : AstVisitor {
             e2id[k] = res
             return expr
         }
+        // matrix column constructor: matCxR(col0, col1, ...) -> OpCompositeConstruct of `cols`
+        // column vectors (each a floatW). Gated on the constructor NAME (not the result type), so a
+        // matrix-RETURNING user function is left to the OpFunctionCall path below. Only the column
+        // form lowers here; the no-arg identity / float3x4-widen forms fall through (unsupported).
+        let mc = matrix_ctor(name)
+        if (mc.ok && length(expr.arguments) == mc.cols) {
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            var cons <- [rt, res]
+            cons |> reserve(2 + mc.cols)
+            var ok_cols = true
+            for (a in expr.arguments) {
+                if (scalar_class(a._type.baseType) != 2 || component_count(a._type.baseType) != mc.width) {
+                    errs |> push("{name}: each column must be a float{mc.width} vector (got {a._type.baseType})")
+                    ok_cols = false
+                    break
+                }
+                let aid = value_of(a)
+                if (aid == 0u) {
+                    ok_cols = false
+                    break
+                }
+                cons |> push(aid)
+            }
+            if (ok_cols) {
+                emit_n(bm, SEC_FUNCS, SpvOp.CompositeConstruct, cons)
+                e2id[k] = res
+            }
+            delete cons
+            return expr
+        }
         // fmod: core OpFRem (C fmod semantics — sign-of-dividend). NOT a GLSL.std.450 ext-inst.
         if (name == "fmod") {
             if (length(expr.arguments) != 2) {
@@ -3624,6 +3981,23 @@ class SpirvEmit : AstVisitor {
             let rt = emit_type(bm, expr._type)
             let res = alloc_id(bm)
             emit(bm, SEC_FUNCS, SpvOp.FRem, rt, res, a, b)
+            e2id[k] = res
+            return expr
+        }
+        // mod: core OpFMod (GLSL mod semantics — sign-of-DIVISOR), the twin of
+        // fmod above. The two differ on a negative dividend, so a port of GLSL's
+        // mod() must reach this one and never fmod.
+        if (name == "mod") {
+            if (length(expr.arguments) != 2) {
+                errs |> push("mod expects 2 arguments")
+                return expr
+            }
+            let a = value_of(expr.arguments[0])
+            let b = value_of(expr.arguments[1])
+            if (a == 0u || b == 0u) return expr
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.FMod, rt, res, a, b)
             e2id[k] = res
             return expr
         }
@@ -3642,8 +4016,30 @@ class SpirvEmit : AstVisitor {
             e2id[k] = res
             return expr
         }
-        // GLSL.std.450 math: OpExtInst
-        let cls = empty(expr.arguments) ? -1 : scalar_class(expr.arguments[0]._type.baseType)
+        // intBitsToFloat / uintBitsToFloat / floatBitsToInt / floatBitsToUint (daslib/math_bits'
+        // int_bits_to_float / uint_bits_to_float / float_bits_to_int / float_bits_to_uint): a bit-pattern
+        // reinterpret -> one core OpBitcast, with the result type taken from the overload's return. math_bits
+        // is a builtin module (is_user_shader_func == false), so its CPU-reinterpret body is never emitted;
+        // without this interception the call would fail-close as an uncallable host function below.
+        if (name == "int_bits_to_float" || name == "uint_bits_to_float" ||
+            name == "float_bits_to_int" || name == "float_bits_to_uint") {
+            if (length(expr.arguments) != 1) {
+                errs |> push("{name} expects 1 argument")
+                return expr
+            }
+            let a = value_of(expr.arguments[0])
+            if (a == 0u) return expr
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.Bitcast, rt, res, a)
+            e2id[k] = res
+            return expr
+        }
+        // GLSL.std.450 math: OpExtInst. arith_class, NOT scalar_class: an ext-op operand carries no
+        // interface-block byte layout, so it may be narrower than 32 bits -- which is what lets
+        // max(int16, int16) emit OpExtInst SMax on %short, the shape glslang gives GLSL's 16-bit max,
+        // rather than failing closed. Same width-aware pair the arithmetic and compare rails use.
+        let cls = empty(expr.arguments) ? -1 : arith_class(expr.arguments[0]._type.baseType)
         let ge = glsl_ext_op(name, cls)
         if (ge.ok) {
             let set = ensure_glsl_ext(bm, *ctx)
@@ -3654,7 +4050,7 @@ class SpirvEmit : AstVisitor {
             // against a vector result (mix/clamp/min/max/step/smoothstep), splat any scalar operand to
             // the result width via OpCompositeConstruct so the OpExtInst is valid. This is what makes
             // daslang lerp(vec, vec, float) emit correctly instead of an invalid (scalar-t) FMix.
-            let result_n = component_count(expr._type.baseType)
+            let result_n = arith_lanes(expr._type.baseType)
             let broadcast = result_n > 1 && ext_op_broadcasts_scalar(ge.op)
             for (a in expr.arguments) {
                 var aid = value_of(a)
@@ -3697,16 +4093,43 @@ class SpirvEmit : AstVisitor {
         return expr
     }
 
-    // ----- fixed-array literal -> OpConstantComposite (whole-array, deduped) -----
-    // emit_const recurses into the (const) elements internally, so the elements' own default visit emits
-    // nothing — at patch they fold to ExprConstFloatN leaves, not sub-call nodes. Records the array's
-    // constant id; a fixed-array `let` then Stores it into the Function-storage OpVariable.
+    // ----- fixed-array literal -> OpConstantComposite / OpCompositeConstruct (whole-array) -----
+    // All-constant elements fold to a deduped OpConstantComposite; emit_const recurses into them
+    // internally, so their own default visit emits nothing (at patch they are ExprConstFloatN leaves,
+    // not sub-call nodes). Elements that are RUNTIME values instead build the array with one
+    // OpCompositeConstruct of their already-emitted ids — the same shape glslang gives
+    // `int[5](a, b, c, d, e)`. Either way a fixed-array `let` / `var` then Stores the id into its
+    // Function-storage OpVariable.
     def override visitExprMakeArray(var expr : ExprMakeArray?) : ExpressionPtr {
         var bm & = unsafe(*m)
-        let r = emit_const(bm, expr, errs)
+        // a dynamic array<T> literal is ALSO an ExprMakeArray; emit_type would panic on tArray
+        if (expr._type == null || expr._type.baseType != Type.tFixedArray) {
+            errs |> push("only fixed-array literals are supported (dynamic array<T> literals are not)")
+            return expr
+        }
+        var probe : array<string>
+        let r = emit_const(bm, expr, probe)
+        delete probe
         if (r.ok) {
             e2id[intptr(expr)] = r.id
+            return expr
         }
+        var cons <- [emit_type(bm, expr._type), 0u]
+        cons |> reserve(2 + length(expr.values))
+        for (v in expr.values) {
+            let vid = value_of(v)
+            if (vid == 0u) {
+                errs |> push("array literal element is neither a compile-time constant nor an emittable value")
+                delete cons
+                return expr
+            }
+            cons |> push(vid)
+        }
+        let res = alloc_id(bm)
+        cons[1] = res
+        emit_n(bm, SEC_FUNCS, SpvOp.CompositeConstruct, cons)
+        delete cons
+        e2id[intptr(expr)] = res
         return expr
     }
 
@@ -4010,11 +4433,57 @@ class SpirvEmit : AstVisitor {
     def override preVisitExprMakeTuple(expr : ExprMakeTuple?) : void {
         errs |> push("tuple construction is not supported in SPIR-V shaders")
     }
-    def override preVisitExprMakeStruct(expr : ExprMakeStruct?) : void {
-        errs |> push("struct construction is not supported in SPIR-V shaders")
-    }
+    // Struct construction (`S(a = x, b = y, ...)`) -> one OpCompositeConstruct of the
+    // field values, in the struct's DECLARED order -- which is what the OpTypeStruct members are in, and
+    // is NOT the order the named arguments are written in. Every field must be given: SPIR-V has no
+    // partial composite, and daslang only omits a field when its declaration carries a default, which
+    // would have to be materialised here; fail closed instead of constructing a short (invalid) composite.
     def override canVisitExprMakeStructBody(expr : ExprMakeStruct?) : bool {
-        return false   // already rejected in preVisit; don't descend into the (unlowerable) field inits
+        return true    // descend: the field initialisers are ordinary expressions and must lower first
+    }
+    def override visitExprMakeStruct(var expr : ExprMakeStruct?) : ExpressionPtr {
+        var bm & = unsafe(*m)
+        let st = expr.makeType != null ? expr.makeType.structType : null
+        if (st == null) {
+            errs |> push("struct construction: not a struct type")
+            return expr
+        }
+        if (length(expr.structs) != 1) {
+            errs |> push("struct construction '{st.name}': only a single struct value is supported (an array-of-struct initializer is not)")
+            return expr
+        }
+        let sid = value_struct_type(bm, st, errs)
+        if (sid == 0u) return expr
+        let nf = length(st.fields)
+        var vals : array<uint>
+        vals |> resize(nf)
+        for (fi in range(nf)) {
+            vals[fi] = 0u
+        }
+        for (fld in *expr.structs[0]) {
+            let fi = field_index_by_name(st, "{fld.name}")
+            if (fi < 0) {
+                errs |> push("struct construction '{st.name}': no such field '{fld.name}'")
+                delete vals
+                return expr
+            }
+            vals[fi] = value_of(fld.value)
+        }
+        for (fi in range(nf)) {
+            if (vals[fi] == 0u) {
+                errs |> push("struct construction '{st.name}': field '{st.fields[fi].name}' has no value (every field must be given)")
+                delete vals
+                return expr
+            }
+        }
+        let res = alloc_id(bm)
+        var ops <- [sid, res]
+        ops |> push_from(vals)
+        emit_n(bm, SEC_FUNCS, SpvOp.CompositeConstruct, ops)
+        delete ops
+        delete vals
+        e2id[intptr(expr)] = res
+        return expr
     }
     def override preVisitExprArrayComprehension(expr : ExprArrayComprehension?) : void {
         errs |> push("array comprehension is not supported in SPIR-V shaders")
@@ -4104,8 +4573,22 @@ def private is_user_shader_func(f : Function const?; entry : FunctionPtr) : bool
     return !(mn == "builtin" || mn == "math" || mn == "math_bits" || mn == "spirv_builtins" || mn == "shader_lingua_franca")
 }
 
+// Is this parameter WRITTEN THROUGH by the callee -- a Function pointer parameter fed by the
+// copy-in/copy-out temp at the call site, rather than a by-value OpFunctionParameter?
+//
+// The two shapes of the test are not interchangeable. das passes a struct BY REFERENCE already, so a
+// struct parameter never carries flags.ref -- `hp : HP` and `var np : NP&` differ ONLY in the const
+// flag, and testing ref on one silently misreads every mutable struct param as read-only. A scalar's
+// `var x : float` is a mutable LOCAL COPY (no propagation), so only the `&` form (ref AND non-const)
+// is an out-param there. Hence: const alone for a struct, ref + const for everything else.
+def private is_out_param(at : TypeDecl?) : bool {
+    if (at == null) return false
+    if (at.baseType == Type.tStructure) return !at.flags.constant
+    return at.flags.ref && !at.flags.constant
+}
+
 // Validate a user function's signature, allocate its OpFunction id + OpTypeFunction, and record it.
-// Only 32-bit scalar/vector results+params are supported (by value, or by reference for params);
+// Only 32-bit scalar/vector/matrix results+params are supported (by value, or by reference for params);
 // anything else is rejected here with a clean error so a later call site doesn't emit invalid SPIR-V.
 def private register_user_func(var m : SpirvModule; var ctx : EmitCtx; f : Function const?; var errors : array<string>) {
     if (key_exists(ctx.user_funcs, intptr(f))) return
@@ -4113,6 +4596,12 @@ def private register_user_func(var m : SpirvModule; var ctx : EmitCtx; f : Funct
     if (f.result.baseType == Type.tVoid) {
         uf.is_void = true
         uf.ret_type = type_void(m)
+    } elif (f.result.baseType == Type.tStructure) {
+        // A struct RESULT is returned by value, exactly as glslang returns one (OpFunction %S).
+        uf.ret_type = value_struct_type(m, f.result.structType, errors)
+        if (uf.ret_type == 0u) {
+            uf.valid = false
+        }
     } elif (is_emittable_value_type(f.result) && f.result.baseType != Type.tFixedArray) {
         uf.ret_type = emit_type(m, f.result)
     } else {
@@ -4122,13 +4611,21 @@ def private register_user_func(var m : SpirvModule; var ctx : EmitCtx; f : Funct
     var ptypes : array<uint>
     for (arg in f.arguments) {
         let at = arg._type
-        if (!is_emittable_value_type(at) || at.baseType == Type.tFixedArray) {
+        // A struct parameter is exempt from the value-type guard below: its fields are what must be
+        // emittable, and emit_value_type reports any that is not. is_out_param draws the read-only /
+        // written-through line for every parameter kind alike.
+        let is_struct = at != null && at.baseType == Type.tStructure
+        if (!is_struct && (!is_emittable_value_type(at) || at.baseType == Type.tFixedArray)) {
             errors |> push("shader function '{f.name}': parameter '{arg.name}' of type {at.baseType} is not supported (only 32-bit scalar/vector/matrix parameters, by value or by reference)")
             uf.valid = false
             continue
         }
-        let vt = emit_type(m, at)
-        if (at.flags.ref && !at.flags.constant) {
+        let vt = emit_value_type(m, at, errors)
+        if (vt == 0u) {
+            uf.valid = false
+            continue
+        }
+        if (is_out_param(at)) {
             ptypes |> push(type_pointer(m, SpvStorageClass.Function, vt))
         } else {
             ptypes |> push(vt)
@@ -4228,6 +4725,7 @@ class SpirvTempAlloc : AstVisitor {
     adapter : VisitorAdapter?
     @do_not_delete m   : SpirvModule?
     @do_not_delete ctx : EmitCtx?
+    errs : array<string>
     def override preVisitExprCall(expr : ExprCall?) : void {
         let f = expr.func
         if (f == null || !key_exists(ctx.user_funcs, intptr(f))) return
@@ -4237,9 +4735,9 @@ class SpirvTempAlloc : AstVisitor {
         for (arg, i in expr.arguments, count()) {
             if (i >= length(f.arguments)) break
             let pt = f.arguments[i]._type
-            if (pt.flags.ref && !pt.flags.constant) {
+            if (is_out_param(pt)) {
                 if (key_exists(ctx.call_temps, intptr(arg))) continue
-                let vt = emit_type(bm, pt)
+                let vt = emit_value_type(bm, pt, errs)
                 let ptr_t = type_pointer(bm, SpvStorageClass.Function, vt)
                 let pid = alloc_id(bm)
                 emit(bm, SEC_FUNCS, SpvOp.Variable, ptr_t, pid, uint(SpvStorageClass.Function))
@@ -4249,12 +4747,13 @@ class SpirvTempAlloc : AstVisitor {
     }
 }
 
-def private alloc_call_temps(var m : SpirvModule; var ctx : EmitCtx; f : FunctionPtr) {
+def private alloc_call_temps(var m : SpirvModule; var ctx : EmitCtx; f : FunctionPtr; var errors : array<string>) {
     var v = new SpirvTempAlloc(m = unsafe(addr(m)), ctx = unsafe(addr(ctx)))
     make_visitor(*v) $(mv_adapter) {
         v.adapter = mv_adapter
         visit(f.body, v.adapter)
     }
+    errors |> push_from(v.errs)
     unsafe {
         delete v
     }
@@ -4268,13 +4767,17 @@ def private emit_user_function(var m : SpirvModule; var ctx : EmitCtx; uf : User
     emit(m, SEC_FUNCS, SpvOp.Function, uf.ret_type, uf.fn_id, 0u, uf.type_id)
     for (arg in f.arguments) {
         let at = arg._type
-        let vt = emit_type(m, at)
+        let vt = emit_value_type(m, at, errors)
         let pid = alloc_id(m)
-        if (at.flags.ref && !at.flags.constant) {
+        if (is_out_param(at)) {
+            // written through: the pointer binds as a memory local, so a field of it access-chains
+            // and a bare write stores -- exactly like a `var` local declared in the body.
             let pt = type_pointer(m, SpvStorageClass.Function, vt)
             emit(m, SEC_FUNCS, SpvOp.FunctionParameter, pt, pid)
             ctx.local_vars |> insert(intptr(arg), LocalVar(ptr_id = pid, value_type = vt))
         } else {
+            // read-only: binds an SSA id, off which a field read is an OpCompositeExtract like any
+            // other struct value.
             emit(m, SEC_FUNCS, SpvOp.FunctionParameter, vt, pid)
             ctx.locals |> insert(intptr(arg), pid)
         }
@@ -4283,7 +4786,7 @@ def private emit_user_function(var m : SpirvModule; var ctx : EmitCtx; uf : User
     emit(m, SEC_FUNCS, SpvOp.Label, id_label)
     ctx.terminated = false
     collect_locals(m, ctx, f.body, errors)
-    alloc_call_temps(m, ctx, f)
+    alloc_call_temps(m, ctx, f, errors)
     drive_emit(m, ctx, f, errors)
     if (!ctx.terminated) {
         if (uf.is_void) {
@@ -4317,7 +4820,7 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
     // Fully overwrite the out-param: a caller that reuses a SpirvReflection (or retries after a
     // failed attempt) must not accumulate stale bindings / ranges from a previous call.
     reflection.stage = stage_flag(stage)
-    reflection.entry_point := "main"
+    reflection.entry_point = "main"
     // Mesh + Task workgroups are sized like compute via LocalSize, so the reflected local_size
     // mirrors the actual workgroup dispatch dims, not (1,1,1).
     let is_workgroupy = stage == ShaderStage.Compute || stage == ShaderStage.Mesh || stage == ShaderStage.Task
@@ -4477,7 +4980,7 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
 
     // Function-storage OpVariables must lead the entry block, before any body code.
     collect_locals(m, ctx, fn.body, errors)
-    alloc_call_temps(m, ctx, fn)
+    alloc_call_temps(m, ctx, fn, errors)
     // Body codegen: the SpirvEmit AstVisitor walks fn.body, emitting into m.
     drive_emit(m, ctx, fn, errors)
 

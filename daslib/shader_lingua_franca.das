@@ -17,6 +17,9 @@ options indenting = 4
 
 module shader_lingua_franca shared public
 
+// float4x4 (the matrix constructors below) lives in math; the vector types are builtin.
+require math
+
 // ===== opaque resource types =====
 // GL-superset: the `texture2D`/`texture3D` uint carries the GL texture-unit handle the host binds
 // (glUniform1i). The SPIR-V emitter recognizes each type by NAME (classify_global / sampler_info)
@@ -48,6 +51,53 @@ var gl_WorkGroupID          : uint3   // this invocation's work group, in the gl
 var gl_LocalInvocationID    : uint3   // this invocation's position within its work group
 var gl_GlobalInvocationID   : uint3   // unique invocation index in the global grid
 var gl_LocalInvocationIndex : uint    // 1D flattening of gl_LocalInvocationID
+
+// ===== matrix constructors =====
+// matCxR(col0, ...) builds a matrix from its columns (GLSL core `mat4(vec4,...)`); daslang matrices
+// are column-major, so the emitter lowers the call to one OpCompositeConstruct (glslang's mat4(cols)).
+def public float4x4(c0, c1, c2, c3 : float4) : float4x4 {
+    var m : float4x4
+    m[0] = c0
+    m[1] = c1
+    m[2] = c2
+    m[3] = c3
+    return m
+}
+
+def public float3x3(c0, c1, c2 : float3) : float3x3 {
+    var m : float3x3
+    m[0] = c0
+    m[1] = c1
+    m[2] = c2
+    return m
+}
+
+// ===== row-vector times matrix =====
+// GLSL's `v * m` (a ROW vector times m) that math lacks: component j is dot(v, column j), exactly
+// SPIR-V's OpVectorTimesMatrix, which the emitter lowers to -- so this CPU body runs only on the host.
+def public operator * (v : float4; m : float4x4) : float4 {
+    return float4(dot(v, m[0]), dot(v, m[1]), dot(v, m[2]), dot(v, m[3]))
+}
+
+def public operator * (v : float3; m : float3x3) : float3 {
+    return float3(dot(v, m[0]), dot(v, m[1]), dot(v, m[2]))
+}
+
+// ===== vector integer modulo =====
+// GLSL's `uvec3 % uvec3` that daslang lacks -> one native OpUMod (the emitter lowers it). Unsigned,
+// 3-lane only; signed `%` stays absent since daslang's OpSRem and GLSL's OpSMod differ on sign.
+def public operator % (a, b : uint3) : uint3 {
+    return uint3(a.x % b.x, a.y % b.y, a.z % b.z)
+}
+
+// ===== float modulo =====
+// GLSL's mod(x,y) = x - y*floor(x/y) (sign-of-DIVISOR, one OpFMod) vs daslang's fmod (sign-of-
+// dividend, OpFRem): they differ on a negative dividend, so a mod() port must reach THIS, not fmod.
+[unused_argument(x, y), sideeffects]
+def public mod(x, y : float) : float { return 0.0 }
+
+[unused_argument(x, y), sideeffects]
+def public mod(x, y : float3) : float3 { return float3(0.0, 0.0, 0.0) }
 
 // ===== texture sampling =====
 // texture(s, uv): filtered sample with implicit LOD (fragment-only on both rails). textureSize:

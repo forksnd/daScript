@@ -48,12 +48,20 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_global", "unsupported global 'g_scale'")
         check_rejects(t, "_fc_image_format", "unsupported @format")
         check_rejects(t, "_fc_local_struct_nested", "struct/array members of a local struct value are not yet supported")
+        // the same nested shape on the MEMORY path: a `var` struct local's undecorated OpTypeStruct
+        // has no recursive plain-struct builder, so the field is refused rather than guessed at
+        check_rejects(t, "_fc_local_struct_var_nested", "nested-struct fields are not yet supported")
         check_rejects(t, "_fc_localtype", "type tDouble is not supported")
         check_rejects(t, "_fc_stmt", "memzero is not supported in SPIR-V shaders")
         check_rejects(t, "_fc_deadcode", "unreachable code after a block terminator")
-        check_rejects(t, "_fc_wswz", "cannot assign through a swizzle")
+        // a write-swizzle chains a component pointer off its base, so the base needs an OpVariable; a
+        // swizzle of a swizzle has only a loaded value, and there is nothing to store through
+        check_rejects(t, "_fc_wswz", "write-swizzle target must be addressable")
         check_rejects(t, "_fc_wgtype", "@workgroup type must be a scalar, vector, matrix, or fixed array")
         check_rejects(t, "_fc_atomicmem", "atomic target must live in @workgroup or @ssbo memory")
+        // a matrix column read is an OpCompositeExtract, whose index is a literal, and a matrix value
+        // has no OpVariable to chain a dynamic index through -- so m[i] needs a compile-time i
+        check_rejects(t, "_fc_matrix_dyn_col", "indexing a matrix with a non-constant column index")
         // user-defined function call rejections (Phase: shader functions)
         check_rejects(t, "_fc_recursion", "recursion is not supported")
         check_rejects(t, "_fc_mutual", "recursion is not supported")
@@ -74,7 +82,7 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_mesh_out_badtype", "not a supported varying type")
         // @task_payload outside a task/mesh stage, and a payload with a nested-struct field
         check_rejects(t, "_fc_payload_stage", "is only valid in a task or mesh shader")
-        check_rejects(t, "_fc_payload_nested", "nested-struct payload fields are not yet supported")
+        check_rejects(t, "_fc_payload_nested", "nested-struct fields are not yet supported")
         // ray tracing: builtins / the traceRayEXT intrinsic / the TLAS descriptor / the RT storage
         // classes are all RT-pipeline-stage-gated, and the trace payload must be a payload GLOBAL
         check_rejects(t, "_fc_rt_builtin_stage", "is not available in the compute stage")

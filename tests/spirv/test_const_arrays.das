@@ -47,3 +47,19 @@ def test_const_array_triangle(t : T?) {
         delete words
     }
 }
+
+[test]
+def test_runtime_array_literal(t : T?) {
+    t |> run("fixed-array literal of runtime elements -> one OpCompositeConstruct + OpStore, not a constant") <| @(t : T?) {
+        var words <- rtarr_words()
+        t |> success(count_op(words, SpvOp.TypeArray) == 1, "rtarr: one OpTypeArray (the int[5])")
+        // the array from its five runtime elements, plus the float3 acc zero-init is a CONSTANT
+        // (all-zero) -- so the only run-time composite builds are the array and the stored float4
+        t |> success(count_op(words, SpvOp.CompositeConstruct) == 2, "rtarr: the int[5] and the stored float4")
+        t |> success(op_has_operand_at(words, SpvOp.Variable, 2, uint(SpvStorageClass.Function)),
+            "rtarr: the array lives in a Function-storage OpVariable")
+        t |> success(has_op(words, SpvOp.AccessChain), "rtarr: ticks[i] indexes through OpAccessChain")
+        validate(t, words, "rtarr")
+        delete words
+    }
+}

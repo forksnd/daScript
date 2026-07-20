@@ -247,6 +247,9 @@ Type and layout mapping
    * - ``struct`` (in ``@uniform``)
      - ``OpTypeStruct`` + ``Block``
      - std140 member ``Offset``\ s
+   * - ``struct`` (local / parameter / result)
+     - ``OpTypeStruct``, undecorated
+     - none — a value, not an interface block
 
 Matrix · vector and matrix · matrix use SPIR-V's default column-major convention, so a daslang
 ``M * v`` is ``OpMatrixTimesVector`` with the matrix uploaded as-is.
@@ -263,7 +266,9 @@ string builders / ``goto`` — these are not shader constructs.
   (``OpLoopMerge``), ``break`` / ``continue``, early ``return``, and the ternary ``?:`` (``OpSelect``,
   branchless).
 * **Operators:** full scalar and vector arithmetic (``+ - * / %``, unary ``-``), comparisons
-  (``== != < > <= >=``), logical ``&&`` / ``||``, and matrix/vector products.
+  (``== != < > <= >=``), logical ``&&`` / ``||``, and matrix/vector products. A whole-vector
+  ``==`` / ``!=`` yields a single ``bool`` (like GLSL): the component-wise compare is reduced with
+  ``OpAll`` / ``OpAny``.
 * **Math:** ``dot`` (``OpDot``) plus the GLSL.std.450 set — ``sin`` / ``cos`` / ``tan`` / ``pow`` /
   ``exp`` / ``log`` / ``sqrt`` / ``rsqrt`` / ``floor`` / ``ceil`` / ``fract`` / ``abs`` / ``min`` /
   ``max`` / ``lerp`` / ``length`` / ``distance`` / ``normalize`` / ``cross`` / ``reflect`` /
