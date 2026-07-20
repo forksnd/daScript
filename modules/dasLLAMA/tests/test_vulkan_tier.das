@@ -405,6 +405,150 @@ def test_vulkan_moe_ffn_streamed(t : T?) {
     }
 }
 
+// ===== heat-cache arm (slot pools, eviction, async split dispatch) =====
+
+// one q8 "layer" mirrored stream=true; advise pins a subset, a mixed top-k query splits, the
+// hits ride the async begin/join chain vs the CPU reference; a re-advise then flips the pinned
+// set (eviction + slice re-upload into freed slots) and the new hits re-verify
+let HWOFF = 40000000l
+let HSTRIDE = 100000l
+let HLAYER = 7l
+
+def private heat_hit_offs(o : array<int64>; nh : int64) : array<int64> {
+    var offs : array<int64>
+    offs |> reserve(int(nh) * 3)
+    for (i in range64(nh)) {
+        offs |> push(o[i])   // nolint:STYLE012 — triple-stride append
+        offs |> push(i)
+        offs |> push(1l)
+    }
+    return <- offs
+}
+
+[test]
+def test_vulkan_moe_heat_cache(t : T?) {
+    t |> run("vulkan heat-pinned expert cache == CPU reference (pins, eviction, split hits)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
+            var want = GpuTierWant()
+            want.heat = 2l   // two slots: the eviction/reuse choreography below assumes C = 2
+            set_gpu_tier_want(want)
+            let ege1 = NFE * N
+            let ege2 = N * NFE
+            var wq1 : array<int8>
+            var ws1 : array<float>
+            var wq3 : array<int8>
+            var ws3 : array<float>
+            var wq2 : array<int8>
+            var ws2 : array<float>
+            fill_stack(wq1, ws1, NE * NFE, N, 51l, true)
+            fill_stack(wq3, ws3, NE * NFE, N, 57l, true)
+            fill_stack(wq2, ws2, NE * N, NFE, 61l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(wq1, ws1, wqb, wsb)
+            let ok1 = moe_gpu_upload_stack(wqb, wsb, HWOFF, N, NE * NFE, 0, [stream = true])
+            pack_upload(wq3, ws3, wqb, wsb)
+            let ok3 = moe_gpu_upload_stack(wqb, wsb, HWOFF + HSTRIDE, N, NE * NFE, 0, [stream = true])
+            pack_upload(wq2, ws2, wqb, wsb)
+            let ok2 = moe_gpu_upload_stack(wqb, wsb, HWOFF + 2l * HSTRIDE, NFE, NE * N, 0, [stream = true])
+            if (!(ok1 && ok3 && ok2)) {
+                feint("no Vulkan device (or probe refused the stream uploads); skipping\n")
+                return
+            }
+            // pin experts {0, 2}; route the top-k [1, 0, 2] — expect 2 hits, expert 1 missing
+            var ids <- [0l, 2l]
+            moe_gpu_heat_advise(HLAYER, HWOFF, HWOFF + HSTRIDE, HWOFF + 2l * HSTRIDE, 0, 0, 0, N, NFE, ids, 2l)
+            var idx <- [1l, 0l, 2l]
+            var hit : array<int8>
+            var o1 : array<int64>
+            var o3 : array<int64>
+            var o2 : array<int64>
+            hit |> resize(3)
+            o1 |> resize(3)
+            o3 |> resize(3)
+            o2 |> resize(3)
+            var nh = matmul_moe_gpu_heat_query(HLAYER, idx, 3l, hit, o1, o3, o2)
+            t |> equal(2l, nh, "two of three routed experts hit the cache")
+            t |> success(hit[0] == int8(0) && hit[1] == int8(1) && hit[2] == int8(1), "hit mask matches the pinned set")
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, 2l)
+            var hoffs1 <- heat_hit_offs(o1, nh)
+            var hoffs3 <- heat_hit_offs(o3, nh)
+            var hoffs2 <- heat_hit_offs(o2, nh)
+            matmul_moe_gpu_ffn_begin(hoffs1, hoffs3, hoffs2, nh, xq, xs, N, NFE, nh, 0, 0, 0, false)
+            // the CPU reference runs BETWEEN begin and join — the overlap the split arm relies on
+            var roffs1 <- make_offs([0l, 2l], [0l, 1l], [1l, 1l], WOFF1, ege1)
+            var roffs3 <- make_offs([0l, 2l], [0l, 1l], [1l, 1l], WOFF3, ege1)
+            var roffs2 <- make_offs([0l, 2l], [0l, 1l], [1l, 1l], WOFF2, ege2)
+            var refv : array<float>
+            ref_ffn(roffs1, roffs3, roffs2, 2, wq1, ws1, wq3, ws3, wq2, ws2, xq, xs, 2l, refv)
+            var gout : array<float>
+            gout |> resize(int(2l * N))
+            matmul_moe_gpu_ffn_join(gout)
+            var c = compare_gout(gout, refv)
+            t |> success(c.maxref > 0.0, "hit dispatch produced non-trivial outputs")
+            t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
+                "async hit dispatch within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+            // flip the pinned set to {1}: evicts both slots, uploads expert 1 into a freed one
+            var ids2 <- [1l]
+            moe_gpu_heat_advise(HLAYER, HWOFF, HWOFF + HSTRIDE, HWOFF + 2l * HSTRIDE, 0, 0, 0, N, NFE, ids2, 1l)
+            nh = matmul_moe_gpu_heat_query(HLAYER, idx, 3l, hit, o1, o3, o2)
+            t |> equal(1l, nh, "re-pin leaves one hit")
+            t |> success(hit[0] == int8(1) && hit[1] == int8(0) && hit[2] == int8(0), "hit mask follows the re-pin")
+            fill_acts(xq, xs, 1l)
+            var eoffs1 <- heat_hit_offs(o1, nh)
+            var eoffs3 <- heat_hit_offs(o3, nh)
+            var eoffs2 <- heat_hit_offs(o2, nh)
+            matmul_moe_gpu_ffn_begin(eoffs1, eoffs3, eoffs2, nh, xq, xs, N, NFE, nh, 0, 0, 0, false)
+            var poffs1 <- make_offs([1l], [0l], [1l], WOFF1, ege1)
+            var poffs3 <- make_offs([1l], [0l], [1l], WOFF3, ege1)
+            var poffs2 <- make_offs([1l], [0l], [1l], WOFF2, ege2)
+            ref_ffn(poffs1, poffs3, poffs2, 1, wq1, ws1, wq3, ws3, wq2, ws2, xq, xs, 1l, refv)
+            gout |> resize(int(N))
+            matmul_moe_gpu_ffn_join(gout)
+            c = compare_gout(gout, refv)
+            t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
+                "post-eviction hit dispatch within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+            delete ids
+            delete ids2
+            delete idx
+            delete hit
+            delete o1
+            delete o3
+            delete o2
+            delete xq
+            delete xs
+            delete hoffs1
+            delete hoffs3
+            delete hoffs2
+            delete eoffs1
+            delete eoffs3
+            delete eoffs2
+            delete roffs1
+            delete roffs3
+            delete roffs2
+            delete poffs1
+            delete poffs3
+            delete poffs2
+            delete refv
+            delete gout
+            delete wq1
+            delete ws1
+            delete wq3
+            delete ws3
+            delete wq2
+            delete ws2
+            delete wqb
+            delete wsb
+        } else {
+            feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
+        }
+    }
+}
+
 // ===== native K-quant arms =====
 
 let KN = 512l        // kq model dim (TWO superblocks per row — nsb = 1 hides stride bugs)

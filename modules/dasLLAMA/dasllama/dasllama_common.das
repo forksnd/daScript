@@ -3559,6 +3559,12 @@ struct Session {
     moe_dn : array<float>       // fused down outputs (k x dim)
     moe_dq : array<int8>        // the k activated-hidden rows requantized (k x n_ff_exp)
     moe_ds : array<float>       // ... and their scales (k x n_ff_exp / 32)
+    // heat-cache split-FFN scratch (decode: hits ride the GPU chain async, misses stay CPU)
+    moe_hdn : array<float>      // GPU hit-expert down outputs, compacted (nhits x dim)
+    heat_hit : array<int8>      // per routed position: 1 = served by the heat cache
+    heat_o1 : array<int64>      // compacted pool-coordinate offsets for the hit dispatch
+    heat_o3 : array<int64>
+    heat_o2 : array<int64>
     // the layer's rmsnormed activation quantized ONCE and reused across every expert's gate/up
     // matmul — dedicated buffers because the down-projections quantize s.hb into the shared xq/xs
     moe_xq : array<int8>        // xb's Q8 quants (dim)
@@ -7002,6 +7008,99 @@ struct private ReuseLayer {
 var private g_reuse_on = -1
 var private g_reuse : array<ReuseLayer>
 
+// ===== heat-cache policy (the live half of the reuse instrument) =====
+// Decaying per-(layer, expert) pick counters drive an interval re-pin: every HEAT_REPIN tokens
+// (staggered by layer so uploads spread) the layer's top-C ids go to the tier via advise.
+
+let private HEAT_DECAY = 256l    // halve the counters every this many tokens (per layer)
+let private HEAT_REPIN = 64l     // advise interval (per layer, layer-staggered)
+
+struct private HeatLayer {
+    cnt : array<float>     // decaying pick counters (n_expert)
+    tokens : int64
+    hits : int64           // routed picks the slot cache served
+    picks : int64          // ... out of this many
+}
+
+var private g_heat : array<HeatLayer>
+var private g_heat_want = -1l    // cached gpu_want_heat() (env read once)
+
+//! Mean/per-layer heat-cache hit rate over the run (the split-FFN's coverage — the LRU sim in
+//! expert_reuse_report is an ORACLE, this is what the live pins actually caught).
+def heat_report(verbose : bool = false) {
+    var hits = 0l
+    var picks = 0l
+    var nl = 0
+    for (li in range(length(g_heat))) {
+        let h & = unsafe(g_heat[li])
+        continue if (h.picks == 0l)
+        nl++
+        hits += h.hits
+        picks += h.picks
+        if (verbose) {
+            to_log(LOG_INFO, "heat L{li} hit {double(h.hits) * 100.0lf / double(h.picks):.1f}% ({h.hits}/{h.picks})\n")
+        }
+    }
+    if (picks == 0l) {
+        to_log(LOG_INFO, "heat: no data (cache never queried)\n")
+        return
+    }
+    to_log(LOG_INFO, "heat MEAN hit {double(hits) * 100.0lf / double(picks):.1f}% ({hits}/{picks} picks over {nl} layers)\n")
+}
+
+def heat_report_reset() {
+    for (h in g_heat) {
+        h.hits = 0l
+        h.picks = 0l
+    }
+}
+
+def private heat_armed() : bool {
+    if (g_heat_want < 0l) {
+        g_heat_want = max(gpu_want_heat(), 0l)
+    }
+    return g_heat_want > 0l && moe_gpu_heat_on()
+}
+
+def private heat_advise_layer(t : Model; l : int64; h : HeatLayer) {
+    let c = t.config
+    var ids <- [for (i in range(length(h.cnt))); int64(i)]
+    ids |> sort() $(a, b) => h.cnt[a] > h.cnt[b]
+    var want = min(g_heat_want, int64(length(ids)))
+    while (want > 0l && h.cnt[ids[want - 1l]] <= 0.0) {   // never pin never-picked experts
+        want--
+    }
+    if (want > 0l) {
+        moe_gpu_heat_advise(l, t.we1_offs[l], t.we3_offs[l], t.we2_offs[l],
+            int(fmt_at(t.we1_fmt, l)), int(fmt_at(t.we3_fmt, l)), int(fmt_at(t.we2_fmt, l)),
+            c.dim, c.n_ff_exp, ids, want)
+    }
+    delete ids
+}
+
+def private heat_note_and_advise(t : Model; l : int64; idx : array<int64>; k, ne : int64) {
+    let li = int(l)
+    if (length(g_heat) <= li) {
+        g_heat |> resize(li + 1)
+    }
+    var h & = unsafe(g_heat[li])
+    if (length(h.cnt) < int(ne)) {
+        h.cnt |> resize(int(ne))
+    }
+    for (j in range64(k)) {
+        h.cnt[idx[j]]++
+    }
+    h.tokens++
+    if (h.tokens % HEAT_DECAY == 0l) {
+        for (i in range(length(h.cnt))) {
+            h.cnt[i] *= 0.5
+        }
+    }
+    if ((h.tokens + l) % HEAT_REPIN == 0l) {
+        heat_advise_layer(t, l, h)
+    }
+}
+
 def private expert_reuse_armed() : bool {
     if (g_reuse_on < 0) {
         g_reuse_on = get_env_variable("DASLLAMA_EXPERT_REUSE") == "1" ? 1 : 0
@@ -7193,6 +7292,20 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         let f3 = fmt_at(t.we3_fmt, l)
         // GPU MoE tier: unbiased plain-q8 or all-K-quant stacks of offloaded layers dispatch on the GPU
         let gpu_moe = !biased && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai && moe_gpu_layer_on_gpu(l)
+        // heat cache: non-resident layers partition the top-k against the tier's slot pools — hits ride the GPU FFN chain async, misses run the CPU groupn path concurrently
+        let heat_moe = !gpu_moe && !biased && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai && heat_armed()
+        var nhits = 0l
+        if (heat_moe) {
+            heat_note_and_advise(t, l, s.moe_idx, k, ne)
+            s.heat_hit |> resize(int(k))
+            s.heat_o1 |> resize(int(k))
+            s.heat_o3 |> resize(int(k))
+            s.heat_o2 |> resize(int(k))
+            nhits = matmul_moe_gpu_heat_query(l, s.moe_idx, k, s.heat_hit, s.heat_o1, s.heat_o3, s.heat_o2)
+            var hl & = unsafe(g_heat[int(l)])
+            hl.hits += nhits
+            hl.picks += k
+        }
         if (gpu_moe) {
             // region triples (slot j = row j) + a k-row gathered image; gate+up/act/requant/down runs device-side into moe_dn
             s.moe_offs1 |> clear(); s.moe_offs1 |> reserve(k * 3l)
@@ -7227,6 +7340,111 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             matmul_moe_gpu_ffn(s.moe_dn, s.moe_offs1, s.moe_offs3, s.moe_offs2, k,
                 s.moe_gxq, s.moe_gxs, dim, nfe, k, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
             prof_add("mm_moe", ts_gu)
+        } elif (nhits > 0l) {
+            // split-FFN: compacted hit regions (pool coordinates, rows 0..nhits) dispatch async
+            let m = k - nhits
+            s.moe_offs1 |> clear()
+            s.moe_offs3 |> clear()
+            s.moe_offs2 |> clear()
+            for (i in range64(nhits)) {
+                s.moe_offs1 |> push(s.heat_o1[i])   // nolint:STYLE012 — loop-append into reused scratch
+                s.moe_offs1 |> push(i)
+                s.moe_offs1 |> push(1l)
+                s.moe_offs3 |> push(s.heat_o3[i])   // nolint:STYLE012 — loop-append into reused scratch
+                s.moe_offs3 |> push(i)
+                s.moe_offs3 |> push(1l)
+                s.moe_offs2 |> push(s.heat_o2[i])   // nolint:STYLE012 — loop-append into reused scratch
+                s.moe_offs2 |> push(i)
+                s.moe_offs2 |> push(1l)
+            }
+            let nb = layer_kq ? dim / 256l : dim / 32l
+            s.moe_gxq |> resize(int(nhits * dim))
+            s.moe_gxs |> resize(int(nhits * nb))
+            unsafe {
+                var gq = addr(s.moe_gxq[0])
+                var gs = addr(s.moe_gxs[0])
+                let sxq = layer_kq ? addr<void?>(s.kxq[0]) : addr<void?>(s.moe_xq[0])
+                let sxs = layer_kq ? addr<void?>(s.kxs[0]) : addr<void?>(s.moe_xs[0])
+                for (i in range64(nhits)) {
+                    memcpy(reinterpret<void?>(gq + i * dim), sxq, int(dim))
+                    memcpy(reinterpret<void?>(gs + i * nb), sxs, int(nb * 4l))
+                }
+            }
+            let ts_sub = ref_time_ticks()
+            matmul_moe_gpu_ffn_begin(s.moe_offs1, s.moe_offs3, s.moe_offs2, nhits,
+                s.moe_gxq, s.moe_gxs, dim, nfe, nhits, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
+            prof_add("heat_sub", ts_sub)   // dispatch cost ON the critical path (the split's tax)
+            // the missed experts run the CPU groupn chain while the GPU crunches the hits
+            var ts_down = ts_gu
+            if (m > 0l) {
+                var mi = 0l
+                for (j in range64(k)) {
+                    if (s.heat_hit[j] == int8(0)) {
+                        s.moe_offs[mi * 2l] = t.we1_offs[l] + s.moe_idx[j] * ege
+                        s.moe_offs[mi * 2l + 1l] = 0l
+                        mi++
+                    }
+                }
+                if (f1 != KqFmt.q8) {
+                    mm_at_kq_groupn(s.moe_gu, t, f1, s.moe_offs, m, s.kxq, s.kxs, s.kxbs, dim, nfe)
+                } else {
+                    mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, m, s.moe_xq, s.moe_xs, dim, nfe)
+                }
+                mi = 0l
+                for (j in range64(k)) {
+                    if (s.heat_hit[j] == int8(0)) {
+                        s.moe_offs[mi * 2l] = t.we3_offs[l] + s.moe_idx[j] * ege
+                        s.moe_offs[mi * 2l + 1l] = 0l
+                        mi++
+                    }
+                }
+                if (f3 != KqFmt.q8) {
+                    mm_at_kq_groupn(s.moe_gu2, t, f3, s.moe_offs, m, s.kxq, s.kxs, s.kxbs, dim, nfe)
+                } else {
+                    mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, m, s.moe_xq, s.moe_xs, dim, nfe)
+                }
+                prof_add("mm_moe", ts_gu)
+                let ts_act = ref_time_ticks()
+                gate_batch(s.moe_gu, s.moe_gu2, c.ffn_act, nfe, m)
+                prof_add("act", ts_act)
+                if (f2 != KqFmt.q8) {
+                    requant_rows_q8k_bs(s.moe_gu, nfe, m, s.moe_dq, s.moe_ds, s.moe_dbs)
+                } else {
+                    requant_rows_q8(s.moe_gu, nfe, m, s.moe_dq, s.moe_ds)
+                }
+                ts_down = ref_time_ticks()
+                mi = 0l
+                for (j in range64(k)) {
+                    if (s.heat_hit[j] == int8(0)) {
+                        s.moe_offs[mi * 2l] = t.we2_offs[l] + s.moe_idx[j] * ege
+                        s.moe_offs[mi * 2l + 1l] = mi * nfe
+                        mi++
+                    }
+                }
+                if (f2 != KqFmt.q8) {
+                    mm_at_kq_groupn(s.moe_dn, t, f2, s.moe_offs, m, s.moe_dq, s.moe_ds, s.moe_dbs, nfe, dim)
+                } else {
+                    mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, m, s.moe_dq, s.moe_ds, nfe, dim)
+                }
+            }
+            s.moe_hdn |> resize(int(nhits * dim))
+            prof_add("mm_moe", ts_down)
+            let ts_join = ref_time_ticks()
+            matmul_moe_gpu_ffn_join(s.moe_hdn)
+            prof_add("heat_wait", ts_join)   // GPU residue after the CPU misses — 0 = fully hidden
+            let ts_hred = ref_time_ticks()
+            var hi = 0l
+            var mrow = 0l
+            for (j in range64(k)) {   // original slot order — the weighted sum stays order-stable
+                if (s.heat_hit[j] != int8(0)) {
+                    axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_hdn[hi * dim])), s.moe_w[j], dim)
+                    hi++
+                } else {
+                    axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[mrow * dim])), s.moe_w[j], dim)
+                    mrow++
+                }
+            }
+            prof_add("moe_reduce", ts_hred)
         } else {
             for (j in range64(k)) {
                 let e = l * ne + s.moe_idx[j]
@@ -7297,11 +7515,13 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             }
             prof_add("mm_moe", ts_down)
         }
-        let ts_red = ref_time_ticks()
-        for (j in range64(k)) {   // slot order preserved — the sum is bit-identical
-            axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[j * dim])), s.moe_w[j], dim)
+        if (nhits == 0l) {   // the split arm above reduced its own hit/miss row banks
+            let ts_red = ref_time_ticks()
+            for (j in range64(k)) {   // slot order preserved — the sum is bit-identical
+                axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[j * dim])), s.moe_w[j], dim)
+            }
+            prof_add("moe_reduce", ts_red)
         }
-        prof_add("moe_reduce", ts_red)
     } else {
         // fp32 reference path: the per-expert loop (q4_0 never routes here — MoE loads are q8/fp32)
         for (j in range64(k)) {

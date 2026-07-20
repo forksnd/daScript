@@ -1567,6 +1567,105 @@ def public set_moe_gpu_attn_route(on : bool) {
     g_moe_gpu_attn_route = on
 }
 
+// ===== heat-pinned expert cache (decode split-FFN) =====
+// The engine partitions each decode token's top-k against the tier's per-layer slot cache: hits
+// dispatch the GPU FFN chain ASYNC (begin/join around the concurrent CPU miss work). Engine owns heat policy (counters, re-pin advise); tier owns slots, uploads, the offset space.
+
+typedef MoeGpuHeatQueryFn = function<(l : int64; idx : int64 const?; k : int64;
+                                      var hit : int8?; var o1 : int64?; var o3 : int64?; var o2 : int64?) : int64>
+typedef MoeGpuHeatAdviseFn = function<(l : int64; b1 : int64; b3 : int64; b2 : int64; f1 : int; f3 : int; f2 : int;
+                                       n : int64; nfe : int64; ids : int64 const?; nids : int64) : void>
+typedef MoeGpuFfnBeginFn = function<(offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64;
+                                     xqp : int8 const?; xsp : float const?; n : int64; nfe : int64; nrows : int64;
+                                     f1 : int; f3 : int; f2 : int; is_gelu : bool) : void>
+typedef MoeGpuFfnJoinFn = function<(var goutp : float?) : void>
+
+[unused_argument(l, idx, k, hit, o1, o3, o2)]
+def private moe_gpu_unset_heat_query(l : int64; idx : int64 const?; k : int64;
+                                     var hit : int8?; var o1 : int64?; var o3 : int64?; var o2 : int64?) : int64 {
+    return 0l
+}
+
+[unused_argument(l, b1, b3, b2, f1, f3, f2, n, nfe, ids, nids)]
+def private moe_gpu_unset_heat_advise(l : int64; b1, b3, b2 : int64; f1, f3, f2 : int;
+                                      n, nfe : int64; ids : int64 const?; nids : int64) {}
+
+[unused_argument(offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)]
+def private moe_gpu_unset_ffn_begin(offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64;
+                                    xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64;
+                                    f1, f3, f2 : int; is_gelu : bool) {
+    panic("dasLLAMA: async GPU FFN begin hit without an installed GPU tier")
+}
+
+[unused_argument(goutp)]
+def private moe_gpu_unset_ffn_join(var goutp : float?) {
+    panic("dasLLAMA: async GPU FFN join hit without an installed GPU tier")
+}
+
+var g_moe_gpu_heat_query = @@moe_gpu_unset_heat_query
+var g_moe_gpu_heat_advise = @@moe_gpu_unset_heat_advise
+var g_moe_gpu_ffn_begin = @@moe_gpu_unset_ffn_begin
+var g_moe_gpu_ffn_join = @@moe_gpu_unset_ffn_join
+var g_moe_gpu_heat_installed = false
+var g_moe_gpu_heat_route = true
+
+//! Tier registration of the heat-cache surface (beside install_moe_gpu_tier).
+def public set_moe_gpu_heat_hooks(query : MoeGpuHeatQueryFn; advise : MoeGpuHeatAdviseFn;
+                                  begin : MoeGpuFfnBeginFn; join : MoeGpuFfnJoinFn) {
+    g_moe_gpu_heat_query = query
+    g_moe_gpu_heat_advise = advise
+    g_moe_gpu_ffn_begin = begin
+    g_moe_gpu_ffn_join = join
+    g_moe_gpu_heat_installed = true
+}
+
+def public moe_gpu_heat_on : bool {
+    return g_moe_gpu_heat_installed && g_moe_gpu_heat_route
+}
+
+//! Runtime routing gate over the heat cache (the --heat-ab in-process lever; pins/uploads stay).
+def public set_moe_gpu_heat_route(on : bool) {
+    g_moe_gpu_heat_route = on
+}
+
+//! Partition the routed top-k against layer l's slot cache: hit[j] per original position,
+//! compacted synthetic offset triples for the hits (pool coordinates), returns the hit count.
+def public matmul_moe_gpu_heat_query(l : int64; idx : array<int64>; k : int64;
+                                     var hit : array<int8>; var o1, o3, o2 : array<int64>) : int64 {
+    unsafe {
+        return invoke(g_moe_gpu_heat_query, l, addr<int64 const?>(idx[0]), k,
+            addr(hit[0]), addr(o1[0]), addr(o3[0]), addr(o2[0]))
+    }
+}
+
+//! Re-pin advice for layer l: the desired hot set (ids, heat-descending), the layer's real plane
+//! bases + formats. The tier reconciles against its slots under its own upload budget.
+def public moe_gpu_heat_advise(l : int64; b1, b3, b2 : int64; f1, f3, f2 : int;
+                               n, nfe : int64; ids : array<int64>; nids : int64) {
+    unsafe {
+        invoke(g_moe_gpu_heat_advise, l, b1, b3, b2, f1, f3, f2, n, nfe, addr<int64 const?>(ids[0]), nids)
+    }
+}
+
+//! Async decode FFN: submit the hit chain, return before it completes (join collects gout).
+//! Exactly one begin may be in flight; the tier asserts the discipline.
+def public matmul_moe_gpu_ffn_begin(offs1 : array<int64>; offs3 : array<int64>; offs2 : array<int64>; nregions : int64;
+                                    xq : array<int8>; xs : array<float>; n, nfe, nrows : int64;
+                                    f1, f3, f2 : int; is_gelu : bool) {
+    unsafe {
+        invoke(g_moe_gpu_ffn_begin,
+            addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, nfe, nrows, f1, f3, f2, is_gelu)
+    }
+}
+
+//! Collect the pending async FFN's output rows (spin the fence, copy back).
+def public matmul_moe_gpu_ffn_join(var gout : array<float>) {
+    unsafe {
+        invoke(g_moe_gpu_ffn_join, addr(gout[0]))
+    }
+}
+
 // ===== GPU tier programmatic config + status =====
 // The setter mirror of the DASLLAMA_GPU_* env vars (env stays the override) plus the status
 // surface dashboards read — what is actually resident after a load, not what was requested.
@@ -1582,6 +1681,7 @@ struct GpuTierWant {
     attn : bool          //!< full-attention layers through the device chain
     dense : bool         //!< dense attention-side planes resident
     dnd : bool           //!< deltanet DECODE step chain (implies the dn uploads)
+    heat : int64         //!< heat-pinned expert cache slots per layer C (0 = off; needs stream mirrors)
 }
 
 var g_gpu_want = GpuTierWant()
@@ -1624,6 +1724,9 @@ def public gpu_want_dense : bool
 
 def public gpu_want_dnd : bool
     => has_env_variable("DASLLAMA_GPU_DND") ? get_env_variable("DASLLAMA_GPU_DND") == "1" : g_gpu_want.dnd
+
+def public gpu_want_heat : int64
+    => has_env_variable("DASLLAMA_GPU_HEAT") ? env_int64("DASLLAMA_GPU_HEAT") : g_gpu_want.heat
 
 //! A GPU backend registers its arm probe here at ``[init]`` so config-driven arming works
 //! after module init (the env path arms at ``[init]`` directly).

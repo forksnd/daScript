@@ -51,6 +51,9 @@ struct Args {
     @clarg_doc = "Run the timed reps twice in-process — deltanet decode step OFF then ON (needs DASLLAMA_GPU_DND=1 for the uploads; the warmup pre-builds the ON arm's step chains)"
     dnd_ab : bool
 
+    @clarg_doc = "Run the timed reps twice in-process — heat-pinned expert cache OFF then ON (needs DASLLAMA_GPU_HEAT=<slots> + DASLLAMA_GPU_MOE_STREAM covering the layers: uploads DMA from the pinned mirrors)"
+    heat_ab : bool
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -170,10 +173,17 @@ def main() {
             }
             delete s
         }
-        let narms = cfg.dnd_ab ? 2 : 1
+        if (cfg.dnd_ab && cfg.heat_ab) {
+            panic("decode_real_bench: --dnd-ab and --heat-ab are mutually exclusive (one route flip per run)")
+        }
+        let narms = cfg.dnd_ab || cfg.heat_ab ? 2 : 1
         for (ai in range(narms)) {
             if (cfg.dnd_ab) {
                 set_moe_gpu_dnd_route(ai == 1)   // route flip only — uploads and residency stay
+            } elif (cfg.heat_ab) {
+                // OFF first so the ON arm's counters/pins warm during its own reps (rep 1 runs
+                // partly cold — the mean understates ON slightly; the delta stays the judge)
+                set_moe_gpu_heat_route(ai == 1)
             }
             var tps : array<double>
             for (_rep in range(reps)) {
@@ -193,7 +203,7 @@ def main() {
                 }
                 tps |> push(double(int64(length(toks)) * ngen) * 1.0e6lf / double(total_us))
             }
-            report(cfg.dnd_ab ? "tg-real{ngen} dnd-{ai == 1 ? "on" : "off"}" : "tg-real{ngen}", tps)
+            report(cfg.dnd_ab ? "tg-real{ngen} dnd-{ai == 1 ? "on" : "off"}" : (cfg.heat_ab ? "tg-real{ngen} heat-{ai == 1 ? "on" : "off"}" : "tg-real{ngen}"), tps)
             delete tps
         }
         if (cfg.prof) {
@@ -213,6 +223,7 @@ def main() {
         if (cfg.reuse) {
             expert_reuse_report(false)
         }
+        heat_report(cfg.prof)   // silent when the cache never ran
         delete toks
         delete t
     }

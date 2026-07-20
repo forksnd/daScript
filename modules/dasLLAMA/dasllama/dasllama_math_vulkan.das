@@ -1700,6 +1700,13 @@ let private DND_OQ_BYTES = DN_MAX_HEADS * DN_MAX_DS
 let private DND_OS_BYTES = (DN_MAX_HEADS * DN_MAX_DS / 32l) * 4l
 let private DND_SMALLS_BYTES = DN_SMALLS_BYTES + DN_MAX_CD * (DN_MAX_DCONV - 1l) * 4l
 
+// heat-cache pool stacks live in a SYNTHETIC element-offset space far above any real plane
+// offset, so find_stack / fill_stack_meta_rows / the whole FFN GEMV rail run verbatim on them
+let private HEAT_BASE = 1l << 42l
+let private HEAT_STRIDE = 1l << 32l          // per pool-stack offset room (>> nslots * ege)
+let private HEAT_UPLOAD_CAP = 2              // steady-state expert uploads per advise call
+let private HEAT_UPLOAD_CAP_FILL = 8         // while the pool is underfull (warmup fills fast)
+
 // attention chain capacities: roped K / raw V persist device-side at ABSOLUTE batch positions
 // across windows, so later windows attend the whole batch — the engine arm gates on start_pos == 0.
 // Maxima cover the qwen3 family; vk_moe_attn asserts them (fail-closed on bigger geometry).
@@ -1807,6 +1814,19 @@ struct private DnStep {
     dirty : bool
 }
 
+struct private HeatPool {
+    s1 : int = -1                 // pool stacks in the synthetic offset space (-1 = unservable layer)
+    s3 : int = -1
+    s2 : int = -1
+    src1 : int = -1               // stream-mirror stacks (the upload source planes)
+    src3 : int = -1
+    src2 : int = -1
+    ege : int64                   // n*nfe elements per expert per plane
+    nslots : int
+    slot_expert : array<int64>    // slot -> pinned expert (-1 free)
+    emap : table<int64; int>      // expert -> slot
+}
+
 struct private GpuState {
     instance : Instance
     device : Device
@@ -1843,6 +1863,10 @@ struct private GpuState {
     @do_not_delete stacks : array<VkStack>
     ffn_cmds : table<int64; FfnCmd>   // (gate, up, down stack idx triple) -> decode FFN chain
     resident_bytes : int64
+    // heat-pinned expert cache (decode split-FFN) + the one-in-flight async FFN discipline
+    heat_pools : table<int64; HeatPool>   // layer -> slot pool
+    ffn_pend_s2 : int = -1        // down stack of the pending async FFN (-1 = none in flight)
+    ffn_pend_bytes : int64
     dev_mem : table<uint64; uint64>   // device buffer -> its VkDeviceMemory (rollback destroy needs it)
     // FFN mid-chain state (lazy — first FFN dispatch creates it)
     hq_dev : uint64          // device requantized-hidden quants (the down GEMM's activation image)
@@ -2373,17 +2397,28 @@ def private bind_batch_pipe(raw : VkCommandBuffer; fmt : int) {
     }
 }
 
-def private submit_wait(var raw : VkCommandBuffer) {
+def private submit_nowait(var raw : VkCommandBuffer) {
     var submit = VkSubmitInfo()
     submit.commandBufferCount = 1u
-    var fence = g_gpu.fence
+    let fence = g_gpu.fence
     unsafe {
         submit.pCommandBuffers = addr(raw)
         vk_check(vkQueueSubmit(g_gpu.queue, 1u, addr(submit), fence), null)
+    }
+}
+
+def private wait_fence {
+    var fence = g_gpu.fence
+    unsafe {
         // spin, never block: vkWaitForFences pays 1-2ms OS wake-up latency per submit (measured)
         while (vkGetFenceStatus(dev_raw(), fence) != VkResult.SUCCESS) {}
         vk_check(vkResetFences(dev_raw(), 1u, addr(fence)), null)
     }
+}
+
+def private submit_wait(var raw : VkCommandBuffer) {
+    submit_nowait(raw)
+    wait_fence()
 }
 
 // refresh a stack's mapped GEMV meta, one entry per ROW (cnt > 1 regions expand so output lands
@@ -3594,8 +3629,9 @@ def private ffn_cmd_for(s1, s3, s2 : int; nrows, n, nfe : int64) : VkCommandBuff
     return fc.cmd
 }
 
-def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
-    // decode-form only — vk_moe_ffn routes the combined (npos > 0) contract to the batch arm instead
+// fill metas/acts and fetch the recorded chain — shared by the sync GEMV form and the async
+// begin/join pair. Returns the down stack index alongside the cmd (join reads its y staging).
+def private ffn_gemv_prep(offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) : tuple<cmd : VkCommandBuffer; s2 : int> {
     let s1 = find_stack(unsafe(offs1[0]), f1)
     let s3 = find_stack(unsafe(offs3[0]), f3)
     let s2 = find_stack(unsafe(offs2[0]), f2)
@@ -3614,11 +3650,192 @@ def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : in
     fill_stack_acts(s1, xqp, xsp, nrows * n)
     fill_stack_acts(s3, xqp, xsp, nrows * n)
     fill_ffn_meta(nrows * nfe, nrows * nfe / xunit, is_gelu)
-    var cmd = ffn_cmd_for(s1, s3, s2, nrows, n, nfe)
-    submit_wait(cmd)
+    return (cmd = ffn_cmd_for(s1, s3, s2, nrows, n, nfe), s2 = s2)
+}
+
+def private vk_moe_ffn_gemv(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+    // decode-form only — vk_moe_ffn routes the combined (npos > 0) contract to the batch arm instead
+    var pc = ffn_gemv_prep(offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
+    submit_wait(pc.cmd)
     unsafe {
-        memcpy(reinterpret<void?>(goutp), g_gpu.stacks[s2].y.mapped, int(nrows * n * 4l))
+        memcpy(reinterpret<void?>(goutp), g_gpu.stacks[pc.s2].y.mapped, int(nrows * n * 4l))
     }
+}
+
+//! MoeGpuFfnBeginFn: submit the decode FFN chain and return — the CPU runs the miss experts
+//! (and anything else) while the GPU crunches; vk_moe_ffn_join collects. ONE in flight.
+def vk_moe_ffn_begin(offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+    assert(g_gpu.ffn_pend_s2 < 0, "dasLLAMA vulkan tier: async FFN begin while one is already in flight")
+    var pc = ffn_gemv_prep(offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)
+    submit_nowait(pc.cmd)
+    g_gpu.ffn_pend_s2 = pc.s2
+    g_gpu.ffn_pend_bytes = nrows * n * 4l
+}
+
+//! MoeGpuFfnJoinFn: spin the pending async FFN's fence and copy its output rows back.
+def vk_moe_ffn_join(var goutp : float?) {
+    assert(g_gpu.ffn_pend_s2 >= 0, "dasLLAMA vulkan tier: async FFN join with nothing in flight")
+    wait_fence()
+    unsafe {
+        memcpy(reinterpret<void?>(goutp), g_gpu.stacks[g_gpu.ffn_pend_s2].y.mapped, int(g_gpu.ffn_pend_bytes))
+    }
+    g_gpu.ffn_pend_s2 = -1
+}
+
+// ===== heat-pinned expert cache (decode split-FFN) =====
+// Per-layer slot pools live in the SYNTHETIC offset space, so the whole decode FFN GEMV rail
+// (find_stack, metas, FfnCmd) serves hit sets verbatim; uploads DMA-slice the pinned stream mirrors — no CPU gather on the decode path.
+
+def private heat_stream_src(base : int64; fmt : int) : int {
+    for (i in range(length(g_gpu.stream_stacks))) {
+        if (g_gpu.stream_stacks[i].base == base && g_gpu.stream_stacks[i].fmt == fmt) {
+            return i
+        }
+    }
+    return -1
+}
+
+def private heat_pool_make(l : int64; b1, b3, b2 : int64; f1, f3, f2 : int; n, nfe : int64) {
+    ensure_batch_state()   // advise records its slice copies into batch_cmd
+    var pool = HeatPool(ege = n * nfe)
+    let kq = f1 != 0
+    let src1 = heat_stream_src(b1, f1)
+    let src3 = heat_stream_src(b3, f3)
+    let src2 = heat_stream_src(b2, f2)
+    let want = gpu_want_heat()
+    if (src1 < 0 || src3 < 0 || src2 < 0 || ((f3 != 0) != kq) || ((f2 != 0) != kq) || want <= 0l) {
+        to_log(LOG_INFO, "dasLLAMA vulkan tier: heat cache skips layer {l} (no stream mirrors)\n")
+        g_gpu.heat_pools[l] <- pool
+        return
+    }
+    let pb1 = stack_plane_bytes(n, nfe, f1)
+    let pb3 = stack_plane_bytes(n, nfe, f3)
+    let pb2 = stack_plane_bytes(nfe, n, f2)
+    let per_slot = pb1.wq + pb1.ws + pb3.wq + pb3.ws + pb2.wq + pb2.ws
+    let c = min(want, (g_gpu.weight_budget - g_gpu.resident_bytes) / per_slot)
+    if (c <= 0l) {
+        to_log(LOG_INFO, "dasLLAMA vulkan tier: heat cache skips layer {l} (VRAM budget)\n")
+        g_gpu.heat_pools[l] <- pool
+        return
+    }
+    let base = HEAT_BASE + l * 3l * HEAT_STRIDE
+    pool.s1 = make_stack_shell(base, c * pool.ege, f1, c * pb1.wq, c * pb1.ws)
+    pool.s3 = make_stack_shell(base + HEAT_STRIDE, c * pool.ege, f3, c * pb3.wq, c * pb3.ws)
+    pool.s2 = make_stack_shell(base + 2l * HEAT_STRIDE, c * pool.ege, f2, c * pb2.wq, c * pb2.ws)
+    ensure_gemv_scratch(pool.s1)
+    ensure_gemv_scratch(pool.s3)
+    ensure_gemv_scratch(pool.s2)
+    pool.src1 = src1
+    pool.src3 = src3
+    pool.src2 = src2
+    pool.nslots = int(c)
+    pool.slot_expert |> resize(int(c))
+    for (i in range(int(c))) {
+        pool.slot_expert[i] = -1l
+    }
+    g_gpu.resident_bytes += c * per_slot
+    to_log(LOG_INFO, "dasLLAMA vulkan tier: heat cache layer {l}: {c} slots ({c * per_slot} bytes)\n")
+    g_gpu.heat_pools[l] <- pool
+}
+
+// one plane slice, mirror -> pool slot (quants + scales; per-row bytes are uniform by layout)
+def private heat_record_slice(raw : VkCommandBuffer; src_si, dst_si : int; e, slot, rowlen, ege : int64) {
+    let rpe = ege / rowlen
+    let rows_src = g_gpu.stream_stacks[src_si].elems / rowlen
+    let rbq = g_gpu.stream_stacks[src_si].wqbytes / rows_src
+    let rbs = g_gpu.stream_stacks[src_si].wsbytes / rows_src
+    cmd_copy_range(raw, g_gpu.stream_stacks[src_si].hwq.buf, e * rpe * rbq,
+        g_gpu.stacks[dst_si].wqbuf, slot * rpe * rbq, rpe * rbq)
+    cmd_copy_range(raw, g_gpu.stream_stacks[src_si].hws.buf, e * rpe * rbs,
+        g_gpu.stacks[dst_si].wsbuf, slot * rpe * rbs, rpe * rbs)
+}
+
+//! MoeGpuHeatAdviseFn: reconcile layer l's pool toward the desired hot set (ids heat-descending).
+//! Pool creation is lazy (budget-clamped C); uploads are capped per call so a re-pin spreads
+//! across advise ticks instead of stalling one token.
+def vk_moe_heat_advise(l : int64; b1, b3, b2 : int64; f1, f3, f2 : int; n, nfe : int64; ids : int64 const?; nids : int64) {
+    if (g_gpu == null) {
+        return
+    }
+    if (!key_exists(g_gpu.heat_pools, l)) {
+        heat_pool_make(l, b1, b3, b2, f1, f3, f2, n, nfe)
+    }
+    var pool & = unsafe(g_gpu.heat_pools[l])
+    if (pool.nslots <= 0) {
+        return
+    }
+    let nwant = min(nids, int64(pool.nslots))
+    var keep : table<int64>
+    for (i in range64(nwant)) {
+        keep |> insert(unsafe(ids[i]))
+    }
+    var pinned = 0
+    for (s in range(pool.nslots)) {
+        let e = pool.slot_expert[s]
+        if (e >= 0l && !key_exists(keep, e)) {
+            pool.emap |> erase(e)
+            pool.slot_expert[s] = -1l
+        } elif (e >= 0l) {
+            pinned++
+        }
+    }
+    delete keep
+    let cap = pinned * 2 < pool.nslots ? HEAT_UPLOAD_CAP_FILL : HEAT_UPLOAD_CAP
+    var up = 0
+    var free_s = 0
+    var raw = g_gpu.batch_cmd
+    for (i in range64(nwant)) {
+        break if (up >= cap)
+        let e = unsafe(ids[i])
+        continue if (key_exists(pool.emap, e))
+        while (free_s < pool.nslots && pool.slot_expert[free_s] >= 0l) {
+            free_s++
+        }
+        break if (free_s >= pool.nslots)
+        if (up == 0) {
+            let rf : VkCommandBufferResetFlags
+            vk_check(vkResetCommandBuffer(raw, rf), null)
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+        }
+        heat_record_slice(raw, pool.src1, pool.s1, e, int64(free_s), n, pool.ege)
+        heat_record_slice(raw, pool.src3, pool.s3, e, int64(free_s), n, pool.ege)
+        heat_record_slice(raw, pool.src2, pool.s2, e, int64(free_s), nfe, pool.ege)
+        pool.emap |> insert(e, free_s)
+        pool.slot_expert[free_s] = e
+        up++
+    }
+    if (up > 0) {
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(raw)
+    }
+}
+
+//! MoeGpuHeatQueryFn: partition the routed top-k against layer l's pinned slots — hit flags per
+//! original position, compacted synthetic offset triples for the hits.
+def vk_moe_heat_query(l : int64; idx : int64 const?; k : int64; var hit : int8?; var o1 : int64?; var o3 : int64?; var o2 : int64?) : int64 {
+    if (g_gpu == null || !key_exists(g_gpu.heat_pools, l)) {
+        return 0l
+    }
+    let pool & = unsafe(g_gpu.heat_pools[l])
+    if (pool.nslots <= 0) {
+        return 0l
+    }
+    var nh = 0l
+    unsafe {
+        for (j in range64(k)) {
+            let sl = pool.emap?[idx[j]] ?? -1
+            hit[j] = int8(sl >= 0 ? 1 : 0)
+            if (sl >= 0) {
+                let so = int64(sl) * pool.ege
+                o1[nh] = g_gpu.stacks[pool.s1].base + so
+                o3[nh] = g_gpu.stacks[pool.s3].base + so
+                o2[nh] = g_gpu.stacks[pool.s2].base + so
+                nh++
+            }
+        }
+    }
+    return nh
 }
 
 // ===== streamed-prefill dispatch (pinned-mirror layers) =====
@@ -3858,7 +4075,8 @@ def private vk_device_name : string {
 //! Idempotent — re-arming after ``set_gpu_tier_want`` just refreshes the layer count.
 def vulkan_moe_gpu_arm : bool {
     let layers = gpu_want_moe_layers()
-    if ((layers <= 0l && gpu_want_moe_stream() <= 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd())
+    if ((layers <= 0l && gpu_want_moe_stream() <= 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd()
+                && gpu_want_heat() <= 0l)
             || !vulkan_backend_available()) {
         return false   // nothing requested (checked first — the device probe is not free)
     }
@@ -3878,5 +4096,6 @@ def dasllama_math_vulkan_register() {
     set_moe_gpu_vram_report(@@vk_resident_bytes)
     set_moe_gpu_device_report(@@vk_device_name)
     set_moe_gpu_dn_state_hooks(@@vk_dn_step_flush, @@vk_dn_step_invalidate)
+    set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
     vulkan_moe_gpu_arm()
 }
