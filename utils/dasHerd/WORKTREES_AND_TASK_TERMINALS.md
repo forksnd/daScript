@@ -88,6 +88,34 @@ Questions to settle before implementation:
 - What state can be reconstructed after the command host itself crashes; a PTY
   cannot be recovered if its owning process is gone.
 
+### Chunk 0: measure terminal execution overhead
+
+Discussion status: agreed
+
+Before choosing a capture fast path or optimizing host topology, measure local
+Git through the terminal stack that already exists. SSH Git is a separate Git
+installation and execution target; it gets the same probe after SSH exists.
+
+Compare the same forced-color Git argv through:
+
+1. direct process capture;
+2. direct process capture plus a raw durable log;
+3. ConPTY, terminal emulation, and a raw durable log.
+
+The probe records launch-to-first-output, launch-to-exit, final-output drain,
+terminal poll/feed time, log-write time, byte count, and exit code. It separates
+the cold first run from warmed median and p95 samples. The command set contains
+a process-launch baseline, a representative colored repository status, and an
+intentional failure to prove nonzero exit propagation.
+
+One windowed run displays the real terminal with color and scrolling while
+retaining its raw log and final exit code. Repeated timing runs are headless.
+This first comparison measures in-process ConPTY/emulator/log overhead; the
+same probe is rerun through detach/IPC after the minimal host exists.
+
+No capture-mode or short-command optimization is selected until these numbers
+exist.
+
 ## Section 1: repository, base, and worktree identity
 
 Discussion status: open
