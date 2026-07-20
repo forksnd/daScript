@@ -96,6 +96,10 @@ class private WatcherRichClient : HvWebSocketClient {
     last_heartbeat : int64
     last_list : int64
     sent_input_bytes : int64
+    desired_columns : int
+    desired_rows : int
+    sent_columns : int
+    sent_rows : int
 
     def override onOpen {
         connected = true
@@ -109,6 +113,8 @@ class private WatcherRichClient : HvWebSocketClient {
         connected = false
         attached = false
         controls = false
+        sent_columns = 0
+        sent_rows = 0
         error = "watcher connection closed"
     }
 
@@ -149,11 +155,20 @@ class private WatcherRichClient : HvWebSocketClient {
                 attached = true
                 controls = incoming.controls
                 g_status = incoming.controls ? "Attached with control" : "Attached read-only"
+                if (controls) {
+                    if (desired_columns <= 0 || desired_rows <= 0) {
+                        desired_columns = g_terminal.columns
+                        desired_rows = g_terminal.rows
+                    }
+                    flush_resize()
+                }
             }
         } elif (envelope._type == "detached") {
             attached = false
             controls = false
             attached_id = ""
+            sent_columns = 0
+            sent_rows = 0
         } elif (envelope._type == "raw_reset") {
             var incoming : WatcherRawResetMessage
             if (sscan_json(body, incoming)) {
@@ -190,6 +205,8 @@ class private WatcherRichClient : HvWebSocketClient {
         selected_id = session_id
         attached = false
         controls = false
+        sent_columns = 0
+        sent_rows = 0
         error = ""
         reset_terminal(columns, rows)
         send("\{\"op\":\"attach\",\"session_id\":{sprint_json(session_id, false)}," +
@@ -212,9 +229,18 @@ class private WatcherRichClient : HvWebSocketClient {
         sent_input_bytes += int64(length(text))
     }
 
-    def resize(columns, rows : int) {
-        if (!controls) return
-        send("\{\"op\":\"resize\",\"columns\":{columns},\"rows\":{rows}\}")
+    def request_resize(columns, rows : int) {
+        desired_columns = columns
+        desired_rows = rows
+        flush_resize()
+    }
+
+    def flush_resize() {
+        if (!controls || desired_columns <= 0 || desired_rows <= 0) return
+        if (desired_columns == sent_columns && desired_rows == sent_rows) return
+        send("\{\"op\":\"resize\",\"columns\":{desired_columns},\"rows\":{desired_rows}\}")
+        sent_columns = desired_columns
+        sent_rows = desired_rows
     }
 
     def terminate_selected() {
@@ -410,7 +436,7 @@ def update() {
                     g_terminal_cache, terminal_style)
                 if (g_client != null) {
                     if (!empty(result.input_text)) g_client->send_input(result.input_text)
-                    if (result.resized) g_client->resize(result.columns, result.rows)
+                    if (result.resized) g_client->request_resize(result.columns, result.rows)
                 }
             }
             separator()
