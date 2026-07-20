@@ -3191,6 +3191,7 @@ def dasllama_metal_llama_register() {
     // shapes decline per call
     register_decode_override("metal", @@metal_decode_forward)
     register_batch_decode_override("metal", @@metal_batch_decode_forward)
+    register_mtp_spec_override("metal", @@metal_mtp_spec_eval)
     register_metal_servable(@@metal_model_servable_impl)   // load_model's image-flavor gate
     if (has_env_variable("DASLLAMA_METAL_DECODE_SKIP")) {
         g_skip = get_env_variable("DASLLAMA_METAL_DECODE_SKIP")

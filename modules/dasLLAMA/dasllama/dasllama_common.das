@@ -262,6 +262,16 @@ def register_decode_override(name : string; fn : DecodeOverrideFn) {
     g_decode_overrides[name] = fn
 }
 
+// The MTP spec-step override: a backend's complete mtp_spec_eval twin (cold gates + accept/
+// reject bookkeeping inside). Keyed by the DECODE override name — selecting "metal" activates
+// both; consulted only for blob models (planar models keep the CPU spec rail).
+typedef MtpSpecOverrideFn = function<(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool>
+var private g_mtp_spec_overrides : table<string; MtpSpecOverrideFn>
+
+def register_mtp_spec_override(name : string; fn : MtpSpecOverrideFn) {
+    g_mtp_spec_overrides[name] = fn
+}
+
 // "would the metal drivers serve this loaded model?" — the model-level gate, registered by the
 // metal driver module at [init] (it owns the path masks). load_model consults it to pick the
 // image flavor: servable -> the blob-only metal flavor, else the planar CPU flavor.
@@ -8463,6 +8473,10 @@ def private mtp_prefill_warm(t : Model; var s : Session; tokens : array<int64>; 
 //! `s.logits` holds the second position's; else one position, plain-eval semantics. Requires [[set_mtp_spec]] ON.
 def mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool {
     let c = t.config
+    if (t.metal_blob && !empty(g_decode_override_name) && key_exists(g_mtp_spec_overrides, g_decode_override_name)) {
+        // a blob model never runs the CPU spec rail — the active override's GPU twin owns the step
+        return invoke(g_mtp_spec_overrides[g_decode_override_name], t, s, tok, accepted)
+    }
     let pos = s.n_past
     // pos < 1: nothing evaled yet — the zero-init mtp_h_pos1 sentinel COLLIDES with pos == 0
     // (0 != 0 would pass the cold check and draft at row -1), so gate it explicitly
@@ -10987,11 +11001,13 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
 
     // spec on: the draft head's SEAM row (start_pos-1) must be written BEFORE the body — the body's
     // own tail overwrites mtp_h with THIS window's last hidden. Cold/foreign handoff just skips it.
-    if (g_mtp_spec && c.n_layer_nextn > 0l && start_pos > 0l && s.mtp_h_pos1 == start_pos) {
+    if (g_mtp_spec && c.n_layer_nextn > 0l && !t.metal_blob && start_pos > 0l && s.mtp_h_pos1 == start_pos) {
         forward_mtp(t, s, tokens[0], start_pos - 1l, false)
     }
     forward_prefill_body(t, s, npos, start_pos, skip_logits)
-    if (g_mtp_spec && c.n_layer_nextn > 0l) {   // spec on: maintain the draft head's KV alongside the trunk's
+    // spec on: maintain the draft head's KV alongside the trunk's — CPU rail only (on a blob
+    // model the GPU spec loop owns the draft slab; these hooks would CPU-touch blob planes)
+    if (g_mtp_spec && c.n_layer_nextn > 0l && !t.metal_blob) {
         mtp_prefill_warm(t, s, tokens, npos, start_pos)
     }
 }
