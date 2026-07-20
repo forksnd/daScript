@@ -58,6 +58,7 @@ struct public WatcherSessionInfo {
     exit_code : int64 = -1l
     elapsed_ms : int64
     output_bytes : int64
+    input_bytes : int64
     columns : int
     rows : int
     revision : int64
@@ -108,6 +109,7 @@ class private WatcherSession {
     exit_seen_ms : int64 = -1l
     exit_code : int64 = -1l
     output_bytes : int64
+    input_bytes : int64
     raw_history : array<uint8>
     raw_history_start : int64
     status_revision : int64
@@ -172,6 +174,7 @@ def private session_info(session : WatcherSession?) : WatcherSessionInfo {
         cwd = session.cwd, state = session.state, reason = session.reason,
         pid = terminal_process_id(session.terminal), exit_code = session.exit_code,
         elapsed_ms = elapsed_ms(session), output_bytes = session.output_bytes,
+        input_bytes = session.input_bytes,
         columns = session.terminal.columns, rows = session.terminal.rows,
         revision = terminal_revision(session.terminal), status_revision = session.status_revision,
         controller_id = session.controller_id,
@@ -350,10 +353,11 @@ def public watcher_output_since(session_id : string; requested_offset : int64;
     return <- result
 }
 
-def private input_session(session : WatcherSession?; text : string; client_id : int) : string {
+def private input_session(var session : WatcherSession?; text : string; client_id : int) : string {
     if (session.controller_id != 0 && session.controller_id != client_id) return "controller lease is held by another client"
     if (session.state != "running" || session.drained) return "session is not running"
     if (!terminal_write(session.terminal, text)) return terminal_transport_error(session.terminal)
+    session.input_bytes += int64(length(text))
     return ""
 }
 

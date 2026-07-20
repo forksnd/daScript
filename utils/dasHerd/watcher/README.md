@@ -11,6 +11,17 @@ Run it from the repository root:
 bin\Release\daslang.exe -jit utils\dasHerd\watcher\main.das
 ```
 
+Run the docked native client with the token printed by the watcher:
+
+```powershell
+bin\Release\daslang-live.exe utils\dasHerd\watcher\rich_client.das -- --token=<token>
+```
+
+The client opens maximized at 150% zoom. Its left pane lists sessions and can
+launch or terminate them; the right pane attaches with control and renders raw
+PTY bytes through the daScript terminal emulator. `--port=9191` is available on
+both processes when the default port is occupied.
+
 The watcher prints a token-bearing control-panel URL. Optional arguments after
 `--` are `--port=9191`, `--token=<token>`, and `--log-root=<directory>`.
 
@@ -20,7 +31,8 @@ authentication design. Do not expose this port through a proxy or tunnel.
 
 HTTP endpoints under `/api/v1/` provide health, session listing, launch,
 input, resize, termination, and a deferred `POST /gc` diagnostic. `/ws` provides attach/detach, controller
-leases, heartbeats, input, resize, terminal snapshots, and bounded raw PTY replay.
+leases, heartbeats, session listing/launch/termination, input, resize, terminal
+snapshots, and bounded raw PTY replay.
 Raw output is delivered as binary WebSocket frames, so the browser can render
 the same color and control sequences and send keyboard input back to the PTY.
 Every request must include the startup token as the `token` query parameter.
@@ -39,3 +51,8 @@ Session logs are stored under
 `logs/dasHerd/watcher/sessions/<session-id>/`. Closing a client releases its
 controller lease but does not stop its child. Killing the watcher necessarily
 loses its live PTYs; already-flushed logs remain readable.
+
+The native terminal registers its full `ImGuiTerminalState` with the live-command
+surface. `imgui_snapshot` can therefore read terminal text, selection, geometry,
+cursor/blink state, performance counters, and input revisions without a screenshot;
+`imgui_click` plus `imgui_key_type` drives the same input path as a human user.

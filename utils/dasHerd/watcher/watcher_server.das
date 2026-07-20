@@ -37,9 +37,12 @@ def public watcher_reset_gc_request() {
 struct private WatcherWsMessage {
     op : string
     session_id : string
+    command_line : string
+    cwd : string
     text : string
     columns : int
     rows : int
+    timeout_ms : int64
     control : bool
     raw : bool
 }
@@ -216,6 +219,11 @@ class DasHerdWatcherServer : HvWebServer {
         send(channel, body, ws_opcode.WS_OPCODE_TEXT, true)
     }
 
+    def send_sessions(channel : WebSocketChannel) {
+        send(channel, "\{\"type\":\"sessions\",\"data\":{watcher_list_json()}\}",
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
     def send_snapshot(var client : WatcherClient?; force : bool = false) {
         if (client == null || empty(client.session_id)) return
         let update_key = watcher_update_key(client.session_id)
@@ -270,6 +278,7 @@ class DasHerdWatcherServer : HvWebServer {
             last_heartbeat = ref_time_ticks()))
         send(channel, "\{\"type\":\"connected\",\"client_id\":{next_client_id}\}",
             ws_opcode.WS_OPCODE_TEXT, true)
+        send_sessions(channel)
     }
 
     def override onWsClose(channel : WebSocketChannel) {
@@ -294,6 +303,20 @@ class DasHerdWatcherServer : HvWebServer {
         client.last_heartbeat = ref_time_ticks()
         if (incoming.op == "heartbeat") {
             send(channel, "\{\"type\":\"heartbeat\"\}", ws_opcode.WS_OPCODE_TEXT, true)
+        } elif (incoming.op == "list") {
+            send_sessions(channel)
+        } elif (incoming.op == "launch") {
+            let result = watcher_launch(WatcherLaunchRequest(
+                command_line = incoming.command_line, cwd = incoming.cwd,
+                columns = incoming.columns, rows = incoming.rows,
+                timeout_ms = incoming.timeout_ms))
+            if (!result.ok) {
+                send_error(channel, result.error)
+                return
+            }
+            send(channel, "\{\"type\":\"launched\",\"session_id\":{sprint_json(result.session_id, false)}\}",
+                ws_opcode.WS_OPCODE_TEXT, true)
+            send_sessions(channel)
         } elif (incoming.op == "attach") {
             if (watcher_find_session(incoming.session_id) < 0) {
                 send_error(channel, "unknown session")
@@ -331,6 +354,11 @@ class DasHerdWatcherServer : HvWebServer {
             }
             let error = watcher_resize(client.session_id, incoming.columns, incoming.rows, client.id)
             if (!empty(error)) send_error(channel, error)
+        } elif (incoming.op == "terminate") {
+            let session_id = !empty(incoming.session_id) ? incoming.session_id : client.session_id
+            let error = watcher_terminate(session_id)
+            if (!empty(error)) send_error(channel, error)
+            send_sessions(channel)
         } else {
             send_error(channel, "unknown operation")
         }
