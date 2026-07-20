@@ -1792,10 +1792,12 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/requirefix/testdata/
 # Install MCP server (stdio transport, no dasHV dependency)
 #   main.das        — full server entry point
 #   cpp_main.das    — cpp/agnostic-subset entry point
+#   mcp_core.das    — transport-neutral core protocol_core requires
 #   protocol_core.das + registry_das.das + registry_cpp.das — shared dispatch + tool registry
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/main.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_main.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/mcp_core.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/protocol_core.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/registry_das.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/registry_cpp.das
@@ -1806,6 +1808,8 @@ install(FILES
 )
 file(GLOB DAS_MCP_TOOLS ${PROJECT_SOURCE_DIR}/utils/mcp/tools/*.das)
 install(FILES ${DAS_MCP_TOOLS} DESTINATION utils/mcp/tools)
+file(GLOB DAS_MCP_SUBTOOLS ${PROJECT_SOURCE_DIR}/utils/mcp/subtools/*.das)
+install(FILES ${DAS_MCP_SUBTOOLS} DESTINATION utils/mcp/subtools)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/test_tools.das
     DESTINATION utils/mcp

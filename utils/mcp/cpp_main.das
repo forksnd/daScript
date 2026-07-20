@@ -37,5 +37,5 @@ def main() {
     build_cpp_tools(reg)
     register_shutdown(reg)
 
-    serve_stdio(reg)
+    serve_stdio(das_mcp_server("daslang", "0.1.0"), reg)
 }

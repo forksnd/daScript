@@ -60,7 +60,7 @@ Alternatively, launch Claude Code itself from an *x64 Native Tools Command Promp
 
 ### Two servers: full (`main.das`) and C++-only (`cpp_main.das`)
 
-The server has two entry points over the same dispatch core (`protocol_core.das`):
+The server has two entry points over the same dispatch core (the provider-neutral `mcp_core.das`, with the daslang module-resolution layer added by `protocol_core.das`):
 
 - **`main.das`** — the full tool set (everything above).
 - **`cpp_main.das`** — only the cpp/agnostic subset: `grep_usage`, `outline`, the seven `cpp_*` tools, and `shutdown`. None of the daslang compiler-backed tools (compile / lint / AOT / introspection / live-reload) are registered, so a C++-only project gets a focused tool list without the daslang toolchain.
@@ -198,7 +198,7 @@ Restart the session in the worktree afterward to pick up the server.
 
 - Each tool invocation runs in a **separate thread** (`new_thread`) with its own context/heap — when the thread ends, its memory is freed without GC
 - **Exception:** `live_*` tools run on the main thread (they use `system()` and `sleep()` which don't work well from `new_thread`)
-- Dispatch + JSON-RPC framing live in `protocol_core.das`. Tools are described by a data-driven registry (`array<ToolDef>`): `registry_das.das` registers the daslang compiler-backed tools, `registry_cpp.das` the cpp/agnostic subset. Adding a tool = one `ToolDef` entry.
+- Dispatch + JSON-RPC framing live in the provider-neutral `mcp_core.das` (serverInfo and the extra-arg names it extracts for every tool come from the `McpServer` config it is handed); `protocol_core.das` adds the daslang layer — the module-resolution args (`project` / `project_root` / `load_modules`), `make_file_tool`, and `das_mcp_server()`. Tools are described by a data-driven registry (`array<ToolDef>`): `registry_das.das` registers the daslang compiler-backed tools, `registry_cpp.das` the cpp/agnostic subset. Adding a tool = one `ToolDef` entry.
 - Two entry points share that dispatch: **`main.das`** registers the full set; **`cpp_main.das`** registers only the cpp/agnostic subset (ast-grep search/outline + the C++ build tools + `shutdown`), for C++-focused consumers that don't want the daslang toolchain in their tool list.
 - Heap is collected after each request when over threshold (1 MB)
 - Tool handlers are modular: each tool lives in `tools/*.das`, MCP-specific shared utilities in `tools/common.das`. The general "comma/newline list of files / globs → file array" expander (`expand_glob`, `parse_file_list`) lives in `daslib/fio`
