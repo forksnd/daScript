@@ -1047,8 +1047,14 @@ def private ref_dn_core(qkvy, zy : array<float>; bts, gts, tapsv, wnormv, av, dt
                     }
                 }
             }
-            for (i in range64(cl * cl)) {   // unit-lower solve off the A' originals
-                p_tm[int(i)] = p_am[int(i)]
+            // unit-lower solve off the A' originals. The copy MUST be CS-strided: the w/d GEMMs
+            // below read T's diagonal and upper entries too, which the solve never writes — a
+            // linear cl*cl copy misses them for cl < CS (masked before this fix because every
+            // fixture's FIRST chunk was exactly CS, pre-seeding diag = 1 / upper = 0)
+            for (i in range64(cl)) {
+                for (jc in range64(cl)) {
+                    p_tm[int(i * CS + jc)] = p_am[int(i * CS + jc)]
+                }
             }
             for (i in range64(cl)) {
                 for (jc in range64(i)) {
@@ -1308,6 +1314,247 @@ def test_vulkan_deltanet(t : T?) {
             delete wsb
         } else {
             feint("dasVulkan not installed; vulkan deltanet chain untestable here\n")
+        }
+    }
+}
+
+// ===== the deltanet decode-step arm =====
+// npos == 1 through the same MoeGpuDnFn: per-token submits with DEVICE-resident state and conv
+// ring, vs the same CPU mirror run once over all tokens (chunking is an algebraic identity —
+// only f32 drift separates cl = 1 steps from one cl = T chunk). The flush at token 4 exercises
+// the whole residency seam: device -> CPU sync, then a cold re-upload from the flushed state,
+// and the final outputs must still match the straight-through reference.
+
+let DNSQ_WOFF = 17000000l
+let DNSZ_WOFF = 18000000l
+let DNSO_WOFF = 19000000l
+let DNSTEPS = 8l
+
+[test]
+def test_vulkan_deltanet_step(t : T?) {
+    t |> run("vulkan deltanet decode step == CPU reference (state carry + mid-sequence flush)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            var wqkv : array<int8>
+            var wsqkv : array<float>
+            var wz : array<int8>
+            var wsz : array<float>
+            var wo : array<int8>
+            var wso : array<float>
+            fill_stack(wqkv, wsqkv, DNCD, DND, 61l, true)
+            fill_stack(wz, wsz, DNDI, DND, 67l, true)
+            fill_stack(wo, wso, DND, DNDI, 71l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(wqkv, wsqkv, wqb, wsb)
+            if (!moe_gpu_upload_stack(wqb, wsb, DNSQ_WOFF, DND, DNCD, 0)) {
+                feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                return
+            }
+            pack_upload(wz, wsz, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, DNSZ_WOFF, DND, DNDI, 0), "z stack uploaded")
+            pack_upload(wo, wso, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, DNSO_WOFF, DNDI, DND, 0), "out stack uploaded")
+            set_moe_gpu_dn_layer(0l, DNSQ_WOFF)   // the flush hook resolves layer -> tier state by this
+            var xq : array<int8>
+            var xs : array<float>
+            xq |> resize(int(DNSTEPS * DND))
+            xs |> resize(int(DNSTEPS * (DND / 32l)))
+            for (i in range(int(DNSTEPS * DND))) {
+                xq[i] = int8((int64(i) * 13l + 5l) % 255l - 127l)
+            }
+            for (i in range(int(DNSTEPS * (DND / 32l)))) {
+                xs[i] = pow2_small(int64(i) + 2l)
+            }
+            var bts : array<float>
+            var gts : array<float>
+            bts |> resize(int(DNSTEPS * DNVH))
+            gts |> resize(int(DNSTEPS * DNVH))
+            for (i in range(int(DNSTEPS * DNVH))) {
+                bts[i] = synth_f(int64(i), 3l, 1.5)
+                gts[i] = synth_f(int64(i), 11l, 1.5)
+            }
+            var tapsv : array<float>
+            tapsv |> resize(int(DNCD * DNCONV))
+            for (i in range(int(DNCD * DNCONV))) {
+                tapsv[i] = synth_f(int64(i), 17l, 0.25)
+            }
+            var wnormv : array<float>
+            wnormv |> resize(int(DNDS))
+            for (i in range(int(DNDS))) {
+                wnormv[i] = 1.0 + synth_f(int64(i), 19l, 0.3)
+            }
+            var av : array<float>
+            var dtv : array<float>
+            av |> resize(int(DNVH))
+            dtv |> resize(int(DNVH))
+            for (i in range(int(DNVH))) {
+                av[i] = -(0.3 + abs(synth_f(int64(i), 23l, 1.2)))
+                dtv[i] = synth_f(int64(i), 29l, 0.4)
+            }
+            var state0 : array<float>
+            state0 |> resize(int(DNVH * DNDS * DNDS))
+            for (i in range(int(DNVH * DNDS * DNDS))) {
+                state0[i] = synth_f(int64(i), 47l, 0.1)
+            }
+            var hist0 : array<float>
+            hist0 |> resize(int(DNCD * DNTAPS))
+            for (i in range(int(DNCD * DNTAPS))) {
+                hist0[i] = synth_f(int64(i), 43l, 0.5)
+            }
+            // references: the straight-through 8-token mirror and the 4-token prefix (flush point)
+            var qkvy : array<float>
+            var zy : array<float>
+            ref_q8_gemm(wqkv, wsqkv, xq, xs, DND, DNCD, DNSTEPS, qkvy)
+            ref_q8_gemm(wz, wsz, xq, xs, DND, DNDI, DNSTEPS, zy)
+            var rstate : array<float>
+            var rstate4 : array<float>
+            rstate := state0
+            rstate4 := state0
+            var refy : array<float>
+            var refconv : array<float>
+            ref_dn_core(qkvy, zy, bts, gts, tapsv, wnormv, av, dtv, rstate, hist0, DNSTEPS, wo, wso, refy, refconv)
+            var qkvy4 : array<float>
+            var zy4 : array<float>
+            var bts4 : array<float>
+            var gts4 : array<float>
+            qkvy4 |> resize(int(4l * DNCD))
+            zy4 |> resize(int(4l * DNDI))
+            bts4 |> resize(int(4l * DNVH))
+            gts4 |> resize(int(4l * DNVH))
+            for (i in range(int(4l * DNCD))) {
+                qkvy4[i] = qkvy[i]
+            }
+            for (i in range(int(4l * DNDI))) {
+                zy4[i] = zy[i]
+            }
+            for (i in range(int(4l * DNVH))) {
+                bts4[i] = bts[i]
+                gts4[i] = gts[i]
+            }
+            var refy4 : array<float>
+            var refconv4 : array<float>
+            ref_dn_core(qkvy4, zy4, bts4, gts4, tapsv, wnormv, av, dtv, rstate4, hist0, 4l, wo, wso, refy4, refconv4)
+            var reft : array<float>
+            var reft4 : array<float>
+            reft |> resize(int(DNTAPS * DNCD))
+            reft4 |> resize(int(DNTAPS * DNCD))
+            for (k in range64(DNTAPS)) {   // ring references, CPU channel-major
+                for (ch in range64(DNCD)) {
+                    reft[int(ch * DNTAPS + k)] = qkvy[int((DNSTEPS - DNTAPS + k) * DNCD + ch)]
+                    reft4[int(ch * DNTAPS + k)] = qkvy[int((4l - DNTAPS + k) * DNCD + ch)]
+                }
+            }
+            // the step arm: gstate/gring are THE engine-side CPU state — cold-uploaded at token 0,
+            // flushed back (and re-uploaded from) at token 4, flushed again after token 7
+            var gstate : array<float>
+            var gring : array<float>
+            gstate := state0
+            gring := hist0
+            var y : array<float>
+            y |> resize(int(DNSTEPS * DND))
+            var y1 : array<float>
+            var xq1 : array<int8>
+            var xs1 : array<float>
+            var b1 : array<float>
+            var g1 : array<float>
+            var tail1 : array<float>
+            y1 |> resize(int(DND))
+            xq1 |> resize(int(DND))
+            xs1 |> resize(int(DND / 32l))
+            b1 |> resize(int(DNVH))
+            g1 |> resize(int(DNVH))
+            tail1 |> resize(int(DNTAPS * DNCD))
+            for (tok in range64(DNSTEPS)) {
+                for (i in range64(DND)) {
+                    xq1[int(i)] = xq[int(tok * DND + i)]
+                }
+                for (i in range64(DND / 32l)) {
+                    xs1[int(i)] = xs[int(tok * (DND / 32l) + i)]
+                }
+                for (i in range64(DNVH)) {
+                    b1[int(i)] = bts[int(tok * DNVH + i)]
+                    g1[int(i)] = gts[int(tok * DNVH + i)]
+                }
+                unsafe {
+                    matmul_moe_gpu_dn(y1, DNSQ_WOFF, DNSZ_WOFF, DNSO_WOFF, xq1, xs1, b1, g1,
+                        addr<float const?>(tapsv[0]), addr<float const?>(wnormv[0]),
+                        addr<float const?>(av[0]), addr<float const?>(dtv[0]),
+                        addr(gstate[0]), tail1, addr<float const?>(gring[0]),
+                        1l, DND, DNCD, DNKD, DNDI, DNVH, DNKH, DNDS, DNCONV, DN_EPS)
+                }
+                for (i in range64(DND)) {
+                    y[int(tok * DND + i)] = y1[int(i)]
+                }
+                if (tok == 3l) {
+                    unsafe {
+                        moe_gpu_dn_flush(0l, addr(gstate[0]), addr(gring[0]))
+                    }
+                    let cs4 = compare_gout(gstate, rstate4)
+                    t |> success(cs4.maxdiff <= float(DN_REL_TOL) * cs4.maxref,
+                        "flushed state at token 4 within tolerance (maxdiff {cs4.maxdiff} vs {float(DN_REL_TOL) * cs4.maxref} bar)")
+                    let cr4 = compare_gout(gring, reft4)
+                    t |> success(cr4.maxdiff <= float(REL_TOL) * cr4.maxref,
+                        "flushed conv ring at token 4 within tolerance (maxdiff {cr4.maxdiff} vs {float(REL_TOL) * cr4.maxref} bar)")
+                }
+            }
+            unsafe {
+                moe_gpu_dn_flush(0l, addr(gstate[0]), addr(gring[0]))
+            }
+            let cy = compare_gout(y, refy)
+            t |> success(cy.maxref > 0.0, "step chain produced non-trivial outputs")
+            t |> success(cy.maxdiff <= float(DN_REL_TOL) * cy.maxref,
+                "step out rows across the flush within tolerance (maxdiff {cy.maxdiff} vs {float(DN_REL_TOL) * cy.maxref} bar, maxref {cy.maxref})")
+            let cs = compare_gout(gstate, rstate)
+            t |> success(cs.maxdiff <= float(DN_REL_TOL) * cs.maxref,
+                "final state within tolerance (maxdiff {cs.maxdiff} vs {float(DN_REL_TOL) * cs.maxref} bar)")
+            let cr = compare_gout(gring, reft)
+            t |> success(cr.maxdiff <= float(REL_TOL) * cr.maxref,
+                "final conv ring within tolerance (maxdiff {cr.maxdiff} vs {float(REL_TOL) * cr.maxref} bar)")
+            reset_moe_gpu_dn_layers()
+            delete wqkv
+            delete wsqkv
+            delete wz
+            delete wsz
+            delete wo
+            delete wso
+            delete wqb
+            delete wsb
+            delete xq
+            delete xs
+            delete bts
+            delete gts
+            delete tapsv
+            delete wnormv
+            delete av
+            delete dtv
+            delete state0
+            delete hist0
+            delete qkvy
+            delete zy
+            delete rstate
+            delete rstate4
+            delete refy
+            delete refconv
+            delete qkvy4
+            delete zy4
+            delete bts4
+            delete gts4
+            delete refy4
+            delete refconv4
+            delete reft
+            delete reft4
+            delete gstate
+            delete gring
+            delete y
+            delete y1
+            delete xq1
+            delete xs1
+            delete b1
+            delete g1
+            delete tail1
+        } else {
+            feint("dasVulkan not installed; vulkan deltanet decode step untestable here\n")
         }
     }
 }

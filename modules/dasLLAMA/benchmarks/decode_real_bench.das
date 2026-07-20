@@ -48,6 +48,9 @@ struct Args {
     @clarg_doc = "Arm the expert-reuse counter and dump its report at the end (adds <1% counting overhead to timed rows)"
     reuse : bool
 
+    @clarg_doc = "Run the timed reps twice in-process — deltanet decode step OFF then ON (needs DASLLAMA_GPU_DND=1 for the uploads; the warmup pre-builds the ON arm's step chains)"
+    dnd_ab : bool
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -167,26 +170,32 @@ def main() {
             }
             delete s
         }
-        var tps : array<double>
-        for (_rep in range(reps)) {
-            var total_us = 0l
-            for (pi in range(length(toks))) {
-                var s <- make_run_state(c)   // fresh session per prompt — no KV/DN-state bleed
-                let plen = int64(length(toks[pi]))
-                forward_prefill(t, s, toks[pi], plen, 0l)   // untimed, as llama-bench excludes the prompt
-                let t0 = ref_time_ticks()
-                var pos = plen
-                for (_g in range64(ngen)) {
-                    forward(t, s, argmax_logit(s, c.vocab_size), pos)
-                    pos++
-                }
-                total_us += int64(get_time_usec(t0))
-                delete s
+        let narms = cfg.dnd_ab ? 2 : 1
+        for (ai in range(narms)) {
+            if (cfg.dnd_ab) {
+                set_moe_gpu_dnd_route(ai == 1)   // route flip only — uploads and residency stay
             }
-            tps |> push(double(int64(length(toks)) * ngen) * 1.0e6lf / double(total_us))
+            var tps : array<double>
+            for (_rep in range(reps)) {
+                var total_us = 0l
+                for (pi in range(length(toks))) {
+                    var s <- make_run_state(c)   // fresh session per prompt — no KV/DN-state bleed
+                    let plen = int64(length(toks[pi]))
+                    forward_prefill(t, s, toks[pi], plen, 0l)   // untimed, as llama-bench excludes the prompt
+                    let t0 = ref_time_ticks()
+                    var pos = plen
+                    for (_g in range64(ngen)) {
+                        forward(t, s, argmax_logit(s, c.vocab_size), pos)
+                        pos++
+                    }
+                    total_us += int64(get_time_usec(t0))
+                    delete s
+                }
+                tps |> push(double(int64(length(toks)) * ngen) * 1.0e6lf / double(total_us))
+            }
+            report(cfg.dnd_ab ? "tg-real{ngen} dnd-{ai == 1 ? "on" : "off"}" : "tg-real{ngen}", tps)
+            delete tps
         }
-        report("tg-real{ngen}", tps)
-        delete tps
         if (cfg.prof) {
             // decode-only bucket window: prefill lands before the reset, so the report is pure decode
             var s <- make_run_state(c)

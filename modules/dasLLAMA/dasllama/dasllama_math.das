@@ -1407,7 +1407,7 @@ var g_moe_gpu_cls_off = -1l            // element offset of the resident classif
 var g_moe_gpu_stream_from = 1000000l   // first STREAMED layer (streamed range = [stream_from, from_layer))
 var g_moe_gpu_dense_offs : table<int64>   // resident dense planes, keyed woff * 8 + fmt (per-format offset spaces)
 var g_moe_gpu_dense_route = true       // runtime routing gate over the marks (in-process A/B lever)
-var g_moe_gpu_dn_layers : table<int64>    // recurrent layers whose deltanet triple is tier-resident
+var g_moe_gpu_dn_layers : table<int64; int64>   // recurrent layer -> its qkv plane offset (tier-resident triples)
 var g_moe_gpu_dn_route = true          // runtime routing gate over the deltanet marks (--dn-ab lever)
 var g_moe_gpu_attn_layers : table<int64>  // full-attention layers whose q/k/v/o quad is tier-resident
 var g_moe_gpu_attn_route = true        // runtime routing gate over the attention marks (--attn-ab lever)
@@ -1483,10 +1483,15 @@ def public set_moe_gpu_dense_route(on : bool) {
     g_moe_gpu_dense_route = on
 }
 
-//! Loader contract: mark one recurrent layer's deltanet triple (qkv / z-gate / out-proj planes)
-//! resident on the tier — the prefill deltanet block then runs as one device chain. Reset per load.
-def public set_moe_gpu_dn_layer(l : int64) {
-    g_moe_gpu_dn_layers |> insert(l)
+//! Loader contract: mark one recurrent layer's deltanet triple resident on the tier (reset per
+//! load). woq = the qkv plane's element offset — the decode-step state hooks key tier state by it.
+def public set_moe_gpu_dn_layer(l : int64; woq : int64) {
+    g_moe_gpu_dn_layers |> insert(l, woq)
+}
+
+//! The marked layer's qkv plane offset (-1 when the layer carries no resident triple).
+def public moe_gpu_dn_layer_key(l : int64) : int64 {
+    return g_moe_gpu_dn_layers?[l] ?? -1l
 }
 
 def public reset_moe_gpu_dn_layers {

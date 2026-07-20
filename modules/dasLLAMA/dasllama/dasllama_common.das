@@ -1876,7 +1876,7 @@ def moe_gpu_upload_resident(var t : Model) {
                 continue
             }
             if (moe_gpu_dense_on_gpu(int(KqFmt.q8), t.dnqkv_offs[l])) {
-                set_moe_gpu_dn_layer(l)
+                set_moe_gpu_dn_layer(l, t.dnqkv_offs[l])
                 dn_marked++
                 continue
             }
@@ -1899,7 +1899,7 @@ def moe_gpu_upload_resident(var t : Model) {
                 dn_stop = true
             }
             break if (dn_stop)
-            set_moe_gpu_dn_layer(l)
+            set_moe_gpu_dn_layer(l, t.dnqkv_offs[l])
             dn_marked++
         }
         if (dn_marked > 0l) {

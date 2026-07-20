@@ -377,6 +377,60 @@ def dn_conv {
     }
 }
 
+// the decode-step conv: dn_conv over [ring history, the fresh qkv row] PLUS the in-place ring
+// advance (each channel's slots touched only by its owning thread — race-free). The ring lives
+// in the layer smalls at the hist region, CPU channel-major, so flush is a straight memcpy.
+[compute_shader(local_size_x=256, name="dn_step_conv_spv")]
+def dn_step_conv {
+    let cd = vk_meta[1u]
+    let kd = vk_meta[2u]
+    let dconv = vk_meta[7u]
+    let taps = dconv - 1u
+    let taps_off = vk_meta[13u]
+    let hist_off = vk_meta[17u]
+    let ds = vk_meta[6u]
+    let eps = vk_xs[0u]
+    let qscale = vk_xs[1u]
+    let tid = gl_LocalInvocationID.x
+    var ch = tid
+    while (ch < cd) {
+        let xnew = vk_y[ch]
+        var acc = xnew * vk_xs[taps_off + ch * dconv + taps]
+        var k = 0u
+        while (k < taps) {
+            acc += vk_xs[hist_off + ch * taps + k] * vk_xs[taps_off + ch * dconv + k]
+            k++
+        }
+        k = 0u
+        while (k + 1u < taps) {
+            vk_xs[hist_off + ch * taps + k] = vk_xs[hist_off + ch * taps + k + 1u]
+            k++
+        }
+        vk_xs[hist_off + ch * taps + taps - 1u] = xnew
+        cv_row[ch] = acc / (1.0 + exp(-acc))
+        ch += 256u
+    }
+    barrier()
+    let nblk = (2u * kd) / ds
+    if (tid < nblk) {
+        var sum = 0.0
+        var j = 0u
+        while (j < ds) {
+            let v = cv_row[tid * ds + j]
+            sum += v * v
+            j++
+        }
+        cv_scale[tid] = (1.0 / max(sqrt(sum), eps)) * (tid < kd / ds ? qscale : 1.0)
+    }
+    barrier()
+    ch = tid
+    while (ch < cd) {
+        let s = ch < 2u * kd ? cv_scale[ch / ds] : 1.0
+        vk_upf[ch] = cv_row[ch] * s
+        ch += 256u
+    }
+}
+
 // scan shared: the 64x64 unit-lower solve tile + the GEMM staging tiles (16-deep K)
 var @workgroup st_tm : float[4096]
 var @workgroup st_ta : float[2048]
@@ -1527,6 +1581,11 @@ let private DN_SM_HIST = DN_SM_DT + DN_MAX_HEADS
 let private DN_SMALLS_BYTES = (DN_SM_HIST + DN_MAX_CD * (DN_MAX_DCONV - 1l) + 64l) * 4l
 let private DN_TAIL_BYTES = DN_MAX_CD * (DN_MAX_DCONV - 1l) * 4l
 
+// decode-step scratch: the raw β/γ staging and the o-row Q8_0 image the out GEMV reads
+let private DND_BG_BYTES = 2l * DN_MAX_HEADS * 4l
+let private DND_OQ_BYTES = DN_MAX_HEADS * DN_MAX_DS
+let private DND_OS_BYTES = (DN_MAX_HEADS * DN_MAX_DS / 32l) * 4l
+
 // attention chain capacities: roped K / raw V persist device-side at ABSOLUTE batch positions
 // across windows, so later windows attend the whole batch — the engine arm gates on start_pos == 0.
 // Maxima cover the qwen3 family; vk_moe_attn asserts them (fail-closed on bigger geometry).
@@ -1614,6 +1673,25 @@ struct private FfnCmd {
     nrows : int64                 // row count cmd was recorded with
 }
 
+// one recurrent layer's pre-recorded deltanet decode-step chain + its device-resident state.
+// valid: the device state/ring/colds match the engine's layer state (cold-upload when not);
+// dirty: the device advanced past the CPU copy — the flush hook syncs before any CPU read.
+struct private DnStep {
+    state_dev : uint64       // nvh·ds·ds f32 — the scan advances it in place (its binding 1)
+    smalls_dev : uint64      // per-layer smalls: colds + the conv ring + the per-token β/γ region
+    conv_set : VkDescriptorSet
+    scan_set : VkDescriptorSet
+    out_set : VkDescriptorSet
+    cmd : VkCommandBuffer    // the warm step chain, recorded once — no per-token re-record
+    s_qkv : int
+    s_z : int
+    s_o : int
+    state_bytes : int64
+    ring_bytes : int64
+    valid : bool
+    dirty : bool
+}
+
 struct private GpuState {
     instance : Instance
     device : Device
@@ -1636,6 +1714,7 @@ struct private GpuState {
     batch_k6 : Pipeline
     comb_pipeline : Pipeline    // routed weighted-sum combine (device-side reduce, prefill batches)
     dn_conv_pipeline : Pipeline // deltanet conv + SiLU + q/k L2-norm (one workgroup per position)
+    dnd_conv_pipeline : Pipeline // deltanet decode-step conv twin (+ in-place ring advance)
     dn_scan_pipeline : Pipeline // deltanet chunked delta-rule scan (one workgroup per v-head)
     dn_rq_pipeline : Pipeline   // plain Q8_0 requant of the scan's o rows (out-proj image)
     at_prep_q_pipeline : Pipeline   // attention q(|gate) deinterleave + qk-rms + partial rope
@@ -1701,6 +1780,14 @@ struct private GpuState {
     dn_scan_set : VkDescriptorSet
     dn_rq_set : VkDescriptorSet
     dn_ready : bool
+    // deltanet decode-step state (lazy — first npos == 1 DN dispatch creates it)
+    dnd_meta : HostBuf            // step meta staging (npos = 1 geometry, filled once)
+    dnd_bg : HostBuf              // per-token raw β/γ staging (copied into the layer smalls per step)
+    dnd_oq_dev : uint64           // the o row's Q8_0 image (requant out, the out GEMV's activations)
+    dnd_os_dev : uint64
+    dnd_rq_set : VkDescriptorSet
+    dnd_steps : table<int64; DnStep>   // qkv plane offset -> the layer's step chain
+    dnd_ready : bool
     // attention chain state (lazy — first attention dispatch creates it)
     at_meta : HostBuf             // attention kernel params staging
     at_meta_dev : uint64
@@ -1892,8 +1979,8 @@ def private vk_moe_init : bool {
     }
     g_gpu.set_layout <- create_descriptor_set_layout(g_gpu.device, dslci)
     var dpci : DescriptorPoolCreateInfo
-    dpci.maxSets = uint(4 * MAX_STACKS)   // decode + batch set per stack, 3 per FFN triple, batch act/rq
-    var psize = DescriptorPoolSize(type_ = VkDescriptorType.STORAGE_BUFFER, descriptorCount = uint(6 * 4 * MAX_STACKS))
+    dpci.maxSets = uint(5 * MAX_STACKS)   // decode + batch set per stack, 3 per FFN triple, 3 per DN step layer, batch act/rq
+    var psize = DescriptorPoolSize(type_ = VkDescriptorType.STORAGE_BUFFER, descriptorCount = uint(6 * 5 * MAX_STACKS))
     dpci.pPoolSizes |> push(psize)
     g_gpu.desc_pool <- create_descriptor_pool(g_gpu.device, dpci)
 
@@ -1924,6 +2011,8 @@ def private vk_moe_init : bool {
     g_gpu.comb_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, cshader)
     var dcshader <- create_shader_module(g_gpu.device, dn_conv_spv)
     g_gpu.dn_conv_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, dcshader)
+    var dtcshader <- create_shader_module(g_gpu.device, dn_step_conv_spv)
+    g_gpu.dnd_conv_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, dtcshader)
     var dsshader <- create_shader_module(g_gpu.device, dn_scan_spv)
     g_gpu.dn_scan_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, dsshader)
     var drshader <- create_shader_module(g_gpu.device, dn_requant_spv)
@@ -2800,6 +2889,11 @@ def vk_moe_dn(var yp : float?; woq, woz, woo : int64;
     let s_z = find_stack(woz, 0)
     let s_o = find_stack(woo, 0)
     let taps = dconv - 1l
+    if (npos == 1l) {   // the decode step — device-resident state, one pre-recorded submit
+        vk_moe_dn_step(yp, s_qkv, s_z, s_o, woq, woz, woo, xqp, xsp, bp, gp,
+            convw, wnormp, ap, dtp, stp, histp, dim, cd, kd, di, nvh, nkh, ds, dconv, eps)
+        return
+    }
     assert(ds <= DN_MAX_DS && ds % 16l == 0l && nvh <= DN_MAX_HEADS && cd <= DN_MAX_CD
            && dconv <= DN_MAX_DCONV && di == nvh * ds && kd == nkh * ds && cd == 2l * kd + di
            && npos > taps && dim % 32l == 0l && di % 32l == 0l,
@@ -2861,6 +2955,244 @@ def vk_moe_dn(var yp : float?; woq, woz, woo : int64;
     unsafe {
         par_memcpy(reinterpret<void?>(stp), g_gpu.dn_state_host.mapped, nvh * ds * ds * 4l)
         memcpy(reinterpret<void?>(tailp), g_gpu.dn_tail_host.mapped, int(taps * cd * 4l))
+    }
+}
+
+// ===== deltanet decode step (npos == 1 through the same MoeGpuDnFn) =====
+// One pre-recorded submit per layer per token: qkv/z GEMVs -> step conv -> scan at cl = 1 ->
+// requant -> out GEMV -> y DMA. State/ring stay device-resident; flush/invalidate = the seams.
+
+def private ensure_dnd_state {
+    if (g_gpu.dnd_ready) {
+        return
+    }
+    ensure_dn_state()   // pulls in ffn/batch state: hq_dev, batch_cmd, the dn staging bufs
+    g_gpu.dnd_meta = make_host_buf(DN_META_BYTES, false)
+    g_gpu.dnd_bg = make_host_buf(DND_BG_BYTES, false)
+    g_gpu.dnd_oq_dev = make_device_buf(DND_OQ_BYTES)
+    g_gpu.dnd_os_dev = make_device_buf(DND_OS_BYTES)
+    g_gpu.dnd_rq_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    // requant: o rows@0 (dn_ws float view at DN_O_OFF), quants@3 / scales@4 = the step o image
+    write_buf_desc(writes, g_gpu.dnd_rq_set, 0u, g_gpu.dn_ws_dev, DN_WS_BYTES)
+    write_buf_desc(writes, g_gpu.dnd_rq_set, 1u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, g_gpu.dnd_rq_set, 2u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, g_gpu.dnd_rq_set, 3u, g_gpu.dnd_oq_dev, DND_OQ_BYTES)
+    write_buf_desc(writes, g_gpu.dnd_rq_set, 4u, g_gpu.dnd_os_dev, DND_OS_BYTES)
+    write_buf_desc(writes, g_gpu.dnd_rq_set, 5u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.dnd_ready = true
+    to_log(LOG_INFO, "dasLLAMA vulkan tier: deltanet decode step engaged\n")
+}
+
+def private fill_dnd_meta(cd, kd, di, nvh, nkh, ds, dconv : int64) {
+    unsafe {
+        var mp = reinterpret<uint?>(g_gpu.dnd_meta.mapped)
+        mp[0] = 1u
+        mp[1] = uint(cd)
+        mp[2] = uint(kd)
+        mp[3] = uint(di)
+        mp[4] = uint(nvh)
+        mp[5] = uint(nkh)
+        mp[6] = uint(ds)
+        mp[7] = uint(dconv)
+        mp[8] = 1u
+        mp[9] = uint(DN_SLAB)
+        mp[10] = uint(DN_O_OFF)
+        mp[11] = uint(DN_SM_BETA)
+        mp[12] = uint(DN_SM_G)
+        mp[13] = uint(DN_SM_TAPS)
+        mp[14] = uint(DN_SM_WNORM)
+        mp[15] = uint(DN_SM_A)
+        mp[16] = uint(DN_SM_DT)
+        mp[17] = uint(DN_SM_HIST)
+        mp[18] = uint(di / 32l)
+    }
+}
+
+// create one layer's step chain: per-layer state/smalls buffers, the three sets, the once-filled
+// GEMV metas (dn stacks never serve FFN GEMVs, so their host metas are ours to pin), and the
+// warm cmd — per token only acts/β/γ refresh and the cmd resubmits as-is
+def private dnd_step_make(s_qkv, s_z, s_o : int; woq, woz, woo : int64;
+                          dim, cd, di, nvh, ds, taps : int64) {
+    ensure_gemv_scratch(s_qkv)
+    ensure_gemv_scratch(s_z)
+    ensure_gemv_scratch(s_o)
+    var qkv_region = fixed_array(woq, 0l, 1l)
+    var z_region = fixed_array(woz, 0l, 1l)
+    var o_region = fixed_array(woo, 0l, 1l)
+    unsafe {
+        fill_stack_meta_rows(s_qkv, addr(qkv_region[0]), 1l, dim, cd, 1l, 0l)
+        fill_stack_meta_rows(s_z, addr(z_region[0]), 1l, dim, di, 1l, 0l)
+        fill_stack_meta_rows(s_o, addr(o_region[0]), 1l, di, dim, 1l, 0l)
+    }
+    var st = DnStep(state_dev = make_device_buf(nvh * ds * ds * 4l),
+                    smalls_dev = make_device_buf(DN_SMALLS_BYTES),
+                    conv_set = alloc_desc_set(), scan_set = alloc_desc_set(), out_set = alloc_desc_set(),
+                    cmd = alloc_cmd(), s_qkv = s_qkv, s_z = s_z, s_o = s_o,
+                    state_bytes = nvh * ds * ds * 4l, ring_bytes = cd * taps * 4l,
+                    valid = false, dirty = false)
+    var writes : array<WriteDescriptorSet>
+    // conv: fresh qkv row@5, conv row out@0 (hq_dev row 0), smalls@4 (ring RMW), params@2
+    write_buf_desc(writes, st.conv_set, 0u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, st.conv_set, 1u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, st.conv_set, 2u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, st.conv_set, 3u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, st.conv_set, 4u, st.smalls_dev, DN_SMALLS_BYTES)
+    write_buf_desc(writes, st.conv_set, 5u, g_gpu.stacks[s_qkv].y_dev, Y_BYTES)
+    // scan: conv row@0, THIS layer's state@1 (residency IS this binding), slabs/o@3, smalls@4, z row@5
+    write_buf_desc(writes, st.scan_set, 0u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, st.scan_set, 1u, st.state_dev, st.state_bytes)
+    write_buf_desc(writes, st.scan_set, 2u, g_gpu.dn_meta_dev, DN_META_BYTES)
+    write_buf_desc(writes, st.scan_set, 3u, g_gpu.dn_ws_dev, DN_WS_BYTES)
+    write_buf_desc(writes, st.scan_set, 4u, st.smalls_dev, DN_SMALLS_BYTES)
+    write_buf_desc(writes, st.scan_set, 5u, g_gpu.stacks[s_z].y_dev, Y_BYTES)
+    // out GEMV: out planes@0/1, the stack's once-filled host meta@2, the o image@3/4, its y_dev@5
+    write_buf_desc(writes, st.out_set, 0u, g_gpu.stacks[s_o].wqbuf, g_gpu.stacks[s_o].wqbytes)
+    write_buf_desc(writes, st.out_set, 1u, g_gpu.stacks[s_o].wsbuf, g_gpu.stacks[s_o].wsbytes)
+    write_buf_desc(writes, st.out_set, 2u, g_gpu.stacks[s_o].meta.buf, META_BYTES)
+    write_buf_desc(writes, st.out_set, 3u, g_gpu.dnd_oq_dev, DND_OQ_BYTES)
+    write_buf_desc(writes, st.out_set, 4u, g_gpu.dnd_os_dev, DND_OS_BYTES)
+    write_buf_desc(writes, st.out_set, 5u, g_gpu.stacks[s_o].y_dev, Y_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    let raw = st.cmd
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    cmd_copy_range(raw, g_gpu.dnd_bg.buf, 0l, st.smalls_dev, DN_SM_BETA * 4l, nvh * 4l)
+    cmd_copy_range(raw, g_gpu.dnd_bg.buf, nvh * 4l, st.smalls_dev, DN_SM_G * 4l, nvh * 4l)
+    cmd_copy_whole(raw, g_gpu.dnd_meta.buf, g_gpu.dn_meta_dev, DN_META_BYTES)
+    batch_barrier(raw, true)
+    bind_gemv_pipe(raw, 0)
+    cmd_bind_dispatch(raw, g_gpu.stacks[s_qkv].raw_set, uint((cd + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+    cmd_bind_dispatch(raw, g_gpu.stacks[s_z].raw_set, uint((di + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.dnd_conv_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, st.conv_set, 1u)
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.dn_scan_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, st.scan_set, uint(nvh))
+    comp_barrier(raw)
+    cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.dn_rq_pipeline, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, g_gpu.dnd_rq_set, uint((di / 32l + 255l) / 256l))
+    comp_barrier(raw)
+    bind_gemv_pipe(raw, 0)
+    cmd_bind_dispatch(raw, st.out_set, uint((dim + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+    batch_barrier(raw, false)
+    cmd_copy_whole(raw, g_gpu.stacks[s_o].y_dev, g_gpu.stacks[s_o].y.buf, dim * 4l)
+    vk_check(vkEndCommandBuffer(raw), null)
+    g_gpu.dnd_steps |> insert(woq, st)
+}
+
+// cold upload: the engine's CPU state is authoritative — stage state + the whole smalls image
+// (colds + ring; the β/γ region carries garbage until the first step overwrites it) and copy up
+def private dnd_cold_upload(st : DnStep; stp : float const?; histp : float const?;
+                            convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?;
+                            cd, taps, dconv, nvh, ds : int64; eps : float) {
+    unsafe {
+        var sp = reinterpret<float?>(g_gpu.dn_smalls.mapped)
+        sp[0] = eps
+        sp[1] = 1.0 / sqrt(float(ds))
+        memcpy(reinterpret<void?>(sp + DN_SM_TAPS), reinterpret<void? -const>(convw), int(cd * dconv * 4l))
+        memcpy(reinterpret<void?>(sp + DN_SM_WNORM), reinterpret<void? -const>(wnormp), int(ds * 4l))
+        memcpy(reinterpret<void?>(sp + DN_SM_A), reinterpret<void? -const>(ap), int(nvh * 4l))
+        memcpy(reinterpret<void?>(sp + DN_SM_DT), reinterpret<void? -const>(dtp), int(nvh * 4l))
+        memcpy(reinterpret<void?>(sp + DN_SM_HIST), reinterpret<void? -const>(histp), int(cd * taps * 4l))
+        memcpy(g_gpu.dn_state_stage.mapped, reinterpret<void? -const>(stp), int(st.state_bytes))
+    }
+    let raw = g_gpu.batch_cmd
+    let rf : VkCommandBufferResetFlags
+    vk_check(vkResetCommandBuffer(raw, rf), null)
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    cmd_copy_whole(raw, g_gpu.dn_smalls.buf, st.smalls_dev, DN_SMALLS_BYTES)
+    cmd_copy_whole(raw, g_gpu.dn_state_stage.buf, st.state_dev, st.state_bytes)
+    vk_check(vkEndCommandBuffer(raw), null)
+    submit_wait(g_gpu.batch_cmd)
+}
+
+def private vk_moe_dn_step(var yp : float?; s_qkv, s_z, s_o : int; woq, woz, woo : int64;
+                           xqp : int8 const?; xsp : float const?; bp : float const?; gp : float const?;
+                           convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?;
+                           stp : float const?; histp : float const?;
+                           dim, cd, kd, di, nvh, nkh, ds, dconv : int64; eps : float) {
+    let taps = dconv - 1l
+    assert(ds <= DN_MAX_DS && ds % 16l == 0l && nvh <= DN_MAX_HEADS && cd <= DN_MAX_CD
+           && dconv <= DN_MAX_DCONV && di == nvh * ds && kd == nkh * ds && cd == 2l * kd + di
+           && dim % 32l == 0l && di % 32l == 0l && di <= DND_OQ_BYTES,
+        "dasLLAMA vulkan tier: deltanet geometry outside step capacity")
+    ensure_dnd_state()
+    if (!key_exists(g_gpu.dnd_steps, woq)) {
+        fill_dnd_meta(cd, kd, di, nvh, nkh, ds, dconv)
+        dnd_step_make(s_qkv, s_z, s_o, woq, woz, woo, dim, cd, di, nvh, ds, taps)
+    }
+    var st = g_gpu.dnd_steps[woq]
+    if (!st.valid) {
+        dnd_cold_upload(st, stp, histp, convw, wnormp, ap, dtp, cd, taps, dconv, nvh, ds, eps)
+    }
+    let ts0 = ref_time_ticks()
+    fill_stack_acts(s_qkv, xqp, xsp, dim)
+    fill_stack_acts(s_z, xqp, xsp, dim)
+    unsafe {
+        var bg = reinterpret<float?>(g_gpu.dnd_bg.mapped)
+        memcpy(reinterpret<void?>(bg), reinterpret<void? -const>(bp), int(nvh * 4l))
+        memcpy(reinterpret<void?>(bg + nvh), reinterpret<void? -const>(gp), int(nvh * 4l))
+    }
+    let ts1 = ref_time_ticks()
+    submit_wait(st.cmd)
+    let ts2 = ref_time_ticks()
+    unsafe {
+        memcpy(reinterpret<void?>(yp), g_gpu.stacks[s_o].y.mapped, int(dim * 4l))
+    }
+    st.valid = true
+    st.dirty = true
+    g_gpu.dnd_steps[woq] = st
+    if (vk_prof()) {
+        to_log(LOG_INFO, "vk_dnd prep {get_time_usec(ts0) - get_time_usec(ts1)} submit {get_time_usec(ts1) - get_time_usec(ts2)} copy {get_time_usec(ts2)}\n")
+    }
+}
+
+// MoeGpuDnFlushFn: sync one layer's device-resident state/ring down into the engine's buffers.
+// Any flush retires the device copy (the CPU is about to read AND may then advance on its own) —
+// the next GPU step cold-uploads from the engine's then-current state.
+def vk_dn_step_flush(l : int64; var stp : float?; var histp : float?) {
+    if (g_gpu == null || !g_gpu.dnd_ready) {
+        return
+    }
+    let woq = moe_gpu_dn_layer_key(l)
+    if (woq < 0l || !key_exists(g_gpu.dnd_steps, woq)) {
+        return
+    }
+    var st = g_gpu.dnd_steps[woq]
+    if (st.dirty) {
+        let raw = g_gpu.batch_cmd
+        let rf : VkCommandBufferResetFlags
+        vk_check(vkResetCommandBuffer(raw, rf), null)
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        cmd_copy_whole(raw, st.state_dev, g_gpu.dn_state_host.buf, st.state_bytes)
+        cmd_copy_range(raw, st.smalls_dev, DN_SM_HIST * 4l, g_gpu.dn_tail_host.buf, 0l, st.ring_bytes)
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(g_gpu.batch_cmd)
+        unsafe {
+            memcpy(reinterpret<void?>(stp), g_gpu.dn_state_host.mapped, int(st.state_bytes))
+            memcpy(reinterpret<void?>(histp), g_gpu.dn_tail_host.mapped, int(st.ring_bytes))
+        }
+    }
+    st.dirty = false
+    st.valid = false
+    g_gpu.dnd_steps[woq] = st
+}
+
+// MoeGpuDnInvalidateFn: the engine rebuilt/zeroed its CPU state — every device copy is stale
+def vk_dn_step_invalidate {
+    if (g_gpu == null) {
+        return
+    }
+    for (st in values(g_gpu.dnd_steps)) {
+        st.valid = false
+        st.dirty = false
     }
 }
 
@@ -3444,5 +3776,6 @@ def dasllama_math_vulkan_register() {
     set_moe_gpu_arm("vulkan", @@vulkan_moe_gpu_arm)
     set_moe_gpu_vram_report(@@vk_resident_bytes)
     set_moe_gpu_device_report(@@vk_device_name)
+    set_moe_gpu_dn_state_hooks(@@vk_dn_step_flush, @@vk_dn_step_invalidate)
     vulkan_moe_gpu_arm()
 }
