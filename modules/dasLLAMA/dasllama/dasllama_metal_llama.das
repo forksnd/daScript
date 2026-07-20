@@ -543,8 +543,8 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
         r.bpart = pool_acquire(g_pool, g_dev, r.bytes_part)
         r.u_nch = uniform_u32(uint(nchunks))
     }
-    if (draft) {
-        r.draft = true
+    if (draft || nrows > 1l) {   // the verify's warm sub-pass shares the draft's cat/eh_proj plumbing
+        r.draft = draft
         r.bcat = pool_acquire(g_pool, g_dev, 2ul * r.bytes_x)
         r.u_dim2 = uniform_u32(uint(2l * dim))
     }
@@ -1079,6 +1079,7 @@ def private metal_mtp_verify_ok(t : Model; s : Session) : bool {
             has_dual_rope(c) || c.attn_sinks || c.v_norm || c.pre_post_norm || c.layer_out_scale ||
             c.final_logit_softcap > 0.0 || !empty(t.suppress) ||
             !t.blocks.ffn_is_dense || t.dn_ba_f32 || c.ffn_act != FfnAct.silu ||
+            t.mtp_ehproj_fmt != KqFmt.q8 ||
             t.wcls_off < 0l || !(c.shared_weights ? t.cls_q8 : t.wcls_fmt == KqFmt.q8)) {
         return false
     }
@@ -1094,10 +1095,9 @@ def private metal_mtp_verify_ok(t : Model; s : Session) : bool {
     return true
 }
 
-// the 2-row verify [tok@pos, d@pos+1]: batch-form sites at nrows=2, SAME-SLAB route table
-// (cnt pos+1/pos+2 — the serial encoder orders row0's KV write before row1's read); dn scans
-// npos=2 in place on the decode DnMirror. Caller poked bx (embed pair) + 2-row rope tables.
-def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
+// one verify-shaped B=2 layer (batch-form sites, same-slab brt row at l*32) — the trunk
+// loop body, shared with the draft-slab warm (which runs it at l == n_layers)
+def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?; brt : MetalBuffer?; l, pos : int64; var dnli : int64&) {
     let c = t.config
     let dim = c.dim
     let n_heads = c.n_heads
@@ -1105,11 +1105,119 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
     let head_size = c.head_size
     let qd = n_heads * head_size
     let kv_dim = c.n_kv_heads * head_size
-    let esz = uint64(kv_row_bytes(r.kdt, 1l))
     let nchunks = (pos + 2l + ATTN_CHUNK_ROWS - 1l) / ATTN_CHUNK_ROWS
-    // per-layer same-slab route entries (element-space offsets for the scalar codecs)
-    g_vrt |> resize(int(c.n_layers * 8l))
-    for (l in range64(c.n_layers)) {
+    unsafe {
+        let rtoff = uint64(l * 32l)
+        if (layer_is_recurrent(c, l)) {
+            let cd = dn_conv_dim(c)
+            let di = c.ssm_d_inner
+            let nvh = c.ssm_dt_rank
+            let bdnq = blob_of(g_dev, t, t.dnqkv_offs[l])
+            enc_gemv_b(enc, false, bdnq.buf, bdnq.boff, r.bxb, r.bdn_qkv, r.u_dim, r.u_cd, r.u_cd, cd)
+            let bdng = blob_of(g_dev, t, t.dngate_offs[l])
+            enc_gemv_b(enc, false, bdng.buf, bdng.boff, r.bxb, r.bdn_z, r.u_dim, r.u_di, r.u_di, di)
+            let bdnb = blob_of(g_dev, t, t.dnbeta_offs[l])
+            enc_gemv_b(enc, false, bdnb.buf, bdnb.boff, r.bxb, r.bdn_b, r.u_dim, r.u_nvh, r.u_nvh, nvh)
+            let bdna = blob_of(g_dev, t, t.dnalpha_offs[l])
+            enc_gemv_b(enc, false, bdna.buf, bdna.boff, r.bxb, r.bdn_g, r.u_dim, r.u_nvh, r.u_nvh, nvh)
+            let soff = uint64(dnli * nvh * c.ssm_d_state * c.ssm_d_state * 4l)
+            let hoff = r.dn_conv_base + uint64(dnli * (c.ssm_d_conv - 1l) * cd * 4l)
+            var bw_cv = upload_region(addr < void? >(t.fblob[t.dn_conv_off + l * c.ssm_d_conv * cd]), uint64(c.ssm_d_conv * cd * 4l))
+            enc_dn_conv(enc, r.bdn_qkv, r.bdn_state, hoff, bw_cv, r.bdn_cv, r.u_cd, r.u_dconv, r.u_two32, cd, 2l)
+            enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_two32, cd)
+            enc_dn_l2norm(enc, r.bdn_cv, r.u_cd, r.u_dn_kd, r.u_ds, r.u_eps, r.u_qscale, 2l * c.ssm_n_group, 2l)
+            var baa = upload_region(addr < void? >(t.fblob[t.dn_a_off + l * nvh]), uint64(nvh * 4l))
+            var bdt = upload_region(addr < void? >(t.fblob[t.dn_dt_off + l * nvh]), uint64(nvh * 4l))
+            enc_dn_scan(enc, r.bdn_cv, r.bdn_state, soff, r.bdn_b, r.bdn_g, baa, bdt, r.bdn_o,
+                r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_two32, c.ssm_d_state, nvh)
+            var bwn = upload_region(addr < void? >(t.fblob[t.dn_norm_off + l * c.ssm_d_state]), uint64(c.ssm_d_state * 4l))
+            enc_dn_gate(enc, r.bdn_o, r.bdn_z, bwn, r.u_ds, r.u_di, r.u_eps, nvh, 2l)
+            let bdno = blob_of(g_dev, t, t.dnout_offs[l])
+            enc_gemv_b(enc, false, bdno.buf, bdno.boff, r.bdn_o, r.bxb2, r.u_di, r.u_dim, r.u_dim, dim)
+            dnli++
+        } else {
+            var bbias = r.bqkv
+            if (c.attn_qkv_bias) {
+                bbias = upload_region_cat3(
+                    addr < void? >(t.bq[l * qd]), uint64(qd * 4l),
+                    addr < void? >(t.bk[l * kv_dim]), uint64(kv_dim * 4l),
+                    addr < void? >(t.bv[l * kv_dim]), uint64(kv_dim * 4l))
+            }
+            if (c.q_gated) {
+                let bwq = blob_of(g_dev, t, t.wq_offs[l])
+                enc_gemv_b(enc, false, bwq.buf, bwq.boff, r.bxb, r.bdn_qg, r.u_dim, r.u_dn_qd2, r.u_dn_qd2, 2l * qd)
+                enc_dn_deint(enc, r.bdn_qg, r.bqkv, r.bdn_gate, r.u_hs, r.u_qd, r.u_qkvd, qd, 2l)
+            } else {
+                let bwq = blob_of(g_dev, t, t.wq_offs[l])
+                enc_gemv_b(enc, false, bwq.buf, bwq.boff, r.bxb, r.bqkv, r.u_dim, r.u_qd, r.u_qkvd, qd)
+            }
+            let bwk = blob_of(g_dev, t, t.wk_offs[l])
+            enc_gemv_b(enc, false, bwk.buf, bwk.boff, r.bxb, r.bqkv, r.u_dim, r.u_kvd, r.u_qkvd, kv_dim, uint64(qd * 4l))
+            let bwv = blob_of(g_dev, t, t.wv_offs[l])
+            enc_gemv_b(enc, false, bwv.buf, bwv.boff, r.bxb, r.bqkv, r.u_dim, r.u_kvd, r.u_qkvd, kv_dim, uint64((qd + kv_dim) * 4l))
+            if (c.qk_norm) {
+                var bqkw = upload_region_cat3(
+                    addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(head_size * 4l),
+                    addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(head_size * 4l), null, 0ul)
+                enc_qk_norm(enc, r.bqkv, bqkw, r.u_nh, r.u_qd, r.u_qkvd, r.u_hs, r.u_hs, r.u_eps,
+                    r.u_qd, n_heads + kv_dim / head_size, 2l, head_size)
+            }
+            enc_rope_store_b(enc, true, r.bqkv, r.bcos, r.bsin, brt, r.u_zero32, r.u_kvd, r.u_qd, r.u_hs, r.u_npq, r.u_npall, r.u_qkvd, r.u_neox,
+                bbias, r.u_hasb, (qd + kv_dim) / 2l, 2l, [rtoff = rtoff, brot = r.u_rot])
+            if (r.chunked) {
+                enc_attn_part_b(enc, true, r.bqkv, r.bpart, brt, r.u_zero32, r.u_kvd, r.u_nh, r.u_kvm, r.u_hs, r.u_scale, r.u_qkvd, r.u_nch,
+                    r.u_softcap, r.u_zero32, 2l, nchunks, n_heads, head_size, [rtoff = rtoff])
+                enc_attn_comb_b(enc, r.bpart, r.bxb, brt, r.u_nch, r.u_nh, r.u_hs, r.u_zero32, 2l, n_heads, head_size, [rtoff = rtoff])
+            } else {
+                enc_attn_b(enc, true, r.bqkv, r.bxb, brt, r.u_zero32, r.u_kvd, r.u_nh, r.u_kvm, r.u_hs, r.u_scale, r.u_qkvd,
+                    r.u_softcap, 2l, n_heads, head_size, [rtoff = rtoff])
+            }
+            if (c.q_gated) {
+                enc_ew2(enc, g_pso_sigmul, r.bxb, 0ul, r.bdn_gate, 0ul, r.u_total_qd, 2l * qd)
+            }
+            let bwo = blob_of(g_dev, t, t.wo_offs[l])
+            enc_gemv_b(enc, false, bwo.buf, bwo.boff, r.bxb, r.bxb2, r.u_qd, r.u_dim, r.u_dim, dim)
+            if (c.attn_out_bias) {
+                var bwo_b = upload_region(addr < void? >(t.bo[l * dim]), uint64(dim * 4l))
+                enc_ew2(enc, g_pso_add, r.bxb2, 0ul, bwo_b, 0ul, r.u_total_dim, 2l * dim)
+            }
+        }
+        var bw_ffn = upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
+        if (dim <= ADD_RMS_MAX_DIM) {
+            enc_add_rms_b(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, 2l)
+        } else {
+            enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb2, 0ul, r.u_total_dim, 2l * dim)
+            enc_rms_b(enc, r.bx, bw_ffn, r.bxb, r.u_dim, r.u_eps, 2l)
+        }
+        let bw1 = blob_of(g_dev, t, t.w1_offs[l])
+        let bw3 = blob_of(g_dev, t, t.w3_offs[l])
+        enc_gemv_w13sw_b(enc, false, bw1.buf, bw1.boff, bw3.boff, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
+        let bw2 = blob_of(g_dev, t, t.w2_offs[l])
+        enc_gemv_b(enc, false, bw2.buf, bw2.boff, r.bh12, r.bxb, r.u_hidden, r.u_dim, r.u_dim, dim)
+        if (l + 1l < c.n_layers) {
+            var bw_attn = upload_region(addr < void? >(t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
+            if (dim <= ADD_RMS_MAX_DIM) {
+                enc_add_rms_b(enc, r.bx, r.bxb, bw_attn, r.bxb, r.u_dim, r.u_eps, 2l)
+            } else {
+                enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb, 0ul, r.u_total_dim, 2l * dim)
+                enc_rms_b(enc, r.bx, bw_attn, r.bxb, r.u_dim, r.u_eps, 2l)
+            }
+        } else {
+            enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb, 0ul, r.u_total_dim, 2l * dim)
+        }
+    }
+}
+
+// the 2-row verify [tok@pos, d@pos+1]: batch-form sites at nrows=2, SAME-SLAB route table
+// (cnt pos+1/pos+2 — the serial encoder orders row0's KV write before row1's read); dn scans
+// npos=2 in place on the decode DnMirror. Caller poked bx (embed pair) + 2-row rope tables.
+def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let esz = uint64(kv_row_bytes(r.kdt, 1l))
+    // per-layer same-slab route entries (elements); the +nextn entry = the warm's draft slab
+    g_vrt |> resize(int((c.n_layers + c.n_layer_nextn) * 8l))
+    for (l in range64(c.n_layers + c.n_layer_nextn)) {
         let lb = uint((r.koff + uint64(mirror_lbase(t, r.kdt, r.cap, l))) / esz)
         let vb = uint((r.voff + uint64(mirror_lbase(t, r.kdt, r.cap, l))) / esz)
         g_vrt[l * 8l] = lb
@@ -1121,7 +1229,7 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
         g_vrt[l * 8l + 6l] = uint(r.cap)
         g_vrt[l * 8l + 7l] = uint(pos + 2l)
     }
-    let bytes_rt = uint64(c.n_layers * 32l)
+    let bytes_rt = uint64((c.n_layers + c.n_layer_nextn) * 32l)
     var brt = pool_acquire_untracked(g_upool, g_dev, bytes_rt)
     unsafe {
         memcpy(metal_buffer_contents(brt), addr < void? >(g_vrt[0]), int(bytes_rt))
@@ -1134,106 +1242,7 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
     }
     var dnli = 0l
     for (l in range64(c.n_layers)) {
-        unsafe {
-            let rtoff = uint64(l * 32l)
-            if (layer_is_recurrent(c, l)) {
-                let cd = dn_conv_dim(c)
-                let di = c.ssm_d_inner
-                let nvh = c.ssm_dt_rank
-                let bdnq = blob_of(g_dev, t, t.dnqkv_offs[l])
-                enc_gemv_b(enc, false, bdnq.buf, bdnq.boff, r.bxb, r.bdn_qkv, r.u_dim, r.u_cd, r.u_cd, cd)
-                let bdng = blob_of(g_dev, t, t.dngate_offs[l])
-                enc_gemv_b(enc, false, bdng.buf, bdng.boff, r.bxb, r.bdn_z, r.u_dim, r.u_di, r.u_di, di)
-                let bdnb = blob_of(g_dev, t, t.dnbeta_offs[l])
-                enc_gemv_b(enc, false, bdnb.buf, bdnb.boff, r.bxb, r.bdn_b, r.u_dim, r.u_nvh, r.u_nvh, nvh)
-                let bdna = blob_of(g_dev, t, t.dnalpha_offs[l])
-                enc_gemv_b(enc, false, bdna.buf, bdna.boff, r.bxb, r.bdn_g, r.u_dim, r.u_nvh, r.u_nvh, nvh)
-                let soff = uint64(dnli * nvh * c.ssm_d_state * c.ssm_d_state * 4l)
-                let hoff = r.dn_conv_base + uint64(dnli * (c.ssm_d_conv - 1l) * cd * 4l)
-                var bw_cv = upload_region(addr < void? >(t.fblob[t.dn_conv_off + l * c.ssm_d_conv * cd]), uint64(c.ssm_d_conv * cd * 4l))
-                enc_dn_conv(enc, r.bdn_qkv, r.bdn_state, hoff, bw_cv, r.bdn_cv, r.u_cd, r.u_dconv, r.u_two32, cd, 2l)
-                enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_two32, cd)
-                enc_dn_l2norm(enc, r.bdn_cv, r.u_cd, r.u_dn_kd, r.u_ds, r.u_eps, r.u_qscale, 2l * c.ssm_n_group, 2l)
-                var baa = upload_region(addr < void? >(t.fblob[t.dn_a_off + l * nvh]), uint64(nvh * 4l))
-                var bdt = upload_region(addr < void? >(t.fblob[t.dn_dt_off + l * nvh]), uint64(nvh * 4l))
-                enc_dn_scan(enc, r.bdn_cv, r.bdn_state, soff, r.bdn_b, r.bdn_g, baa, bdt, r.bdn_o,
-                    r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_two32, c.ssm_d_state, nvh)
-                var bwn = upload_region(addr < void? >(t.fblob[t.dn_norm_off + l * c.ssm_d_state]), uint64(c.ssm_d_state * 4l))
-                enc_dn_gate(enc, r.bdn_o, r.bdn_z, bwn, r.u_ds, r.u_di, r.u_eps, nvh, 2l)
-                let bdno = blob_of(g_dev, t, t.dnout_offs[l])
-                enc_gemv_b(enc, false, bdno.buf, bdno.boff, r.bdn_o, r.bxb2, r.u_di, r.u_dim, r.u_dim, dim)
-                dnli++
-            } else {
-                var bbias = r.bqkv
-                if (c.attn_qkv_bias) {
-                    bbias = upload_region_cat3(
-                        addr < void? >(t.bq[l * qd]), uint64(qd * 4l),
-                        addr < void? >(t.bk[l * kv_dim]), uint64(kv_dim * 4l),
-                        addr < void? >(t.bv[l * kv_dim]), uint64(kv_dim * 4l))
-                }
-                if (c.q_gated) {
-                    let bwq = blob_of(g_dev, t, t.wq_offs[l])
-                    enc_gemv_b(enc, false, bwq.buf, bwq.boff, r.bxb, r.bdn_qg, r.u_dim, r.u_dn_qd2, r.u_dn_qd2, 2l * qd)
-                    enc_dn_deint(enc, r.bdn_qg, r.bqkv, r.bdn_gate, r.u_hs, r.u_qd, r.u_qkvd, qd, 2l)
-                } else {
-                    let bwq = blob_of(g_dev, t, t.wq_offs[l])
-                    enc_gemv_b(enc, false, bwq.buf, bwq.boff, r.bxb, r.bqkv, r.u_dim, r.u_qd, r.u_qkvd, qd)
-                }
-                let bwk = blob_of(g_dev, t, t.wk_offs[l])
-                enc_gemv_b(enc, false, bwk.buf, bwk.boff, r.bxb, r.bqkv, r.u_dim, r.u_kvd, r.u_qkvd, kv_dim, uint64(qd * 4l))
-                let bwv = blob_of(g_dev, t, t.wv_offs[l])
-                enc_gemv_b(enc, false, bwv.buf, bwv.boff, r.bxb, r.bqkv, r.u_dim, r.u_kvd, r.u_qkvd, kv_dim, uint64((qd + kv_dim) * 4l))
-                if (c.qk_norm) {
-                    var bqkw = upload_region_cat3(
-                        addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(head_size * 4l),
-                        addr < void? >(t.fblob[t.rms_k_offs[l]]), uint64(head_size * 4l), null, 0ul)
-                    enc_qk_norm(enc, r.bqkv, bqkw, r.u_nh, r.u_qd, r.u_qkvd, r.u_hs, r.u_hs, r.u_eps,
-                        r.u_qd, n_heads + kv_dim / head_size, 2l, head_size)
-                }
-                enc_rope_store_b(enc, true, r.bqkv, r.bcos, r.bsin, brt, r.u_zero32, r.u_kvd, r.u_qd, r.u_hs, r.u_npq, r.u_npall, r.u_qkvd, r.u_neox,
-                    bbias, r.u_hasb, (qd + kv_dim) / 2l, 2l, [rtoff = rtoff, brot = r.u_rot])
-                if (r.chunked) {
-                    enc_attn_part_b(enc, true, r.bqkv, r.bpart, brt, r.u_zero32, r.u_kvd, r.u_nh, r.u_kvm, r.u_hs, r.u_scale, r.u_qkvd, r.u_nch,
-                        r.u_softcap, r.u_zero32, 2l, nchunks, n_heads, head_size, [rtoff = rtoff])
-                    enc_attn_comb_b(enc, r.bpart, r.bxb, brt, r.u_nch, r.u_nh, r.u_hs, r.u_zero32, 2l, n_heads, head_size, [rtoff = rtoff])
-                } else {
-                    enc_attn_b(enc, true, r.bqkv, r.bxb, brt, r.u_zero32, r.u_kvd, r.u_nh, r.u_kvm, r.u_hs, r.u_scale, r.u_qkvd,
-                        r.u_softcap, 2l, n_heads, head_size, [rtoff = rtoff])
-                }
-                if (c.q_gated) {
-                    enc_ew2(enc, g_pso_sigmul, r.bxb, 0ul, r.bdn_gate, 0ul, r.u_total_qd, 2l * qd)
-                }
-                let bwo = blob_of(g_dev, t, t.wo_offs[l])
-                enc_gemv_b(enc, false, bwo.buf, bwo.boff, r.bxb, r.bxb2, r.u_qd, r.u_dim, r.u_dim, dim)
-                if (c.attn_out_bias) {
-                    var bwo_b = upload_region(addr < void? >(t.bo[l * dim]), uint64(dim * 4l))
-                    enc_ew2(enc, g_pso_add, r.bxb2, 0ul, bwo_b, 0ul, r.u_total_dim, 2l * dim)
-                }
-            }
-            var bw_ffn = upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
-            if (dim <= ADD_RMS_MAX_DIM) {
-                enc_add_rms_b(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, 2l)
-            } else {
-                enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb2, 0ul, r.u_total_dim, 2l * dim)
-                enc_rms_b(enc, r.bx, bw_ffn, r.bxb, r.u_dim, r.u_eps, 2l)
-            }
-            let bw1 = blob_of(g_dev, t, t.w1_offs[l])
-            let bw3 = blob_of(g_dev, t, t.w3_offs[l])
-            enc_gemv_w13sw_b(enc, false, bw1.buf, bw1.boff, bw3.boff, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
-            let bw2 = blob_of(g_dev, t, t.w2_offs[l])
-            enc_gemv_b(enc, false, bw2.buf, bw2.boff, r.bh12, r.bxb, r.u_hidden, r.u_dim, r.u_dim, dim)
-            if (l + 1l < c.n_layers) {
-                var bw_attn = upload_region(addr < void? >(t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
-                if (dim <= ADD_RMS_MAX_DIM) {
-                    enc_add_rms_b(enc, r.bx, r.bxb, bw_attn, r.bxb, r.u_dim, r.u_eps, 2l)
-                } else {
-                    enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb, 0ul, r.u_total_dim, 2l * dim)
-                    enc_rms_b(enc, r.bx, bw_attn, r.bxb, r.u_dim, r.u_eps, 2l)
-                }
-            } else {
-                enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb, 0ul, r.u_total_dim, 2l * dim)
-            }
-        }
+        encode_verify_layer(t, r, enc, brt, l, pos, dnli)
     }
     // both rows norm+classify: row0 = the verify truth, row1 = the accept-path continuation
     unsafe {
@@ -1242,6 +1251,25 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
     }
     let bcls = blob_of(g_dev, t, t.wcls_off)
     enc_gemv_b(enc, false, bcls.buf, bcls.boff, r.bxf, r.blog, r.u_dim, r.u_vocab, r.u_vocab, c.vocab_size)
+    // draft-slab warm: the draft block at B=2, no cls — future drafts need contiguous slab rows
+    unsafe {
+        enc_copy_row(enc, r.bcat, uint64(2l * dim * 4l), r.bxb, r.u_dim, dim)
+        enc_copy_row(enc, r.bxf, 0ul, r.bxb, r.u_dim, dim, uint64(dim * 4l))
+        var bw_hn = upload_region(addr < void? >(t.fblob[t.mtp_hnorm_off]), uint64(dim * 4l))
+        enc_rms_b(enc, r.bxb, bw_hn, r.bxb2, r.u_dim, r.u_eps, 2l)
+        var bw_en = upload_region(addr < void? >(t.fblob[t.mtp_enorm_off]), uint64(dim * 4l))
+        enc_rms_b(enc, r.bcat, bw_en, r.bh12, r.u_dim, r.u_eps, 2l)
+        enc_copy_row(enc, r.bh12, 0ul, r.bcat, r.u_dim, dim)
+        enc_copy_row(enc, r.bxb2, 0ul, r.bcat, r.u_dim, dim, uint64(dim * 4l))
+        enc_copy_row(enc, r.bh12, uint64(dim * 4l), r.bcat, r.u_dim, dim, uint64(2l * dim * 4l))
+        enc_copy_row(enc, r.bxb2, uint64(dim * 4l), r.bcat, r.u_dim, dim, uint64(3l * dim * 4l))
+        let behp = blob_of(g_dev, t, t.mtp_ehproj_off)
+        enc_gemv_b(enc, false, behp.buf, behp.boff, r.bcat, r.bx, r.u_dim2, r.u_dim, r.u_dim, dim)
+        var bw_att = upload_region(addr < void? >(t.fblob[t.rms_att_off + c.n_layers * dim]), uint64(dim * 4l))
+        enc_rms_b(enc, r.bx, bw_att, r.bxb, r.u_dim, r.u_eps, 2l)
+    }
+    var dnw = 0l
+    encode_verify_layer(t, r, enc, brt, c.n_layers, pos, dnw)
     metal_end_encoding(enc)
     metal_release(enc)
     metal_commit(cb)
@@ -1260,7 +1288,7 @@ def private finish_verify_step(t : Model; var s : Session; r : StepRes; pos : in
         unsafe {
             var kmp = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + r.koff
             var vmp = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + r.voff
-            for (l in range64(c.n_layers)) {
+            for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the warmed draft-slab rows
                 let rowb = kv_row_bytes(s.kv_dtype_k, layer_kv_dim(c, l))
                 let lb = mirror_lbase(t, s.kv_dtype_k, r.cap, l)
                 for (i in range64(2l)) {
@@ -1303,6 +1331,11 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
         }
     }
     if (!cold) {
+        // the warm's row-pos h input is the PRE-draft trunk hidden — the draft overwrites mtp_h
+        s.mtp_xb_save |> resize(int(c.dim))
+        unsafe {
+            memcpy(addr < void? >(s.mtp_xb_save[0]), addr < void? >(s.mtp_h[0]), int(c.dim * 4l))
+        }
         cold = !metal_mtp_draft_forward(t, s, tok, pos)
     }
     if (cold) {
@@ -1351,6 +1384,10 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
         memcpy(metal_buffer_contents(r.bx), addr < void? >(s.mtp_cat[0]), int(r.bytes_x))
         memcpy(metal_buffer_contents(r.bcos), addr < void? >(s.rope_cos[0]), int(r.bytes_tab))
         memcpy(metal_buffer_contents(r.bsin), addr < void? >(s.rope_sin[0]), int(r.bytes_tab))
+        // warm inputs: embed pair + the saved pre-draft h — bcat is untouched by the trunk pass
+        var bc = reinterpret<uint8?>(metal_buffer_contents(r.bcat))
+        memcpy(reinterpret<void?>(bc), addr < void? >(s.mtp_cat[0]), int(2l * c.dim * 4l))
+        memcpy(reinterpret<void?>(bc + 2l * c.dim * 4l), addr < void? >(s.mtp_xb_save[0]), int(c.dim * 4l))
     }
     encode_verify_step(t, r, pos)
     let vok = finish_verify_step(t, s, r, pos)
@@ -1529,7 +1566,7 @@ def private release_step(var r : StepRes) {
         pool_release(g_pool, r.bpart, r.bytes_part)
         pool_release(g_upool, r.u_nch, 4ul)
     }
-    if (r.draft) {
+    if (r.bcat != null) {
         pool_release(g_pool, r.bcat, 2ul * r.bytes_x)
         pool_release(g_upool, r.u_dim2, 4ul)
     }
