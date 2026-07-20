@@ -764,7 +764,11 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                     enc_fwht_unsign(enc, r.bxb, u_hs_l, u_qd_l, n_heads, 1l, head_size)
                 }
             }
-            if (g_skip != "gemv") {
+            if (!recr && c.q_gated && g_skip != "ew") {
+                // gated-attention epilogue: out ⊙ σ(gate) between the attention output and wo (the CPU order)
+                enc_ew2(enc, g_pso_sigmul, r.bxb, 0ul, r.bdn_gate, 0ul, u_qd_l, qd)
+            }
+            if (!recr && g_skip != "gemv") {   // recurrent layers have no wo — ssm_out (already in bxb2) is their out projection
                 enc_site_gemv(enc, t, kq_fmt_at(t.wo_fmt, l), t.wo_offs[l], dim, qd, r.bxb, r.bxb2, u_qd_l, r.u_dim)
                 if (c.attn_out_bias) {
                     var bwo_b = upload_region(addr < void? >(t.bo[l * dim]), uint64(dim * 4l))
