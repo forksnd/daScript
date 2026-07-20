@@ -282,7 +282,7 @@ def test_metal_prefill_kernels(t : T?) {
                 var brhs = buf_u32(dev, uint(HEAD_SIZE))
                 var brnp = buf_u32(dev, uint(NPOS * QD / 2))
                 var brnx = buf_u32(dev, 0u)
-                var ropebufs <- [brv, brc, brs, brn, brhs, brnp, brnx]
+                var ropebufs <- [brv, brc, brs, brn, brhs, brnp, brnx, brhs]   // trailing brhs = rot (full rope)
                 let roperan = run_compute_1d(queue, pso_rope, ropebufs, uint(NPOS * QD / 2), 64u, err)
                 t |> success(roperan, "rope dispatch: {err}")
                 t |> equal(buf_mismatch_approx(brv, rvwant), 0)
@@ -306,7 +306,7 @@ def test_metal_prefill_kernels(t : T?) {
                 }
                 var brv2 = buf_upload(dev, rv)
                 var brnx1 = buf_u32(dev, 1u)
-                var ropebufs2 <- [brv2, brc, brs, brn, brhs, brnp, brnx1]
+                var ropebufs2 <- [brv2, brc, brs, brn, brhs, brnp, brnx1, brhs]
                 let roperan2 = run_compute_1d(queue, pso_rope, ropebufs2, uint(NPOS * QD / 2), 64u, err)
                 t |> success(roperan2, "rope NEOX dispatch: {err}")
                 t |> equal(buf_mismatch_approx(brv2, rvwant), 0)
@@ -316,6 +316,49 @@ def test_metal_prefill_kernels(t : T?) {
                 }
                 metal_release(brv2)
                 metal_release(brnx1)
+
+                // ===== partial NEOX (rot < head_size, Wave D) — vs rope_scaled_neox_tab_part;
+                // the table rows are rot/2 wide, dims >= rot pass through untouched
+                let prot = HEAD_SIZE / 2
+                let phalf = prot / 2
+                var rcosp : array<float>
+                var rsinp : array<float>
+                rcosp |> resize(NPOS * phalf)
+                rsinp |> resize(NPOS * phalf)
+                for (k in range(NPOS * phalf)) {
+                    rcosp[k] = cos(0.02 * float(k % 89))
+                    rsinp[k] = sin(0.02 * float(k % 89))
+                }
+                for (k in range(NPOS * QD)) {
+                    rv[k] = 0.17 * float(k % 33) - 2.4
+                    rvwant[k] = rv[k]
+                }
+                unsafe {
+                    for (p in range(NPOS)) {
+                        rope_scaled_neox_tab_part(addr(rvwant[p * QD]), int64(HEAD_SIZE), int64(prot),
+                            int64(QD), addr<float const?>(rcosp[p * phalf]), addr<float const?>(rsinp[p * phalf]))
+                    }
+                }
+                var brv3 = buf_upload(dev, rv)
+                var brcp = buf_upload(dev, rcosp)
+                var brsp = buf_upload(dev, rsinp)
+                var brnx2 = buf_u32(dev, 1u)
+                var brot = buf_u32(dev, uint(prot))
+                var ropebufs3 <- [brv3, brcp, brsp, brn, brhs, brnp, brnx2, brot]
+                let roperan3 = run_compute_1d(queue, pso_rope, ropebufs3, uint(NPOS * QD / 2), 64u, err)
+                t |> success(roperan3, "rope partial-NEOX dispatch: {err}")
+                t |> equal(buf_mismatch_approx(brv3, rvwant), 0)
+                ropebufs3 |> clear()
+                unsafe {
+                    delete ropebufs3
+                }
+                delete rcosp
+                delete rsinp
+                metal_release(brv3)
+                metal_release(brcp)
+                metal_release(brsp)
+                metal_release(brnx2)
+                metal_release(brot)
                 metal_release(brc)
                 metal_release(brs)
                 metal_release(brn)

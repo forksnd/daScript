@@ -2027,6 +2027,7 @@ class MetalRopeStoreF16 {
     @uniform @binding = 10 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
     @ssbo @binding = 11 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 12 has_bias : uint
+    @uniform @binding = 13 rot : uint       // partial rotary width (qwen35: 64 of 256); == head_size for full
 
     [metal_kernel(name="metal_rope_store16_msl")]
     def metal_rope_store16 {
@@ -2037,12 +2038,15 @@ class MetalRopeStoreF16 {
         let isK = gid >= npairs_q
         let lgid = isK ? gid - npairs_q : gid
         let half = head_size / 2u
+        let halfr = rot / 2u
         let j = lgid % half
         let hbase = (lgid / half) * head_size
-        let i = neox != 0u ? hbase + j : hbase + 2u * j
-        let i2 = neox != 0u ? i + half : i + 1u
-        let fcr = tcos[j]
-        let fci = tsin[j]
+        // threads j < rot/2 rotate the (j, j+rot/2) pair; the rest identity-cover [rot, hs)
+        let rotp = j < halfr
+        let i = neox != 0u ? (rotp ? hbase + j : hbase + rot + (j - halfr)) : hbase + 2u * j
+        let i2 = neox != 0u ? (rotp ? i + halfr : i + (half - halfr)) : i + 1u
+        let fcr = rotp ? tcos[j] : 1.0
+        let fci = rotp ? tsin[j] : 0.0
         let kvd = npairs * 2u - qd   // grid = (qd + kvd)/2 pairs
         if (isK) {
             let v0 = qk[qd + i] + (has_bias != 0u ? bias[qd + i] : 0.0)
@@ -2084,6 +2088,7 @@ class MetalRopeStoreHF16 {
     @uniform @binding = 13 has_bias : uint
     @uniform @binding = 14 has_norm : uint
     @uniform @binding = 15 eps : float
+    @uniform @binding = 16 rot : uint       // partial rotary width; == head_size for full
     @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
     @workgroup part : float[16]
 
@@ -2092,7 +2097,6 @@ class MetalRopeStoreHF16 {
         let tgid = gl_WorkGroupID.x
         let lid = gl_LocalInvocationID.x
         let hs = head_size
-        let half = hs / 2u
         let nkvh = nheads / kv_mul
         let kvd = nkvh * hs
         let isQ = tgid < nheads
@@ -2117,14 +2121,17 @@ class MetalRopeStoreHF16 {
                 let inv = 1.0 / sqrt(total / float(hs) + eps)
                 v = w[(isK ? hs : 0u) + lid] * (v * inv)
             }
-            // rope via the tgmem-staged partner (the whole head is resident in this tg)
+            // rope via the tgmem-staged partner (the whole head is resident in this tg);
+            // partial rot: lanes >= rot pass through (identity coefficients, self partner)
             buf[lid] = v
             barrier()
-            let isHi = neox != 0u ? lid >= half : (lid & 1u) != 0u
-            let j = neox != 0u ? (isHi ? lid - half : lid) : lid / 2u
-            let fcr = tcos[j]
-            let fci = tsin[j]
-            let other = buf[neox != 0u ? (isHi ? lid - half : lid + half) : (lid ^ 1u)]
+            let halfr = rot / 2u
+            let inrot = lid < rot
+            let isHi = neox != 0u ? (lid >= halfr && inrot) : ((lid & 1u) != 0u && inrot)
+            let j = min(neox != 0u ? (isHi ? lid - halfr : lid) : lid / 2u, halfr - 1u)
+            let fcr = inrot ? tcos[j] : 1.0
+            let fci = inrot ? tsin[j] : 0.0
+            let other = buf[neox != 0u ? (isHi ? lid - halfr : (inrot ? lid + halfr : lid)) : (lid ^ 1u)]
             v = isHi ? other * fci + v * fcr : v * fcr - other * fci
         }
         if (isQ) {
@@ -2152,6 +2159,7 @@ class MetalRopeStoreF32 {
     @uniform @binding = 10 neox : uint
     @ssbo @binding = 11 bias : array<float>
     @uniform @binding = 12 has_bias : uint
+    @uniform @binding = 13 rot : uint       // partial rotary width; == head_size for full
 
     [metal_kernel(name="metal_rope_store32_msl")]
     def metal_rope_store32 {
@@ -2162,12 +2170,14 @@ class MetalRopeStoreF32 {
         let isK = gid >= npairs_q
         let lgid = isK ? gid - npairs_q : gid
         let half = head_size / 2u
+        let halfr = rot / 2u
         let j = lgid % half
         let hbase = (lgid / half) * head_size
-        let i = neox != 0u ? hbase + j : hbase + 2u * j
-        let i2 = neox != 0u ? i + half : i + 1u
-        let fcr = tcos[j]
-        let fci = tsin[j]
+        let rotp = j < halfr
+        let i = neox != 0u ? (rotp ? hbase + j : hbase + rot + (j - halfr)) : hbase + 2u * j
+        let i2 = neox != 0u ? (rotp ? i + halfr : i + (half - halfr)) : i + 1u
+        let fcr = rotp ? tcos[j] : 1.0
+        let fci = rotp ? tsin[j] : 0.0
         let kvd = npairs * 2u - qd
         if (isK) {
             let v0 = qk[qd + i] + (has_bias != 0u ? bias[qd + i] : 0.0)
@@ -6034,7 +6044,8 @@ def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?) {
 // fused rope + KV-row store: the v source binds the SAME QKV buffer at its v byte offset
 def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; vsoff : uint64;
                    kmb, vmb : MetalBuffer?; koff, voff : uint64;
-                   bcos, bsin, bqd, bhs, bnpq, bnpall, bneox, bbias, bhasb : MetalBuffer?; npairs : int64) {
+                   bcos, bsin, bqd, bhs, bnpq, bnpall, bneox, bbias, bhasb : MetalBuffer?; npairs : int64;
+                   brot : MetalBuffer? = null) {
     metal_set_pipeline(enc, f16 ? g_pso_rpst16 : g_pso_rpst32)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, bqkv, vsoff, 1)
@@ -6049,6 +6060,7 @@ def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; 
     metal_set_buffer(enc, bneox, 0ul, 10)
     metal_set_buffer(enc, bbias, 0ul, 11)
     metal_set_buffer(enc, bhasb, 0ul, 12)
+    metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 13)   // rot defaults to head_size (full rope)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6057,7 +6069,7 @@ def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; 
 def enc_rope_store_h16(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : uint64;
                        kmb, vmb : MetalBuffer?; koff, voff : uint64;
                        bcos, bsin, bqkw, bbias, bqd, bhs, bnh, bkvm, bneox, bhasb, bhasn, beps : MetalBuffer?;
-                       ntg, head_size : int64) {
+                       ntg, head_size : int64; brot : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_rpst_h16)
     metal_set_threadgroup_memory_length(enc, metal_rope_store_h16_msl_tgmem, 0)
     metal_set_buffer(enc, bqkv, 0ul, 0)
@@ -6076,6 +6088,7 @@ def enc_rope_store_h16(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
     metal_set_buffer(enc, bhasb, 0ul, 13)
     metal_set_buffer(enc, bhasn, 0ul, 14)
     metal_set_buffer(enc, beps, 0ul, 15)
+    metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 16)   // rot defaults to head_size (full rope)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 

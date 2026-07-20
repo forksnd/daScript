@@ -63,6 +63,8 @@ enum MetalDecodeDecline {
     gpu_error           // dispatch failed at execution time
     planar              // weights not in the blob-image form (the drivers are blob-only —
                         // load_model under metal mode transforms/maps the metal flavor)
+    dn_state            // deltanet recurrent state not GPU-resident for this position (state is
+                        // forward-only and NOT re-derivable — no watermark repair exists)
 }
 
 //! Layer-stack features a model's graph needs beyond the base llama dense block — ONE derivation
@@ -929,6 +931,91 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
 }
 
 
+// ===== deltanet recurrent-state mirrors (Wave D) — per-session GPU S + conv state =====
+// Forward-only, NOT re-derivable: pos 0 zeroes, s.dn_pos == pos syncs from CPU, else decline;
+// own buffers (KV-arena rebuild re-uploads from CPU — impossible for state); layout == Session's.
+
+struct DnMirror {
+    uid : uint64
+    @do_not_delete buf : MetalBuffer?   // [state planes f32][conv planes f32]
+    conv_off : uint64                   // byte offset of the conv-history region
+    bytes : uint64
+    pos : int64                         // next position the GPU state expects (forward-only)
+    tick : int64
+}
+var g_dn_mirrors : table<uint64; DnMirror>
+let DN_MIRRORS_MAX = 4      // per-session state is big (35B: ~60MB) — oldest evicts; a returning
+                            // evicted session declines unless it restarts at pos 0 or off CPU state
+
+def dn_mirror_release(mr : DnMirror) {
+    if (mr.buf != null) {
+        metal_release(mr.buf)
+    }
+}
+
+def dn_mirror_prepare(var s : Session; pos : int64) : tuple<ok : bool; buf : MetalBuffer?; conv_off : uint64> {
+    let sbytes = uint64(length(s.dn_state)) * 4ul
+    let cbytes = uint64(length(s.dn_conv_state)) * 4ul
+    if (sbytes == 0ul) {
+        return (ok = false, buf = null, conv_off = 0ul)
+    }
+    if (key_exists(g_dn_mirrors, s.uid) && g_dn_mirrors[s.uid].bytes != sbytes + cbytes) {
+        dn_mirror_release(g_dn_mirrors[s.uid])
+        g_dn_mirrors |> erase(s.uid)
+    }
+    let have = key_exists(g_dn_mirrors, s.uid)
+    let cpu_prefix = s.dn_pos == pos
+    if (!have && pos != 0l && !cpu_prefix) {
+        return (ok = false, buf = null, conv_off = 0ul)
+    }
+    if (!have) {
+        while (length(g_dn_mirrors) >= DN_MIRRORS_MAX) {
+            var victim = 0ul
+            var vtick = 0l
+            for (uid, mr in keys(g_dn_mirrors), values(g_dn_mirrors)) {
+                if (victim == 0ul || mr.tick < vtick) {
+                    victim = uid
+                    vtick = mr.tick
+                }
+            }
+            dn_mirror_release(g_dn_mirrors[victim])
+            g_dn_mirrors |> erase(victim)
+        }
+        g_dn_mirrors[s.uid] = DnMirror(uid = s.uid, buf = metal_new_buffer(g_dev, sbytes + cbytes),
+            conv_off = sbytes, bytes = sbytes + cbytes, pos = -1l)
+    }
+    if (pos == 0l) {
+        // fresh conversation: zero both regions (dn_reset's GPU half). Safe on unified memory —
+        // no step of this session is in flight at pos 0 (spec is clipped for recurrent models)
+        unsafe {
+            memset8(metal_buffer_contents(g_dn_mirrors[s.uid].buf), uint8(0), int(sbytes + cbytes))
+        }
+        g_dn_mirrors[s.uid].pos = 0l
+    } elif (g_dn_mirrors[s.uid].pos != pos) {
+        if (!cpu_prefix) {
+            return (ok = false, buf = null, conv_off = 0ul)
+        }
+        // the CPU ran positions [0, pos) — its state is the source of truth; sync it up
+        unsafe {
+            var dst = reinterpret<uint8?>(metal_buffer_contents(g_dn_mirrors[s.uid].buf))
+            memcpy(reinterpret<void?>(dst), addr<void?>(s.dn_state[0]), int(sbytes))
+            memcpy(reinterpret<void?>(dst + sbytes), addr<void?>(s.dn_conv_state[0]), int(cbytes))
+        }
+        g_dn_mirrors[s.uid].pos = pos
+    }
+    g_tick++
+    g_dn_mirrors[s.uid].tick = g_tick
+    let mr = g_dn_mirrors[s.uid]   // cheap copy — one lookup per statement (table re-hash safety)
+    return (ok = true, buf = mr.buf, conv_off = mr.conv_off)
+}
+
+// the step served and its command buffer completed — the GPU state now holds position pos's update
+def dn_mirror_advance(uid : uint64; pos : int64) {
+    if (key_exists(g_dn_mirrors, uid)) {
+        g_dn_mirrors[uid].pos = pos + 1l
+    }
+}
+
 def signs_buffer() : MetalBuffer? {
     if (g_signs == null) {
         var signs : array<float>
@@ -1264,6 +1351,12 @@ def metal_common_release {
     }
     unsafe {
         delete g_mirrors
+    }
+    for (dmr in values(g_dn_mirrors)) {
+        dn_mirror_release(dmr)
+    }
+    unsafe {
+        delete g_dn_mirrors
     }
     g_mirror_bytes = 0ul
     if (g_arena != null) {

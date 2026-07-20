@@ -3017,6 +3017,7 @@ class MetalRope {
     @uniform @binding = 4 head_size : uint
     @uniform @binding = 5 npairs : uint     // ntok * n/2 — grid guard
     @uniform @binding = 6 neox : uint       // pair (j, j+half) instead of (2j, 2j+1); same table row j
+    @uniform @binding = 7 rot : uint        // partial rotary width; == head_size for full (table rows rot/2 wide)
 
     [metal_kernel(name="metal_rope_msl")]
     def metal_rope {
@@ -3028,12 +3029,16 @@ class MetalRope {
         let p = gid / pairs_per_row
         let rem = gid % pairs_per_row
         let half = head_size / 2u
+        let halfr = rot / 2u
         let h = rem / half
         let j = rem % half
-        let i = p * n + h * head_size + (neox != 0u ? j : 2u * j)
-        let i2 = neox != 0u ? i + half : i + 1u
-        let fcr = tcos[p * half + j]
-        let fci = tsin[p * half + j]
+        // threads j < rot/2 rotate the (j, j+rot/2) pair; the rest identity-cover [rot, hs)
+        let rotp = j < halfr
+        let hb = p * n + h * head_size
+        let i = neox != 0u ? (rotp ? hb + j : hb + rot + (j - halfr)) : hb + 2u * j
+        let i2 = neox != 0u ? (rotp ? i + halfr : i + (half - halfr)) : i + 1u
+        let fcr = rotp ? tcos[p * halfr + j] : 1.0
+        let fci = rotp ? tsin[p * halfr + j] : 0.0
         let v0 = v[i]
         let v1 = v[i2]
         v[i] = v0 * fcr - v1 * fci
@@ -4684,7 +4689,7 @@ def private enc_qk_norm_pf(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brst
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(hs), 1u, 1u))
 }
 
-def private enc_rope(enc : MetalComputeEncoder?; bv, bcos, bsin, bn, bhs, bnpairs, bneox : MetalBuffer?; npairs : int64; off : uint64 = 0ul) {
+def private enc_rope(enc : MetalComputeEncoder?; bv, bcos, bsin, bn, bhs, bnpairs, bneox : MetalBuffer?; npairs : int64; off : uint64 = 0ul; brot : MetalBuffer? = null) {
     metal_set_pipeline(enc, g_pso_rope)
     metal_set_buffer(enc, bv, off, 0)
     metal_set_buffer(enc, bcos, 0ul, 1)
@@ -4693,6 +4698,7 @@ def private enc_rope(enc : MetalComputeEncoder?; bv, bcos, bsin, bn, bhs, bnpair
     metal_set_buffer(enc, bhs, 0ul, 4)
     metal_set_buffer(enc, bnpairs, 0ul, 5)
     metal_set_buffer(enc, bneox, 0ul, 6)
+    metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 7)   // rot defaults to head_size (full rope)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
