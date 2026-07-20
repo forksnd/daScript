@@ -403,11 +403,15 @@ def private cfg_sourced(key : string) : bool
 
 // vulkan detail knobs — explicit config/CLI wins; unset gets the blessed serving shape
 // (K=2 resident + S=35 streamed + DN + ATTN) under gpu = vulkan
+// 0 / unset = auto (-1): the loader fills the VRAM budget and streams the rest; a positive value
+// pins it exactly. The old hardcoded K=2/S=35 was tuned to one 3060 Ti, and auto measured slightly
+// BETTER there (4/36, 26.30 vs 26.11 tg-real256). Treating 0 as auto also removes the control-page
+// trap where saving the raw unset sentinels wrote explicit zeros and disarmed the tier on restart.
 def private gpu_detail_layers(cfg : ServerArgs) : int64
-    => int64(cfg_sourced("gpu_layers") ? cfg.gpu_layers : 2)
+    => int64(cfg_sourced("gpu_layers") && cfg.gpu_layers > 0 ? cfg.gpu_layers : -1)
 
 def private gpu_detail_stream(cfg : ServerArgs) : int64
-    => int64(cfg_sourced("gpu_stream") ? cfg.gpu_stream : 35)
+    => int64(cfg_sourced("gpu_stream") && cfg.gpu_stream > 0 ? cfg.gpu_stream : -1)
 
 def private gpu_detail_dn(cfg : ServerArgs) : bool
     => cfg_sourced("gpu_dn") ? cfg.gpu_dn : true
@@ -653,12 +657,17 @@ def init() {
     set_metal_mode(metal_mode)
     to_log(LOG_INFO, "dasllama-server: metal mode {get_metal_mode()}\n")
     if (gpu == "vulkan") {
+        // shexp rides the blessed shape: the resident shared expert measured +8.3% on decode
+        // (decode-arc S2) and was missing here. The booleans stay explicit rather than riding
+        // auto_tier, so an explicit `gpu_dn = false` still turns its rail off.
         set_gpu_tier_want(GpuTierWant(
             moe_layers = gpu_detail_layers(g_cfg), moe_stream = gpu_detail_stream(g_cfg),
             vram_mb = int64(g_cfg.gpu_vram_mb), dn = gpu_detail_dn(g_cfg),
-            attn = gpu_detail_attn(g_cfg), dense = g_cfg.gpu_dense))
+            attn = gpu_detail_attn(g_cfg), dense = g_cfg.gpu_dense, shexp = true))
         if (moe_gpu_tier_arm()) {
-            to_log(LOG_INFO, "dasllama-server: vulkan GPU tier armed (K={gpu_detail_layers(g_cfg)}, S={gpu_detail_stream(g_cfg)}, dn={gpu_detail_dn(g_cfg)}, attn={gpu_detail_attn(g_cfg)})\n")
+            let ktag = gpu_detail_layers(g_cfg) < 0l ? "auto" : "{gpu_detail_layers(g_cfg)}"
+            let stag = gpu_detail_stream(g_cfg) < 0l ? "auto" : "{gpu_detail_stream(g_cfg)}"
+            to_log(LOG_INFO, "dasllama-server: vulkan GPU tier armed (K={ktag}, S={stag}, dn={gpu_detail_dn(g_cfg)}, attn={gpu_detail_attn(g_cfg)})\n")
         } else {
             to_log(LOG_WARNING, "dasllama-server: gpu = vulkan requested but the tier did not arm (no vulkan device, or this build lacks the vulkan module)\n")
         }

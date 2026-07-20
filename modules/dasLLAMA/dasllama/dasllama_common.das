@@ -1780,12 +1780,17 @@ def moe_gpu_upload_resident(var t : Model) {
     reset_moe_gpu_shexp_layers()
     reset_moe_gpu_qkv_layers()
     set_moe_gpu_model_support("")
-    let nstream = gpu_want_moe_stream()
+    // -1 = auto: ask for every layer and let the walk's own budget stops place the split (the
+    // resident loop drops a partial triple and breaks, the streamed loop does the same on the
+    // pinned-mirror budget) — that is what makes auto degrade on a smaller card instead of failing
+    let nstream_want = gpu_want_moe_stream()
+    let nstream = nstream_want < 0l ? t.config.n_layers : nstream_want
     let dn_want = gpu_want_dn() || gpu_want_dnd()   // the decode step rides the same dn uploads
     let at_want = gpu_want_attn()
+    // layer count tests == 0, NOT <= 0: -1 is the auto sentinel and must read as a REQUEST
     if (!moe_gpu_tier_installed()
-            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want
-                && !gpu_want_shexp() && !gpu_want_qkv())) {
+            || (moe_gpu_layer_count() == 0l && nstream <= 0l && !dn_want && !at_want
+                && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())) {
         return   // tier absent or nothing requested
     }
     // capability guard: the tier serves q8-mode MoE models only — record WHY for the status
@@ -1810,7 +1815,9 @@ def moe_gpu_upload_resident(var t : Model) {
     let dim = t.config.dim
     let ne = t.config.n_expert
     let nfe = t.config.n_ff_exp
-    let want = min(moe_gpu_layer_count(), layers)
+    let want_raw = moe_gpu_layer_count()
+    let want = want_raw < 0l ? layers : min(want_raw, layers)   // -1 = auto: fill the budget
+    set_moe_gpu_layer_count(want)   // publish the resolved count — downstream status reads it
     let repacked = kernel_backend_needs_repack(active_kernel_backend())
     let mr = repacked ? active_q8_layout_mr() : 1l
     let kgroup = repacked ? active_q8_kgroup() : 4l
@@ -3746,6 +3753,8 @@ struct Session {
     mtp_xb_save : array<float>     // prompt-warm x_b preservation (the warm's eh_proj output rides x_b for the arch blocks; consumers like mtp_verify_row0 / embed_forward need the trunk hiddens back)
     mtp_logits : array<float>      // verify-batch row-0 logits (vocab; the draft check reads its argmax)
     mtp_vbatch : array<int64>      // the 2-row verify batch [tok, draft] (persistent — no per-step alloc)
+    mtp_norm_b : array<float>      // verify-batch final-normed rows (npos x dim), input to the batched classifier
+    mtp_logits_b : array<float>    // verify-batch logits (npos x vocab) — ONE classifier pass covers every row
     mtp_drafted : int64            // session-lifetime telemetry: drafts attempted / accepted
     mtp_accepted : int64
     // deltanet rollback for a rejected verify batch (sized lazily on first snapshot)
@@ -8279,6 +8288,17 @@ def set_mtp_spec(on : bool) {
 //! Current state of the [[set_mtp_spec]] gate.
 def get_mtp_spec() : bool => g_mtp_spec
 
+var private g_mtp_batch_cls = true
+
+//! One batched classifier pass over the whole MTP verify window instead of a per-row GEMV each —
+//! the plane (vocab x dim) is a step's largest weight read. Pure perf lever; A/B only.
+def set_mtp_batch_cls(on : bool) {
+    g_mtp_batch_cls = on
+}
+
+//! Current state of the [[set_mtp_batch_cls]] gate.
+def get_mtp_batch_cls() : bool => g_mtp_batch_cls
+
 def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bool = true) {
     let c = t.config
     let dim = c.dim
@@ -8352,6 +8372,40 @@ def private mtp_verify_row0(t : Model; var s : Session) {
     }
 }
 
+// The tied-fp32 classifier (mm_fblob) and the GPU-resident plane have no batched form — those keep
+// the per-row path.
+def private mtp_cls_batch_ok(t : Model) : bool {
+    let c = t.config
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
+    return g_mtp_batch_cls && !tied_f32 && !moe_gpu_cls_on_gpu(t.wcls_off)
+}
+
+// One classifier pass for the whole verify window: normalize every row, then a single batched GEMM
+// over the plane. Row 0 feeds the draft check, the last row feeds the next step — the same values
+// the per-row path produces, from one weight stream instead of npos of them.
+def private mtp_verify_logits(t : Model; var s : Session; npos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let vocab = c.vocab_size
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    s.mtp_norm_b |> scratch_resize(npos * dim)
+    s.mtp_logits_b |> scratch_resize(npos * vocab)
+    rms_batch(s.mtp_norm_b, s.x_b, t, t.rms_final_off, dim, npos)
+    mm_b_f(s, s.mtp_logits_b, t, cls_fmt, t.wcls_off, s.mtp_norm_b, dim, vocab, npos)
+    copy_floats(s.mtp_logits_b, 0l, s.mtp_logits, 0l, vocab)
+    copy_floats(s.mtp_logits_b, (npos - 1l) * vocab, s.logits, 0l, vocab)
+    // mirror the plain classifier tail exactly — `truth` must match plain decode BY CONSTRUCTION
+    if (c.final_logit_softcap > 0.0) {
+        softcap4(s.mtp_logits, vocab, c.final_logit_softcap)
+        softcap4(s.logits, vocab, c.final_logit_softcap)
+    }
+    for (id in t.suppress) {
+        s.mtp_logits[id] = -1.0e30
+        s.logits[id] = -1.0e30
+    }
+}
+
 // Write the draft head's IN-CHUNK KV rows for a just-prefilled [start_pos, start_pos+npos) window.
 // Rows start_pos..start_pos+npos-2 ride one batched eh_proj GEMM + the arch's blocks at l = n_layers.
 // x_b is saved/restored around the pass: post-prefill contents are load-bearing for mtp_verify_row0.
@@ -8403,8 +8457,13 @@ def mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : int64&
     mtp_state_snapshot(s)
     s.mtp_vbatch[0] = tok
     s.mtp_vbatch[1] = d
-    forward_prefill(t, s, s.mtp_vbatch, 2l, pos)
-    mtp_verify_row0(t, s)
+    let batch_cls = mtp_cls_batch_ok(t)
+    forward_prefill(t, s, s.mtp_vbatch, 2l, pos, batch_cls)
+    if (batch_cls) {
+        mtp_verify_logits(t, s, 2l)   // both rows from one classifier stream
+    } else {
+        mtp_verify_row0(t, s)
+    }
     let truth = parallel_argmax(s.mtp_logits, c.vocab_size)
     if (truth == d) {
         s.mtp_accepted++
@@ -10869,7 +10928,7 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
     }
 }
 
-def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64) {
+def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64; skip_logits : bool = false) {
     let c = t.config
     if (npos <= 0l) {
         return
@@ -10906,7 +10965,7 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     if (g_mtp_spec && c.n_layer_nextn > 0l && start_pos > 0l && s.mtp_h_pos1 == start_pos) {
         forward_mtp(t, s, tokens[0], start_pos - 1l, false)
     }
-    forward_prefill_body(t, s, npos, start_pos)
+    forward_prefill_body(t, s, npos, start_pos, skip_logits)
     if (g_mtp_spec && c.n_layer_nextn > 0l) {   // spec on: maintain the draft head's KV alongside the trunk's
         mtp_prefill_warm(t, s, tokens, npos, start_pos)
     }
@@ -11090,7 +11149,7 @@ def private forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : 
 
 // the shared prefill core: rope table + layer stack + final norm/classifier, over a pre-filled
 // s.x_b residual stream (token or embedding sourced)
-def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64) {
+def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; skip_logits : bool = false) {
     let c = t.config
     let dim = c.dim
 
@@ -11139,6 +11198,10 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     if (c.n_layer_nextn > 0l) {   // stash the last position's h_nextn for the MTP draft head
         copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)
         s.mtp_h_pos1 = start_pos + last + 1l
+    }
+    if (skip_logits) {   // MTP verify: the caller runs ONE batched classifier covering every row
+        prof_add("final", ts_final)
+        return
     }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
