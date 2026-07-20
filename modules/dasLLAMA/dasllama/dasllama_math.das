@@ -1628,6 +1628,29 @@ def public set_moe_gpu_heat_route(on : bool) {
     g_moe_gpu_heat_route = on
 }
 
+// ===== shared-expert residency (decode, async behind the routed experts) =====
+
+var g_moe_gpu_shexp_layers : table<int64>   // layers whose shexp gate/up/down triple is resident
+var g_moe_gpu_shexp_route = true
+
+//! Loader contract: mark one layer's shared-expert triple resident on the tier. Reset per load.
+def public set_moe_gpu_shexp_layer(l : int64) {
+    g_moe_gpu_shexp_layers |> insert(l)
+}
+
+def public reset_moe_gpu_shexp_layers {
+    g_moe_gpu_shexp_layers |> clear()
+}
+
+def public moe_gpu_shexp_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_shexp_route && key_exists(g_moe_gpu_shexp_layers, l)
+}
+
+//! Runtime routing gate over the shared-expert marks (the --shexp-ab in-process lever).
+def public set_moe_gpu_shexp_route(on : bool) {
+    g_moe_gpu_shexp_route = on
+}
+
 //! Partition the routed top-k against layer l's slot cache: hit[j] per original position,
 //! compacted synthetic offset triples for the hits (pool coordinates), returns the hit count.
 def public matmul_moe_gpu_heat_query(l : int64; idx : array<int64>; k : int64;
@@ -1682,6 +1705,7 @@ struct GpuTierWant {
     dense : bool         //!< dense attention-side planes resident
     dnd : bool           //!< deltanet DECODE step chain (implies the dn uploads)
     heat : int64         //!< heat-pinned expert cache slots per layer C (0 = off; needs stream mirrors)
+    shexp : bool         //!< shared-expert triples resident; decode runs them async behind the routed experts
 }
 
 var g_gpu_want = GpuTierWant()
@@ -1727,6 +1751,9 @@ def public gpu_want_dnd : bool
 
 def public gpu_want_heat : int64
     => has_env_variable("DASLLAMA_GPU_HEAT") ? env_int64("DASLLAMA_GPU_HEAT") : g_gpu_want.heat
+
+def public gpu_want_shexp : bool
+    => has_env_variable("DASLLAMA_GPU_SHEXP") ? get_env_variable("DASLLAMA_GPU_SHEXP") == "1" : g_gpu_want.shexp
 
 //! A GPU backend registers its arm probe here at ``[init]`` so config-driven arming works
 //! after module init (the env path arms at ``[init]`` directly).

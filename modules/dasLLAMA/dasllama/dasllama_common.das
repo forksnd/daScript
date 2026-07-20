@@ -1777,12 +1777,13 @@ def moe_gpu_upload_resident(var t : Model) {
     reset_moe_gpu_dense_offs()
     reset_moe_gpu_dn_layers()
     reset_moe_gpu_attn_layers()
+    reset_moe_gpu_shexp_layers()
     set_moe_gpu_model_support("")
     let nstream = gpu_want_moe_stream()
     let dn_want = gpu_want_dn() || gpu_want_dnd()   // the decode step rides the same dn uploads
     let at_want = gpu_want_attn()
     if (!moe_gpu_tier_installed()
-            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want)) {
+            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want && !gpu_want_shexp())) {
         return   // tier absent or nothing requested
     }
     // capability guard: the tier serves q8-mode MoE models only — record WHY for the status
@@ -1862,6 +1863,40 @@ def moe_gpu_upload_resident(var t : Model) {
         }
         if (dense_marked > 0l) {
             to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: {dense_marked} dense planes resident\n")
+        }
+    }
+    // shared-expert triples — DASLLAMA_GPU_SHEXP=1 opt-in. Dense (every token, every layer, one
+    // fixed weight set) so residency carries no miss term; q8 only (the repack registers them fmt 0).
+    if (gpu_want_shexp() && t.config.n_ff_shexp > 0l && !t.config.moe_dense_shexp) {
+        let nsh = t.config.n_ff_shexp
+        let she = dim * nsh
+        var sh_marked = 0l
+        for (l in range64(layers)) {
+            var uploads <- [(woff = t.wsh1_off + l * she, n = dim, rows = nsh),
+                            (woff = t.wsh3_off + l * she, n = dim, rows = nsh),
+                            (woff = t.wsh2_off + l * she, n = nsh, rows = dim)]
+            var ok = true
+            var done = 0
+            for (u in uploads) {
+                if (!moe_gpu_gather_upload(t, KqFmt.q8, u.woff, u.n, u.rows, u.rows, mr, kgroup, wbias, wq, ws)) {
+                    ok = false
+                    break
+                }
+                done++
+            }
+            if (!ok) {
+                moe_gpu_drop_stacks(done, false)   // partial triple rolls back (the resident-walk rule)
+                delete uploads
+                break
+            }
+            // deliberately NOT set_moe_gpu_dense_off: that would also route the PREFILL shexp GEMMs
+            // onto the dense rail (a separately measured wash) and stop this being a decode-only lever
+            set_moe_gpu_shexp_layer(l)
+            sh_marked++
+            delete uploads
+        }
+        if (sh_marked > 0l) {
+            to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: shared experts of {sh_marked} layers resident\n")
         }
     }
     // deltanet triples third — DASLLAMA_GPU_DN=1 opt-in: each recurrent layer's qkv/z-gate/
@@ -7570,15 +7605,37 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     }
     moe_select(c, unsafe(addr(s.moe_logits[0])), s.moe_idx, s.moe_w, 0l, ebp)
     prof_add("moe_route", ts_route)
+    // resident shared expert: submit FIRST, collect AFTER the routed experts, so it runs inside the CPU's own expert window — a synchronous per-layer submit is the heat-cache wash.
+    let sh_gpu = (c.n_ff_shexp > 0l && !c.moe_dense_shexp && t.quant == QuantMode.q8
+        && moe_gpu_shexp_on_gpu(l) && !moe_gpu_layer_on_gpu(l) && !heat_armed())
+    let nsh = c.n_ff_shexp
+    let she = dim * nsh
+    if (sh_gpu) {
+        let ts_shs = ref_time_ticks()
+        quantize_q8_0_into(s.xb, dim, s.moe_xq, s.moe_xs, 0l, 0l)   // moe_experts_apply recomputes the same bits
+        // the routed CPU path uses moe_offs (not the triples) — these are free at this gate
+        s.moe_offs1 <- [t.wsh1_off + l * she, 0l, 1l]
+        s.moe_offs3 <- [t.wsh3_off + l * she, 0l, 1l]
+        s.moe_offs2 <- [t.wsh2_off + l * she, 0l, 1l]
+        matmul_moe_gpu_ffn_begin(s.moe_offs1, s.moe_offs3, s.moe_offs2, 1l, s.moe_xq, s.moe_xs,
+            dim, nsh, 1l, 0, 0, 0, c.ffn_act == FfnAct.gelu)
+        prof_add("shexp_sub", ts_shs)
+    }
     moe_experts_apply(t, s, l)
+    if (sh_gpu) {
+        let ts_shw = ref_time_ticks()
+        trace_tag(TRACE_TAG_SHEXP)
+        let g = c.moe_shexp_gated ? moe_shexp_gate(t, l, unsafe(addr(s.xb[0]))) : 1.0
+        matmul_moe_gpu_ffn_join(s.xb2)
+        axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.xb2[0])), g, dim)
+        prof_add("shexp_wait", ts_shw)   // 0 = fully hidden behind the routed-expert window
+    }
     // shared expert, gated by a sigmoid scalar from its per-layer gate vector (glm4moe: ungated, g = 1)
-    if (c.n_ff_shexp > 0l) {
+    if (c.n_ff_shexp > 0l && !sh_gpu) {
         let pre_q8 = t.quant == QuantMode.q8
         let ts_sh = ref_time_ticks()
         trace_tag(TRACE_TAG_SHEXP)
         let g = c.moe_shexp_gated ? moe_shexp_gate(t, l, unsafe(addr(s.xb[0]))) : 1.0
-        let nsh = c.n_ff_shexp
-        let she = dim * nsh
         if (pre_q8) {
             // shexp gate+up share the hoisted xb quants: one region-list dispatch, act on the halves
             s.ffn_offs[0] = t.wsh1_off + l * she

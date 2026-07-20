@@ -54,6 +54,9 @@ struct Args {
     @clarg_doc = "Run the timed reps twice in-process — heat-pinned expert cache OFF then ON (needs DASLLAMA_GPU_HEAT=<slots> + DASLLAMA_GPU_MOE_STREAM covering the layers: uploads DMA from the pinned mirrors)"
     heat_ab : bool
 
+    @clarg_doc = "Run the timed reps twice in-process — resident shared expert OFF then ON (needs DASLLAMA_GPU_SHEXP=1 for the uploads)"
+    shexp_ab : bool
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -173,13 +176,15 @@ def main() {
             }
             delete s
         }
-        if (cfg.dnd_ab && cfg.heat_ab) {
-            panic("decode_real_bench: --dnd-ab and --heat-ab are mutually exclusive (one route flip per run)")
+        if ((cfg.dnd_ab ? 1 : 0) + (cfg.heat_ab ? 1 : 0) + (cfg.shexp_ab ? 1 : 0) > 1) {
+            panic("decode_real_bench: --dnd-ab / --heat-ab / --shexp-ab are mutually exclusive (one route flip per run)")
         }
-        let narms = cfg.dnd_ab || cfg.heat_ab ? 2 : 1
+        let narms = cfg.dnd_ab || cfg.heat_ab || cfg.shexp_ab ? 2 : 1
         for (ai in range(narms)) {
             if (cfg.dnd_ab) {
                 set_moe_gpu_dnd_route(ai == 1)   // route flip only — uploads and residency stay
+            } elif (cfg.shexp_ab) {
+                set_moe_gpu_shexp_route(ai == 1)
             } elif (cfg.heat_ab) {
                 // OFF first so the ON arm's counters/pins warm during its own reps (rep 1 runs
                 // partly cold — the mean understates ON slightly; the delta stays the judge)
@@ -203,7 +208,15 @@ def main() {
                 }
                 tps |> push(double(int64(length(toks)) * ngen) * 1.0e6lf / double(total_us))
             }
-            report(cfg.dnd_ab ? "tg-real{ngen} dnd-{ai == 1 ? "on" : "off"}" : (cfg.heat_ab ? "tg-real{ngen} heat-{ai == 1 ? "on" : "off"}" : "tg-real{ngen}"), tps)
+            var tag = "tg-real{ngen}"
+            if (cfg.dnd_ab) {
+                tag = "tg-real{ngen} dnd-{ai == 1 ? "on" : "off"}"
+            } elif (cfg.heat_ab) {
+                tag = "tg-real{ngen} heat-{ai == 1 ? "on" : "off"}"
+            } elif (cfg.shexp_ab) {
+                tag = "tg-real{ngen} shexp-{ai == 1 ? "on" : "off"}"
+            }
+            report(tag, tps)
             delete tps
         }
         if (cfg.prof) {

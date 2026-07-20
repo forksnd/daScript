@@ -3632,6 +3632,7 @@ def private ffn_cmd_for(s1, s3, s2 : int; nrows, n, nfe : int64) : VkCommandBuff
 // fill metas/acts and fetch the recorded chain — shared by the sync GEMV form and the async
 // begin/join pair. Returns the down stack index alongside the cmd (join reads its y staging).
 def private ffn_gemv_prep(offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) : tuple<cmd : VkCommandBuffer; s2 : int> {
+    ensure_ffn_state()   // fill_ffn_meta below writes its staging: a shexp-only run dispatches FFN first
     let s1 = find_stack(unsafe(offs1[0]), f1)
     let s3 = find_stack(unsafe(offs3[0]), f3)
     let s2 = find_stack(unsafe(offs2[0]), f2)
@@ -4076,7 +4077,7 @@ def private vk_device_name : string {
 def vulkan_moe_gpu_arm : bool {
     let layers = gpu_want_moe_layers()
     if ((layers <= 0l && gpu_want_moe_stream() <= 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd()
-                && gpu_want_heat() <= 0l)
+                && gpu_want_heat() <= 0l && !gpu_want_shexp())
             || !vulkan_backend_available()) {
         return false   // nothing requested (checked first — the device probe is not free)
     }
