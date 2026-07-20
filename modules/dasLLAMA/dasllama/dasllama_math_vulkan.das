@@ -1645,9 +1645,10 @@ let private XQ_BYTES = 1_048_576l          // per-stack activation quants capaci
 let private XS_BYTES = 262_144l            // ... their scales
 let private Y_BYTES = 1_048_576l           // per-stack output capacity
 let private META_BYTES = 4_096l            // params + region table
-let private MAX_STACKS = 224               // descriptor pool capacity (dense attention planes add
-                                           // ~130 small stacks on top of experts+cls; VRAM budget
-                                           // still caps the heavy ones far lower)
+let private MAX_STACKS = 384               // descriptor pool capacity. Dense/shexp/qkv rails add
+                                           // ~250 small stacks on top of experts+cls; starving a
+                                           // LATER walk section here costs far more than the pool
+                                           // (a 224 cap silently cut 6 DN layers = -14% tg)
 let private WG_X = 64u                     // kernel workgroup width (spec-const axis 0 can retune it)
 let private BATCH_XQ_BYTES = 33_554_432l   // device-local gathered-activation scratch (chunk cap)
 let private BATCH_XS_BYTES = 8_388_608l    // ... its scale plane
@@ -1814,6 +1815,14 @@ struct private DnStep {
     dirty : bool
 }
 
+struct private QkvCmd {
+    cmd : VkCommandBuffer   // the warm q/k/v group, recorded once (planes fixed per layer)
+    k_set : VkDescriptorSet // k/v read the Q stack's shared acts image and write its shared y
+    v_set : VkDescriptorSet
+    sq : int
+    ybytes : int64
+}
+
 struct private HeatPool {
     s1 : int = -1                 // pool stacks in the synthetic offset space (-1 = unservable layer)
     s3 : int = -1
@@ -1867,6 +1876,7 @@ struct private GpuState {
     heat_pools : table<int64; HeatPool>   // layer -> slot pool
     ffn_pend_s2 : int = -1        // down stack of the pending async FFN (-1 = none in flight)
     ffn_pend_bytes : int64
+    qkv_cmds : table<int64; QkvCmd>   // q plane offset -> the layer's decode q/k/v group
     dev_mem : table<uint64; uint64>   // device buffer -> its VkDeviceMemory (rollback destroy needs it)
     // FFN mid-chain state (lazy — first FFN dispatch creates it)
     hq_dev : uint64          // device requantized-hidden quants (the down GEMM's activation image)
@@ -3683,6 +3693,83 @@ def vk_moe_ffn_join(var goutp : float?) {
     g_gpu.ffn_pend_s2 = -1
 }
 
+// ===== decode q/k/v group (one submit per attention layer) =====
+// Shared activation image + shared y (per-plane bases via the GEMV meta) ⇒ ONE submit, not three
+// (~74us each would eat the win). Serial-chain work: pays on GPU read speed, nothing hides here.
+
+def private qkv_cmd_make(sq, sk, sv : int; woq, wok, wov : int64; n, dq, dk, dv : int64) {
+    ensure_gemv_scratch(sq)
+    ensure_gemv_scratch(sk)
+    ensure_gemv_scratch(sv)
+    var qreg = fixed_array(woq, 0l, 1l)
+    var kreg = fixed_array(wok, 0l, 1l)
+    var vreg = fixed_array(wov, 0l, 1l)
+    unsafe {   // metas are ours to pin: these stacks serve no other decode GEMV
+        fill_stack_meta_rows(sq, addr(qreg[0]), 1l, n, dq, 1l, 0l)
+        fill_stack_meta_rows(sk, addr(kreg[0]), 1l, n, dk, 1l, 0l, dq)
+        fill_stack_meta_rows(sv, addr(vreg[0]), 1l, n, dv, 1l, 0l, dq + dk)
+    }
+    var qc = QkvCmd(cmd = alloc_cmd(), k_set = alloc_desc_set(), v_set = alloc_desc_set(),
+                    sq = sq, ybytes = (dq + dk + dv) * 4l)
+    assert(qc.ybytes <= Y_BYTES, "dasLLAMA vulkan tier: qkv group exceeds output capacity")
+    var writes : array<WriteDescriptorSet>
+    write_buf_desc(writes, qc.k_set, 0u, g_gpu.stacks[sk].wqbuf, g_gpu.stacks[sk].wqbytes)
+    write_buf_desc(writes, qc.k_set, 1u, g_gpu.stacks[sk].wsbuf, g_gpu.stacks[sk].wsbytes)
+    write_buf_desc(writes, qc.k_set, 2u, g_gpu.stacks[sk].meta.buf, META_BYTES)
+    write_buf_desc(writes, qc.k_set, 3u, g_gpu.stacks[sq].xq.buf, XQ_BYTES)
+    write_buf_desc(writes, qc.k_set, 4u, g_gpu.stacks[sq].xs.buf, XS_BYTES)
+    write_buf_desc(writes, qc.k_set, 5u, g_gpu.stacks[sq].y_dev, Y_BYTES)
+    write_buf_desc(writes, qc.v_set, 0u, g_gpu.stacks[sv].wqbuf, g_gpu.stacks[sv].wqbytes)
+    write_buf_desc(writes, qc.v_set, 1u, g_gpu.stacks[sv].wsbuf, g_gpu.stacks[sv].wsbytes)
+    write_buf_desc(writes, qc.v_set, 2u, g_gpu.stacks[sv].meta.buf, META_BYTES)
+    write_buf_desc(writes, qc.v_set, 3u, g_gpu.stacks[sq].xq.buf, XQ_BYTES)
+    write_buf_desc(writes, qc.v_set, 4u, g_gpu.stacks[sq].xs.buf, XS_BYTES)
+    write_buf_desc(writes, qc.v_set, 5u, g_gpu.stacks[sq].y_dev, Y_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    let raw = qc.cmd
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    let fq = g_gpu.stacks[sq].fmt
+    let fk = g_gpu.stacks[sk].fmt
+    let fv = g_gpu.stacks[sv].fmt
+    bind_gemv_pipe(raw, fq)
+    cmd_bind_dispatch(raw, g_gpu.stacks[sq].raw_set, uint((dq + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+    if (fk != fq) {
+        bind_gemv_pipe(raw, fk)
+    }
+    cmd_bind_dispatch(raw, qc.k_set, uint((dk + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+    if (fv != fk) {
+        bind_gemv_pipe(raw, fv)
+    }
+    cmd_bind_dispatch(raw, qc.v_set, uint((dv + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+    batch_barrier(raw, false)
+    cmd_copy_whole(raw, g_gpu.stacks[sq].y_dev, g_gpu.stacks[sq].y.buf, qc.ybytes)
+    vk_check(vkEndCommandBuffer(raw), null)
+    g_gpu.qkv_cmds |> insert(woq, qc)
+}
+
+//! MoeGpuQkvFn: one attention layer's q/k/v decode projections as ONE submit. The three planes
+//! must share a quant CLASS (one activation image); the caller's gate enforces it.
+def vk_moe_qkv(var yq : float?; var yk : float?; var yv : float?; woq, wok, wov : int64;
+               fq, fk, fv : int; xqp : int8 const?; xsp : float const?; n, dq, dk, dv : int64) {
+    let sq = find_stack(woq, fq)
+    let sk = find_stack(wok, fk)
+    let sv = find_stack(wov, fv)
+    if (!key_exists(g_gpu.qkv_cmds, woq)) {
+        qkv_cmd_make(sq, sk, sv, woq, wok, wov, n, dq, dk, dv)
+    }
+    var qc = g_gpu.qkv_cmds[woq]
+    fill_stack_acts(sq, xqp, xsp, n)
+    submit_wait(qc.cmd)
+    unsafe {
+        let yp = reinterpret<float?>(g_gpu.stacks[sq].y.mapped)
+        memcpy(reinterpret<void?>(yq), reinterpret<void?>(yp), int(dq * 4l))
+        memcpy(reinterpret<void?>(yk), reinterpret<void?>(yp + dq), int(dk * 4l))
+        memcpy(reinterpret<void?>(yv), reinterpret<void?>(yp + dq + dk), int(dv * 4l))
+    }
+}
+
 // ===== heat-pinned expert cache (decode split-FFN) =====
 // Per-layer slot pools live in the SYNTHETIC offset space, so the whole decode FFN GEMV rail
 // (find_stack, metas, FfnCmd) serves hit sets verbatim; uploads DMA-slice the pinned stream mirrors — no CPU gather on the decode path.
@@ -4077,7 +4164,7 @@ def private vk_device_name : string {
 def vulkan_moe_gpu_arm : bool {
     let layers = gpu_want_moe_layers()
     if ((layers <= 0l && gpu_want_moe_stream() <= 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd()
-                && gpu_want_heat() <= 0l && !gpu_want_shexp())
+                && gpu_want_heat() <= 0l && !gpu_want_shexp() && !gpu_want_qkv())
             || !vulkan_backend_available()) {
         return false   // nothing requested (checked first — the device probe is not free)
     }
@@ -4098,5 +4185,6 @@ def dasllama_math_vulkan_register() {
     set_moe_gpu_device_report(@@vk_device_name)
     set_moe_gpu_dn_state_hooks(@@vk_dn_step_flush, @@vk_dn_step_invalidate)
     set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
+    set_moe_gpu_qkv_hook(@@vk_moe_qkv)
     vulkan_moe_gpu_arm()
 }

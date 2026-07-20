@@ -1651,6 +1651,60 @@ def public set_moe_gpu_shexp_route(on : bool) {
     g_moe_gpu_shexp_route = on
 }
 
+// ===== decode q/k/v group (attention layers, one submit) =====
+// Serial-chain work — nothing hides behind it, so it pays only where the GPU reads the planes
+// faster than the CPU. That crossover moves with core count and card, hence the gate.
+
+typedef MoeGpuQkvFn = function<(var yq : float?; var yk : float?; var yv : float?;
+                                woq : int64; wok : int64; wov : int64; fq : int; fk : int; fv : int;
+                                xqp : int8 const?; xsp : float const?;
+                                n : int64; dq : int64; dk : int64; dv : int64) : void>
+
+[unused_argument(yq, yk, yv, woq, wok, wov, fq, fk, fv, xqp, xsp, n, dq, dk, dv)]
+def private moe_gpu_unset_qkv(var yq : float?; var yk : float?; var yv : float?;
+                              woq, wok, wov : int64; fq, fk, fv : int;
+                              xqp : int8 const?; xsp : float const?; n, dq, dk, dv : int64) {
+    panic("dasLLAMA: GPU qkv dispatch hit without an installed GPU tier")
+}
+
+var g_moe_gpu_qkv = @@moe_gpu_unset_qkv
+var g_moe_gpu_qkv_layers : table<int64>
+var g_moe_gpu_qkv_route = true
+
+//! Tier registration of the decode q/k/v group (beside install_moe_gpu_tier).
+def public set_moe_gpu_qkv_hook(f : MoeGpuQkvFn) {
+    g_moe_gpu_qkv = f
+}
+
+//! Loader contract: mark one attention layer's q/k/v triple resident. Reset per load.
+def public set_moe_gpu_qkv_layer(l : int64) {
+    g_moe_gpu_qkv_layers |> insert(l)
+}
+
+def public reset_moe_gpu_qkv_layers {
+    g_moe_gpu_qkv_layers |> clear()
+}
+
+def public moe_gpu_qkv_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_qkv_route && key_exists(g_moe_gpu_qkv_layers, l)
+}
+
+//! Runtime routing gate over the qkv marks (the --qkv-ab in-process lever; uploads stay).
+def public set_moe_gpu_qkv_route(on : bool) {
+    g_moe_gpu_qkv_route = on
+}
+
+//! One attention layer's q/k/v decode projections on the tier — one submit, one shared
+//! activation image (the three planes must share a quant class), results copied back per plane.
+def public matmul_gpu_qkv(var yq : array<float>; var yk : array<float>; var yv : array<float>;
+                          woq, wok, wov : int64; fq, fk, fv : int;
+                          xq : array<int8>; xs : array<float>; n, dq, dk, dv : int64) {
+    unsafe {
+        invoke(g_moe_gpu_qkv, addr(yq[0]), addr(yk[0]), addr(yv[0]), woq, wok, wov, fq, fk, fv,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, dq, dk, dv)
+    }
+}
+
 //! Partition the routed top-k against layer l's slot cache: hit[j] per original position,
 //! compacted synthetic offset triples for the hits (pool coordinates), returns the hit count.
 def public matmul_moe_gpu_heat_query(l : int64; idx : array<int64>; k : int64;
@@ -1706,6 +1760,7 @@ struct GpuTierWant {
     dnd : bool           //!< deltanet DECODE step chain (implies the dn uploads)
     heat : int64         //!< heat-pinned expert cache slots per layer C (0 = off; needs stream mirrors)
     shexp : bool         //!< shared-expert triples resident; decode runs them async behind the routed experts
+    qkv : bool           //!< attention q/k/v triples resident; decode projects them in one submit
 }
 
 var g_gpu_want = GpuTierWant()
@@ -1754,6 +1809,9 @@ def public gpu_want_heat : int64
 
 def public gpu_want_shexp : bool
     => has_env_variable("DASLLAMA_GPU_SHEXP") ? get_env_variable("DASLLAMA_GPU_SHEXP") == "1" : g_gpu_want.shexp
+
+def public gpu_want_qkv : bool
+    => has_env_variable("DASLLAMA_GPU_QKV") ? get_env_variable("DASLLAMA_GPU_QKV") == "1" : g_gpu_want.qkv
 
 //! A GPU backend registers its arm probe here at ``[init]`` so config-driven arming works
 //! after module init (the env path arms at ``[init]`` directly).

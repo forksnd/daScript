@@ -1778,12 +1778,14 @@ def moe_gpu_upload_resident(var t : Model) {
     reset_moe_gpu_dn_layers()
     reset_moe_gpu_attn_layers()
     reset_moe_gpu_shexp_layers()
+    reset_moe_gpu_qkv_layers()
     set_moe_gpu_model_support("")
     let nstream = gpu_want_moe_stream()
     let dn_want = gpu_want_dn() || gpu_want_dnd()   // the decode step rides the same dn uploads
     let at_want = gpu_want_attn()
     if (!moe_gpu_tier_installed()
-            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want && !gpu_want_shexp())) {
+            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want
+                && !gpu_want_shexp() && !gpu_want_qkv())) {
         return   // tier absent or nothing requested
     }
     // capability guard: the tier serves q8-mode MoE models only — record WHY for the status
@@ -2003,6 +2005,46 @@ def moe_gpu_upload_resident(var t : Model) {
         }
         if (at_marked > 0l) {
             to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: attention quads of {at_marked} layers resident\n")
+        }
+    }
+    // attention q/k/v triples — DASLLAMA_GPU_QKV=1 opt-in. LAST of the dense rails ON PURPOSE: it
+    // is the lowest-value one and an earlier section exhausting stacks/VRAM starves those behind it
+    // (a 224-stack cap once cut 6 DN layers = -14% tg). Pays only where GPU reads beat CPU reads.
+    if (gpu_want_qkv()) {
+        var qkv_marked = 0l
+        for (l in range64(layers)) {
+            continue if (layer_is_recurrent(t.config, l) || t.kv_src[l] != l || moe_gpu_attn_on_gpu(l))
+            let qd = layer_qd(t.config, l)
+            let kv = layer_kv_dim(t.config, l)
+            let fq = fmt_at(t.wq_fmt, l)
+            let fk = fmt_at(t.wk_fmt, l)
+            let fv = fmt_at(t.wv_fmt, l)
+            // one shared activation image ⇒ the three planes must agree on quant CLASS
+            let cls_ok = (fq == KqFmt.q8) == (fk == KqFmt.q8) && (fq == KqFmt.q8) == (fv == KqFmt.q8)
+            continue if (t.wq_offs[l] < 0l || t.wk_offs[l] < 0l || t.wv_offs[l] < 0l || !cls_ok
+                || !kq_servable(t, fq) || !kq_servable(t, fk) || !kq_servable(t, fv))
+            var uploads <- [(f = fq, woff = t.wq_offs[l], n = dim, rows = t.config.q_gated ? 2l * qd : qd),
+                            (f = fk, woff = t.wk_offs[l], n = dim, rows = kv),
+                            (f = fv, woff = t.wv_offs[l], n = dim, rows = kv)]
+            var done = 0
+            var ok = true
+            for (u in uploads) {
+                if (!moe_gpu_gather_upload(t, u.f, u.woff, u.n, u.rows, u.rows, mr, kgroup, wbias, wq, ws)) {
+                    ok = false
+                    break
+                }
+                done++
+            }
+            delete uploads
+            if (!ok) {
+                moe_gpu_drop_stacks(done, false)   // partial triple rolls back
+                break
+            }
+            set_moe_gpu_qkv_layer(l)
+            qkv_marked++
+        }
+        if (qkv_marked > 0l) {
+            to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: q/k/v of {qkv_marked} attention layers resident\n")
         }
     }
     for (i in range64(want)) {
@@ -5066,6 +5108,19 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
     let fq = fmt_at(t.wq_fmt, l)
     let fk = fmt_at(t.wk_fmt, l)
     let fv = fmt_at(t.wv_fmt, l)
+    if (moe_gpu_qkv_on_gpu(l)) {   // resident triple: all three projections in one device submit
+        let qrows = c.q_gated ? 2l * qd : qd
+        if (fq == KqFmt.q8) {
+            quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+            matmul_gpu_qkv(s.q, s.k, s.v, qoff, koff, voff, int(fq), int(fk), int(fv),
+                s.xq, s.xs, dim, qrows, kv, kv)
+        } else {
+            quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
+            matmul_gpu_qkv(s.q, s.k, s.v, qoff, koff, voff, int(fq), int(fk), int(fv),
+                s.kxq, s.kxs, dim, qrows, kv, kv)
+        }
+        return
+    }
     if (voff < 0l) {
         // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection, fused into the weightless V-norm
         mm_f(s.q, t, fq, qoff, s.xb, s.xq, s.xs, s.xbs, dim, qd)
