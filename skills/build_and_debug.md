@@ -50,6 +50,22 @@ The default (no env, no flag) stays per-build-dir, so **CI is unchanged** — it
 - **Don't truncate output** with `head`/`tail` — daslang stack traces and `DAS_GC_BREAK_ON_ID` traces are easily clipped. Capture full output, then `grep` if needed
 - **`options log_infer_passes`** — append at the end of a failing `.das` file to dump per-pass infer activity (which generics got reified, when finalize ran, where lookups missed). Smaller and more targeted than `options log` for template/generic reification bugs. `options log` stays the right tool when you need the final program text
 
+### JIT crash symbols and daslang stacks
+
+Use both debug rails for a long-running JIT repro:
+
+```text
+bin/Release/daslang.exe -jit -jit-stack path/to/main.das -- --jit-debug
+```
+
+- `-jit-stack` is a host flag placed before the script. It retains a logical daslang frame for every generated function and block so `Context::getStackWalk()` has useful JIT state.
+- `--jit-debug` is an LLVM JIT option passed after the script separator. It emits CodeView/PDB debug information, generated function names, and `.das` file/line locations. On Windows the PDB lands beside the content-addressed DLL under `.jitted_scripts/`.
+- `--jit-opt-level=0` disables the LLVM IR pass pipeline and is useful when inspecting generated code, but codegen-side target optimization is still pinned at level 3; it is not yet a true end-to-end O0 build.
+- JIT crash bundles should preserve the matching `.dll`, `.pdb`, `.map`, and retained `.o` together. The content hash changes when debug info is toggled, so artifacts from a non-debug cache entry do not decode a debug run.
+- Windows Release C/C++ builds use `/Z7` plus linker `/DEBUG /OPT:REF /OPT:ICF`, producing side PDBs without changing optimized code. Keep the PDB that matches every shipped exe/DLL when diagnosing native runtime frames.
+
+The implementation and remaining debugger roadmap are in `modules/dasLLVM/DEBUGGING.md`.
+
 ## Build configurations (module flags)
 
 Optional modules are controlled by CMake flags (`DAS_*_DISABLED`). The active configuration lives in `.vscode/settings.json` under `cmake.configureSettings` (the "WIP" block is the active one; others are commented-out presets).

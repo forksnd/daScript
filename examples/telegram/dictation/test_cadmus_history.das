@@ -275,11 +275,34 @@ def test_history_migrations_linq_and_fts(t : T?) {
         if (length(pending) == 1) {
             t |> equal(pending[0].TelegramMessageId, 711l)
         }
-        requeue_failed_cadmus_import_media(path)
+        requeue_failed_cadmus_import_media(path, IMPORT_MAX_ATTEMPTS)
         let retried <- load_next_cadmus_import_media(path)
         t |> equal(length(retried), 1)
         if (length(retried) == 1) {
             t |> equal(retried[0].TelegramMessageId, 710l)
+        }
+    }
+
+    t |> run("import rows that exhausted their attempts are never requeued again") @(t : T?) {
+        with_cadmus_database(path) $(db) {
+            upsert_cadmus_import_media_db(db, CadmusImportMedia(
+                Id = 0, ChatId = 30l, TelegramMessageId = 720l,
+                RelativePath = "voice_messages/too_long.ogg", FileSize = 50l,
+                ModifiedAt = 200l, Status = "failed", Attempts = IMPORT_MAX_ATTEMPTS,
+                LastError = "clip audio to under ~10.9 minutes", PipelineVersion = 1))
+        }
+        t |> equal(count_exhausted_cadmus_import_media(path, IMPORT_MAX_ATTEMPTS), 1)
+        requeue_failed_cadmus_import_media(path, IMPORT_MAX_ATTEMPTS)
+        with_cadmus_database(path) $(db) {
+            let rows <- %linq! from media : CadmusImportMedia in db
+                               where media.ChatId == 30l && media.TelegramMessageId == 720l
+                               select media %%
+            t |> equal(length(rows), 1)
+            if (length(rows) == 1) {
+                // Still failed: a requeue must not resurrect a row that spent its budget.
+                t |> equal(rows[0].Status, "failed")
+                t |> equal(rows[0].Attempts, IMPORT_MAX_ATTEMPTS)
+            }
         }
     }
 

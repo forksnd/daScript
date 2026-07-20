@@ -103,4 +103,18 @@ def test_cadmus_routing_and_dates(t : T?) {
         t |> equal(parse_cadmus_local_date("2026-02-30", from_time, until_time), false)
         t |> equal(parse_cadmus_local_date("not-a-date", from_time, until_time), false)
     }
+
+    t |> run("ASR refusals about the audio itself are permanent, server trouble is not") @(t : T?) {
+        // Verbatim dasLLAMA parakeet refusal for audio past its 8192-frame local-attention switch.
+        t |> equal(is_permanent_asr_failure(
+            "transcription HTTP 500: dasLLAMA parakeet: 13513 encoder frames crosses the " +
+            "local-attention switch — clip audio to under ~10.9 minutes"), true)
+        t |> equal(is_permanent_asr_failure("unsupported audio format"), true)
+        // Transient conditions must stay retryable.
+        t |> equal(is_permanent_asr_failure(
+            "no ASR response within 900s (request timed out or server unavailable)"), false)
+        t |> equal(is_permanent_asr_failure("no response from http://127.0.0.1:8080 (server down?)"), false)
+        t |> equal(is_permanent_asr_failure("transcription HTTP 503: model loading"), false)
+        t |> equal(is_permanent_asr_failure(""), false)
+    }
 }

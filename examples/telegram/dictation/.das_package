@@ -18,4 +18,6 @@ def release() {
     release_main("main.das")
     release_name("dictation-bot")
     release_include_if_missing("dictation.toml") // initialize once; preserve deployed edits on upgrades
+    release_include("watchdog.py")
+    release_include("control.html")
 }
