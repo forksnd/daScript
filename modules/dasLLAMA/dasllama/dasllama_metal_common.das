@@ -931,6 +931,13 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
 }
 
 
+// Wave D serve gate for the deltanet kernel set: fixed d_state 128 (the scan/l2/gate lane math
+// bakes 32 lanes x 4), conv taps <= 8 (hist registers), q8 β/α planes (f32-on-disk = stage 3).
+def dn_metal_ok(t : Model) : bool {
+    let c = t.config
+    return c.ssm_d_state == 128l && c.ssm_d_conv >= 2l && c.ssm_d_conv <= 8l && !t.dn_ba_f32
+}
+
 // ===== deltanet recurrent-state mirrors (Wave D) — per-session GPU S + conv state =====
 // Forward-only, NOT re-derivable: pos 0 zeroes, s.dn_pos == pos syncs from CPU, else decline;
 // own buffers (KV-arena rebuild re-uploads from CPU — impossible for state); layout == Session's.
