@@ -19,6 +19,7 @@ var private g_log_file : FILE const? = null
 var private g_log_path : string
 var private g_command_name : string
 var private g_command_line : string
+var private g_visual_header : string
 var private g_zoom_percent = 150
 var private g_started = 0l
 var private g_launch_us = -1l
@@ -53,6 +54,7 @@ def private select_command(repository : string) {
     }
     g_command_name = commands[index].name
     g_command_line = commands[index].command_line
+    g_visual_header = "$ {g_command_line}"
 }
 
 def private zoom_by(delta : int) {
@@ -138,7 +140,6 @@ def update() {
             closable = false,
             flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove)) {
         text("Git through ConPTY + terminal emulator + raw log")
-        text_disabled("{g_command_line}")
         separator()
         let io & = unsafe(GetIO())
         if (IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows) && io.KeyCtrl) {
@@ -149,6 +150,7 @@ def update() {
             }
         }
         let terminal_style = ImGuiTerminalStyle(
+            visual_header = g_visual_header,
             view_height = max(GetTextLineHeight(),
                 GetContentRegionAvail().y - GetFrameHeightWithSpacing() * 2.0f
                     - GetStyle().ItemSpacing.y * 2.0f))
