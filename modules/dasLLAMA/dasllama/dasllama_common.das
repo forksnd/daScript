@@ -1779,7 +1779,7 @@ def moe_gpu_upload_resident(var t : Model) {
     reset_moe_gpu_attn_layers()
     set_moe_gpu_model_support("")
     let nstream = gpu_want_moe_stream()
-    let dn_want = gpu_want_dn()
+    let dn_want = gpu_want_dn() || gpu_want_dnd()   // the decode step rides the same dn uploads
     let at_want = gpu_want_attn()
     if (!moe_gpu_tier_installed()
             || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want)) {
@@ -6483,8 +6483,59 @@ def private dn_token_core(t : Model; var s : Session; l : int64; qkv : float con
     }
 }
 
+// The deltanet decode step as ONE device chain (npos=1 through MoeGpuDnFn): CPU keeps norm +
+// raw β/α + the q8 image. State/conv history live DEVICE-SIDE across steps — dn_flush_layer /
+// moe_gpu_dn_invalidate are the sync seams for every CPU consumer.
+def private deltanet_decode_gpu(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    let dim = c.dim
+    let cd = dn_conv_dim(c)
+    let kd = dn_key_dim(c)
+    let di = c.ssm_d_inner
+    let nvh = c.ssm_dt_rank
+    let nkh = c.ssm_n_group
+    let ds = c.ssm_d_state
+    let dconv = c.ssm_d_conv
+    let taps = dconv - 1l
+    let ts_norm0 = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
+    prof_add("norm", ts_norm0)
+    let ts_qkv = ref_time_ticks()
+    if (t.dn_ba_f32) {   // F32-on-disk beta/alpha matmul fp32, like llama.cpp
+        mm_fblob(s.dn_beta, t, t.dn_betaf_off + l * dim * nvh, s.xb, dim, nvh)
+        mm_fblob(s.dn_g, t, t.dn_alphaf_off + l * dim * nvh, s.xb, dim, nvh)
+    } else {
+        mm_f(s.dn_beta, t, KqFmt.q8, t.dnbeta_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
+        mm_f(s.dn_g, t, KqFmt.q8, t.dnalpha_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
+    }
+    quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)   // one Q8_0 image serves the qkv AND z GEMVs
+    prof_add("mm_qkv", ts_qkv)
+    let ts_gpu = ref_time_ticks()
+    s.dn_tail |> resize(int(taps * cd))   // contract slot only — the step arm never writes it
+    unsafe {
+        matmul_moe_gpu_dn(s.xb2, t.dnqkv_offs[l], t.dngate_offs[l], t.dnout_offs[l],
+            s.xq, s.xs, s.dn_beta, s.dn_g,
+            addr < float const? >(t.fblob[t.dn_conv_off + l * dconv * cd]),
+            addr < float const? >(t.fblob[t.dn_norm_off + l * ds]),
+            addr < float const? >(t.fblob[t.dn_a_off + l * nvh]),
+            addr < float const? >(t.fblob[t.dn_dt_off + l * nvh]),
+            addr(s.dn_state[s.dn_state_prefix[l]]), s.dn_tail,
+            addr < float const? >(s.dn_conv_state[s.dn_conv_prefix[l]]),
+            1l, dim, cd, kd, di, nvh, nkh, ds, dconv, c.norm_eps)
+    }
+    prof_add("dn_gpu", ts_gpu)
+    let ts_resid = ref_time_ticks()
+    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb2[0])), dim)
+    prof_add("act_resid", ts_resid)
+}
+
 // attn-norm → fused qkv/z/β/α projections → per-token deltanet core → ssm_out projection → residual.
 def private deltanet_decode(t : Model; var s : Session; l : int64) {
+    if (moe_gpu_dnd_on_gpu(l)) {
+        deltanet_decode_gpu(t, s, l)
+        return
+    }
+    dn_flush_layer(s, l)   // device state may be dirty from earlier GPU steps (route flip)
     let c = t.config
     let dim = c.dim
     let cd = dn_conv_dim(c)
@@ -6676,6 +6727,23 @@ def private dn_reset(var s : Session) {
     }
     for (i in range64(int64(length(s.dn_state)))) {
         s.dn_state[i] = 0.0
+    }
+    moe_gpu_dn_invalidate()   // CPU zeros are now authoritative — drop any device-resident copies
+}
+
+// Sync one layer's device-resident deltanet state down before a CPU read (no-op when clean).
+def private dn_flush_layer(var s : Session; l : int64) {
+    if (l < int64(length(s.dn_state_prefix)) && s.dn_state_prefix[l] >= 0l) {
+        unsafe {
+            moe_gpu_dn_flush(l, addr(s.dn_state[s.dn_state_prefix[l]]),
+                addr(s.dn_conv_state[s.dn_conv_prefix[l]]))
+        }
+    }
+}
+
+def private dn_flush_all(var s : Session) {
+    for (l in range64(int64(length(s.dn_state_prefix)))) {
+        dn_flush_layer(s, l)
     }
 }
 
@@ -7899,6 +7967,7 @@ def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bo
 //! verify batch: a rejected draft has already advanced the state past itself. KV rows stay correct;
 //! only the recurrent state rolls back, then one plain forward re-advances it.
 def mtp_state_snapshot(var s : Session) {
+    dn_flush_all(s)   // the snapshot must capture device-resident decode-step state
     let nc = int64(length(s.dn_conv_state))
     let ns = int64(length(s.dn_state))
     s.mtp_snap_conv |> resize(nc)   // no-op after the first call
@@ -7912,6 +7981,7 @@ def mtp_state_restore(var s : Session) {
     copy_floats(s.mtp_snap_conv, 0l, s.dn_conv_state, 0l, int64(length(s.mtp_snap_conv)))
     copy_floats(s.mtp_snap_state, 0l, s.dn_state, 0l, int64(length(s.mtp_snap_state)))
     s.dn_pos = s.mtp_snap_pos
+    moe_gpu_dn_invalidate()   // restored CPU state is authoritative — device copies are stale
 }
 
 // After a 2-row verify forward_prefill([tok, draft], 2, pos): row 0's post-norm hidden and
@@ -9434,6 +9504,7 @@ def private deltanet_prefill_gpu(t : Model; var s : Session; l : int64; npos : i
 // (state carried across positions), then one batched ssm_out projection + residual.
 def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64) {
     trace_tag(TRACE_TAG_DN)   // override the loop's attn_std stamp: dn layers color separately
+    dn_flush_layer(s, l)   // every prefill branch reads/round-trips CPU state buffers
     if (g_dn_prefill_mode == DnPrefillMode.chunked && npos >= 32l && moe_gpu_dn_on_gpu(l)) {
         deltanet_prefill_gpu(t, s, l, npos)   // buckets dn_norm / dn_mm_in / dn_gpu / dn_resid
         return

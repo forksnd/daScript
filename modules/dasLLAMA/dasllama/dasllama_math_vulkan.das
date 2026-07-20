@@ -3425,7 +3425,7 @@ def private vk_device_name : string {
 //! Idempotent — re-arming after ``set_gpu_tier_want`` just refreshes the layer count.
 def vulkan_moe_gpu_arm : bool {
     let layers = gpu_want_moe_layers()
-    if ((layers <= 0l && gpu_want_moe_stream() <= 0l && !gpu_want_dn() && !gpu_want_attn())
+    if ((layers <= 0l && gpu_want_moe_stream() <= 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd())
             || !vulkan_backend_available()) {
         return false   // nothing requested (checked first — the device probe is not free)
     }

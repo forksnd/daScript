@@ -1502,6 +1502,47 @@ def public set_moe_gpu_dn_route(on : bool) {
     g_moe_gpu_dn_route = on
 }
 
+// ===== deltanet DECODE step =====
+// Same MoeGpuDnFn hook at npos == 1, same dn marks/uploads; separate routing gate (--dnd-ab).
+// State lives device-side across steps — flush/invalidate seams guard every CPU state consumer.
+
+typedef MoeGpuDnFlushFn = function<(l : int64; var stp : float?; var histp : float?) : void>
+typedef MoeGpuDnInvalidateFn = function<() : void>
+
+[unused_argument(l, stp, histp)]
+def private moe_gpu_noop_dn_flush(l : int64; var stp : float?; var histp : float?) {}
+def private moe_gpu_noop_dn_invalidate() {}
+
+var g_moe_gpu_dnd_route = true
+var g_moe_gpu_dn_flush = @@moe_gpu_noop_dn_flush
+var g_moe_gpu_dn_invalidate = @@moe_gpu_noop_dn_invalidate
+
+def public moe_gpu_dnd_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_dnd_route && key_exists(g_moe_gpu_dn_layers, l)
+}
+
+//! Runtime routing gate over the deltanet DECODE step (the --dnd-ab in-process lever).
+def public set_moe_gpu_dnd_route(on : bool) {
+    g_moe_gpu_dnd_route = on
+}
+
+//! Tier registration of the state-residency seams (beside install_moe_gpu_tier).
+def public set_moe_gpu_dn_state_hooks(flush : MoeGpuDnFlushFn; inval : MoeGpuDnInvalidateFn) {
+    g_moe_gpu_dn_flush = flush
+    g_moe_gpu_dn_invalidate = inval
+}
+
+//! Sync one layer's device-resident deltanet state back into the engine's buffers (no-op when
+//! the device copy is clean or absent). Call before ANY CPU read of dn_state/conv history.
+def public moe_gpu_dn_flush(l : int64; var stp : float?; var histp : float?) {
+    invoke(g_moe_gpu_dn_flush, l, stp, histp)
+}
+
+//! Drop all device-resident deltanet state (the engine rebuilt/zeroed its CPU copies).
+def public moe_gpu_dn_invalidate() {
+    invoke(g_moe_gpu_dn_invalidate)
+}
+
 //! Loader contract: mark one full-attention layer's q/k/v/o plane quad resident on the tier —
 //! the prefill attention block then runs as one device chain. Reset per load.
 def public set_moe_gpu_attn_layer(l : int64) {
@@ -1535,6 +1576,7 @@ struct GpuTierWant {
     dn : bool            //!< recurrent (deltanet) layers through the device chain
     attn : bool          //!< full-attention layers through the device chain
     dense : bool         //!< dense attention-side planes resident
+    dnd : bool           //!< deltanet DECODE step chain (implies the dn uploads)
 }
 
 var g_gpu_want = GpuTierWant()
@@ -1574,6 +1616,9 @@ def public gpu_want_attn : bool
 
 def public gpu_want_dense : bool
     => has_env_variable("DASLLAMA_GPU_DENSE") ? get_env_variable("DASLLAMA_GPU_DENSE") == "1" : g_gpu_want.dense
+
+def public gpu_want_dnd : bool
+    => has_env_variable("DASLLAMA_GPU_DND") ? get_env_variable("DASLLAMA_GPU_DND") == "1" : g_gpu_want.dnd
 
 //! A GPU backend registers its arm probe here at ``[init]`` so config-driven arming works
 //! after module init (the env path arms at ``[init]`` directly).
