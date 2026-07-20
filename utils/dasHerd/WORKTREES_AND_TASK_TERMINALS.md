@@ -116,6 +116,28 @@ same probe is rerun through detach/IPC after the minimal host exists.
 No capture-mode or short-command optimization is selected until these numbers
 exist.
 
+The first measurement found raw logging indistinguishable from noise and
+in-process terminal overhead of roughly 5-16 ms at process exit. dasHerd keeps
+one terminal execution path; it does not add a direct-capture fast path. The
+conservative post-exit drain must not block result delivery or scheduling.
+
+### Chunk 1: measure an isolated session process
+
+Discussion status: agreed; first measurement complete
+
+The first process-isolation probe launches a fresh interpreted daScript worker
+for every session. The worker owns ConPTY, terminal emulation, and logging and
+acknowledges readiness over a pipe. This deliberately simple prototype measures
+the complete extra process and runtime boundary before it becomes architecture.
+
+The fresh worker added roughly 334-345 ms at median and peaked near 71 MiB
+working set in one status sample. Almost all latency occurred before the worker
+ready acknowledgement; terminal execution inside the worker continued to match
+the in-process lane. Therefore an interpreted worker compiled afresh per Git
+query is rejected. Per-session isolation itself remains open pending the same
+probe with a small AOT/native host; a persistent per-worktree host is the next
+fallback, not an unmeasured optimization.
+
 ## Section 1: repository, base, and worktree identity
 
 Discussion status: open
