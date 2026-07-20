@@ -1780,7 +1780,11 @@ def moe_gpu_upload_resident(var t : Model) {
     reset_moe_gpu_shexp_layers()
     reset_moe_gpu_qkv_layers()
     set_moe_gpu_model_support("")
-    let nstream = gpu_want_moe_stream()
+    // -1 = auto: ask for every layer and let the walk's own budget stops place the split (the
+    // resident loop drops a partial triple and breaks, the streamed loop does the same on the
+    // pinned-mirror budget) — that is what makes auto degrade on a smaller card instead of failing
+    let nstream_want = gpu_want_moe_stream()
+    let nstream = nstream_want < 0l ? t.config.n_layers : nstream_want
     let dn_want = gpu_want_dn() || gpu_want_dnd()   // the decode step rides the same dn uploads
     let at_want = gpu_want_attn()
     if (!moe_gpu_tier_installed()
@@ -1810,7 +1814,9 @@ def moe_gpu_upload_resident(var t : Model) {
     let dim = t.config.dim
     let ne = t.config.n_expert
     let nfe = t.config.n_ff_exp
-    let want = min(moe_gpu_layer_count(), layers)
+    let want_raw = moe_gpu_layer_count()
+    let want = want_raw < 0l ? layers : min(want_raw, layers)   // -1 = auto: fill the budget
+    set_moe_gpu_layer_count(want)   // publish the resolved count — downstream status reads it
     let repacked = kernel_backend_needs_repack(active_kernel_backend())
     let mr = repacked ? active_q8_layout_mr() : 1l
     let kgroup = repacked ? active_q8_kgroup() : 4l

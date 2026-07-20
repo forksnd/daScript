@@ -1439,7 +1439,11 @@ def public set_moe_gpu_from_layer(from_layer : int64) {
 }
 
 def public moe_gpu_layer_on_gpu(l : int64) : bool {
-    return g_moe_gpu_installed && l >= g_moe_gpu_from_layer
+    // upper bound is load-bearing: the MTP draft block sits at index n_layers, above every uploaded
+    // range, so an unbounded `l >= from_layer` dispatches against a region never uploaded.
+    // total 0 = loader never reported it; keep the old unbounded answer
+    return (g_moe_gpu_installed && l >= g_moe_gpu_from_layer
+        && (g_moe_gpu_total_layers <= 0l || l < g_moe_gpu_total_layers))
 }
 
 //! Loader contract: first streamed layer (streamed range = [from, the resident set); reset per
@@ -1758,8 +1762,9 @@ def public matmul_moe_gpu_ffn_join(var gout : array<float>) {
 //! (an env var present in the environment overrides its field). Set BEFORE ``load_model``,
 //! then call ``moe_gpu_tier_arm`` so a backend can install its hooks.
 struct GpuTierWant {
-    moe_layers : int64   //!< resident expert-stack layers K, offloaded from the end
-    moe_stream : int64   //!< streamed prefill layers S below the resident set
+    auto_tier : bool     //!< request the measured-best rail set; individual knobs below still override
+    moe_layers : int64   //!< resident expert-stack layers K, offloaded from the end (auto: -1 = fill the budget)
+    moe_stream : int64   //!< streamed prefill layers S below the resident set (auto: -1 = all of them)
     vram_mb : int64      //!< resident-weight VRAM cap override in MB (0 = query the device)
     dn : bool            //!< recurrent (deltanet) layers through the device chain
     attn : bool          //!< full-attention layers through the device chain
@@ -1788,34 +1793,44 @@ def public set_gpu_tier_want(want : GpuTierWant) {
 
 def private env_int64(name : string) : int64 => int64(to_int(get_env_variable(name)))
 
+//! One switch for the measured-best rail set: expert stacks sized to the VRAM budget, plus the
+//! deltanet/attention/dense/shared-expert/classifier rails. qkv and heat stay off (measured
+//! negative and a wash). Any DASLLAMA_GPU_* knob still overrides individually.
+def public gpu_want_auto : bool
+    => has_env_variable("DASLLAMA_GPU") ? get_env_variable("DASLLAMA_GPU") == "1" : g_gpu_want.auto_tier
+
 //! Effective tier request, env-else-programmatic — the load walk and the GPU backends read
 //! these instead of the raw env vars.
+
+// -1 = auto: the upload walk resolves it against n_layers and lets its budget stops place the split
 def public gpu_want_moe_layers : int64
-    => has_env_variable("DASLLAMA_GPU_MOE_LAYERS") ? env_int64("DASLLAMA_GPU_MOE_LAYERS") : g_gpu_want.moe_layers
+    => (has_env_variable("DASLLAMA_GPU_MOE_LAYERS") ? env_int64("DASLLAMA_GPU_MOE_LAYERS")
+        : (g_gpu_want.moe_layers != 0l ? g_gpu_want.moe_layers : (gpu_want_auto() ? -1l : 0l)))
 
 def public gpu_want_moe_stream : int64
-    => has_env_variable("DASLLAMA_GPU_MOE_STREAM") ? env_int64("DASLLAMA_GPU_MOE_STREAM") : g_gpu_want.moe_stream
+    => (has_env_variable("DASLLAMA_GPU_MOE_STREAM") ? env_int64("DASLLAMA_GPU_MOE_STREAM")
+        : (g_gpu_want.moe_stream != 0l ? g_gpu_want.moe_stream : (gpu_want_auto() ? -1l : 0l)))
 
 def public gpu_want_vram_mb : int64
     => has_env_variable("DASLLAMA_GPU_VRAM_MB") ? env_int64("DASLLAMA_GPU_VRAM_MB") : g_gpu_want.vram_mb
 
 def public gpu_want_dn : bool
-    => has_env_variable("DASLLAMA_GPU_DN") ? get_env_variable("DASLLAMA_GPU_DN") == "1" : g_gpu_want.dn
+    => has_env_variable("DASLLAMA_GPU_DN") ? get_env_variable("DASLLAMA_GPU_DN") == "1" : (g_gpu_want.dn || gpu_want_auto())
 
 def public gpu_want_attn : bool
-    => has_env_variable("DASLLAMA_GPU_ATTN") ? get_env_variable("DASLLAMA_GPU_ATTN") == "1" : g_gpu_want.attn
+    => has_env_variable("DASLLAMA_GPU_ATTN") ? get_env_variable("DASLLAMA_GPU_ATTN") == "1" : (g_gpu_want.attn || gpu_want_auto())
 
 def public gpu_want_dense : bool
-    => has_env_variable("DASLLAMA_GPU_DENSE") ? get_env_variable("DASLLAMA_GPU_DENSE") == "1" : g_gpu_want.dense
+    => has_env_variable("DASLLAMA_GPU_DENSE") ? get_env_variable("DASLLAMA_GPU_DENSE") == "1" : (g_gpu_want.dense || gpu_want_auto())
 
 def public gpu_want_dnd : bool
-    => has_env_variable("DASLLAMA_GPU_DND") ? get_env_variable("DASLLAMA_GPU_DND") == "1" : g_gpu_want.dnd
+    => has_env_variable("DASLLAMA_GPU_DND") ? get_env_variable("DASLLAMA_GPU_DND") == "1" : (g_gpu_want.dnd || gpu_want_auto())
 
 def public gpu_want_heat : int64
     => has_env_variable("DASLLAMA_GPU_HEAT") ? env_int64("DASLLAMA_GPU_HEAT") : g_gpu_want.heat
 
 def public gpu_want_shexp : bool
-    => has_env_variable("DASLLAMA_GPU_SHEXP") ? get_env_variable("DASLLAMA_GPU_SHEXP") == "1" : g_gpu_want.shexp
+    => has_env_variable("DASLLAMA_GPU_SHEXP") ? get_env_variable("DASLLAMA_GPU_SHEXP") == "1" : (g_gpu_want.shexp || gpu_want_auto())
 
 def public gpu_want_qkv : bool
     => has_env_variable("DASLLAMA_GPU_QKV") ? get_env_variable("DASLLAMA_GPU_QKV") == "1" : g_gpu_want.qkv
