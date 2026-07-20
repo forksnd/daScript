@@ -336,7 +336,7 @@ def make_progress_path(dir : string) : string {
     mkdir_rec(dir)
     progress_seq++
     let ticks = ref_time_ticks()
-    return "{dir}/mcp_progress_{ticks}_{progress_seq}.txt"
+    return path_join(dir, "mcp_progress_{ticks}_{progress_seq}.txt")
 }
 
 // Fold a progress line into a safe JSON string body: escape the backslash and
