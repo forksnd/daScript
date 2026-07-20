@@ -525,6 +525,7 @@ class MathCalls {
         c[i] = (((exp(min(x, 4.0)) + sqrt(abs(x))) + (rsqrt(abs(y) + 1.0) + tanh(x))) +
             ((sin(x) + cos(y)) + (saturate(x) + max(x, y))))
         c[i] += float(qa[i])
+        c[i] += log(abs(x) + 1.0)
         let u = va[i]
         let v = vb[i]
         vc[i] = (((exp(min(u, float4(4.0))) + sqrt(abs(u))) + (rsqrt(abs(v) + float4(1.0)) + tanh(u))) +
@@ -748,6 +749,7 @@ def public declared_msl_census : table<string> {
         // math builtins (Phase 6): 1:1 MSL spellings — float scalar + vector classes
         // (abs also signed int; min/max any numeric class)
         "call.math.exp.f32",
+        "call.math.log.f32",
         "call.math.sqrt.f32",
         "call.math.rsqrt.f32",
         "call.math.sin.f32",

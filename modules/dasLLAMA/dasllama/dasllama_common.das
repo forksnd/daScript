@@ -2157,11 +2157,20 @@ def private metal_blob_layout_ok(t : Model) : bool {
     let has_ffn = int64(length(t.w1_offs)) >= c.n_layers
     let has_exps = (c.moe && int64(length(t.we1_offs)) >= c.n_layers &&
         int64(length(t.we2_offs)) >= c.n_layers && int64(length(t.we3_offs)) >= c.n_layers)
+    let has_dn = c.recr_mask != 0ul && int64(length(t.dnqkv_offs)) >= c.n_layers
     if (!has_ffn && !has_exps) {
         return false
     }
     for (l in range64(c.n_layers)) {
-        if (!metal_blob_off_ok(t.wq_offs[l], metal_blob_fmt_at(t.wq_fmt, l)) ||
+        // recurrent layers (Wave D): no attention tensors (offs -1, off_ok true), q8 dn planes instead
+        let dn_bad = (has_dn && layer_is_recurrent(c, l) &&
+            (!metal_blob_off_ok(t.dnqkv_offs[l], KqFmt.q8) ||
+             !metal_blob_off_ok(t.dngate_offs[l], KqFmt.q8) ||
+             !metal_blob_off_ok(t.dnbeta_offs[l], KqFmt.q8) ||
+             !metal_blob_off_ok(t.dnalpha_offs[l], KqFmt.q8) ||
+             !metal_blob_off_ok(t.dnout_offs[l], KqFmt.q8)))
+        if (dn_bad ||
+                !metal_blob_off_ok(t.wq_offs[l], metal_blob_fmt_at(t.wq_fmt, l)) ||
                 !metal_blob_off_ok(t.wk_offs[l], metal_blob_fmt_at(t.wk_fmt, l)) ||
                 !metal_blob_off_ok(t.wv_offs[l], metal_blob_fmt_at(t.wv_fmt, l)) ||
                 !metal_blob_off_ok(t.wo_offs[l], metal_blob_fmt_at(t.wo_fmt, l)) ||
@@ -2171,6 +2180,16 @@ def private metal_blob_layout_ok(t : Model) : bool {
                 (has_exps && (!metal_blob_off_ok(t.we1_offs[l], metal_blob_fmt_at(t.we1_fmt, l)) ||
                     !metal_blob_off_ok(t.we2_offs[l], metal_blob_fmt_at(t.we2_fmt, l)) ||
                     !metal_blob_off_ok(t.we3_offs[l], metal_blob_fmt_at(t.we3_fmt, l))))) {
+            return false
+        }
+    }
+    // shexp planes: always q8, contiguous at base + l*she — base + stride covers every layer
+    if (c.n_ff_shexp > 0l) {
+        let she = c.dim * c.n_ff_shexp
+        if ((she % 256l) != 0l ||
+                !metal_blob_off_ok(t.wsh1_off, KqFmt.q8) ||
+                !metal_blob_off_ok(t.wsh2_off, KqFmt.q8) ||
+                !metal_blob_off_ok(t.wsh3_off, KqFmt.q8)) {
             return false
         }
     }

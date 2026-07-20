@@ -282,7 +282,7 @@ def test_metal_prefill_kernels(t : T?) {
                 var brhs = buf_u32(dev, uint(HEAD_SIZE))
                 var brnp = buf_u32(dev, uint(NPOS * QD / 2))
                 var brnx = buf_u32(dev, 0u)
-                var ropebufs <- [brv, brc, brs, brn, brhs, brnp, brnx]
+                var ropebufs <- [brv, brc, brs, brn, brhs, brnp, brnx, brhs]   // trailing brhs = rot (full rope)
                 let roperan = run_compute_1d(queue, pso_rope, ropebufs, uint(NPOS * QD / 2), 64u, err)
                 t |> success(roperan, "rope dispatch: {err}")
                 t |> equal(buf_mismatch_approx(brv, rvwant), 0)
@@ -306,7 +306,7 @@ def test_metal_prefill_kernels(t : T?) {
                 }
                 var brv2 = buf_upload(dev, rv)
                 var brnx1 = buf_u32(dev, 1u)
-                var ropebufs2 <- [brv2, brc, brs, brn, brhs, brnp, brnx1]
+                var ropebufs2 <- [brv2, brc, brs, brn, brhs, brnp, brnx1, brhs]
                 let roperan2 = run_compute_1d(queue, pso_rope, ropebufs2, uint(NPOS * QD / 2), 64u, err)
                 t |> success(roperan2, "rope NEOX dispatch: {err}")
                 t |> equal(buf_mismatch_approx(brv2, rvwant), 0)
@@ -316,6 +316,49 @@ def test_metal_prefill_kernels(t : T?) {
                 }
                 metal_release(brv2)
                 metal_release(brnx1)
+
+                // ===== partial NEOX (rot < head_size, Wave D) — vs rope_scaled_neox_tab_part;
+                // the table rows are rot/2 wide, dims >= rot pass through untouched
+                let prot = HEAD_SIZE / 2
+                let phalf = prot / 2
+                var rcosp : array<float>
+                var rsinp : array<float>
+                rcosp |> resize(NPOS * phalf)
+                rsinp |> resize(NPOS * phalf)
+                for (k in range(NPOS * phalf)) {
+                    rcosp[k] = cos(0.02 * float(k % 89))
+                    rsinp[k] = sin(0.02 * float(k % 89))
+                }
+                for (k in range(NPOS * QD)) {
+                    rv[k] = 0.17 * float(k % 33) - 2.4
+                    rvwant[k] = rv[k]
+                }
+                unsafe {
+                    for (p in range(NPOS)) {
+                        rope_scaled_neox_tab_part(addr(rvwant[p * QD]), int64(HEAD_SIZE), int64(prot),
+                            int64(QD), addr<float const?>(rcosp[p * phalf]), addr<float const?>(rsinp[p * phalf]))
+                    }
+                }
+                var brv3 = buf_upload(dev, rv)
+                var brcp = buf_upload(dev, rcosp)
+                var brsp = buf_upload(dev, rsinp)
+                var brnx2 = buf_u32(dev, 1u)
+                var brot = buf_u32(dev, uint(prot))
+                var ropebufs3 <- [brv3, brcp, brsp, brn, brhs, brnp, brnx2, brot]
+                let roperan3 = run_compute_1d(queue, pso_rope, ropebufs3, uint(NPOS * QD / 2), 64u, err)
+                t |> success(roperan3, "rope partial-NEOX dispatch: {err}")
+                t |> equal(buf_mismatch_approx(brv3, rvwant), 0)
+                ropebufs3 |> clear()
+                unsafe {
+                    delete ropebufs3
+                }
+                delete rcosp
+                delete rsinp
+                metal_release(brv3)
+                metal_release(brcp)
+                metal_release(brsp)
+                metal_release(brnx2)
+                metal_release(brot)
                 metal_release(brc)
                 metal_release(brs)
                 metal_release(brn)
@@ -429,6 +472,18 @@ def test_metal_prefill_kernels(t : T?) {
                 moe_gemv_gate(t, dev, queue, 64, 24, 5, 3, 3, false)   // batch streams, shared-x form
                 moe_gemv_gate(t, dev, queue, 64, 24, 5, 3, 3, true)    // batch streams, down form
                 moe_combine_gate(t, dev, queue, 200, 4)
+
+                // ===== deltanet kernels (Wave D) =====
+                // the chain gates compare each stage at its seam vs a sequential CPU mirror;
+                // shapes: decode (npos 1), a batch window, npos < taps (history straddle),
+                // and nkh == nvh (the 0.8B class; the rest exercise the h % nkh fan-out)
+                dn_chain_gate(t, dev, queue, 2, 4, 4, 1)
+                dn_chain_gate(t, dev, queue, 2, 4, 4, 5)
+                dn_chain_gate(t, dev, queue, 2, 4, 4, 2)
+                dn_chain_gate(t, dev, queue, 4, 4, 4, 3)
+                dn_deint_sigmul_gate(t, dev, queue, 3, 64, 2)
+                axpy_sig_gate(t, dev, queue, 1, 96)    // shexp combine (stage 3): decode shape
+                axpy_sig_gate(t, dev, queue, 5, 64)    // ... and the per-position prefill shape
 
                 metal_release(queue)
             }
@@ -956,6 +1011,462 @@ def private moe_combine_gate(t : T?; dev, queue; dim, k : int) {
     metal_release(pso)
     delete dn
     delete selw
+    delete want
+}
+
+// ===== deltanet kernel gates (Wave D) =====
+
+// The whole recurrent chain vs a sequential CPU mirror — conv+SiLU (history straddle), q/k L2
+// norm + q pre-scale, the fused sequential delta rule, the z-gated out-norm — compared at each
+// stage's seam so a red localizes to (stage). ds pinned 128 (the serve gate's shape).
+def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
+    let ds = 128
+    let kd = nkh * ds
+    let di = nvh * ds
+    let cd = 2 * kd + di
+    let taps = dconv - 1
+    let qscale = 1.0 / sqrt(float(ds))
+    var err : string
+    var pso_conv = pipeline_from_source(dev, metal_dn_conv_msl, metal_dn_conv_msl_entry, metal_dn_conv_msl_fastmath, err)
+    t |> success(pso_conv != null, "dn conv pipeline: {err}")
+    var pso_hist = pipeline_from_source(dev, metal_dn_conv_hist_msl, metal_dn_conv_hist_msl_entry, metal_dn_conv_hist_msl_fastmath, err)
+    t |> success(pso_hist != null, "dn hist pipeline: {err}")
+    var pso_l2 = pipeline_from_source(dev, metal_dn_l2norm_msl, metal_dn_l2norm_msl_entry, metal_dn_l2norm_msl_fastmath, err)
+    t |> success(pso_l2 != null, "dn l2norm pipeline: {err}")
+    var pso_scan = pipeline_from_source(dev, metal_dn_scan_msl, metal_dn_scan_msl_entry, metal_dn_scan_msl_fastmath, err)
+    t |> success(pso_scan != null, "dn scan pipeline: {err}")
+    var pso_gate = pipeline_from_source(dev, metal_dn_gate_msl, metal_dn_gate_msl_entry, metal_dn_gate_msl_fastmath, err)
+    t |> success(pso_gate != null, "dn gate pipeline: {err}")
+    if (pso_conv == null || pso_hist == null || pso_l2 == null || pso_scan == null || pso_gate == null) {
+        return
+    }
+    // inputs — hash patterns; ssm_a strictly negative (= -exp(A_log)), nonzero history + state
+    var xq : array<float>
+    var hist : array<float>
+    var cw : array<float>
+    var braw : array<float>
+    var graw : array<float>
+    var aa : array<float>
+    var dtb : array<float>
+    var st0 : array<float>
+    var zz : array<float>
+    var wn : array<float>
+    xq |> resize(npos * cd)
+    hist |> resize(cd * taps)
+    cw |> resize(cd * dconv)
+    braw |> resize(npos * nvh)
+    graw |> resize(npos * nvh)
+    aa |> resize(nvh)
+    dtb |> resize(nvh)
+    st0 |> resize(nvh * ds * ds)
+    zz |> resize(npos * di)
+    wn |> resize(ds)
+    for (k in range(npos * cd)) {
+        xq[k] = 0.03 * float(k % 53) - 0.8
+    }
+    for (k in range(cd * taps)) {
+        hist[k] = 0.05 * float(k % 31) - 0.7
+    }
+    for (k in range(cd * dconv)) {
+        cw[k] = 0.04 * float(k % 23) - 0.4
+    }
+    for (k in range(npos * nvh)) {
+        braw[k] = 0.3 * float(k % 11) - 1.5
+        graw[k] = 0.2 * float(k % 13) - 1.0
+    }
+    for (k in range(nvh)) {
+        aa[k] = -(0.4 + 0.15 * float(k))
+        dtb[k] = 0.1 * float(k) - 0.2
+    }
+    for (k in range(nvh * ds * ds)) {
+        st0[k] = 0.01 * float(k % 37) - 0.18
+    }
+    for (k in range(npos * di)) {
+        zz[k] = 0.07 * float(k % 27) - 0.9
+    }
+    for (k in range(ds)) {
+        wn[k] = 0.6 + 0.02 * float(k % 17)
+    }
+    // stage 1 mirror: conv + SiLU (window rows or history straddle), then the history advance
+    var cv : array<float>
+    var hwant : array<float>
+    cv |> resize(npos * cd)
+    hwant |> resize(cd * taps)
+    for (p in range(npos)) {
+        for (ch in range(cd)) {
+            var acc = 0.0
+            for (k in range(dconv)) {
+                let sp = p + k - taps
+                let xv = sp >= 0 ? xq[sp * cd + ch] : hist[ch * taps + p + k]
+                acc += xv * cw[ch * dconv + k]
+            }
+            cv[p * cd + ch] = acc / (1.0 + exp(-acc))
+        }
+    }
+    for (ch in range(cd)) {
+        for (k in range(taps)) {
+            let src = npos - taps + k
+            hwant[ch * taps + k] = src >= 0 ? xq[src * cd + ch] : hist[ch * taps + src + taps]
+        }
+    }
+    var bx = buf_upload(dev, xq)
+    var bh = buf_upload(dev, hist)
+    var bw = buf_upload(dev, cw)
+    var by = buf_fill(dev, npos * cd, 0.0)
+    var bcd = buf_u32(dev, uint(cd))
+    var bdc = buf_u32(dev, uint(dconv))
+    var bnp = buf_u32(dev, uint(npos))
+    let cran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso_conv)
+        metal_set_buffer(enc, bx, 0ul, 0)
+        metal_set_buffer(enc, bh, 0ul, 1)
+        metal_set_buffer(enc, bw, 0ul, 2)
+        metal_set_buffer(enc, by, 0ul, 3)
+        metal_set_buffer(enc, bcd, 0ul, 4)
+        metal_set_buffer(enc, bdc, 0ul, 5)
+        metal_set_buffer(enc, bnp, 0ul, 6)
+        metal_dispatch_threadgroups(enc, uint3(uint((cd + 255) / 256), uint(npos), 1u), uint3(256u, 1u, 1u))
+    }
+    t |> success(cran, "dn conv dispatch npos={npos}: {err}")
+    t |> equal(buf_mismatch_approx(by, cv), 0)
+    let hran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso_hist)
+        metal_set_buffer(enc, bx, 0ul, 0)
+        metal_set_buffer(enc, bh, 0ul, 1)
+        metal_set_buffer(enc, bcd, 0ul, 2)
+        metal_set_buffer(enc, bdc, 0ul, 3)
+        metal_set_buffer(enc, bnp, 0ul, 4)
+        metal_dispatch_threadgroups(enc, uint3(uint((cd + 255) / 256), 1u, 1u), uint3(256u, 1u, 1u))
+    }
+    t |> success(hran, "dn hist dispatch npos={npos}: {err}")
+    t |> equal(buf_mismatch_approx(bh, hwant), 0)
+    // stage 2 mirror: per-head L2 over q/k + q pre-scale (double square-sum like the CPU)
+    for (p in range(npos)) {
+        for (blk in range(2 * nkh)) {
+            var sum = 0.0lf
+            for (j in range(ds)) {
+                let v = cv[p * cd + blk * ds + j]
+                sum += double(v * v)
+            }
+            let sc = (1.0 / max(sqrt(float(sum)), EPS)) * (blk < nkh ? qscale : 1.0)
+            for (j in range(ds)) {
+                cv[p * cd + blk * ds + j] *= sc
+            }
+        }
+    }
+    var bkd = buf_u32(dev, uint(kd))
+    var bds = buf_u32(dev, uint(ds))
+    var beps = buf_f32(dev, EPS)
+    var bqs = buf_f32(dev, qscale)
+    let lran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso_l2)
+        metal_set_buffer(enc, by, 0ul, 0)
+        metal_set_buffer(enc, bcd, 0ul, 1)
+        metal_set_buffer(enc, bkd, 0ul, 2)
+        metal_set_buffer(enc, bds, 0ul, 3)
+        metal_set_buffer(enc, beps, 0ul, 4)
+        metal_set_buffer(enc, bqs, 0ul, 5)
+        metal_dispatch_threadgroups(enc, uint3(uint((2 * nkh + 7) / 8), uint(npos), 1u), uint3(256u, 1u, 1u))
+    }
+    t |> success(lran, "dn l2norm dispatch npos={npos}: {err}")
+    t |> equal(buf_mismatch_approx(by, cv), 0)
+    // stage 3 mirror: the sequential delta rule per v-head (k-heads fan via h % nkh)
+    var owant : array<float>
+    var stw : array<float>
+    var skd : array<float>
+    owant |> resize(npos * di)
+    stw := st0
+    skd |> resize(ds)
+    for (h in range(nvh)) {
+        let kh = h % nkh
+        let sb = h * ds * ds
+        for (p in range(npos)) {
+            let gr = graw[p * nvh + h] + dtb[h]
+            let dec = exp(aa[h] * (gr > 20.0 ? gr : log(1.0 + exp(gr))))
+            let beta = 1.0 / (1.0 + exp(-braw[p * nvh + h]))
+            let qb = p * cd + kh * ds
+            let kb = p * cd + kd + kh * ds
+            let vb = p * cd + 2 * kd + h * ds
+            for (j in range(ds)) {
+                skd[j] = 0.0
+            }
+            for (i in range(ds)) {
+                let ki = cv[kb + i]
+                for (j in range(ds)) {
+                    let sv = stw[sb + i * ds + j] * dec
+                    stw[sb + i * ds + j] = sv
+                    skd[j] += ki * sv
+                }
+            }
+            for (j in range(ds)) {
+                skd[j] = (cv[vb + j] - skd[j]) * beta
+                owant[p * di + h * ds + j] = 0.0
+            }
+            for (i in range(ds)) {
+                let ki = cv[kb + i]
+                let qi = cv[qb + i]
+                for (j in range(ds)) {
+                    let sv = stw[sb + i * ds + j] + ki * skd[j]
+                    stw[sb + i * ds + j] = sv
+                    owant[p * di + h * ds + j] += qi * sv
+                }
+            }
+        }
+    }
+    var bst = buf_upload(dev, st0)
+    var bbr = buf_upload(dev, braw)
+    var bgr = buf_upload(dev, graw)
+    var baa = buf_upload(dev, aa)
+    var bdt = buf_upload(dev, dtb)
+    var bo = buf_fill(dev, npos * di, 0.0)
+    var bnvh = buf_u32(dev, uint(nvh))
+    var bnkh = buf_u32(dev, uint(nkh))
+    var bdi = buf_u32(dev, uint(di))
+    let sran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso_scan)
+        metal_set_buffer(enc, by, 0ul, 0)
+        metal_set_buffer(enc, bst, 0ul, 1)
+        metal_set_buffer(enc, bbr, 0ul, 2)
+        metal_set_buffer(enc, bgr, 0ul, 3)
+        metal_set_buffer(enc, baa, 0ul, 4)
+        metal_set_buffer(enc, bdt, 0ul, 5)
+        metal_set_buffer(enc, bo, 0ul, 6)
+        metal_set_buffer(enc, bcd, 0ul, 7)
+        metal_set_buffer(enc, bkd, 0ul, 8)
+        metal_set_buffer(enc, bds, 0ul, 9)
+        metal_set_buffer(enc, bnvh, 0ul, 10)
+        metal_set_buffer(enc, bnkh, 0ul, 11)
+        metal_set_buffer(enc, bdi, 0ul, 12)
+        metal_set_buffer(enc, bnp, 0ul, 13)
+        metal_dispatch_threadgroups(enc, uint3(uint(ds / 4), uint(nvh), 1u), uint3(128u, 1u, 1u))
+    }
+    t |> success(sran, "dn scan dispatch npos={npos} nkh={nkh} nvh={nvh}: {err}")
+    t |> equal(buf_mismatch_approx(bo, owant), 0)
+    t |> equal(buf_mismatch_approx(bst, stw), 0)
+    // stage 4 mirror: per-head RMS with the shared weight, ⊙ SiLU(z)
+    var gwant : array<float>
+    gwant |> resize(npos * di)
+    for (p in range(npos)) {
+        for (h in range(nvh)) {
+            var ms = 0.0lf
+            for (j in range(ds)) {
+                let v = owant[p * di + h * ds + j]
+                ms += double(v * v)
+            }
+            let inv = 1.0 / sqrt(float(ms) / float(ds) + EPS)
+            for (j in range(ds)) {
+                let v = owant[p * di + h * ds + j]
+                let zv = zz[p * di + h * ds + j]
+                gwant[p * di + h * ds + j] = (wn[j] * (v * inv)) * (zv / (1.0 + exp(-zv)))
+            }
+        }
+    }
+    var bz = buf_upload(dev, zz)
+    var bwn = buf_upload(dev, wn)
+    let gran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso_gate)
+        metal_set_buffer(enc, bo, 0ul, 0)
+        metal_set_buffer(enc, bz, 0ul, 1)
+        metal_set_buffer(enc, bwn, 0ul, 2)
+        metal_set_buffer(enc, bds, 0ul, 3)
+        metal_set_buffer(enc, bdi, 0ul, 4)
+        metal_set_buffer(enc, beps, 0ul, 5)
+        metal_dispatch_threadgroups(enc, uint3(uint((nvh + 7) / 8), uint(npos), 1u), uint3(256u, 1u, 1u))
+    }
+    t |> success(gran, "dn gate dispatch npos={npos}: {err}")
+    t |> equal(buf_mismatch_approx(bo, gwant), 0)
+    metal_release(bx)
+    metal_release(bh)
+    metal_release(bw)
+    metal_release(by)
+    metal_release(bcd)
+    metal_release(bdc)
+    metal_release(bnp)
+    metal_release(bkd)
+    metal_release(bds)
+    metal_release(beps)
+    metal_release(bqs)
+    metal_release(bst)
+    metal_release(bbr)
+    metal_release(bgr)
+    metal_release(baa)
+    metal_release(bdt)
+    metal_release(bo)
+    metal_release(bnvh)
+    metal_release(bnkh)
+    metal_release(bdi)
+    metal_release(bz)
+    metal_release(bwn)
+    metal_release(pso_conv)
+    metal_release(pso_hist)
+    metal_release(pso_l2)
+    metal_release(pso_scan)
+    metal_release(pso_gate)
+    delete xq
+    delete hist
+    delete cw
+    delete braw
+    delete graw
+    delete aa
+    delete dtb
+    delete st0
+    delete zz
+    delete wn
+    delete cv
+    delete hwant
+    delete owant
+    delete stw
+    delete skd
+    delete gwant
+}
+
+// The 2x-wide [q|gate] deinterleave + the σ(g) out-gate — trivial mirrors, bit-exact.
+def private dn_deint_sigmul_gate(t : T?; dev, queue; nh, hs, npos : int) {
+    let qd = nh * hs
+    var err : string
+    var pso_de = pipeline_from_source(dev, metal_dn_deint_msl, metal_dn_deint_msl_entry, metal_dn_deint_msl_fastmath, err)
+    t |> success(pso_de != null, "dn deint pipeline: {err}")
+    var pso_sg = pipeline_from_source(dev, metal_sigmul_msl, metal_sigmul_msl_entry, metal_sigmul_msl_fastmath, err)
+    t |> success(pso_sg != null, "sigmul pipeline: {err}")
+    if (pso_de == null || pso_sg == null) {
+        return
+    }
+    let qs = qd + 64          // a wider destination row stride (the qkv panel form)
+    var qg : array<float>
+    var qwant : array<float>
+    var gwant : array<float>
+    qg |> resize(npos * 2 * qd)
+    qwant |> resize(npos * qs)
+    gwant |> resize(npos * qd)
+    for (k in range(npos * 2 * qd)) {
+        qg[k] = 0.09 * float(k % 43) - 1.7
+    }
+    for (p in range(npos)) {
+        for (i in range(qd)) {
+            let h = i / hs
+            let ii = i % hs
+            qwant[p * qs + i] = qg[p * 2 * qd + h * 2 * hs + ii]
+            gwant[p * qd + i] = qg[p * 2 * qd + h * 2 * hs + hs + ii]
+        }
+    }
+    var bqg = buf_upload(dev, qg)
+    var bq = buf_fill(dev, npos * qs, 0.0)
+    var bgt = buf_fill(dev, npos * qd, 0.0)
+    var bhs = buf_u32(dev, uint(hs))
+    var bqd = buf_u32(dev, uint(qd))
+    var bqs = buf_u32(dev, uint(qs))
+    let dran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso_de)
+        metal_set_buffer(enc, bqg, 0ul, 0)
+        metal_set_buffer(enc, bq, 0ul, 1)
+        metal_set_buffer(enc, bgt, 0ul, 2)
+        metal_set_buffer(enc, bhs, 0ul, 3)
+        metal_set_buffer(enc, bqd, 0ul, 4)
+        metal_set_buffer(enc, bqs, 0ul, 5)
+        metal_dispatch_threadgroups(enc, uint3(uint((qd + 255) / 256), uint(npos), 1u), uint3(256u, 1u, 1u))
+    }
+    t |> success(dran, "dn deint dispatch: {err}")
+    // the pad tail of each destination row is unwritten — compare only the written columns
+    var qgot <- buf_download(bq, npos * qs, type<float>)
+    var dbad = 0
+    for (p in range(npos)) {
+        for (i in range(qd)) {
+            if (qgot[p * qs + i] != qwant[p * qs + i]) {
+                dbad++
+            }
+        }
+    }
+    t |> equal(dbad, 0)
+    t |> equal(buf_mismatch_exact(bgt, gwant), 0)
+    // sigmul: x ⊙ σ(g) on the deinterleaved gate rows
+    var xv : array<float>
+    var swant : array<float>
+    xv |> resize(npos * qd)
+    swant |> resize(npos * qd)
+    for (k in range(npos * qd)) {
+        xv[k] = 0.06 * float(k % 39) - 1.1
+        swant[k] = xv[k] / (1.0 + exp(-gwant[k]))
+    }
+    var bxv = buf_upload(dev, xv)
+    var btot = buf_u32(dev, uint(npos * qd))
+    let sran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso_sg)
+        metal_set_buffer(enc, bxv, 0ul, 0)
+        metal_set_buffer(enc, bgt, 0ul, 1)
+        metal_set_buffer(enc, btot, 0ul, 2)
+        metal_dispatch_threadgroups(enc, uint3(uint((npos * qd + 63) / 64), 1u, 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(sran, "sigmul dispatch: {err}")
+    t |> equal(buf_mismatch_approx(bxv, swant), 0)
+    metal_release(bqg)
+    metal_release(bq)
+    metal_release(bgt)
+    metal_release(bhs)
+    metal_release(bqd)
+    metal_release(bqs)
+    metal_release(bxv)
+    metal_release(btot)
+    metal_release(pso_de)
+    metal_release(pso_sg)
+    delete qg
+    delete qwant
+    delete gwant
+    delete qgot
+    delete xv
+    delete swant
+}
+
+def private axpy_sig_gate(t : T?; dev, queue; npos, dim : int) {
+    var err : string
+    var pso = pipeline_from_source(dev, metal_axpy_sig_msl, metal_axpy_sig_msl_entry, metal_axpy_sig_msl_fastmath, err)
+    t |> success(pso != null, "axpy_sig pipeline: {err}")
+    if (pso == null) {
+        return
+    }
+    let total = npos * dim
+    var yv : array<float>
+    var xv : array<float>
+    var gv : array<float>
+    var want : array<float>
+    yv |> resize(total)
+    xv |> resize(total)
+    gv |> resize(npos)
+    want |> resize(total)
+    for (k in range(total)) {
+        yv[k] = 0.05 * float(k % 37) - 0.9
+        xv[k] = 0.07 * float(k % 41) - 1.3
+    }
+    for (p in range(npos)) {
+        gv[p] = 0.6 * float(p) - 1.2
+    }
+    for (k in range(total)) {
+        want[k] = yv[k] + xv[k] / (1.0 + exp(-gv[k / dim]))
+    }
+    var by = buf_upload(dev, yv)
+    var bx = buf_upload(dev, xv)
+    var bg = buf_upload(dev, gv)
+    var btot = buf_u32(dev, uint(total))
+    var bdim = buf_u32(dev, uint(dim))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, by, 0ul, 0)
+        metal_set_buffer(enc, bx, 0ul, 1)
+        metal_set_buffer(enc, bg, 0ul, 2)
+        metal_set_buffer(enc, btot, 0ul, 3)
+        metal_set_buffer(enc, bdim, 0ul, 4)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 255) / 256), 1u, 1u), uint3(256u, 1u, 1u))
+    }
+    t |> success(ran, "axpy_sig dispatch: {err}")
+    t |> equal(buf_mismatch_approx(by, want), 0)
+    metal_release(by)
+    metal_release(bx)
+    metal_release(bg)
+    metal_release(btot)
+    metal_release(bdim)
+    metal_release(pso)
+    delete yv
+    delete xv
+    delete gv
     delete want
 }
 

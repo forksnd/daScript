@@ -1,7 +1,7 @@
 options gen2
 options indenting = 4
 
-// Real-GPU behavioral gate for the Phase-6 math builtins (exp/sqrt/rsqrt/sin/cos/tanh/abs/
+// Real-GPU behavioral gate for the Phase-6 math builtins (exp/log/sqrt/rsqrt/sin/cos/tanh/abs/
 // saturate/min/max — float scalar + float4 + int/uint classes). fastmath=false pins the precise
 // MSL math path: fast::sin/cos carry an ABSOLUTE ~2^-11 error bound that would swamp the oracle
 // tolerance, while the precise set stays within a few ULP of the CPU libm reference. abs/min/max/
@@ -39,6 +39,7 @@ class MathCalls {
         c[i] = (((exp(min(x, 4.0)) + sqrt(abs(x))) + (rsqrt(abs(y) + 1.0) + tanh(x))) +
             ((sin(x) + cos(y)) + (saturate(x) + max(x, y))))
         c[i] += float(qa[i])
+        c[i] += log(abs(x) + 1.0)
         let u = va[i]
         let v = vb[i]
         vc[i] = (((exp(min(u, float4(4.0))) + sqrt(abs(u))) + (rsqrt(abs(v) + float4(1.0)) + tanh(u))) +
@@ -84,9 +85,9 @@ def test_math_gpu_vs_cpu(t : T?) {
             oracle->mathcalls()
         }
         // k=0: x=-11, y=-4: exp(-11)+sqrt(11)+rsqrt(5)+tanh(-11)+sin(-11)+cos(-4)+saturate(-11)+max(-11,-4),
-        // then += float(qa[0]) = -125
+        // then += float(qa[0]) = -125, then += log(|x|+1) = log(12)
         t |> success(fapprox(oracle.c[0], exp(-11.0) + sqrt(11.0) + rsqrt(5.0) + tanh(-11.0) +
-            sin(-11.0) + cos(-4.0) + 0.0 + (-4.0) - 125.0), "the oracle itself computed")
+            sin(-11.0) + cos(-4.0) + 0.0 + (-4.0) - 125.0 + log(12.0)), "the oracle itself computed")
         t |> equal(oracle.ic[0], min(9, -3) + max(-9, -3))
         static_if (typeinfo builtin_module_exists(das_metal)) {
             var gpu_bad = -1
