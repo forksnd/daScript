@@ -310,7 +310,10 @@ struct private StepRes {
     // deltanet (Wave D) — recurrent-layer scratch + the gated-attention twins; dn steps only
     dn : bool
     bdn_state : MetalBuffer?   // the session's DnMirror buffer (mirror-owned, never released here)
-    dn_conv_base : uint64      // byte offset of the conv-history region inside bdn_state
+    dn_state_base : uint64     // live region's state base inside bdn_state
+    dn_conv_base : uint64      // live region's conv-history base inside bdn_state
+    dn_state_alt : uint64      // shadow region bases — the MTP verify's dual-store targets
+    dn_conv_alt : uint64
     bdn_qkv : MetalBuffer?     // [cd] fused qkv projection row
     bdn_cv : MetalBuffer?      // [cd] conv output (l2-normed in place)
     bdn_z : MetalBuffer?       // [di] z gate row
@@ -635,16 +638,16 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                 }
             }
             if (g_skip != "attn") {
-                let soff = uint64(dnli * nvh * c.ssm_d_state * c.ssm_d_state * 4l)
+                let soff = r.dn_state_base + uint64(dnli * nvh * c.ssm_d_state * c.ssm_d_state * 4l)
                 let hoff = r.dn_conv_base + uint64(dnli * (c.ssm_d_conv - 1l) * cd * 4l)
                 var bw_cv = upload_region(addr < void? >(t.fblob[t.dn_conv_off + l * c.ssm_d_conv * cd]), uint64(c.ssm_d_conv * cd * 4l))
                 enc_dn_conv(enc, r.bdn_qkv, r.bdn_state, hoff, bw_cv, r.bdn_cv, r.u_cd, r.u_dconv, r.u_one32, cd, 1l)
-                enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_one32, cd)
+                enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_one32, cd, hoff, r.u_zero32)
                 enc_dn_l2norm(enc, r.bdn_cv, r.u_cd, r.u_dn_kd, r.u_ds, r.u_eps, r.u_qscale, 2l * c.ssm_n_group, 1l)
                 var baa = upload_region(addr < void? >(t.fblob[t.dn_a_off + l * nvh]), uint64(nvh * 4l))
                 var bdt = upload_region(addr < void? >(t.fblob[t.dn_dt_off + l * nvh]), uint64(nvh * 4l))
                 enc_dn_scan(enc, r.bdn_cv, r.bdn_state, soff, r.bdn_b, r.bdn_g, baa, bdt, r.bdn_o,
-                    r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_one32, c.ssm_d_state, nvh)
+                    r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_one32, c.ssm_d_state, nvh, soff, r.u_zero32)
                 var bwn = upload_region(addr < void? >(t.fblob[t.dn_norm_off + l * c.ssm_d_state]), uint64(c.ssm_d_state * 4l))
                 enc_dn_gate(enc, r.bdn_o, r.bdn_z, bwn, r.u_ds, r.u_di, r.u_eps, nvh, 1l)
             }
@@ -1120,16 +1123,20 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
             enc_gemv_b(enc, false, bdnb.buf, bdnb.boff, r.bxb, r.bdn_b, r.u_dim, r.u_nvh, r.u_nvh, nvh)
             let bdna = blob_of(g_dev, t, t.dnalpha_offs[l])
             enc_gemv_b(enc, false, bdna.buf, bdna.boff, r.bxb, r.bdn_g, r.u_dim, r.u_nvh, r.u_nvh, nvh)
-            let soff = uint64(dnli * nvh * c.ssm_d_state * c.ssm_d_state * 4l)
-            let hoff = r.dn_conv_base + uint64(dnli * (c.ssm_d_conv - 1l) * cd * 4l)
+            // dual-store: post-row0 state/hist land in the shadow region — reject flips to it
+            let sslice = uint64(dnli * nvh * c.ssm_d_state * c.ssm_d_state * 4l)
+            let hslice = uint64(dnli * (c.ssm_d_conv - 1l) * cd * 4l)
+            let soff = r.dn_state_base + sslice
+            let hoff = r.dn_conv_base + hslice
             var bw_cv = upload_region(addr < void? >(t.fblob[t.dn_conv_off + l * c.ssm_d_conv * cd]), uint64(c.ssm_d_conv * cd * 4l))
             enc_dn_conv(enc, r.bdn_qkv, r.bdn_state, hoff, bw_cv, r.bdn_cv, r.u_cd, r.u_dconv, r.u_two32, cd, 2l)
-            enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_two32, cd)
+            enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_two32, cd, r.dn_conv_alt + hslice, r.u_one32)
             enc_dn_l2norm(enc, r.bdn_cv, r.u_cd, r.u_dn_kd, r.u_ds, r.u_eps, r.u_qscale, 2l * c.ssm_n_group, 2l)
             var baa = upload_region(addr < void? >(t.fblob[t.dn_a_off + l * nvh]), uint64(nvh * 4l))
             var bdt = upload_region(addr < void? >(t.fblob[t.dn_dt_off + l * nvh]), uint64(nvh * 4l))
             enc_dn_scan(enc, r.bdn_cv, r.bdn_state, soff, r.bdn_b, r.bdn_g, baa, bdt, r.bdn_o,
-                r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_two32, c.ssm_d_state, nvh)
+                r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_two32, c.ssm_d_state, nvh,
+                r.dn_state_alt + sslice, r.u_one32)
             var bwn = upload_region(addr < void? >(t.fblob[t.dn_norm_off + l * c.ssm_d_state]), uint64(c.ssm_d_state * 4l))
             enc_dn_gate(enc, r.bdn_o, r.bdn_z, bwn, r.u_ds, r.u_di, r.u_eps, nvh, 2l)
             let bdno = blob_of(g_dev, t, t.dnout_offs[l])
@@ -1312,14 +1319,14 @@ def private finish_verify_step(t : Model; var s : Session; r : StepRes; pos : in
 
 //! mtp_spec_eval's GPU twin: draft + B=2 same-slab verify, wholly on the metal decode path.
 //! Cold/decline paths fall back to one plain (GPU) forward — output-invariant either way.
-//! v1 reject = dn blit-restore + re-forward; the dual-store ping-pong removes both later.
+//! Reject is ~free: row0 IS the truth decode, the dn shadow region flips in — no re-forward.
 def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool {
     let c = t.config
     let pos = s.n_past
     var cold = (g_dev == null || !t.metal_blob || c.n_layer_nextn <= 0l || pos < 1l ||
         s.mtp_h_pos1 != pos || pos + 2l > c.seq_len || !metal_mtp_verify_ok(t, s))
     if (!cold && c.recr_mask != 0ul) {
-        // the verify scans the decode DnMirror in place — it must be resident and current
+        // the verify scans the decode DnMirror's live region — it must be resident and current
         cold = !key_exists(g_dn_mirrors, s.uid) || g_dn_mirrors[s.uid].pos != pos
     }
     if (!cold) {
@@ -1348,17 +1355,6 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
         d = 0l
     }
     s.mtp_drafted++
-    if (c.recr_mask != 0ul) {
-        // v1 dn snapshot: blit the mirror's state+conv regions to the CPU snap arrays (GPU idle here)
-        let dm = g_dn_mirrors[s.uid]
-        s.mtp_snap_conv |> resize(int((dm.bytes - dm.conv_off) / 4ul))
-        s.mtp_snap_state |> resize(int(dm.conv_off / 4ul))
-        unsafe {
-            var mb = reinterpret<uint8?>(metal_buffer_contents(dm.buf))
-            memcpy(addr < void? >(s.mtp_snap_state[0]), reinterpret<void?>(mb), int(dm.conv_off))
-            memcpy(addr < void? >(s.mtp_snap_conv[0]), reinterpret<void?>(mb + dm.conv_off), int(dm.bytes - dm.conv_off))
-        }
-    }
     mtp_verify_prep(t, s, tok, d, pos)
     finish_pending_step()
     let mr = g_mirrors[s.uid]
@@ -1370,7 +1366,7 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
         return false
     }
     if (r.dn) {
-        var dm = dn_mirror_prepare(s, pos)
+        var dm = dn_mirror_prepare(s, pos, dn_mirror_regions(t))
         if (!dm.ok) {
             release_step(r)
             forward(t, s, tok, pos)
@@ -1378,7 +1374,10 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
             return false
         }
         r.bdn_state = dm.buf
+        r.dn_state_base = dm.state_off
         r.dn_conv_base = dm.conv_off
+        r.dn_state_alt = dm.state_alt
+        r.dn_conv_alt = dm.conv_alt
     }
     unsafe {
         memcpy(metal_buffer_contents(r.bx), addr < void? >(s.mtp_cat[0]), int(r.bytes_x))
@@ -1408,15 +1407,29 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
         s.n_past = pos + 2l
         return true
     }
-    release_step(r)
-    if (c.recr_mask != 0ul) {
-        // reject (or verify error): restore the pre-verify dn state; the cursor never advanced
-        let dm = g_dn_mirrors[s.uid]
+    if (vok) {
+        // reject: row0 already IS tok@pos's plain decode — its logits, hidden, and the shadow
+        // dn region (post-row0) stand in for the re-forward; the garbage draft row sits above
+        // the watermark and the next step rewrites it
         unsafe {
-            var mb = reinterpret<uint8?>(metal_buffer_contents(dm.buf))
-            memcpy(reinterpret<void?>(mb), addr < void? >(s.mtp_snap_state[0]), int(dm.conv_off))
-            memcpy(reinterpret<void?>(mb + dm.conv_off), addr < void? >(s.mtp_snap_conv[0]), int(dm.bytes - dm.conv_off))
+            var hx = reinterpret<uint8?>(metal_buffer_contents(r.bxf))
+            memcpy(addr < void? >(s.mtp_h[0]), reinterpret<void?>(hx), int(c.dim * 4l))
+            memcpy(addr < void? >(s.logits[0]), addr < void? >(s.mtp_logits[0]), int(c.vocab_size * 4l))
         }
+        release_step(r)
+        s.mtp_h_pos1 = pos + 1l
+        g_mirrors[s.uid].watermark = pos + 1l
+        if (c.recr_mask != 0ul) {
+            dn_mirror_flip(s.uid, pos + 1l)
+        }
+        s.n_past = pos + 1l
+        return false
+    }
+    release_step(r)
+    if (c.recr_mask != 0ul && key_exists(g_dn_mirrors, s.uid)) {
+        // verify dispatch failed mid-scan — the mirror state is unreliable and not re-derivable
+        dn_mirror_release(g_dn_mirrors[s.uid])
+        g_dn_mirrors |> erase(s.uid)
     }
     forward(t, s, tok, pos)
     s.n_past = pos + 1l
@@ -1756,13 +1769,14 @@ def private metal_decode_slow(t : Model; var s : Session; pos : int64) : bool {
     }
     var r = acquire_step(t, s, pos, mir.koff, mir.voff, mir.cap)
     if (r.dn) {
-        var dm = dn_mirror_prepare(s, pos)
+        var dm = dn_mirror_prepare(s, pos, dn_mirror_regions(t))
         if (!dm.ok) {   // state not resident and no CPU prefix to sync from — decline this step
             release_step(r)
             decline(MetalDecodeDecline.dn_state)
             return false
         }
         r.bdn_state = dm.buf
+        r.dn_state_base = dm.state_off
         r.dn_conv_base = dm.conv_off
     }
     poke_step(s, r)

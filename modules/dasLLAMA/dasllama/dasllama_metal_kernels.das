@@ -6409,13 +6409,15 @@ def enc_dn_conv(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uin
 }
 
 def enc_dn_conv_hist(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uint64;
-                     bcd, bdconv, bnp : MetalBuffer?; cd : int64) {
+                     bcd, bdconv, bnp : MetalBuffer?; cd : int64; hmoff : uint64; bmid : MetalBuffer?) {
     metal_set_pipeline(enc, g_pso_dn_hist)
     metal_set_buffer(enc, bx, 0ul, 0)
     metal_set_buffer(enc, bhist, hoff, 1)
     metal_set_buffer(enc, bcd, 0ul, 2)
     metal_set_buffer(enc, bdconv, 0ul, 3)
     metal_set_buffer(enc, bnp, 0ul, 4)
+    metal_set_buffer(enc, bhist, hmoff, 5)
+    metal_set_buffer(enc, bmid, 0ul, 6)
     metal_dispatch_threadgroups(enc, uint3(uint((cd + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6431,7 +6433,8 @@ def enc_dn_l2norm(enc : MetalComputeEncoder?; by, bcd, bkd, bds, beps, bqscale :
 }
 
 def enc_dn_scan(enc : MetalComputeEncoder?; bcv, bst : MetalBuffer?; stoff : uint64;
-                bbraw, bgraw, baa, bdtb, bo, bcd, bkd, bds, bnvh, bnkh, bdi, bnp : MetalBuffer?; ds, nvh : int64) {
+                bbraw, bgraw, baa, bdtb, bo, bcd, bkd, bds, bnvh, bnkh, bdi, bnp : MetalBuffer?; ds, nvh : int64;
+                stmoff : uint64; bmid : MetalBuffer?) {
     metal_set_pipeline(enc, g_pso_dn_scan)
     metal_set_buffer(enc, bcv, 0ul, 0)
     metal_set_buffer(enc, bst, stoff, 1)
@@ -6447,6 +6450,8 @@ def enc_dn_scan(enc : MetalComputeEncoder?; bcv, bst : MetalBuffer?; stoff : uin
     metal_set_buffer(enc, bnkh, 0ul, 11)
     metal_set_buffer(enc, bdi, 0ul, 12)
     metal_set_buffer(enc, bnp, 0ul, 13)
+    metal_set_buffer(enc, bst, stmoff, 14)
+    metal_set_buffer(enc, bmid, 0ul, 15)
     metal_dispatch_threadgroups(enc, uint3(uint(ds / 4l), uint(nvh), 1u), uint3(128u, 1u, 1u))
 }
 
