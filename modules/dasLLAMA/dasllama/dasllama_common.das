@@ -2059,12 +2059,13 @@ def moe_gpu_upload_resident(var t : Model) {
         let f1 = fmt_at(t.we1_fmt, l)
         let f2 = fmt_at(t.we2_fmt, l)
         let f3 = fmt_at(t.we3_fmt, l)
-        let all_q8 = f1 == KqFmt.q8 && f2 == KqFmt.q8 && f3 == KqFmt.q8
-        let all_kq = moe_gpu_fmt_kq(f1) && moe_gpu_fmt_kq(f2) && moe_gpu_fmt_kq(f3)
-        // dense-lead layers carry no expert stacks; the tier offloads plain-q8 or all-K-quant
-        // stack triples (a q8/kq mix would need two activation forms in one chain) — either way
-        // the walk stops so the resident set stays contiguous from the end
-        if (l < t.config.n_layer_dense_lead || t.we1_offs[l] < 0l || !(all_q8 || all_kq)) {
+        // gate/up must share a form (one activation image); down is free. llama.cpp's Q4_K_M MoE
+        // recipe bumps ffn_down_exps to Q5_0/Q8_0, so k4/k4/q8 is the COMMON shape (glm4moe,
+        // gemma). The walk stops on refusal so the resident set stays contiguous from the end.
+        let gu_ok = ((f1 == KqFmt.q8) == (f3 == KqFmt.q8)
+            && (f1 == KqFmt.q8 || (moe_gpu_fmt_kq(f1) && moe_gpu_fmt_kq(f3))))
+        let dn_ok = f2 == KqFmt.q8 || moe_gpu_fmt_kq(f2)
+        if (l < t.config.n_layer_dense_lead || t.we1_offs[l] < 0l || !(gu_ok && dn_ok)) {
             break
         }
         var got = 0
@@ -2100,9 +2101,10 @@ def moe_gpu_upload_resident(var t : Model) {
         let f1 = fmt_at(t.we1_fmt, l)
         let f2 = fmt_at(t.we2_fmt, l)
         let f3 = fmt_at(t.we3_fmt, l)
-        let all_q8 = f1 == KqFmt.q8 && f2 == KqFmt.q8 && f3 == KqFmt.q8
-        let all_kq = moe_gpu_fmt_kq(f1) && moe_gpu_fmt_kq(f2) && moe_gpu_fmt_kq(f3)
-        if (!(all_q8 || all_kq)) {
+        // same rule as the resident walk: gate/up share one activation image, down is free
+        let gu_ok = ((f1 == KqFmt.q8) == (f3 == KqFmt.q8)
+            && (f1 == KqFmt.q8 || (moe_gpu_fmt_kq(f1) && moe_gpu_fmt_kq(f3))))
+        if (!(gu_ok && (f2 == KqFmt.q8 || moe_gpu_fmt_kq(f2)))) {
             break
         }
         var got = 0
