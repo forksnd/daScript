@@ -963,9 +963,9 @@ def moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
     return false
 }
 
-// The MoE serve gate — the covered graph shapes (Wave C): the plain routed FFN (qwen3moe,
-// silu) and gemma4's parallel dense-shared + routed form (gelu, custom router norm,
-// per-expert down scales); softmax + norm_topk gating, no biases / mx4 / dense-lead.
+// The MoE serve gate — the covered graph shapes (Wave C): the plain routed FFN (qwen3moe, silu,
+// no biases), gemma4's dense-shared + routed dual branch (gelu, router norm, down scales), and
+// gpt-oss's mx4 experts (softmax_weight, router/expert biases, disk-order). No shexp / dense-lead.
 def moe_metal_ok(t : Model) : bool {
     let c = t.config
     if (!c.moe || c.n_ff_shexp > 0l || c.n_layer_dense_lead > 0l || c.moe_exp_probs ||

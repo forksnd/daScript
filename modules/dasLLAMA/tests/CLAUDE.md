@@ -77,7 +77,7 @@ model blocks tagged with a listed family run — `family_on(t, name)` in
 `_model_tier.das`, EXACT token match, loud `t |> skip` like the arm filter. Model-free blocks
 (the `kernels` suite, the image `mechanics` arm) carry no tag and always run. Family tokens
 today: `llama` (all four metal suites + the image smol arm), `qwen2`, `qwen3`, `phi3`,
-`gemma2`, `gemma3`, `qwen3moe`, `gemma4moe`, `gptoss` (the support-matrix family cells), `gemma`,
+`gemma2`, `gemma3`, `gemma4`, `qwen3moe`, `gemma4moe`, `gptoss` (the support-matrix family cells), `gemma`,
 `ultravox`, `whisper`, `voxtral` (image suite arms).
 When profiling one family across formats, gate each round with
 `--arm <arms> --family <fam>` instead of the whole zoo. Tag every NEW model-loading block

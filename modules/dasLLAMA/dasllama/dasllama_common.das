@@ -530,7 +530,7 @@ struct Model {
     // From then on every kq matmul MUST run the backend slots — disk-order portable kernels would
     // read garbage — and embed_row gathers rows through the grp layout too.
     kq_repacked : bool = false
-    mx4_repacked : bool = false   // repack_mx4_stacks ran (CPU laneq layout — no GPU carry)
+    mx4_repacked : bool = false   // the CPU repack pass ran (set by repack_q8_weights; mx4 stacks laneq when present — no GPU carry)
     kq_repack_mr4 : int64 = 4l   // per-FORMAT repack interleaves (kq v2: the families tune separately)
     kq_repack_mr5 : int64 = 4l
     kq_repack_mr6 : int64 = 4l
