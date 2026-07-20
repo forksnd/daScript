@@ -19,11 +19,17 @@ accidental access from an unrelated local page; it is not the future remote
 authentication design. Do not expose this port through a proxy or tunnel.
 
 HTTP endpoints under `/api/v1/` provide health, session listing, launch,
-input, resize, and termination. `/ws` provides attach/detach, controller
+input, resize, termination, and a deferred `POST /gc` diagnostic. `/ws` provides attach/detach, controller
 leases, heartbeats, input, resize, terminal snapshots, and bounded raw PTY replay.
 Raw output is delivered as binary WebSocket frames, so the browser can render
 the same color and control sequences and send keyboard input back to the PTY.
 Every request must include the startup token as the `token` query parameter.
+
+The script exposes `init`, `update`, and `shutdown` for lifecycle hosts. Its
+standalone loop performs optional GC only after `update` returns, when request
+temporaries are dead; all state that must survive collection is globally rooted.
+Automatic collection is fragmentation-driven and rate-limited. `POST /gc`
+coalesces a request for a validated collection at that same safe boundary.
 
 The browser terminal vendors xterm.js 5.5.0 with the matching fit 0.10.0,
 Unicode 11 0.8.0, and web-links 0.11.0 addons under `vendor/xterm/`. It works

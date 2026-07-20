@@ -16,6 +16,23 @@ require strings
 
 let private MAX_REQUEST_BODY_BYTES = 1024 * 1024
 let private CONTROLLER_HEARTBEAT_TIMEOUT_MS = 5000l
+var private g_watcher_gc_requested = false
+
+def public watcher_request_gc() : bool {
+    let coalesced = g_watcher_gc_requested
+    g_watcher_gc_requested = true
+    return coalesced
+}
+
+def public watcher_take_gc_request() : bool {
+    let requested = g_watcher_gc_requested
+    g_watcher_gc_requested = false
+    return requested
+}
+
+def public watcher_reset_gc_request() {
+    g_watcher_gc_requested = false
+}
 
 struct private WatcherWsMessage {
     op : string
@@ -126,6 +143,12 @@ class DasHerdWatcherServer : HvWebServer {
         GET("/api/v1/sessions") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
             return resp |> JSON(watcher_list_json(), http_status.OK)
+        }
+        POST("/api/v1/gc") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            let coalesced = watcher_request_gc()
+            return resp |> JSON("\{\"ok\":true,\"scheduled\":true,\"coalesced\":{coalesced}\}",
+                http_status.ACCEPTED)
         }
         POST("/api/v1/sessions") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
