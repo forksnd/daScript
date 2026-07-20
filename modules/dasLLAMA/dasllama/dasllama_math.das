@@ -1407,7 +1407,7 @@ var g_moe_gpu_cls_off = -1l            // element offset of the resident classif
 var g_moe_gpu_stream_from = 1000000l   // first STREAMED layer (streamed range = [stream_from, from_layer))
 var g_moe_gpu_dense_offs : table<int64>   // resident dense planes, keyed woff * 8 + fmt (per-format offset spaces)
 var g_moe_gpu_dense_route = true       // runtime routing gate over the marks (in-process A/B lever)
-var g_moe_gpu_dn_layers : table<int64>    // recurrent layers whose deltanet triple is tier-resident
+var g_moe_gpu_dn_layers : table<int64; int64>   // recurrent layer -> its qkv plane offset (tier-resident triples)
 var g_moe_gpu_dn_route = true          // runtime routing gate over the deltanet marks (--dn-ab lever)
 var g_moe_gpu_attn_layers : table<int64>  // full-attention layers whose q/k/v/o quad is tier-resident
 var g_moe_gpu_attn_route = true        // runtime routing gate over the attention marks (--attn-ab lever)
@@ -1483,10 +1483,15 @@ def public set_moe_gpu_dense_route(on : bool) {
     g_moe_gpu_dense_route = on
 }
 
-//! Loader contract: mark one recurrent layer's deltanet triple (qkv / z-gate / out-proj planes)
-//! resident on the tier — the prefill deltanet block then runs as one device chain. Reset per load.
-def public set_moe_gpu_dn_layer(l : int64) {
-    g_moe_gpu_dn_layers |> insert(l)
+//! Loader contract: mark one recurrent layer's deltanet triple resident on the tier (reset per
+//! load). woq = the qkv plane's element offset — the decode-step state hooks key tier state by it.
+def public set_moe_gpu_dn_layer(l : int64; woq : int64) {
+    g_moe_gpu_dn_layers |> insert(l, woq)
+}
+
+//! The marked layer's qkv plane offset (-1 when the layer carries no resident triple).
+def public moe_gpu_dn_layer_key(l : int64) : int64 {
+    return g_moe_gpu_dn_layers?[l] ?? -1l
 }
 
 def public reset_moe_gpu_dn_layers {
@@ -1500,6 +1505,47 @@ def public moe_gpu_dn_on_gpu(l : int64) : bool {
 //! Runtime routing gate over the deltanet marks (the --dn-ab in-process lever; uploads stay).
 def public set_moe_gpu_dn_route(on : bool) {
     g_moe_gpu_dn_route = on
+}
+
+// ===== deltanet DECODE step =====
+// Same MoeGpuDnFn hook at npos == 1, same dn marks/uploads; separate routing gate (--dnd-ab).
+// State lives device-side across steps — flush/invalidate seams guard every CPU state consumer.
+
+typedef MoeGpuDnFlushFn = function<(l : int64; var stp : float?; var histp : float?) : void>
+typedef MoeGpuDnInvalidateFn = function<() : void>
+
+[unused_argument(l, stp, histp)]
+def private moe_gpu_noop_dn_flush(l : int64; var stp : float?; var histp : float?) {}
+def private moe_gpu_noop_dn_invalidate() {}
+
+var g_moe_gpu_dnd_route = true
+var g_moe_gpu_dn_flush = @@moe_gpu_noop_dn_flush
+var g_moe_gpu_dn_invalidate = @@moe_gpu_noop_dn_invalidate
+
+def public moe_gpu_dnd_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_dnd_route && key_exists(g_moe_gpu_dn_layers, l)
+}
+
+//! Runtime routing gate over the deltanet DECODE step (the --dnd-ab in-process lever).
+def public set_moe_gpu_dnd_route(on : bool) {
+    g_moe_gpu_dnd_route = on
+}
+
+//! Tier registration of the state-residency seams (beside install_moe_gpu_tier).
+def public set_moe_gpu_dn_state_hooks(flush : MoeGpuDnFlushFn; inval : MoeGpuDnInvalidateFn) {
+    g_moe_gpu_dn_flush = flush
+    g_moe_gpu_dn_invalidate = inval
+}
+
+//! Sync one layer's device-resident deltanet state back into the engine's buffers (no-op when
+//! the device copy is clean or absent). Call before ANY CPU read of dn_state/conv history.
+def public moe_gpu_dn_flush(l : int64; var stp : float?; var histp : float?) {
+    invoke(g_moe_gpu_dn_flush, l, stp, histp)
+}
+
+//! Drop all device-resident deltanet state (the engine rebuilt/zeroed its CPU copies).
+def public moe_gpu_dn_invalidate() {
+    invoke(g_moe_gpu_dn_invalidate)
 }
 
 //! Loader contract: mark one full-attention layer's q/k/v/o plane quad resident on the tier —
@@ -1521,6 +1567,182 @@ def public set_moe_gpu_attn_route(on : bool) {
     g_moe_gpu_attn_route = on
 }
 
+// ===== heat-pinned expert cache (decode split-FFN) =====
+// The engine partitions each decode token's top-k against the tier's per-layer slot cache: hits
+// dispatch the GPU FFN chain ASYNC (begin/join around the concurrent CPU miss work). Engine owns heat policy (counters, re-pin advise); tier owns slots, uploads, the offset space.
+
+typedef MoeGpuHeatQueryFn = function<(l : int64; idx : int64 const?; k : int64;
+                                      var hit : int8?; var o1 : int64?; var o3 : int64?; var o2 : int64?) : int64>
+typedef MoeGpuHeatAdviseFn = function<(l : int64; b1 : int64; b3 : int64; b2 : int64; f1 : int; f3 : int; f2 : int;
+                                       n : int64; nfe : int64; ids : int64 const?; nids : int64) : void>
+typedef MoeGpuFfnBeginFn = function<(offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64;
+                                     xqp : int8 const?; xsp : float const?; n : int64; nfe : int64; nrows : int64;
+                                     f1 : int; f3 : int; f2 : int; is_gelu : bool) : void>
+typedef MoeGpuFfnJoinFn = function<(var goutp : float?) : void>
+
+[unused_argument(l, idx, k, hit, o1, o3, o2)]
+def private moe_gpu_unset_heat_query(l : int64; idx : int64 const?; k : int64;
+                                     var hit : int8?; var o1 : int64?; var o3 : int64?; var o2 : int64?) : int64 {
+    return 0l
+}
+
+[unused_argument(l, b1, b3, b2, f1, f3, f2, n, nfe, ids, nids)]
+def private moe_gpu_unset_heat_advise(l : int64; b1, b3, b2 : int64; f1, f3, f2 : int;
+                                      n, nfe : int64; ids : int64 const?; nids : int64) {}
+
+[unused_argument(offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)]
+def private moe_gpu_unset_ffn_begin(offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64;
+                                    xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64;
+                                    f1, f3, f2 : int; is_gelu : bool) {
+    panic("dasLLAMA: async GPU FFN begin hit without an installed GPU tier")
+}
+
+[unused_argument(goutp)]
+def private moe_gpu_unset_ffn_join(var goutp : float?) {
+    panic("dasLLAMA: async GPU FFN join hit without an installed GPU tier")
+}
+
+var g_moe_gpu_heat_query = @@moe_gpu_unset_heat_query
+var g_moe_gpu_heat_advise = @@moe_gpu_unset_heat_advise
+var g_moe_gpu_ffn_begin = @@moe_gpu_unset_ffn_begin
+var g_moe_gpu_ffn_join = @@moe_gpu_unset_ffn_join
+var g_moe_gpu_heat_installed = false
+var g_moe_gpu_heat_route = true
+
+//! Tier registration of the heat-cache surface (beside install_moe_gpu_tier).
+def public set_moe_gpu_heat_hooks(query : MoeGpuHeatQueryFn; advise : MoeGpuHeatAdviseFn;
+                                  begin : MoeGpuFfnBeginFn; join : MoeGpuFfnJoinFn) {
+    g_moe_gpu_heat_query = query
+    g_moe_gpu_heat_advise = advise
+    g_moe_gpu_ffn_begin = begin
+    g_moe_gpu_ffn_join = join
+    g_moe_gpu_heat_installed = true
+}
+
+def public moe_gpu_heat_on : bool {
+    return g_moe_gpu_heat_installed && g_moe_gpu_heat_route
+}
+
+//! Runtime routing gate over the heat cache (the --heat-ab in-process lever; pins/uploads stay).
+def public set_moe_gpu_heat_route(on : bool) {
+    g_moe_gpu_heat_route = on
+}
+
+// ===== shared-expert residency (decode, async behind the routed experts) =====
+
+var g_moe_gpu_shexp_layers : table<int64>   // layers whose shexp gate/up/down triple is resident
+var g_moe_gpu_shexp_route = true
+
+//! Loader contract: mark one layer's shared-expert triple resident on the tier. Reset per load.
+def public set_moe_gpu_shexp_layer(l : int64) {
+    g_moe_gpu_shexp_layers |> insert(l)
+}
+
+def public reset_moe_gpu_shexp_layers {
+    g_moe_gpu_shexp_layers |> clear()
+}
+
+def public moe_gpu_shexp_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_shexp_route && key_exists(g_moe_gpu_shexp_layers, l)
+}
+
+//! Runtime routing gate over the shared-expert marks (the --shexp-ab in-process lever).
+def public set_moe_gpu_shexp_route(on : bool) {
+    g_moe_gpu_shexp_route = on
+}
+
+// ===== decode q/k/v group (attention layers, one submit) =====
+// Serial-chain work — nothing hides behind it, so it pays only where the GPU reads the planes
+// faster than the CPU. That crossover moves with core count and card, hence the gate.
+
+typedef MoeGpuQkvFn = function<(var yq : float?; var yk : float?; var yv : float?;
+                                woq : int64; wok : int64; wov : int64; fq : int; fk : int; fv : int;
+                                xqp : int8 const?; xsp : float const?;
+                                n : int64; dq : int64; dk : int64; dv : int64) : void>
+
+[unused_argument(yq, yk, yv, woq, wok, wov, fq, fk, fv, xqp, xsp, n, dq, dk, dv)]
+def private moe_gpu_unset_qkv(var yq : float?; var yk : float?; var yv : float?;
+                              woq, wok, wov : int64; fq, fk, fv : int;
+                              xqp : int8 const?; xsp : float const?; n, dq, dk, dv : int64) {
+    panic("dasLLAMA: GPU qkv dispatch hit without an installed GPU tier")
+}
+
+var g_moe_gpu_qkv = @@moe_gpu_unset_qkv
+var g_moe_gpu_qkv_layers : table<int64>
+var g_moe_gpu_qkv_route = true
+
+//! Tier registration of the decode q/k/v group (beside install_moe_gpu_tier).
+def public set_moe_gpu_qkv_hook(f : MoeGpuQkvFn) {
+    g_moe_gpu_qkv = f
+}
+
+//! Loader contract: mark one attention layer's q/k/v triple resident. Reset per load.
+def public set_moe_gpu_qkv_layer(l : int64) {
+    g_moe_gpu_qkv_layers |> insert(l)
+}
+
+def public reset_moe_gpu_qkv_layers {
+    g_moe_gpu_qkv_layers |> clear()
+}
+
+def public moe_gpu_qkv_on_gpu(l : int64) : bool {
+    return g_moe_gpu_installed && g_moe_gpu_qkv_route && key_exists(g_moe_gpu_qkv_layers, l)
+}
+
+//! Runtime routing gate over the qkv marks (the --qkv-ab in-process lever; uploads stay).
+def public set_moe_gpu_qkv_route(on : bool) {
+    g_moe_gpu_qkv_route = on
+}
+
+//! One attention layer's q/k/v decode projections on the tier — one submit, one shared
+//! activation image (the three planes must share a quant class), results copied back per plane.
+def public matmul_gpu_qkv(var yq : array<float>; var yk : array<float>; var yv : array<float>;
+                          woq, wok, wov : int64; fq, fk, fv : int;
+                          xq : array<int8>; xs : array<float>; n, dq, dk, dv : int64) {
+    unsafe {
+        invoke(g_moe_gpu_qkv, addr(yq[0]), addr(yk[0]), addr(yv[0]), woq, wok, wov, fq, fk, fv,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, dq, dk, dv)
+    }
+}
+
+//! Partition the routed top-k against layer l's slot cache: hit[j] per original position,
+//! compacted synthetic offset triples for the hits (pool coordinates), returns the hit count.
+def public matmul_moe_gpu_heat_query(l : int64; idx : array<int64>; k : int64;
+                                     var hit : array<int8>; var o1, o3, o2 : array<int64>) : int64 {
+    unsafe {
+        return invoke(g_moe_gpu_heat_query, l, addr<int64 const?>(idx[0]), k,
+            addr(hit[0]), addr(o1[0]), addr(o3[0]), addr(o2[0]))
+    }
+}
+
+//! Re-pin advice for layer l: the desired hot set (ids, heat-descending), the layer's real plane
+//! bases + formats. The tier reconciles against its slots under its own upload budget.
+def public moe_gpu_heat_advise(l : int64; b1, b3, b2 : int64; f1, f3, f2 : int;
+                               n, nfe : int64; ids : array<int64>; nids : int64) {
+    unsafe {
+        invoke(g_moe_gpu_heat_advise, l, b1, b3, b2, f1, f3, f2, n, nfe, addr<int64 const?>(ids[0]), nids)
+    }
+}
+
+//! Async decode FFN: submit the hit chain, return before it completes (join collects gout).
+//! Exactly one begin may be in flight; the tier asserts the discipline.
+def public matmul_moe_gpu_ffn_begin(offs1 : array<int64>; offs3 : array<int64>; offs2 : array<int64>; nregions : int64;
+                                    xq : array<int8>; xs : array<float>; n, nfe, nrows : int64;
+                                    f1, f3, f2 : int; is_gelu : bool) {
+    unsafe {
+        invoke(g_moe_gpu_ffn_begin,
+            addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, nfe, nrows, f1, f3, f2, is_gelu)
+    }
+}
+
+//! Collect the pending async FFN's output rows (spin the fence, copy back).
+def public matmul_moe_gpu_ffn_join(var gout : array<float>) {
+    unsafe {
+        invoke(g_moe_gpu_ffn_join, addr(gout[0]))
+    }
+}
+
 // ===== GPU tier programmatic config + status =====
 // The setter mirror of the DASLLAMA_GPU_* env vars (env stays the override) plus the status
 // surface dashboards read — what is actually resident after a load, not what was requested.
@@ -1535,6 +1757,10 @@ struct GpuTierWant {
     dn : bool            //!< recurrent (deltanet) layers through the device chain
     attn : bool          //!< full-attention layers through the device chain
     dense : bool         //!< dense attention-side planes resident
+    dnd : bool           //!< deltanet DECODE step chain (implies the dn uploads)
+    heat : int64         //!< heat-pinned expert cache slots per layer C (0 = off; needs stream mirrors)
+    shexp : bool         //!< shared-expert triples resident; decode runs them async behind the routed experts
+    qkv : bool           //!< attention q/k/v triples resident; decode projects them in one submit
 }
 
 var g_gpu_want = GpuTierWant()
@@ -1574,6 +1800,18 @@ def public gpu_want_attn : bool
 
 def public gpu_want_dense : bool
     => has_env_variable("DASLLAMA_GPU_DENSE") ? get_env_variable("DASLLAMA_GPU_DENSE") == "1" : g_gpu_want.dense
+
+def public gpu_want_dnd : bool
+    => has_env_variable("DASLLAMA_GPU_DND") ? get_env_variable("DASLLAMA_GPU_DND") == "1" : g_gpu_want.dnd
+
+def public gpu_want_heat : int64
+    => has_env_variable("DASLLAMA_GPU_HEAT") ? env_int64("DASLLAMA_GPU_HEAT") : g_gpu_want.heat
+
+def public gpu_want_shexp : bool
+    => has_env_variable("DASLLAMA_GPU_SHEXP") ? get_env_variable("DASLLAMA_GPU_SHEXP") == "1" : g_gpu_want.shexp
+
+def public gpu_want_qkv : bool
+    => has_env_variable("DASLLAMA_GPU_QKV") ? get_env_variable("DASLLAMA_GPU_QKV") == "1" : g_gpu_want.qkv
 
 //! A GPU backend registers its arm probe here at ``[init]`` so config-driven arming works
 //! after module init (the env path arms at ``[init]`` directly).

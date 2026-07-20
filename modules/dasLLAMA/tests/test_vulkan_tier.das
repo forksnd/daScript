@@ -405,6 +405,150 @@ def test_vulkan_moe_ffn_streamed(t : T?) {
     }
 }
 
+// ===== heat-cache arm (slot pools, eviction, async split dispatch) =====
+
+// one q8 "layer" mirrored stream=true; advise pins a subset, a mixed top-k query splits, the
+// hits ride the async begin/join chain vs the CPU reference; a re-advise then flips the pinned
+// set (eviction + slice re-upload into freed slots) and the new hits re-verify
+let HWOFF = 40000000l
+let HSTRIDE = 100000l
+let HLAYER = 7l
+
+def private heat_hit_offs(o : array<int64>; nh : int64) : array<int64> {
+    var offs : array<int64>
+    offs |> reserve(int(nh) * 3)
+    for (i in range64(nh)) {
+        offs |> push(o[i])   // nolint:STYLE012 — triple-stride append
+        offs |> push(i)
+        offs |> push(1l)
+    }
+    return <- offs
+}
+
+[test]
+def test_vulkan_moe_heat_cache(t : T?) {
+    t |> run("vulkan heat-pinned expert cache == CPU reference (pins, eviction, split hits)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
+            var want = GpuTierWant()
+            want.heat = 2l   // two slots: the eviction/reuse choreography below assumes C = 2
+            set_gpu_tier_want(want)
+            let ege1 = NFE * N
+            let ege2 = N * NFE
+            var wq1 : array<int8>
+            var ws1 : array<float>
+            var wq3 : array<int8>
+            var ws3 : array<float>
+            var wq2 : array<int8>
+            var ws2 : array<float>
+            fill_stack(wq1, ws1, NE * NFE, N, 51l, true)
+            fill_stack(wq3, ws3, NE * NFE, N, 57l, true)
+            fill_stack(wq2, ws2, NE * N, NFE, 61l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(wq1, ws1, wqb, wsb)
+            let ok1 = moe_gpu_upload_stack(wqb, wsb, HWOFF, N, NE * NFE, 0, [stream = true])
+            pack_upload(wq3, ws3, wqb, wsb)
+            let ok3 = moe_gpu_upload_stack(wqb, wsb, HWOFF + HSTRIDE, N, NE * NFE, 0, [stream = true])
+            pack_upload(wq2, ws2, wqb, wsb)
+            let ok2 = moe_gpu_upload_stack(wqb, wsb, HWOFF + 2l * HSTRIDE, NFE, NE * N, 0, [stream = true])
+            if (!(ok1 && ok3 && ok2)) {
+                feint("no Vulkan device (or probe refused the stream uploads); skipping\n")
+                return
+            }
+            // pin experts {0, 2}; route the top-k [1, 0, 2] — expect 2 hits, expert 1 missing
+            var ids <- [0l, 2l]
+            moe_gpu_heat_advise(HLAYER, HWOFF, HWOFF + HSTRIDE, HWOFF + 2l * HSTRIDE, 0, 0, 0, N, NFE, ids, 2l)
+            var idx <- [1l, 0l, 2l]
+            var hit : array<int8>
+            var o1 : array<int64>
+            var o3 : array<int64>
+            var o2 : array<int64>
+            hit |> resize(3)
+            o1 |> resize(3)
+            o3 |> resize(3)
+            o2 |> resize(3)
+            var nh = matmul_moe_gpu_heat_query(HLAYER, idx, 3l, hit, o1, o3, o2)
+            t |> equal(2l, nh, "two of three routed experts hit the cache")
+            t |> success(hit[0] == int8(0) && hit[1] == int8(1) && hit[2] == int8(1), "hit mask matches the pinned set")
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, 2l)
+            var hoffs1 <- heat_hit_offs(o1, nh)
+            var hoffs3 <- heat_hit_offs(o3, nh)
+            var hoffs2 <- heat_hit_offs(o2, nh)
+            matmul_moe_gpu_ffn_begin(hoffs1, hoffs3, hoffs2, nh, xq, xs, N, NFE, nh, 0, 0, 0, false)
+            // the CPU reference runs BETWEEN begin and join — the overlap the split arm relies on
+            var roffs1 <- make_offs([0l, 2l], [0l, 1l], [1l, 1l], WOFF1, ege1)
+            var roffs3 <- make_offs([0l, 2l], [0l, 1l], [1l, 1l], WOFF3, ege1)
+            var roffs2 <- make_offs([0l, 2l], [0l, 1l], [1l, 1l], WOFF2, ege2)
+            var refv : array<float>
+            ref_ffn(roffs1, roffs3, roffs2, 2, wq1, ws1, wq3, ws3, wq2, ws2, xq, xs, 2l, refv)
+            var gout : array<float>
+            gout |> resize(int(2l * N))
+            matmul_moe_gpu_ffn_join(gout)
+            var c = compare_gout(gout, refv)
+            t |> success(c.maxref > 0.0, "hit dispatch produced non-trivial outputs")
+            t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
+                "async hit dispatch within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+            // flip the pinned set to {1}: evicts both slots, uploads expert 1 into a freed one
+            var ids2 <- [1l]
+            moe_gpu_heat_advise(HLAYER, HWOFF, HWOFF + HSTRIDE, HWOFF + 2l * HSTRIDE, 0, 0, 0, N, NFE, ids2, 1l)
+            nh = matmul_moe_gpu_heat_query(HLAYER, idx, 3l, hit, o1, o3, o2)
+            t |> equal(1l, nh, "re-pin leaves one hit")
+            t |> success(hit[0] == int8(1) && hit[1] == int8(0) && hit[2] == int8(0), "hit mask follows the re-pin")
+            fill_acts(xq, xs, 1l)
+            var eoffs1 <- heat_hit_offs(o1, nh)
+            var eoffs3 <- heat_hit_offs(o3, nh)
+            var eoffs2 <- heat_hit_offs(o2, nh)
+            matmul_moe_gpu_ffn_begin(eoffs1, eoffs3, eoffs2, nh, xq, xs, N, NFE, nh, 0, 0, 0, false)
+            var poffs1 <- make_offs([1l], [0l], [1l], WOFF1, ege1)
+            var poffs3 <- make_offs([1l], [0l], [1l], WOFF3, ege1)
+            var poffs2 <- make_offs([1l], [0l], [1l], WOFF2, ege2)
+            ref_ffn(poffs1, poffs3, poffs2, 1, wq1, ws1, wq3, ws3, wq2, ws2, xq, xs, 1l, refv)
+            gout |> resize(int(N))
+            matmul_moe_gpu_ffn_join(gout)
+            c = compare_gout(gout, refv)
+            t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
+                "post-eviction hit dispatch within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+            delete ids
+            delete ids2
+            delete idx
+            delete hit
+            delete o1
+            delete o3
+            delete o2
+            delete xq
+            delete xs
+            delete hoffs1
+            delete hoffs3
+            delete hoffs2
+            delete eoffs1
+            delete eoffs3
+            delete eoffs2
+            delete roffs1
+            delete roffs3
+            delete roffs2
+            delete poffs1
+            delete poffs3
+            delete poffs2
+            delete refv
+            delete gout
+            delete wq1
+            delete ws1
+            delete wq3
+            delete ws3
+            delete wq2
+            delete ws2
+            delete wqb
+            delete wsb
+        } else {
+            feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
+        }
+    }
+}
+
 // ===== native K-quant arms =====
 
 let KN = 512l        // kq model dim (TWO superblocks per row — nsb = 1 hides stride bugs)
@@ -1047,8 +1191,14 @@ def private ref_dn_core(qkvy, zy : array<float>; bts, gts, tapsv, wnormv, av, dt
                     }
                 }
             }
-            for (i in range64(cl * cl)) {   // unit-lower solve off the A' originals
-                p_tm[int(i)] = p_am[int(i)]
+            // unit-lower solve off the A' originals. The copy MUST be CS-strided: the w/d GEMMs
+            // below read T's diagonal and upper entries too, which the solve never writes — a
+            // linear cl*cl copy misses them for cl < CS (masked before this fix because every
+            // fixture's FIRST chunk was exactly CS, pre-seeding diag = 1 / upper = 0)
+            for (i in range64(cl)) {
+                for (jc in range64(cl)) {
+                    p_tm[int(i * CS + jc)] = p_am[int(i * CS + jc)]
+                }
             }
             for (i in range64(cl)) {
                 for (jc in range64(i)) {
@@ -1308,6 +1458,247 @@ def test_vulkan_deltanet(t : T?) {
             delete wsb
         } else {
             feint("dasVulkan not installed; vulkan deltanet chain untestable here\n")
+        }
+    }
+}
+
+// ===== the deltanet decode-step arm =====
+// npos == 1 through the same MoeGpuDnFn: per-token submits with DEVICE-resident state and conv
+// ring, vs the same CPU mirror run once over all tokens (chunking is an algebraic identity —
+// only f32 drift separates cl = 1 steps from one cl = T chunk). The flush at token 4 exercises
+// the whole residency seam: device -> CPU sync, then a cold re-upload from the flushed state,
+// and the final outputs must still match the straight-through reference.
+
+let DNSQ_WOFF = 17000000l
+let DNSZ_WOFF = 18000000l
+let DNSO_WOFF = 19000000l
+let DNSTEPS = 8l
+
+[test]
+def test_vulkan_deltanet_step(t : T?) {
+    t |> run("vulkan deltanet decode step == CPU reference (state carry + mid-sequence flush)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            var wqkv : array<int8>
+            var wsqkv : array<float>
+            var wz : array<int8>
+            var wsz : array<float>
+            var wo : array<int8>
+            var wso : array<float>
+            fill_stack(wqkv, wsqkv, DNCD, DND, 61l, true)
+            fill_stack(wz, wsz, DNDI, DND, 67l, true)
+            fill_stack(wo, wso, DND, DNDI, 71l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(wqkv, wsqkv, wqb, wsb)
+            if (!moe_gpu_upload_stack(wqb, wsb, DNSQ_WOFF, DND, DNCD, 0)) {
+                feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                return
+            }
+            pack_upload(wz, wsz, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, DNSZ_WOFF, DND, DNDI, 0), "z stack uploaded")
+            pack_upload(wo, wso, wqb, wsb)
+            t |> success(moe_gpu_upload_stack(wqb, wsb, DNSO_WOFF, DNDI, DND, 0), "out stack uploaded")
+            set_moe_gpu_dn_layer(0l, DNSQ_WOFF)   // the flush hook resolves layer -> tier state by this
+            var xq : array<int8>
+            var xs : array<float>
+            xq |> resize(int(DNSTEPS * DND))
+            xs |> resize(int(DNSTEPS * (DND / 32l)))
+            for (i in range(int(DNSTEPS * DND))) {
+                xq[i] = int8((int64(i) * 13l + 5l) % 255l - 127l)
+            }
+            for (i in range(int(DNSTEPS * (DND / 32l)))) {
+                xs[i] = pow2_small(int64(i) + 2l)
+            }
+            var bts : array<float>
+            var gts : array<float>
+            bts |> resize(int(DNSTEPS * DNVH))
+            gts |> resize(int(DNSTEPS * DNVH))
+            for (i in range(int(DNSTEPS * DNVH))) {
+                bts[i] = synth_f(int64(i), 3l, 1.5)
+                gts[i] = synth_f(int64(i), 11l, 1.5)
+            }
+            var tapsv : array<float>
+            tapsv |> resize(int(DNCD * DNCONV))
+            for (i in range(int(DNCD * DNCONV))) {
+                tapsv[i] = synth_f(int64(i), 17l, 0.25)
+            }
+            var wnormv : array<float>
+            wnormv |> resize(int(DNDS))
+            for (i in range(int(DNDS))) {
+                wnormv[i] = 1.0 + synth_f(int64(i), 19l, 0.3)
+            }
+            var av : array<float>
+            var dtv : array<float>
+            av |> resize(int(DNVH))
+            dtv |> resize(int(DNVH))
+            for (i in range(int(DNVH))) {
+                av[i] = -(0.3 + abs(synth_f(int64(i), 23l, 1.2)))
+                dtv[i] = synth_f(int64(i), 29l, 0.4)
+            }
+            var state0 : array<float>
+            state0 |> resize(int(DNVH * DNDS * DNDS))
+            for (i in range(int(DNVH * DNDS * DNDS))) {
+                state0[i] = synth_f(int64(i), 47l, 0.1)
+            }
+            var hist0 : array<float>
+            hist0 |> resize(int(DNCD * DNTAPS))
+            for (i in range(int(DNCD * DNTAPS))) {
+                hist0[i] = synth_f(int64(i), 43l, 0.5)
+            }
+            // references: the straight-through 8-token mirror and the 4-token prefix (flush point)
+            var qkvy : array<float>
+            var zy : array<float>
+            ref_q8_gemm(wqkv, wsqkv, xq, xs, DND, DNCD, DNSTEPS, qkvy)
+            ref_q8_gemm(wz, wsz, xq, xs, DND, DNDI, DNSTEPS, zy)
+            var rstate : array<float>
+            var rstate4 : array<float>
+            rstate := state0
+            rstate4 := state0
+            var refy : array<float>
+            var refconv : array<float>
+            ref_dn_core(qkvy, zy, bts, gts, tapsv, wnormv, av, dtv, rstate, hist0, DNSTEPS, wo, wso, refy, refconv)
+            var qkvy4 : array<float>
+            var zy4 : array<float>
+            var bts4 : array<float>
+            var gts4 : array<float>
+            qkvy4 |> resize(int(4l * DNCD))
+            zy4 |> resize(int(4l * DNDI))
+            bts4 |> resize(int(4l * DNVH))
+            gts4 |> resize(int(4l * DNVH))
+            for (i in range(int(4l * DNCD))) {
+                qkvy4[i] = qkvy[i]
+            }
+            for (i in range(int(4l * DNDI))) {
+                zy4[i] = zy[i]
+            }
+            for (i in range(int(4l * DNVH))) {
+                bts4[i] = bts[i]
+                gts4[i] = gts[i]
+            }
+            var refy4 : array<float>
+            var refconv4 : array<float>
+            ref_dn_core(qkvy4, zy4, bts4, gts4, tapsv, wnormv, av, dtv, rstate4, hist0, 4l, wo, wso, refy4, refconv4)
+            var reft : array<float>
+            var reft4 : array<float>
+            reft |> resize(int(DNTAPS * DNCD))
+            reft4 |> resize(int(DNTAPS * DNCD))
+            for (k in range64(DNTAPS)) {   // ring references, CPU channel-major
+                for (ch in range64(DNCD)) {
+                    reft[int(ch * DNTAPS + k)] = qkvy[int((DNSTEPS - DNTAPS + k) * DNCD + ch)]
+                    reft4[int(ch * DNTAPS + k)] = qkvy[int((4l - DNTAPS + k) * DNCD + ch)]
+                }
+            }
+            // the step arm: gstate/gring are THE engine-side CPU state — cold-uploaded at token 0,
+            // flushed back (and re-uploaded from) at token 4, flushed again after token 7
+            var gstate : array<float>
+            var gring : array<float>
+            gstate := state0
+            gring := hist0
+            var y : array<float>
+            y |> resize(int(DNSTEPS * DND))
+            var y1 : array<float>
+            var xq1 : array<int8>
+            var xs1 : array<float>
+            var b1 : array<float>
+            var g1 : array<float>
+            var tail1 : array<float>
+            y1 |> resize(int(DND))
+            xq1 |> resize(int(DND))
+            xs1 |> resize(int(DND / 32l))
+            b1 |> resize(int(DNVH))
+            g1 |> resize(int(DNVH))
+            tail1 |> resize(int(DNTAPS * DNCD))
+            for (tok in range64(DNSTEPS)) {
+                for (i in range64(DND)) {
+                    xq1[int(i)] = xq[int(tok * DND + i)]
+                }
+                for (i in range64(DND / 32l)) {
+                    xs1[int(i)] = xs[int(tok * (DND / 32l) + i)]
+                }
+                for (i in range64(DNVH)) {
+                    b1[int(i)] = bts[int(tok * DNVH + i)]
+                    g1[int(i)] = gts[int(tok * DNVH + i)]
+                }
+                unsafe {
+                    matmul_moe_gpu_dn(y1, DNSQ_WOFF, DNSZ_WOFF, DNSO_WOFF, xq1, xs1, b1, g1,
+                        addr<float const?>(tapsv[0]), addr<float const?>(wnormv[0]),
+                        addr<float const?>(av[0]), addr<float const?>(dtv[0]),
+                        addr(gstate[0]), tail1, addr<float const?>(gring[0]),
+                        1l, DND, DNCD, DNKD, DNDI, DNVH, DNKH, DNDS, DNCONV, DN_EPS)
+                }
+                for (i in range64(DND)) {
+                    y[int(tok * DND + i)] = y1[int(i)]
+                }
+                if (tok == 3l) {
+                    unsafe {
+                        moe_gpu_dn_flush(0l, addr(gstate[0]), addr(gring[0]))
+                    }
+                    let cs4 = compare_gout(gstate, rstate4)
+                    t |> success(cs4.maxdiff <= float(DN_REL_TOL) * cs4.maxref,
+                        "flushed state at token 4 within tolerance (maxdiff {cs4.maxdiff} vs {float(DN_REL_TOL) * cs4.maxref} bar)")
+                    let cr4 = compare_gout(gring, reft4)
+                    t |> success(cr4.maxdiff <= float(REL_TOL) * cr4.maxref,
+                        "flushed conv ring at token 4 within tolerance (maxdiff {cr4.maxdiff} vs {float(REL_TOL) * cr4.maxref} bar)")
+                }
+            }
+            unsafe {
+                moe_gpu_dn_flush(0l, addr(gstate[0]), addr(gring[0]))
+            }
+            let cy = compare_gout(y, refy)
+            t |> success(cy.maxref > 0.0, "step chain produced non-trivial outputs")
+            t |> success(cy.maxdiff <= float(DN_REL_TOL) * cy.maxref,
+                "step out rows across the flush within tolerance (maxdiff {cy.maxdiff} vs {float(DN_REL_TOL) * cy.maxref} bar, maxref {cy.maxref})")
+            let cs = compare_gout(gstate, rstate)
+            t |> success(cs.maxdiff <= float(DN_REL_TOL) * cs.maxref,
+                "final state within tolerance (maxdiff {cs.maxdiff} vs {float(DN_REL_TOL) * cs.maxref} bar)")
+            let cr = compare_gout(gring, reft)
+            t |> success(cr.maxdiff <= float(REL_TOL) * cr.maxref,
+                "final conv ring within tolerance (maxdiff {cr.maxdiff} vs {float(REL_TOL) * cr.maxref} bar)")
+            reset_moe_gpu_dn_layers()
+            delete wqkv
+            delete wsqkv
+            delete wz
+            delete wsz
+            delete wo
+            delete wso
+            delete wqb
+            delete wsb
+            delete xq
+            delete xs
+            delete bts
+            delete gts
+            delete tapsv
+            delete wnormv
+            delete av
+            delete dtv
+            delete state0
+            delete hist0
+            delete qkvy
+            delete zy
+            delete rstate
+            delete rstate4
+            delete refy
+            delete refconv
+            delete qkvy4
+            delete zy4
+            delete bts4
+            delete gts4
+            delete refy4
+            delete refconv4
+            delete reft
+            delete reft4
+            delete gstate
+            delete gring
+            delete y
+            delete y1
+            delete xq1
+            delete xs1
+            delete b1
+            delete g1
+            delete tail1
+        } else {
+            feint("dasVulkan not installed; vulkan deltanet decode step untestable here\n")
         }
     }
 }

@@ -1777,12 +1777,15 @@ def moe_gpu_upload_resident(var t : Model) {
     reset_moe_gpu_dense_offs()
     reset_moe_gpu_dn_layers()
     reset_moe_gpu_attn_layers()
+    reset_moe_gpu_shexp_layers()
+    reset_moe_gpu_qkv_layers()
     set_moe_gpu_model_support("")
     let nstream = gpu_want_moe_stream()
-    let dn_want = gpu_want_dn()
+    let dn_want = gpu_want_dn() || gpu_want_dnd()   // the decode step rides the same dn uploads
     let at_want = gpu_want_attn()
     if (!moe_gpu_tier_installed()
-            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want)) {
+            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want
+                && !gpu_want_shexp() && !gpu_want_qkv())) {
         return   // tier absent or nothing requested
     }
     // capability guard: the tier serves q8-mode MoE models only — record WHY for the status
@@ -1864,6 +1867,40 @@ def moe_gpu_upload_resident(var t : Model) {
             to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: {dense_marked} dense planes resident\n")
         }
     }
+    // shared-expert triples — DASLLAMA_GPU_SHEXP=1 opt-in. Dense (every token, every layer, one
+    // fixed weight set) so residency carries no miss term; q8 only (the repack registers them fmt 0).
+    if (gpu_want_shexp() && t.config.n_ff_shexp > 0l && !t.config.moe_dense_shexp) {
+        let nsh = t.config.n_ff_shexp
+        let she = dim * nsh
+        var sh_marked = 0l
+        for (l in range64(layers)) {
+            var uploads <- [(woff = t.wsh1_off + l * she, n = dim, rows = nsh),
+                            (woff = t.wsh3_off + l * she, n = dim, rows = nsh),
+                            (woff = t.wsh2_off + l * she, n = nsh, rows = dim)]
+            var ok = true
+            var done = 0
+            for (u in uploads) {
+                if (!moe_gpu_gather_upload(t, KqFmt.q8, u.woff, u.n, u.rows, u.rows, mr, kgroup, wbias, wq, ws)) {
+                    ok = false
+                    break
+                }
+                done++
+            }
+            if (!ok) {
+                moe_gpu_drop_stacks(done, false)   // partial triple rolls back (the resident-walk rule)
+                delete uploads
+                break
+            }
+            // deliberately NOT set_moe_gpu_dense_off: that would also route the PREFILL shexp GEMMs
+            // onto the dense rail (a separately measured wash) and stop this being a decode-only lever
+            set_moe_gpu_shexp_layer(l)
+            sh_marked++
+            delete uploads
+        }
+        if (sh_marked > 0l) {
+            to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: shared experts of {sh_marked} layers resident\n")
+        }
+    }
     // deltanet triples third — DASLLAMA_GPU_DN=1 opt-in: each recurrent layer's qkv/z-gate/
     // out-proj planes + the layer mark that routes its whole prefill attention through the
     // device chain. Layer-ascending; a budget stop leaves later layers CPU, a partial triple rolls back.
@@ -1876,7 +1913,7 @@ def moe_gpu_upload_resident(var t : Model) {
                 continue
             }
             if (moe_gpu_dense_on_gpu(int(KqFmt.q8), t.dnqkv_offs[l])) {
-                set_moe_gpu_dn_layer(l)
+                set_moe_gpu_dn_layer(l, t.dnqkv_offs[l])
                 dn_marked++
                 continue
             }
@@ -1899,7 +1936,7 @@ def moe_gpu_upload_resident(var t : Model) {
                 dn_stop = true
             }
             break if (dn_stop)
-            set_moe_gpu_dn_layer(l)
+            set_moe_gpu_dn_layer(l, t.dnqkv_offs[l])
             dn_marked++
         }
         if (dn_marked > 0l) {
@@ -1968,6 +2005,46 @@ def moe_gpu_upload_resident(var t : Model) {
         }
         if (at_marked > 0l) {
             to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: attention quads of {at_marked} layers resident\n")
+        }
+    }
+    // attention q/k/v triples — DASLLAMA_GPU_QKV=1 opt-in. LAST of the dense rails ON PURPOSE: it
+    // is the lowest-value one and an earlier section exhausting stacks/VRAM starves those behind it
+    // (a 224-stack cap once cut 6 DN layers = -14% tg). Pays only where GPU reads beat CPU reads.
+    if (gpu_want_qkv()) {
+        var qkv_marked = 0l
+        for (l in range64(layers)) {
+            continue if (layer_is_recurrent(t.config, l) || t.kv_src[l] != l || moe_gpu_attn_on_gpu(l))
+            let qd = layer_qd(t.config, l)
+            let kv = layer_kv_dim(t.config, l)
+            let fq = fmt_at(t.wq_fmt, l)
+            let fk = fmt_at(t.wk_fmt, l)
+            let fv = fmt_at(t.wv_fmt, l)
+            // one shared activation image ⇒ the three planes must agree on quant CLASS
+            let cls_ok = (fq == KqFmt.q8) == (fk == KqFmt.q8) && (fq == KqFmt.q8) == (fv == KqFmt.q8)
+            continue if (t.wq_offs[l] < 0l || t.wk_offs[l] < 0l || t.wv_offs[l] < 0l || !cls_ok
+                || !kq_servable(t, fq) || !kq_servable(t, fk) || !kq_servable(t, fv))
+            var uploads <- [(f = fq, woff = t.wq_offs[l], n = dim, rows = t.config.q_gated ? 2l * qd : qd),
+                            (f = fk, woff = t.wk_offs[l], n = dim, rows = kv),
+                            (f = fv, woff = t.wv_offs[l], n = dim, rows = kv)]
+            var done = 0
+            var ok = true
+            for (u in uploads) {
+                if (!moe_gpu_gather_upload(t, u.f, u.woff, u.n, u.rows, u.rows, mr, kgroup, wbias, wq, ws)) {
+                    ok = false
+                    break
+                }
+                done++
+            }
+            delete uploads
+            if (!ok) {
+                moe_gpu_drop_stacks(done, false)   // partial triple rolls back
+                break
+            }
+            set_moe_gpu_qkv_layer(l)
+            qkv_marked++
+        }
+        if (qkv_marked > 0l) {
+            to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: q/k/v of {qkv_marked} attention layers resident\n")
         }
     }
     for (i in range64(want)) {
@@ -3559,6 +3636,12 @@ struct Session {
     moe_dn : array<float>       // fused down outputs (k x dim)
     moe_dq : array<int8>        // the k activated-hidden rows requantized (k x n_ff_exp)
     moe_ds : array<float>       // ... and their scales (k x n_ff_exp / 32)
+    // heat-cache split-FFN scratch (decode: hits ride the GPU chain async, misses stay CPU)
+    moe_hdn : array<float>      // GPU hit-expert down outputs, compacted (nhits x dim)
+    heat_hit : array<int8>      // per routed position: 1 = served by the heat cache
+    heat_o1 : array<int64>      // compacted pool-coordinate offsets for the hit dispatch
+    heat_o3 : array<int64>
+    heat_o2 : array<int64>
     // the layer's rmsnormed activation quantized ONCE and reused across every expert's gate/up
     // matmul — dedicated buffers because the down-projections quantize s.hb into the shared xq/xs
     moe_xq : array<int8>        // xb's Q8 quants (dim)
@@ -5025,6 +5108,19 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
     let fq = fmt_at(t.wq_fmt, l)
     let fk = fmt_at(t.wk_fmt, l)
     let fv = fmt_at(t.wv_fmt, l)
+    if (moe_gpu_qkv_on_gpu(l)) {   // resident triple: all three projections in one device submit
+        let qrows = c.q_gated ? 2l * qd : qd
+        if (fq == KqFmt.q8) {
+            quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+            matmul_gpu_qkv(s.q, s.k, s.v, qoff, koff, voff, int(fq), int(fk), int(fv),
+                s.xq, s.xs, dim, qrows, kv, kv)
+        } else {
+            quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
+            matmul_gpu_qkv(s.q, s.k, s.v, qoff, koff, voff, int(fq), int(fk), int(fv),
+                s.kxq, s.kxs, dim, qrows, kv, kv)
+        }
+        return
+    }
     if (voff < 0l) {
         // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection, fused into the weightless V-norm
         mm_f(s.q, t, fq, qoff, s.xb, s.xq, s.xs, s.xbs, dim, qd)
@@ -6483,8 +6579,59 @@ def private dn_token_core(t : Model; var s : Session; l : int64; qkv : float con
     }
 }
 
+// The deltanet decode step as ONE device chain (npos=1 through MoeGpuDnFn): CPU keeps norm +
+// raw β/α + the q8 image. State/conv history live DEVICE-SIDE across steps — dn_flush_layer /
+// moe_gpu_dn_invalidate are the sync seams for every CPU consumer.
+def private deltanet_decode_gpu(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    let dim = c.dim
+    let cd = dn_conv_dim(c)
+    let kd = dn_key_dim(c)
+    let di = c.ssm_d_inner
+    let nvh = c.ssm_dt_rank
+    let nkh = c.ssm_n_group
+    let ds = c.ssm_d_state
+    let dconv = c.ssm_d_conv
+    let taps = dconv - 1l
+    let ts_norm0 = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
+    prof_add("norm", ts_norm0)
+    let ts_qkv = ref_time_ticks()
+    if (t.dn_ba_f32) {   // F32-on-disk beta/alpha matmul fp32, like llama.cpp
+        mm_fblob(s.dn_beta, t, t.dn_betaf_off + l * dim * nvh, s.xb, dim, nvh)
+        mm_fblob(s.dn_g, t, t.dn_alphaf_off + l * dim * nvh, s.xb, dim, nvh)
+    } else {
+        mm_f(s.dn_beta, t, KqFmt.q8, t.dnbeta_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
+        mm_f(s.dn_g, t, KqFmt.q8, t.dnalpha_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
+    }
+    quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)   // one Q8_0 image serves the qkv AND z GEMVs
+    prof_add("mm_qkv", ts_qkv)
+    let ts_gpu = ref_time_ticks()
+    s.dn_tail |> resize(int(taps * cd))   // contract slot only — the step arm never writes it
+    unsafe {
+        matmul_moe_gpu_dn(s.xb2, t.dnqkv_offs[l], t.dngate_offs[l], t.dnout_offs[l],
+            s.xq, s.xs, s.dn_beta, s.dn_g,
+            addr < float const? >(t.fblob[t.dn_conv_off + l * dconv * cd]),
+            addr < float const? >(t.fblob[t.dn_norm_off + l * ds]),
+            addr < float const? >(t.fblob[t.dn_a_off + l * nvh]),
+            addr < float const? >(t.fblob[t.dn_dt_off + l * nvh]),
+            addr(s.dn_state[s.dn_state_prefix[l]]), s.dn_tail,
+            addr < float const? >(s.dn_conv_state[s.dn_conv_prefix[l]]),
+            1l, dim, cd, kd, di, nvh, nkh, ds, dconv, c.norm_eps)
+    }
+    prof_add("dn_gpu", ts_gpu)
+    let ts_resid = ref_time_ticks()
+    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb2[0])), dim)
+    prof_add("act_resid", ts_resid)
+}
+
 // attn-norm → fused qkv/z/β/α projections → per-token deltanet core → ssm_out projection → residual.
 def private deltanet_decode(t : Model; var s : Session; l : int64) {
+    if (moe_gpu_dnd_on_gpu(l)) {
+        deltanet_decode_gpu(t, s, l)
+        return
+    }
+    dn_flush_layer(s, l)   // device state may be dirty from earlier GPU steps (route flip)
     let c = t.config
     let dim = c.dim
     let cd = dn_conv_dim(c)
@@ -6676,6 +6823,23 @@ def private dn_reset(var s : Session) {
     }
     for (i in range64(int64(length(s.dn_state)))) {
         s.dn_state[i] = 0.0
+    }
+    moe_gpu_dn_invalidate()   // CPU zeros are now authoritative — drop any device-resident copies
+}
+
+// Sync one layer's device-resident deltanet state down before a CPU read (no-op when clean).
+def private dn_flush_layer(var s : Session; l : int64) {
+    if (l < int64(length(s.dn_state_prefix)) && s.dn_state_prefix[l] >= 0l) {
+        unsafe {
+            moe_gpu_dn_flush(l, addr(s.dn_state[s.dn_state_prefix[l]]),
+                addr(s.dn_conv_state[s.dn_conv_prefix[l]]))
+        }
+    }
+}
+
+def private dn_flush_all(var s : Session) {
+    for (l in range64(int64(length(s.dn_state_prefix)))) {
+        dn_flush_layer(s, l)
     }
 }
 
@@ -6913,6 +7077,268 @@ def private moe_shexp_gate(t : Model; l : int64; xp : float const?) : float {
     }
 }
 
+// ===== cross-token expert reuse instrument (decode) =====
+// DASLLAMA_EXPERT_REUSE=1 arms per-layer recording of decode expert picks — the data gate for
+// the hot-expert decode cache (only cross-token reuse pays; per-token streaming loses).
+
+let private REUSE_CAPS = fixed_array(8l, 16l, 32l, 64l)   // simulated per-layer LRU capacities
+
+struct private ReuseLayer {
+    freq : array<int64>    // per-expert pick count (static-pinning oracle input)
+    prev : array<int64>    // previous token's picks
+    prevn : int64
+    lru : array<int64>     // the simulated LRU lists, flattened at cap-sum offsets
+    lrun : int64[4]
+    hits : int64[4]
+    consec : int64         // picks already picked at the previous token
+    accesses : int64
+    tokens : int64
+}
+
+var private g_reuse_on = -1
+var private g_reuse : array<ReuseLayer>
+
+// ===== heat-cache policy (the live half of the reuse instrument) =====
+// Decaying per-(layer, expert) pick counters drive an interval re-pin: every HEAT_REPIN tokens
+// (staggered by layer so uploads spread) the layer's top-C ids go to the tier via advise.
+
+let private HEAT_DECAY = 256l    // halve the counters every this many tokens (per layer)
+let private HEAT_REPIN = 64l     // advise interval (per layer, layer-staggered)
+
+struct private HeatLayer {
+    cnt : array<float>     // decaying pick counters (n_expert)
+    tokens : int64
+    hits : int64           // routed picks the slot cache served
+    picks : int64          // ... out of this many
+}
+
+var private g_heat : array<HeatLayer>
+var private g_heat_want = -1l    // cached gpu_want_heat() (env read once)
+
+//! Mean/per-layer heat-cache hit rate over the run (the split-FFN's coverage — the LRU sim in
+//! expert_reuse_report is an ORACLE, this is what the live pins actually caught).
+def heat_report(verbose : bool = false) {
+    var hits = 0l
+    var picks = 0l
+    var nl = 0
+    for (li in range(length(g_heat))) {
+        let h & = unsafe(g_heat[li])
+        continue if (h.picks == 0l)
+        nl++
+        hits += h.hits
+        picks += h.picks
+        if (verbose) {
+            to_log(LOG_INFO, "heat L{li} hit {double(h.hits) * 100.0lf / double(h.picks):.1f}% ({h.hits}/{h.picks})\n")
+        }
+    }
+    if (picks == 0l) {
+        to_log(LOG_INFO, "heat: no data (cache never queried)\n")
+        return
+    }
+    to_log(LOG_INFO, "heat MEAN hit {double(hits) * 100.0lf / double(picks):.1f}% ({hits}/{picks} picks over {nl} layers)\n")
+}
+
+def heat_report_reset() {
+    for (h in g_heat) {
+        h.hits = 0l
+        h.picks = 0l
+    }
+}
+
+def private heat_armed() : bool {
+    if (g_heat_want < 0l) {
+        g_heat_want = max(gpu_want_heat(), 0l)
+    }
+    return g_heat_want > 0l && moe_gpu_heat_on()
+}
+
+def private heat_advise_layer(t : Model; l : int64; h : HeatLayer) {
+    let c = t.config
+    var ids <- [for (i in range(length(h.cnt))); int64(i)]
+    ids |> sort() $(a, b) => h.cnt[a] > h.cnt[b]
+    var want = min(g_heat_want, int64(length(ids)))
+    while (want > 0l && h.cnt[ids[want - 1l]] <= 0.0) {   // never pin never-picked experts
+        want--
+    }
+    if (want > 0l) {
+        moe_gpu_heat_advise(l, t.we1_offs[l], t.we3_offs[l], t.we2_offs[l],
+            int(fmt_at(t.we1_fmt, l)), int(fmt_at(t.we3_fmt, l)), int(fmt_at(t.we2_fmt, l)),
+            c.dim, c.n_ff_exp, ids, want)
+    }
+    delete ids
+}
+
+def private heat_note_and_advise(t : Model; l : int64; idx : array<int64>; k, ne : int64) {
+    let li = int(l)
+    if (length(g_heat) <= li) {
+        g_heat |> resize(li + 1)
+    }
+    var h & = unsafe(g_heat[li])
+    if (length(h.cnt) < int(ne)) {
+        h.cnt |> resize(int(ne))
+    }
+    for (j in range64(k)) {
+        h.cnt[idx[j]]++
+    }
+    h.tokens++
+    if (h.tokens % HEAT_DECAY == 0l) {
+        for (i in range(length(h.cnt))) {
+            h.cnt[i] *= 0.5
+        }
+    }
+    if ((h.tokens + l) % HEAT_REPIN == 0l) {
+        heat_advise_layer(t, l, h)
+    }
+}
+
+def private expert_reuse_armed() : bool {
+    if (g_reuse_on < 0) {
+        g_reuse_on = get_env_variable("DASLLAMA_EXPERT_REUSE") == "1" ? 1 : 0
+    }
+    return g_reuse_on == 1
+}
+
+//! Arm/disarm the reuse counter programmatically (benches; the env is for probes/servers).
+def set_expert_reuse(on : bool) {
+    g_reuse_on = on ? 1 : 0
+}
+
+def private expert_reuse_note(l : int64; idx : array<int64>; k, ne : int64) {
+    let li = int(l)
+    if (length(g_reuse) <= li) {
+        g_reuse |> resize(li + 1)
+    }
+    var r & = unsafe(g_reuse[li])
+    if (length(r.freq) < int(ne)) {
+        r.freq |> resize(int(ne))
+        r.lru |> resize(120)   // sum of REUSE_CAPS
+        r.prev |> resize(int(k))
+    }
+    for (j in range64(k)) {
+        let id = idx[j]
+        r.freq[id]++
+        r.accesses++
+        for (p in range64(r.prevn)) {
+            if (r.prev[p] == id) {
+                r.consec++
+                break
+            }
+        }
+        var base = 0l
+        for (ci in range(4)) {
+            let cap = REUSE_CAPS[ci]
+            var found = -1l
+            for (p in range64(r.lrun[ci])) {
+                if (r.lru[base + p] == id) {
+                    found = p
+                    break
+                }
+            }
+            if (found >= 0l) {
+                r.hits[ci]++
+            } else {
+                if (r.lrun[ci] < cap) {
+                    r.lrun[ci]++
+                }
+                found = r.lrun[ci] - 1l   // lands most-recent; the true LRU tail falls off when full
+            }
+            var p = found
+            while (p > 0l) {
+                r.lru[base + p] = r.lru[base + p - 1l]
+                p--
+            }
+            r.lru[base] = id
+            base += cap
+        }
+    }
+    for (j in range64(k)) {
+        r.prev[j] = idx[j]
+    }
+    r.prevn = k
+    r.tokens++
+}
+
+//! Print the decode expert-reuse report accumulated under ``DASLLAMA_EXPERT_REUSE=1``: per layer
+//! (``verbose`` only), simulated LRU hit rates at capacities 8/16/32/64, static top-C frequency
+//! coverage (the whole-run pinning oracle), and consecutive-token overlap.
+def expert_reuse_report(verbose : bool = true) {
+    var nl = 0
+    for (r in g_reuse) {
+        if (r.accesses > 0l) {
+            nl++
+        }
+    }
+    var sum_hits : int64[4]
+    var sum_cov : int64[4]
+    var sum_consec = 0l
+    var sum_acc = 0l
+    var toks = 0l
+    for (li in range(length(g_reuse))) {
+        var r & = unsafe(g_reuse[li])
+        if (r.accesses == 0l) {
+            continue
+        }
+        toks = max(toks, r.tokens)
+        // static top-C coverage: sort a frequency copy descending, prefix-sum at each capacity
+        var f := r.freq
+        f |> sort() $(a, b) => a > b
+        var cov : int64[4]
+        var acc = 0l
+        var fi = 0
+        for (ci in range(4)) {
+            while (int64(fi) < min(REUSE_CAPS[ci], int64(length(f)))) {
+                acc += f[fi]
+                fi++
+            }
+            cov[ci] = acc
+            sum_cov[ci] += acc
+        }
+        delete f
+        let a = double(r.accesses)
+        let ltag = li < 10 ? "L0" : "L"
+        if (verbose) {
+            to_log(LOG_INFO, "{ltag}{li} lru {double(r.hits[0]) * 100.0lf / a:.1f}/{double(r.hits[1]) * 100.0lf / a:.1f}/{double(r.hits[2]) * 100.0lf / a:.1f}/{double(r.hits[3]) * 100.0lf / a:.1f}%  top {double(cov[0]) * 100.0lf / a:.1f}/{double(cov[1]) * 100.0lf / a:.1f}/{double(cov[2]) * 100.0lf / a:.1f}/{double(cov[3]) * 100.0lf / a:.1f}%  consec {double(r.consec) * 100.0lf / a:.1f}%\n")
+        }
+        for (ci in range(4)) {
+            sum_hits[ci] += r.hits[ci]
+        }
+        sum_consec += r.consec
+        sum_acc += r.accesses
+    }
+    if (sum_acc == 0l) {
+        to_log(LOG_INFO, "expert-reuse: no data (DASLLAMA_EXPERT_REUSE=1 not set, or no decode ran)\n")
+        return
+    }
+    let a = double(sum_acc)
+    to_log(LOG_INFO, "MEAN lru {double(sum_hits[0]) * 100.0lf / a:.1f}/{double(sum_hits[1]) * 100.0lf / a:.1f}/{double(sum_hits[2]) * 100.0lf / a:.1f}/{double(sum_hits[3]) * 100.0lf / a:.1f}%  top {double(sum_cov[0]) * 100.0lf / a:.1f}/{double(sum_cov[1]) * 100.0lf / a:.1f}/{double(sum_cov[2]) * 100.0lf / a:.1f}/{double(sum_cov[3]) * 100.0lf / a:.1f}%  consec {double(sum_consec) * 100.0lf / a:.1f}%  (caps {REUSE_CAPS[0]}/{REUSE_CAPS[1]}/{REUSE_CAPS[2]}/{REUSE_CAPS[3]}, tokens {toks}, layers-with-data {nl})\n")
+    // the transfer-budget view: cache misses per token per layer at each capacity
+    let tl = double(sum_acc) / (toks > 0l ? double(toks) : 1.0lf)
+    to_log(LOG_INFO, "miss/tok/layer lru {(a - double(sum_hits[0])) / a * tl / double(nl > 0 ? nl : 1):.2f}/{(a - double(sum_hits[1])) / a * tl / double(nl > 0 ? nl : 1):.2f}/{(a - double(sum_hits[2])) / a * tl / double(nl > 0 ? nl : 1):.2f}/{(a - double(sum_hits[3])) / a * tl / double(nl > 0 ? nl : 1):.2f}\n")
+}
+
+//! Drop all accumulated expert-reuse data (phase separation in probes).
+def expert_reuse_reset() {
+    delete g_reuse
+}
+
+//! Top-``n`` expert ids for layer ``li`` by recorded pick frequency — the pinning candidate set.
+def expert_reuse_top(li : int; n : int) : array<int64> {
+    var res : array<int64>
+    if (li < 0 || li >= length(g_reuse)) {
+        return <- res
+    }
+    let r & = unsafe(g_reuse[li])
+    var ids <- [for (i in range(length(r.freq))); int64(i)]
+    ids |> sort() $(a, b) => r.freq[a] > r.freq[b]
+    for (i in range(min(n, length(ids)))) {
+        if (r.freq[ids[i]] > 0l) {
+            res |> push(ids[i])
+        }
+    }
+    delete ids
+    return <- res
+}
+
 // Routed experts, given the pre-normed input in s.xb and the top-k selection in s.moe_idx/s.moe_w:
 // s.moe_acc = Σ_j w_j · FFN_e_j(xb). Shared by qwen2moe/gpt-oss (via moe_ffn_core) and gemma4
 // (which folds its per-expert down scale into s.moe_w first).
@@ -6922,6 +7348,9 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
     let dim = c.dim
     let ne = c.n_expert
     let k = c.n_expert_used
+    if (expert_reuse_armed()) {
+        expert_reuse_note(l, s.moe_idx, k, ne)
+    }
     for (i in range64(dim)) {
         s.moe_acc[i] = 0.0
     }
@@ -6953,6 +7382,20 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         let f3 = fmt_at(t.we3_fmt, l)
         // GPU MoE tier: unbiased plain-q8 or all-K-quant stacks of offloaded layers dispatch on the GPU
         let gpu_moe = !biased && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai && moe_gpu_layer_on_gpu(l)
+        // heat cache: non-resident layers partition the top-k against the tier's slot pools — hits ride the GPU FFN chain async, misses run the CPU groupn path concurrently
+        let heat_moe = !gpu_moe && !biased && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai && heat_armed()
+        var nhits = 0l
+        if (heat_moe) {
+            heat_note_and_advise(t, l, s.moe_idx, k, ne)
+            s.heat_hit |> resize(int(k))
+            s.heat_o1 |> resize(int(k))
+            s.heat_o3 |> resize(int(k))
+            s.heat_o2 |> resize(int(k))
+            nhits = matmul_moe_gpu_heat_query(l, s.moe_idx, k, s.heat_hit, s.heat_o1, s.heat_o3, s.heat_o2)
+            var hl & = unsafe(g_heat[int(l)])
+            hl.hits += nhits
+            hl.picks += k
+        }
         if (gpu_moe) {
             // region triples (slot j = row j) + a k-row gathered image; gate+up/act/requant/down runs device-side into moe_dn
             s.moe_offs1 |> clear(); s.moe_offs1 |> reserve(k * 3l)
@@ -6987,6 +7430,111 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             matmul_moe_gpu_ffn(s.moe_dn, s.moe_offs1, s.moe_offs3, s.moe_offs2, k,
                 s.moe_gxq, s.moe_gxs, dim, nfe, k, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
             prof_add("mm_moe", ts_gu)
+        } elif (nhits > 0l) {
+            // split-FFN: compacted hit regions (pool coordinates, rows 0..nhits) dispatch async
+            let m = k - nhits
+            s.moe_offs1 |> clear()
+            s.moe_offs3 |> clear()
+            s.moe_offs2 |> clear()
+            for (i in range64(nhits)) {
+                s.moe_offs1 |> push(s.heat_o1[i])   // nolint:STYLE012 — loop-append into reused scratch
+                s.moe_offs1 |> push(i)
+                s.moe_offs1 |> push(1l)
+                s.moe_offs3 |> push(s.heat_o3[i])   // nolint:STYLE012 — loop-append into reused scratch
+                s.moe_offs3 |> push(i)
+                s.moe_offs3 |> push(1l)
+                s.moe_offs2 |> push(s.heat_o2[i])   // nolint:STYLE012 — loop-append into reused scratch
+                s.moe_offs2 |> push(i)
+                s.moe_offs2 |> push(1l)
+            }
+            let nb = layer_kq ? dim / 256l : dim / 32l
+            s.moe_gxq |> resize(int(nhits * dim))
+            s.moe_gxs |> resize(int(nhits * nb))
+            unsafe {
+                var gq = addr(s.moe_gxq[0])
+                var gs = addr(s.moe_gxs[0])
+                let sxq = layer_kq ? addr<void?>(s.kxq[0]) : addr<void?>(s.moe_xq[0])
+                let sxs = layer_kq ? addr<void?>(s.kxs[0]) : addr<void?>(s.moe_xs[0])
+                for (i in range64(nhits)) {
+                    memcpy(reinterpret<void?>(gq + i * dim), sxq, int(dim))
+                    memcpy(reinterpret<void?>(gs + i * nb), sxs, int(nb * 4l))
+                }
+            }
+            let ts_sub = ref_time_ticks()
+            matmul_moe_gpu_ffn_begin(s.moe_offs1, s.moe_offs3, s.moe_offs2, nhits,
+                s.moe_gxq, s.moe_gxs, dim, nfe, nhits, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
+            prof_add("heat_sub", ts_sub)   // dispatch cost ON the critical path (the split's tax)
+            // the missed experts run the CPU groupn chain while the GPU crunches the hits
+            var ts_down = ts_gu
+            if (m > 0l) {
+                var mi = 0l
+                for (j in range64(k)) {
+                    if (s.heat_hit[j] == int8(0)) {
+                        s.moe_offs[mi * 2l] = t.we1_offs[l] + s.moe_idx[j] * ege
+                        s.moe_offs[mi * 2l + 1l] = 0l
+                        mi++
+                    }
+                }
+                if (f1 != KqFmt.q8) {
+                    mm_at_kq_groupn(s.moe_gu, t, f1, s.moe_offs, m, s.kxq, s.kxs, s.kxbs, dim, nfe)
+                } else {
+                    mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, m, s.moe_xq, s.moe_xs, dim, nfe)
+                }
+                mi = 0l
+                for (j in range64(k)) {
+                    if (s.heat_hit[j] == int8(0)) {
+                        s.moe_offs[mi * 2l] = t.we3_offs[l] + s.moe_idx[j] * ege
+                        s.moe_offs[mi * 2l + 1l] = 0l
+                        mi++
+                    }
+                }
+                if (f3 != KqFmt.q8) {
+                    mm_at_kq_groupn(s.moe_gu2, t, f3, s.moe_offs, m, s.kxq, s.kxs, s.kxbs, dim, nfe)
+                } else {
+                    mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, m, s.moe_xq, s.moe_xs, dim, nfe)
+                }
+                prof_add("mm_moe", ts_gu)
+                let ts_act = ref_time_ticks()
+                gate_batch(s.moe_gu, s.moe_gu2, c.ffn_act, nfe, m)
+                prof_add("act", ts_act)
+                if (f2 != KqFmt.q8) {
+                    requant_rows_q8k_bs(s.moe_gu, nfe, m, s.moe_dq, s.moe_ds, s.moe_dbs)
+                } else {
+                    requant_rows_q8(s.moe_gu, nfe, m, s.moe_dq, s.moe_ds)
+                }
+                ts_down = ref_time_ticks()
+                mi = 0l
+                for (j in range64(k)) {
+                    if (s.heat_hit[j] == int8(0)) {
+                        s.moe_offs[mi * 2l] = t.we2_offs[l] + s.moe_idx[j] * ege
+                        s.moe_offs[mi * 2l + 1l] = mi * nfe
+                        mi++
+                    }
+                }
+                if (f2 != KqFmt.q8) {
+                    mm_at_kq_groupn(s.moe_dn, t, f2, s.moe_offs, m, s.moe_dq, s.moe_ds, s.moe_dbs, nfe, dim)
+                } else {
+                    mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, m, s.moe_dq, s.moe_ds, nfe, dim)
+                }
+            }
+            s.moe_hdn |> resize(int(nhits * dim))
+            prof_add("mm_moe", ts_down)
+            let ts_join = ref_time_ticks()
+            matmul_moe_gpu_ffn_join(s.moe_hdn)
+            prof_add("heat_wait", ts_join)   // GPU residue after the CPU misses — 0 = fully hidden
+            let ts_hred = ref_time_ticks()
+            var hi = 0l
+            var mrow = 0l
+            for (j in range64(k)) {   // original slot order — the weighted sum stays order-stable
+                if (s.heat_hit[j] != int8(0)) {
+                    axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_hdn[hi * dim])), s.moe_w[j], dim)
+                    hi++
+                } else {
+                    axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[mrow * dim])), s.moe_w[j], dim)
+                    mrow++
+                }
+            }
+            prof_add("moe_reduce", ts_hred)
         } else {
             for (j in range64(k)) {
                 let e = l * ne + s.moe_idx[j]
@@ -7057,11 +7605,13 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             }
             prof_add("mm_moe", ts_down)
         }
-        let ts_red = ref_time_ticks()
-        for (j in range64(k)) {   // slot order preserved — the sum is bit-identical
-            axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[j * dim])), s.moe_w[j], dim)
+        if (nhits == 0l) {   // the split arm above reduced its own hit/miss row banks
+            let ts_red = ref_time_ticks()
+            for (j in range64(k)) {   // slot order preserved — the sum is bit-identical
+                axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[j * dim])), s.moe_w[j], dim)
+            }
+            prof_add("moe_reduce", ts_red)
         }
-        prof_add("moe_reduce", ts_red)
     } else {
         // fp32 reference path: the per-expert loop (q4_0 never routes here — MoE loads are q8/fp32)
         for (j in range64(k)) {
@@ -7110,15 +7660,37 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     }
     moe_select(c, unsafe(addr(s.moe_logits[0])), s.moe_idx, s.moe_w, 0l, ebp)
     prof_add("moe_route", ts_route)
+    // resident shared expert: submit FIRST, collect AFTER the routed experts, so it runs inside the CPU's own expert window — a synchronous per-layer submit is the heat-cache wash.
+    let sh_gpu = (c.n_ff_shexp > 0l && !c.moe_dense_shexp && t.quant == QuantMode.q8
+        && moe_gpu_shexp_on_gpu(l) && !moe_gpu_layer_on_gpu(l) && !heat_armed())
+    let nsh = c.n_ff_shexp
+    let she = dim * nsh
+    if (sh_gpu) {
+        let ts_shs = ref_time_ticks()
+        quantize_q8_0_into(s.xb, dim, s.moe_xq, s.moe_xs, 0l, 0l)   // moe_experts_apply recomputes the same bits
+        // the routed CPU path uses moe_offs (not the triples) — these are free at this gate
+        s.moe_offs1 <- [t.wsh1_off + l * she, 0l, 1l]
+        s.moe_offs3 <- [t.wsh3_off + l * she, 0l, 1l]
+        s.moe_offs2 <- [t.wsh2_off + l * she, 0l, 1l]
+        matmul_moe_gpu_ffn_begin(s.moe_offs1, s.moe_offs3, s.moe_offs2, 1l, s.moe_xq, s.moe_xs,
+            dim, nsh, 1l, 0, 0, 0, c.ffn_act == FfnAct.gelu)
+        prof_add("shexp_sub", ts_shs)
+    }
     moe_experts_apply(t, s, l)
+    if (sh_gpu) {
+        let ts_shw = ref_time_ticks()
+        trace_tag(TRACE_TAG_SHEXP)
+        let g = c.moe_shexp_gated ? moe_shexp_gate(t, l, unsafe(addr(s.xb[0]))) : 1.0
+        matmul_moe_gpu_ffn_join(s.xb2)
+        axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.xb2[0])), g, dim)
+        prof_add("shexp_wait", ts_shw)   // 0 = fully hidden behind the routed-expert window
+    }
     // shared expert, gated by a sigmoid scalar from its per-layer gate vector (glm4moe: ungated, g = 1)
-    if (c.n_ff_shexp > 0l) {
+    if (c.n_ff_shexp > 0l && !sh_gpu) {
         let pre_q8 = t.quant == QuantMode.q8
         let ts_sh = ref_time_ticks()
         trace_tag(TRACE_TAG_SHEXP)
         let g = c.moe_shexp_gated ? moe_shexp_gate(t, l, unsafe(addr(s.xb[0]))) : 1.0
-        let nsh = c.n_ff_shexp
-        let she = dim * nsh
         if (pre_q8) {
             // shexp gate+up share the hoisted xb quants: one region-list dispatch, act on the halves
             s.ffn_offs[0] = t.wsh1_off + l * she
@@ -7727,6 +8299,7 @@ def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bo
 //! verify batch: a rejected draft has already advanced the state past itself. KV rows stay correct;
 //! only the recurrent state rolls back, then one plain forward re-advances it.
 def mtp_state_snapshot(var s : Session) {
+    dn_flush_all(s)   // the snapshot must capture device-resident decode-step state
     let nc = int64(length(s.dn_conv_state))
     let ns = int64(length(s.dn_state))
     s.mtp_snap_conv |> resize(nc)   // no-op after the first call
@@ -7740,6 +8313,7 @@ def mtp_state_restore(var s : Session) {
     copy_floats(s.mtp_snap_conv, 0l, s.dn_conv_state, 0l, int64(length(s.mtp_snap_conv)))
     copy_floats(s.mtp_snap_state, 0l, s.dn_state, 0l, int64(length(s.mtp_snap_state)))
     s.dn_pos = s.mtp_snap_pos
+    moe_gpu_dn_invalidate()   // restored CPU state is authoritative — device copies are stale
 }
 
 // After a 2-row verify forward_prefill([tok, draft], 2, pos): row 0's post-norm hidden and
@@ -9262,6 +9836,7 @@ def private deltanet_prefill_gpu(t : Model; var s : Session; l : int64; npos : i
 // (state carried across positions), then one batched ssm_out projection + residual.
 def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64) {
     trace_tag(TRACE_TAG_DN)   // override the loop's attn_std stamp: dn layers color separately
+    dn_flush_layer(s, l)   // every prefill branch reads/round-trips CPU state buffers
     if (g_dn_prefill_mode == DnPrefillMode.chunked && npos >= 32l && moe_gpu_dn_on_gpu(l)) {
         deltanet_prefill_gpu(t, s, l, npos)   // buckets dn_norm / dn_mm_in / dn_gpu / dn_resid
         return
