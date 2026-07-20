@@ -482,6 +482,8 @@ def test_metal_prefill_kernels(t : T?) {
                 dn_chain_gate(t, dev, queue, 2, 4, 4, 2)
                 dn_chain_gate(t, dev, queue, 4, 4, 4, 3)
                 dn_deint_sigmul_gate(t, dev, queue, 3, 64, 2)
+                axpy_sig_gate(t, dev, queue, 1, 96)    // shexp combine (stage 3): decode shape
+                axpy_sig_gate(t, dev, queue, 5, 64)    // ... and the per-position prefill shape
 
                 metal_release(queue)
             }
@@ -1412,6 +1414,60 @@ def private dn_deint_sigmul_gate(t : T?; dev, queue; nh, hs, npos : int) {
     delete qgot
     delete xv
     delete swant
+}
+
+def private axpy_sig_gate(t : T?; dev, queue; npos, dim : int) {
+    var err : string
+    var pso = pipeline_from_source(dev, metal_axpy_sig_msl, metal_axpy_sig_msl_entry, metal_axpy_sig_msl_fastmath, err)
+    t |> success(pso != null, "axpy_sig pipeline: {err}")
+    if (pso == null) {
+        return
+    }
+    let total = npos * dim
+    var yv : array<float>
+    var xv : array<float>
+    var gv : array<float>
+    var want : array<float>
+    yv |> resize(total)
+    xv |> resize(total)
+    gv |> resize(npos)
+    want |> resize(total)
+    for (k in range(total)) {
+        yv[k] = 0.05 * float(k % 37) - 0.9
+        xv[k] = 0.07 * float(k % 41) - 1.3
+    }
+    for (p in range(npos)) {
+        gv[p] = 0.6 * float(p) - 1.2
+    }
+    for (k in range(total)) {
+        want[k] = yv[k] + xv[k] / (1.0 + exp(-gv[k / dim]))
+    }
+    var by = buf_upload(dev, yv)
+    var bx = buf_upload(dev, xv)
+    var bg = buf_upload(dev, gv)
+    var btot = buf_u32(dev, uint(total))
+    var bdim = buf_u32(dev, uint(dim))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, by, 0ul, 0)
+        metal_set_buffer(enc, bx, 0ul, 1)
+        metal_set_buffer(enc, bg, 0ul, 2)
+        metal_set_buffer(enc, btot, 0ul, 3)
+        metal_set_buffer(enc, bdim, 0ul, 4)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 255) / 256), 1u, 1u), uint3(256u, 1u, 1u))
+    }
+    t |> success(ran, "axpy_sig dispatch: {err}")
+    t |> equal(buf_mismatch_approx(by, want), 0)
+    metal_release(by)
+    metal_release(bx)
+    metal_release(bg)
+    metal_release(btot)
+    metal_release(bdim)
+    metal_release(pso)
+    delete yv
+    delete xv
+    delete gv
+    delete want
 }
 
 // ===== local GPU plumbing (generic bodies instantiate only inside the static_if above) =====

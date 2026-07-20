@@ -5707,6 +5707,7 @@ var g_pso_dn_scan : MetalComputePipeline?      // the fused sequential delta rul
 var g_pso_dn_gate : MetalComputePipeline?      // z-gated out-norm
 var g_pso_dn_deint : MetalComputePipeline?     // 2x-wide [q|gate] deinterleave
 var g_pso_sigmul : MetalComputePipeline?       // x ⊙ σ(g) — the gated-attention out-gate
+var g_pso_axpy_sig : MetalComputePipeline?     // y += x ⊙ σ(g[row]) — the shexp combine (stage 3)
 var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
 var g_pso_qkvrs32 : MetalComputePipeline?
 var g_pso_w13sw : MetalComputePipeline?
@@ -5840,6 +5841,7 @@ def metal_decode_init : bool {
     g_pso_dn_gate = compile_pso(metal_dn_gate_msl, metal_dn_gate_msl_entry, metal_dn_gate_msl_fastmath, ok)
     g_pso_dn_deint = compile_pso(metal_dn_deint_msl, metal_dn_deint_msl_entry, metal_dn_deint_msl_fastmath, ok)
     g_pso_sigmul = compile_pso(metal_sigmul_msl, metal_sigmul_msl_entry, metal_sigmul_msl_fastmath, ok)
+    g_pso_axpy_sig = compile_pso(metal_axpy_sig_msl, metal_axpy_sig_msl_entry, metal_axpy_sig_msl_fastmath, ok)
     g_e8m0_tab = metal_new_buffer(g_dev, 1024ul)
     unsafe {
         var ep = reinterpret<uint?>(metal_buffer_contents(g_e8m0_tab))
@@ -6276,7 +6278,7 @@ def enc_moe_router(enc : MetalComputeEncoder?; bw, bx, by, bn, bd, bxs, brb, bha
 }
 
 // the selection buffer binds twice (uint idx + float w views, both at 0); one tg per stream
-// row; bgm = gating mode (0 = softmax + norm_topk, 1 = gpt-oss softmax_weight)
+// row; bgm = gating mode (0 = softmax + norm_topk, 1 = gpt-oss softmax_weight, 2 = softmax no-renorm)
 def enc_moe_select(enc : MetalComputeEncoder?; blg, bsel, bne, bnk, bgm : MetalBuffer?; nst : int64) {
     metal_set_pipeline(enc, g_pso_moe_select)
     metal_set_buffer(enc, blg, 0ul, 0)
@@ -6470,6 +6472,16 @@ def enc_moe_combine(enc : MetalComputeEncoder?; bdn, bsel, by, bdim, bnk : Metal
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, bnk, 0ul, 4)
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 255l) / 256l), uint(nst), 1u), uint3(256u, 1u, 1u))
+}
+
+def enc_axpy_sig(enc : MetalComputeEncoder?; by, bx, bg, btot, bdim : MetalBuffer?; total : int64) {
+    metal_set_pipeline(enc, g_pso_axpy_sig)
+    metal_set_buffer(enc, by, 0ul, 0)
+    metal_set_buffer(enc, bx, 0ul, 1)
+    metal_set_buffer(enc, bg, 0ul, 2)
+    metal_set_buffer(enc, btot, 0ul, 3)
+    metal_set_buffer(enc, bdim, 0ul, 4)
+    metal_dispatch_threadgroups(enc, uint3(uint((total + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
 // fused add + rms when dim fits the kernel's row slab, the unfused pair otherwise
@@ -7265,6 +7277,7 @@ def metal_kernels_release {
     release_pso(g_pso_dn_gate)
     release_pso(g_pso_dn_deint)
     release_pso(g_pso_sigmul)
+    release_pso(g_pso_axpy_sig)
     if (g_e8m0_tab != null) {
         metal_release(g_e8m0_tab)
         g_e8m0_tab = null

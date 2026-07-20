@@ -296,6 +296,7 @@ struct private StepRes {
     bmoe_rt : MetalBuffer?     // gemma4: router-input row, reused as the routed-branch acc
     u_moe_invd : MetalBuffer?  // gemma4: 1/sqrt(dim) router scale
     u_moe_gmode : MetalBuffer? // select gating mode (1 = gpt-oss softmax_weight)
+    u_moe_nsh : MetalBuffer?   // shexp width (qwen35moe; null = no shared expert)
     u_hass : MetalBuffer?      // attention sinks present (binds hass on the attn dispatches)
     // deltanet (Wave D) — recurrent-layer scratch + the gated-attention twins; dn steps only
     dn : bool
@@ -317,7 +318,7 @@ struct private StepRes {
     u_di : MetalBuffer?
     u_dconv : MetalBuffer?
     u_qscale : MetalBuffer?
-    u_one32 : MetalBuffer?     // npos = 1 (the decode window)
+    u_one32 : MetalBuffer?     // constant 1 (dn npos, the shexp gate's 1-row GEMV) — unconditional
     u_dn_qd2 : MetalBuffer?    // 2*qd — the packed [q|gate] GEMV width
     u_rot : MetalBuffer?       // partial rotary width (null = full; rope binds default to hs)
     bytes_dn_cd : uint64
@@ -367,7 +368,8 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     let qkvd_mx = max(qkvd, qkvd_sw)
     let moe = !t.blocks.ffn_is_dense
     let knfe = moe ? c.n_expert_used * c.n_ff_exp : 0l
-    let h2 = max(2l * hidden, 2l * knfe)   // moe: bh12 holds k gate rows | k up rows
+    let nsh = moe ? c.n_ff_shexp : 0l
+    let h2 = max(2l * hidden, max(2l * knfe, 2l * nsh))   // moe: bh12 holds k gate rows | k up rows (+ the shexp pair)
     let rot = c.rope_dim > 0l ? c.rope_dim : head_size   // partial-rope tables are rot/2 wide
     var r = StepRes(valid = true, pos = pos, uid = s.uid,
         kdt = s.kv_dtype_k, s16 = t.wscale_f16, hetero = hetero, moe = moe,
@@ -424,6 +426,7 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     r.u_hasn = uniform_u32(c.qk_norm ? 1u : 0u)
     r.u_softcap = uniform_f32(c.attn_logit_softcap)
     r.u_zero32 = uniform_u32(0u)
+    r.u_one32 = uniform_u32(1u)
     if (c.sliding_window > 0l) {
         let wstart = pos + 1l > c.sliding_window ? pos + 1l - c.sliding_window : 0l
         r.u_winsl = uniform_u32(uint(c.sliding_window))
@@ -453,7 +456,10 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
             r.bmoe_rt = pool_acquire(g_pool, g_dev, r.bytes_x)
             r.u_moe_invd = uniform_f32(1.0 / sqrt(float(dim)))
         }
-        r.u_moe_gmode = uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : 0u)
+        if (nsh > 0l) {
+            r.u_moe_nsh = uniform_u32(uint(nsh))
+        }
+        r.u_moe_gmode = uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : (c.norm_topk_prob ? 0u : 2u))
     }
     if (c.attn_sinks) {
         r.u_hass = uniform_u32(1u)
@@ -478,7 +484,6 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
         r.u_di = uniform_u32(uint(di))
         r.u_dconv = uniform_u32(uint(c.ssm_d_conv))
         r.u_qscale = uniform_f32(1.0 / sqrt(float(c.ssm_d_state)))
-        r.u_one32 = uniform_u32(1u)
     }
     if (c.q_gated) {
         r.bdn_qg = pool_acquire(g_pool, g_dev, 2ul * r.bytes_q)
@@ -623,8 +628,16 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                 if (g_skip != "gemv") {
                     enc_site_gemv(enc, t, KqFmt.q8, t.dnqkv_offs[l], cd, dim, r.bxb, r.bdn_qkv, r.u_dim, r.u_cd)
                     enc_site_gemv(enc, t, KqFmt.q8, t.dngate_offs[l], di, dim, r.bxb, r.bdn_z, r.u_dim, r.u_di)
-                    enc_site_gemv(enc, t, KqFmt.q8, t.dnbeta_offs[l], nvh, dim, r.bxb, r.bdn_b, r.u_dim, r.u_nvh)
-                    enc_site_gemv(enc, t, KqFmt.q8, t.dnalpha_offs[l], nvh, dim, r.bxb, r.bdn_g, r.u_dim, r.u_nvh)
+                    if (t.dn_ba_f32) {
+                        // F32-on-disk β/α (35B): fblob slabs ride the router f32 GEMV
+                        var bw_bt = upload_region(addr < void? >(t.fblob[t.dn_betaf_off + l * dim * nvh]), uint64(dim * nvh * 4l))
+                        enc_moe_router(enc, bw_bt, r.bxb, r.bdn_b, r.u_dim, r.u_nvh, r.u_dim, g_one, g_zero, nvh, 1l)
+                        var bw_al = upload_region(addr < void? >(t.fblob[t.dn_alphaf_off + l * dim * nvh]), uint64(dim * nvh * 4l))
+                        enc_moe_router(enc, bw_al, r.bxb, r.bdn_g, r.u_dim, r.u_nvh, r.u_dim, g_one, g_zero, nvh, 1l)
+                    } else {
+                        enc_site_gemv(enc, t, KqFmt.q8, t.dnbeta_offs[l], nvh, dim, r.bxb, r.bdn_b, r.u_dim, r.u_nvh)
+                        enc_site_gemv(enc, t, KqFmt.q8, t.dnalpha_offs[l], nvh, dim, r.bxb, r.bdn_g, r.u_dim, r.u_nvh)
+                    }
                 }
                 if (g_skip != "attn") {
                     let soff = uint64(dnli * nvh * c.ssm_d_state * c.ssm_d_state * 4l)
@@ -817,6 +830,11 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                         var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
                         enc_moe_wscale(enc, r.bmoe_sel, bw_ds, r.u_moe_k, 1l)
                     }
+                    if (r.u_moe_nsh != null) {
+                        // shexp raw gate dot (σ in the combine) — bmoe_lg[0] is free once select consumed it
+                        var bw_shg = upload_region(addr < void? >(t.fblob[t.shexp_gate_off + l * dim]), uint64(dim * 4l))
+                        enc_moe_router(enc, bw_shg, r.bxb, r.bmoe_lg, r.u_dim, r.u_one32, r.u_dim, g_one, g_zero, 1l, 1l)
+                    }
                     if (t.experts_mx4) {
                         // gpt-oss: mx4 expert planes + per-expert biases fold into the twins
                         var bwb1 = upload_region(addr < void? >(t.fblob[t.web1_off + l * c.n_expert * c.n_ff_exp]), uint64(c.n_expert * c.n_ff_exp * 4l))
@@ -851,7 +869,20 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
                             r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
                             r.u_zero32, r.u_zero32, r.u_zero32)
                     }
+                    if (r.u_moe_nsh != null) {
+                        // shexp FFN reads bxb BEFORE combine overwrites it; bh12/bxb2 are free here
+                        let nsh = c.n_ff_shexp
+                        let she = dim * nsh
+                        let bwsh1 = blob_of(g_dev, t, t.wsh1_off + l * she)
+                        enc_gemv_w13sw(enc, bwsh1.buf, bwsh1.boff, uint64(((t.wsh3_off + l * she) / 32l) * 34l),
+                            r.bxb, r.bh12, r.u_dim, r.u_moe_nsh, nsh)
+                        enc_site_gemv(enc, t, KqFmt.q8, t.wsh2_off + l * she, dim, nsh, r.bh12, r.bxb2, r.u_moe_nsh, r.u_dim)
+                    }
                     enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, g4 ? r.bmoe_rt : r.bxb, r.u_dim, r.u_moe_k, dim, 1l)
+                    if (r.u_moe_nsh != null && g_skip != "ew") {
+                        // routed sum lands in bxb first — the shexp branch adds σ(gate)-scaled on top
+                        enc_axpy_sig(enc, r.bxb, r.bxb2, r.bmoe_lg, r.u_dim, r.u_dim, dim)
+                    }
                 }
                 if (g4) {
                     // routed post-norm + the dense shared branch, summed into bxb for the epilogue
@@ -1058,6 +1089,7 @@ def private release_step(var r : StepRes) {
     pool_release(g_upool, r.u_eps, 4ul)
     pool_release(g_upool, r.u_softcap, 4ul)
     pool_release(g_upool, r.u_zero32, 4ul)
+    pool_release(g_upool, r.u_one32, 4ul)
     if (r.u_winsl != null) {
         pool_release(g_upool, r.u_winsl, 4ul)
     }
@@ -1108,6 +1140,9 @@ def private release_step(var r : StepRes) {
             pool_release(g_pool, r.bmoe_rt, r.bytes_x)
             pool_release(g_upool, r.u_moe_invd, 4ul)
         }
+        if (r.u_moe_nsh != null) {
+            pool_release(g_upool, r.u_moe_nsh, 4ul)
+        }
         pool_release(g_upool, r.u_moe_gmode, 4ul)
     }
     if (r.u_hass != null) {
@@ -1128,7 +1163,6 @@ def private release_step(var r : StepRes) {
         pool_release(g_upool, r.u_di, 4ul)
         pool_release(g_upool, r.u_dconv, 4ul)
         pool_release(g_upool, r.u_qscale, 4ul)
-        pool_release(g_upool, r.u_one32, 4ul)
         r.bdn_state = null   // mirror-owned
     }
     if (r.bdn_qg != null) {
@@ -1390,6 +1424,10 @@ def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : arra
                 return MetalDecodeDecline.kquant_native
             }
         }
+    }
+    // shexp MoE has no batch arm — a std-attention shexp model (qwen2moe-class) must decline
+    if (!t.blocks.ffn_is_dense && t.config.n_ff_shexp > 0l) {
+        return MetalDecodeDecline.graph
     }
     let shape = decode_shape_decline(t, BATCH_NEEDS_OK, true)
     if (shape != MetalDecodeDecline.none) {
@@ -1739,7 +1777,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     var u_moe_kdim = moe ? uniform_u32(uint(c.n_expert_used * dim)) : null
     var u_moe_tot = moe ? uniform_u32(uint(nrows * knfe)) : null
     var u_moe_invd = g4moe ? uniform_f32(1.0 / sqrt(float(dim))) : null
-    var u_moe_gmode = moe ? uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : 0u) : null
+    var u_moe_gmode = moe ? uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : (c.norm_topk_prob ? 0u : 2u)) : null
     var u_hass = c.attn_sinks ? uniform_u32(1u) : null
     var u_xs4_dim = mv ? uniform_u32(uint(dim / 4l)) : null
     var u_xs4_qd = mv ? uniform_u32(uint(qd / 4l)) : null

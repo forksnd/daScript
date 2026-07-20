@@ -577,7 +577,7 @@ class MetalMoeSelect {
     @ssbo @binding = 2 selw : array<float>   // the same buffer, float view — w of stream s at s*2k + k
     @uniform @binding = 3 ne : uint
     @uniform @binding = 4 nk : uint
-    @uniform @binding = 5 gmode : uint       // 0 = softmax + norm_topk; 1 = softmax_weight (gpt-oss)
+    @uniform @binding = 5 gmode : uint       // 0 = softmax + norm_topk; 1 = softmax_weight (gpt-oss); 2 = softmax, no renorm (qwen2moe)
 
     [metal_kernel(name="metal_moe_select_msl")]
     def metal_moe_select {
@@ -590,9 +590,9 @@ class MetalMoeSelect {
             let j = lane + uint(t) * 32u
             v[t] = j < ne ? lg[lg0 + j] : -3.0e38
         }
-        // gmode 0: softmax over all ne (the CPU order: max, exp with the -80 floor, sum,
+        // gmode 0/2: softmax over all ne (the CPU order: max, exp with the -80 floor, sum,
         // divide-all); gmode 1 (gpt-oss softmax_weight) selects on the RAW logits instead
-        if (gmode == 0u) {
+        if (gmode != 1u) {
             var mx = v[0]
             for [unroll_full] (t in range(8)) {
                 mx = max(mx, v[t])
@@ -670,8 +670,9 @@ class MetalMoeSelect {
                     i++
                 }
             }
-        } else {
-            // norm_topk renorm to sum 1 (the CPU f16-min clamp)
+        } elif (gmode == 0u) {
+            // norm_topk renorm to sum 1 (the CPU f16-min clamp); gmode 2 (qwen2moe) keeps
+            // the softmax weights as selected — no renorm
             ws = max(ws, 6.103515625e-5)
             if (lane == 0u) {
                 var i = 0u
@@ -3925,6 +3926,25 @@ class MetalSigmul {
     }
 }
 
+// Shared-expert combine (qwen35moe): y += x ⊙ σ(g[row]) — one raw gate dot per position
+// (decode total = dim; prefill total = npos x dim, row = the position).
+class MetalAxpySig {
+    @ssbo @binding = 0 y : array<float>
+    @ssbo @binding = 1 x : array<float>
+    @ssbo @binding = 2 g : array<float>     // per-position raw gate dots (σ applied here)
+    @uniform @binding = 3 total : uint      // grid guard
+    @uniform @binding = 4 dim : uint
+
+    [metal_kernel(name="metal_axpy_sig_msl")]
+    def metal_axpy_sig {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= total) {
+            return
+        }
+        y[gid] += x[gid] / (1.0 + exp(-g[gid / dim]))
+    }
+}
+
 // Batched narrow q8 GEMV for the β/α projections (d = dt_rank, 16..64 — under every GEMM
 // N tile): one simdgroup per (output row, position), the MetalQ8Gemv stream walk per row.
 class MetalDnBa {
@@ -4011,6 +4031,7 @@ var private g_pf_pso_dn_gate : MetalComputePipeline?
 var private g_pf_pso_dn_deint : MetalComputePipeline?
 var private g_pf_pso_dn_ba : MetalComputePipeline?
 var private g_pf_pso_sigmul : MetalComputePipeline?
+var private g_pf_pso_axpy_sig : MetalComputePipeline?   // shexp combine (Wave D stage 3)
 var private g_pso_gemm : MetalComputePipeline?
 var private g_pso_gemm64 : MetalComputePipeline?
 var private g_pf_pso_rms : MetalComputePipeline?
@@ -4169,6 +4190,10 @@ def public metal_prefill_shutdown {
     if (g_pf_pso_sigmul != null) {
         metal_release(g_pf_pso_sigmul)
         g_pf_pso_sigmul = null
+    }
+    if (g_pf_pso_axpy_sig != null) {
+        metal_release(g_pf_pso_axpy_sig)
+        g_pf_pso_axpy_sig = null
     }
     if (g_pso_addbias != null) {
         metal_release(g_pso_addbias)
@@ -4368,6 +4393,7 @@ def private metal_prefill_init : bool {
     g_pf_pso_dn_deint = pf_compile_pso(metal_dn_deint_msl, metal_dn_deint_msl_entry, metal_dn_deint_msl_fastmath, ok)
     g_pf_pso_dn_ba = pf_compile_pso(metal_dn_ba_msl, metal_dn_ba_msl_entry, metal_dn_ba_msl_fastmath, ok)
     g_pf_pso_sigmul = pf_compile_pso(metal_sigmul_msl, metal_sigmul_msl_entry, metal_sigmul_msl_fastmath, ok)
+    g_pf_pso_axpy_sig = pf_compile_pso(metal_axpy_sig_msl, metal_axpy_sig_msl_entry, metal_axpy_sig_msl_fastmath, ok)
     g_pf_e8m0_tab = metal_new_buffer(g_pf_dev, 1024ul)
     unsafe {
         var ep = reinterpret<uint?>(metal_buffer_contents(g_pf_e8m0_tab))
@@ -4993,6 +5019,32 @@ def private pf_enc_dn_ba(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : u
     metal_dispatch_threadgroups(enc, uint3(uint((d + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
+// batched f32-slab GEMV riding MetalMoeRouterB: d rows per position (dn_ba_f32 β/α d = dt_rank;
+// the shexp gate d = 1); y[p*d + row] — the pf_enc_dn_ba layout
+def private pf_enc_slab_gemv_b(enc : MetalComputeEncoder?; bw, bx, by, bn, bd, bnp : MetalBuffer?; d, npos : int64) {
+    metal_set_pipeline(enc, g_pf_pso_moe_router_b)
+    metal_set_buffer(enc, bw, 0ul, 0)
+    metal_set_buffer(enc, bx, 0ul, 1)
+    metal_set_buffer(enc, by, 0ul, 2)
+    metal_set_buffer(enc, bn, 0ul, 3)
+    metal_set_buffer(enc, bd, 0ul, 4)
+    metal_set_buffer(enc, bn, 0ul, 5)   // per-position x stride = dim
+    metal_set_buffer(enc, g_pf_one, 0ul, 6)
+    metal_set_buffer(enc, g_pf_zero, 0ul, 7)
+    metal_set_buffer(enc, bnp, 0ul, 8)
+    metal_dispatch_threadgroups(enc, uint3(uint((d + 3l) / 4l), uint((npos + 7l) / 8l), 1u), uint3(128u, 1u, 1u))
+}
+
+def private pf_enc_axpy_sig(enc : MetalComputeEncoder?; by, bx, bg, btot, bdim : MetalBuffer?; total : int64) {
+    metal_set_pipeline(enc, g_pf_pso_axpy_sig)
+    metal_set_buffer(enc, by, 0ul, 0)
+    metal_set_buffer(enc, bx, 0ul, 1)
+    metal_set_buffer(enc, bg, 0ul, 2)
+    metal_set_buffer(enc, btot, 0ul, 3)
+    metal_set_buffer(enc, bdim, 0ul, 4)
+    metal_dispatch_threadgroups(enc, uint3(uint((total + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
+}
+
 def private pf_enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba, bb, btot : MetalBuffer?; total : int64; bascale : MetalBuffer? = null) {
     metal_set_pipeline(enc, pso)
     metal_set_buffer(enc, ba, 0ul, 0)
@@ -5092,7 +5144,8 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     let bytes_x = uint64(mp * dim * 4l)
     let bytes_xb = uint64(mp * max(dim, qd_mx) * 4l)   // dim-wide norm outs AND the qd-wide AV out
     let bytes_q = uint64(mp * qd_mx * 4l)
-    let bytes_h = uint64(mp * hidden * 4l)
+    let nsh = !t.blocks.ffn_is_dense ? c.n_ff_shexp : 0l   // shared expert (qwen35moe) rides bhb/bhb2
+    let bytes_h = uint64(mp * max(hidden, nsh) * 4l)
     let bytes_att = uint64(n_heads * mp * nk64 * 4l)   // per-head score slabs: mp queries x nk64 keys
     let bytes_tab = uint64(npos * half * 4l)
     let bytes_tab_sw = uint64(npos * half_sw * 4l)   // the swa pair's row width is ITS class's hs/2
@@ -5240,7 +5293,11 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     var u_moe_g1 = moe ? pf_uniform_u32(1u) : null
     var u_moe_ptot = moe ? pf_uniform_u32(uint(mpad * c.n_ff_exp)) : null
     var u_moe_invd = g4moe ? pf_uniform_f32(1.0 / sqrt(float(dim))) : null
-    var u_moe_gmode = moe ? pf_uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : 0u) : null
+    var u_moe_gmode = moe ? pf_uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : (c.norm_topk_prob ? 0u : 2u)) : null
+    // shared expert (qwen35moe): nsh width + npos*nsh act span + the gate GEMV's 1-row bound
+    var u_moe_nsh = nsh > 0l ? pf_uniform_u32(uint(nsh)) : null
+    var u_moe_shtot = nsh > 0l ? pf_uniform_u32(uint(npos * nsh)) : null
+    var u_moe_one = nsh > 0l ? pf_uniform_u32(1u) : null
     var u_hass = c.attn_sinks ? pf_uniform_u32(1u) : null
     var u_scale = pf_uniform_f32(scale)
     var u_eps = pf_uniform_f32(c.norm_eps)
@@ -5366,10 +5423,18 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         enc_gemm_mm(enc, bwqkv.buf, bwqkv.boff, bxb, bdnqkv, u_dim, u_dn_cd, mp, cd_dn)
                         let bwz = pf_blob_of(t, t.dngate_offs[l])
                         enc_gemm_mm(enc, bwz.buf, bwz.boff, bxb, bdnz, u_dim, u_dn_di, mp, di_dn)
-                        let bwb = pf_blob_of(t, t.dnbeta_offs[l])
-                        pf_enc_dn_ba(enc, bwb.buf, bwb.boff, bxb, bdnb, u_dim, u_dn_nvh, nvh_dn, npos)
-                        let bwa = pf_blob_of(t, t.dnalpha_offs[l])
-                        pf_enc_dn_ba(enc, bwa.buf, bwa.boff, bxb, bdng, u_dim, u_dn_nvh, nvh_dn, npos)
+                        if (t.dn_ba_f32) {
+                            // F32-on-disk β/α (35B): fblob slabs ride the router-b f32 GEMV
+                            var bw_bt = pf_upload_region(addr < void? >(t.fblob[t.dn_betaf_off + l * dim * nvh_dn]), uint64(dim * nvh_dn * 4l))
+                            pf_enc_slab_gemv_b(enc, bw_bt, bxb, bdnb, u_dim, u_dn_nvh, u_dn_np, nvh_dn, npos)
+                            var bw_al = pf_upload_region(addr < void? >(t.fblob[t.dn_alphaf_off + l * dim * nvh_dn]), uint64(dim * nvh_dn * 4l))
+                            pf_enc_slab_gemv_b(enc, bw_al, bxb, bdng, u_dim, u_dn_nvh, u_dn_np, nvh_dn, npos)
+                        } else {
+                            let bwb = pf_blob_of(t, t.dnbeta_offs[l])
+                            pf_enc_dn_ba(enc, bwb.buf, bwb.boff, bxb, bdnb, u_dim, u_dn_nvh, nvh_dn, npos)
+                            let bwa = pf_blob_of(t, t.dnalpha_offs[l])
+                            pf_enc_dn_ba(enc, bwa.buf, bwa.boff, bxb, bdng, u_dim, u_dn_nvh, nvh_dn, npos)
+                        }
                     }
                     if (g_pf_skip != "attn" && g_pf_skip != "nongemm") {
                         let soff = uint64(dnli * nvh_dn * c.ssm_d_state * c.ssm_d_state * 4l)
@@ -5568,6 +5633,11 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         var bw_ds = pf_upload_region(unsafe(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert])), uint64(c.n_expert * 4l))
                         pf_enc_moe_wscale(enc, bmsel, bw_ds, u_moe_nk, npos)
                     }
+                    if (nsh > 0l) {
+                        // shexp raw gate dots (σ in the combine) — bmlg is free once select consumed it
+                        var bw_shg = pf_upload_region(unsafe(addr < void? >(t.fblob[t.shexp_gate_off + l * dim])), uint64(dim * 4l))
+                        pf_enc_slab_gemv_b(enc, bw_shg, bxb, bmlg, u_dim, u_moe_one, u_moe_np, 1l, npos)
+                    }
                     if (!pf_skip_moe_mm()) {
                         if (t.experts_mx4) {
                             var bwb1 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.web1_off + l * c.n_expert * c.n_ff_exp])), uint64(c.n_expert * c.n_ff_exp * 4l))
@@ -5584,11 +5654,21 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                             pf_enc_moe_mm(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg2,
                                 u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe3 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
                         }
+                        if (nsh > 0l) {
+                            // shexp gate/up: dense q8 mul_mm at the wsh planes (bhb/bhb2 sized max(hidden, nsh))
+                            let bwsh1 = pf_blob_of(t, t.wsh1_off + l * dim * nsh)
+                            enc_gemm_mm(enc, bwsh1.buf, bwsh1.boff, bxb, bhb, u_dim, u_moe_nsh, mp, nsh)
+                            let bwsh3 = pf_blob_of(t, t.wsh3_off + l * dim * nsh)
+                            enc_gemm_mm(enc, bwsh3.buf, bwsh3.boff, bxb, bhb2, u_dim, u_moe_nsh, mp, nsh)
+                        }
                     }
                 }
                 if (moe && g_pf_skip != "ew" && g_pf_skip != "nongemm" && g_pf_skip != "moe" && !pf_skip_moe_act()) {
                     let pso_act = c.ffn_act == FfnAct.swiglu_oai ? g_pf_pso_swiglu_oai : (g4moe ? g_pf_pso_geglu : g_pf_pso_swiglu)
                     pf_enc_ew2(enc, pso_act, bmg, bmg2, u_moe_ptot, mpad * c.n_ff_exp)
+                    if (nsh > 0l) {
+                        pf_enc_ew2(enc, g_pf_pso_swiglu, bhb, bhb2, u_moe_shtot, npos * nsh)
+                    }
                 }
                 if (moe && g_pf_skip != "gemm" && g_pf_skip != "moe") {
                     let fe2 = pf_fmt_at(t.we2_fmt, l)
@@ -5602,9 +5682,18 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                             pf_enc_moe_mm(enc, t, fe2, t.we2_offs[l], dim, npos, bmg, bmdn,
                                 u_moe_nfe, u_dim, bmcnt, bmbase, bmbkt, fe2 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g0)
                         }
+                        if (nsh > 0l) {
+                            // shexp down into bxb2 (free post-residual) — bxb still feeds the reduce
+                            let bwsh2 = pf_blob_of(t, t.wsh2_off + l * dim * nsh)
+                            enc_gemm_mm(enc, bwsh2.buf, bwsh2.boff, bhb, bxb2, u_moe_nsh, u_dim, mp, dim)
+                        }
                     }
                     if (!pf_skip_moe_reduce()) {
                         pf_enc_moe_reduce(enc, bmdn, bmsel, bminv, g4moe ? bmg4rt : bxb, u_dim, u_moe_nk, dim, npos)
+                        if (nsh > 0l) {
+                            // routed sum lands in bxb first — the shexp branch adds σ(gate)-scaled on top
+                            pf_enc_axpy_sig(enc, bxb, bxb2, bmlg, u_total_dim, u_dim, npos * dim)
+                        }
                     }
                     if (g4moe && g_pf_skip != "ew" && g_pf_skip != "nongemm") {
                         var bw_pf2 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.rms_post_ffn2_off + l * dim])), uint64(dim * 4l))
@@ -5922,6 +6011,11 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
             pool_release(g_pf_upool, u_moe_invd, 4ul)
         }
         pool_release(g_pf_upool, u_moe_gmode, 4ul)
+        if (nsh > 0l) {
+            pool_release(g_pf_upool, u_moe_nsh, 4ul)
+            pool_release(g_pf_upool, u_moe_shtot, 4ul)
+            pool_release(g_pf_upool, u_moe_one, 4ul)
+        }
     }
     if (u_hass != null) {
         pool_release(g_pf_upool, u_hass, 4ul)

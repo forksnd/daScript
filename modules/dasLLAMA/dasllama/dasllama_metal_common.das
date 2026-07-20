@@ -932,10 +932,11 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
 
 
 // Wave D serve gate for the deltanet kernel set: fixed d_state 128 (the scan/l2/gate lane math
-// bakes 32 lanes x 4), conv taps <= 8 (hist registers), q8 β/α planes (f32-on-disk = stage 3).
+// bakes 32 lanes x 4), conv taps <= 8 (hist registers). β/α projections: q8 planes ride the
+// site GEMVs; f32-on-disk (dn_ba_f32) rides the router-slab f32 GEMV off the fblob offsets.
 def dn_metal_ok(t : Model) : bool {
     let c = t.config
-    return c.ssm_d_state == 128l && c.ssm_d_conv >= 2l && c.ssm_d_conv <= 8l && !t.dn_ba_f32
+    return c.ssm_d_state == 128l && c.ssm_d_conv >= 2l && c.ssm_d_conv <= 8l
 }
 
 // ===== deltanet recurrent-state mirrors (Wave D) — per-session GPU S + conv state =====
@@ -1057,12 +1058,12 @@ def moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
     return false
 }
 
-// The MoE serve gate — the covered graph shapes (Wave C): the plain routed FFN (qwen3moe, silu,
-// no biases), gemma4's dense-shared + routed dual branch (gelu, router norm, down scales), and
-// gpt-oss's mx4 experts (softmax_weight, router/expert biases, disk-order). No shexp / dense-lead.
+// The MoE serve gate — covered graph shapes: plain routed FFN (qwen3moe, silu, no biases)
+// + optional sigmoid-gated shared expert (qwen35moe), gemma4's dense-shared dual branch, and
+// gpt-oss's mx4 experts (softmax_weight, biases, disk-order). No dense-lead / selection bias.
 def moe_metal_ok(t : Model) : bool {
     let c = t.config
-    if (!c.moe || c.n_ff_shexp > 0l || c.n_layer_dense_lead > 0l || c.moe_exp_probs ||
+    if (!c.moe || c.n_layer_dense_lead > 0l || c.moe_exp_probs ||
             (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0)) {
         return false
     }
@@ -1070,21 +1071,33 @@ def moe_metal_ok(t : Model) : bool {
         // gpt-oss: softmax_weight top-k on raw logits, router + per-expert biases, clamped
         // swiglu, disk-order mx4 stacks (the CPU laneq repack has no GPU carry)
         if (c.moe_gate != MoeGate.softmax_weight || c.ffn_act != FfnAct.swiglu_oai ||
-                !c.moe_router_bias || !c.moe_exps_bias || c.moe_dense_shexp || t.mx4_repacked ||
+                !c.moe_router_bias || !c.moe_exps_bias || c.moe_dense_shexp || c.n_ff_shexp > 0l ||
+                t.mx4_repacked ||
                 t.router_b_off < 0l || t.web1_off < 0l || t.web2_off < 0l || t.web3_off < 0l) {
             return false
         }
     } elif (c.moe_dense_shexp) {
         if (c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
-                c.moe_router_bias || c.moe_exps_bias ||
+                c.moe_router_bias || c.moe_exps_bias || c.n_ff_shexp > 0l ||
                 c.ffn_act != FfnAct.gelu || t.moe_router_scale_off < 0l || t.moe_down_scale_off < 0l ||
                 t.rms_pre_ffn2_off < 0l || t.rms_post_ffn1_off < 0l || t.rms_post_ffn2_off < 0l ||
                 int64(length(t.w1_offs)) < c.n_layers) {
             return false
         }
-    } elif (c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
+    } elif (c.moe_gate != MoeGate.softmax ||
             c.moe_router_bias || c.moe_exps_bias || c.ffn_act != FfnAct.silu) {
+        // norm_topk_prob both ways: renorm = select gmode 0 (qwen3moe/qwen35moe), no-renorm =
+        // gmode 2 (qwen2moe)
         return false
+    } elif (c.n_ff_shexp > 0l) {
+        // sigmoid-gated shared expert (qwen35moe): q8 wsh planes at base + l*she ride the
+        // dense site kernels — base + stride %256 (bind), nsh %64 (prefill C tiles)
+        let she = c.dim * c.n_ff_shexp
+        if (!c.moe_shexp_gated ||
+                (c.n_ff_shexp % 64l) != 0l || (she % 256l) != 0l ||
+                (t.wsh1_off % 256l) != 0l || (t.wsh2_off % 256l) != 0l || (t.wsh3_off % 256l) != 0l) {
+            return false
+        }
     }
     let ne = c.n_expert
     let k = c.n_expert_used

@@ -2183,6 +2183,16 @@ def private metal_blob_layout_ok(t : Model) : bool {
             return false
         }
     }
+    // shexp planes: always q8, contiguous at base + l*she — base + stride covers every layer
+    if (c.n_ff_shexp > 0l) {
+        let she = c.dim * c.n_ff_shexp
+        if ((she % 256l) != 0l ||
+                !metal_blob_off_ok(t.wsh1_off, KqFmt.q8) ||
+                !metal_blob_off_ok(t.wsh2_off, KqFmt.q8) ||
+                !metal_blob_off_ok(t.wsh3_off, KqFmt.q8)) {
+            return false
+        }
+    }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     return (metal_blob_off_ok(t.wcls_off, cls_fmt) &&
         (!t.cls_q8 || metal_blob_off_ok(t.emb_q8_off, KqFmt.q8)))
