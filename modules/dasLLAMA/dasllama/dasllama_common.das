@@ -530,6 +530,7 @@ struct Model {
     // From then on every kq matmul MUST run the backend slots — disk-order portable kernels would
     // read garbage — and embed_row gathers rows through the grp layout too.
     kq_repacked : bool = false
+    mx4_repacked : bool = false   // the CPU repack pass ran (set by repack_q8_weights; mx4 stacks laneq when present — no GPU carry)
     kq_repack_mr4 : int64 = 4l   // per-FORMAT repack interleaves (kq v2: the families tune separately)
     kq_repack_mr5 : int64 = 4l
     kq_repack_mr6 : int64 = 4l
@@ -2072,7 +2073,14 @@ def private metal_blob_off_ok(off : int64; fmt : KqFmt) : bool {
 
 def private metal_blob_layout_ok(t : Model) : bool {
     let c = t.config
-    if (int64(length(t.wq_offs)) < c.n_layers || int64(length(t.w1_offs)) < c.n_layers) {
+    if (int64(length(t.wq_offs)) < c.n_layers) {
+        return false
+    }
+    // a pure-MoE file (qwen3moe) carries no dense FFN arrays — its expert stacks bind instead
+    let has_ffn = int64(length(t.w1_offs)) >= c.n_layers
+    let has_exps = (c.moe && int64(length(t.we1_offs)) >= c.n_layers &&
+        int64(length(t.we2_offs)) >= c.n_layers && int64(length(t.we3_offs)) >= c.n_layers)
+    if (!has_ffn && !has_exps) {
         return false
     }
     for (l in range64(c.n_layers)) {
@@ -2080,9 +2088,12 @@ def private metal_blob_layout_ok(t : Model) : bool {
                 !metal_blob_off_ok(t.wk_offs[l], metal_blob_fmt_at(t.wk_fmt, l)) ||
                 !metal_blob_off_ok(t.wv_offs[l], metal_blob_fmt_at(t.wv_fmt, l)) ||
                 !metal_blob_off_ok(t.wo_offs[l], metal_blob_fmt_at(t.wo_fmt, l)) ||
-                !metal_blob_off_ok(t.w1_offs[l], metal_blob_fmt_at(t.w1_fmt, l)) ||
-                !metal_blob_off_ok(t.w2_offs[l], metal_blob_fmt_at(t.w2_fmt, l)) ||
-                !metal_blob_off_ok(t.w3_offs[l], metal_blob_fmt_at(t.w3_fmt, l))) {
+                (has_ffn && (!metal_blob_off_ok(t.w1_offs[l], metal_blob_fmt_at(t.w1_fmt, l)) ||
+                    !metal_blob_off_ok(t.w2_offs[l], metal_blob_fmt_at(t.w2_fmt, l)) ||
+                    !metal_blob_off_ok(t.w3_offs[l], metal_blob_fmt_at(t.w3_fmt, l)))) ||
+                (has_exps && (!metal_blob_off_ok(t.we1_offs[l], metal_blob_fmt_at(t.we1_fmt, l)) ||
+                    !metal_blob_off_ok(t.we2_offs[l], metal_blob_fmt_at(t.we2_fmt, l)) ||
+                    !metal_blob_off_ok(t.we3_offs[l], metal_blob_fmt_at(t.we3_fmt, l))))) {
             return false
         }
     }
@@ -2098,7 +2109,7 @@ def convert_model_to_metal_blob(var t : Model) : bool {
     if (t.metal_blob) {
         return true
     }
-    if (t.quant != QuantMode.q8 || t.kq_repacked || kernel_backend_needs_repack(active_kernel_backend())) {
+    if (t.quant != QuantMode.q8 || t.kq_repacked || t.mx4_repacked || kernel_backend_needs_repack(active_kernel_backend())) {
         return false
     }
     if (t.image_map != null) {
@@ -2356,6 +2367,7 @@ def private repack_q8_weights(var t : Model) {
         push_repack(regs, 0, t.mtp_ehproj_off, 2l * dim, dim)
     }
     repack_regions(t, regs)
+    t.mx4_repacked = true
     delete regs
 }
 

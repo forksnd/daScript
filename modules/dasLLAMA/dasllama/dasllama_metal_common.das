@@ -558,6 +558,19 @@ def blob_of(dev : MetalDevice?; t : Model; off : int64) : tuple<buf : MetalBuffe
     }
 }
 
+//! The native-MXFP4 expert planes (gpt-oss) + one stack's byte offsets within them: nibble
+//! bytes at off/2, E8M0 scale bytes at off/32 (disk order — the mx4_repacked gate keeps the
+//! CPU laneq repack out). Region-relative uint32 indices stay safe per layer stack.
+def mx4_of(dev : MetalDevice?; t : Model; off : int64) : tuple<qbuf : MetalBuffer?; qoff : uint64; sbuf : MetalBuffer?; soff : uint64> {
+    assert(t.metal_blob)
+    unsafe {
+        return (qbuf = plane_buffer(dev, addr < void? >(t.mxq[0]), uint64(long_length(t.mxq)), t.image_map != null),
+                qoff = uint64(off / 2l),
+                sbuf = plane_buffer(dev, addr < void? >(t.mxs[0]), uint64(long_length(t.mxs)), t.image_map != null),
+                soff = uint64(off / 32l))
+    }
+}
+
 // the kq formats the Metal kernels implement — anything else (the q4_0 QAT tier, future
 // formats) must DECLINE kquant_native instead of falling into a wrong-layout kernel branch
 // (the dispatchers below treat "not k4/k6" as k5)
@@ -932,6 +945,95 @@ def signs_buffer() : MetalBuffer? {
 // tq4-mirror rope+store: one threadgroup per head (the FWHT spans it); mirror rows bind twice
 // each (half-scale + byte views at the same row offset)
 
+def private moe_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
+
+// one MoE weight stack's (fmt, offset) serve check: base offset = the format's BIND alignment
+// (q8/k4/k5 %256, k6's d-plane pair %512); per-expert stride = the in-kernel index unit
+// (q8 32-blocks, kq 256-superblocks — the expert shift is index math, no base multiple)
+def moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
+    if (fmt == KqFmt.q8) {
+        return off >= 0l && (off % 256l) == 0l && (ege % 32l) == 0l
+    }
+    if (fmt == KqFmt.k4 || fmt == KqFmt.k5) {
+        return off >= 0l && (off % 256l) == 0l && (ege % 256l) == 0l
+    }
+    if (fmt == KqFmt.k6) {
+        return off >= 0l && (off % 512l) == 0l && (ege % 256l) == 0l
+    }
+    return false
+}
+
+// The MoE serve gate — the covered graph shapes (Wave C): the plain routed FFN (qwen3moe, silu,
+// no biases), gemma4's dense-shared + routed dual branch (gelu, router norm, down scales), and
+// gpt-oss's mx4 experts (softmax_weight, router/expert biases, disk-order). No shexp / dense-lead.
+def moe_metal_ok(t : Model) : bool {
+    let c = t.config
+    if (!c.moe || c.n_ff_shexp > 0l || c.n_layer_dense_lead > 0l || c.moe_exp_probs ||
+            (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0)) {
+        return false
+    }
+    if (t.experts_mx4) {
+        // gpt-oss: softmax_weight top-k on raw logits, router + per-expert biases, clamped
+        // swiglu, disk-order mx4 stacks (the CPU laneq repack has no GPU carry)
+        if (c.moe_gate != MoeGate.softmax_weight || c.ffn_act != FfnAct.swiglu_oai ||
+                !c.moe_router_bias || !c.moe_exps_bias || c.moe_dense_shexp || t.mx4_repacked ||
+                t.router_b_off < 0l || t.web1_off < 0l || t.web2_off < 0l || t.web3_off < 0l) {
+            return false
+        }
+    } elif (c.moe_dense_shexp) {
+        if (c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
+                c.moe_router_bias || c.moe_exps_bias ||
+                c.ffn_act != FfnAct.gelu || t.moe_router_scale_off < 0l || t.moe_down_scale_off < 0l ||
+                t.rms_pre_ffn2_off < 0l || t.rms_post_ffn1_off < 0l || t.rms_post_ffn2_off < 0l ||
+                int64(length(t.w1_offs)) < c.n_layers) {
+            return false
+        }
+    } elif (c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
+            c.moe_router_bias || c.moe_exps_bias || c.ffn_act != FfnAct.silu) {
+        return false
+    }
+    let ne = c.n_expert
+    let k = c.n_expert_used
+    let nfe = c.n_ff_exp
+    let ege = c.dim * nfe
+    // select holds 8 logits per lane (ne <= 256); %64 dims = the gathered mul_mm C tiles
+    if (ne < 1l || ne > 256l || k < 1l || k > 16l || k > ne || nfe <= 0l ||
+            (c.dim % 64l) != 0l || (nfe % 64l) != 0l ||
+            ne * ege > 3800000000l ||   // uint32 in-kernel indices (q8 byte view = elements * 34/32)
+            t.router_off < 0l || empty(t.we1_offs) || empty(t.we2_offs) || empty(t.we3_offs)) {
+        return false
+    }
+    if (t.experts_mx4) {
+        // mx4 binds: nibble bytes at off/2 (%4 => off %8), E8M0 at off/32 (%4 => off %128)
+        if ((ege % 32l) != 0l) {
+            return false
+        }
+        for (l in range64(c.n_layers)) {
+            if (t.we1_offs[l] < 0l || (t.we1_offs[l] % 128l) != 0l ||
+                    t.we2_offs[l] < 0l || (t.we2_offs[l] % 128l) != 0l ||
+                    t.we3_offs[l] < 0l || (t.we3_offs[l] % 128l) != 0l) {
+                return false
+            }
+        }
+        return true
+    }
+    for (l in range64(c.n_layers)) {
+        let f1 = moe_fmt_at(t.we1_fmt, l)
+        let f2 = moe_fmt_at(t.we2_fmt, l)
+        let f3 = moe_fmt_at(t.we3_fmt, l)
+        // per-site alignment + (kq kernels iterate whole superblock rows) reduction dims %256
+        if (!moe_site_ok(f1, t.we1_offs[l], ege) ||
+                !moe_site_ok(f2, t.we2_offs[l], ege) ||
+                !moe_site_ok(f3, t.we3_offs[l], ege) ||
+                ((f1 != KqFmt.q8 || f3 != KqFmt.q8) && (c.dim % 256l) != 0l) ||
+                (f2 != KqFmt.q8 && (nfe % 256l) != 0l)) {
+            return false
+        }
+    }
+    return true
+}
+
+
 let HZ_BX     = 1u
 let HZ_BXB    = 2u
 let HZ_BXB2   = 4u
@@ -943,6 +1045,13 @@ let HZ_ARENA  = 128u
 let HZ_BPSK   = 256u
 let HZ_BXF    = 512u
 let HZ_BLOG   = 1024u
+let HZ_BMLG   = 2048u   // MoE router logits (Wave C)
+let HZ_BMSEL  = 4096u   // MoE selection rows
+let HZ_BMDN   = 8192u   // MoE per-slot down outputs
+let HZ_BMG4X  = 16384u  // gemma4 MoE: the pre_ffn2 expert-input panel
+let HZ_BMRT   = 32768u  // gemma4 MoE: router-input / routed-acc panel
+let HZ_BMGH   = 65536u  // gemma4 MoE: expert gate panel (dense branch keeps bhb)
+let HZ_BMGH2  = 131072u // gemma4 MoE: expert up panel
 
 struct HazTrack {
     on : bool

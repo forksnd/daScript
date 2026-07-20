@@ -55,7 +55,10 @@ require _model_tier
 // (stage 3: two attention classes, hs 512, V-from-K, v_norm, out_scale, suppress) serves
 // ALL THREE paths token-exact (stage 3d: per-class batch uniforms + prefix `lay`). mistral3
 // (empty config = the llama shape) serves by construction; no <= 35B mistral3-arch GGUF
-// exists to validate against, so its real-model row waits on a fixture. MoE/deltanet = C-D.
+// exists to validate against, so its real-model row waits on a fixture. qwen3moe +
+// gemma4moe-26B + gptoss (wave C): GPU MoE routing — expert-indexed GEMV twins (decode/batch)
+// + CSR-gathered mul_mm prefill; gemma4's parallel-dense form; gpt-oss mx4 experts + sinks +
+// softmax_weight + biases + swiglu_oai. qwen2moe (sigmoid shexp) parked. deltanet = wave D.
 
 def private counting_prompt(start, last : int) : string {
     return build_string() $(var w) {
@@ -650,6 +653,163 @@ def private family_cells(t : T?; path, family, tag : string; expect_needs : uint
 }
 
 [unused_argument(t, path)]   // off-Apple the gated body is empty
+def private gemma4moe_row(t : T?; path : string) {
+    // gemma4-26B-A4B (Wave C stage 3): the parallel dense-shared + routed MoE graph. TOKEN
+    // parity is NOT a valid instrument here (wave ruling): the CPU router's double norm is an
+    // inverse TEMPERATURE on the expert softmax and the model amplifies ANY float-class
+    // difference to ~2.5 logits/step (the CPU's own f32-router run differs identically) — so
+    // the cells are ENGAGE + shallow logits TOLERANCES (measured noise 2.1 / 5.7; bars ~3x).
+    // Serial two-phase: CPU truths on the planar load, then the blob twin (27GB x2 resident
+    // would flirt with the box) — 26.9GB > the 6GiB tier, DASLLAMA_PARITY_FULL-gated.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "gemma4moe") || !arm_on(t, "fam-gemma4moe") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let c = tr.config
+        t |> success(c.moe && c.moe_dense_shexp && c.n_expert == 128l && c.n_expert_used == 8l,
+            "gemma4moe-26b: MoE geometry loads (ne={c.n_expert} k={c.n_expert_used} nfe={c.n_ff_exp})")
+        let derived = metal_needs(tr)
+        let expected = MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding | MetalNeed.v_norm
+        t |> success((derived & expected) == expected,
+            "gemma4moe-26b: metal_needs derives {expected} (got {derived})")
+        let vocab = c.vocab_size
+        var prompt <- encode(tr, counting_prompt(1, 20), true, false)
+        var lg0 : array<float>
+        var lg1 : array<float>
+        var t0 = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            eval_(tr, s, prompt)
+            lg0 := s.logits
+            t0 = greedy_top(s.logits, vocab)
+            var one <- [t0]
+            eval_(tr, s, one)
+            delete one
+            lg1 := s.logits
+            delete s
+        }
+        delete tr
+        var trg <- blob_twin(t, path, 512l)
+        matrix_cell(t, trg, KVDtype.f16, "gemma4moe-26b/q8/f16", "", "", "")
+        var mpf = 0.0
+        var m1 = 0.0
+        var served = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            select_prefill_override("metal")
+            select_decode_override("metal")
+            set_metal_prefill_min_npos(1l)
+            let pf0 = metal_prefill_stats().prefills
+            let d0 = metal_decode_stats().decodes
+            var s = make_run_state(trg.config, KVDtype.f16, KVDtype.f16)
+            eval_(trg, s, prompt)
+            for (v in range64(vocab)) {
+                mpf = max(mpf, abs(lg0[v] - s.logits[v]))
+            }
+            var one <- [t0]
+            eval_(trg, s, one)
+            delete one
+            for (v in range64(vocab)) {
+                m1 = max(m1, abs(lg1[v] - s.logits[v]))
+            }
+            served = (metal_prefill_stats().prefills - pf0) + (metal_decode_stats().decodes - d0)
+            set_metal_prefill_min_npos(64l)
+            select_prefill_override("")
+            select_decode_override("")
+            delete s
+        }
+        t |> success(served == 2l, "gemma4moe-26b: GPU prefill + forced step both served ({served}/2)")
+        t |> success(mpf <= 8.0, "gemma4moe-26b: post-prefill logits within 8.0 of the CPU truth (measured {mpf})")
+        t |> success(m1 <= 16.0, "gemma4moe-26b: one forced step within 16.0 of the CPU truth (measured {m1})")
+        to_log(LOG_INFO, "gemma4moe-26b tolerance cells: post-prefill maxd={mpf} (tol 8), forced step maxd={m1} (tol 16)\n")
+        delete lg0
+        delete lg1
+        delete prompt
+        delete trg
+    }
+}
+
+[unused_argument(t, path)]   // off-Apple the gated body is empty
+def private gptoss_row(t : T?; path : string) {
+    // gpt-oss-20b (Wave C stage 4): MXFP4 expert stacks + attention sinks + softmax_weight
+    // routing + router/expert biases + swiglu_oai + wo out-bias. ENGAGE cells + shallow
+    // logits tolerances (measured noise 0.23/0.29 — the tightest MoE envelope; bars ~8x).
+    // 12GB > the 6GiB tier — DASLLAMA_PARITY_FULL-gated; serial two-phase like the 26B row.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "gptoss") || !arm_on(t, "fam-gptoss") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let c = tr.config
+        t |> success(c.moe && tr.experts_mx4 && c.attn_sinks && c.n_expert == 32l && c.n_expert_used == 4l,
+            "gptoss-20b: MoE geometry loads (mx4={tr.experts_mx4} sinks={c.attn_sinks} ne={c.n_expert} k={c.n_expert_used})")
+        let derived = metal_needs(tr)
+        let expected = MetalNeed.neox | MetalNeed.sliding | MetalNeed.sinks | MetalNeed.out_bias
+        t |> success((derived & expected) == expected,
+            "gptoss-20b: metal_needs derives {expected} (got {derived})")
+        let vocab = c.vocab_size
+        var prompt <- encode(tr, counting_prompt(1, 20), true, false)
+        var lg0 : array<float>
+        var lg1 : array<float>
+        var t0 = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            eval_(tr, s, prompt)
+            lg0 := s.logits
+            t0 = greedy_top(s.logits, vocab)
+            var one <- [t0]
+            eval_(tr, s, one)
+            delete one
+            lg1 := s.logits
+            delete s
+        }
+        delete tr
+        var trg <- blob_twin(t, path, 512l)
+        matrix_cell(t, trg, KVDtype.f16, "gptoss-20b/mx4/f16", "", "", "")
+        var mpf = 0.0
+        var m1 = 0.0
+        var served = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            select_prefill_override("metal")
+            select_decode_override("metal")
+            set_metal_prefill_min_npos(1l)
+            let pf0 = metal_prefill_stats().prefills
+            let d0 = metal_decode_stats().decodes
+            var s = make_run_state(trg.config, KVDtype.f16, KVDtype.f16)
+            eval_(trg, s, prompt)
+            for (v in range64(vocab)) {
+                mpf = max(mpf, abs(lg0[v] - s.logits[v]))
+            }
+            var one <- [t0]
+            eval_(trg, s, one)
+            delete one
+            for (v in range64(vocab)) {
+                m1 = max(m1, abs(lg1[v] - s.logits[v]))
+            }
+            served = (metal_prefill_stats().prefills - pf0) + (metal_decode_stats().decodes - d0)
+            set_metal_prefill_min_npos(64l)
+            select_prefill_override("")
+            select_decode_override("")
+            delete s
+        }
+        t |> success(served == 2l, "gptoss-20b: GPU prefill + forced step both served ({served}/2)")
+        t |> success(mpf <= 2.0, "gptoss-20b: post-prefill logits within 2.0 of the CPU truth (measured {mpf})")
+        t |> success(m1 <= 4.0, "gptoss-20b: one forced step within 4.0 of the CPU truth (measured {m1})")
+        to_log(LOG_INFO, "gptoss-20b tolerance cells: post-prefill maxd={mpf} (tol 2), forced step maxd={m1} (tol 4)\n")
+        delete lg0
+        delete lg1
+        delete prompt
+        delete trg
+    }
+}
+
+[unused_argument(t, path)]   // off-Apple the gated body is empty
 def private gemma2_window_row(t : T?; path : string) {
     // sliding-window masking parity: shrink the window post-load (config-driven everywhere —
     // gemma2 is single-θ, so rope is unaffected) and generate PAST it. The prompt-depth assert
@@ -1056,6 +1216,17 @@ def test_metal_family_matrix(t : T?) {
             // the q8 twin drives the hetero fixed-B mul_mv rail (a class the k4 row never
             // dispatches); 12.5GB — DASLLAMA_PARITY_FULL-gated like the row above
             gemma4_hetero_q8_row(t, path_join(models_dir(), "gemma-4-12B-it-Q8_0.gguf"))
+            // qwen3moe (Wave C): qwen3 attention + GPU MoE routing — router + top-k select +
+            // expert-indexed GEMVs (decode/batch) + gathered mul_mm prefill (k4 gate/up, k6
+            // down). All three paths ENGAGE; 18.5GB > the 6GiB tier — DASLLAMA_PARITY_FULL-gated.
+            family_cells(t, path_join(models_dir(), "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"), "qwen3moe",
+                "qwen3moe-30b/k4/f16", uint(MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim),
+                "", KVDtype.f16, 6.0)
+            // gemma4-26B-A4B (Wave C stage 3): the parallel dense-shared + routed graph —
+            // ENGAGE cells + shallow logits tolerances (see the row's ruling comment)
+            gemma4moe_row(t, path_join(models_dir(), "gemma-4-26B-A4B-it-Q8_0.gguf"))
+            // gpt-oss-20b (Wave C stage 4): mx4 experts + sinks + softmax_weight + biases
+            gptoss_row(t, path_join(models_dir(), "gpt-oss-20b-mxfp4.gguf"))
             metal_decode_shutdown()
             metal_prefill_shutdown()
             t |> equal(metal_live_object_count(), 0l)
