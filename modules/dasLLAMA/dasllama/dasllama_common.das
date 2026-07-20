@@ -8334,6 +8334,18 @@ def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bo
     mm_cls(s.logits, t, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
 }
 
+//! CPU-side input prep for a GPU draft step: the raw embed row into s.x (+ embed_scale) and the
+//! draft row's rope table — forward()'s prologue at the draft position, for the metal MTP arm
+def mtp_draft_prep(t : Model; var s : Session; token, pos : int64) {
+    let c = t.config
+    embed_row(t, token, unsafe(addr(s.x[0])))
+    if (c.embed_scale != 1.0) {
+        scale_inplace(unsafe(addr(s.x[0])), c.embed_scale, c.dim)
+    }
+    build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l,
+                     c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
+}
+
 //! Snapshot/restore the deltanet recurrent state (conv history + S + dn_pos) around a speculative
 //! verify batch: a rejected draft has already advanced the state past itself. KV rows stay correct;
 //! only the recurrent state rolls back, then one plain forward re-advances it.

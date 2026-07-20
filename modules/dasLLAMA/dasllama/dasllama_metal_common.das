@@ -726,7 +726,7 @@ def mirror_evict_to_cap(cap_bytes : uint64; keep : uint64) {
 def mirror_row_total(t : Model) : int64 {
     let c = t.config
     var tot = 0l
-    for (l in range64(c.n_layers)) {
+    for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the MTP draft slab (trunk-shaped attention)
         tot += layer_kv_dim(c, l)   // the GPU gate pins kv_src[l] == l, so every layer owns rows
     }
     return tot
@@ -906,7 +906,7 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
         unsafe {
             var kdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + koff
             var vdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + voff
-            for (l in range64(c.n_layers)) {
+            for (l in range64(c.n_layers + c.n_layer_nextn)) {   // draft slab rides the watermark contract
                 let kvd_l = layer_kv_dim(c, l)
                 let krow = kv_row_bytes(s.kv_dtype_k, kvd_l)
                 let vrow = kv_row_bytes(s.kv_dtype_v, kvd_l)
