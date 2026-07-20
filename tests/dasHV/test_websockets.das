@@ -40,6 +40,11 @@ class WsTestServer : HvWebServer {
         }
         clients |> insert_clone(channel, nickname)
         send(channel, "welcome {nickname}", ws_opcode.WS_OPCODE_TEXT, true)
+        var binary = fixed_array<uint8>(0x41u, 0u, 0x42u)
+        unsafe {
+            send(channel, reinterpret<string#>(addr(binary[0])), length(binary),
+                ws_opcode.WS_OPCODE_BINARY, true)
+        }
     }
 
     def override onWsClose(channel : WebSocketChannel) {
@@ -70,6 +75,8 @@ class WsTestServer : HvWebServer {
 
 class TestWsClient : HvWebSocketClient {
     received : array<string>
+    binary_received : array<uint8>
+    binary_frames : int
     connected : bool = false
     closed : bool = false
 
@@ -85,6 +92,17 @@ class TestWsClient : HvWebSocketClient {
     def override onMessage(msg : string#) {
         received |> push_clone(string(msg))
     }
+    def override onMessageFrame(msg : string#; byte_count : int; opcode : ws_opcode) {
+        if (opcode == ws_opcode.WS_OPCODE_TEXT) {
+            onMessage(msg)
+        } elif (opcode == ws_opcode.WS_OPCODE_BINARY) {
+            binary_frames++
+            binary_received |> resize(byte_count)
+            if (byte_count > 0) {
+                unsafe { memcpy(addr(binary_received[0]), reinterpret<void?>(msg), byte_count) }
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -94,6 +112,15 @@ class TestWsClient : HvWebSocketClient {
 def wait_messages(var client : TestWsClient?; count : int; max_ms : int = 3000) {
     var elapsed = 0
     while (length(client.received) < count && elapsed < max_ms) {
+        client->process_event_que()
+        sleep(1u)
+        elapsed += 1
+    }
+}
+
+def wait_binary_frames(var client : TestWsClient?; count : int; max_ms : int = 3000) {
+    var elapsed = 0
+    while (client.binary_frames < count && elapsed < max_ms) {
         client->process_event_que()
         sleep(1u)
         elapsed += 1
@@ -166,6 +193,22 @@ def test_websockets(t : T?) {
             unsafe {
                 delete client
             }
+        }
+
+        t |> run("binary frames preserve opcode, length, and embedded zero bytes") @(t : T?) {
+            var client = new TestWsClient()
+            client->init("{ws_url}/ws")
+            wait_messages(client, 1)
+            wait_binary_frames(client, 1)
+            t |> equal(client.binary_frames, 1)
+            t |> equal(length(client.binary_received), 3)
+            t |> equal(client.binary_received[0], uint8(0x41))
+            t |> equal(client.binary_received[1], uint8(0))
+            t |> equal(client.binary_received[2], uint8(0x42))
+            client->close()
+            wait_closed(client)
+            client->cleanup()
+            unsafe { delete client }
         }
 
         t |> run("send and receive echo") @(t : T?) {

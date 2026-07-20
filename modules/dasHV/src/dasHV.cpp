@@ -177,9 +177,10 @@ public:
             });
         };
         onmessage = [=]( const string & msg ) {
+            const auto message_opcode = opcode();
             lock_guard<mutex> guard(lock);
-            que.emplace_back([=](){
-                onMessage(msg);
+            que.emplace_back([=]() {
+                onMessageFrame(msg, message_opcode);
             });
         };
     }
@@ -193,9 +194,10 @@ public:
             invoke_onClose(context,fnOnClose,classPtr);
         }
     }
-    void onMessage ( const string & msg ) {
-        if ( auto fnOnMessage = get_onMessage(classPtr) ) {
-            invoke_onMessage(context,fnOnMessage,classPtr,(char *)msg.c_str());
+    void onMessageFrame ( const string & msg, ws_opcode opcode ) {
+        if ( auto fnOnMessageFrame = get_onMessageFrame(classPtr) ) {
+            invoke_onMessageFrame(context, fnOnMessageFrame, classPtr,
+                (char *)msg.data(), static_cast<int32_t>(msg.size()), opcode);
         }
     }
     void tick() {

@@ -6,7 +6,8 @@ options no_unused_function_arguments = false
 //! High-level WebSocket and HTTP wrappers for the ``dashv`` C++ module.
 //!
 //! Provides ``HvWebSocketClient`` for WebSocket client connections with
-//! ``onOpen``, ``onClose``, and ``onMessage`` callbacks, and ``HvWebServer``
+//! ``onOpen``, ``onClose``, ``onMessage``, and lossless ``onMessageFrame``
+//! callbacks, and ``HvWebServer``
 //! for HTTP/WebSocket servers with route registration and static file serving.
 //! Also includes ``with_http_request`` and ``get_body_bytes`` helpers.
 
@@ -45,6 +46,9 @@ class HvWebSocketClient {
         //! Called when the WebSocket connection is closed.
     def abstract onMessage(msg : string#) : void
         //! Called when a text message is received from the server.
+    def abstract onMessageFrame(msg : string#; byte_count : int; opcode : ws_opcode) : void
+        //! Called for every complete text or binary frame. ``byte_count`` is
+        //! authoritative and preserves embedded zero bytes.
     def is_connected : bool {
         //! Returns ``true`` if the WebSocket connection is currently open.
         return is_connected(client)
