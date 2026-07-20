@@ -3674,6 +3674,252 @@ class MetalSoftcapRow {
     }
 }
 
+// ===== DeltaNet (Wave D) — the qwen35 recurrent-layer chain =====
+
+// Causal depthwise conv over the fused [q;k;v] rows + SiLU (dn_conv_step's batch form): one
+// thread per (channel, position); positions reaching before the window read the channel-major
+// history taps (the CPU dn_conv_state layout). Never writes history — MetalDnConvHist advances.
+class MetalDnConv {
+    @ssbo @binding = 0 x : array<float>     // [npos x cd] fused qkv projection rows
+    @ssbo @binding = 1 hist : array<float>  // [cd x taps] channel-major history (layer slice)
+    @ssbo @binding = 2 w : array<float>     // [cd x dconv] conv taps (raw fblob layout)
+    @ssbo @binding = 3 y : array<float>     // [npos x cd] conv output, silu'd
+    @uniform @binding = 4 cd : uint
+    @uniform @binding = 5 dconv : uint
+    @uniform @binding = 6 npos : uint
+
+    [metal_kernel(name="metal_dn_conv_msl")]
+    def metal_dn_conv {
+        let ch = gl_GlobalInvocationID.x
+        let p = gl_GlobalInvocationID.y
+        if (ch >= cd) {
+            return
+        }
+        let taps = dconv - 1u
+        var acc = 0.0
+        var k = 0u
+        while (k < dconv) {
+            let sp = int(p + k) - int(taps)
+            let xv = sp >= 0 ? x[uint(sp) * cd + ch] : hist[ch * taps + (p + k)]
+            acc += xv * w[ch * dconv + k]
+            k++
+        }
+        y[p * cd + ch] = acc / (1.0 + exp(-acc))
+    }
+}
+
+// Advance the channel-major conv history past an npos window: the new taps are the window's
+// last `taps` input rows, shifted in from the old history when npos < taps (straddle). Reads
+// land in registers before any write, so the in-place buffer update is safe per channel.
+class MetalDnConvHist {
+    @ssbo @binding = 0 x : array<float>     // [npos x cd] the window's fused qkv rows
+    @ssbo @binding = 1 hist : array<float>  // [cd x taps] channel-major history (layer slice)
+    @uniform @binding = 2 cd : uint
+    @uniform @binding = 3 dconv : uint
+    @uniform @binding = 4 npos : uint
+
+    [metal_kernel(name="metal_dn_conv_hist_msl")]
+    def metal_dn_conv_hist {
+        let ch = gl_GlobalInvocationID.x
+        if (ch >= cd) {
+            return
+        }
+        let taps = dconv - 1u
+        var nh : float[8]                   // dconv <= 8 by the serve gate
+        var k = 0u
+        while (k < taps) {
+            let src = int(npos + k) - int(taps)
+            nh[k] = src >= 0 ? x[uint(src) * cd + ch] : hist[ch * taps + uint(src + int(taps))]
+            k++
+        }
+        k = 0u
+        while (k < taps) {
+            hist[ch * taps + k] = nh[k]
+            k++
+        }
+    }
+}
+
+// Per-head L2 norm over the conv-out q/k regions in place, q pre-scale folded (l2_norm_rows +
+// scale_inplace): one simdgroup per (head block, position). CPU accumulates the square-sum in
+// DOUBLE — the f32 simd tree here is the deltanet drift class (same as the Vulkan tier).
+class MetalDnL2Norm {
+    @ssbo @binding = 0 y : array<float>     // [npos x cd] conv rows: q at 0, k at kd
+    @uniform @binding = 1 cd : uint
+    @uniform @binding = 2 kd : uint         // key_dim = nkh * ds
+    @uniform @binding = 3 ds : uint         // 128 (gated)
+    @uniform @binding = 4 eps : float
+    @uniform @binding = 5 qscale : float    // 1/sqrt(ds); k blocks get 1
+
+    [metal_kernel(name="metal_dn_l2norm_msl")]
+    def metal_dn_l2norm {
+        let blk = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        let p = gl_WorkGroupID.y
+        let nblk = (2u * kd) / ds
+        if (blk >= nblk) {
+            return
+        }
+        let lane = gl_SubgroupInvocationID
+        let base = p * cd + blk * ds + lane * 4u
+        var v : float[4]
+        var ss = 0.0
+        for [unroll_full] (c in range(4)) {
+            v[c] = y[base + uint(c)]
+            ss += v[c] * v[c]
+        }
+        ss = simd_sum(ss)
+        let sc = (1.0 / max(sqrt(ss), eps)) * (blk < kd / ds ? qscale : 1.0)
+        for [unroll_full] (c in range(4)) {
+            y[base + uint(c)] = v[c] * sc
+        }
+    }
+}
+
+// The fused sequential delta rule (llama.cpp's gated_delta_net shape): one simdgroup per
+// (state column j, v-head) holds S[:,j] in registers and walks ALL npos tokens in-kernel —
+// zero per-token state traffic; β/σ/softplus fold into the loop (redundant per column, trivial).
+class MetalDnScan {
+    @ssbo @binding = 0 cv : array<float>    // [npos x cd] conv rows: q at 0 / k at kd / v at 2kd
+    @ssbo @binding = 1 st : array<float>    // state layer slice [nvh x ds x ds] row-major (i·ds + j)
+    @ssbo @binding = 2 braw : array<float>  // [npos x nvh] raw beta projections
+    @ssbo @binding = 3 graw : array<float>  // [npos x nvh] raw alpha projections
+    @ssbo @binding = 4 aa : array<float>    // [nvh] ssm_a = -exp(A_log) (fblob row)
+    @ssbo @binding = 5 dtb : array<float>   // [nvh] dt_bias (fblob row)
+    @ssbo @binding = 6 o : array<float>     // [npos x di] delta-rule output rows
+    @uniform @binding = 7 cd : uint
+    @uniform @binding = 8 kd : uint
+    @uniform @binding = 9 ds : uint         // 128 (gated)
+    @uniform @binding = 10 nvh : uint
+    @uniform @binding = 11 nkh : uint
+    @uniform @binding = 12 di : uint        // nvh * ds
+    @uniform @binding = 13 npos : uint
+
+    [metal_kernel(name="metal_dn_scan_msl")]
+    def metal_dn_scan {
+        let j = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        let h = gl_WorkGroupID.y
+        if (j >= ds) {
+            return
+        }
+        let lane = gl_SubgroupInvocationID
+        let kh = h % nkh
+        let qoff = kh * ds + lane * 4u
+        let koff = kd + kh * ds + lane * 4u
+        let voff = 2u * kd + h * ds + j
+        let a_h = aa[h]
+        let dt_h = dtb[h]
+        let s0 = h * ds * ds + (lane * 4u) * ds + j
+        var ls : float[4]
+        for [unroll_full] (c in range(4)) {
+            ls[c] = st[s0 + uint(c) * ds]
+        }
+        var p = 0u
+        while (p < npos) {
+            let gr = graw[p * nvh + h] + dt_h
+            let dec = exp(a_h * (gr > 20.0 ? gr : log(1.0 + exp(gr))))
+            let beta = 1.0 / (1.0 + exp(-braw[p * nvh + h]))
+            let cb = p * cd
+            var kv4 : float[4]
+            var sk = 0.0
+            for [unroll_full] (c in range(4)) {
+                kv4[c] = cv[cb + koff + uint(c)]
+                ls[c] *= dec
+                sk += kv4[c] * ls[c]
+            }
+            sk = simd_sum(sk)
+            let d = (cv[cb + voff] - sk) * beta
+            var yy = 0.0
+            for [unroll_full] (c in range(4)) {
+                ls[c] += kv4[c] * d
+                yy += cv[cb + qoff + uint(c)] * ls[c]
+            }
+            yy = simd_sum(yy)
+            if (lane == 0u) {
+                o[p * di + h * ds + j] = yy
+            }
+            p++
+        }
+        for [unroll_full] (c in range(4)) {
+            st[s0 + uint(c) * ds] = ls[c]
+        }
+    }
+}
+
+// Gated out-norm (dn_token_core's tail): per (v-head, position) RMSNorm over ds with the
+// SHARED ssm_norm row, then ⊙ SiLU(z) — in place on o, one simdgroup per (head, position).
+class MetalDnGate {
+    @ssbo @binding = 0 o : array<float>     // [npos x di] delta-rule output, gated in place
+    @ssbo @binding = 1 z : array<float>     // [npos x di] raw gate projections
+    @ssbo @binding = 2 wn : array<float>    // [ds] shared norm weight (fblob row)
+    @uniform @binding = 3 ds : uint         // 128 (gated)
+    @uniform @binding = 4 di : uint
+    @uniform @binding = 5 eps : float
+
+    [metal_kernel(name="metal_dn_gate_msl")]
+    def metal_dn_gate {
+        let h = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+        let p = gl_WorkGroupID.y
+        if (h >= di / ds) {
+            return
+        }
+        let lane = gl_SubgroupInvocationID
+        let base = p * di + h * ds + lane * 4u
+        var v : float[4]
+        var ss = 0.0
+        for [unroll_full] (c in range(4)) {
+            v[c] = o[base + uint(c)]
+            ss += v[c] * v[c]
+        }
+        ss = simd_sum(ss)
+        let inv = rsqrt(ss / float(ds) + eps)
+        for [unroll_full] (c in range(4)) {
+            let zz = z[base + uint(c)]
+            o[base + uint(c)] = (wn[lane * 4u + uint(c)] * (v[c] * inv)) * (zz / (1.0 + exp(-zz)))
+        }
+    }
+}
+
+// Deinterleave the 2x-wide gated-attention Q projection (head h's q at 2h·hs, its gate at
+// (2h+1)·hs): q lands in the qkv panel's q segment, the gate in its own rows — keeps the
+// rope/attention classes untouched by the packing.
+class MetalDnDeint {
+    @ssbo @binding = 0 qg : array<float>    // [npos x 2qd] packed [q|gate] projection rows
+    @ssbo @binding = 1 q : array<float>     // qkv panel, q segment at row stride qs
+    @ssbo @binding = 2 gt : array<float>    // [npos x qd] sigmoid-gate rows
+    @uniform @binding = 3 hs : uint
+    @uniform @binding = 4 qd : uint
+    @uniform @binding = 5 qs : uint         // q panel row stride, elements (qkvd; decode binds qd)
+
+    [metal_kernel(name="metal_dn_deint_msl")]
+    def metal_dn_deint {
+        let i = gl_GlobalInvocationID.x
+        let p = gl_GlobalInvocationID.y
+        if (i >= qd) {
+            return
+        }
+        let sb = p * 2u * qd + (i / hs) * 2u * hs + i % hs
+        q[p * qs + i] = qg[sb]
+        gt[p * qd + i] = qg[sb + hs]
+    }
+}
+
+// Per-head sigmoid output gate (sigmoid_gate): x ⊙ σ(g) in place — the gated-attention
+// epilogue between the attention output and the out projection.
+class MetalSigmul {
+    @ssbo @binding = 0 x : array<float>
+    @ssbo @binding = 1 g : array<float>
+    @uniform @binding = 2 total : uint      // grid guard
+
+    [metal_kernel(name="metal_sigmul_msl")]
+    def metal_sigmul {
+        let gid = gl_GlobalInvocationID.x
+        if (gid >= total) {
+            return
+        }
+        x[gid] = x[gid] / (1.0 + exp(-g[gid]))
+    }
+}
+
 // ===== the whole-prefill driver =====
 // Registered as prefill override "metal" (DASLLAMA_PIN_PREFILL). One command buffer per prefill;
 // ONE commit+wait, then unified-memory readback hands x_b + per-layer roped-K/raw-V back to the CPU.
