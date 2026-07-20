@@ -1420,6 +1420,12 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
             cold = kmr.watermark < pos || kmr.cap_rows < pos + 2l
         }
     }
+    if (cold && get_env_variable("DASLLAMA_MTP_DEBUG") == "cold") {   // bring-up bisect: log the failing gate
+        let vok_g = metal_mtp_verify_ok(t, s)
+        let dnp = c.recr_mask != 0ul && key_exists(g_dn_mirrors, s.uid) ? g_dn_mirrors[s.uid].pos : -1l
+        let wm = key_exists(g_mirrors, s.uid) ? g_mirrors[s.uid].watermark : -1l
+        to_log(LOG_INFO, "mtp cold: pos={pos} h_pos1={s.mtp_h_pos1} seq={c.seq_len} verify_ok={vok_g} dn_pos={dnp} watermark={wm}\n")
+    }
     if (!cold) {
         // the warm's row-pos h input is the PRE-draft trunk hidden — the draft overwrites mtp_h
         s.mtp_xb_save |> resize(int(c.dim))
@@ -1427,6 +1433,9 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
             memcpy(addr < void? >(s.mtp_xb_save[0]), addr < void? >(s.mtp_h[0]), int(c.dim * 4l))
         }
         cold = !metal_mtp_draft_forward(t, s, tok, pos)
+        if (cold && get_env_variable("DASLLAMA_MTP_DEBUG") == "cold") {
+            to_log(LOG_INFO, "mtp cold: draft declined at pos={pos}\n")
+        }
     }
     if (cold) {
         forward(t, s, tok, pos)
