@@ -6913,6 +6913,175 @@ def private moe_shexp_gate(t : Model; l : int64; xp : float const?) : float {
     }
 }
 
+// ===== cross-token expert reuse instrument (decode) =====
+// DASLLAMA_EXPERT_REUSE=1 arms per-layer recording of decode expert picks — the data gate for
+// the hot-expert decode cache (only cross-token reuse pays; per-token streaming loses).
+
+let private REUSE_CAPS = fixed_array(8l, 16l, 32l, 64l)   // simulated per-layer LRU capacities
+
+struct private ReuseLayer {
+    freq : array<int64>    // per-expert pick count (static-pinning oracle input)
+    prev : array<int64>    // previous token's picks
+    prevn : int64
+    lru : array<int64>     // the simulated LRU lists, flattened at cap-sum offsets
+    lrun : int64[4]
+    hits : int64[4]
+    consec : int64         // picks already picked at the previous token
+    accesses : int64
+    tokens : int64
+}
+
+var private g_reuse_on = -1
+var private g_reuse : array<ReuseLayer>
+
+def private expert_reuse_armed() : bool {
+    if (g_reuse_on < 0) {
+        g_reuse_on = get_env_variable("DASLLAMA_EXPERT_REUSE") == "1" ? 1 : 0
+    }
+    return g_reuse_on == 1
+}
+
+//! Arm/disarm the reuse counter programmatically (benches; the env is for probes/servers).
+def set_expert_reuse(on : bool) {
+    g_reuse_on = on ? 1 : 0
+}
+
+def private expert_reuse_note(l : int64; idx : array<int64>; k, ne : int64) {
+    let li = int(l)
+    if (length(g_reuse) <= li) {
+        g_reuse |> resize(li + 1)
+    }
+    var r & = unsafe(g_reuse[li])
+    if (length(r.freq) < int(ne)) {
+        r.freq |> resize(int(ne))
+        r.lru |> resize(120)   // sum of REUSE_CAPS
+        r.prev |> resize(int(k))
+    }
+    for (j in range64(k)) {
+        let id = idx[j]
+        r.freq[id]++
+        r.accesses++
+        for (p in range64(r.prevn)) {
+            if (r.prev[p] == id) {
+                r.consec++
+                break
+            }
+        }
+        var base = 0l
+        for (ci in range(4)) {
+            let cap = REUSE_CAPS[ci]
+            var found = -1l
+            for (p in range64(r.lrun[ci])) {
+                if (r.lru[base + p] == id) {
+                    found = p
+                    break
+                }
+            }
+            if (found >= 0l) {
+                r.hits[ci]++
+            } else {
+                if (r.lrun[ci] < cap) {
+                    r.lrun[ci]++
+                }
+                found = r.lrun[ci] - 1l   // lands most-recent; the true LRU tail falls off when full
+            }
+            var p = found
+            while (p > 0l) {
+                r.lru[base + p] = r.lru[base + p - 1l]
+                p--
+            }
+            r.lru[base] = id
+            base += cap
+        }
+    }
+    for (j in range64(k)) {
+        r.prev[j] = idx[j]
+    }
+    r.prevn = k
+    r.tokens++
+}
+
+//! Print the decode expert-reuse report accumulated under ``DASLLAMA_EXPERT_REUSE=1``: per layer
+//! (``verbose`` only), simulated LRU hit rates at capacities 8/16/32/64, static top-C frequency
+//! coverage (the whole-run pinning oracle), and consecutive-token overlap.
+def expert_reuse_report(verbose : bool = true) {
+    var nl = 0
+    for (r in g_reuse) {
+        if (r.accesses > 0l) {
+            nl++
+        }
+    }
+    var sum_hits : int64[4]
+    var sum_cov : int64[4]
+    var sum_consec = 0l
+    var sum_acc = 0l
+    var toks = 0l
+    for (li in range(length(g_reuse))) {
+        var r & = unsafe(g_reuse[li])
+        if (r.accesses == 0l) {
+            continue
+        }
+        toks = max(toks, r.tokens)
+        // static top-C coverage: sort a frequency copy descending, prefix-sum at each capacity
+        var f := r.freq
+        f |> sort() $(a, b) => a > b
+        var cov : int64[4]
+        var acc = 0l
+        var fi = 0
+        for (ci in range(4)) {
+            while (int64(fi) < min(REUSE_CAPS[ci], int64(length(f)))) {
+                acc += f[fi]
+                fi++
+            }
+            cov[ci] = acc
+            sum_cov[ci] += acc
+        }
+        delete f
+        let a = double(r.accesses)
+        let ltag = li < 10 ? "L0" : "L"
+        if (verbose) {
+            to_log(LOG_INFO, "{ltag}{li} lru {double(r.hits[0]) * 100.0lf / a:.1f}/{double(r.hits[1]) * 100.0lf / a:.1f}/{double(r.hits[2]) * 100.0lf / a:.1f}/{double(r.hits[3]) * 100.0lf / a:.1f}%  top {double(cov[0]) * 100.0lf / a:.1f}/{double(cov[1]) * 100.0lf / a:.1f}/{double(cov[2]) * 100.0lf / a:.1f}/{double(cov[3]) * 100.0lf / a:.1f}%  consec {double(r.consec) * 100.0lf / a:.1f}%\n")
+        }
+        for (ci in range(4)) {
+            sum_hits[ci] += r.hits[ci]
+        }
+        sum_consec += r.consec
+        sum_acc += r.accesses
+    }
+    if (sum_acc == 0l) {
+        to_log(LOG_INFO, "expert-reuse: no data (DASLLAMA_EXPERT_REUSE=1 not set, or no decode ran)\n")
+        return
+    }
+    let a = double(sum_acc)
+    to_log(LOG_INFO, "MEAN lru {double(sum_hits[0]) * 100.0lf / a:.1f}/{double(sum_hits[1]) * 100.0lf / a:.1f}/{double(sum_hits[2]) * 100.0lf / a:.1f}/{double(sum_hits[3]) * 100.0lf / a:.1f}%  top {double(sum_cov[0]) * 100.0lf / a:.1f}/{double(sum_cov[1]) * 100.0lf / a:.1f}/{double(sum_cov[2]) * 100.0lf / a:.1f}/{double(sum_cov[3]) * 100.0lf / a:.1f}%  consec {double(sum_consec) * 100.0lf / a:.1f}%  (caps {REUSE_CAPS[0]}/{REUSE_CAPS[1]}/{REUSE_CAPS[2]}/{REUSE_CAPS[3]}, tokens {toks}, layers-with-data {nl})\n")
+    // the transfer-budget view: cache misses per token per layer at each capacity
+    let tl = double(sum_acc) / (toks > 0l ? double(toks) : 1.0lf)
+    to_log(LOG_INFO, "miss/tok/layer lru {(a - double(sum_hits[0])) / a * tl / double(nl > 0 ? nl : 1):.2f}/{(a - double(sum_hits[1])) / a * tl / double(nl > 0 ? nl : 1):.2f}/{(a - double(sum_hits[2])) / a * tl / double(nl > 0 ? nl : 1):.2f}/{(a - double(sum_hits[3])) / a * tl / double(nl > 0 ? nl : 1):.2f}\n")
+}
+
+//! Drop all accumulated expert-reuse data (phase separation in probes).
+def expert_reuse_reset() {
+    delete g_reuse
+}
+
+//! Top-``n`` expert ids for layer ``li`` by recorded pick frequency — the pinning candidate set.
+def expert_reuse_top(li : int; n : int) : array<int64> {
+    var res : array<int64>
+    if (li < 0 || li >= length(g_reuse)) {
+        return <- res
+    }
+    let r & = unsafe(g_reuse[li])
+    var ids <- [for (i in range(length(r.freq))); int64(i)]
+    ids |> sort() $(a, b) => r.freq[a] > r.freq[b]
+    for (i in range(min(n, length(ids)))) {
+        if (r.freq[ids[i]] > 0l) {
+            res |> push(ids[i])
+        }
+    }
+    delete ids
+    return <- res
+}
+
 // Routed experts, given the pre-normed input in s.xb and the top-k selection in s.moe_idx/s.moe_w:
 // s.moe_acc = Σ_j w_j · FFN_e_j(xb). Shared by qwen2moe/gpt-oss (via moe_ffn_core) and gemma4
 // (which folds its per-expert down scale into s.moe_w first).
@@ -6922,6 +7091,9 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
     let dim = c.dim
     let ne = c.n_expert
     let k = c.n_expert_used
+    if (expert_reuse_armed()) {
+        expert_reuse_note(l, s.moe_idx, k, ne)
+    }
     for (i in range64(dim)) {
         s.moe_acc[i] = 0.0
     }
