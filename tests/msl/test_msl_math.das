@@ -31,6 +31,7 @@ kernel void mathcalls(device const float* a [[buffer(0)]],
     float y = b[i];
     c[i] = (((exp(min(x, 4.0f)) + sqrt(abs(x))) + (rsqrt((abs(y) + 1.0f)) + tanh(x))) + ((sin(x) + cos(y)) + (saturate(x) + max(x, y))));
     c[i] += float(qa[i]);
+    c[i] += log((abs(x) + 1.0f));
     float4 u = va[i];
     float4 v = vb[i];
     vc[i] = (((exp(min(u, float4(4.0f, 4.0f, 4.0f, 4.0f))) + sqrt(abs(u))) + (rsqrt((abs(v) + float4(1.0f, 1.0f, 1.0f, 1.0f))) + tanh(u))) + ((sin(u) + cos(v)) + (saturate(u) + max(u, v))));
@@ -47,6 +48,7 @@ def test_mathcalls_shape(t : T?) {
         t |> success(contains(mathcalls_msl, "exp(min(x, 4.0f))"), "exp + scalar min")
         t |> success(contains(mathcalls_msl, "sqrt(abs(x))"), "sqrt + float abs")
         t |> success(contains(mathcalls_msl, "rsqrt((abs(y) + 1.0f))"), "rsqrt")
+        t |> success(contains(mathcalls_msl, "log((abs(x) + 1.0f))"), "log")
         t |> success(contains(mathcalls_msl, "tanh(x)"), "tanh")
         t |> success(contains(mathcalls_msl, "sin(x)") && contains(mathcalls_msl, "cos(y)"), "sin/cos")
         t |> success(contains(mathcalls_msl, "saturate(x)"), "saturate")

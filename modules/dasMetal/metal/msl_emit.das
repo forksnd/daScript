@@ -739,7 +739,7 @@ def private sgmat_zero_fill(sgname : string) : string {
 // float-family (abs also signed-int); min/max take any numeric class. Fastmath is a kernel-level
 // property; single ops stay correctly rounded under MTLMathModeSafe (Phase-4 measured fact).
 let private MSL_MATH_UNARY : table<string> <- {
-    "exp", "sqrt", "rsqrt", "sin", "cos", "tanh", "abs", "saturate", "round"
+    "exp", "log", "sqrt", "rsqrt", "sin", "cos", "tanh", "abs", "saturate", "round"
 }
 
 // simdgroup intrinsics, the math whitelist, + the ctor/convert/saturating-narrow family are the
