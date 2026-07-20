@@ -4850,6 +4850,385 @@
       ]
     },
     {
+      "id": "opencode/background-color-erase",
+      "checkpoints": [
+        {
+          "checkpoint": "panel",
+          "screen": [
+            "",
+            "    prompt"
+          ],
+          "history": [],
+          "cursor": {
+            "row": 1,
+            "column": 10
+          },
+          "alternate_active": false,
+          "title": "",
+          "replies": [],
+          "cells": [
+            {
+              "row": 0,
+              "column": 2,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 0,
+              "column": 3,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 0,
+              "column": 4,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 0,
+              "column": 5,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 0,
+              "column": 6,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 0,
+              "column": 7,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 0,
+              "column": 8,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 0,
+              "column": 9,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 1,
+              "column": 2,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 1,
+              "column": 3,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 1,
+              "column": 4,
+              "grapheme": "p",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 1,
+              "column": 5,
+              "grapheme": "r",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 1,
+              "column": 6,
+              "grapheme": "o",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 1,
+              "column": 7,
+              "grapheme": "m",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 1,
+              "column": 8,
+              "grapheme": "p",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 1,
+              "column": 9,
+              "grapheme": "t",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            },
+            {
+              "row": 1,
+              "column": 10,
+              "grapheme": " ",
+              "width": 1,
+              "attributes": 0,
+              "foreground": {
+                "kind": "default_color",
+                "index": 0,
+                "red": 0,
+                "green": 0,
+                "blue": 0
+              },
+              "background": {
+                "kind": "rgb",
+                "index": 0,
+                "red": 30,
+                "green": 30,
+                "blue": 30
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "id": "claude-code/captured-startup-and-teardown",
       "checkpoints": [
         {

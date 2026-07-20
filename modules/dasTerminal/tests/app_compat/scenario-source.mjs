@@ -158,6 +158,21 @@ export const corpus = {
       ]
     },
     {
+      id: "opencode/background-color-erase",
+      source: "OpenCode 1.18.4, Windows ConPTY capture, 2026-07-20",
+      columns: 12,
+      rows: 2,
+      steps: [
+        {
+          feed: bytes(
+            `${ESC}[48;2;30;30;30m${ESC}[1;3H${ESC}[8X` +
+            `${ESC}[2;3H  prompt${ESC}[1X`
+          )
+        },
+        { checkpoint: "panel" }
+      ]
+    },
+    {
       id: "claude-code/captured-startup-and-teardown",
       source: "Claude Code 2.1.215, Windows ConPTY capture, 2026-07-19",
       columns: 100,

@@ -391,6 +391,21 @@ def private copy_cell(cell : TerminalCell const; row, column : int) : TerminalCe
         hyperlink = cell.hyperlink)
 }
 
+def private erased_cell(buffer : TerminalBuffer const; row, column : int) : TerminalCell {
+    return TerminalCell(row = row, column = column, grapheme = " ", width = 1,
+        attributes = buffer.pen.attributes, foreground = buffer.pen.foreground,
+        background = buffer.pen.background)
+}
+
+def private erased_row(buffer : TerminalBuffer const; columns, row : int) : TerminalRow {
+    var result = TerminalRow()
+    result.cells |> reserve(columns)
+    for (column in range(columns)) {
+        result.cells |> push(erased_cell(buffer, row, column))
+    }
+    return <- result
+}
+
 def private clear_cell(terminal : Terminal const; var buffer : TerminalBuffer;
                        row, column : int) {
     if (row < 0 || row >= terminal.rows || column < 0 || column >= terminal.columns) return
@@ -400,12 +415,12 @@ def private clear_cell(terminal : Terminal const; var buffer : TerminalBuffer;
         first--
     }
     if (buffer.screen[physical_row].cells[first].width == 2 && first + 1 >= column) {
-        buffer.screen[physical_row].cells[first] = blank_cell(row, first)
+        buffer.screen[physical_row].cells[first] = erased_cell(buffer, row, first)
         if (first + 1 < terminal.columns) {
-            buffer.screen[physical_row].cells[first + 1] = blank_cell(row, first + 1)
+            buffer.screen[physical_row].cells[first + 1] = erased_cell(buffer, row, first + 1)
         }
     } else {
-        buffer.screen[physical_row].cells[column] = blank_cell(row, column)
+        buffer.screen[physical_row].cells[column] = erased_cell(buffer, row, column)
     }
 }
 
@@ -423,7 +438,7 @@ def private scroll_up(terminal : Terminal const; var buffer : TerminalBuffer; no
     if (normal) append_history_row(buffer, buffer.screen[first])
     buffer.screen_start = (buffer.screen_start + 1) % terminal.rows
     let last = screen_index(buffer, terminal.rows - 1)
-    buffer.screen[last] <- blank_row(terminal.columns, terminal.rows - 1)
+    buffer.screen[last] <- erased_row(buffer, terminal.columns, terminal.rows - 1)
 }
 
 def private scroll_rows_up(terminal : Terminal const; var buffer : TerminalBuffer;
@@ -445,7 +460,7 @@ def private scroll_rows_up(terminal : Terminal const; var buffer : TerminalBuffe
     }
     for (row in range(last - count + 1, last + 1)) {
         let destination = screen_index(buffer, row)
-        buffer.screen[destination] <- blank_row(terminal.columns, row)
+        buffer.screen[destination] <- erased_row(buffer, terminal.columns, row)
     }
 }
 
@@ -459,7 +474,7 @@ def private scroll_rows_down(terminal : Terminal const; var buffer : TerminalBuf
         for (_ in range(count)) {
             buffer.screen_start = (buffer.screen_start + terminal.rows - 1) % terminal.rows
             let top = screen_index(buffer, 0)
-            buffer.screen[top] <- blank_row(terminal.columns, 0)
+            buffer.screen[top] <- erased_row(buffer, terminal.columns, 0)
         }
         return
     }
@@ -472,7 +487,7 @@ def private scroll_rows_down(terminal : Terminal const; var buffer : TerminalBuf
     }
     for (blank in range(first, first + count)) {
         let destination = screen_index(buffer, blank)
-        buffer.screen[destination] <- blank_row(terminal.columns, blank)
+        buffer.screen[destination] <- erased_row(buffer, terminal.columns, blank)
     }
 }
 
@@ -624,7 +639,7 @@ def private erase_display(terminal : Terminal const; var buffer : TerminalBuffer
     if (mode == 2 || mode == 3) {
         for (row in range(terminal.rows)) {
             let physical = screen_index(buffer, row)
-            buffer.screen[physical] <- blank_row(terminal.columns, row)
+            buffer.screen[physical] <- erased_row(buffer, terminal.columns, row)
         }
         if (mode == 3) {
             buffer.history |> clear()
@@ -634,13 +649,13 @@ def private erase_display(terminal : Terminal const; var buffer : TerminalBuffer
         erase_line(terminal, buffer, 0)
         for (row in range(buffer.cursor.row + 1, terminal.rows)) {
             let physical = screen_index(buffer, row)
-            buffer.screen[physical] <- blank_row(terminal.columns, row)
+            buffer.screen[physical] <- erased_row(buffer, terminal.columns, row)
         }
     } elif (mode == 1) {
         erase_line(terminal, buffer, 1)
         for (row in range(0, buffer.cursor.row)) {
             let physical = screen_index(buffer, row)
-            buffer.screen[physical] <- blank_row(terminal.columns, row)
+            buffer.screen[physical] <- erased_row(buffer, terminal.columns, row)
         }
     }
 }
