@@ -91,6 +91,10 @@ namespace das {
         JobQue & operator = ( JobQue && ) = delete;
         ~JobQue ();
         bool isEmpty (bool includingMainThreadJobs = false);
+        // Wait until nothing is queued or running, up to timeoutMs (0 = wait forever). Returns false
+        // on timeout. join() does NOT do this -- it flags shutdown and waits for the THREADS, and a
+        // worker tests that flag before the fifo, so queued-but-unstarted jobs are discarded.
+        bool drain ( int timeoutMs );
         bool areJobsPending(JobCategory category);
         int getNumberOfQueuedJobs();
         int getTotalHwJobs();

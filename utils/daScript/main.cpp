@@ -967,9 +967,16 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
     // das::dump_alloc_leaks is registered as an atexit handler via init_seg(lib),
     // so it fires after all static destructors — cleaner than dumping here.
     if ( g_smart_ptr_total!=0 ) {
+        // The exit is unconditional but the explanation used to sit inside `if (dumpLeaks)`, so
+        // `-no-dump-leaks` turned this into a bare exit(1) -- indistinguishable from a script that
+        // simply returned 1. Announce the reason either way; only the per-pointer dump is optional.
+        TextPrinter tp;
+        tp << "FATAL: exiting with code 1 -- " << uint64_t(g_smart_ptr_total)
+           << " smart pointer(s) still alive at shutdown";
+        if ( !dumpLeaks ) tp << " (re-run without -no-dump-leaks for the per-pointer dump)";
+        tp << "\n";
+        tp.output();    // ~TextWriter only frees the buffer; without this the message is discarded
         if ( dumpLeaks ) {
-            TextPrinter tp;
-            tp << "smart pointers leaked: " << uint64_t(g_smart_ptr_total) << "\n";
             ptr_ref_count::DumpTrackPtr();
         }
         exit(1);

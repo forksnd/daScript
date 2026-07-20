@@ -1,0 +1,1 @@
+Terminates the program immediately with the specified integer exit code, equivalent to C exit. A non-zero code is reported with the calling script location and a daslang stack trace, so the exit is not silent; exit(0) is a normal shutdown and prints nothing.

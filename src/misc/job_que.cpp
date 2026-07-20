@@ -378,6 +378,21 @@ namespace das {
         }
     }
 
+    bool JobQue::drain ( int timeoutMs ) {
+        // Poll rather than condvar: completion has no single signalling point (jobs finish on N
+        // workers and on the calling thread), and this runs once per scope exit, not in a hot path.
+        // Pumping EvalMainThreadJobs is required, not optional: isEmpty(true) counts jobs that only
+        // the calling thread can run, so without this the queue never empties and every drain with
+        // main-thread work outstanding would spin to the timeout. Same shape as wait() above.
+        auto deadline = ref_time_ticks();
+        for ( ;; ) {
+            if ( isEmpty(true) ) return true;
+            if ( timeoutMs > 0 && get_time_usec(deadline) >= int64_t(timeoutMs) * 1000 ) return false;
+            EvalMainThreadJobs();
+            this_thread::yield();
+        }
+    }
+
     void JobQue::join() {
         {
             // Set the flag and wake every parked worker under the lock so none misses the wakeup.

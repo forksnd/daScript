@@ -144,6 +144,7 @@ struct ReleaseSpec {
     wasm_build_command : string         //!< shell command that builds this EXTERNAL module's wasm archives (run with cwd = module dir); empty = in-tree module built by `daspkg build --wasm`
     wasm_archives : array<string>       //!< archives (relative to module dir) produced by wasm_build_command, staged into the release wasm lib dir
     requires_jit : bool                 //!< app is JIT-only (per-box [tune]/[llvm_code] kernels); a baked -exe would run broken, so `daspkg release` refuses it
+    include_symbols : bool              //!< ship debug symbols for every shipped binary into `<bundle>/symbols/`
 }
 
 var _release_spec : ReleaseSpec
@@ -161,6 +162,13 @@ def release_main(script : string) {
 //! a clear message instead of producing a dead binary. Such an app deploys as `daslang -jit <main>`.
 def release_requires_jit() {
     _release_spec.requires_jit = true
+}
+
+//! Ship debug symbols for every shipped binary into `<bundle>/symbols/`, so a minidump from the
+//! deployed tree resolves (`cdb -y <bundle>\symbols`). Opt-in: symbols dwarf the payload (daslang's
+//! runtime PDBs are ~320 MB). Windows `.pdb` only; see `skills/daspkg.md`.
+def release_include_symbols() {
+    _release_spec.include_symbols = true
 }
 
 //! Entry script for `daspkg release wasm` (the wasm64 build) when it differs from the native release_main() — e.g. a live_stub variant that drops the desktop live-reload stack (which can't cross-compile). Falls back to release_main() when unset.
