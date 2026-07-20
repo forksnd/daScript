@@ -60,7 +60,7 @@ def private load_corpus(path : string) : array<string> {
     var texts : array<string>
     fopen(path, "rb") $(f) {
         if (f == null) {
-            panic("can't open prompt corpus")
+            panic("can't open prompt corpus {path}")
         }
         for (p in split(fread(f), "%%")) {
             let tp = strip(p)

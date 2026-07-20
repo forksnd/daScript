@@ -1787,8 +1787,9 @@ def moe_gpu_upload_resident(var t : Model) {
     let nstream = nstream_want < 0l ? t.config.n_layers : nstream_want
     let dn_want = gpu_want_dn() || gpu_want_dnd()   // the decode step rides the same dn uploads
     let at_want = gpu_want_attn()
+    // layer count tests == 0, NOT <= 0: -1 is the auto sentinel and must read as a REQUEST
     if (!moe_gpu_tier_installed()
-            || (moe_gpu_layer_count() <= 0l && nstream <= 0l && !dn_want && !at_want
+            || (moe_gpu_layer_count() == 0l && nstream <= 0l && !dn_want && !at_want
                 && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())) {
         return   // tier absent or nothing requested
     }

@@ -4163,7 +4163,9 @@ def private vk_device_name : string {
 //! Idempotent — re-arming after ``set_gpu_tier_want`` just refreshes the layer count.
 def vulkan_moe_gpu_arm : bool {
     let layers = gpu_want_moe_layers()
-    if ((layers <= 0l && gpu_want_moe_stream() <= 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd()
+    // counts test == 0, NOT <= 0: -1 is the auto sentinel and must read as a REQUEST, or an
+    // auto-sized-layers-only want would silently fail to arm
+    if ((layers == 0l && gpu_want_moe_stream() == 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd()
                 && gpu_want_heat() <= 0l && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())
             || !vulkan_backend_available()) {
         return false   // nothing requested (checked first — the device probe is not free)

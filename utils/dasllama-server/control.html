@@ -1219,16 +1219,12 @@ function renderForm(surface, status) {
         if (f.t === "bool") cell.append(input, label); else cell.append(label, input);
         form.append(cell);
     }
-    // switching gpu to vulkan while every detail knob still shows its raw unset sentinel would
-    // SAVE those zeros as explicit authoritative values and disarm the tier on restart — fill
-    // in the blessed serving shape (K=2 + S=35 + DN + ATTN) so the form shows what will run
+    // gpu_layers / gpu_stream 0 means AUTO server-side (fill the VRAM budget, stream the rest), so
+    // the zeros are safe to save now and the form no longer invents box-specific counts — only the
+    // rail toggles need filling in so the page shows what will actually run
     $("f-gpu").addEventListener("change", () => {
         if ($("f-gpu").value === "vulkan"
-            && Math.trunc(Number($("f-gpu_layers").value)) === 0
-            && Math.trunc(Number($("f-gpu_stream").value)) === 0
             && !$("f-gpu_dn").checked && !$("f-gpu_attn").checked) {
-            $("f-gpu_layers").value = "2";
-            $("f-gpu_stream").value = "35";
             $("f-gpu_dn").checked = true;
             $("f-gpu_attn").checked = true;
         }

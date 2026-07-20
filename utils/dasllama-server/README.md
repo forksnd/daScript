@@ -154,10 +154,12 @@ first — Windows locks the exe.
 Config precedence: `defaults < config TOML < explicit CLI flags` — unless the TOML carries
 `authoritative = true` (what the control page saves), which flips the top: `defaults < CLI <
 authoritative TOML`. The `gpu` key (`off | metal | metal-required | vulkan`) is the first-class
-backend selector; `gpu = vulkan` arms the MoE tier with the blessed shape (K=2 resident + S=35
-streamed expert stacks + DN + ATTN) unless the `gpu_layers` / `gpu_stream` / `gpu_dn` / `gpu_attn`
-/ `gpu_dense` / `gpu_vram_mb` keys override it. The `DASLLAMA_GPU_*` env vars still override
-everything (they remain the A/B levers).
+backend selector; `gpu = vulkan` arms the MoE tier in its blessed shape — expert stacks sized
+**automatically** (resident layers fill the VRAM budget, the rest stream) plus DN + ATTN + dense +
+the resident shared expert. `gpu_layers` / `gpu_stream` are `0` = auto by default; set either to a
+positive value to pin it exactly, and `gpu_dn` / `gpu_attn` / `gpu_dense` / `gpu_vram_mb` override
+the rest. The `DASLLAMA_GPU_*` env vars still override everything (they remain the A/B levers), and
+`DASLLAMA_GPU=1` requests the same auto shape without a config file.
 
 ### Chat
 
