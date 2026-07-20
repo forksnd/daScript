@@ -1012,7 +1012,7 @@ def dn_mirror_prepare(var s : Session; pos : int64) : tuple<ok : bool; buf : Met
     }
     g_tick++
     g_dn_mirrors[s.uid].tick = g_tick
-    let mr = g_dn_mirrors[s.uid]   // cheap copy — one lookup per statement (table re-hash safety)
+    var mr = g_dn_mirrors[s.uid]   // cheap copy — one lookup per statement (table re-hash safety)
     return (ok = true, buf = mr.buf, conv_off = mr.conv_off)
 }
 

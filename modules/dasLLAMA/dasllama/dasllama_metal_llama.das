@@ -982,6 +982,9 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
             decode_override_logits_done()
         }
         g_mirrors[s.uid].watermark = r.pos + 1l
+        if (r.dn) {   // the GPU state now holds pos's update — advance the mirror's forward-only cursor
+            dn_mirror_advance(s.uid, r.pos)
+        }
         g_us_readback += int64(get_time_usec(ts_rb))
         g_decodes++
         if (int64(length(g_step_trace)) < g_step_trace_cap) {
@@ -1158,8 +1161,9 @@ def private discard_pre {
 // GPU. When speculation gates pass, the cb commits AND chains itself (argmax + embed gather, no
 // CPU poke); otherwise it stays uncommitted. Quietly declines when gates fail — slow path serves those.
 def private pre_encode_next(t : Model; s : Session; npos : int64; var prev_blog : MetalBuffer?) {
-    // quiet non-decline: skipping the pre-encode just means the slow path serves the next step
-    if (decode_decline(t, s, npos) != MetalDecodeDecline.none || !key_exists(g_mirrors, s.uid)) {
+    // no encode-ahead for recurrent (two cbs race the one dn state buffer); a declined/absent-mirror skip = slow path serves it
+    if (t.config.recr_mask != 0ul ||
+            decode_decline(t, s, npos) != MetalDecodeDecline.none || !key_exists(g_mirrors, s.uid)) {
         return
     }
     let mr = g_mirrors[s.uid]   // cheap copy, capacity check ONLY — row npos-1 is in flight on the GPU
@@ -1205,6 +1209,16 @@ def private metal_decode_slow(t : Model; var s : Session; pos : int64) : bool {
         return false
     }
     var r = acquire_step(t, s, pos, mir.koff, mir.voff, mir.cap)
+    if (r.dn) {
+        var dm = dn_mirror_prepare(s, pos)
+        if (!dm.ok) {   // state not resident and no CPU prefix to sync from — decline this step
+            release_step(r)
+            decline(MetalDecodeDecline.dn_state)
+            return false
+        }
+        r.bdn_state = dm.buf
+        r.dn_conv_base = dm.conv_off
+    }
     poke_step(s, r)
     g_us_setup += int64(get_time_usec(ts_all))
     let ts_enc = ref_time_ticks()
