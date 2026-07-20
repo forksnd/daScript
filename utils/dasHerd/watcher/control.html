@@ -246,7 +246,7 @@
       terminal.onBinary(data => {
         if (attached && controls) sendWs({op: 'input', text: data});
       });
-      new ResizeObserver(scheduleFit).observe($('.terminal-host'));
+      new ResizeObserver(scheduleFit).observe(document.querySelector('.terminal-host'));
 
       setZoom(Number(localStorage.getItem('dasherd-watcher-zoom') || 150));
       $('launch').onclick = async () => {
