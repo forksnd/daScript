@@ -299,6 +299,9 @@ struct private StepRes {
     u_moe_k : MetalBuffer?
     u_moe_nfe : MetalBuffer?
     u_moe_knfe : MetalBuffer?  // k * n_ff_exp — the swiglu span over the slot rows
+    u_moe_ss : MetalBuffer?    // sel stride per stream (2k) — the verify's two-stream forms
+    u_moe_kdim : MetalBuffer?  // k * dim — per-stream bmoe_dn stride
+    u_moe_tot : MetalBuffer?   // nrows * knfe — the two-stream swiglu span
     u_moe_eblk : MetalBuffer?  // q8 blocks per expert plane (ege / 32)
     u_moe_esb : MetalBuffer?   // kq superblocks per expert plane (ege / 256)
     u_moe_xs_dn : MetalBuffer? // the down site's per-slot x stride (nfe)
@@ -337,6 +340,7 @@ struct private StepRes {
     bytes_dn_di : uint64
     bytes_dn_h : uint64        // nvh floats (β / α rows)
     bytes_moe_lg : uint64
+    bytes_moe_sel : uint64
     bytes_moe_dn : uint64
     bytes_supp : uint64
     bytes_tab_sw : uint64      // the swa rope pair's row bytes (hetero: hs_sw/2 floats != bytes_tab)
@@ -452,15 +456,19 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     }
     if (moe) {
         let ege = dim * c.n_ff_exp
-        r.bytes_moe_lg = uint64(c.n_expert * 4l)
-        r.bytes_moe_dn = uint64(c.n_expert_used * dim * 4l)
+        r.bytes_moe_lg = uint64(nrows * c.n_expert * 4l)
+        r.bytes_moe_sel = uint64(nrows) * 128ul
+        r.bytes_moe_dn = uint64(nrows * c.n_expert_used * dim * 4l)
         r.bmoe_lg = pool_acquire(g_pool, g_dev, r.bytes_moe_lg)
-        r.bmoe_sel = pool_acquire(g_pool, g_dev, 128ul)   // k <= 16: [k idx][k w]
+        r.bmoe_sel = pool_acquire(g_pool, g_dev, r.bytes_moe_sel)   // k <= 16: [k idx][k w] per stream
         r.bmoe_dn = pool_acquire(g_pool, g_dev, r.bytes_moe_dn)
         r.u_moe_ne = uniform_u32(uint(c.n_expert))
         r.u_moe_k = uniform_u32(uint(c.n_expert_used))
         r.u_moe_nfe = uniform_u32(uint(c.n_ff_exp))
         r.u_moe_knfe = uniform_u32(uint(knfe))
+        r.u_moe_ss = uniform_u32(uint(2l * c.n_expert_used))
+        r.u_moe_kdim = uniform_u32(uint(c.n_expert_used * dim))
+        r.u_moe_tot = uniform_u32(uint(nrows * knfe))
         r.u_moe_eblk = uniform_u32(uint(ege / 32l))
         r.u_moe_esb = uniform_u32(uint(ege / 256l))
         r.u_moe_xs_dn = uniform_u32(uint(c.n_ff_exp))
@@ -1074,15 +1082,16 @@ def metal_mtp_draft_forward(t : Model; var s : Session; token, pos : int64) : bo
 
 var private g_vrt : array<uint>   // per-layer 2-row route entries: uint4(koff_el+lbase, voff_el+lbase, cap, cnt_i)
 
-// verify shape gate: f16 KV, dense silu FFN, no epilogue exotics. Weight sites are fmt-generic
-// (enc_verify_site: q8 planes or the kq mvb twins — the load gate vets kernel coverage); a
-// missing attn_v has no verify arm yet. The MoE/shexp arm stages in after the dense ladder
+// verify shape gate: f16 KV, silu FFN (dense or routed MoE ± shexp), no epilogue exotics.
+// Weight sites are fmt-generic (enc_verify_site / enc_moe_gemv — the load gate vets kernel
+// coverage); a missing attn_v and the g4/mx4 MoE forms have no verify arm yet
 def private metal_mtp_verify_ok(t : Model; s : Session) : bool {
     let c = t.config
     if (s.kv_dtype_k != KVDtype.f16 || s.kv_dtype_v != KVDtype.f16 ||
             has_dual_rope(c) || c.attn_sinks || c.v_norm || c.pre_post_norm || c.layer_out_scale ||
             c.final_logit_softcap > 0.0 || !empty(t.suppress) ||
-            !t.blocks.ffn_is_dense || c.ffn_act != FfnAct.silu ||
+            (!t.blocks.ffn_is_dense && (c.moe_dense_shexp || t.experts_mx4)) ||
+            c.ffn_act != FfnAct.silu ||
             t.wcls_off < 0l || (c.shared_weights && !t.cls_q8 && t.emb_fmt == KqFmt.q8)) {
         return false
     }
@@ -1213,21 +1222,66 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
             enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb2, 0ul, r.u_total_dim, 2l * dim)
             enc_rms_b(enc, r.bx, bw_ffn, r.bxb, r.u_dim, r.u_eps, 2l)
         }
-        let f1 = kq_fmt_at(t.w1_fmt, l)
-        let f2 = kq_fmt_at(t.w2_fmt, l)
-        let f3 = kq_fmt_at(t.w3_fmt, l)
-        if (f1 == KqFmt.q8 && f2 == KqFmt.q8 && f3 == KqFmt.q8) {
-            let bw1 = blob_of(g_dev, t, t.w1_offs[l])
-            let bw3 = blob_of(g_dev, t, t.w3_offs[l])
-            enc_gemv_w13sw_b(enc, false, bw1.buf, bw1.boff, bw3.boff, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
-            let bw2 = blob_of(g_dev, t, t.w2_offs[l])
-            enc_gemv_b(enc, false, bw2.buf, bw2.boff, r.bh12, r.bxb, r.u_hidden, r.u_dim, r.u_dim, dim)
+        if (r.moe) {
+            // router -> select -> experts -> combine at two streams; shexp rides the fixed-B2 q8 forms
+            let knfe = c.n_expert_used * c.n_ff_exp
+            let fe1 = kq_fmt_at(t.we1_fmt, l)
+            let fe3 = kq_fmt_at(t.we3_fmt, l)
+            let fe2 = kq_fmt_at(t.we2_fmt, l)
+            var bw_rt = upload_region(addr < void? >(t.fblob[t.router_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
+            var brb : MetalBuffer? = g_one
+            var bhrb = r.u_zero32
+            if (c.moe_router_bias) {
+                brb = upload_region(addr < void? >(t.fblob[t.router_b_off + l * c.n_expert]), uint64(c.n_expert * 4l))
+                bhrb = r.u_moe_gmode
+            }
+            enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, brb, bhrb, c.n_expert, 2l)
+            enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_moe_gmode, 2l)
+            if (r.u_moe_nsh != null) {
+                var bw_shg = upload_region(addr < void? >(t.fblob[t.shexp_gate_off + l * dim]), uint64(dim * 4l))
+                enc_moe_router(enc, bw_shg, r.bxb, r.bmoe_lg, r.u_dim, r.u_one32, r.u_dim, g_one, g_zero, 1l, 2l)
+            }
+            enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, 2l, r.bxb, r.bh12,
+                r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                r.u_moe_ss, r.u_dim, r.u_moe_knfe)
+            enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, 2l, r.bxb, r.bh12,
+                r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                r.u_moe_ss, r.u_dim, r.u_moe_knfe, uint64(2l * knfe * 4l))
+            enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(2l * knfe * 4l), r.u_moe_tot, 2l * knfe)
+            enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, 2l, r.bh12, r.bmoe_dn,
+                r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
+                r.u_moe_ss, r.u_moe_knfe, r.u_moe_kdim)
+            if (r.u_moe_nsh != null) {
+                // shexp FFN reads bxb BEFORE combine overwrites it; bh12 is free after expert W2
+                let nsh = c.n_ff_shexp
+                let she = dim * nsh
+                let bwsh1 = blob_of(g_dev, t, t.wsh1_off + l * she)
+                enc_gemv_w13sw_b(enc, false, bwsh1.buf, bwsh1.boff, uint64(((t.wsh3_off + l * she) / 32l) * 34l),
+                    r.bxb, r.bh12, r.u_dim, r.u_moe_nsh, nsh)
+                let bwsh2 = blob_of(g_dev, t, t.wsh2_off + l * she)
+                enc_gemv_b(enc, false, bwsh2.buf, bwsh2.boff, r.bh12, r.bxb2, r.u_moe_nsh, r.u_dim, r.u_dim, dim)
+            }
+            enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, r.bxb, r.u_dim, r.u_moe_k, dim, 2l)
+            if (r.u_moe_nsh != null) {
+                enc_axpy_sig(enc, r.bxb, r.bxb2, r.bmoe_lg, r.u_total_dim, r.u_dim, 2l * dim)
+            }
         } else {
-            // gate rows land at 0, up rows at 2*hidden (bh12 is nrows * 2*hidden); swiglu fuses in place
-            enc_verify_site(t, r, enc, f1, t.w1_offs[l], hidden, dim, hidden, r.bxb, r.bh12, r.u_dim, r.u_hidden, r.u_hidden)
-            enc_verify_site(t, r, enc, f3, t.w3_offs[l], hidden, dim, hidden, r.bxb, r.bh12, r.u_dim, r.u_hidden, r.u_hidden, [ycol = 2l * hidden])
-            enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(2l * hidden * 4l), r.u_total_h, 2l * hidden)
-            enc_verify_site(t, r, enc, f2, t.w2_offs[l], dim, hidden, dim, r.bh12, r.bxb, r.u_hidden, r.u_dim, r.u_dim)
+            let f1 = kq_fmt_at(t.w1_fmt, l)
+            let f2 = kq_fmt_at(t.w2_fmt, l)
+            let f3 = kq_fmt_at(t.w3_fmt, l)
+            if (f1 == KqFmt.q8 && f2 == KqFmt.q8 && f3 == KqFmt.q8) {
+                let bw1 = blob_of(g_dev, t, t.w1_offs[l])
+                let bw3 = blob_of(g_dev, t, t.w3_offs[l])
+                enc_gemv_w13sw_b(enc, false, bw1.buf, bw1.boff, bw3.boff, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
+                let bw2 = blob_of(g_dev, t, t.w2_offs[l])
+                enc_gemv_b(enc, false, bw2.buf, bw2.boff, r.bh12, r.bxb, r.u_hidden, r.u_dim, r.u_dim, dim)
+            } else {
+                // gate rows land at 0, up rows at 2*hidden (bh12 is nrows * 2*hidden); swiglu fuses in place
+                enc_verify_site(t, r, enc, f1, t.w1_offs[l], hidden, dim, hidden, r.bxb, r.bh12, r.u_dim, r.u_hidden, r.u_hidden)
+                enc_verify_site(t, r, enc, f3, t.w3_offs[l], hidden, dim, hidden, r.bxb, r.bh12, r.u_dim, r.u_hidden, r.u_hidden, [ycol = 2l * hidden])
+                enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(2l * hidden * 4l), r.u_total_h, 2l * hidden)
+                enc_verify_site(t, r, enc, f2, t.w2_offs[l], dim, hidden, dim, r.bh12, r.bxb, r.u_hidden, r.u_dim, r.u_dim)
+            }
         }
         if (l + 1l < c.n_layers) {
             var bw_attn = upload_region(addr < void? >(t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
@@ -1677,7 +1731,7 @@ def private release_step(var r : StepRes) {
     }
     if (r.moe) {
         pool_release(g_pool, r.bmoe_lg, r.bytes_moe_lg)
-        pool_release(g_pool, r.bmoe_sel, 128ul)
+        pool_release(g_pool, r.bmoe_sel, r.bytes_moe_sel)
         pool_release(g_pool, r.bmoe_dn, r.bytes_moe_dn)
         pool_release(g_upool, r.u_moe_ne, 4ul)
         pool_release(g_upool, r.u_moe_k, 4ul)
