@@ -1426,6 +1426,7 @@ enum MetalPrefillDecline {
     device              // metal_prefill_init failed (no device / PSO build failure)
     gpu_error           // dispatch failed at execution time
     planar              // weights not in the blob-image form (the drivers are blob-only)
+    dn_state            // recurrent state not GPU-resident and no CPU prefix to sync from
 }
 
 var g_prefill_declines = 0l
