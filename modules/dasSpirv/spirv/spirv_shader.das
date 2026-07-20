@@ -128,17 +128,20 @@ class SpirvShader : AstFunctionAnnotation {
     }
     def override fixup(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
         let argName = args |> find_arg("name") ?as tString ?? "{func.name}`spirv"
+        var err : array<string>
+        // local_size_{x,y,z} take an int literal OR the name of a module-scope int constant -- the same
+        // rule the layout indices follow. A compute shader whose workgroup size is a platform config
+        // value names it (`local_size_x = SUBGROUP_SIZE`) rather than hardcoding the number.
         var local_size : int3
-        local_size.x = args |> find_arg("local_size_x") ?as tInt ?? 1
-        local_size.y = args |> find_arg("local_size_y") ?as tInt ?? 1
-        local_size.z = args |> find_arg("local_size_z") ?as tInt ?? 1
+        local_size.x = annotation_int(args, "local_size_x", 1, err)
+        local_size.y = annotation_int(args, "local_size_y", 1, err)
+        local_size.z = annotation_int(args, "local_size_z", 1, err)
         // local_size_*_id = N makes that workgroup axis a specialization constant (SpecId = N,
         // default = the local_size_* value); -1 (absent) keeps the axis a plain literal.
         var local_size_ids : int3
         local_size_ids.x = args |> find_arg("local_size_x_id") ?as tInt ?? -1
         local_size_ids.y = args |> find_arg("local_size_y_id") ?as tInt ?? -1
         local_size_ids.z = args |> find_arg("local_size_z_id") ?as tInt ?? -1
-        var err : array<string>
         // Mesh-shader output configuration (max_vertices / max_primitives / output_topology). Only the
         // mesh stage carries these; other stages keep the defaults, which generate_spirv ignores. The
         // topology string is validated here — the only place the annotation args are visible — and a bad
@@ -162,10 +165,16 @@ class SpirvShader : AstFunctionAnnotation {
             }
         }
         let mesh_cfg = MeshOutputConfig(max_vertices = mv, max_primitives = mp, topology = topology)
+        // early_fragment_tests -> the EarlyFragmentTests execution mode; fragment-only, so reject it on
+        // any other stage where the mode would be illegal.
+        let early_frag = args |> find_arg("early_fragment_tests") ?as tBool ?? false
+        if (early_frag && shader_stage() != ShaderStage.Fragment) {
+            err |> push("early_fragment_tests is only valid on a fragment shader")
+        }
         var glob <- find_variable(compiling_module(), argName)
         if (glob != null && glob.init == null && glob.name == argName) {
             var refl : SpirvReflection
-            var words <- generate_spirv(func, err, shader_stage(), local_size, local_size_ids, mesh_cfg, refl)
+            var words <- generate_spirv(func, err, shader_stage(), local_size, local_size_ids, mesh_cfg, early_frag, refl)
             if (err |> empty()) {
                 glob.init = build_uint_array_literal(words, func.at)
                 // Fill the companion reflection global in the same fixup (gated on the blob's

@@ -85,7 +85,7 @@ captured global (default ``<func>`spirv``). The entry point is always emitted as
      - reads ``gl_VertexIndex`` / ``gl_InstanceIndex``, writes ``gl_Position``
    * - ``[fragment_shader]``
      - ``Fragment``
-     - reads ``gl_FragCoord``; ``OriginUpperLeft``
+     - reads ``gl_FragCoord``; ``OriginUpperLeft``; ``early_fragment_tests=true`` → ``EarlyFragmentTests`` (depth/stencil before the shader)
 
 
 Resources and stage I/O
@@ -156,6 +156,10 @@ Declared in ``spirv_builtins`` and recognized by name; available only in the sta
      - ``uint3``
      - ``NumWorkgroups``
      - compute
+   * - ``gl_WorkGroupSize``
+     - ``uint3``
+     - ``WorkgroupSize``
+     - compute
    * - ``gl_VertexIndex``
      - ``int``
      - ``VertexIndex``
@@ -172,6 +176,11 @@ Declared in ``spirv_builtins`` and recognized by name; available only in the sta
      - ``float4``
      - ``FragCoord``
      - fragment
+
+Every builtin above is an ``OpVariable`` except ``gl_WorkGroupSize``, which is the shader's own
+``local_size``: it folds to a ``BuiltIn WorkgroupSize``-decorated ``OpConstantComposite`` (no
+variable, no entry-point interface entry). That is what lets a module shared by several shaders --
+each compiled with its own ``local_size`` -- read the size of whichever one is compiling it.
 
 
 Textures and storage images

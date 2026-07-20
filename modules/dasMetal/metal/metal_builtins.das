@@ -13,10 +13,6 @@ module metal_builtins shared public
 require daslib/shader_lingua_franca public
 
 // ===== compute builtins (Metal-only additions) =====
-// gl_WorkGroupSize is a layout CONSTANT in GLSL; Metal surfaces it as a real kernel parameter
-// ([[threads_per_threadgroup]]), so here it is an ordinary builtin global the host/driver can set.
-var gl_WorkGroupSize : uint3            // threads per threadgroup     -> [[threads_per_threadgroup]]
-
 // simdgroup IDs, GLSL subgroup spellings (KHR_shader_subgroup names — portable if dasSpirv grows
 // subgroup support later); the emitter lowers each to Metal's simdgroup attribute.
 var gl_SubgroupInvocationID : uint      // lane within the simdgroup   -> [[thread_index_in_simdgroup]]

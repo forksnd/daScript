@@ -34,6 +34,10 @@ struct image2D         { texture2D : uint }
 struct samplerCube     { textureCube : uint }
 struct sampler2DArray  { texture2DArray : uint }
 struct sampler2DShadow { texture2D : uint }
+// image3D is the volume storage image, addressed by an int3 (x, y, z). Both rails speak it: the GLSL
+// emitter writes its layout/access qualifiers alongside image2D's, and the SPIR-V emitter lowers it
+// to an OpTypeImage with Dim=3D. Arrayed storage images (image2DArray, imageCubeArray) stay SPIR-V-only.
+struct image3D         { texture3D : uint }
 
 // ===== vertex / fragment / point builtins =====
 var gl_Position   : float4    // clip-space output position (vertex stage)
@@ -51,6 +55,10 @@ var gl_WorkGroupID          : uint3   // this invocation's work group, in the gl
 var gl_LocalInvocationID    : uint3   // this invocation's position within its work group
 var gl_GlobalInvocationID   : uint3   // unique invocation index in the global grid
 var gl_LocalInvocationIndex : uint    // 1D flattening of gl_LocalInvocationID
+// The declared workgroup size (the shader's own local_size_{x,y,z}) -- a COMPILE-TIME CONSTANT, not
+// a dispatch input: the SPIR-V emitter folds it to a BuiltIn WorkgroupSize OpConstantComposite. A
+// module shared by several shaders (each with its own local_size) cannot name that size any other way.
+var gl_WorkGroupSize        : uint3   // the local_size the shader was compiled with
 
 // ===== matrix constructors =====
 // matCxR(col0, ...) builds a matrix from its columns (GLSL core `mat4(vec4,...)`); daslang matrices
@@ -75,18 +83,18 @@ def public float3x3(c0, c1, c2 : float3) : float3x3 {
 // ===== row-vector times matrix =====
 // GLSL's `v * m` (a ROW vector times m) that math lacks: component j is dot(v, column j), exactly
 // SPIR-V's OpVectorTimesMatrix, which the emitter lowers to -- so this CPU body runs only on the host.
-def public operator * (v : float4; m : float4x4) : float4 {
+def public operator *(v : float4; m : float4x4) : float4 {
     return float4(dot(v, m[0]), dot(v, m[1]), dot(v, m[2]), dot(v, m[3]))
 }
 
-def public operator * (v : float3; m : float3x3) : float3 {
+def public operator *(v : float3; m : float3x3) : float3 {
     return float3(dot(v, m[0]), dot(v, m[1]), dot(v, m[2]))
 }
 
 // ===== vector integer modulo =====
 // GLSL's `uvec3 % uvec3` that daslang lacks -> one native OpUMod (the emitter lowers it). Unsigned,
 // 3-lane only; signed `%` stays absent since daslang's OpSRem and GLSL's OpSMod differ on sign.
-def public operator % (a, b : uint3) : uint3 {
+def public operator %(a, b : uint3) : uint3 {
     return uint3(a.x % b.x, a.y % b.y, a.z % b.z)
 }
 
@@ -125,6 +133,16 @@ def public textureLod(s : sampler2D; uv : float2; lod : float) : float4 {
     return float4(0.0, 0.0, 0.0, 0.0)
 }
 
+[unused_argument(s, uv, lod), sideeffects]
+def public textureLod(s : sampler3D; uv : float3; lod : float) : float4 {
+    return float4(0.0, 0.0, 0.0, 0.0)
+}
+
+[unused_argument(s, uv, lod), sideeffects]
+def public textureLod(s : sampler2DArray; uv : float3; lod : float) : float4 {
+    return float4(0.0, 0.0, 0.0, 0.0)
+}
+
 // texelFetch reads a single texel by integer coordinate + mip level, unfiltered. Stage-agnostic
 // (no derivatives). GLSL name-identical (core + ES 3.0); SPIR-V lowers it to OpImage + OpImageFetch.
 [unused_argument(s, coord, lod), sideeffects]
@@ -158,6 +176,12 @@ def public textureSize(s : sampler2DArray; lod : int) : int3 {
     return int3(0, 0, 0)
 }
 
+// texelFetch on a sampler2DArray indexes (x, y, layer) -- the layer is a plain array index, never normalized, so the coordinate is int3 while the sampler2D form takes int2. GLSL name-identical; the emitter's OpImage + OpImageFetch path is dimension-agnostic and needs no change.
+[unused_argument(s, coord, lod), sideeffects]
+def public texelFetch(s : sampler2DArray; coord : int3; lod : int) : float4 {
+    return float4(0.0, 0.0, 0.0, 0.0)
+}
+
 // textureCompare samples a depth-comparison (shadow) sampler: returns the scalar compare result in [0,1] (1 = lit, 0 = shadowed; a filtered sampler returns the PCF average). Implicit LOD -> fragment-only. SPIR-V lowers it to OpImageSampleDrefImplicitLod; the GLSL emitter rewrites it to the GL spelling texture(sampler2DShadow, vec3(uv, compare)) (GL has no distinct shadow function).
 [unused_argument(s, uv, compare), sideeffects]
 def public textureCompare(s : sampler2DShadow; uv : float2; compare : float) : float {
@@ -178,6 +202,20 @@ def public imageLoad(img : image2D; uv : int2) : float4 {
 [unused_argument(img), sideeffects]
 def public imageSize(img : image2D) : int2 {
     return int2(0, 0)
+}
+
+// image3D is addressed one coordinate wider than image2D; imageSize returns (width, height, depth).
+[unused_argument(img, uvw, data), sideeffects]
+def public imageStore(img : image3D; uvw : int3; data : float4) : void {}
+
+[unused_argument(img, uvw), sideeffects]
+def public imageLoad(img : image3D; uvw : int3) : float4 {
+    return float4(0.0, 0.0, 0.0, 0.0)
+}
+
+[unused_argument(img), sideeffects]
+def public imageSize(img : image3D) : int3 {
+    return int3(0, 0, 0)
 }
 
 // ===== compute synchronization =====

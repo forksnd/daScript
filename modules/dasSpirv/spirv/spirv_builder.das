@@ -278,6 +278,18 @@ def public type_acceleration_structure(var m : SpirvModule) : uint {
     return id
 }
 
+// OpTypeRayQueryKHR — the opaque ray-query object type (SPV_KHR_ray_query). A Function-storage
+// LOCAL (not a descriptor), passed by pointer to the rayQuery*EXT intrinsics. Deduped (no operands).
+def public type_ray_query(var m : SpirvModule) : uint {
+    let key = "rayquery"
+    let ex = m.type_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.TypeRayQueryKHR, id)
+    m.type_pool |> insert(key, id)
+    return id
+}
+
 // OpTypeSampledImage wrapping an image type — the type of a combined image+sampler descriptor.
 def public type_sampled_image(var m : SpirvModule; image_type : uint) : uint {
     let key = "simg{image_type}"
@@ -342,6 +354,20 @@ def public type_runtime_array(var m : SpirvModule; elem : uint; stride : int) : 
     let id = alloc_id(m)
     emit(m, SEC_TYPES, SpvOp.TypeRuntimeArray, id, elem)
     emit(m, SEC_DECOR, SpvOp.Decorate, id, uint(SpvDecoration.ArrayStride), uint(stride))
+    m.type_pool |> insert(key, id)
+    return id
+}
+
+// A runtime-sized array of an OPAQUE element (an image / sampled image / sampler) -- the descriptor
+// array a variable-descriptor-count binding exposes. Opaque types have no byte layout, so unlike the
+// SSBO form above this one carries NO ArrayStride; decorating it would be invalid SPIR-V. Deduped on
+// the element alone, in its own key space so it never collides with a strided array of the same id.
+def public type_runtime_array_opaque(var m : SpirvModule; elem : uint) : uint {
+    let key = "rtao{elem}"
+    let ex = m.type_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.TypeRuntimeArray, id, elem)
     m.type_pool |> insert(key, id)
     return id
 }
@@ -507,6 +533,7 @@ def public const_int(var m : SpirvModule; v : int) : uint {
     m.const_pool |> insert(key, id)
     return id
 }
+
 
 def public const_float(var m : SpirvModule; v : float) : uint {
     // Key by the raw IEEE-754 bits, NOT the stringified float: stringifying would collapse distinct

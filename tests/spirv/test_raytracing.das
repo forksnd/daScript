@@ -6,10 +6,12 @@ options indenting = 4
 //   * OpCapability RayTracingKHR (4479) + OpExtension "SPV_KHR_ray_tracing", each exactly once
 //   * the SPIR-V 1.4 header (SPV_KHR_ray_tracing requires >= 1.4) and NO execution modes (none of
 //     the three stages takes one)
-//   * the RT storage classes on the payload / hit-attribute OpVariables + payload Location decorations
+//   * the RT storage classes on the payload / hit-attribute OpVariables (no Location decoration: glslang
+//     emits none on a ray payload, and neither do we)
 //   * OpTypeAccelerationStructureKHR + DescriptorSet/Binding on the TLAS descriptor
-//   * OpTraceRayKHR's payload operand == the matching @ray_payload variable id (raygen payload at
-//     Location 0; the closest-hit shadow payload at Location 1 -- the multi-payload case)
+//   * OpTraceRayKHR's payload operand == the matching @ray_payload variable id (the closest-hit's own
+//     outgoing shadow payload, distinguished from the incoming one by storage class -- the multi-payload
+//     case)
 //   * the reflected acceleration_structure binding + raygen stage flag
 //   * spirv-val against vulkan1.2 (the first env with SPV_KHR_ray_tracing promoted extensions).
 // AnyHit / Intersection / Callable stages land with their first consumer.
@@ -77,18 +79,6 @@ def private trace_ray_payload_id(words : array<uint>) : tuple<ok : bool; value :
     return res
 }
 
-// The id decorated `Location = loc` (Decorate <id> Location loc), or ok=false.
-def private id_with_location(words : array<uint>; loc : uint) : tuple<ok : bool; value : uint> {
-    var res = (ok = false, value = 0u)
-    foreach_inst(words) $(opcode : uint; w : array<uint>; s, n : int) {
-        if (res.ok || opcode != uint(SpvOp.Decorate)) return
-        if (n > 2 && w[s + 1] == uint(SpvDecoration.Location) && w[s + 2] == loc) {
-            res = (ok = true, value = w[s + 0])
-        }
-    }
-    return res
-}
-
 def private assert_rt_module_shape(t : T?; words : array<uint>; lbl : string; model : SpvExecutionModel) {
     t |> success(words[1] == SPV_VERSION_1_4, "{lbl}: SPIR-V header version is 1.4")
     t |> success(op_has_operand_at(words, SpvOp.Capability, 0, uint(SpvCapability.RayTracingKHR)),
@@ -115,12 +105,12 @@ def test_raygen_stage(t : T?) {
             "rt_raygen: gl_LaunchIDEXT -> BuiltIn LaunchIdKHR")
         t |> success(op_has_operand_pair(words, SpvOp.Decorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.LaunchSizeKHR)),
             "rt_raygen: gl_LaunchSizeEXT -> BuiltIn LaunchSizeKHR")
-        // @ray_payload -> a RayPayloadKHR OpVariable, Location 0
+        // @ray_payload -> a RayPayloadKHR OpVariable (no Location decoration: glslang emits none on a
+        // payload, so neither do we)
         let pvar = variable_id_with_storage(words, SpvStorageClass.RayPayloadKHR)
         t |> success(pvar.ok, "rt_raygen: @ray_payload -> RayPayloadKHR OpVariable")
-        let ploc = id_with_location(words, 0u)
-        t |> success(ploc.ok && ploc.value == pvar.value,
-            "rt_raygen: the payload variable carries Location 0 (loc-id={ploc.value} var={pvar.value})")
+        t |> success(!op_has_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.Location)),
+            "rt_raygen: no Location decoration on the payload (matches glslang)")
         // the TLAS descriptor: OpTypeAccelerationStructureKHR + set/binding decorations
         t |> success(has_op(words, SpvOp.TypeAccelerationStructureKHR),
             "rt_raygen: OpTypeAccelerationStructureKHR")
@@ -160,12 +150,11 @@ def test_miss_stage(t : T?) {
     t |> run("[miss_shader]: model + incoming payload + world-ray builtin") <| @(t : T?) {
         var words <- rt_miss_words()
         assert_rt_module_shape(t, words, "rt_miss", SpvExecutionModel.MissKHR)
-        // @incoming_ray_payload -> an IncomingRayPayloadKHR OpVariable, Location 0
+        // @incoming_ray_payload -> an IncomingRayPayloadKHR OpVariable (no Location, matching glslang)
         let pvar = variable_id_with_storage(words, SpvStorageClass.IncomingRayPayloadKHR)
         t |> success(pvar.ok, "rt_miss: @incoming_ray_payload -> IncomingRayPayloadKHR OpVariable")
-        let ploc = id_with_location(words, 0u)
-        t |> success(ploc.ok && ploc.value == pvar.value,
-            "rt_miss: the incoming payload carries Location 0")
+        t |> success(!op_has_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.Location)),
+            "rt_miss: no Location decoration on the incoming payload (matches glslang)")
         // the world-ray builtin read by the sky gradient
         t |> success(op_has_operand_pair(words, SpvOp.Decorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.WorldRayDirectionKHR)),
             "rt_miss: gl_WorldRayDirectionEXT -> BuiltIn WorldRayDirectionKHR")
@@ -187,11 +176,12 @@ def test_closest_hit_stage(t : T?) {
         // both payloads: the incoming one (written result) + the chit's OWN outgoing shadow payload
         let ivar = variable_id_with_storage(words, SpvStorageClass.IncomingRayPayloadKHR)
         t |> success(ivar.ok, "rt_chit: @incoming_ray_payload -> IncomingRayPayloadKHR OpVariable")
+        // the shadow (outgoing) payload is the RayPayloadKHR var; the incoming one is
+        // IncomingRayPayloadKHR -- storage class alone distinguishes them (no Location, matching glslang)
         let svar = variable_id_with_storage(words, SpvStorageClass.RayPayloadKHR)
         t |> success(svar.ok, "rt_chit: the shadow @ray_payload -> RayPayloadKHR OpVariable")
-        let sloc = id_with_location(words, 1u)
-        t |> success(sloc.ok && sloc.value == svar.value,
-            "rt_chit: the shadow payload carries @location = 1")
+        t |> success(!op_has_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.Location)),
+            "rt_chit: no Location decoration on either payload (matches glslang)")
         // the hit-state builtins
         t |> success(op_has_operand_pair(words, SpvOp.Decorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.RayTmaxKHR)),
             "rt_chit: gl_HitTEXT -> BuiltIn RayTmaxKHR")
@@ -207,7 +197,7 @@ def test_closest_hit_stage(t : T?) {
         // ... and no MeshShadingEXT capability leaked in via the gl_PrimitiveID path
         t |> success(!op_has_operand_at(words, SpvOp.Capability, 0, uint(SpvCapability.MeshShadingEXT)),
             "rt_chit: no MeshShadingEXT capability")
-        // the shadow trace: OpTraceRayKHR whose payload operand is the SHADOW payload (Location 1)
+        // the shadow trace: OpTraceRayKHR whose payload operand is the SHADOW (outgoing) payload
         t |> success(count_op(words, SpvOp.TraceRayKHR) == 1,
             "rt_chit: exactly one OpTraceRayKHR (got {count_op(words, SpvOp.TraceRayKHR)})")
         let tpay = trace_ray_payload_id(words)

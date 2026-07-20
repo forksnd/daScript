@@ -49,3 +49,23 @@ def test_fragment_realism(t : T?) {
         delete words
     }
 }
+
+[test]
+def test_early_fragment_tests(t : T?) {
+    t |> run("early_fragment_tests -> EarlyFragmentTests execution mode; spirv-val clean") <| @(t : T?) {
+        var words <- early_frag_words()
+        let model = op_first_operand(words, SpvOp.EntryPoint)
+        t |> success(model.ok && model.value == uint(SpvExecutionModel.Fragment),
+            "early_frag: EntryPoint model is Fragment")
+        // [fragment_shader(early_fragment_tests=true)] -> OpExecutionMode ... EarlyFragmentTests
+        t |> success(op_has_operand_at(words, SpvOp.ExecutionMode, 1, uint(SpvExecutionMode.EarlyFragmentTests)),
+            "early_frag: early_fragment_tests -> EarlyFragmentTests execution mode")
+        // OriginUpperLeft is still emitted (every fragment shader); DepthReplacing is NOT (no gl_FragDepth).
+        t |> success(op_has_operand_at(words, SpvOp.ExecutionMode, 1, uint(SpvExecutionMode.OriginUpperLeft)),
+            "early_frag: OriginUpperLeft still present")
+        t |> success(!op_has_operand_at(words, SpvOp.ExecutionMode, 1, uint(SpvExecutionMode.DepthReplacing)),
+            "early_frag: no DepthReplacing (no gl_FragDepth write)")
+        validate(t, words, "early_frag")
+        delete words
+    }
+}
