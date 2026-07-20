@@ -60,6 +60,18 @@ struct Args {
     @clarg_doc = "Run the timed reps twice in-process — attention q/k/v group OFF then ON (needs DASLLAMA_GPU_QKV=1 for the uploads)"
     qkv_ab : bool
 
+    @clarg_doc = "Run the timed reps twice in-process — MTP/NextN self-speculation OFF then ON (needs a NextN head in the GGUF; the ON arm also reports draft accept rate)"
+    mtp_ab : bool
+
+    @clarg_doc = "Force the per-position MoE prefill instead of the grouped buckets (bit-identical, pure perf lever) — the grouped path is tuned for large npos, so this probes whether it loses at the MTP verify's npos=2"
+    grouped_off : bool
+
+    @clarg_doc = "Run the timed reps twice in-process with MTP ON both times — batched verify classifier OFF then ON. Drift-cancelled measurement of the one-classifier-stream-per-verify win"
+    batchcls_ab : bool
+
+    @clarg_doc = "Run the timed reps twice in-process — resident GPU classifier plane OFF then ON (needs DASLLAMA_GPU_CLS=1, which arms the tier by itself so the classifier offload is measured alone)"
+    cls_ab : bool
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -148,6 +160,9 @@ def main() {
     if (cfg.reuse) {
         set_expert_reuse(true)
     }
+    if (cfg.grouped_off) {
+        set_moe_grouped_prefill(false)
+    }
     var tk <- load_tokenizer_auto(cfg.model)
     print("loading {cfg.model}\n")
     with_job_que() {
@@ -162,7 +177,7 @@ def main() {
         }
         t.config.seq_len = min(t.config.seq_len, maxlen + ngen + 8l)
         let c = t.config
-        print("config: dim={c.dim} layers={c.n_layers} experts={c.n_expert} k={c.n_expert_used} | backend {active_kernel_backend()} | t{threads} affinity {pinned ? "hard" : "env/off"} | {length(toks)} prompts x {ngen} tok x {reps} reps\n")
+        print("config: dim={c.dim} layers={c.n_layers} experts={c.n_expert} k={c.n_expert_used} | backend {active_kernel_backend()} | t{threads} affinity {pinned ? "hard" : "env/off"} | moe-prefill {get_moe_grouped_prefill() ? "grouped" : "per-pos"} | {length(toks)} prompts x {ngen} tok x {reps} reps\n")
         // loud tier line — a silent GPU no-engage (absent DLL, failed probe) must never pass as a row
         let gs = gpu_tier_status()
         let gname = empty(gs.backend) ? "OFF" : "{gs.backend} {gs.device}"
@@ -179,10 +194,20 @@ def main() {
             }
             delete s
         }
-        if ((cfg.dnd_ab ? 1 : 0) + (cfg.heat_ab ? 1 : 0) + (cfg.shexp_ab ? 1 : 0) + (cfg.qkv_ab ? 1 : 0) > 1) {
+        if ((cfg.dnd_ab ? 1 : 0) + (cfg.heat_ab ? 1 : 0) + (cfg.shexp_ab ? 1 : 0) + (cfg.qkv_ab ? 1 : 0)
+                + (cfg.mtp_ab ? 1 : 0) + (cfg.batchcls_ab ? 1 : 0) + (cfg.cls_ab ? 1 : 0) > 1) {
             panic("decode_real_bench: the --*-ab levers are mutually exclusive (one route flip per run)")
         }
-        let narms = cfg.dnd_ab || cfg.heat_ab || cfg.shexp_ab || cfg.qkv_ab ? 2 : 1
+        // a silent no-engage must never pass as an A/B row — both arms would be identical
+        if (cfg.cls_ab && !gs.cls_resident) {
+            panic("decode_real_bench: --cls-ab needs the classifier plane resident on the tier (set DASLLAMA_GPU_CLS=1)")
+        }
+        // a model with no NextN head silently no-ops the gate — that must never pass as an A/B row
+        if ((cfg.mtp_ab || cfg.batchcls_ab) && c.n_layer_nextn <= 0l) {
+            panic("decode_real_bench: --mtp-ab / --batchcls-ab need a NextN draft head, and {cfg.model} has none")
+        }
+        let narms = (cfg.dnd_ab || cfg.heat_ab || cfg.shexp_ab || cfg.qkv_ab || cfg.mtp_ab
+            || cfg.batchcls_ab || cfg.cls_ab) ? 2 : 1
         for (ai in range(narms)) {
             if (cfg.dnd_ab) {
                 set_moe_gpu_dnd_route(ai == 1)   // route flip only — uploads and residency stay
@@ -194,24 +219,50 @@ def main() {
                 // OFF first so the ON arm's counters/pins warm during its own reps (rep 1 runs
                 // partly cold — the mean understates ON slightly; the delta stays the judge)
                 set_moe_gpu_heat_route(ai == 1)
+            } elif (cfg.mtp_ab) {
+                set_mtp_spec(ai == 1)   // must be live BEFORE the prefill: it warms the draft head's KV
+            } elif (cfg.batchcls_ab) {
+                set_mtp_spec(true)   // MTP on in BOTH arms — the flip under test is the classifier route
+                set_mtp_batch_cls(ai == 1)
+            } elif (cfg.cls_ab) {
+                set_moe_gpu_cls_route(ai == 1)   // route flip only — the upload and its VRAM stay
             }
+            let mtp_on = (cfg.mtp_ab && ai == 1) || cfg.batchcls_ab
+            var drafted = 0l
+            var accepted = 0l
             var tps : array<double>
             for (_rep in range(reps)) {
                 var total_us = 0l
+                var rep_gen = 0l
                 for (pi in range(length(toks))) {
                     var s <- make_run_state(c)   // fresh session per prompt — no KV/DN-state bleed
                     let plen = int64(length(toks[pi]))
                     forward_prefill(t, s, toks[pi], plen, 0l)   // untimed, as llama-bench excludes the prompt
                     let t0 = ref_time_ticks()
-                    var pos = plen
-                    for (_g in range64(ngen)) {
-                        forward(t, s, argmax_logit(s, c.vocab_size), pos)
-                        pos++
+                    if (mtp_on) {
+                        s.n_past = plen   // forward_prefill leaves n_past alone; mtp_spec_eval drives it
+                        var tok = argmax_logit(s, c.vocab_size)
+                        var gen = 0l
+                        while (gen < ngen) {
+                            var acc = 0l   // the accepted id itself is unused here — only the 1-vs-2 advance counts
+                            gen += mtp_spec_eval(t, s, tok, acc) ? 2l : 1l
+                            tok = argmax_logit(s, c.vocab_size)
+                        }
+                        rep_gen += gen   // may overshoot ngen by 1 on a trailing accept — count what ran
+                    } else {
+                        var pos = plen
+                        for (_g in range64(ngen)) {
+                            forward(t, s, argmax_logit(s, c.vocab_size), pos)
+                            pos++
+                        }
+                        rep_gen += ngen
                     }
                     total_us += int64(get_time_usec(t0))
+                    drafted += s.mtp_drafted   // session-lifetime counters; harvest before the free
+                    accepted += s.mtp_accepted
                     delete s
                 }
-                tps |> push(double(int64(length(toks)) * ngen) * 1.0e6lf / double(total_us))
+                tps |> push(double(rep_gen) * 1.0e6lf / double(total_us))
             }
             var tag = "tg-real{ngen}"
             if (cfg.dnd_ab) {
@@ -222,8 +273,18 @@ def main() {
                 tag = "tg-real{ngen} shexp-{ai == 1 ? "on" : "off"}"
             } elif (cfg.qkv_ab) {
                 tag = "tg-real{ngen} qkv-{ai == 1 ? "on" : "off"}"
+            } elif (cfg.mtp_ab) {
+                tag = "tg-real{ngen} mtp-{ai == 1 ? "on" : "off"}"
+            } elif (cfg.batchcls_ab) {
+                tag = "tg-real{ngen} batchcls-{ai == 1 ? "on" : "off"}"
+            } elif (cfg.cls_ab) {
+                tag = "tg-real{ngen} gpucls-{ai == 1 ? "on" : "off"}"
             }
             report(tag, tps)
+            if (mtp_on) {
+                let rate = drafted > 0l ? double(accepted) * 100.0lf / double(drafted) : 0.0lf
+                print("  mtp: {accepted}/{drafted} drafts accepted ({rate:.1f}%)\n")
+            }
             delete tps
         }
         if (cfg.prof) {

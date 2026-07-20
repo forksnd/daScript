@@ -1404,6 +1404,7 @@ var g_moe_gpu_installed = false
 var g_moe_gpu_layer_count = 0l         // K = layers offloaded from the END (env-driven, set by the tier)
 var g_moe_gpu_from_layer = 1000000l    // first offloaded layer (n_layers - K, set by the loader)
 var g_moe_gpu_cls_off = -1l            // element offset of the resident classifier plane (loader contract)
+var g_moe_gpu_cls_route = true         // runtime routing gate over the resident classifier (--cls-ab lever)
 var g_moe_gpu_stream_from = 1000000l   // first STREAMED layer (streamed range = [stream_from, from_layer))
 var g_moe_gpu_dense_offs : table<int64>   // resident dense planes, keyed woff * 8 + fmt (per-format offset spaces)
 var g_moe_gpu_dense_route = true       // runtime routing gate over the marks (in-process A/B lever)
@@ -1458,7 +1459,13 @@ def public set_moe_gpu_cls_off(woff : int64) {
 }
 
 def public moe_gpu_cls_on_gpu(woff : int64) : bool {
-    return g_moe_gpu_installed && woff == g_moe_gpu_cls_off
+    return g_moe_gpu_installed && g_moe_gpu_cls_route && woff == g_moe_gpu_cls_off
+}
+
+//! Runtime routing gate over the resident classifier plane (the --cls-ab in-process lever).
+//! Route flip only — the upload and its VRAM residency stay, matching the other tier gates.
+def public set_moe_gpu_cls_route(on : bool) {
+    g_moe_gpu_cls_route = on
 }
 
 //! Loader contract: mark one dense (attention-side) plane resident on the tier. Keyed by
@@ -1812,6 +1819,12 @@ def public gpu_want_shexp : bool
 
 def public gpu_want_qkv : bool
     => has_env_variable("DASLLAMA_GPU_QKV") ? get_env_variable("DASLLAMA_GPU_QKV") == "1" : g_gpu_want.qkv
+
+//! Arm-intent for the classifier plane. The UPLOAD is opt-OUT (DASLLAMA_GPU_CLS=0 declines it), so
+//! this is only the stronger "=1 arms the tier by itself" signal — letting the classifier offload be
+//! measured without also offloading expert layers. Unset keeps today's behavior exactly.
+def public gpu_want_cls : bool
+    => get_env_variable("DASLLAMA_GPU_CLS") == "1"
 
 //! A GPU backend registers its arm probe here at ``[init]`` so config-driven arming works
 //! after module init (the env path arms at ``[init]`` directly).
