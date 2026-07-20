@@ -1074,28 +1074,36 @@ def metal_mtp_draft_forward(t : Model; var s : Session; token, pos : int64) : bo
 
 var private g_vrt : array<uint>   // per-layer 2-row route entries: uint4(koff_el+lbase, voff_el+lbase, cap, cnt_i)
 
-// v1 verify shape gate: q8 sites, f16 KV, dense silu FFN, no epilogue exotics. The kq/MoE/shexp
-// arms stage in after the dense ladder
+// verify shape gate: f16 KV, dense silu FFN, no epilogue exotics. Weight sites are fmt-generic
+// (enc_verify_site: q8 planes or the kq mvb twins — the load gate vets kernel coverage); a
+// missing attn_v has no verify arm yet. The MoE/shexp arm stages in after the dense ladder
 def private metal_mtp_verify_ok(t : Model; s : Session) : bool {
     let c = t.config
     if (s.kv_dtype_k != KVDtype.f16 || s.kv_dtype_v != KVDtype.f16 ||
             has_dual_rope(c) || c.attn_sinks || c.v_norm || c.pre_post_norm || c.layer_out_scale ||
             c.final_logit_softcap > 0.0 || !empty(t.suppress) ||
-            !t.blocks.ffn_is_dense || t.dn_ba_f32 || c.ffn_act != FfnAct.silu ||
-            t.mtp_ehproj_fmt != KqFmt.q8 ||
-            t.wcls_off < 0l || !(c.shared_weights ? t.cls_q8 : t.wcls_fmt == KqFmt.q8)) {
+            !t.blocks.ffn_is_dense || c.ffn_act != FfnAct.silu ||
+            t.wcls_off < 0l || (c.shared_weights && !t.cls_q8 && t.emb_fmt == KqFmt.q8)) {
         return false
     }
     for (l in range64(c.n_layers)) {
         return false if (layer_is_sliding(c, l))
-        continue if (layer_is_recurrent(c, l))   // dn sites are q8-gated by dn_metal_ok
-        if (kq_fmt_at(t.wq_fmt, l) != KqFmt.q8 || kq_fmt_at(t.wk_fmt, l) != KqFmt.q8 || kq_fmt_at(t.wo_fmt, l) != KqFmt.q8 ||
-                (t.wv_offs[l] >= 0l && kq_fmt_at(t.wv_fmt, l) != KqFmt.q8) ||
-                kq_fmt_at(t.w1_fmt, l) != KqFmt.q8 || kq_fmt_at(t.w2_fmt, l) != KqFmt.q8 || kq_fmt_at(t.w3_fmt, l) != KqFmt.q8) {
-            return false
-        }
+        continue if (layer_is_recurrent(c, l))
+        return false if (t.wv_offs[l] < 0l)
     }
     return true
+}
+
+// one verify-B=2 weight site: a q8 plane rides the batched q8 GEMV, a kq plane the small-batch
+// mvb twins (the batch rail's dispatch at nrows=2). ycol = flat element offset into by
+def private enc_verify_site(t : Model; var r : StepRes; enc : MetalComputeEncoder?; fmt : KqFmt;
+                            woff, rows, n, ys : int64; bx, by, bn, bd, bys : MetalBuffer?; ycol : int64 = 0l) {
+    if (fmt == KqFmt.q8) {
+        let bw = blob_of(g_dev, t, woff)
+        enc_gemv_b(enc, false, bw.buf, bw.boff, bx, by, bn, bd, bys, rows, uint64(ycol * 4l))
+    } else {
+        enc_kq_site_b(enc, t, fmt, woff, rows, n, bx, n, by, ys, ycol, bn, bd, bys, r.u_two32, 2l, 2l)
+    }
 }
 
 // one verify-shaped B=2 layer (batch-form sites, same-slab brt row at l*32) — the trunk
@@ -1108,6 +1116,7 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
     let head_size = c.head_size
     let qd = n_heads * head_size
     let kv_dim = c.n_kv_heads * head_size
+    let qkvd = qd + 2l * kv_dim
     let nchunks = (pos + 2l + ATTN_CHUNK_ROWS - 1l) / ATTN_CHUNK_ROWS
     unsafe {
         let rtoff = uint64(l * 32l)
@@ -1119,10 +1128,18 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
             enc_gemv_b(enc, false, bdnq.buf, bdnq.boff, r.bxb, r.bdn_qkv, r.u_dim, r.u_cd, r.u_cd, cd)
             let bdng = blob_of(g_dev, t, t.dngate_offs[l])
             enc_gemv_b(enc, false, bdng.buf, bdng.boff, r.bxb, r.bdn_z, r.u_dim, r.u_di, r.u_di, di)
-            let bdnb = blob_of(g_dev, t, t.dnbeta_offs[l])
-            enc_gemv_b(enc, false, bdnb.buf, bdnb.boff, r.bxb, r.bdn_b, r.u_dim, r.u_nvh, r.u_nvh, nvh)
-            let bdna = blob_of(g_dev, t, t.dnalpha_offs[l])
-            enc_gemv_b(enc, false, bdna.buf, bdna.boff, r.bxb, r.bdn_g, r.u_dim, r.u_nvh, r.u_nvh, nvh)
+            if (t.dn_ba_f32) {
+                // F32-on-disk β/α: the router-slab f32 GEMV, one stream per verify row
+                var bw_bt = upload_region(addr < void? >(t.fblob[t.dn_betaf_off + l * dim * nvh]), uint64(dim * nvh * 4l))
+                enc_moe_router(enc, bw_bt, r.bxb, r.bdn_b, r.u_dim, r.u_nvh, r.u_dim, g_one, g_zero, nvh, 2l)
+                var bw_al = upload_region(addr < void? >(t.fblob[t.dn_alphaf_off + l * dim * nvh]), uint64(dim * nvh * 4l))
+                enc_moe_router(enc, bw_al, r.bxb, r.bdn_g, r.u_dim, r.u_nvh, r.u_dim, g_one, g_zero, nvh, 2l)
+            } else {
+                let bdnb = blob_of(g_dev, t, t.dnbeta_offs[l])
+                enc_gemv_b(enc, false, bdnb.buf, bdnb.boff, r.bxb, r.bdn_b, r.u_dim, r.u_nvh, r.u_nvh, nvh)
+                let bdna = blob_of(g_dev, t, t.dnalpha_offs[l])
+                enc_gemv_b(enc, false, bdna.buf, bdna.boff, r.bxb, r.bdn_g, r.u_dim, r.u_nvh, r.u_nvh, nvh)
+            }
             // dual-store: post-row0 state/hist land in the shadow region — reject flips to it
             let sslice = uint64(dnli * nvh * c.ssm_d_state * c.ssm_d_state * 4l)
             let hslice = uint64(dnli * (c.ssm_d_conv - 1l) * cd * 4l)
@@ -1151,17 +1168,17 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
                     addr < void? >(t.bv[l * kv_dim]), uint64(kv_dim * 4l))
             }
             if (c.q_gated) {
-                let bwq = blob_of(g_dev, t, t.wq_offs[l])
-                enc_gemv_b(enc, false, bwq.buf, bwq.boff, r.bxb, r.bdn_qg, r.u_dim, r.u_dn_qd2, r.u_dn_qd2, 2l * qd)
+                enc_verify_site(t, r, enc, kq_fmt_at(t.wq_fmt, l), t.wq_offs[l], 2l * qd, dim, 2l * qd,
+                    r.bxb, r.bdn_qg, r.u_dim, r.u_dn_qd2, r.u_dn_qd2)
                 enc_dn_deint(enc, r.bdn_qg, r.bqkv, r.bdn_gate, r.u_hs, r.u_qd, r.u_qkvd, qd, 2l)
             } else {
-                let bwq = blob_of(g_dev, t, t.wq_offs[l])
-                enc_gemv_b(enc, false, bwq.buf, bwq.boff, r.bxb, r.bqkv, r.u_dim, r.u_qd, r.u_qkvd, qd)
+                enc_verify_site(t, r, enc, kq_fmt_at(t.wq_fmt, l), t.wq_offs[l], qd, dim, qkvd,
+                    r.bxb, r.bqkv, r.u_dim, r.u_qd, r.u_qkvd)
             }
-            let bwk = blob_of(g_dev, t, t.wk_offs[l])
-            enc_gemv_b(enc, false, bwk.buf, bwk.boff, r.bxb, r.bqkv, r.u_dim, r.u_kvd, r.u_qkvd, kv_dim, uint64(qd * 4l))
-            let bwv = blob_of(g_dev, t, t.wv_offs[l])
-            enc_gemv_b(enc, false, bwv.buf, bwv.boff, r.bxb, r.bqkv, r.u_dim, r.u_kvd, r.u_qkvd, kv_dim, uint64((qd + kv_dim) * 4l))
+            enc_verify_site(t, r, enc, kq_fmt_at(t.wk_fmt, l), t.wk_offs[l], kv_dim, dim, qkvd,
+                r.bxb, r.bqkv, r.u_dim, r.u_kvd, r.u_qkvd, [ycol = qd])
+            enc_verify_site(t, r, enc, kq_fmt_at(t.wv_fmt, l), t.wv_offs[l], kv_dim, dim, qkvd,
+                r.bxb, r.bqkv, r.u_dim, r.u_kvd, r.u_qkvd, [ycol = qd + kv_dim])
             if (c.qk_norm) {
                 var bqkw = upload_region_cat3(
                     addr < void? >(t.fblob[t.rms_q_offs[l]]), uint64(head_size * 4l),
@@ -1182,8 +1199,8 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
             if (c.q_gated) {
                 enc_ew2(enc, g_pso_sigmul, r.bxb, 0ul, r.bdn_gate, 0ul, r.u_total_qd, 2l * qd)
             }
-            let bwo = blob_of(g_dev, t, t.wo_offs[l])
-            enc_gemv_b(enc, false, bwo.buf, bwo.boff, r.bxb, r.bxb2, r.u_qd, r.u_dim, r.u_dim, dim)
+            enc_verify_site(t, r, enc, kq_fmt_at(t.wo_fmt, l), t.wo_offs[l], dim, qd, dim,
+                r.bxb, r.bxb2, r.u_qd, r.u_dim, r.u_dim)
             if (c.attn_out_bias) {
                 var bwo_b = upload_region(addr < void? >(t.bo[l * dim]), uint64(dim * 4l))
                 enc_ew2(enc, g_pso_add, r.bxb2, 0ul, bwo_b, 0ul, r.u_total_dim, 2l * dim)
@@ -1196,11 +1213,22 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
             enc_ew2(enc, g_pso_add, r.bx, 0ul, r.bxb2, 0ul, r.u_total_dim, 2l * dim)
             enc_rms_b(enc, r.bx, bw_ffn, r.bxb, r.u_dim, r.u_eps, 2l)
         }
-        let bw1 = blob_of(g_dev, t, t.w1_offs[l])
-        let bw3 = blob_of(g_dev, t, t.w3_offs[l])
-        enc_gemv_w13sw_b(enc, false, bw1.buf, bw1.boff, bw3.boff, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
-        let bw2 = blob_of(g_dev, t, t.w2_offs[l])
-        enc_gemv_b(enc, false, bw2.buf, bw2.boff, r.bh12, r.bxb, r.u_hidden, r.u_dim, r.u_dim, dim)
+        let f1 = kq_fmt_at(t.w1_fmt, l)
+        let f2 = kq_fmt_at(t.w2_fmt, l)
+        let f3 = kq_fmt_at(t.w3_fmt, l)
+        if (f1 == KqFmt.q8 && f2 == KqFmt.q8 && f3 == KqFmt.q8) {
+            let bw1 = blob_of(g_dev, t, t.w1_offs[l])
+            let bw3 = blob_of(g_dev, t, t.w3_offs[l])
+            enc_gemv_w13sw_b(enc, false, bw1.buf, bw1.boff, bw3.boff, r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
+            let bw2 = blob_of(g_dev, t, t.w2_offs[l])
+            enc_gemv_b(enc, false, bw2.buf, bw2.boff, r.bh12, r.bxb, r.u_hidden, r.u_dim, r.u_dim, dim)
+        } else {
+            // gate rows land at 0, up rows at 2*hidden (bh12 is nrows * 2*hidden); swiglu fuses in place
+            enc_verify_site(t, r, enc, f1, t.w1_offs[l], hidden, dim, hidden, r.bxb, r.bh12, r.u_dim, r.u_hidden, r.u_hidden)
+            enc_verify_site(t, r, enc, f3, t.w3_offs[l], hidden, dim, hidden, r.bxb, r.bh12, r.u_dim, r.u_hidden, r.u_hidden, [ycol = 2l * hidden])
+            enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(2l * hidden * 4l), r.u_total_h, 2l * hidden)
+            enc_verify_site(t, r, enc, f2, t.w2_offs[l], dim, hidden, dim, r.bh12, r.bxb, r.u_hidden, r.u_dim, r.u_dim)
+        }
         if (l + 1l < c.n_layers) {
             var bw_attn = upload_region(addr < void? >(t.fblob[t.rms_att_off + (l + 1l) * dim]), uint64(dim * 4l))
             if (dim <= ADD_RMS_MAX_DIM) {
@@ -1256,8 +1284,9 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
         var bwfin = upload_region(addr < void? >(t.fblob[t.rms_final_off]), uint64(dim * 4l))
         enc_rms_b(enc, r.bx, bwfin, r.bxf, r.u_dim, r.u_eps, 2l)
     }
-    let bcls = blob_of(g_dev, t, t.wcls_off)
-    enc_gemv_b(enc, false, bcls.buf, bcls.boff, r.bxf, r.blog, r.u_dim, r.u_vocab, r.u_vocab, c.vocab_size)
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    enc_verify_site(t, r, enc, cls_fmt, t.wcls_off, c.vocab_size, dim, c.vocab_size,
+        r.bxf, r.blog, r.u_dim, r.u_vocab, r.u_vocab)
     // draft-slab warm: the draft block at B=2, no cls — future drafts need contiguous slab rows
     unsafe {
         enc_copy_row(enc, r.bcat, uint64(2l * dim * 4l), r.bxb, r.u_dim, dim)
@@ -1270,8 +1299,8 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
         enc_copy_row(enc, r.bxb2, 0ul, r.bcat, r.u_dim, dim, uint64(dim * 4l))
         enc_copy_row(enc, r.bh12, uint64(dim * 4l), r.bcat, r.u_dim, dim, uint64(2l * dim * 4l))
         enc_copy_row(enc, r.bxb2, uint64(dim * 4l), r.bcat, r.u_dim, dim, uint64(3l * dim * 4l))
-        let behp = blob_of(g_dev, t, t.mtp_ehproj_off)
-        enc_gemv_b(enc, false, behp.buf, behp.boff, r.bcat, r.bx, r.u_dim2, r.u_dim, r.u_dim, dim)
+        enc_verify_site(t, r, enc, t.mtp_ehproj_fmt, t.mtp_ehproj_off, dim, 2l * dim, dim,
+            r.bcat, r.bx, r.u_dim2, r.u_dim, r.u_dim)
         var bw_att = upload_region(addr < void? >(t.fblob[t.rms_att_off + c.n_layers * dim]), uint64(dim * 4l))
         enc_rms_b(enc, r.bx, bw_att, r.bxb, r.u_dim, r.u_eps, 2l)
     }
