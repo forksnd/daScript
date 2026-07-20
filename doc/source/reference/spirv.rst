@@ -119,8 +119,9 @@ take an integer value (``@binding = 0``); ``@in`` / ``@out`` / ``@ssbo`` / ``@un
      - — (graphics I/O)
 
 ``@uniform`` / ``@push_constant`` globals must be a ``struct`` (32-bit scalar / vector / matrix
-members); ``@ssbo`` must be an ``array<T>``. Member access (``ubo.field``) lowers to ``OpAccessChain``
-+ ``OpLoad``.
+members, plus ``int64`` / ``uint64`` scalars — the ``Int64`` capability, GLSL's
+``GL_ARB_gpu_shader_int64``, packed std140 like a ``double``: base align 8, size 8); ``@ssbo`` must be
+an ``array<T>``. Member access (``ubo.field``) lowers to ``OpAccessChain`` + ``OpLoad``.
 
 
 Built-in variables
@@ -238,6 +239,9 @@ Type and layout mapping
    * - ``int`` / ``uint`` / ``float``
      - ``OpTypeInt 32`` / ``OpTypeFloat 32``
      - 4 bytes
+   * - ``int64`` / ``uint64``
+     - ``OpTypeInt 64`` (``Int64`` capability)
+     - 8 bytes, base align 8 (std140/std430, like a ``double``)
    * - ``bool``
      - ``OpTypeBool``
      - no physical interface-block layout

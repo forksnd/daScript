@@ -44,8 +44,8 @@ def ctor_gen(spec : ShaderTypeSpec; lane : block<(i : int) : int>) : string {
         return lit(spec.kind, invoke(lane, 0))      // bare literal: no float16(float16) ctor exists
     }
     if (spec.arity == 1) {
-        // 32-bit scalars: the literal already IS the type — a same-type ctor is PERF020 noise
-        if (spec.name == "float" || spec.name == "int" || spec.name == "uint") {
+        // scalars whose literal already IS the type (double's `1.lf` too) — a same-type ctor is PERF020 noise
+        if (spec.name == "float" || spec.name == "int" || spec.name == "uint" || spec.name == "double") {
             return lit(spec.kind, invoke(lane, 0))
         }
         return "{spec.name}({lit(spec.kind, invoke(lane, 0))})"
@@ -106,10 +106,11 @@ def emit_body(var writer; spec : ShaderTypeSpec; seed : string) {
     }
 }
 
-// only fp16 rows need the sink widened (float16 r -> float elem); storage rows pre-widen to
-// int/uint and 32-bit arith rows already produce the element type (PERF020: same-type cast)
+// fp16 and fp64 rows need the sink narrowed to the float SSBO element (float16 / double r -> float
+// elem); storage rows pre-widen to int/uint and 32-bit arith rows already produce the element type
+// (PERF020: same-type cast)
 def ssbo_sink(spec : ShaderTypeSpec) : string {
-    return spec.kind == "half" ? "{ssbo_elem(spec)}(r)" : "r"
+    return (spec.kind == "half" || spec.kind == "double") ? "{ssbo_elem(spec)}(r)" : "r"
 }
 
 def ssbo_elem(spec : ShaderTypeSpec) : string {
@@ -618,10 +619,10 @@ def main {
             spv_mode = "emit", glsl_mode = "emit", spv_needle = "", glsl_needle = ""),
         ShaderTypeSpec(name = "uint4", glsl_name = "uvec4", arity = 4, kind = "uint", has_arith = true,
             spv_mode = "emit", glsl_mode = "emit", spv_needle = "", glsl_needle = ""),
-        // reject-rail controls: dasSpirv rejects double locals; dasGlsl supports double (GL 4.x fp64),
-        // so its proven reject control is the memzero statement (side-effecting — optimizer-proof)
+        // double proves the scalar fp64 arithmetic rail: dasSpirv lowers it to OpTypeFloat 64 (a GLSL
+        // dvec3 closure ports as three doubles); dasGlsl's fp64 support is not gated here (skip)
         ShaderTypeSpec(name = "double", glsl_name = "", arity = 1, kind = "double", has_arith = true,
-            spv_mode = "reject", glsl_mode = "skip", spv_needle = "tDouble is not supported", glsl_needle = ""),
+            spv_mode = "emit", glsl_mode = "skip", spv_needle = "", glsl_needle = ""),
         ShaderTypeSpec(name = "memzero", glsl_name = "", arity = 1, kind = "memzero", has_arith = false,
             spv_mode = "skip", glsl_mode = "reject", spv_needle = "", glsl_needle = "memzero is not supported")
     ]

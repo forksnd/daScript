@@ -154,11 +154,13 @@ def private ensure_width_cap(var m : SpirvModule; is_float : bool; width : uint)
     }
     let key = is_float ? "cap_f{width}" : "cap_i{width}"
     return if ((m.type_pool?[key] ?? 0u) != 0u)
-    if (is_float && width == 16u) {
-        emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Float16))
-    } elif (!is_float && width == 16u) {
+    if (is_float) {
+        emit(m, SEC_CAPS, SpvOp.Capability, uint(width == 64u ? SpvCapability.Float64 : SpvCapability.Float16))
+    } elif (width == 64u) {
+        emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Int64))
+    } elif (width == 16u) {
         emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Int16))
-    } elif (!is_float && width == 8u) {
+    } elif (width == 8u) {
         emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Int8))
     }
     m.type_pool |> insert(key, 1u)
@@ -546,6 +548,21 @@ def public const_float(var m : SpirvModule; v : float) : uint {
     let ft = type_float(m, 32u)
     let id = alloc_id(m)
     emit(m, SEC_TYPES, SpvOp.Constant, ft, id, bits)
+    m.const_pool |> insert(key, id)
+    return id
+}
+
+// The 64-bit float OpConstant. Unlike every other constant here the literal spans TWO words, low-order
+// first (SPIR-V 2.2.1), so a 64-bit value is the one case the 4-operand emit is spent in full. Keyed on
+// the bits, for the reason const_float spells out above.
+def public const_double(var m : SpirvModule; v : double) : uint {
+    let bits = unsafe(reinterpret<uint64>(v))
+    let key = "cd_{bits}"
+    let ex = m.const_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let ft = type_float(m, 64u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.Constant, ft, id, uint(bits & 0xfffffffful), uint(bits >> 32ul))
     m.const_pool |> insert(key, id)
     return id
 }

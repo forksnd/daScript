@@ -11,6 +11,14 @@ require spirv_builder
 require daslib/ast
 require daslib/shader_block_layout
 
+// Scalar type-id for a numeric_info class + width: OpTypeFloat for the float class, OpTypeInt with
+// the class's signedness otherwise. type_int declares the Int16 / Int64 capability for the narrow
+// and wide widths on the way through.
+def public numeric_scalar_type(var m : SpirvModule; cls, width : int) : uint {
+    if (cls == 2) return type_float(m, uint(width))
+    return type_int(m, uint(width), cls == 0 ? 1u : 0u)
+}
+
 def public emit_type(var m : SpirvModule; t : TypeDecl?) : uint {
     if (t == null) {
         panic("emit_type: null TypeDecl")
@@ -24,7 +32,10 @@ def public emit_type(var m : SpirvModule; t : TypeDecl?) : uint {
     if (bt == Type.tBool) return type_bool(m)
     if (bt == Type.tInt) return type_int(m, 32u, 1u)
     if (bt == Type.tUInt) return type_int(m, 32u, 0u)
+    if (bt == Type.tInt64) return type_int(m, 64u, 1u)
+    if (bt == Type.tUInt64) return type_int(m, 64u, 0u)
     if (bt == Type.tFloat) return type_float(m, 32u)
+    if (bt == Type.tDouble) return type_float(m, 64u)
     if (bt == Type.tInt2) return type_vector(m, type_int(m, 32u, 1u), 2)
     if (bt == Type.tInt3) return type_vector(m, type_int(m, 32u, 1u), 3)
     if (bt == Type.tInt4) return type_vector(m, type_int(m, 32u, 1u), 4)
@@ -72,9 +83,8 @@ def public emit_component_type(var m : SpirvModule; t : TypeDecl?) : uint {
         panic("emit_component_type: null TypeDecl")
     }
     let bt = t.baseType
-    if (bt == Type.tInt || bt == Type.tInt2 || bt == Type.tInt3 || bt == Type.tInt4) return type_int(m, 32u, 1u)
-    if (bt == Type.tUInt || bt == Type.tUInt2 || bt == Type.tUInt3 || bt == Type.tUInt4) return type_int(m, 32u, 0u)
-    if (bt == Type.tFloat || bt == Type.tFloat2 || bt == Type.tFloat3 || bt == Type.tFloat4) return type_float(m, 32u)
+    let ni = numeric_info(bt)
+    if (ni.ok) return numeric_scalar_type(m, ni.cls, ni.width)
     if (bt == Type.tBool) return type_bool(m)
     if (bt == Type.tFloat16 || bt == Type.tHalf2 || bt == Type.tHalf3 || bt == Type.tHalf4) return type_float(m, 16u)
     if (bt == Type.tInt16 || bt == Type.tShort2 || bt == Type.tShort3 || bt == Type.tShort4) return type_int(m, 16u, 1u)

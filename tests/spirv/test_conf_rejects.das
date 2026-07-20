@@ -39,7 +39,6 @@ def private check_rejects(t : T?; fixture, needle : string) {
 [test]
 def test_conf_rejects_spirv(t : T?) {
     t |> run("conformance reject rows fail closed") <| @(t : T?) {
-        check_rejects(t, "_fc_conf_double", "tDouble is not supported")
         check_rejects(t, "_fc_conf_half8", "is CPU-only")
         check_rejects(t, "_fc_conf_short8", "is CPU-only")
         check_rejects(t, "_fc_conf_ushort8", "is CPU-only")
