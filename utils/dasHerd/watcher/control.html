@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dasHerd watcher</title>
+  <style>
+    :root { color-scheme: dark; font-size: 150%; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { background: #11151b; color: #e8edf2; font: .72rem/1.35 system-ui, sans-serif; overflow: hidden; }
+    button, input { font: inherit; color: inherit; background: #202832; border: 1px solid #465567; border-radius: .25rem; padding: .35rem .5rem; }
+    button { cursor: pointer; }
+    button:hover { background: #2b3745; }
+    .app { height: 100%; display: grid; grid-template-columns: minmax(12rem, 24%) 1fr; grid-template-rows: 1fr auto; }
+    aside { border-right: 1px solid #394655; min-width: 0; overflow: auto; padding: .6rem; }
+    main { min-width: 0; display: flex; flex-direction: column; }
+    h1 { font-size: .95rem; margin: 0 0 .6rem; }
+    .launch { display: grid; gap: .35rem; margin-bottom: .7rem; }
+    .sessions { display: grid; gap: .3rem; }
+    .session { width: 100%; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session.selected { outline: 2px solid #65a8ff; }
+    .toolbar { display: flex; gap: .35rem; align-items: center; padding: .45rem; border-bottom: 1px solid #394655; }
+    .command { padding: .45rem .65rem; color: #91c6ff; background: #171d25; border-bottom: 1px solid #303b48; overflow-wrap: anywhere; }
+    pre { flex: 1; margin: 0; padding: .65rem; overflow: auto; white-space: pre; font: .72rem/1.25 Consolas, "Cascadia Mono", monospace; tab-size: 4; }
+    .input-row { display: grid; grid-template-columns: 1fr auto; gap: .35rem; padding: .45rem; border-top: 1px solid #394655; }
+    footer { grid-column: 1 / -1; display: flex; gap: .4rem; align-items: center; padding: .35rem .55rem; border-top: 1px solid #394655; background: #171d25; }
+    .grow { flex: 1; }
+    .muted { color: #9aa8b7; }
+    .error { color: #ff8e87; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <h1>dasHerd watcher</h1>
+      <div class="launch">
+        <input id="command" value="powershell.exe -NoLogo" aria-label="Command line">
+        <input id="cwd" placeholder="working directory (optional)" aria-label="Working directory">
+        <button id="launch">Launch terminal</button>
+      </div>
+      <div id="sessions" class="sessions"></div>
+    </aside>
+    <main>
+      <div class="toolbar">
+        <button id="refresh">Refresh</button>
+        <button id="attach">Attach + control</button>
+        <button id="detach">Detach</button>
+        <button id="terminate">Terminate</button>
+        <span id="state" class="muted">No session selected</span>
+      </div>
+      <div id="commandHeader" class="command">$</div>
+      <pre id="screen" tabindex="0" aria-label="Terminal screen"></pre>
+      <div class="input-row">
+        <input id="input" placeholder="Send text; Enter appends a newline" aria-label="Terminal input">
+        <button id="send">Send</button>
+      </div>
+    </main>
+    <footer>
+      <span id="connection" class="muted">Connecting…</span>
+      <span class="grow"></span>
+      <button id="zoomOut">−5%</button>
+      <button id="zoomReset">Reset</button>
+      <button id="zoomIn">+5%</button>
+      <span id="zoom">150%</span>
+    </footer>
+  </div>
+  <script>
+    const $ = id => document.getElementById(id);
+    const token = new URLSearchParams(location.search).get('token') || '';
+    const api = path => `${path}?token=${encodeURIComponent(token)}`;
+    let sessions = [];
+    let selected = '';
+    let attached = '';
+    let controls = false;
+    let ws;
+
+    function setZoom(value) {
+      const zoom = Math.max(50, Math.min(300, Math.round(value / 5) * 5));
+      document.documentElement.style.fontSize = `${zoom}%`;
+      $('zoom').textContent = `${zoom}%`;
+      localStorage.setItem('dasherd-watcher-zoom', zoom);
+    }
+    setZoom(Number(localStorage.getItem('dasherd-watcher-zoom') || 150));
+
+    async function request(path, options = {}) {
+      const response = await fetch(api(path), {
+        ...options,
+        headers: {'content-type': 'application/json', ...(options.headers || {})}
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      return data;
+    }
+
+    function showError(error) {
+      $('connection').textContent = String(error.message || error);
+      $('connection').className = 'error';
+    }
+
+    function renderSessions() {
+      $('sessions').replaceChildren(...sessions.map(session => {
+        const button = document.createElement('button');
+        button.className = `session${session.id === selected ? ' selected' : ''}`;
+        button.textContent = `${session.id} · ${session.state} · ${session.command_line}`;
+        button.title = session.command_line;
+        button.onclick = () => { selected = session.id; renderSessions(); attach(true); };
+        return button;
+      }));
+    }
+
+    async function refreshSessions() {
+      sessions = await request('/api/v1/sessions');
+      if (selected && !sessions.some(s => s.id === selected)) selected = '';
+      renderSessions();
+    }
+
+    function sendWs(message) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('WebSocket is not connected');
+      ws.send(JSON.stringify(message));
+    }
+
+    function attach(control) {
+      if (!selected) return;
+      sendWs({op: 'attach', session_id: selected, control});
+    }
+
+    function connect() {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`);
+      ws.onopen = () => {
+        $('connection').textContent = 'Connected';
+        $('connection').className = 'muted';
+        refreshSessions().catch(showError);
+      };
+      ws.onclose = () => {
+        controls = false;
+        $('connection').textContent = 'Disconnected; reconnecting…';
+        setTimeout(connect, 1000);
+      };
+      ws.onerror = showError;
+      ws.onmessage = event => {
+        const message = JSON.parse(event.data);
+        if (message.type === 'error') showError(new Error(message.error));
+        if (message.type === 'attached') {
+          attached = message.session_id;
+          controls = message.controls;
+          $('connection').textContent = controls ? 'Connected · controller' : 'Connected · observing';
+          $('connection').className = 'muted';
+        }
+        if (message.type === 'detached') {
+          attached = '';
+          controls = false;
+        }
+        if (message.type === 'snapshot') {
+          const data = message.data;
+          $('screen').textContent = data.screen_text;
+          $('commandHeader').textContent = `$ ${data.session.command_line}`;
+          $('state').textContent = `${data.session.state} · pid ${data.session.pid} · ${data.session.output_bytes} bytes`;
+          const index = sessions.findIndex(s => s.id === data.session.id);
+          if (index >= 0) sessions[index] = data.session; else sessions.push(data.session);
+          renderSessions();
+        }
+      };
+    }
+
+    $('launch').onclick = async () => {
+      try {
+        const result = await request('/api/v1/sessions', {method: 'POST', body: JSON.stringify({
+          command_line: $('command').value, cwd: $('cwd').value,
+          columns: 100, rows: 30, timeout_ms: 0
+        })});
+        selected = result.session_id;
+        await refreshSessions();
+        attach(true);
+      } catch (error) { showError(error); }
+    };
+    $('refresh').onclick = () => refreshSessions().catch(showError);
+    $('attach').onclick = () => attach(true);
+    $('detach').onclick = () => { if (attached) sendWs({op: 'detach'}); };
+    $('terminate').onclick = async () => {
+      if (!selected || !confirm(`Terminate ${selected}?`)) return;
+      try { await request('/api/v1/terminate', {method: 'POST', body: JSON.stringify({session_id: selected})}); }
+      catch (error) { showError(error); }
+    };
+    function sendInput(newline = false) {
+      if (!attached || !controls) return showError(new Error('Attach as controller first'));
+      sendWs({op: 'input', text: $('input').value + (newline ? '\r' : '')});
+      $('input').value = '';
+    }
+    $('send').onclick = () => sendInput(false);
+    $('input').onkeydown = event => { if (event.key === 'Enter') { event.preventDefault(); sendInput(true); } };
+    $('zoomOut').onclick = () => setZoom(parseInt($('zoom').textContent) - 5);
+    $('zoomIn').onclick = () => setZoom(parseInt($('zoom').textContent) + 5);
+    $('zoomReset').onclick = () => setZoom(150);
+    setInterval(() => { if (ws?.readyState === WebSocket.OPEN) sendWs({op: 'heartbeat'}); }, 2000);
+    setInterval(() => refreshSessions().catch(showError), 2000);
+    connect();
+  </script>
+</body>
+</html>

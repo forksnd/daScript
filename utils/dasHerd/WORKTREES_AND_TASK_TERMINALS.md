@@ -138,6 +138,48 @@ query is rejected. Per-session isolation itself remains open pending the same
 probe with a small AOT/native host; a persistent per-worktree host is the next
 fallback, not an unmeasured optimization.
 
+### Chunk 2: smallest persistent watcher
+
+Discussion status: first local slice implemented
+
+One persistent JIT watcher owns multiple PTYs and terminal emulators. Browser,
+UI, live-command, and future agent surfaces are clients of this process; they
+do not own its child processes. The first client is a minimal browser control
+panel. The local protocol is authenticated HTTP plus WebSocket on
+`127.0.0.1` only.
+
+The first API provides health and session listing, launch, UTF-8 input, resize,
+termination, attach/detach, snapshots, and controller heartbeats. Many clients
+may observe a session, but only one client holds its controller lease. Browser
+close, explicit detach, and heartbeat expiry release that lease without
+terminating the child. Polling is bounded per session on each watcher tick so
+one noisy PTY cannot create an unbounded drain loop.
+
+Each session writes the following under
+`logs/dasHerd/watcher/sessions/<session-id>/`:
+
+- `session.json`: immutable launch request;
+- `output.raw`: exact PTY output bytes, flushed as they arrive;
+- `events.jsonl`: lifecycle, timeout, exit, drain, and controller events.
+
+Input payload contents are deliberately absent from the event log. An optional
+external wall deadline terminates hung children and retains `wall_timeout` as
+the final reason. Process exit is reported immediately; raw-output drain uses
+the existing conservative 250 ms quiet interval without delaying the exit
+observation.
+
+Focused validation covers normal output and exit, wall timeout, exclusive
+controller transfer, browser/WebSocket disconnect while the child continues,
+heartbeat lease expiry, loopback token rejection, and watcher crash. A forced
+watcher crash loses its live PTYs as expected, kills their children when the
+ConPTY owner disappears, and leaves already-flushed raw logs readable. PTY
+recovery after watcher death is explicitly not part of this slice.
+
+Still deferred are remote authentication/pairing, TLS/LAN binding, SSH target
+transport, styled browser terminal rendering, replay after watcher restart,
+log rotation and retention policy, native dasHerd UI integration, and the
+live-command terminal schema.
+
 ## Section 1: repository, base, and worktree identity
 
 Discussion status: open

@@ -591,6 +591,21 @@ int das_wss_send_fragment ( Handle<hv::WebSocketChannel> h, const char * buf, in
     return p->send(buf, len, fragment, opcode);
 }
 
+int das_wss_close_channel ( Handle<hv::WebSocketChannel> h ) {
+    auto p = HandleRegistry<hv::WebSocketChannel>::instance().lookup(h);
+    if ( !p ) return -1;
+    return p->close();
+}
+
+bool das_wss_set_bind_host ( Handle<hv::WebSocketServer> h, const char * host ) {
+    auto adapter = lookup_server(h);
+    if ( !adapter || !host ) return false;
+    const size_t len = strlen(host);
+    if ( len == 0 || len >= sizeof(adapter->host) ) return false;
+    memcpy(adapter->host, host, len + 1);
+    return true;
+}
+
 int das_wss_start ( Handle<hv::WebSocketServer> h ) {
     auto adapter = lookup_server(h);
     if ( !adapter ) return -1;
@@ -1299,6 +1314,12 @@ public:
         addExtern<DAS_BIND_FUN(das_wss_send_fragment)> (*this, lib, "send",
             SideEffects::worstDefault, "das_wss_send_fragment")
                 ->args({"channel","msg","len","fragment","opcode"});
+        addExtern<DAS_BIND_FUN(das_wss_close_channel)> (*this, lib, "close",
+            SideEffects::worstDefault, "das_wss_close_channel")
+                ->args({"channel"});
+        addExtern<DAS_BIND_FUN(das_wss_set_bind_host)> (*this, lib, "set_bind_host",
+            SideEffects::worstDefault, "das_wss_set_bind_host")
+                ->args({"server","host"});
         addExtern<DAS_BIND_FUN(das_wss_start)> (*this, lib, "start",
             SideEffects::worstDefault, "das_wss_start")
                 ->args({"server"});

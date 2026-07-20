@@ -100,6 +100,10 @@ class HvWebServer {
         //! Starts the server. Returns 0 on success.
         return start(server)
     }
+    def set_bind_host(host : string) : bool {
+        //! Selects the interface to bind before ``start`` (for example, ``127.0.0.1``).
+        return set_bind_host(server, host)
+    }
     def stop : int {
         //! Stops the server. Returns 0 on success.
         return stop(server)
