@@ -145,7 +145,7 @@
         button.className = `session${session.id === selected ? ' selected' : ''}`;
         button.textContent = `${session.id} - ${session.state} - ${session.command_line}`;
         button.title = session.command_line;
-        button.onclick = () => { selected = session.id; renderSessions(); attach(true); };
+        button.onclick = () => { selected = session.id; renderSessions(); attach(session.state === 'running'); };
         return button;
       }));
     }
@@ -158,6 +158,11 @@
 
     function attach(control) {
       if (!selected) return;
+      const session = sessions.find(item => item.id === selected);
+      if (control && session?.state !== 'running') {
+        showError(new Error('This session has exited; its output is replay-only'));
+        return;
+      }
       sendWs({op: 'attach', session_id: selected, control, raw: true});
     }
 

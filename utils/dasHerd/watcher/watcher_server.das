@@ -278,10 +278,13 @@ class DasHerdWatcherServer : HvWebServer {
             }
             detach(client, "reattach")
             client.session_id = incoming.session_id
-            client.controls = incoming.control && watcher_claim_controller(incoming.session_id, client.id)
+            let accepts_input = watcher_accepts_input(incoming.session_id)
+            client.controls = incoming.control && accepts_input && watcher_claim_controller(incoming.session_id, client.id)
             client.raw = incoming.raw
             client.raw_offset = 0l
-            if (incoming.control && !client.controls) {
+            if (incoming.control && !accepts_input) {
+                send_error(channel, "session is not running; output is replay-only")
+            } elif (incoming.control && !client.controls) {
                 send_error(channel, "controller lease is held by another client")
             }
             send(channel, "\{\"type\":\"attached\",\"session_id\":{sprint_json(client.session_id, false)},\"controls\":{client.controls}\}",

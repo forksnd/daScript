@@ -192,6 +192,11 @@ def public watcher_find_session(session_id : string) : int {
     return -1
 }
 
+def public watcher_accepts_input(session_id : string) : bool {
+    let index = watcher_find_session(session_id)
+    return index >= 0 && g_sessions[index] != null && g_sessions[index].state == "running"
+}
+
 def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult {
     if (empty(request.command_line)) {
         return WatcherLaunchResult(error = "command_line is required")

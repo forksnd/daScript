@@ -33,7 +33,9 @@ def test_watcher_process_lifecycle(t : T?) {
             command_line = "powershell.exe -NoProfile -Command \"Write-Output watcher-core-ok\"",
             cwd = root, columns = 80, rows = 20, timeout_ms = 5000l))
         t |> success(quick.ok, quick.error)
+        t |> success(watcher_accepts_input(quick.session_id), "running session accepts input")
         t |> success(wait_for(quick.session_id, "exited", 5000l), "quick command exits and drains")
+        t |> success(!watcher_accepts_input(quick.session_id), "exited session is replay-only")
         let quick_snapshot = watcher_snapshot_json(quick.session_id)
         t |> success(find(quick_snapshot, "watcher-core-ok") >= 0, "viewport retains command output")
         t |> success(find(quick_snapshot, "\"exit_code\":0") >= 0, "exit code is retained")
