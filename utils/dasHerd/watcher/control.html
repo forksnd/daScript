@@ -153,6 +153,7 @@
     async function refreshSessions() {
       sessions = await request('/api/v1/sessions');
       if (selected && !sessions.some(s => s.id === selected)) selected = '';
+      if (!selected) selected = sessions.find(session => session.state === 'running')?.id || '';
       renderSessions();
     }
 
@@ -173,9 +174,10 @@
       ws.onopen = () => {
         $('connection').textContent = 'Connected';
         $('connection').className = 'muted';
-        refreshSessions().catch(showError);
+        refreshSessions().then(() => { if (selected) attach(true); }).catch(showError);
       };
       ws.onclose = () => {
+        attached = '';
         controls = false;
         if (terminal) terminal.options.disableStdin = true;
         $('connection').textContent = 'Disconnected; reconnecting...';
