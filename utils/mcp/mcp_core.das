@@ -409,7 +409,7 @@ def run_with_progress(argv : array<string>; timeout_sec : float; var output : st
             }
         }
     }
-    output := captured
+    output = captured
     remove(current_progress_file, err)
     return code
 }
