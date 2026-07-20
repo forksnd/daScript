@@ -409,6 +409,8 @@ class MetalKqMulMmK6 {
         let nsb = kdim / 256u
         let wrow = nBase + lr0
         var xcur = unsafe(addr(xf[(mBase + lr1) * kdim4 + iy / 4u]))
+        var sv : uint4
+        var dall = 0.0
         var kb = 0u
         while (kb < nkb) {
             let sb = kb / 8u
@@ -418,12 +420,21 @@ class MetalKqMulMmK6 {
             let b1 = unsafe(xcur[1])
             let half6 = js / 4u
             let gg = js % 4u
-            let sv = ksc[blk]
+            if (js == 0u) {   // superblock scalars change every 8th kb; uniform branch, no divergence
+                sv = ksc[blk]
+                dall = float(kdh[blk])
+            }
             let si = half6 * 8u + gg * 2u + il0
             let scw = si < 8u ? (si < 4u ? sv.x : sv.y) : (si < 12u ? sv.z : sv.w)
             let s6 = float(((int(scw >> ((si & 3u) * 8u)) & 255) ^ 128) - 128)
-            let dsc = float(kdh[blk]) * s6
+            let dsc = dall * s6
             let dmn = dsc * 32.0   // -32 folded to the fma form (k4's dmn shape)
+            // byte-position shift folded into exact power-of-two pre-scales (lcpp dequantize_q6_K
+            // shape): q<<8c is an exact f32 integer (6-bit quants), dsc/2^8c is an exponent shift,
+            // so each fma sees the same real product — bit-identical, one shift fewer per element
+            let dsc1 = dsc * 0.00390625
+            let dsc2 = dsc * 0.0000152587890625
+            let dsc3 = dsc * 0.000000059604644775390625
             let qb = blk * 48u + half6 * 16u + (gg & 1u) * 8u + il0 * 4u
             let hb = blk * 48u + 32u + half6 * 8u + il0 * 4u
             let nsh = (gg / 2u) * 4u
@@ -432,12 +443,12 @@ class MetalKqMulMmK6 {
                 let u = kqu[qb + uint(k)]
                 let hu = kqu[hb + uint(k)]
                 // all 4 bytes composed at once — cross-byte bleed of the uint-wide shifts is
-                // masked off; per element only shift+mask+fma remain
+                // masked off; per element only mask+fma remain (shift folded into dsc1..3)
                 let qv = ((u >> nsh) & 0x0F0F0F0F) | (((hu >> hsh) & 0x03030303) << 4u)
-                for [unroll_full] (c in range(4)) {
-                    let q = (qv >> (8u * uint(c))) & 255u
-                    va[k * 4 + c] = float16(dsc * float(q) - dmn)
-                }
+                va[k * 4] = float16(dsc * float(qv & 255u) - dmn)
+                va[k * 4 + 1] = float16(dsc1 * float(qv & 65280u) - dmn)
+                va[k * 4 + 2] = float16(dsc2 * float(qv & 16711680u) - dmn)
+                va[k * 4 + 3] = float16(dsc3 * float(qv & 4278190080u) - dmn)
             }
             barrier()
             for [unroll_full] (i in range(16)) {
@@ -1834,6 +1845,8 @@ class MetalMoeMulMmK6 {
             srcrow = bkt[rbase + min(mBase + lr1, ce - 1u)] / nk
         }
         var xcur = unsafe(addr(xf[srcrow * kdim4 + iy / 4u]))
+        var sv : uint4
+        var dall = 0.0
         var kb = 0u
         while (kb < nkb) {
             let sb = kb / 8u
@@ -1843,12 +1856,19 @@ class MetalMoeMulMmK6 {
             let b1 = unsafe(xcur[1])
             let half6 = js / 4u
             let gg = js % 4u
-            let sv = ksc[blk]
+            if (js == 0u) {   // superblock scalars change every 8th kb; uniform branch, no divergence
+                sv = ksc[blk]
+                dall = float(kdh[blk])
+            }
             let si = half6 * 8u + gg * 2u + il0
             let scw = si < 8u ? (si < 4u ? sv.x : sv.y) : (si < 12u ? sv.z : sv.w)
             let s6 = float(((int(scw >> ((si & 3u) * 8u)) & 255) ^ 128) - 128)
-            let dsc = float(kdh[blk]) * s6
+            let dsc = dall * s6
             let dmn = dsc * 32.0
+            // shift folded into exact power-of-two pre-scales — see MetalKqMulMmK6
+            let dsc1 = dsc * 0.00390625
+            let dsc2 = dsc * 0.0000152587890625
+            let dsc3 = dsc * 0.000000059604644775390625
             let qb = blk * 48u + half6 * 16u + (gg & 1u) * 8u + il0 * 4u
             let hb = blk * 48u + 32u + half6 * 8u + il0 * 4u
             let nsh = (gg / 2u) * 4u
@@ -1857,10 +1877,10 @@ class MetalMoeMulMmK6 {
                 let u = kqu[qb + uint(k)]
                 let hu = kqu[hb + uint(k)]
                 let qv = ((u >> nsh) & 0x0F0F0F0F) | (((hu >> hsh) & 0x03030303) << 4u)
-                for [unroll_full] (c in range(4)) {
-                    let q = (qv >> (8u * uint(c))) & 255u
-                    va[k * 4 + c] = float16(dsc * float(q) - dmn)
-                }
+                va[k * 4] = float16(dsc * float(qv & 255u) - dmn)
+                va[k * 4 + 1] = float16(dsc1 * float(qv & 65280u) - dmn)
+                va[k * 4 + 2] = float16(dsc2 * float(qv & 16711680u) - dmn)
+                va[k * 4 + 3] = float16(dsc3 * float(qv & 4278190080u) - dmn)
             }
             barrier()
             for [unroll_full] (i in range(16)) {
