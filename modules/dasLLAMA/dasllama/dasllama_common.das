@@ -11016,7 +11016,11 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     if (g_mtp_spec && c.n_layer_nextn > 0l && start_pos > 0l && s.mtp_h_pos1 == start_pos) {
         if (t.metal_blob) {
             if (!empty(g_decode_override_name) && key_exists(g_mtp_seam_overrides, g_decode_override_name)) {
-                invoke(g_mtp_seam_overrides[g_decode_override_name], t, s, tokens[0], start_pos)
+                if (!invoke(g_mtp_seam_overrides[g_decode_override_name], t, s, tokens[0], start_pos)) {
+                    // quality-only miss: the stale seam row dents draft acceptance until the next
+                    // draft rewrites it (the verify keeps outputs exact) — loud so a dip is traceable
+                    to_log(LOG_WARNING, "dasLLAMA: MTP seam row declined at pos {start_pos} — draft acceptance may dip this window\n")
+                }
             }
         } else {
             forward_mtp(t, s, tokens[0], start_pos - 1l, false)
