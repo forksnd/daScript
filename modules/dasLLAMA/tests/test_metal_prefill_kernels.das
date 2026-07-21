@@ -483,6 +483,11 @@ def test_metal_prefill_kernels(t : T?) {
                 moe_mulmm_q51_gate(t, dev, queue, 64, 64, [32, 40, 64])    // padded tail on expert 1
                 moe_mulmm_q51_gate(t, dev, queue, 96, 128, [8, 96])        // 2 col tiles, tiny run + multi-tile
 
+                // ===== mx4 expert GEMV (reworked to the q51 shape — gpt-oss's decode kernel) =====
+                moe_gemv_mx4_gate(t, dev, queue, 96, 24, 5, 3, 1, false, false)   // gate/up (shared x)
+                moe_gemv_mx4_gate(t, dev, queue, 64, 32, 7, 4, 1, true, true)     // down site + bias rows
+                moe_gemv_mx4_gate(t, dev, queue, 64, 24, 5, 3, 3, true, true)     // batch streams, biased down
+
                 // ===== deltanet kernels (Wave D) =====
                 // the chain gates compare each stage at its seam vs a sequential CPU mirror;
                 // shapes: decode (npos 1), a batch window, npos < taps (history straddle),
@@ -1090,6 +1095,144 @@ def private moe_gemv_q51_gate(t : T?; dev, queue; n, d, net, k, nst : int; persl
     delete sel
     delete xv
     delete want
+}
+
+// The expert-indexed mx4 GEMV on exact-arithmetic planes: nibble values from the signed
+// doubled-e2m1 table, pow2 E8M0 scales, int x — BIT-exact (covers the bias arm too).
+def private moe_gemv_mx4_gate(t : T?; dev, queue; n, d, net, k, nst : int; perslot, bias : bool) {
+    var err : string
+    var pso = pipeline_from_source(dev, metal_moe_gemv_mx4_msl, metal_moe_gemv_mx4_msl_entry, metal_moe_gemv_mx4_msl_fastmath, err)
+    t |> success(pso != null, "moe mx4 gemv pipeline: {err}")
+    if (pso == null) {
+        return
+    }
+    let nb = n / 32
+    let vt = fixed_array(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+                         0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0)
+    var etab : array<float>
+    etab |> resize(256)
+    for (ei in range(256)) {
+        etab[ei] = unsafe(reinterpret<float>(ei < 2 ? (0x00200000u << uint(ei)) : (uint(ei - 1) << 23u)))
+    }
+    var qp : array<uint8>
+    var sp : array<uint8>
+    var wref : array<float>
+    qp |> resize(net * d * nb * 16)
+    sp |> resize(net * d * nb)
+    wref |> resize(net * d * n)
+    for (b in range(net * d * nb)) {
+        let sc = 120 + (b * 3) % 12   // pow2 scales 2^-8 .. 2^3 — every product dyadic
+        sp[b] = uint8(sc)
+        for (i in range(16)) {
+            let nl = (b * 7 + i * 5 + 1) % 16
+            let nh = (b * 11 + i * 3 + 2) % 16
+            qp[b * 16 + i] = uint8(nl | (nh << 4))
+            wref[b * 32 + i] = vt[nl] * etab[sc]
+            wref[b * 32 + 16 + i] = vt[nh] * etab[sc]
+        }
+    }
+    var sel : array<uint>
+    sel |> resize(nst * 2 * k)
+    for (s in range(nst)) {
+        for (j in range(k)) {
+            sel[s * 2 * k + j] = uint((s + j * 3 + net - 1) % net)
+        }
+    }
+    let xrows = perslot ? nst * k : nst
+    var xv : array<float>
+    xv |> resize(xrows * n)
+    for (i in range(xrows * n)) {
+        xv[i] = float((i * 3) % 9 - 4)
+    }
+    var wb : array<float>
+    wb |> resize(net * d)
+    for (i in range(net * d)) {
+        wb[i] = bias ? float(i % 7 - 3) * 0.25 : 0.0
+    }
+    var want : array<float>
+    want |> resize(nst * k * d)
+    for (s in range(nst)) {
+        for (j in range(k)) {
+            let e = int(sel[s * 2 * k + j])
+            let x0 = (perslot ? s * k + j : s) * n
+            for (r in range(d)) {
+                var acc = 0.0
+                for (c in range(n)) {
+                    acc += wref[(e * d + r) * n + c] * xv[x0 + c]
+                }
+                want[(s * k + j) * d + r] = acc + (bias ? wb[e * d + r] : 0.0)
+            }
+        }
+    }
+    var bw = buf_upload(dev, qp)
+    var bs = buf_upload(dev, sp)
+    var bx = buf_upload(dev, xv)
+    var by = buf_fill(dev, nst * k * d, -1000.0)
+    var bn = buf_u32(dev, uint(n))
+    var bd = buf_u32(dev, uint(d))
+    var bsel = buf_upload(dev, sel)
+    var beblk = buf_u32(dev, uint(d * nb))
+    var bxs = buf_u32(dev, perslot ? uint(n) : 0u)
+    var bss = buf_u32(dev, uint(2 * k))
+    var bbxs = buf_u32(dev, uint((perslot ? k : 1) * n))
+    var bbys = buf_u32(dev, uint(k * d))
+    var bwb = buf_upload(dev, wb)
+    var bhasb = buf_u32(dev, bias ? 1u : 0u)
+    var betab = buf_upload(dev, etab)
+    var vtf : array<float>
+    vtf |> resize(16)
+    for (i in range(16)) {
+        vtf[i] = vt[i]
+    }
+    var bvt = buf_upload(dev, vtf)
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bw, 0ul, 0)
+        metal_set_buffer(enc, bs, 0ul, 1)
+        metal_set_buffer(enc, bx, 0ul, 2)
+        metal_set_buffer(enc, by, 0ul, 3)
+        metal_set_buffer(enc, bn, 0ul, 4)
+        metal_set_buffer(enc, bd, 0ul, 5)
+        metal_set_buffer(enc, bsel, 0ul, 6)
+        metal_set_buffer(enc, beblk, 0ul, 7)
+        metal_set_buffer(enc, bxs, 0ul, 8)
+        metal_set_buffer(enc, bss, 0ul, 9)
+        metal_set_buffer(enc, bbxs, 0ul, 10)
+        metal_set_buffer(enc, bbys, 0ul, 11)
+        metal_set_buffer(enc, bwb, 0ul, 12)
+        metal_set_buffer(enc, bhasb, 0ul, 13)
+        metal_set_buffer(enc, betab, 0ul, 14)
+        metal_set_buffer(enc, bvt, 0ul, 15)
+        metal_dispatch_threadgroups(enc, uint3(uint((d + 3) / 4), uint(k), uint(nst)), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "moe mx4 gemv dispatch n={n} d={d} net={net} k={k} nst={nst} bias={bias}: {err}")
+    t |> equal(buf_mismatch_exact(by, want), 0)
+    metal_release(bw)
+    metal_release(bs)
+    metal_release(bx)
+    metal_release(by)
+    metal_release(bn)
+    metal_release(bd)
+    metal_release(bsel)
+    metal_release(beblk)
+    metal_release(bxs)
+    metal_release(bss)
+    metal_release(bbxs)
+    metal_release(bbys)
+    metal_release(bwb)
+    metal_release(bhasb)
+    metal_release(betab)
+    metal_release(bvt)
+    metal_release(pso)
+    delete etab
+    delete qp
+    delete sp
+    delete wref
+    delete sel
+    delete xv
+    delete wb
+    delete want
+    delete vtf
 }
 
 // The gathered q51 mul_mm: ne experts with padded-CSR row runs (gather = 0 bucket-rows mode);
