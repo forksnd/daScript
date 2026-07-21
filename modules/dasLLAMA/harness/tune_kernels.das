@@ -2010,7 +2010,7 @@ def main {
         "dot_bf16" => "vec8_u2", "add_scale_inplace" => "vec8_u2",
         "axpy_tq4kv" => "vec8_u2", "cvt_tq4kv_to_f32" => "vec8_u2",
         "dot_q8tq4kv" => "vec16", "quantize_tq4kv_row" => "plain",
-        "dot_q8q8_f16s" => "vec16"
+        "dot_q8q8_f16s" => "vec16", "dot_q51e" => "vec16"
     }
     // upsert into the app sidecar (same resolution [tuned] reads from): the loop-hint winners
     // join the "kernels" section next to the [tune] generator perms, "runtime" is replaced —

@@ -2113,56 +2113,116 @@ def dot_q51q8_scalar(wq : uint8 const?; ws : uint8 const?; xq : int8 const?; xs 
     return f
 }
 
-// Portable q51 batch (the KernelBackend.q51_batch default): rows-outer/tokens-inner over the
-// scalar row dot — the mm_b_q51_pre core (one expert region, ntok token rows).
+//! Expand one q51 plane row's 5-bit quants to full bytes in `qe` (n bytes): nibbles via u64
+//! masks + the qh bits ORd in at 0x10 via the u64 bit-spread. Exact. The fast kernels MAC over
+//! the expanded row — a MAC over just-stored STACK bytes defeats the vectorizer (1.95 vs 8.1 GB/s).
+[hint(unsafe_range_check, noalias = wq, noalias = qe)]
+def expand_q51_row(wq : uint8 const?; var qe : int8?; nb : int64) {
+    unsafe {
+        var qp64 = reinterpret<uint64?>(qe)
+        for (bi in range64(nb)) {
+            let wb = bi * 20l
+            let wp64 = reinterpret<uint64 const?>(wq + wb)
+            let w0 = wp64[0]
+            let w1 = wp64[1]
+            let s0 = ((((0x0101010101010101ul * uint64(wq[wb + 16l])) & 0x8040201008040201ul) + 0x7f7f7f7f7f7f7f7ful) >> 3ul) & 0x1010101010101010ul
+            let s1 = ((((0x0101010101010101ul * uint64(wq[wb + 17l])) & 0x8040201008040201ul) + 0x7f7f7f7f7f7f7f7ful) >> 3ul) & 0x1010101010101010ul
+            let s2 = ((((0x0101010101010101ul * uint64(wq[wb + 18l])) & 0x8040201008040201ul) + 0x7f7f7f7f7f7f7f7ful) >> 3ul) & 0x1010101010101010ul
+            let s3 = ((((0x0101010101010101ul * uint64(wq[wb + 19l])) & 0x8040201008040201ul) + 0x7f7f7f7f7f7f7f7ful) >> 3ul) & 0x1010101010101010ul
+            qp64[bi * 4l] = (w0 & 0x0f0f0f0f0f0f0f0ful) | s0
+            qp64[bi * 4l + 1l] = (w1 & 0x0f0f0f0f0f0f0f0ful) | s1
+            qp64[bi * 4l + 2l] = ((w0 >> 4ul) & 0x0f0f0f0f0f0f0f0ful) | s2
+            qp64[bi * 4l + 3l] = ((w1 >> 4ul) & 0x0f0f0f0f0f0f0f0ful) | s3
+        }
+    }
+}
+
+[hint(unsafe_range_check, noalias = qe, noalias = ws, noalias = xq, noalias = xs)]
+def template dot_q51e_template(qe : int8 const ?; ws : uint8 const ?; xq : int8 const ?; xs : float const ?; n : int64) : float {
+    let nb = n / 32l
+    var f = 0.0
+    for (bi in range64(nb)) {
+        let xb = bi * 32l
+        var isum = 0
+        var asum = 0
+        for [tune = 1] (k in range64(32l)) {
+            let a = int(unsafe(xq[xb + k]))
+            isum += int(unsafe(qe[xb + k])) * a
+            asum += a
+        }
+        let d = f16_to_f32(uint(unsafe(ws[bi * 4l])) | (uint(unsafe(ws[bi * 4l + 1l])) << 8u))
+        let m = f16_to_f32(uint(unsafe(ws[bi * 4l + 2l])) | (uint(unsafe(ws[bi * 4l + 3l])) << 8u))
+        f += (d * float(isum) + m * float(asum)) * unsafe(xs[bi])
+    }
+    return f
+}
+
+//! The q51 MAC over an expand_q51_row-expanded row — the fast kernels' core. Bit-identical to
+//! dot_q51q8_scalar (exact int sums, same per-block fold order); vectorizes like dot_q8q8.
+[hint(unsafe_range_check, noalias = qe, noalias = ws, noalias = xq, noalias = xs), tuned(fallback = "vec16")]
+def dot_q51e(qe : int8 const?; ws : uint8 const?; xq : int8 const?; xs : float const?; n : int64) : float {}
+
+// Portable q51 batch (the KernelBackend.q51_batch default): rows-outer/tokens-inner — each row
+// expands ONCE into the worker's scratch, then ntok MAC passes (the mm_b_q51_pre core).
 def q51q8_batch_kernel(var yp : float?; wq : uint8 const?; ws : uint8 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     var myp = yp
     unsafe {
         maybe_parallel_for(0, int(d), matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
+            var qe : array<int8>
+            qe |> resize(n)
             unsafe {
+                var qep = addr(qe[0])
                 for (i in range(rb, re)) {
-                    let wrow = wq + int64(i) * nb * 20l
+                    expand_q51_row(wq + int64(i) * nb * 20l, qep, nb)
                     let srow = ws + int64(i) * nb * 4l
                     for (tk in range64(ntok)) {
-                        myp[tk * d + int64(i)] = dot_q51q8_scalar(wrow, srow, xqp + tk * n, xsp + tk * nb, n)
+                        myp[tk * d + int64(i)] = dot_q51e(qep, srow, xqp + tk * n, xsp + tk * nb, n)
                     }
                 }
             }
+            delete qe
         }
     }
 }
 
 // Portable q51 groupN (the groupn_q51 default — MoE decode dispatch): (element woff, activation
-// xoff) pairs, one scalar row dot per (region, row). No bias form — no biased-q51 arch exists.
+// xoff) pairs, expand-then-MAC per (region, row). No bias form — no biased-q51 arch exists.
 def q51q8_groupn_kernel(var yp : float?; wq : uint8 const?; ws : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
     unsafe {
         maybe_parallel_for(0, int(nregions * d), matmul_chunks_gemv(int(nregions * d), 1, n * d * nregions)) $(rb, re) {
+            var qe : array<int8>
+            qe |> resize(n)
             unsafe {
+                var qep = addr(qe[0])
                 for (i in range(rb, re)) {
                     let ii = int64(i)
                     let r = ii / d
                     let row = ii % d
                     let woff = offs[r * 2l]
                     let xoff = offs[r * 2l + 1l]
-                    myp[ii] = dot_q51q8_scalar(wq + (woff / 32l + row * nb) * 20l, ws + (woff / 32l + row * nb) * 4l,
-                        xqp + xoff, xsp + xoff / 32l, n)
+                    expand_q51_row(wq + (woff / 32l + row * nb) * 20l, qep, nb)
+                    myp[ii] = dot_q51e(qep, ws + (woff / 32l + row * nb) * 4l, xqp + xoff, xsp + xoff / 32l, n)
                 }
             }
+            delete qe
         }
     }
 }
 
 // Portable q51 batch groupN (the q51_batch_groupn default — fused MoE prefill): (element woff,
-// row0, cnt) triples, per (region, row) scalar dots over the region's token-row range.
+// row0, cnt) triples; each (region, row) expands once, then cnt token MACs.
 def q51q8_batch_groupn_kernel(var yp : float?; wq : uint8 const?; ws : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
     unsafe {
         maybe_parallel_for(0, int(nregions * d), matmul_chunks(int(nregions * d), get_q8_batch_chunks_per_job(), n * d * nregions)) $(rb, re) {
+            var qe : array<int8>
+            qe |> resize(n)
             unsafe {
+                var qep = addr(qe[0])
                 for (i in range(rb, re)) {
                     let ii = int64(i)
                     let r = ii / d
@@ -2170,13 +2230,14 @@ def q51q8_batch_groupn_kernel(var yp : float?; wq : uint8 const?; ws : uint8 con
                     let woff = offs[r * 3l]
                     let row0 = offs[r * 3l + 1l]
                     let cnt = offs[r * 3l + 2l]
-                    let wrow = wq + (woff / 32l + row * nb) * 20l
+                    expand_q51_row(wq + (woff / 32l + row * nb) * 20l, qep, nb)
                     let srow = ws + (woff / 32l + row * nb) * 4l
                     for (tk in range64(cnt)) {
-                        myp[(row0 + tk) * d + row] = dot_q51q8_scalar(wrow, srow, xqp + (row0 + tk) * n, xsp + (row0 + tk) * nb, n)
+                        myp[(row0 + tk) * d + row] = dot_q51e(qep, srow, xqp + (row0 + tk) * n, xsp + (row0 + tk) * nb, n)
                     }
                 }
             }
+            delete qe
         }
     }
 }
