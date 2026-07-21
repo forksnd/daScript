@@ -85,6 +85,13 @@ def test_repository_untracked_diff_contract(t : T?) {
             expected_exit_code, "expanded")
         t |> equal(expanded_error, "")
         t |> equal(argv[9], "--unified=20")
+
+        let staged_view_error = repository_staged_file_view_argv(
+            "D:/Work/tree", "staged.das", "D:/Temp/staged-view.raw", argv)
+        t |> equal(staged_view_error, "")
+        t |> equal(argv[length(argv) - 2],
+            "--output=D:/Temp/staged-view.raw")
+        t |> equal(argv[length(argv) - 1], ":0:staged.das")
     }
 }
 
@@ -116,10 +123,21 @@ def test_repository_text_read_contract(t : T?) {
         t |> success(fwrite(empty_path, ""), "empty fixture is written")
 
         var text : string
-        t |> equal(repository_read_text_file(empty_path, text), "")
+        t |> equal(repository_read_text_file(empty_path, 1024, text), "")
         t |> equal(text, "", "an opened empty file is a successful preview")
-        t |> success(!empty(repository_read_text_file(root, text)),
+        t |> success(!empty(repository_read_text_file(root, 1024, text)),
             "a path that cannot be read as a regular file reports an error")
+
+        let bytes_path = path_join(root, "bytes.bin")
+        t |> success(fwrite(bytes_path, "abc"), "byte fixture is written")
+        t |> success(!empty(repository_read_text_file(bytes_path, 2, text)),
+            "text View rejects files beyond its raw-byte limit")
+        var bytes : array<uint8>
+        var byte_count = 0
+        t |> equal(repository_read_file_bytes(
+            bytes_path, 3, bytes, byte_count), "")
+        t |> equal(byte_count, 3)
+        t |> equal(string(bytes), "abc")
 
         rmdir_rec(root)
     }

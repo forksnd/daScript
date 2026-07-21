@@ -67,6 +67,9 @@ def test_binary_patch_detection(t : T?) {
         t |> equal(git_patch_is_binary(binary_patch), true)
         let literal_patch = "diff --git a/image.png b/image.png\nGIT binary patch\nliteral 0\n"
         t |> equal(git_patch_is_binary(literal_patch), true)
+        let deleted_patch = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n"
+        t |> equal(git_patch_result_is_deleted(deleted_patch), true)
+        t |> equal(git_patch_result_is_deleted(text_patch), false)
     }
 }
 

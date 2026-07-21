@@ -311,11 +311,15 @@ def public repository_file_diff_argv(repository_id, worktree_path, file_path,
         diff_context)
 }
 
-def public repository_read_text_file(path : string; var text : string&) : string {
+def public repository_read_text_file(path : string; max_bytes : int;
+                                     var text : string&) : string {
     text = ""
     let file_status = stat(path)
     if (!file_status.is_valid || !file_status.is_reg) {
-        return "could not read working file text"
+        return "could not read file text"
+    }
+    if (file_status.size > uint64(max_bytes)) {
+        return "file exceeds the raw-byte View limit"
     }
     var loaded = false
     fopen(path, "rb") $(file) {
@@ -324,11 +328,35 @@ def public repository_read_text_file(path : string; var text : string&) : string
             loaded = true
         }
     }
-    return loaded ? "" : "could not read working file text"
+    return loaded ? "" : "could not read file text"
+}
+
+def public repository_read_file_bytes(path : string; max_bytes : int;
+                                      var bytes : array<uint8>;
+                                      var byte_count : int&) : string {
+    delete bytes
+    byte_count = 0
+    let file_status = stat(path)
+    if (!file_status.is_valid || !file_status.is_reg) {
+        return "could not read file bytes"
+    }
+    var loaded = false
+    fopen(path, "rb") $(file) {
+        if (file != null) {
+            fmap(file) $(var data : array<uint8>#) {
+                byte_count = length(data)
+                if (byte_count <= max_bytes) {
+                    bytes := data
+                }
+                loaded = true
+            }
+        }
+    }
+    return loaded ? "" : "could not read file bytes"
 }
 
 def public repository_working_file_text(repository_id, worktree_path, file_path : string;
-                                        var text : string&) : string {
+                                        max_bytes : int; var text : string&) : string {
     text = ""
     let repository_index = find_repository(repository_id)
     if (repository_index < 0 || g_repositories[repository_index] == null) {
@@ -349,7 +377,7 @@ def public repository_working_file_text(repository_id, worktree_path, file_path 
     }
     let absolute_path = path_join(worktree_path, file_path)
     if (!fexist(absolute_path)) return "working file does not exist"
-    return repository_read_text_file(absolute_path, text)
+    return repository_read_text_file(absolute_path, max_bytes, text)
 }
 
 def public repository_working_file_bytes(repository_id, worktree_path, file_path : string;
@@ -377,19 +405,23 @@ def public repository_working_file_bytes(repository_id, worktree_path, file_path
     }
     let absolute_path = path_join(worktree_path, file_path)
     if (!fexist(absolute_path)) return "working file does not exist"
-    var loaded = false
-    fopen(absolute_path, "rb") $(file) {
-        if (file != null) {
-            fmap(file) $(var data : array<uint8>#) {
-                byte_count = length(data)
-                if (byte_count <= max_bytes) {
-                    bytes := data
-                }
-                loaded = true
-            }
-        }
+    let read_error = repository_read_file_bytes(
+        absolute_path, max_bytes, bytes, byte_count)
+    return empty(read_error) ? "" : "could not read working file bytes"
+}
+
+def public repository_staged_file_view_argv(worktree_path, file_path,
+                                            output_path : string;
+                                            var argv : array<string>&) : string {
+    delete argv
+    if (!repository_valid_relative_file_path(file_path)) {
+        return "invalid worktree-relative file path"
     }
-    return loaded ? "" : "could not read working file bytes"
+    if (empty(output_path)) return "staged view output path is required"
+    var inscope command <- ["git", "-C", worktree_path, "--no-pager", "show",
+        "--format=", "--output={output_path}", ":0:{file_path}"]
+    argv := command
+    return ""
 }
 
 def private launch_git(var runtime : RepositoryRuntime?; argv : array<string>;

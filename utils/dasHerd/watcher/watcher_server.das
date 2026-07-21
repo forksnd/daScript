@@ -75,6 +75,7 @@ struct public RepositoryFileInspectionMessage {
     view_text : string
     view_base64 : string
     view_byte_count : int
+    view_available : bool
     status : string
     error : string
 }
@@ -99,6 +100,9 @@ class private WatcherClient {
     inspection_session_id : string
     inspection_expected_exit_code : int64
     inspection_delivered : bool = true
+    inspection_phase : string
+    inspection_patch : string
+    inspection_artifact_path : string
 }
 
 struct private WatcherOk {
@@ -340,7 +344,8 @@ class DasHerdWatcherServer : HvWebServer {
                              loading : bool; patch, error : string;
                              view_text : string = ""; status : string = "";
                              view_base64 : string = "";
-                             view_byte_count : int = 0) {
+                             view_byte_count : int = 0;
+                             view_available : bool = false) {
         if (client == null) return
         let message = RepositoryFileInspectionMessage(
             request_id = client.inspection_request_id,
@@ -352,9 +357,60 @@ class DasHerdWatcherServer : HvWebServer {
             task_session_id = client.inspection_session_id,
             loading = loading, patch = patch, view_text = view_text,
             view_base64 = view_base64, view_byte_count = view_byte_count,
+            view_available = view_available,
             status = status, error = error)
         send(client.channel, sprint_json(message, false),
             ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def cleanup_inspection_artifact(var client : WatcherClient?) {
+        if (client == null || empty(client.inspection_artifact_path)) return
+        if (fexist(client.inspection_artifact_path)) {
+            let _removed = remove(client.inspection_artifact_path)
+        }
+        client.inspection_artifact_path = ""
+    }
+
+    def start_staged_file_view(var client : WatcherClient?; patch : string) {
+        if (client == null) return
+        let artifact_path = watcher_session_artifact_path(
+            client.inspection_session_id, "staged-view.raw")
+        var inscope argv : array<string>
+        let command_error = repository_staged_file_view_argv(
+            client.inspection_worktree_path, client.inspection_file_path,
+            artifact_path, argv)
+        if (!empty(command_error)) {
+            client.inspection_delivered = true
+            self.send_file_inspection(client, false, "", command_error)
+            return
+        }
+        let _pruned = watcher_prune_completed_sessions(
+            "git-file-view", client.inspection_repository_id,
+            client.inspection_worktree_path)
+        var inscope request = WatcherLaunchRequest(
+            cwd = client.inspection_worktree_path,
+            display_name = "Git staged view: {client.inspection_file_path}",
+            kind = "git-file-view", target_id = "local",
+            repository_id = client.inspection_repository_id,
+            worktree_path = client.inspection_worktree_path,
+            columns = 80, rows = 25, timeout_ms = 15000l)
+        request.argv := argv
+        let result = watcher_launch(request)
+        client.inspection_phase = "staged-view"
+        client.inspection_patch = clone_string(patch)
+        client.inspection_artifact_path = artifact_path
+        client.inspection_session_id = result.session_id
+        client.inspection_expected_exit_code = 0l
+        if (!result.ok) {
+            client.inspection_delivered = true
+            self.cleanup_inspection_artifact(client)
+            client.inspection_patch = ""
+            self.send_file_inspection(client, false, "", result.error)
+            return
+        }
+        client.inspection_delivered = false
+        self.send_file_inspection(client, true, "", "", "",
+            "Reading full staged file (15 second limit)...")
     }
 
     def start_file_inspection(var client : WatcherClient?;
@@ -364,6 +420,7 @@ class DasHerdWatcherServer : HvWebServer {
                 && watcher_accepts_input(client.inspection_session_id)) {
             let _ = watcher_terminate(client.inspection_session_id, "superseded")
         }
+        self.cleanup_inspection_artifact(client)
         client.inspection_request_id = incoming.request_id
         client.inspection_repository_id = incoming.repository_id
         client.inspection_worktree_path = incoming.worktree_path
@@ -374,6 +431,8 @@ class DasHerdWatcherServer : HvWebServer {
             client.inspection_diff_context = "compact"
         }
         client.inspection_session_id = ""
+        client.inspection_phase = "diff"
+        client.inspection_patch = ""
         client.inspection_delivered = true
 
         var inscope argv : array<string>
@@ -415,21 +474,74 @@ class DasHerdWatcherServer : HvWebServer {
         if (!watcher_get_session_info(client.inspection_session_id, info)
                 || !info.drained) return
         var truncated = false
-        let patch = watcher_machine_output_text(client.inspection_session_id, truncated)
+        let output = watcher_machine_output_text(client.inspection_session_id, truncated)
         let _compacted = watcher_compact_session(client.inspection_session_id, 80, 25)
+        if (client.inspection_phase == "staged-view") {
+            client.inspection_delivered = true
+            if (truncated) {
+                self.cleanup_inspection_artifact(client)
+                client.inspection_patch = ""
+                self.send_file_inspection(client, false, "",
+                    "staged file command exceeded the retained machine-output limit")
+                return
+            }
+            if (info.exit_code != client.inspection_expected_exit_code) {
+                self.cleanup_inspection_artifact(client)
+                client.inspection_patch = ""
+                self.send_file_inspection(client, false, "",
+                    "git show exited with {info.exit_code}: {output}")
+                return
+            }
+            var view_text = ""
+            var view_base64 = ""
+            var view_byte_count = 0
+            var view_error = ""
+            if (git_patch_is_binary(client.inspection_patch)) {
+                var inscope bytes : array<uint8>
+                view_error = repository_read_file_bytes(
+                    client.inspection_artifact_path,
+                    MAX_FILE_PREVIEW_RAW_BYTES, bytes, view_byte_count)
+                if (empty(view_error) && !empty(bytes)) {
+                    view_base64 = base64_encode(bytes)
+                }
+            } else {
+                view_error = repository_read_text_file(
+                    client.inspection_artifact_path,
+                    MAX_FILE_PREVIEW_RAW_BYTES, view_text)
+            }
+            self.cleanup_inspection_artifact(client)
+            let patch = client.inspection_patch
+            client.inspection_patch = ""
+            if (!empty(view_error)) {
+                self.send_file_inspection(client, false, "", view_error)
+                return
+            }
+            self.send_file_inspection(client, false, patch, "", view_text,
+                "", view_base64, view_byte_count, true)
+            return
+        }
         client.inspection_delivered = true
         if (truncated) {
             self.send_file_inspection(client, false, "",
                 "diff exceeded the retained machine-output limit")
         } elif (info.exit_code != client.inspection_expected_exit_code) {
             self.send_file_inspection(client, false, "",
-                "git diff exited with {info.exit_code}: {patch}")
+                "git diff exited with {info.exit_code}: {output}")
         } else {
+            if (client.inspection_comparison == "staged") {
+                if (git_patch_result_is_deleted(output)) {
+                    self.send_file_inspection(client, false, output, "",
+                        "", "", "", 0, true)
+                    return
+                }
+                self.start_staged_file_view(client, output)
+                return
+            }
             var view_text = ""
             var view_base64 = ""
             var view_byte_count = 0
             if (client.inspection_comparison == "working") {
-                let binary = git_patch_is_binary(patch)
+                let binary = git_patch_is_binary(output)
                 var view_error = ""
                 if (binary) {
                     var inscope bytes : array<uint8>
@@ -438,7 +550,7 @@ class DasHerdWatcherServer : HvWebServer {
                         client.inspection_repository_id,
                         client.inspection_worktree_path,
                         client.inspection_file_path,
-                        MAX_BINARY_PREVIEW_RAW_BYTES, bytes, view_byte_count)
+                        MAX_FILE_PREVIEW_RAW_BYTES, bytes, view_byte_count)
                     if (empty(view_error)) {
                         if (!empty(bytes)) {
                             view_base64 = base64_encode(bytes)
@@ -448,15 +560,16 @@ class DasHerdWatcherServer : HvWebServer {
                     view_error = repository_working_file_text(
                         client.inspection_repository_id,
                         client.inspection_worktree_path,
-                        client.inspection_file_path, view_text)
+                        client.inspection_file_path,
+                        MAX_FILE_PREVIEW_RAW_BYTES, view_text)
                 }
                 if (!empty(view_error)) {
                     self.send_file_inspection(client, false, "", view_error)
                     return
                 }
             }
-            self.send_file_inspection(client, false, patch, "", view_text,
-                "", view_base64, view_byte_count)
+            self.send_file_inspection(client, false, output, "", view_text,
+                "", view_base64, view_byte_count, true)
         }
     }
 
@@ -523,6 +636,7 @@ class DasHerdWatcherServer : HvWebServer {
         if (index < 0) return
         var client = clients[index]
         detach(client, "client_closed")
+        self.cleanup_inspection_artifact(client)
         clients |> erase(index)
         unsafe { delete client }
     }
@@ -644,6 +758,7 @@ class DasHerdWatcherServer : HvWebServer {
             var client = clients[index]
             if (client != null) {
                 detach(client, "server_shutdown")
+                self.cleanup_inspection_artifact(client)
                 unsafe { delete client }
             }
         }

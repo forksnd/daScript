@@ -9,10 +9,10 @@ require strings public
 require daslib/strings_boost
 require math
 
-//! Raw binary bytes embedded into the JSON/base64 fallback preview path.
-//! 8 MiB becomes roughly 10.7 MiB on the wire while bounding simultaneous
-//! mapped/raw/encoded/decoded allocations in the watcher and rich client.
-let public MAX_BINARY_PREVIEW_RAW_BYTES = 8 * 1024 * 1024
+//! Raw bytes embedded into a file View response. 8 MiB bounds text JSON and
+//! becomes roughly 10.7 MiB for the binary base64 fallback while limiting
+//! simultaneous mapped/raw/encoded/decoded allocations across both clients.
+let public MAX_FILE_PREVIEW_RAW_BYTES = 8 * 1024 * 1024
 
 enum public GitDiffLineKind {
     context
@@ -250,6 +250,16 @@ def public git_patch_is_binary(patch : string) : bool {
     var inscope lines <- split(patch, "\n")
     for (raw_line in lines) {
         if (git_patch_line_is_binary(trim_cr(raw_line))) return true
+    }
+    return false
+}
+
+def public git_patch_result_is_deleted(patch : string) : bool {
+    for (raw_line in split(patch, "\n")) {
+        let line = trim_cr(raw_line)
+        if (line == "+++ /dev/null" || starts_with(line, "deleted file mode ")
+                || (starts_with(line, "Binary files ")
+                    && find(line, " and /dev/null differ") >= 0)) return true
     }
     return false
 }

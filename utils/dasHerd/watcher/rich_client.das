@@ -75,6 +75,7 @@ struct private WatcherFileInspectionMessage {
     view_text : string
     view_base64 : string
     view_byte_count : int
+    view_available : bool
     status : string
     error : string
 }
@@ -146,6 +147,7 @@ struct private GitInspectorState {
     source_view_text : string
     source_view_base64 : string
     source_view_byte_count : int
+    source_view_available : bool
     syntax_choice : int
     diff_context_choice : int
     resolved_language : string
@@ -289,7 +291,8 @@ def private queue_inspector_prepare(status : string) {
     if (!inspector_prepare_worker_queue(g_prepare_worker, generation,
             g_inspector.source_patch, g_inspector.source_view_text,
             g_inspector.resolved_language, g_inspector.source_view_base64,
-            g_inspector.source_view_byte_count)) {
+            g_inspector.source_view_byte_count,
+            g_inspector.source_view_available)) {
         let failure = "File inspection preparation worker is unavailable"
         inspector_load_fail(g_inspector.prepare, generation,
             failure)
@@ -313,6 +316,7 @@ def private install_file_inspection(message : WatcherFileInspectionMessage const
     g_inspector.source_view_text = clone_string(message.view_text)
     g_inspector.source_view_base64 = clone_string(message.view_base64)
     g_inspector.source_view_byte_count = message.view_byte_count
+    g_inspector.source_view_available = message.view_available
     queue_inspector_prepare("Preparing diff...")
 }
 
@@ -377,6 +381,7 @@ def private begin_file_inspection(repository_id, worktree_path, file_path,
         g_inspector.source_view_text = ""
         g_inspector.source_view_base64 = ""
         g_inspector.source_view_byte_count = 0
+        g_inspector.source_view_available = false
         g_inspector.syntax_choice = 0
         g_inspector.resolved_language = inspector_language_for_path(file_path)
         DIFF_SYNTAX.value = 0
