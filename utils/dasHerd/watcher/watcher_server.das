@@ -11,6 +11,7 @@ module watcher_server shared public
 require dashv/dashv_boost public
 require ./watcher_core.das public
 require ./repository_core.das public
+require ./file_inspection.das
 require daslib/json_boost
 require daslib/base64
 require strings
@@ -429,18 +430,18 @@ class DasHerdWatcherServer : HvWebServer {
             var view_base64 = ""
             var view_byte_count = 0
             if (client.inspection_comparison == "working") {
-                let binary = find(patch, "Binary files ") >= 0 || find(patch, "GIT binary patch") >= 0
+                let binary = git_patch_is_binary(patch)
                 var view_error = ""
                 if (binary) {
                     var inscope bytes : array<uint8>
+                    view_byte_count = 0
                     view_error = repository_working_file_bytes(
                         client.inspection_repository_id,
                         client.inspection_worktree_path,
-                        client.inspection_file_path, bytes)
+                        client.inspection_file_path,
+                        MAX_BINARY_PREVIEW_BYTES, bytes, view_byte_count)
                     if (empty(view_error)) {
-                        view_byte_count = length(bytes)
-                        if (!empty(bytes)
-                                && view_byte_count <= MAX_BINARY_PREVIEW_BYTES) {
+                        if (!empty(bytes)) {
                             view_base64 = base64_encode(bytes)
                         }
                     }

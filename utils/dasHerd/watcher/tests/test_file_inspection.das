@@ -56,6 +56,18 @@ def test_unified_patch_projection(t : T?) {
 }
 
 [test]
+def test_binary_patch_detection(t : T?) {
+    t |> run("binary markers are metadata lines, not text payload substrings") <| @(t : T?) {
+        let text_patch = "diff --git a/note.txt b/note.txt\n@@ -1 +1 @@\n-old\n+Binary files are discussed here\n+GIT binary patch\n"
+        t |> equal(git_patch_is_binary(text_patch), false)
+        let binary_patch = "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
+        t |> equal(git_patch_is_binary(binary_patch), true)
+        let literal_patch = "diff --git a/image.png b/image.png\nGIT binary patch\nliteral 0\n"
+        t |> equal(git_patch_is_binary(literal_patch), true)
+    }
+}
+
+[test]
 def test_inspector_load_state(t : T?) {
     t |> run("replacement retains ready content until the matching result arrives") <| @(t : T?) {
         var state = InspectorLoadState()

@@ -236,6 +236,19 @@ def private append_change_rows(var result : GitParsedPatch;
     delete added_lines
 }
 
+def private git_patch_line_is_binary(line : string) : bool {
+    return (line == "GIT binary patch"
+        || starts_with(line, "Binary files ") && ends_with(line, " differ"))
+}
+
+def public git_patch_is_binary(patch : string) : bool {
+    var inscope lines <- split(patch, "\n")
+    for (raw_line in lines) {
+        if (git_patch_line_is_binary(trim_cr(raw_line))) return true
+    }
+    return false
+}
+
 def public git_parse_unified_patch(patch : string) : GitParsedPatch {
     var result = GitParsedPatch()
     var inscope old_lines : array<string>
@@ -252,7 +265,7 @@ def public git_parse_unified_patch(patch : string) : GitParsedPatch {
     var new_line = 0
     for (raw_line in lines) {
         let line = trim_cr(raw_line)
-        if (starts_with(line, "Binary files ") || starts_with(line, "GIT binary patch")) {
+        if (git_patch_line_is_binary(line)) {
             result.binary = true
         }
         if (starts_with(line, "@@")) {

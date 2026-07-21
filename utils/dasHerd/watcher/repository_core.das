@@ -329,8 +329,11 @@ def public repository_working_file_text(repository_id, worktree_path, file_path 
 }
 
 def public repository_working_file_bytes(repository_id, worktree_path, file_path : string;
-                                         var bytes : array<uint8>) : string {
+                                         max_bytes : int;
+                                         var bytes : array<uint8>;
+                                         var byte_count : int&) : string {
     delete bytes
+    byte_count = 0
     let repository_index = find_repository(repository_id)
     if (repository_index < 0 || g_repositories[repository_index] == null) {
         return "unknown repository"
@@ -355,7 +358,10 @@ def public repository_working_file_bytes(repository_id, worktree_path, file_path
     fopen(absolute_path, "rb") $(file) {
         if (file != null) {
             fmap(file) $(var data : array<uint8>#) {
-                bytes := data
+                byte_count = length(data)
+                if (byte_count <= max_bytes) {
+                    bytes := data
+                }
                 loaded = true
             }
         }
