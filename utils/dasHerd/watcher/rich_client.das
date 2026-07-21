@@ -1513,7 +1513,6 @@ def shutdown() {
         g_client = null
     }
     release_inspector_content()
-    markdown_view_dispose(g_inspector.markdown_view)
     text_source_view_dispose(g_inspector.old_view)
     text_source_view_dispose(g_inspector.new_view)
     text_source_view_dispose(g_inspector.view)

@@ -38,6 +38,9 @@ def test_unified_patch_projection(t : T?) {
         t |> equal(parsed.rows[4].old_kind, GitDiffLineKind.removed)
         t |> equal(parsed.rows[4].new_kind, GitDiffLineKind.empty)
         t |> equal(length(parsed.new_changed_lines), 2)
+        t |> equal(length(parsed.new_deleted_anchors), 1)
+        t |> equal(parsed.new_deleted_anchors[0], 4,
+            "EOF deletion is anchored after the fourth resulting line")
     }
     t |> run("separated hunks retain navigation boundaries") <| @(tt : T?) {
         let source = "diff --git a/a.das b/a.das\n--- a/a.das\n+++ b/a.das\n@@ -2,2 +2,2 @@\n-old one\n+new one\n keep\n@@ -20 +20 @@\n-old two\n+new two\n"

@@ -326,12 +326,23 @@ def public git_parse_unified_patch(patch : string) : GitParsedPatch {
     }
     old_aligned |> reserve(length(result.rows))
     new_aligned |> reserve(length(result.rows))
-    for (row in result.rows) {
+    var hunk_index = 0
+    var new_cursor = 0
+    for (row_index in range(length(result.rows))) {
+        if (hunk_index < length(result.hunks)
+                && result.hunks[hunk_index].row_start == row_index) {
+            new_cursor = max(0, result.hunks[hunk_index].new_start - 1)
+            hunk_index++
+        }
+        let row = result.rows[row_index]
         old_aligned |> push(row.old_text)
         new_aligned |> push(row.new_text)
         if (row.old_kind == GitDiffLineKind.removed
                 && row.new_kind == GitDiffLineKind.empty) {
-            result.new_deleted_anchors |> push(max(0, row.new_line - 1))
+            result.new_deleted_anchors |> push(new_cursor)
+        }
+        if (row.new_line > 0) {
+            new_cursor = row.new_line
         }
     }
     result.old_text = join(old_lines, "\n")
