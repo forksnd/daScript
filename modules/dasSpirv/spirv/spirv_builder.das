@@ -481,6 +481,19 @@ def public const_uint(var m : SpirvModule; v : uint) : uint {
     return id
 }
 
+// The zero of ANY type, whatever its shape -- OpConstantNull takes the type id and needs no
+// per-component constituents, so one entry serves scalars, vectors, matrices and arrays alike.
+// Keyed by that type id, which the type pool has already made unique.
+def public const_null(var m : SpirvModule; t : uint) : uint {
+    let key = "cn_{t}"
+    let ex = m.const_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.ConstantNull, t, id)
+    m.const_pool |> insert(key, id)
+    return id
+}
+
 // Signed-int and float OpConstants. The literal word is the raw 32-bit pattern: uint(v) carries an
 // int's two's-complement bits; reinterpret carries a float's IEEE-754 bits. Keyed separately from
 // const_uint so int 2 and uint 2 (distinct types) don't collide in the pool.

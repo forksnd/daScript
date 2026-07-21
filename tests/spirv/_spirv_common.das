@@ -470,6 +470,25 @@ def public catri_words : array<uint> {
     return clone_to_move(catri_spv)
 }
 
+// ===== fixed-array literal of RUNTIME elements: glslang builds `int[5](a, b, c, d, e)` with one
+// OpCompositeConstruct of the five values, then OpStores it into the array's Function-storage
+// OpVariable. A `var` array is then written through OpAccessChain per element. =====
+var @ssbo @binding = 0 rta_buf : array<float4>
+[compute_shader(local_size_x=8, name="rtarr_spv"), marker(no_coverage)]
+def rtarr {
+    let i0 = int(gl_LocalInvocationID.x)
+    let ticks = fixed_array(i0 - 2, i0 - 1, i0, i0 + 1, i0 + 2)
+    var acc = float3(0.0, 0.0, 0.0)
+    for (i in range(5)) {
+        acc += rta_buf[ticks[i]].xyz
+    }
+    rta_buf[i0] = float4(acc, 0.0)
+}
+
+def public rtarr_words : array<uint> {
+    return clone_to_move(rtarr_spv)
+}
+
 // ===== Phase-4a UBO fixture: a @uniform struct read through OpAccessChain by field index. The
 // struct's std140 layout exercises both packing edge cases — a scalar packing after a vec2
 // (uv@16,flags@24,scale@28) and after a vec3 (dir@32,bias@44). Every field is read; member loads

@@ -856,16 +856,26 @@ namespace das {
             if ( e->rtti_isTypeDecl() ) return true;    // type<...> witness: a compile-time tag
             if ( e->rtti_isUnsafe() ) return inlinePure(static_cast<ExprUnsafe *>(e)->body);
             if ( e->rtti_isVar() ) {
-                auto ev = static_cast<ExprVar *>(e);
-                // a manufactured, not-yet-resolved temp read (this pass's own __inl*
-                // vars, e.g. an earlier site's result temp): no flags, no type - reads
-                // as "global" and untyped, which would hoist it as an impure COPY.
-                // it is a plain local read - pure. everything else at patch time is
-                // resolved, so the flags can be trusted
-                if ( !ev->variable && !ev->type ) return true;
-                return !ev->isGlobalVariable();
+                // a bare (non-R2V) variable is an LVALUE - a reference to storage,
+                // not a value read. Storage identity is stable for BOTH a local and
+                // a global (global storage never moves), so referencing one is pure;
+                // hoisting a global array/struct being indexed would only make a
+                // pointless reference temp - and for a global array that temp is a
+                // local dynamic array the shader backends cannot represent at all.
+                // A global's VALUE read (which CAN change mid-inline) stays impure at
+                // the R2V case below, where it is snapshotted.
+                return true;
             }
-            if ( e->rtti_isR2V() ) return inlinePure(static_cast<ExprRef2Value *>(e)->subexpr);
+            if ( e->rtti_isR2V() ) {
+                auto sub = static_cast<ExprRef2Value *>(e)->subexpr;
+                // a global's value can be mutated between the inline site and the
+                // spliced body, so its rvalue read is snapshotted (kept impure)
+                if ( sub && sub->rtti_isVar() ) {
+                    auto ev = static_cast<ExprVar *>(sub);
+                    if ( (ev->variable || ev->type) && ev->isGlobalVariable() ) return false;
+                }
+                return inlinePure(sub);
+            }
             if ( e->rtti_isField() ) return inlinePure(static_cast<ExprField *>(e)->value);
             if ( e->rtti_isSafeField() ) return inlinePure(static_cast<ExprSafeField *>(e)->value);
             if ( e->rtti_isAsVariant() ) return inlinePure(static_cast<ExprAsVariant *>(e)->value);
