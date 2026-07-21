@@ -1380,6 +1380,11 @@ let benchRecord = null;
 
 function renderBench(b) {
     const log = $("bench-log");
+    if (b.state === "running" || !(b.result && b.result.record)) {
+        // never leave a prior run's record copyable — a stale copy is a wrong submission
+        benchRecord = null;
+        $("bench-record-row").style.display = "none";
+    }
     if (b.log && b.log.length) {
         log.style.display = "block";
         log.innerHTML = b.log.map(l => esc(l)).join("<br>");

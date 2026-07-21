@@ -278,7 +278,7 @@ def main() {
     var refCmd = ""
     if (!empty(cfg.ref)) {
         let aff = (!gpu && affinity_on()) ? lcpp_affinity_args(threads) : ""
-        refCmd = "{cfg.ref} -m {cfg.model} -ngl {cfg.ngl} -t {threads}{aff} -p {cfg.plen} -n {cfg.ngen} -r {reps} -o json"
+        refCmd = "\"{cfg.ref}\" -m \"{cfg.model}\" -ngl {cfg.ngl} -t {threads}{aff} -p {cfg.plen} -n {cfg.ngen} -r {reps} -o json"
         say(fmt, "ref: {refCmd}\n")
         if (!run_llama_bench(refCmd, refRows)) {
             say(fmt, "warning: llama-bench run/parse failed — no ref rows\n")

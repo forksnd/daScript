@@ -198,7 +198,7 @@ def main : int {
             let backend = ngl != 0 ? "metal" : "cpu"
             let t0 = ref_time_ticks()
             let aff = ngl == 0 && affinity_on() ? lcpp_affinity_args(threads) : ""
-            let cmd = "{bin} -m {path} -ngl {ngl} -t {threads}{aff} -p {cfg.plen} -n {cfg.ngen} -r {cfg.reps} -o json"
+            let cmd = "\"{bin}\" -m \"{path}\" -ngl {ngl} -t {threads}{aff} -p {cfg.plen} -n {cfg.ngen} -r {cfg.reps} -o json"
             to_log(LOG_INFO, "gen_bench_records: START {file} ref {flavor} {backend}\n")
             var rows : array<LlamaBenchRow>
             if (!run_llama_bench(cmd, rows) || empty(rows)) {

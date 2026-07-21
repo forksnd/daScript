@@ -982,7 +982,9 @@ def run_llama_bench(cmd : string; var rows : array<LlamaBenchRow>) : bool {
     var out = ""
     unsafe {
         popen(cmd) $(f) {
-            out = fread_to_eof(f)
+            if (f != null) {   // popen can hand a null handle on spawn failure (bad binary path)
+                out = fread_to_eof(f)
+            }
         }
     }
     return sscan_json(out, rows)
