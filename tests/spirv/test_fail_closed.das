@@ -51,7 +51,7 @@ def test_fail_closed_rejections(t : T?) {
         // the same nested shape on the MEMORY path: a `var` struct local's undecorated OpTypeStruct
         // has no recursive plain-struct builder, so the field is refused rather than guessed at
         check_rejects(t, "_fc_local_struct_var_nested", "nested-struct fields are not yet supported")
-        check_rejects(t, "_fc_localtype", "type tDouble is not supported")
+        check_rejects(t, "_fc_localtype", "type tInt64 is not supported")
         check_rejects(t, "_fc_stmt", "memzero is not supported in SPIR-V shaders")
         check_rejects(t, "_fc_deadcode", "unreachable code after a block terminator")
         // a write-swizzle chains a component pointer off its base, so the base needs an OpVariable; a
@@ -74,8 +74,8 @@ def test_fail_closed_rejections(t : T?) {
         // user-defined function call rejections (Phase: shader functions)
         check_rejects(t, "_fc_recursion", "recursion is not supported")
         check_rejects(t, "_fc_mutual", "recursion is not supported")
-        check_rejects(t, "_fc_badparam", "is not supported (only 32-bit scalar/vector/matrix parameters")
-        check_rejects(t, "_fc_badret", "return type tDouble is not supported")
+        check_rejects(t, "_fc_badparam", "parameter 'x' of type tInt64 is not supported")
+        check_rejects(t, "_fc_badret", "return type tInt64 is not supported")
         // subpass input attachments + subpassLoad are fragment-only
         check_rejects(t, "_fc_subpass_stage", "subpassInput 'fc_subpass' is fragment-only")
         // mesh-shader output config: bad topology string (parsed in patch) + non-positive count (emit gate)
@@ -87,7 +87,7 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_mesh_indices_topology", "requires output_topology")
         // gl_PrimitiveID is a fragment Input builtin (+ closest-hit); reading it in a vertex shader is rejected
         check_rejects(t, "_fc_primid_stage", "is not available in the vertex stage")
-        // a mesh @out array<T> with an unsupported element type (double) fails closed, not crash emit_type
+        // a mesh @out array<T> with an unsupported element type (int64) fails closed, not crash emit_type
         check_rejects(t, "_fc_mesh_out_badtype", "not a supported varying type")
         // @task_payload outside a task/mesh stage, and a payload with a nested-struct field
         check_rejects(t, "_fc_payload_stage", "is only valid in a task or mesh shader")

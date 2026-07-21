@@ -479,9 +479,12 @@ def private is_emittable_value_type(t : TypeDecl?) : bool {
     if (matrix_info(t).ok) return true
     let bt = t.baseType
     if (bt == Type.tFixedArray && t.firstType != null) return is_emittable_value_type(t.firstType)
-    // every classified width emits: 32-bit natively, 16/8-bit through the width-generic type
-    // factories (which pull Float16/Int16/Int8 caps). 8/16-lane forms stay unclassified (-1).
-    return scalar_class(bt) >= 0 || bt == Type.tBool
+    // The 16/32-bit numerics and the 64-bit float carry a value; arith_width_ok is the one place that
+    // line is drawn, so the value rail and the arithmetic rail never disagree. A 64-bit INT lowers as
+    // an interface-block MEMBER only (no arithmetic, no local): admitting it here would give it an
+    // OpVariable no opcode can consume.
+    let ni = numeric_info(bt)
+    return (ni.ok && arith_width_ok(ni.cls, ni.width)) || bt == Type.tBool
 }
 
 // gl_MeshVerticesEXT / gl_PrimitiveTriangleIndicesEXT — the mesh per-vertex / per-primitive Output
@@ -1795,6 +1798,7 @@ def private scalar_type_name_class(name : string) : tuple<cls : int; width : int
     if (name == "uint16") return (cls = 1, width = 16)
     if (name == "int8") return (cls = 0, width = 8)
     if (name == "uint8") return (cls = 1, width = 8)
+    if (name == "double") return (cls = 2, width = 64)
     return (cls = -1, width = 0)
 }
 
@@ -1802,14 +1806,23 @@ def private scalar_type_name_class(name : string) : tuple<cls : int; width : int
 // (callers handle the same-class-same-width no-op). int<->uint at the SAME width is a bit
 // reinterpret (OpBitcast — daslang two's-complement cast semantics); same-class width changes
 // are FConvert (f16<->f32) / SConvert / UConvert (SPIR-V narrowing keeps low bits = the das
-// C-truncation); class changes are value conversions (width-agnostic opcodes). Cross-sign
-// cross-width int casts stay unsupported (not in the das shader convert surface).
+// C-truncation); class changes are value conversions (width-agnostic opcodes). A cross-sign
+// cross-width int cast is supported only when it NARROWS; widening fails closed.
 def private convert_op(src_cls, src_w, dst_cls, dst_w : int) : tuple<ok : bool; code : SpvOp> {
     if (src_cls == dst_cls) {
         if (src_w == dst_w) return (ok = false, code = SpvOp.Nop)   // no-op — caller's case
         if (src_cls == 2) return (ok = true, code = SpvOp.FConvert)
         if (src_cls == 0) return (ok = true, code = SpvOp.SConvert)
         if (src_cls == 1) return (ok = true, code = SpvOp.UConvert)
+    }
+    // int -> int across signedness AND width is one instruction only when it NARROWS: SConvert and
+    // UConvert both keep the low bits there, which is exactly the C truncation daslang's narrowing
+    // ctor and GLSL's uint16_t(int) both mean, and the opcode is picked by the DESTINATION's
+    // signedness because that is what SPIR-V's Result Type demands. A cross-class WIDENING is NOT:
+    // C sign-extends an int16 into a uint32 where OpUConvert zero-extends, so it would need a
+    // widen-then-bitcast pair and fails closed rather than silently zero-extending a negative.
+    if (src_cls <= 1 && dst_cls <= 1 && dst_w < src_w) {
+        return (ok = true, code = dst_cls == 0 ? SpvOp.SConvert : SpvOp.UConvert)
     }
     if (dst_cls == 2) {                                             // -> float
         if (src_cls == 0) return (ok = true, code = SpvOp.ConvertSToF)
@@ -2276,6 +2289,8 @@ def private emit_const(var m : SpirvModule; e : ExpressionPtr; var errors : arra
     if (ci != null) return (ok = true, id = const_int(m, ci.value))
     let cf = e ?as ExprConstFloat
     if (cf != null) return (ok = true, id = const_float(m, cf.value))
+    let cd = e ?as ExprConstDouble
+    if (cd != null) return (ok = true, id = const_double(m, cd.value))
     let cb = e ?as ExprConstBool
     if (cb != null) return (ok = true, id = const_bool(m, cb.value))
     // 16/8-bit scalar constants (lattice VECTOR constants don't exist as nodes — they arrive
@@ -2943,6 +2958,11 @@ class SpirvEmit : AstVisitor {
     def override visitExprConstFloat(var expr : ExprConstFloat?) : ExpressionPtr {
         var bm & = unsafe(*m)
         e2id[intptr(expr)] = const_float(bm, expr.value)
+        return expr
+    }
+    def override visitExprConstDouble(var expr : ExprConstDouble?) : ExpressionPtr {
+        var bm & = unsafe(*m)
+        e2id[intptr(expr)] = const_double(bm, expr.value)
         return expr
     }
     def override visitExprConstBool(var expr : ExprConstBool?) : ExpressionPtr {
@@ -5391,8 +5411,9 @@ def private is_out_param(at : TypeDecl?) : bool {
 }
 
 // Validate a user function's signature, allocate its OpFunction id + OpTypeFunction, and record it.
-// Only 32-bit scalar/vector/matrix results+params are supported (by value, or by reference for params);
-// anything else is rejected here with a clean error so a later call site doesn't emit invalid SPIR-V.
+// Only 16/32-bit scalar/vector/matrix results+params are supported (by value, or by reference for
+// params); anything else is rejected here with a clean error so a later call site doesn't emit
+// invalid SPIR-V.
 def private register_user_func(var m : SpirvModule; var ctx : EmitCtx; f : Function const?; var errors : array<string>) {
     if (key_exists(ctx.user_funcs, intptr(f))) return
     var uf = UserFunc(fn = f, valid = true, is_void = false, fn_id = 0u, type_id = 0u, ret_type = 0u)
@@ -5408,7 +5429,7 @@ def private register_user_func(var m : SpirvModule; var ctx : EmitCtx; f : Funct
     } elif (is_emittable_value_type(f.result) && f.result.baseType != Type.tFixedArray) {
         uf.ret_type = emit_type(m, f.result)
     } else {
-        errors |> push("shader function '{f.name}': return type {f.result.baseType} is not supported (only void and 32-bit scalar/vector/matrix results)")
+        errors |> push("shader function '{f.name}': return type {f.result.baseType} is not supported (only void, a plain struct, and 16/32-bit scalar/vector/matrix results)")
         uf.valid = false
     }
     var ptypes : array<uint>
@@ -5419,7 +5440,7 @@ def private register_user_func(var m : SpirvModule; var ctx : EmitCtx; f : Funct
         // written-through line for every parameter kind alike.
         let is_struct = at != null && at.baseType == Type.tStructure
         if (!is_struct && (!is_emittable_value_type(at) || at.baseType == Type.tFixedArray)) {
-            errors |> push("shader function '{f.name}': parameter '{arg.name}' of type {at.baseType} is not supported (only 32-bit scalar/vector/matrix parameters, by value or by reference)")
+            errors |> push("shader function '{f.name}': parameter '{arg.name}' of type {at.baseType} is not supported (only a plain struct and 16/32-bit scalar/vector/matrix parameters, by value or by reference)")
             uf.valid = false
             continue
         }

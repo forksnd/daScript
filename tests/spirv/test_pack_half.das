@@ -27,6 +27,12 @@ def test_pack_half_spirv(t : T?) {
         t |> equal(words[0], SPV_MAGIC)
         t |> equal(count_op(words, SpvOp.ExtInst), 2)       // one pack + one unpack
         t |> success(has_op(words, SpvOp.ExtInstImport), "GLSL.std.450 imported")
+        // OpExtInst operand index 3 is the GLSLstd450 instruction literal, so the census above is
+        // pinned to the two specific ext-insts rather than merely counting ExtInst opcodes.
+        t |> success(op_has_operand_at(words, SpvOp.ExtInst, 3, uint(GLSLstd450.PackHalf2x16)),
+            "the pack ext-inst is GLSLstd450 PackHalf2x16 (58)")
+        t |> success(op_has_operand_at(words, SpvOp.ExtInst, 3, uint(GLSLstd450.UnpackHalf2x16)),
+            "the unpack ext-inst is GLSLstd450 UnpackHalf2x16 (62)")
         let r = validate_spirv(words)
         if (r.ran) {
             t |> success(r.ok, "spirv-val: {r.msg}")

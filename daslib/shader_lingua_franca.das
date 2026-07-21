@@ -107,6 +107,79 @@ def public mod(x, y : float) : float { return 0.0 }
 [unused_argument(x, y), sideeffects]
 def public mod(x, y : float3) : float3 { return float3(0.0, 0.0, 0.0) }
 
+// ===== 16-bit integer arithmetic =====
+// daslang's 16-bit ints are storage + converts only; these close +/- and lower to native OpIAdd /
+// OpISub / OpSNegate on OpTypeInt 16 (glslang's i16vec2). `*` `/` absent: GLSL widens `2*s` to int.
+def public operator +(a, b : int16) : int16 { return int16(int(a) + int(b)) }
+def public operator +(a, b : short2) : short2 { return short2(int2(a) + int2(b)) }
+def public operator +(a, b : short3) : short3 { return short3(int3(a) + int3(b)) }
+def public operator +(a, b : short4) : short4 { return short4(int4(a) + int4(b)) }
+
+def public operator -(a, b : int16) : int16 { return int16(int(a) - int(b)) }
+def public operator -(a, b : short2) : short2 { return short2(int2(a) - int2(b)) }
+def public operator -(a, b : short3) : short3 { return short3(int3(a) - int3(b)) }
+def public operator -(a, b : short4) : short4 { return short4(int4(a) - int4(b)) }
+
+def public operator -(a : int16) : int16 { return int16(-int(a)) }
+def public operator -(a : short2) : short2 { return short2(-int2(a)) }
+def public operator -(a : short3) : short3 { return short3(-int3(a)) }
+def public operator -(a : short4) : short4 { return short4(-int4(a)) }
+
+// ===== 16-bit ordering comparisons =====
+// daslang rejects `<` `<=` `>` `>=` on storage types (only `==` `!=` are defined); GLSL compares a
+// 16-bit pair natively (glslang gives one OpSGreaterThanEqual on two %short), which these restore.
+def public operator <(a, b : int16) : bool { return int(a) < int(b) }
+def public operator <=(a, b : int16) : bool { return int(a) <= int(b) }
+def public operator >(a, b : int16) : bool { return int(a) > int(b) }
+def public operator >=(a, b : int16) : bool { return int(a) >= int(b) }
+
+// The unsigned twin: glslang picks the UNSIGNED opcode (OpUGreaterThanEqual) for uint16, so these
+// cannot fold into the signed set above -- a uint16 pair compared through int() would take the signed
+// op and order 0xffff BELOW 0.
+def public operator <(a, b : uint16) : bool { return uint(a) < uint(b) }
+def public operator <=(a, b : uint16) : bool { return uint(a) <= uint(b) }
+def public operator >(a, b : uint16) : bool { return uint(a) > uint(b) }
+def public operator >=(a, b : uint16) : bool { return uint(a) >= uint(b) }
+
+// ===== 16-bit max =====
+// daslang declares max only over its 32-bit numerics, so a 16-bit max would otherwise widen both
+// operands and narrow the result -- three converts around glslang's one OpExtInst SMax on two %short.
+def public max(a, b : int16) : int16 { return int16(max(int(a), int(b))) }
+
+// ===== 16-bit vector constructors from 16-bit lanes =====
+// daslang builds a shortN from INT lanes but not from 16-bit ones, so without these a 16-bit add
+// re-enters a vector via two OpSConverts per lane; with them one bare OpCompositeConstruct, as glslang.
+def public short2(x, y : int16) : short2 { return short2(int(x), int(y)) }
+def public short3(x, y, z : int16) : short3 { return short3(int(x), int(y), int(z)) }
+def public short3(xy : short2; z : int16) : short3 { return short3(int(xy.x), int(xy.y), int(z)) }
+def public short4(x, y, z, w : int16) : short4 { return short4(int(x), int(y), int(z), int(w)) }
+def public short4(xyz : short3; w : int16) : short4 {
+    return short4(int(xyz.x), int(xyz.y), int(xyz.z), int(w))
+}
+
+// The unsigned twin, for a u16vec4 shuffled lane by lane. Only the 4-lane form has a glslang
+// reference to gate it; the narrower ones would be an untested lowering, so they stay a compile
+// error, exactly as the 16-bit `*` and `/` do.
+def public ushort4(x, y, z, w : uint16) : ushort4 {
+    return ushort4(uint(x), uint(y), uint(z), uint(w))
+}
+
+// ===== 16-bit float vector constructors from 16-bit lanes =====
+// daslang builds a halfN from FLOAT lanes and narrows a whole vector, but cannot COMPOSE one from
+// narrower half pieces; with these the constituents already ARE the component type -- one OpCompositeConstruct.
+def public half3(xy : half2; z : float16) : half3 {
+    return half3(float(xy.x), float(xy.y), float(z))
+}
+
+def public half4(xy, zw : half2) : half4 {
+    return half4(float(xy.x), float(xy.y), float(zw.x), float(zw.y))
+}
+
+// GLSL converts a 16-bit float straight to int (OpConvertFToS is width-agnostic); daslang core
+// declares no int(float16), so without this a port widens first and spends an OpFConvert the glslang
+// reference does not. uint is absent -- no glslang reference gates it.
+def public int(v : float16) : int { return int(float(v)) }
+
 // ===== texture sampling =====
 // texture(s, uv): filtered sample with implicit LOD (fragment-only on both rails). textureSize:
 // the mip-0 dimensions in texels.
