@@ -355,6 +355,31 @@ def public repository_read_file_bytes(path : string; max_bytes : int;
     return loaded ? "" : "could not read file bytes"
 }
 
+def public repository_working_preview_path(worktree_path, file_path : string;
+                                           var absolute_path : string&) : string {
+    absolute_path = ""
+    if (!repository_valid_relative_file_path(file_path)) {
+        return "invalid worktree-relative file path"
+    }
+    let candidate = path_join(worktree_path, file_path)
+    if (!fexist(candidate)) return "working file does not exist"
+    var current = worktree_path
+    var inscope components <- split(replace(file_path, "\\", "/"), "/")
+    for (component in components) {
+        if (empty(component) || component == ".") continue
+        current = path_join(current, component)
+        var symlink_error = ""
+        if (is_symlink(current, symlink_error)) {
+            return "working file path contains a symlink"
+        }
+        if (!empty(symlink_error)) {
+            return "could not inspect working file path: {symlink_error}"
+        }
+    }
+    absolute_path = candidate
+    return ""
+}
+
 def public repository_working_file_text(repository_id, worktree_path, file_path : string;
                                         max_bytes : int; var text : string&) : string {
     text = ""
@@ -372,11 +397,10 @@ def public repository_working_file_text(repository_id, worktree_path, file_path 
         }
     }
     if (!file_found) return "file has no observed working-tree change"
-    if (!repository_valid_relative_file_path(file_path)) {
-        return "invalid worktree-relative file path"
-    }
-    let absolute_path = path_join(worktree_path, file_path)
-    if (!fexist(absolute_path)) return "working file does not exist"
+    var absolute_path = ""
+    let path_error = repository_working_preview_path(
+        worktree_path, file_path, absolute_path)
+    if (!empty(path_error)) return path_error
     return repository_read_text_file(absolute_path, max_bytes, text)
 }
 
@@ -400,11 +424,10 @@ def public repository_working_file_bytes(repository_id, worktree_path, file_path
         }
     }
     if (!file_found) return "file has no observed working-tree change"
-    if (!repository_valid_relative_file_path(file_path)) {
-        return "invalid worktree-relative file path"
-    }
-    let absolute_path = path_join(worktree_path, file_path)
-    if (!fexist(absolute_path)) return "working file does not exist"
+    var absolute_path = ""
+    let path_error = repository_working_preview_path(
+        worktree_path, file_path, absolute_path)
+    if (!empty(path_error)) return path_error
     let read_error = repository_read_file_bytes(
         absolute_path, max_bytes, bytes, byte_count)
     return empty(read_error) ? "" : "could not read working file bytes"

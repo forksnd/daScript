@@ -130,6 +130,10 @@ def test_repository_text_read_contract(t : T?) {
 
         let bytes_path = path_join(root, "bytes.bin")
         t |> success(fwrite(bytes_path, "abc"), "byte fixture is written")
+        var preview_path = ""
+        t |> equal(repository_working_preview_path(
+            root, "bytes.bin", preview_path), "")
+        t |> equal(preview_path, bytes_path)
         t |> success(!empty(repository_read_text_file(bytes_path, 2, text)),
             "text View rejects files beyond its raw-byte limit")
         var bytes : array<uint8>
