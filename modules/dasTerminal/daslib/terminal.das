@@ -181,6 +181,18 @@ struct private TerminalBuffer {
     scroll_bottom : int
 }
 
+def private clear_rows(var rows : array<TerminalRow>) {
+    for (index in range(length(rows))) {
+        delete rows[index].cells
+    }
+    rows |> clear()
+}
+
+def private delete_rows(var rows : array<TerminalRow>) {
+    clear_rows(rows)
+    delete rows
+}
+
 typedef public Pty = smart_ptr<pty_handle>
 
 struct public Terminal {
@@ -225,14 +237,14 @@ def private blank_row(columns, row : int) : TerminalRow {
 }
 
 def private reset_buffer(var buffer : TerminalBuffer; columns, rows : int) {
-    buffer.screen |> clear()
+    clear_rows(buffer.screen)
     buffer.screen |> reserve(rows)
     for (row in range(rows)) {
         var next <- blank_row(columns, row)
         buffer.screen |> emplace(next)
     }
     buffer.screen_start = 0
-    buffer.history |> clear()
+    clear_rows(buffer.history)
     buffer.history_start = 0
     buffer.cursor = TerminalCursor()
     buffer.saved_cursor = TerminalCursor()
@@ -645,7 +657,7 @@ def private erase_display(terminal : Terminal const; var buffer : TerminalBuffer
             reset_row(buffer.screen[physical], buffer, terminal.columns, row)
         }
         if (mode == 3) {
-            buffer.history |> clear()
+            clear_rows(buffer.history)
             buffer.history_start = 0
         }
     } elif (mode == 0) {
@@ -996,10 +1008,10 @@ def public terminal_create(columns : int = 80; rows : int = 25) : Terminal {
 }
 
 def public terminal_dispose(var terminal : Terminal&) {
-    delete terminal.normal.screen
-    delete terminal.normal.history
-    delete terminal.alternate.screen
-    delete terminal.alternate.history
+    delete_rows(terminal.normal.screen)
+    delete_rows(terminal.normal.history)
+    delete_rows(terminal.alternate.screen)
+    delete_rows(terminal.alternate.history)
     delete terminal.unknown_sequences
     delete terminal.replies
     delete terminal.events
@@ -1108,7 +1120,7 @@ def private resize_buffer(var buffer : TerminalBuffer; old_columns, old_rows,
         }
         replacement |> emplace(next)
     }
-    delete buffer.screen
+    delete_rows(buffer.screen)
     buffer.screen <- replacement
     buffer.screen_start = 0
     for (logical in range(length(buffer.history))) {

@@ -19,6 +19,14 @@ def main {
     assert(after_repaint_bytes <= live_grid_bytes + 1024ul,
         "replacing terminal rows must release or reuse their owned cell arrays")
 
+    for (_ in range(20)) {
+        terminal_feed(terminal, "history\r\n{to_char(27)}[3J")
+    }
+
+    let after_scrollback_clear_bytes = heap_bytes_allocated()
+    assert(after_scrollback_clear_bytes <= after_repaint_bytes + 1024ul,
+        "clearing scrollback must release its owned cell arrays")
+
     terminal_dispose(terminal)
     let after_dispose_bytes = heap_bytes_allocated()
     assert(after_dispose_bytes == 0ul,
