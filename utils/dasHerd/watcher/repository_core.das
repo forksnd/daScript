@@ -569,14 +569,22 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
             fail_refresh(runtime, "git returned no worktrees")
             return
         }
+        let main_path = worktrees[0].path
+        let resolved_id = repository_id(runtime.snapshot.record.target_id, main_path)
+        let collision_index = find_repository(resolved_id)
+        if (collision_index >= 0 && g_repositories[collision_index] != runtime) {
+            delete worktrees
+            fail_refresh(runtime,
+                "main checkout is already registered: {main_path}")
+            return
+        }
         delete runtime.snapshot.worktrees
         runtime.snapshot.worktrees <- worktrees
         runtime.snapshot.files |> clear()
-        let main_path = runtime.snapshot.worktrees[0].path
         if (runtime.snapshot.record.checkout_path != main_path) {
             let old_default_name = base_name(runtime.snapshot.record.checkout_path)
             runtime.snapshot.record.checkout_path = main_path
-            runtime.snapshot.record.id = repository_id(runtime.snapshot.record.target_id, main_path)
+            runtime.snapshot.record.id = resolved_id
             if (empty(runtime.snapshot.record.display_name) || runtime.snapshot.record.display_name == old_default_name) {
                 runtime.snapshot.record.display_name = base_name(main_path)
             }

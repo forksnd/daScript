@@ -511,7 +511,9 @@ def public watcher_compact_session(session_id : string;
     return true
 }
 
-def public watcher_prune_completed_sessions(kind, repository_id, worktree_path : string) : int {
+def public watcher_prune_completed_sessions(kind : string;
+                                            repository_id : string;
+                                            worktree_path : string) : int {
     var removed = 0
     var index = length(g_sessions)
     while (index > 0) {
