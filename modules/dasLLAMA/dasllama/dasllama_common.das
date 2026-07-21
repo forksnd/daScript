@@ -272,6 +272,16 @@ def register_mtp_spec_override(name : string; fn : MtpSpecOverrideFn) {
     g_mtp_spec_overrides[name] = fn
 }
 
+// The MTP seam-row override: writes the draft head's row pos-1 on a blob model BEFORE a
+// continuation window's trunk body (forward_mtp(..., false)'s GPU twin) — the body's own
+// tail overwrites mtp_h, so the seam must consume the pre-window handoff first
+typedef MtpSeamOverrideFn = function<(t : Model; var s : Session; token, pos : int64) : bool>
+var private g_mtp_seam_overrides : table<string; MtpSeamOverrideFn>
+
+def register_mtp_seam_override(name : string; fn : MtpSeamOverrideFn) {
+    g_mtp_seam_overrides[name] = fn
+}
+
 // "would the metal drivers serve this loaded model?" — the model-level gate, registered by the
 // metal driver module at [init] (it owns the path masks). load_model consults it to pick the
 // image flavor: servable -> the blob-only metal flavor, else the planar CPU flavor.
@@ -11003,8 +11013,14 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
 
     // spec on: the draft head's SEAM row (start_pos-1) must be written BEFORE the body — the body's
     // own tail overwrites mtp_h with THIS window's last hidden. Cold/foreign handoff just skips it.
-    if (g_mtp_spec && c.n_layer_nextn > 0l && !t.metal_blob && start_pos > 0l && s.mtp_h_pos1 == start_pos) {
-        forward_mtp(t, s, tokens[0], start_pos - 1l, false)
+    if (g_mtp_spec && c.n_layer_nextn > 0l && start_pos > 0l && s.mtp_h_pos1 == start_pos) {
+        if (t.metal_blob) {
+            if (!empty(g_decode_override_name) && key_exists(g_mtp_seam_overrides, g_decode_override_name)) {
+                invoke(g_mtp_seam_overrides[g_decode_override_name], t, s, tokens[0], start_pos)
+            }
+        } else {
+            forward_mtp(t, s, tokens[0], start_pos - 1l, false)
+        }
     }
     forward_prefill_body(t, s, npos, start_pos, skip_logits)
     // spec on: maintain the draft head's KV alongside the trunk's — CPU rail only (on a blob

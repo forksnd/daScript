@@ -982,9 +982,9 @@ def private encode_cls_tail(t : Model; var r : StepRes; enc : MetalComputeEncode
 }
 
 // encode the MTP draft-head step: [enorm(embed) ; hnorm(mtp_h)] -> eh_proj -> the trunk-shaped
-// block at l == n_layers -> shared-head norm + classifier. The caller poked bx = raw embed row,
-// bxb2 = mtp_h, bcos/bsin = the DRAFT row's rope table; r.pos is the draft row (trunk pos - 1)
-def private encode_draft_step(t : Model; var r : StepRes) {
+// block at l == n_layers -> shared-head norm + classifier (skipped for the seam-row variant).
+// The caller poked bx = raw embed row, bxb2 = mtp_h, bcos/bsin = the DRAFT row's rope table
+def private encode_draft_step(t : Model; var r : StepRes; with_cls : bool = true) {
     let c = t.config
     let dim = c.dim
     var cb = metal_new_command_buffer_unretained(g_queue)
@@ -1002,7 +1002,9 @@ def private encode_draft_step(t : Model; var r : StepRes) {
     }
     var dn0 = 0l
     encode_layer(t, r, enc, c.n_layers, dn0)
-    encode_cls_tail(t, r, enc, t.mtp_headnorm_off >= 0l ? t.mtp_headnorm_off : t.rms_final_off)
+    if (with_cls) {
+        encode_cls_tail(t, r, enc, t.mtp_headnorm_off >= 0l ? t.mtp_headnorm_off : t.rms_final_off)
+    }
     metal_end_encoding(enc)
     metal_release(enc)
     metal_commit(cb)
@@ -1010,10 +1012,10 @@ def private encode_draft_step(t : Model; var r : StepRes) {
     r.cb = cb
 }
 
-// land the draft step: the draft-slab KV row back to the CPU cache, logits, the mtp_h handoff.
-// NO watermark/dn-cursor touch — the draft rewrites a row BELOW the watermark in its OWN slab,
-// and never runs the recurrent branch (layer_is_recurrent is false at n_layers by construction)
-def private finish_draft_step(t : Model; var s : Session; r : StepRes) : bool {
+// land the draft step: the draft-slab KV row back to the CPU cache, logits + mtp_h handoff
+// (the seam variant lands the KV row ONLY). NO watermark/dn-cursor touch — the draft rewrites
+// a row BELOW the watermark in its OWN slab and never runs the recurrent branch
+def private finish_draft_step(t : Model; var s : Session; r : StepRes; seam : bool = false) : bool {
     metal_wait_until_completed(r.cb)
     let err = metal_command_buffer_error(r.cb)
     let ok = empty(err)
@@ -1031,13 +1033,17 @@ def private finish_draft_step(t : Model; var s : Session; r : StepRes) : bool {
                 reinterpret<void?>(kmp + lb + dpos * rowb), int(rowb))
             memcpy(reinterpret<void?>(kv_layer_vbase(s, l, c.seq_len) + prow * rowb),
                 reinterpret<void?>(vmp + lb + dpos * rowb), int(rowb))
-            if (r.bnc == null) {
-                memcpy(addr < void? >(s.logits[0]), metal_buffer_contents(r.blog), int(r.bytes_log))
+            if (!seam) {
+                if (r.bnc == null) {
+                    memcpy(addr < void? >(s.logits[0]), metal_buffer_contents(r.blog), int(r.bytes_log))
+                }
+                // the head's own h_nextn — recursive drafting handoff (forward_mtp's contract)
+                memcpy(addr < void? >(s.mtp_h[0]), metal_buffer_contents(r.bxf), int(r.bytes_x))
             }
-            // the head's own h_nextn — recursive drafting handoff (forward_mtp's contract)
-            memcpy(addr < void? >(s.mtp_h[0]), metal_buffer_contents(r.bxf), int(r.bytes_x))
         }
-        s.mtp_h_pos1 = 0l   // NOT a trunk hidden: the warm's seam row must not consume it
+        if (!seam) {
+            s.mtp_h_pos1 = 0l   // NOT a trunk hidden: the warm's seam row must not consume it
+        }
     } else {
         to_log(LOG_ERROR, "dasLLAMA metal MTP draft: dispatch failed ({err})\n")
         decline(MetalDecodeDecline.gpu_error)
@@ -1048,7 +1054,7 @@ def private finish_draft_step(t : Model; var s : Session; r : StepRes) : bool {
 //! forward_mtp's GPU twin: the draft head against a resident blob model. `pos` is the trunk
 //! position (n_past); the draft row lands at pos-1 (rotary is delta-invariant). Needs a
 //! GPU-current session (KV mirror holds rows [0, pos)) and GPU logits. false = declined.
-def metal_mtp_draft_forward(t : Model; var s : Session; token, pos : int64) : bool {
+def metal_mtp_draft_forward(t : Model; var s : Session; token, pos : int64; seam : bool = false) : bool {
     let c = t.config
     if (g_dev == null || !t.metal_blob || c.n_layer_nextn <= 0l || pos < 1l ||
             weight_caches_stale() || !key_exists(g_mirrors, s.uid)) {
@@ -1072,10 +1078,16 @@ def metal_mtp_draft_forward(t : Model; var s : Session; token, pos : int64) : bo
         memcpy(metal_buffer_contents(r.bcos), addr < void? >(s.rope_cos[0]), int(r.bytes_tab))
         memcpy(metal_buffer_contents(r.bsin), addr < void? >(s.rope_sin[0]), int(r.bytes_tab))
     }
-    encode_draft_step(t, r)
-    let ok = finish_draft_step(t, s, r)
+    encode_draft_step(t, r, !seam)
+    let ok = finish_draft_step(t, s, r, seam)
     release_step(r)
     return ok
+}
+
+//! forward_mtp(..., false)'s GPU twin — the continuation-window SEAM: write the draft head's
+//! KV row pos-1 from (embed(token), the pre-window mtp_h) without touching logits or mtp_h.
+def metal_mtp_seam_row(t : Model; var s : Session; token, pos : int64) : bool {
+    return metal_mtp_draft_forward(t, s, token, pos, true)
 }
 
 // ===== MTP B=2 same-slab verify (the spec step's trunk forward) =====
@@ -3201,6 +3213,7 @@ def dasllama_metal_llama_register() {
     register_decode_override("metal", @@metal_decode_forward)
     register_batch_decode_override("metal", @@metal_batch_decode_forward)
     register_mtp_spec_override("metal", @@metal_mtp_spec_eval)
+    register_mtp_seam_override("metal", @@metal_mtp_seam_row)
     register_metal_servable(@@metal_model_servable_impl)   // load_model's image-flavor gate
     if (has_env_variable("DASLLAMA_METAL_DECODE_SKIP")) {
         g_skip = get_env_variable("DASLLAMA_METAL_DECODE_SKIP")
