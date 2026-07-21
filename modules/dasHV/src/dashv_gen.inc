@@ -4,14 +4,16 @@ protected:
     __fn_onOpen = 0,
     __fn_onClose = 1,
     __fn_onMessage = 2,
+    __fn_onMessageFrame = 3,
   };
 protected:
-  int _das_class_method_offset[3];
+  int _das_class_method_offset[4];
 public:
   HvWebSocketClient_Adapter ( const StructInfo * info ) {
       _das_class_method_offset[__fn_onOpen] = info->fields[5]->offset;
       _das_class_method_offset[__fn_onClose] = info->fields[6]->offset;
       _das_class_method_offset[__fn_onMessage] = info->fields[7]->offset;
+      _das_class_method_offset[__fn_onMessageFrame] = info->fields[8]->offset;
   }
   __forceinline Func get_onOpen ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_onOpen]);
@@ -40,6 +42,15 @@ public:
         (__context__,nullptr,__funcCall__,
           self,msg);
   }
+  __forceinline Func get_onMessageFrame ( void * self ) const {
+    return getDasClassMethod(self,_das_class_method_offset[__fn_onMessageFrame]);
+  }
+  __forceinline void invoke_onMessageFrame ( Context * __context__, Func __funcCall__, void * self, char * const  msg, int32_t byte_count, DAS_COMMENT(bound_enum) ws_opcode opcode ) const {
+    das_invoke_function<void>::invoke
+      <void *,char * const ,int32_t,DAS_COMMENT(bound_enum) ws_opcode>
+        (__context__,nullptr,__funcCall__,
+          self,msg,byte_count,opcode);
+  }
 };
 
 class HvWebServer_Adapter {
@@ -54,10 +65,10 @@ protected:
   int _das_class_method_offset[4];
 public:
   HvWebServer_Adapter ( const StructInfo * info ) {
-      _das_class_method_offset[__fn_onWsOpen] = info->fields[11]->offset;
-      _das_class_method_offset[__fn_onWsClose] = info->fields[12]->offset;
-      _das_class_method_offset[__fn_onWsMessage] = info->fields[13]->offset;
-      _das_class_method_offset[__fn_onTick] = info->fields[14]->offset;
+      _das_class_method_offset[__fn_onWsOpen] = info->fields[12]->offset;
+      _das_class_method_offset[__fn_onWsClose] = info->fields[13]->offset;
+      _das_class_method_offset[__fn_onWsMessage] = info->fields[14]->offset;
+      _das_class_method_offset[__fn_onTick] = info->fields[15]->offset;
   }
   __forceinline Func get_onWsOpen ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_onWsOpen]);

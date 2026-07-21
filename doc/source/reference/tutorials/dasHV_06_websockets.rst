@@ -75,6 +75,8 @@ Subclass ``HvWebSocketClient`` and override:
 - ``onOpen()`` — connection established
 - ``onClose()`` — connection lost
 - ``onMessage(msg)`` — text message received
+- ``onMessageFrame(msg, byte_count, opcode)`` — lossless text or binary frame;
+  ``byte_count`` is authoritative when the payload contains embedded zero bytes
 
 .. code-block:: das
 
@@ -92,6 +94,11 @@ Subclass ``HvWebSocketClient`` and override:
 
        def override onMessage(msg : string#) {
            received |> push_clone(string(msg))
+       }
+
+       def override onMessageFrame(msg : string#; byte_count : int; opcode : ws_opcode) {
+           if (opcode == ws_opcode.WS_OPCODE_TEXT) onMessage(msg)
+           // Binary consumers use msg together with byte_count here.
        }
    }
 
@@ -257,6 +264,8 @@ Quick Reference
      - Client: connection lost
    * - ``onMessage(msg)``
      - Client: text message received
+   * - ``onMessageFrame(msg, byte_count, opcode)``
+     - Client: lossless text/binary frame (defaults to forwarding text to ``onMessage``)
    * - ``init(url) : int``
      - Client: connect to WebSocket server
    * - ``send(text)``

@@ -177,9 +177,10 @@ public:
             });
         };
         onmessage = [=]( const string & msg ) {
+            const auto message_opcode = opcode();
             lock_guard<mutex> guard(lock);
-            que.emplace_back([=](){
-                onMessage(msg);
+            que.emplace_back([=]() {
+                onMessageFrame(msg, message_opcode);
             });
         };
     }
@@ -193,9 +194,10 @@ public:
             invoke_onClose(context,fnOnClose,classPtr);
         }
     }
-    void onMessage ( const string & msg ) {
-        if ( auto fnOnMessage = get_onMessage(classPtr) ) {
-            invoke_onMessage(context,fnOnMessage,classPtr,(char *)msg.c_str());
+    void onMessageFrame ( const string & msg, ws_opcode opcode ) {
+        if ( auto fnOnMessageFrame = get_onMessageFrame(classPtr) ) {
+            invoke_onMessageFrame(context, fnOnMessageFrame, classPtr,
+                (char *)msg.data(), static_cast<int32_t>(msg.size()), opcode);
         }
     }
     void tick() {
@@ -589,6 +591,21 @@ int das_wss_send_fragment ( Handle<hv::WebSocketChannel> h, const char * buf, in
     if ( len < 0 || fragment < 0 ) return -1;
     if ( !buf && len != 0 ) return -1;
     return p->send(buf, len, fragment, opcode);
+}
+
+int das_wss_close_channel ( Handle<hv::WebSocketChannel> h ) {
+    auto p = HandleRegistry<hv::WebSocketChannel>::instance().lookup(h);
+    if ( !p ) return -1;
+    return p->close();
+}
+
+bool das_wss_set_bind_host ( Handle<hv::WebSocketServer> h, const char * host ) {
+    auto adapter = lookup_server(h);
+    if ( !adapter || !host ) return false;
+    const size_t len = strlen(host);
+    if ( len == 0 || len >= sizeof(adapter->host) ) return false;
+    memcpy(adapter->host, host, len + 1);
+    return true;
 }
 
 int das_wss_start ( Handle<hv::WebSocketServer> h ) {
@@ -1299,6 +1316,12 @@ public:
         addExtern<DAS_BIND_FUN(das_wss_send_fragment)> (*this, lib, "send",
             SideEffects::worstDefault, "das_wss_send_fragment")
                 ->args({"channel","msg","len","fragment","opcode"});
+        addExtern<DAS_BIND_FUN(das_wss_close_channel)> (*this, lib, "close",
+            SideEffects::worstDefault, "das_wss_close_channel")
+                ->args({"channel"});
+        addExtern<DAS_BIND_FUN(das_wss_set_bind_host)> (*this, lib, "set_bind_host",
+            SideEffects::worstDefault, "das_wss_set_bind_host")
+                ->args({"server","host"});
         addExtern<DAS_BIND_FUN(das_wss_start)> (*this, lib, "start",
             SideEffects::worstDefault, "das_wss_start")
                 ->args({"server"});

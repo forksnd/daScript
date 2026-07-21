@@ -6,7 +6,8 @@ options no_unused_function_arguments = false
 //! High-level WebSocket and HTTP wrappers for the ``dashv`` C++ module.
 //!
 //! Provides ``HvWebSocketClient`` for WebSocket client connections with
-//! ``onOpen``, ``onClose``, and ``onMessage`` callbacks, and ``HvWebServer``
+//! ``onOpen``, ``onClose``, ``onMessage``, and lossless ``onMessageFrame``
+//! callbacks, and ``HvWebServer``
 //! for HTTP/WebSocket servers with route registration and static file serving.
 //! Also includes ``with_http_request`` and ``get_body_bytes`` helpers.
 
@@ -45,6 +46,12 @@ class HvWebSocketClient {
         //! Called when the WebSocket connection is closed.
     def abstract onMessage(msg : string#) : void
         //! Called when a text message is received from the server.
+    def onMessageFrame(msg : string#; byte_count : int; opcode : ws_opcode) {
+        //! Called for every complete text or binary frame. ``byte_count`` is
+        //! authoritative and preserves embedded zero bytes. The default keeps
+        //! the original text-only contract by forwarding text frames.
+        if (opcode == ws_opcode.WS_OPCODE_TEXT) onMessage(msg)
+    }
     def is_connected : bool {
         //! Returns ``true`` if the WebSocket connection is currently open.
         return is_connected(client)
@@ -99,6 +106,10 @@ class HvWebServer {
     def start : int {
         //! Starts the server. Returns 0 on success.
         return start(server)
+    }
+    def set_bind_host(host : string) : bool {
+        //! Selects the interface to bind before ``start`` (for example, ``127.0.0.1``).
+        return set_bind_host(server, host)
     }
     def stop : int {
         //! Stops the server. Returns 0 on success.

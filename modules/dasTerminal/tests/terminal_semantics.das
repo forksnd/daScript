@@ -108,6 +108,7 @@ def main {
     let bytes <- [uint8(0xe4), uint8(0xb8), uint8(0xad)]
     terminal_feed_bytes(styled, bytes)
     terminal_snapshot(styled, snapshot)
+    assert(snapshot.normal.cells[3].grapheme == "中")
     assert(snapshot.normal.cells[3].width == 2)
 
     var key_bytes : array<uint8>
