@@ -398,7 +398,8 @@ require ?math math
 
 (source_file
   (require_declaration
-    guard: (identifier)
+    guard: (require_module_name
+      (identifier))
     module: (require_module_name
       (identifier))))
 
@@ -412,8 +413,37 @@ require ?pugixml pugixml/linq_fold_xml public
 
 (source_file
   (require_declaration
-    guard: (identifier)
+    guard: (require_module_name
+      (identifier))
     module: (require_module_name
+      (identifier)
+      (identifier))))
+
+================================================================================
+Optional require with a PATH guard
+================================================================================
+
+require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen
+require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (require_declaration
+    guard: (require_module_name
+      (identifier)
+      (identifier)
+      (identifier))
+    module: (require_module_name
+      (identifier)
+      (identifier)))
+  (require_declaration
+    guard: (require_module_name
+      (identifier)
+      (identifier)
+      (identifier))
+    module: (require_module_name
+      (identifier)
       (identifier)
       (identifier))))
 
