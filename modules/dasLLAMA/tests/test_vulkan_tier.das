@@ -678,12 +678,18 @@ def private fill_acts_kq(var xq : array<int8>; var xs : array<float>; nrows : in
 // the CPU reference of the kq FFN contract: dequantized weights against the Q8_K activation
 // image (per-256 scales), silu, per-256 Q8_K requant, dequantized-down GEMM — double
 // accumulation, judged by the same relative-tolerance bar as the q8 arms
+// midblk = the INTERMEDIATE's requant block: 256 when down is a K-quant, 32 when down is q8.
+// The gate/up dots always ride the kq 256-block activation image; only the h -> down hop changes.
 def private ref_ffn_kq(offs1, offs3, offs2 : array<int64>; nreg : int;
                        w1, w3, w2 : array<float>;
-                       xq : array<int8>; xs : array<float>; nrows : int64; var gout : array<float>) {
+                       xq : array<int8>; xs : array<float>; nrows : int64; var gout : array<float>;
+                       midblk : int = 256) {
+    // a midblk that does not divide KNFE would silently drop h's tail and produce a WRONG
+    // baseline — masking a real kernel failure. verify, not assert: this must hold in release too
+    verify(int(KNFE) % midblk == 0, "ref_ffn_kq: midblk must divide KNFE")
     gout |> resize(int(nrows * KN))
     let nsb = int(KN / 256l)
-    let nsbh = int(KNFE / 256l)
+    let nsbh = int(KNFE) / midblk
     var gate : array<float>
     var up : array<float>
     var h : array<float>
@@ -724,22 +730,22 @@ def private ref_ffn_kq(offs1, offs3, offs2 : array<int64>; nreg : int;
             }
             for (sb in range(nsbh)) {
                 var amax = 0.0
-                for (j in range(256)) {
-                    amax = max(amax, abs(h[sb * 256 + j]))
+                for (j in range(midblk)) {
+                    amax = max(amax, abs(h[sb * midblk + j]))
                 }
                 let d = amax / 127.0
                 let id = d != 0.0 ? 1.0 / d : 0.0
                 hs[sb] = d
-                for (j in range(256)) {
-                    hq[sb * 256 + j] = int(round(h[sb * 256 + j] * id))
+                for (j in range(midblk)) {
+                    hq[sb * midblk + j] = int(round(h[sb * midblk + j] * id))
                 }
             }
             for (o in range(int(KN))) {
                 var y = 0.0lf
                 for (sb in range(nsbh)) {
                     var dd = 0.0lf
-                    for (j in range(256)) {
-                        dd += double(w2[(rb2 + o) * int(KNFE) + sb * 256 + j]) * double(hq[sb * 256 + j])
+                    for (j in range(midblk)) {
+                        dd += double(w2[(rb2 + o) * int(KNFE) + sb * midblk + j]) * double(hq[sb * midblk + j])
                     }
                     y += dd * double(hs[sb])
                 }
@@ -895,6 +901,118 @@ let KDWOFF = 31000000l  // k4 dense plane base (kq offset space, clear of KWOFF*
 let DROP_WOFF = 32000000l   // drop-arm scratch plane (q8 space)
 let DD = 160l           // dense output dim (%32)
 let DNR = 40l           // batch rows — one full 32-tile plus an unpadded remainder
+
+// llama.cpp's Q4_K_M MoE recipe bumps ffn_down_exps to Q5_0/Q8_0 while gate/up stay Q4_K, so
+// k4/k4/q8 is the shape real files ship (glm4moe, gemma). gate/up must agree (one activation
+// image); down is free — the chain requants the intermediate in the DOWN stack's form.
+let MXOFF1 = 210000000l
+let MXOFF3 = 220000000l
+let MXOFF2 = 230000000l
+
+def private dequant_q8_stack(wq : array<int8>; ws : array<float>; rows, n : int64; var w : array<float>) {
+    let nb = int(n / 32l)
+    w |> resize(int(rows * n))
+    for (r in range64(rows)) {
+        for (i in range64(n)) {
+            w[int(r * n + i)] = float(wq[int(r * n + i)]) * ws[int(r) * nb + int(i / 32l)]
+        }
+    }
+}
+
+[test]
+def test_vulkan_moe_ffn_mixed(t : T?) {
+    t |> run("vulkan MoE mixed triple (k4 gate/up + q8 down) == CPU reference") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            var wq1 : array<uint8>
+            var ws1 : array<uint8>
+            var wq3 : array<uint8>
+            var ws3 : array<uint8>
+            fill_kq_stack(1, NE * KNFE, KN, 61l, true, wq1, ws1)
+            fill_kq_stack(1, NE * KNFE, KN, 67l, true, wq3, ws3)
+            var up_ok = moe_gpu_upload_stack(wq1, ws1, MXOFF1, KN, NE * KNFE, 1)
+            if (!up_ok) {
+                feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                return
+            }
+            up_ok = moe_gpu_upload_stack(wq3, ws3, MXOFF3, KN, NE * KNFE, 1)
+            t |> success(up_ok, "k4 up stack uploaded")
+            // down: plain q8, the format the Q5_0/Q8_0 downs land in after the loader's transcode
+            var dq2 : array<int8>
+            var ds2 : array<float>
+            fill_stack(dq2, ds2, NE * KN, KNFE, 71l, false)
+            var wqb : array<uint8>
+            var wsb : array<uint8>
+            pack_upload(dq2, ds2, wqb, wsb)
+            up_ok = moe_gpu_upload_stack(wqb, wsb, MXOFF2, KNFE, NE * KN, 0)
+            t |> success(up_ok, "q8 down stack uploaded")
+
+            var w1 : array<float>
+            var w3 : array<float>
+            var w2 : array<float>
+            dequant_kq_stack(1, wq1, ws1, NE * KNFE, KN, w1)
+            dequant_kq_stack(1, wq3, ws3, NE * KNFE, KN, w3)
+            dequant_q8_stack(dq2, ds2, NE * KN, KNFE, w2)
+            let ege1 = KNFE * KN
+            let ege2 = KN * KNFE
+
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts_kq(xq, xs, 2l)
+            var offs1 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], MXOFF1, ege1)
+            var offs3 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], MXOFF3, ege1)
+            var offs2 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], MXOFF2, ege2)
+            var gout : array<float>
+            gout |> resize(int(2l * KN))
+            matmul_moe_gpu_ffn(gout, offs1, offs3, offs2, 2l, xq, xs, KN, KNFE, 2l, 1, 1, 0, false)
+            // ref_ffn_kq derives its row bases against the KWOFF* constants, so the reference
+            // gets its own offsets over the same regions (the GPU side rides the MXOFF* stacks)
+            let refoffs1 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], KWOFF1, ege1)
+            let refoffs3 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], KWOFF3, ege1)
+            let refoffs2 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], KWOFF2, ege2)
+            var refv : array<float>
+            ref_ffn_kq(refoffs1, refoffs3, refoffs2, 2, w1, w3, w2, xq, xs, 2l, refv, 32)
+            var c = compare_gout(gout, refv)
+            t |> success(c.maxref > 0.0, "mixed decode arm produced non-trivial outputs")
+            t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
+                "mixed k4/k4/q8 decode arm within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+
+            // batch arm: 40 rows (>= the 32-row tile, unpadded) — vk_moe_ffn_batch carries its own
+            // xunit split and chunk sizing, so the decode arm above does NOT cover it
+            fill_acts_kq(xq, xs, 40l)
+            var boffs1 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], MXOFF1, ege1)
+            var boffs3 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], MXOFF3, ege1)
+            var boffs2 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], MXOFF2, ege2)
+            gout |> resize(int(40l * KN))
+            matmul_moe_gpu_ffn(gout, boffs1, boffs3, boffs2, 2l, xq, xs, KN, KNFE, 40l, 1, 1, 0, false)
+            let rboffs1 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], KWOFF1, ege1)
+            let rboffs3 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], KWOFF3, ege1)
+            let rboffs2 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], KWOFF2, ege2)
+            ref_ffn_kq(rboffs1, rboffs3, rboffs2, 2, w1, w3, w2, xq, xs, 40l, refv, 32)
+            c = compare_gout(gout, refv)
+            t |> success(c.maxref > 0.0, "mixed batch arm produced non-trivial outputs")
+            t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
+                "mixed k4/k4/q8 batch arm within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+            delete wq1
+            delete ws1
+            delete wq3
+            delete ws3
+            delete dq2
+            delete ds2
+            delete wqb
+            delete wsb
+            delete w1
+            delete w3
+            delete w2
+            delete xq
+            delete xs
+            delete gout
+            delete refv
+        } else {
+            feint("vulkan module not built; skipping\n")
+        }
+    }
+}
 
 [test]
 def test_vulkan_dense_gemm(t : T?) {

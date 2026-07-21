@@ -2592,12 +2592,12 @@ def private ensure_batch_set(si : int; ybuf, xqbuf, xsbuf : uint64; xqbytes, xsb
 }
 
 // chunk row cap: the gathered x window, both hidden planes, the requant planes, and the down
-// output (which reuses y1) must all fit their buffers. xunit = the activation scale block size
-// (32 for Q8_0 chains, 256 for Q8_K)
-def private ffn_chunk_rows(n, nfe, xunit : int64) : int64 {
-    var r = min(BATCH_XQ_BYTES / n, BATCH_XS_BYTES / ((n / xunit) * 4l))
+// output (which reuses y1) must all fit their buffers. Two activation units: `in` = gate/up
+// image, `mid` = intermediate (follows the DOWN stack, may differ). 32 for Q8_0, 256 for Q8_K.
+def private ffn_chunk_rows(n, nfe, xunit_in, xunit_mid : int64) : int64 {
+    var r = min(BATCH_XQ_BYTES / n, BATCH_XS_BYTES / ((n / xunit_in) * 4l))
     r = min(r, BATCH_Y_BYTES / (max(nfe, n) * 4l))
-    r = min(r, min(BATCH_HQ_BYTES / nfe, BATCH_HS_BYTES / ((nfe / xunit) * 4l)))
+    r = min(r, min(BATCH_HQ_BYTES / nfe, BATCH_HS_BYTES / ((nfe / xunit_mid) * 4l)))
     return min(r, BATCH_CHUNK_ROWS)
 }
 
@@ -2792,11 +2792,12 @@ def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : i
     let s1 = find_stack(unsafe(offs1[0]), f1)
     let s3 = find_stack(unsafe(offs3[0]), f3)
     let s2 = find_stack(unsafe(offs2[0]), f2)
-    // upload walk only admits all-q8 or all-kq triples, so kq-ness must agree across the three stacks
-    let kq = f1 != 0
-    assert((f3 != 0) == kq && (f2 != 0) == kq,
-        "dasLLAMA vulkan tier: q8/kq mixed stack triple in one FFN chain")
-    let xunit = kq ? 256l : 32l
+    // gate/up share one activation image (forms must agree); down's intermediate is its own unit
+    let kq_in = f1 != 0
+    assert((f3 != 0) == kq_in,
+        "dasLLAMA vulkan tier: gate/up form mismatch — they share one activation image")
+    let xunit_in = kq_in ? 256l : 32l
+    let xunit_mid = f2 != 0 ? 256l : 32l
     ensure_batch_state()
     ensure_batch_set(s1, g_gpu.batch_y1_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
     ensure_batch_set(s3, g_gpu.batch_y2_dev, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, BATCH_XQ_BYTES, BATCH_XS_BYTES)
@@ -2815,7 +2816,7 @@ def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : i
             par_memcpy(reinterpret<void?>(cp + COMB_WI_BYTES), reinterpret<void? -const>(invp), nrows * 4l)
         }
     }
-    let chunk = ffn_chunk_rows(n, nfe, xunit)
+    let chunk = ffn_chunk_rows(n, nfe, xunit_in, xunit_mid)
     var r0 = 0l
     while (r0 < nrows) {
         let r1 = min(r0 + chunk, nrows)
@@ -2826,10 +2827,10 @@ def private vk_moe_ffn_batch(var goutp : float?; offs1 : int64 const?; offs3 : i
         assert(nwg1 == nwg3, "dasLLAMA vulkan tier: fused batch pair region mismatch")
         let nwg2 = fill_batch_meta(s2, offs2, nregions, nfe, n, r0, r1)
         let ts1 = ref_time_ticks()
-        upload_batch_acts(xqp, xsp, r0, rows, n, xunit)
+        upload_batch_acts(xqp, xsp, r0, rows, n, xunit_in)
         let ts2 = ref_time_ticks()
-        fill_ffn_meta(rows * nfe, rows * nfe / xunit, is_gelu, comb ? n : 0l, comb_k, r0, r1)
-        record_ffn_batch_cmd(s1, s3, s2, nwg1, nwg2, rows, nfe, rows * n * 4l, rows * n, rows * (n / xunit) * 4l,
+        fill_ffn_meta(rows * nfe, rows * nfe / xunit_mid, is_gelu, comb ? n : 0l, comb_k, r0, r1)
+        record_ffn_batch_cmd(s1, s3, s2, nwg1, nwg2, rows, nfe, rows * n * 4l, rows * n, rows * (n / xunit_in) * 4l,
             [comb_npos = comb ? uint(npos) : 0u, comb_first = r0 == 0l, comb_last = r1 == nrows,
              comb_wi_bytes = nrows * 4l, comb_y_bytes = npos * n * 4l])
         let ts3 = ref_time_ticks()
@@ -3647,20 +3648,21 @@ def private ffn_gemv_prep(offs1 : int64 const?; offs3 : int64 const?; offs2 : in
     let s3 = find_stack(unsafe(offs3[0]), f3)
     let s2 = find_stack(unsafe(offs2[0]), f2)
     assert(nrows * max(nfe, n) * 4l <= Y_BYTES, "dasLLAMA vulkan tier: FFN dispatch exceeds output capacity")
-    // upload walk only admits all-q8 or all-kq triples, so kq-ness must agree across the three stacks
-    let kq = f1 != 0
-    assert((f3 != 0) == kq && (f2 != 0) == kq,
-        "dasLLAMA vulkan tier: q8/kq mixed stack triple in one FFN chain")
-    let xunit = kq ? 256l : 32l
+    // gate/up share one activation image (same xqp below) so forms must agree; down's is its own
+    let kq_in = f1 != 0
+    assert((f3 != 0) == kq_in,
+        "dasLLAMA vulkan tier: gate/up form mismatch — they share one activation image")
+    let xunit_in = kq_in ? 256l : 32l
+    let xunit_mid = f2 != 0 ? 256l : 32l
     ensure_gemv_scratch(s1)
     ensure_gemv_scratch(s3)
     ensure_gemv_scratch(s2)
-    fill_stack_meta_rows(s1, offs1, nregions, n, nfe, nrows, n / xunit)
-    fill_stack_meta_rows(s3, offs3, nregions, n, nfe, nrows, n / xunit)
-    fill_stack_meta_rows(s2, offs2, nregions, nfe, n, nrows, nfe / xunit)
+    fill_stack_meta_rows(s1, offs1, nregions, n, nfe, nrows, n / xunit_in)
+    fill_stack_meta_rows(s3, offs3, nregions, n, nfe, nrows, n / xunit_in)
+    fill_stack_meta_rows(s2, offs2, nregions, nfe, n, nrows, nfe / xunit_mid)
     fill_stack_acts(s1, xqp, xsp, nrows * n)
     fill_stack_acts(s3, xqp, xsp, nrows * n)
-    fill_ffn_meta(nrows * nfe, nrows * nfe / xunit, is_gelu)
+    fill_ffn_meta(nrows * nfe, nrows * nfe / xunit_mid, is_gelu)
     return (cmd = ffn_cmd_for(s1, s3, s2, nrows, n, nfe), s2 = s2)
 }
 
