@@ -46,9 +46,6 @@ def fract(x : float4) {
     return x - floor(x)
 }
 
-// ===== GL-only compute builtin =====
-var gl_WorkGroupSize : uint3        // local work group size we defined with layout
-
 // ===== Legacy GLSL 1.x builtins =====
 // GL-only; NOT in the lingua franca. Invalid in GLSL ES 3.00 and desktop core -- superseded by
 // explicit `out vec4` fragment outputs and texture(). Kept so existing demos keep compiling on the
