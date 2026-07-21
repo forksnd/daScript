@@ -2180,6 +2180,7 @@ class SpirvEmit : AstVisitor {
     loop_ids : table<uint64; LoopIds>    // intptr(ExprWhile/ExprFor) -> its 5 loop-skeleton labels
     for_src : table<uint64>              // for-source range() call ptrs to intercept in visitExprCall (6.3)
     copy_dst : uint64                    // intptr(ExprCopy.left) while that destination subtree is walked
+    suppress_bounds_arg : bool = false   // next node is a `.[]` call's __context__/__lineinfo__ tail — elide
     errs    : array<string>
 
     // coerce a visited child to an rvalue id: a value passes through; a pointer is OpLoad'd here (the
@@ -2506,29 +2507,32 @@ class SpirvEmit : AstVisitor {
     }
 
     // ----- indexing: ssbo array or local fixed array -> pointer (AccessChain) -----
-    def override visitExprAt(var expr : ExprAt?) : ExpressionPtr {
+    // Shared by visitExprAt (a raw a[i]) and visitExprCall's `.[]` operator form (the -jit / no-opt
+    // lowering of a bounds-checked a[i]): result_expr keys the side-map + gives the element type, so
+    // both spellings emit the identical instruction.
+    def emit_index_read(base_expr : ExpressionPtr; index_expr : ExpressionPtr; result_expr : ExpressionPtr) : void {
         var bm & = unsafe(*m)
-        let k = intptr(expr)
+        let k = intptr(result_expr)
         // A matrix COLUMN read (m[i], GLSL's mat[i]): a matrix is an emittable VALUE here, not an
         // addressable composite, so there is no OpVariable to chain through -- extract the column off
         // the loaded matrix. OpCompositeExtract takes LITERAL indices, so the column must be a
         // compile-time constant; a dynamic one is rejected rather than lowered into a blob that only
         // spirv-val would catch. Must precede the local-variable branch below: a value-`let` matrix is
         // an ExprVar with no ptr_id, which that branch would reject as non-indexable.
-        let mi = matrix_info(expr.subexpr._type)
+        let mi = matrix_info(base_expr._type)
         if (mi.ok) {
-            let mci = expr.index ?as ExprConstInt
+            let mci = index_expr ?as ExprConstInt
             if (mci == null) {
                 errs |> push("indexing a matrix with a non-constant column index is not supported")
-                return expr
+                return
             }
-            let mbase = value_of(expr.subexpr)
-            if (mbase == 0u) return expr   // operand failed to lower (error already pushed)
-            let mrt = emit_type(bm, expr._type)
+            let mbase = value_of(base_expr)
+            if (mbase == 0u) return   // operand failed to lower (error already pushed)
+            let mrt = emit_type(bm, result_expr._type)
             let mres = alloc_id(bm)
             emit(bm, SEC_FUNCS, SpvOp.CompositeExtract, mrt, mres, mbase, uint(mci.value))
             e2id[k] = mres
-            return expr
+            return
         }
         // A vector component under an index (GLSL's v[i]) on a base that is a pure VALUE -- a call
         // result, a `let` local, a parameter, a folded constant global -- has no OpVariable to chain a
@@ -2537,40 +2541,40 @@ class SpirvEmit : AstVisitor {
         // `var` local, an ssbo element, a block member) keeps the pointer path below, which is what
         // glslang gives `h_min[i]` -- so this must test addressability, not merely vector-ness.
         // A constant index takes OpCompositeExtract, the literal-operand form, like the swizzle read.
-        if (arith_lanes(expr.subexpr._type.baseType) >= 2 && !is_addressable(expr.subexpr)) {
-            let vbase = value_of(expr.subexpr)
-            if (vbase == 0u) return expr   // operand failed to lower (error already pushed)
-            let vrt = emit_type(bm, expr._type)
+        if (arith_lanes(base_expr._type.baseType) >= 2 && !is_addressable(base_expr)) {
+            let vbase = value_of(base_expr)
+            if (vbase == 0u) return   // operand failed to lower (error already pushed)
+            let vrt = emit_type(bm, result_expr._type)
             let vres = alloc_id(bm)
-            let vci = expr.index ?as ExprConstInt
+            let vci = index_expr ?as ExprConstInt
             if (vci != null) {
                 emit(bm, SEC_FUNCS, SpvOp.CompositeExtract, vrt, vres, vbase, uint(vci.value))
             } else {
-                let vidx = value_of(expr.index)
-                if (vidx == 0u) return expr   // index failed to lower (error already pushed)
+                let vidx = value_of(index_expr)
+                if (vidx == 0u) return   // index failed to lower (error already pushed)
                 emit(bm, SEC_FUNCS, SpvOp.VectorExtractDynamic, vrt, vres, vbase, vidx)
             }
             e2id[k] = vres
-            return expr
+            return
         }
-        let lev = expr.subexpr ?as ExprVar
+        let lev = base_expr ?as ExprVar
         if (lev != null && (lev.varFlags.local || lev.varFlags.argument || lev.varFlags._block)) {
             let lv = ctx.local_vars?[intptr(lev.variable)] ?? LocalVar()
             if (lv.ptr_id == 0u) {
                 errs |> push("indexing local '{lev.name}': only fixed-array `var`/`let` locals are indexable")
-                return expr
+                return
             }
-            let idx = value_of(expr.index)
-            if (idx == 0u) return expr   // index failed to lower (error already pushed) — no 0-operand access chain
-            let pointee = emit_type(bm, expr._type)
+            let idx = value_of(index_expr)
+            if (idx == 0u) return   // index failed to lower (error already pushed) — no 0-operand access chain
+            let pointee = emit_type(bm, result_expr._type)
             let ptr_t = type_pointer(bm, SpvStorageClass.Function, pointee)
             let res = alloc_id(bm)
             emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, lv.ptr_id, idx)
             e2ptr[k] = res
             e2pty[k] = pointee
-            return expr
+            return
         }
-        let bv = global_var_of(expr.subexpr)
+        let bv = global_var_of(base_expr)
         if (bv == null) {
             // Indexing a fixed-array field inside a Block (ubo.lights[i] / ubo.material.kernel[i]) or
             // inside a struct local (s.arr[i]). The subexpr is a chained ExprField whose e2ptr is a
@@ -2579,24 +2583,24 @@ class SpirvEmit : AstVisitor {
             // struct element, plain emit_type would panic (it doesn't lower tStructure) and would
             // also not return the laid-out (deduped) type — so re-acquire it via build_block_struct,
             // which is idempotent under the type/decoration dedup pools.
-            if (key_exists(e2ptr, intptr(expr.subexpr))) {
-                let idx = value_of(expr.index)
-                if (idx == 0u) return expr   // index failed to lower (error already pushed)
-                let base = ptr_of(expr.subexpr)
-                let rv = root_global_of(expr.subexpr)
-                let storage = root_storage_of(expr.subexpr)
+            if (key_exists(e2ptr, intptr(base_expr))) {
+                let idx = value_of(index_expr)
+                if (idx == 0u) return   // index failed to lower (error already pushed)
+                let base = ptr_of(base_expr)
+                let rv = root_global_of(base_expr)
+                let storage = root_storage_of(base_expr)
                 let rname = rv != null ? string(rv.name) : "(?)"
-                let pointee = field_pointee_type(bm, expr._type, "{rname}[]", storage)
-                if (pointee == 0u) return expr
+                let pointee = field_pointee_type(bm, result_expr._type, "{rname}[]", storage)
+                if (pointee == 0u) return
                 let ptr_t = type_pointer(bm, storage, pointee)
                 let res = alloc_id(bm)
                 emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, base.id, idx)
                 e2ptr[k] = res
                 e2pty[k] = pointee
-                return expr
+                return
             }
             errs |> push("indexing is only supported on a global ssbo array, a local fixed array, or an array field inside a @uniform/@push_constant/@ssbo block")
-            return expr
+            return
         }
         let gi = ctx.globals?[intptr(bv)] ?? GlobalInfo()
         // BARE array global (not wrapped in a Block struct), so the access chain is a single index off
@@ -2606,15 +2610,15 @@ class SpirvEmit : AstVisitor {
         // emit_type can't lower, so use the classified elem_type; @workgroup scalar/vector elements
         // lower fine via emit_type.
         if (gi.storage == SpvStorageClass.Workgroup || gi.is_mesh_output) {
-            let idx = value_of(expr.index)
-            if (idx == 0u) return expr   // index failed to lower (error already pushed)
-            let pointee = (gi.is_mesh_output && gi.elem_type != 0u) ? gi.elem_type : emit_type(bm, expr._type)
+            let idx = value_of(index_expr)
+            if (idx == 0u) return   // index failed to lower (error already pushed)
+            let pointee = (gi.is_mesh_output && gi.elem_type != 0u) ? gi.elem_type : emit_type(bm, result_expr._type)
             let res = alloc_id(bm)
             let ptr_t = type_pointer(bm, gi.storage, pointee)
             emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, gi.var_id, idx)
             e2ptr[k] = res
             e2pty[k] = pointee
-            return expr
+            return
         }
         // descriptor array of samplers (sampler2D[N], etc.): the ExprAt is read STRUCTURALLY by the
         // texture/textureLod/textureCompare/textureSize/texelFetch handler (resolve_sampler_arg),
@@ -2623,16 +2627,16 @@ class SpirvEmit : AstVisitor {
         // directly; any other consumer (which doesn't exist for an opaque sampler value) would
         // surface a clean "no rvalue available" fail-closed.
         if (gi.is_sampler_array) {
-            return expr
+            return
         }
         if (!gi.is_ssbo) {
             errs |> push("only ssbo, @workgroup, or sampler descriptor-array indexing is supported for now")
-            return expr
+            return
         }
-        let idx = value_of(expr.index)
-        if (idx == 0u) return expr   // index failed to lower (error already pushed) — no 0-operand access chain
+        let idx = value_of(index_expr)
+        if (idx == 0u) return   // index failed to lower (error already pushed) — no 0-operand access chain
         // use the classified element type-id: a struct element can't go through emit_type
-        let pointee = gi.elem_type != 0u ? gi.elem_type : emit_type(bm, expr._type)
+        let pointee = gi.elem_type != 0u ? gi.elem_type : emit_type(bm, result_expr._type)
         let res = alloc_id(bm)
         let ptr_t = type_pointer(bm, gi.storage, pointee)
         var ops <- [ptr_t, res, gi.var_id, const_uint(bm, 0u), idx]
@@ -2640,6 +2644,9 @@ class SpirvEmit : AstVisitor {
         delete ops
         e2ptr[k] = res
         e2pty[k] = pointee
+    }
+    def override visitExprAt(var expr : ExprAt?) : ExpressionPtr {
+        emit_index_read(expr.subexpr, expr.index, expr)
         return expr
     }
 
@@ -3147,6 +3154,13 @@ class SpirvEmit : AstVisitor {
         }
     }
 
+    // Flag EXACTLY a `.[]` runtime-index call's __context__ / __lineinfo__ tail (args 2/3) by node
+    // identity, so the ExprFakeContext / ExprFakeLineInfo rejects elide them; scoping to those nodes
+    // (not the whole `.[]` subtree) keeps an explicit __context__ in the base / index failing closed.
+    def override preVisitExprCallArgument(expr : ExprCall?; arg : ExpressionPtr; last : bool) : void {
+        suppress_bounds_arg = (expr.name == ".[]" && length(expr.arguments) > 3 &&
+            (arg == expr.arguments[2] || arg == expr.arguments[3]))
+    }
     // ----- calls: texture / vector constructors / dot / GLSL.std.450 math (args pre-visited) -----
     // Mirrors emit_call but reads operand ids via value_of (children already visited). for-source
     // range()/urange() calls are consumed by preVisitExprForBody and skipped here.
@@ -3155,6 +3169,18 @@ class SpirvEmit : AstVisitor {
         var bm & = unsafe(*m)
         let name = "{expr.name}"
         let k = intptr(expr)
+        // A bounds-checked a[i] lowers to a `.[](base, index, __context__, __lineinfo__)` OPERATOR call
+        // under -jit / no-opt (a const index folds to a raw ExprAt), so route base/index through the
+        // same emit_index_read the ExprAt path uses. The __context__ / __lineinfo__ tail (a trapping
+        // out-of-range panic in the interpreter) is elided in preVisitExprCallArgument; SPIR-V has no
+        // trap. The unchecked form carries just (base, index).
+        if (name == ".[]") {
+            let argc = length(expr.arguments)
+            if (argc == 2 || argc == 4) {
+                emit_index_read(expr.arguments[0], expr.arguments[1], expr)
+                return expr
+            }
+        }
         // discard(): abandon the fragment -> OpKill. A block terminator (sets ctx.terminated), so any
         // following statement on the same path is rejected as unreachable. Fragment-only.
         if (name == "discard") {
@@ -4390,6 +4416,22 @@ class SpirvEmit : AstVisitor {
     }
     def override preVisitExprConstPtr(expr : ExprConstPtr?) : void {
         errs |> push("pointer constant is not supported in SPIR-V shaders")
+    }
+    // __context__ / __lineinfo__ ARE lowerable as a `.[]` bounds-check tail: elided when
+    // preVisitExprCallArgument flagged them, but fail closed anywhere else.
+    def override preVisitExprFakeContext(expr : ExprFakeContext?) : void {
+        if (suppress_bounds_arg) {
+            suppress_bounds_arg = false
+            return
+        }
+        errs |> push("__context__ is not supported in SPIR-V shaders")
+    }
+    def override preVisitExprFakeLineInfo(expr : ExprFakeLineInfo?) : void {
+        if (suppress_bounds_arg) {
+            suppress_bounds_arg = false
+            return
+        }
+        errs |> push("__lineinfo__ is not supported in SPIR-V shaders")
     }
     def override preVisitExprSafeAt(expr : ExprSafeAt?) : void {
         errs |> push("safe index (?[]) is not supported in SPIR-V shaders")
