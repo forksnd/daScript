@@ -148,8 +148,8 @@ def private kq_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q
 // and have no fp32-table GEMV.
 def private metal_model_servable_impl(t : Model) : bool {
     let cls_fmt = t.config.shared_weights ? t.emb_fmt : t.wcls_fmt
-    // tied-fp32 classifier (no fp32-table GEMV); MTP stays planar until stage 4 (GPU logits skip the mtp_h stash)
-    if ((t.config.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8) || t.config.n_layer_nextn > 0l) {
+    // tied-fp32 classifier declines (no fp32-table GEMV); NextN serves — prefill stashes mtp_h + warms the slab
+    if (t.config.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8) {
         return false
     }
     return decode_shape_decline(t, DECODE_NEEDS_OK, true) == MetalDecodeDecline.none
