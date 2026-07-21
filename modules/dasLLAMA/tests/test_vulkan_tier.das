@@ -570,12 +570,12 @@ def private lcg_byte(var st : uint64&) : uint8 {
 }
 
 // synthesize one kq stack directly in the tier's DEVICE layout: quant payload (any bytes are
-// valid nibble/qh payloads) + 20B scale rows (f16 d/dmin from the pow2 sets, 6-bit sc/mn or
-// signed i8 sub-scales)
+// valid nibble/qh payloads) + 20B scale rows (f16 d/dmin from the pow2 sets, 6-bit sc/mn,
+// signed i8 sub-scales, or q40's 8 per-block f16 d)
 def private fill_kq_stack(fmt : int; rows, n : int64; seed : int64; tiny_d : bool;
                           var wqb : array<uint8>; var wsb : array<uint8>) {
     let nsb = n / 256l
-    let qsb = fmt == 1 ? 128l : (fmt == 2 ? 160l : 192l)
+    let qsb = fmt == 2 ? 160l : (fmt == 3 ? 192l : 128l)
     wqb |> resize(int(rows * nsb * qsb))
     wsb |> resize(int(rows * nsb * 20l))
     var st = uint64(seed) * 2654435761ul + 12345ul
@@ -594,6 +594,15 @@ def private fill_kq_stack(fmt : int; rows, n : int64; seed : int64; tiny_d : boo
             wsb[so + 17] = uint8((h >> 8u) & 0xFFu)
             wsb[so + 18] = uint8(0)
             wsb[so + 19] = uint8(0)
+        } elif (fmt == 4) {
+            for (blk in range(8)) {   // one f16 d per 32-block, words 0..3; 16..19 pad
+                let h = f32_to_f16(tiny_d ? pow2_tiny(sb + seed + int64(blk)) : pow2_small(sb + seed + int64(blk)))
+                wsb[so + blk * 2] = uint8(h & 0xFFu)
+                wsb[so + blk * 2 + 1] = uint8((h >> 8u) & 0xFFu)
+            }
+            for (i in range(16, 20)) {
+                wsb[so + i] = uint8(0)
+            }
         } else {
             let hd = f32_to_f16(tiny_d ? pow2_tiny(sb + seed) : pow2_small(sb + seed))
             let hm = f32_to_f16(tiny_d ? pow2_tiny(sb + seed + 1l) : pow2_small(sb + seed + 1l))
@@ -614,14 +623,23 @@ def private fill_kq_stack(fmt : int; rows, n : int64; seed : int64; tiny_d : boo
 def private dequant_kq_stack(fmt : int; wqb : array<uint8>; wsb : array<uint8>; rows, n : int64;
                              var w : array<float>) {
     let nsb = n / 256l
-    let qsb = fmt == 1 ? 128l : (fmt == 2 ? 160l : 192l)
+    let qsb = fmt == 2 ? 160l : (fmt == 3 ? 192l : 128l)
     w |> resize(int(rows * n))
     for (rr in range64(rows)) {
         for (sbi in range64(nsb)) {
             let qo = (rr * nsb + sbi) * qsb
             let so = (rr * nsb + sbi) * 20l
             let wo = rr * n + sbi * 256l
-            if (fmt == 3) {
+            if (fmt == 4) {
+                for (blk in range64(8l)) {
+                    let d = f16_to_f32(uint(wsb[int(so + blk * 2l)]) | (uint(wsb[int(so + blk * 2l + 1l)]) << 8u))
+                    for (m in range64(16l)) {
+                        let b = int(wqb[int(qo + blk * 16l + m)])
+                        w[int(wo + blk * 32l + m)] = d * float((b & 15) - 8)
+                        w[int(wo + blk * 32l + 16l + m)] = d * float((b >> 4) - 8)
+                    }
+                }
+            } elif (fmt == 3) {
                 let d = f16_to_f32(uint(wsb[int(so) + 16]) | (uint(wsb[int(so) + 17]) << 8u))
                 for (blk in range64(8l)) {
                     let shift = int(2l * (blk % 4l))
@@ -888,6 +906,115 @@ def test_vulkan_moe_ffn_kq(t : T?) {
             delete xs
             delete gout
             delete refv
+        } else {
+            feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
+        }
+    }
+}
+
+// ===== q40 arms (native Q4_0 stacks — the all-q40 triple a Q4_0 file ships) =====
+
+let QWOFF1 = 41000000l
+let QWOFF3 = 42000000l
+let QWOFF2 = 43000000l
+
+// Q4_0 rides the k4 nibble tiling with one f16 d per 32-block and no min plane, so its quants
+// carry an implicit -8: the kernel folds that as an integer subtract against the block sums,
+// and a sign error there is exactly what this arm catches.
+[test]
+def test_vulkan_moe_ffn_q40(t : T?) {
+    t |> run("vulkan MoE q40 tier (all-Q4_0 triple) == CPU reference") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            var wq1 : array<uint8>
+            var ws1 : array<uint8>
+            var wq3 : array<uint8>
+            var ws3 : array<uint8>
+            var wq2 : array<uint8>
+            var ws2 : array<uint8>
+            fill_kq_stack(4, NE * KNFE, KN, 83l, false, wq1, ws1)
+            fill_kq_stack(4, NE * KNFE, KN, 97l, false, wq3, ws3)
+            fill_kq_stack(4, NE * KN, KNFE, 101l, false, wq2, ws2)
+            var up_ok = moe_gpu_upload_stack(wq1, ws1, QWOFF1, KN, NE * KNFE, 4)
+            if (!up_ok) {
+                feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                return
+            }
+            up_ok = moe_gpu_upload_stack(wq3, ws3, QWOFF3, KN, NE * KNFE, 4)
+            t |> success(up_ok, "q40 up stack uploaded")
+            up_ok = moe_gpu_upload_stack(wq2, ws2, QWOFF2, KNFE, NE * KN, 4)
+            t |> success(up_ok, "q40 down stack uploaded")
+            var w1 : array<float>
+            var w3 : array<float>
+            var w2 : array<float>
+            dequant_kq_stack(4, wq1, ws1, NE * KNFE, KN, w1)
+            dequant_kq_stack(4, wq3, ws3, NE * KNFE, KN, w3)
+            dequant_kq_stack(4, wq2, ws2, NE * KN, KNFE, w2)
+            let ege1 = KNFE * KN
+            let ege2 = KN * KNFE
+            var xq : array<int8>
+            var xs : array<float>
+            var gout : array<float>
+            var refv : array<float>
+
+            // decode arm: 2 rows, 1 per region (the GEMV kernel)
+            fill_acts_kq(xq, xs, 2l)
+            var offs1 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], QWOFF1, ege1)
+            var offs3 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], QWOFF3, ege1)
+            var offs2 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], QWOFF2, ege2)
+            gout |> resize(int(2l * KN))
+            matmul_moe_gpu_ffn(gout, offs1, offs3, offs2, 2l, xq, xs, KN, KNFE, 2l, 4, 4, 4, false)
+            // ref_ffn_kq derives its row bases against the KWOFF* constants
+            var refoffs1 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], KWOFF1, ege1)
+            var refoffs3 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], KWOFF3, ege1)
+            var refoffs2 <- make_offs([1l, 2l], [0l, 1l], [1l, 1l], KWOFF2, ege2)
+            ref_ffn_kq(refoffs1, refoffs3, refoffs2, 2, w1, w3, w2, xq, xs, 2l, refv)
+            var c = compare_gout(gout, refv)
+            t |> success(c.maxref > 0.0, "q40 decode arm produced non-trivial outputs")
+            t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
+                "q40 decode arm within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+
+            // batch arm (the q40 tile): 40 rows (>= the 32-row tile, unpadded), 2 regions
+            fill_acts_kq(xq, xs, 40l)
+            var boffs1 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], QWOFF1, ege1)
+            var boffs3 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], QWOFF3, ege1)
+            var boffs2 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], QWOFF2, ege2)
+            gout |> resize(int(40l * KN))
+            matmul_moe_gpu_ffn(gout, boffs1, boffs3, boffs2, 2l, xq, xs, KN, KNFE, 40l, 4, 4, 4, false)
+            var rboffs1 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], KWOFF1, ege1)
+            var rboffs3 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], KWOFF3, ege1)
+            var rboffs2 <- make_offs([0l, 2l], [0l, 24l], [24l, 16l], KWOFF2, ege2)
+            ref_ffn_kq(rboffs1, rboffs3, rboffs2, 2, w1, w3, w2, xq, xs, 40l, refv)
+            c = compare_gout(gout, refv)
+            t |> success(c.maxref > 0.0, "q40 batch arm produced non-trivial outputs")
+            t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
+                "q40 batch arm within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+
+            delete wq1
+            delete ws1
+            delete wq3
+            delete ws3
+            delete wq2
+            delete ws2
+            delete w1
+            delete w3
+            delete w2
+            delete xq
+            delete xs
+            delete gout
+            delete refv
+            delete offs1
+            delete offs3
+            delete offs2
+            delete refoffs1
+            delete refoffs3
+            delete refoffs2
+            delete boffs1
+            delete boffs3
+            delete boffs2
+            delete rboffs1
+            delete rboffs3
+            delete rboffs2
         } else {
             feint("dasVulkan not installed; vulkan MoE tier untestable here\n")
         }

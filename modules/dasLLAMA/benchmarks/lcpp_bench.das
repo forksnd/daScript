@@ -54,6 +54,9 @@ struct Args {
     @clarg_doc = "A/B the attention GPU chain in-process: every row runs twice, attention routing OFF then ON. Needs DASLLAMA_GPU_ATTN=1 (uploads + marks); mutually exclusive with the other A/B levers"
     attn_ab : bool
 
+    @clarg_doc = "A/B the GPU MoE prefill arm in-process: every row runs twice, device-side prefill OFF then ON. Needs resident expert layers (DASLLAMA_GPU_MOE_LAYERS); decode has no npos gate so tg reads as a wash. Mutually exclusive with the other A/B levers"
+    prefill_ab : bool
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -125,6 +128,9 @@ def main() {
     if (cfg.attn_ab && !has_env_variable("DASLLAMA_GPU_ATTN")) {
         print("warning: --attn-ab without DASLLAMA_GPU_ATTN=1 — no attention marks, both arms identical\n")
     }
+    if (cfg.prefill_ab && !has_env_variable("DASLLAMA_GPU_MOE_LAYERS") && !has_env_variable("DASLLAMA_GPU_MOE_STREAM")) {
+        print("warning: --prefill-ab without DASLLAMA_GPU_MOE_LAYERS/_STREAM — no resident expert layers, both arms identical\n")
+    }
     print("loading {cfg.model}\n")
     with_job_que() {
         setup_dasllama_jobque_()
@@ -136,10 +142,10 @@ def main() {
         let c = t.config
         print("config: dim={c.dim} layers={c.n_layers} vocab={c.vocab_size} | backend {active_kernel_backend()} (batch {active_batch_backend()}) | t{threads} affinity {pinned ? "hard" : "env/off"} | pp{plen} tg{ngen} x {reps} reps\n")
         var s <- make_run_state(c)
-        if ((cfg.dense_ab ? 1 : 0) + (cfg.comb_ab ? 1 : 0) + (cfg.dn_ab ? 1 : 0) + (cfg.attn_ab ? 1 : 0) > 1) {
-            print("warning: --dense-ab / --comb-ab / --dn-ab / --attn-ab are mutually exclusive — running the first only\n")
+        if ((cfg.dense_ab ? 1 : 0) + (cfg.comb_ab ? 1 : 0) + (cfg.dn_ab ? 1 : 0) + (cfg.attn_ab ? 1 : 0) + (cfg.prefill_ab ? 1 : 0) > 1) {
+            print("warning: --dense-ab / --comb-ab / --dn-ab / --attn-ab / --prefill-ab are mutually exclusive — running the first only\n")
         }
-        let ab = cfg.dense_ab || cfg.comb_ab || cfg.dn_ab || cfg.attn_ab
+        let ab = cfg.dense_ab || cfg.comb_ab || cfg.dn_ab || cfg.attn_ab || cfg.prefill_ab
         for (arm in range(ab ? 2 : 1)) {
             var dtag = ""
             if (cfg.dense_ab) {
@@ -154,6 +160,9 @@ def main() {
             } elif (cfg.attn_ab) {
                 dtag = arm == 0 ? " attn=off" : " attn=on"
                 set_moe_gpu_attn_route(arm != 0)
+            } elif (cfg.prefill_ab) {
+                dtag = arm == 0 ? " gpuprefill=off" : " gpuprefill=on"
+                set_moe_gpu_prefill_route(arm != 0)
             }
             if (plen > 0l) {
                 let warm <- build_prompt(plen, 999l)
