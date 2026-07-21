@@ -14,7 +14,6 @@ require imgui/imgui_markdown_tree_sitter
 require stbimage/stbimage_boost
 require ./file_inspection.das
 
-let private MAX_BINARY_PREVIEW_BYTES = 32 * 1024 * 1024
 let private MAX_BINARY_PREVIEW_PIXELS = 64l * 1024l * 1024l
 
 enum public InspectorPrepareEventKind {
@@ -216,10 +215,10 @@ def private prepare_worker_main(var jobs : Channel?&;
                         }
                     }
                     if (prepared_patch.binary) {
-                        if (job.view_byte_count > MAX_BINARY_PREVIEW_BYTES) {
-                            preview_error = "Binary preview exceeds the 32 MiB raw-byte limit"
+                        if (job.view_byte_count > MAX_BINARY_PREVIEW_RAW_BYTES) {
+                            preview_error = "Binary preview exceeds the 8 MiB raw-byte limit"
                         } elif (empty(job.view_base64)) {
-                            preview_error = "No working-file bytes were provided"
+                            preview_error = "Binary preview bytes are unavailable for this comparison"
                         } else {
                             var inscope encoded : array<uint8>
                             let decoded = base64_decode(job.view_base64, encoded)

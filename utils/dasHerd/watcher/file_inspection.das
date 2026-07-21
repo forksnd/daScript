@@ -9,6 +9,11 @@ require strings public
 require daslib/strings_boost
 require math
 
+//! Raw binary bytes embedded into the JSON/base64 fallback preview path.
+//! 8 MiB becomes roughly 10.7 MiB on the wire while bounding simultaneous
+//! mapped/raw/encoded/decoded allocations in the watcher and rich client.
+let public MAX_BINARY_PREVIEW_RAW_BYTES = 8 * 1024 * 1024
+
 enum public GitDiffLineKind {
     context
     removed

@@ -17,7 +17,6 @@ require daslib/base64
 require strings
 
 let private MAX_REQUEST_BODY_BYTES = 1024 * 1024
-let private MAX_BINARY_PREVIEW_BYTES = 32 * 1024 * 1024
 let private CONTROLLER_HEARTBEAT_TIMEOUT_MS = 5000l
 var private g_watcher_gc_requested = false
 
@@ -439,7 +438,7 @@ class DasHerdWatcherServer : HvWebServer {
                         client.inspection_repository_id,
                         client.inspection_worktree_path,
                         client.inspection_file_path,
-                        MAX_BINARY_PREVIEW_BYTES, bytes, view_byte_count)
+                        MAX_BINARY_PREVIEW_RAW_BYTES, bytes, view_byte_count)
                     if (empty(view_error)) {
                         if (!empty(bytes)) {
                             view_base64 = base64_encode(bytes)
