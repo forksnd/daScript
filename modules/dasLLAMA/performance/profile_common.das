@@ -205,7 +205,7 @@ def private exec_fmt_add(var seen : table<string>; a : array<KqFmt>) {
 
 //! What this loaded das Model EXECUTES — per-site weight formats, activation/scale treatment,
 //! and the weight layout — the bench record's apples-to-apples receipt (`BenchRun.exec_fmt`).
-//! A kq entry (k4/k5/k6/q40) means the DISK format runs natively; q8 planes on a K-quant file
+//! A kq entry (k4/k5/k6/q40/q51) means the DISK format runs natively; q8 planes on a K-quant file
 //! are tensors the file itself ships as Q8_0 (norms/embeddings ride fblob, not listed).
 def model_exec_fmt(t : Model) : string {
     if (t.quant != QuantMode.q8) {

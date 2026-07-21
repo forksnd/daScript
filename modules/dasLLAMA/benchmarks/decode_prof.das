@@ -124,6 +124,9 @@ def private kq_wbytes(f : KqFmt; q8wb : double) : double {
     if (f == KqFmt.q40) {
         return (128.0lf + 16.0lf) / 256.0lf   // nibbles + 8 x f16 d
     }
+    if (f == KqFmt.q51) {
+        return (20.0lf + 4.0lf) / 32.0lf   // per 32-block: nibbles + qh, f16 d + m
+    }
     return q8wb
 }
 

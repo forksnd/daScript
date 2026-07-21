@@ -1194,6 +1194,12 @@ typedef BackendAvailableFn = function<() : bool>
 // shape: ONE dispatch runs every routed expert's [d x n] GEMM over its own row range of a shared
 // token-row image. `offs` packs TRIPLES [weight offset, row0, cnt]; bit-exact vs a per-region loop.
 typedef MatmulMx4Q8BatchGroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// q51 (native Q5_1) kernels — mx4's shape with per-32-BLOCK planes: wq = 20B/block nibbles+qh
+// (row stride (n/32)*20), ws = 4B/block f16 d+m (row stride (n/32)*4), Q8_0-form activations.
+// No bias forms (no biased-q51 arch); offs conventions match the mx4/q8 groupn twins.
+typedef MatmulQ51Q8BatchFn = function<(var yp : float?; wq : uint8 const?; ws : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64; ntok : int64) : void>
+typedef MatmulQ51GroupNFn = function<(var yp : float?; wq : uint8 const?; ws : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+typedef MatmulQ51Q8BatchGroupNFn = function<(var yp : float?; wq : uint8 const?; ws : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
 // Native K-quant rows-range GEMV core (kq stage 4): rows [rb, re) of one plane-region pair
 // (kqp/ksp = the format's quant/scale plane bases). One typedef per format; a backend's cores
 // read ITS repacked kq layout — mixing backends across a load is as illegal as for the Q8 plane.
@@ -1232,6 +1238,12 @@ struct KernelBackend {
     repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
     groupn : MatmulQ8Q8GroupNFn = @@q8q8_unset_groupn
     groupn_mx4 : MatmulMx4GroupNFn = @@mx4q8_unset_groupn
+    // q51 slots DEFAULT to the portable kernels (not panic stubs): the q51 planes are never
+    // repacked, so the portable disk-order forms are correct on every backend — a native/tuned
+    // backend overrides them explicitly.
+    q51_batch : MatmulQ51Q8BatchFn = @@q51q8_batch_kernel
+    groupn_q51 : MatmulQ51GroupNFn = @@q51q8_groupn_kernel
+    q51_batch_groupn : MatmulQ51Q8BatchGroupNFn = @@q51q8_batch_groupn_kernel
     // Optional row-range GEMV core (see MatmulQ8Q8RowsFn) — backends without one keep the panic
     // stub, and the fused multi-stage decode falls back to the per-op dispatch path.
     mm_rows : MatmulQ8Q8RowsFn = @@q8q8_unset_rows
@@ -1293,6 +1305,9 @@ var g_mm_mx4q8_batch = @@mx4q8_unset_batch
 var g_mm_mx4q8_batch_groupn = @@mx4q8_unset_batch_groupn
 var g_mm_q8q8_groupn = @@q8q8_unset_groupn
 var g_mm_mx4q8_groupn = @@mx4q8_unset_groupn
+var g_mm_q51q8_batch = @@q51q8_batch_kernel
+var g_mm_q51q8_groupn = @@q51q8_groupn_kernel
+var g_mm_q51q8_batch_groupn = @@q51q8_batch_groupn_kernel
 var g_mm_q8q8_rows = @@q8q8_unset_rows
 var g_active_has_rows = false       // does the active backend carry a row-range GEMV core?
 var g_mm_q8q8_s16 = @@q8q8_unset_kernel_s16
@@ -2067,6 +2082,105 @@ def repack_mx4_identity(var np : uint8?; var ep : uint8?; n, d : int64) {}
 [unused_argument(fmt, kq, ks, n, d)]
 def repack_kq_identity(fmt : int; var kq : uint8?; var ks : uint8?; n, d : int64) {}
 
+//! Q5_1·Q8 dot, scalar reference form — THE q51 float-order contract every q51 kernel
+//! reproduces: per 32-block isum = Σ q·a (q = nibble | qh_bit << 4, unsigned [0,31]), asum = Σ a
+//! computed INLINE (Q8_0-form activations carry no block sums); f += (d·isum + m·asum)·xs[b].
+[hint(unsafe_range_check, noalias = wq, noalias = ws, noalias = xq, noalias = xs)]
+def dot_q51q8_scalar(wq : uint8 const?; ws : uint8 const?; xq : int8 const?; xs : float const?; n : int64) : float {
+    let nb = n / 32l
+    var f = 0.0
+    unsafe {
+        for (bi in range64(nb)) {
+            let wb = bi * 20l
+            let xb = bi * 32l
+            let qh = uint(wq[wb + 16l]) | (uint(wq[wb + 17l]) << 8u) | (uint(wq[wb + 18l]) << 16u) | (uint(wq[wb + 19l]) << 24u)
+            var isum = 0
+            var asum = 0
+            for (j in range64(16l)) {
+                let b = int(wq[wb + j])
+                let h0 = (int(qh >> uint(j)) & 1) << 4
+                let h1 = (int(qh >> uint(j + 16l)) & 1) << 4
+                let a0 = int(xq[xb + j])
+                let a1 = int(xq[xb + j + 16l])
+                isum += ((b & 15) | h0) * a0 + ((b >> 4) | h1) * a1
+                asum += a0 + a1
+            }
+            let d = f16_to_f32(uint(ws[bi * 4l]) | (uint(ws[bi * 4l + 1l]) << 8u))
+            let m = f16_to_f32(uint(ws[bi * 4l + 2l]) | (uint(ws[bi * 4l + 3l]) << 8u))
+            f += (d * float(isum) + m * float(asum)) * xs[bi]
+        }
+    }
+    return f
+}
+
+// Portable q51 batch (the KernelBackend.q51_batch default): rows-outer/tokens-inner over the
+// scalar row dot — the mm_b_q51_pre core (one expert region, ntok token rows).
+def q51q8_batch_kernel(var yp : float?; wq : uint8 const?; ws : uint8 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
+    let nb = n / 32l
+    var myp = yp
+    unsafe {
+        maybe_parallel_for(0, int(d), matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let wrow = wq + int64(i) * nb * 20l
+                    let srow = ws + int64(i) * nb * 4l
+                    for (tk in range64(ntok)) {
+                        myp[tk * d + int64(i)] = dot_q51q8_scalar(wrow, srow, xqp + tk * n, xsp + tk * nb, n)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Portable q51 groupN (the groupn_q51 default — MoE decode dispatch): (element woff, activation
+// xoff) pairs, one scalar row dot per (region, row). No bias form — no biased-q51 arch exists.
+def q51q8_groupn_kernel(var yp : float?; wq : uint8 const?; ws : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    unsafe {
+        maybe_parallel_for(0, int(nregions * d), matmul_chunks_gemv(int(nregions * d), 1, n * d * nregions)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let ii = int64(i)
+                    let r = ii / d
+                    let row = ii % d
+                    let woff = offs[r * 2l]
+                    let xoff = offs[r * 2l + 1l]
+                    myp[ii] = dot_q51q8_scalar(wq + (woff / 32l + row * nb) * 20l, ws + (woff / 32l + row * nb) * 4l,
+                        xqp + xoff, xsp + xoff / 32l, n)
+                }
+            }
+        }
+    }
+}
+
+// Portable q51 batch groupN (the q51_batch_groupn default — fused MoE prefill): (element woff,
+// row0, cnt) triples, per (region, row) scalar dots over the region's token-row range.
+def q51q8_batch_groupn_kernel(var yp : float?; wq : uint8 const?; ws : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    unsafe {
+        maybe_parallel_for(0, int(nregions * d), matmul_chunks(int(nregions * d), get_q8_batch_chunks_per_job(), n * d * nregions)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let ii = int64(i)
+                    let r = ii / d
+                    let row = ii % d
+                    let woff = offs[r * 3l]
+                    let row0 = offs[r * 3l + 1l]
+                    let cnt = offs[r * 3l + 2l]
+                    let wrow = wq + (woff / 32l + row * nb) * 20l
+                    let srow = ws + (woff / 32l + row * nb) * 4l
+                    for (tk in range64(cnt)) {
+                        myp[(row0 + tk) * d + row] = dot_q51q8_scalar(wrow, srow, xqp + (row0 + tk) * n, xsp + (row0 + tk) * nb, n)
+                    }
+                }
+            }
+        }
+    }
+}
+
 def private no_backend() {
     panic("dasLLAMA: no Q8·Q8 kernel backend registered — require dasllama/dasllama_math_default")
 }
@@ -2175,6 +2289,9 @@ def private activate(be : KernelBackend) {
     g_mm_mx4q8_batch_groupn = be.mx4_batch_groupn
     g_mm_q8q8_groupn = be.groupn
     g_mm_mx4q8_groupn = be.groupn_mx4
+    g_mm_q51q8_batch = be.q51_batch
+    g_mm_q51q8_groupn = be.groupn_q51
+    g_mm_q51q8_batch_groupn = be.q51_batch_groupn
     g_mm_q8q8_rows = be.mm_rows
     g_active_has_rows = !(be.mm_rows == @@q8q8_unset_rows)
     g_mm_q8q8_s16 = be.mm_s16
@@ -2230,6 +2347,8 @@ def private apply_batch_override(name : string) {
     g_mm_q8q8_batch = be.batch
     g_mm_mx4q8_batch = be.mx4_batch
     g_mm_mx4q8_batch_groupn = be.mx4_batch_groupn
+    g_mm_q51q8_batch = be.q51_batch
+    g_mm_q51q8_batch_groupn = be.q51_batch_groupn
     g_active_mx4_native_batch = be.mx4_native_batch
     g_active_batch_backend = be.name
 }
@@ -2756,6 +2875,40 @@ def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<
             addr<int64 const?>(offs[0]), nregions,
             addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
             addr<float const?>(bias[0]), addr<int64 const?>(boffs[0]), n, d)
+    }
+}
+
+//! Batched Q5_1·Q8 GEMM (blob+offset form): weight region at ELEMENT offset `woff` in the whole
+//! q51 planes (quants at (woff/32)*20, d+m at (woff/32)*4) — the mm_b_q51_pre core. n % 32 == 0.
+def matmul_q51q8_batch(var y : array<float>; wq : array<uint8>; ws : array<uint8>; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
+    unsafe {
+        invoke(g_mm_q51q8_batch, addr(y[0]),
+            addr<uint8 const?>(wq[(woff / 32l) * 20l]), addr<uint8 const?>(ws[(woff / 32l) * 4l]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, ntok)
+    }
+}
+
+//! Region-list Q5_1·Q8 GEMV — the q51 twin of matmul_mx4q8_groupn (offs pack (weight element
+//! offset, activation element offset) PAIRS; kernels derive the /32*20 and /32*4 byte positions).
+def matmul_q51q8_groupn(var y : array<float>; wq : array<uint8> | #; ws : array<uint8> | #; offs : array<int64>; nregions : int64;
+                        xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q51q8_groupn, addr(y[0]),
+            addr<uint8 const?>(wq[0]), addr<uint8 const?>(ws[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
+    }
+}
+
+//! Region-list batched Q5_1·Q8 GEMM — the q51 twin of matmul_mx4q8_batch_groupn (offs pack
+//! (weight element offset, row0, cnt) TRIPLES over one token-row image). n % 32 == 0.
+def matmul_q51q8_batch_groupn(var y : array<float>; wq : array<uint8> | #; ws : array<uint8> | #; offs : array<int64>; nregions : int64;
+                              xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q51q8_batch_groupn, addr(y[0]),
+            addr<uint8 const?>(wq[0]), addr<uint8 const?>(ws[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
     }
 }
 

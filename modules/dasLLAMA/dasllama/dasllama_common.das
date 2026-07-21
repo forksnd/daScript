@@ -40,16 +40,22 @@ enum QuantMode {
     q4_0
 }
 
-//! Per-weight storage format under a q8-mode load with native K-quant planes (kquant_native):
-//! q8 = qblob/qscales; k4/k5/k6 = the tensor's element offset indexes that format's plane pair. A
-//! Q4_K_M file mixes formats PER TENSOR, so the tag rides per layer next to each offset array.
+//! Per-weight storage format under a q8-mode load with native planes: q8 = qblob/qscales;
+//! k4/k5/k6/q40 = superblock plane pairs (a file mixes formats PER TENSOR — tags ride per layer);
+//! q51 = native Q5_1, per-32-BLOCK planes + Q8_0-form activations (rows % 32, expert stacks only).
 enum KqFmt : uint8 {
     q8
     k4
     k5
     k6
     q40
+    q51
 }
+
+// The superblock-lattice formats (Q8_K-form activations, % 256 rows, repack + stamped kq
+// kernels). q51 deliberately fails this: it rides per-32 planes with Q8_0-form activations —
+// a `fmt != KqFmt.q8` test no longer implies the kq lattice; branch on kq_sb where it does.
+def private kq_sb(f : KqFmt) : bool => f == KqFmt.k4 || f == KqFmt.k5 || f == KqFmt.k6 || f == KqFmt.q40
 
 //! FFN gate activation: silu = SwiGLU (Llama family), gelu = GeGLU (Gemma), swiglu_oai = the
 //! clamped SwiGLU with +1 on the up branch (gpt-oss).
@@ -545,6 +551,9 @@ struct Model {
     // the q40 tier's plane pair (128B nibbles — the k4 pairing — + 16B of f16 d per superblock)
     q40q : array<uint8>
     q40s : array<uint8>
+    // the q51 tier's plane pair, per 32-BLOCK: 20B nibbles+qh / 4B f16 d+m (never repacked)
+    q51q : array<uint8>
+    q51s : array<uint8>
     kquant_native : bool = false
     // kq stage 4: the kq planes were repacked at load into the active backend's grp<mr> layout.
     // From then on every kq matmul MUST run the backend slots — disk-order portable kernels would
@@ -783,6 +792,7 @@ struct private LayoutSizes {
     k5_n : int64
     k6_n : int64
     q40_n : int64
+    q51_n : int64
 }
 
 // The big-weight layout cursors: one element cursor per storage plane. kq_take advances the
@@ -793,6 +803,7 @@ struct private KqCursors {
     k5 : int64
     k6 : int64
     q40 : int64
+    q51 : int64
 }
 
 def private kq_take(var cur : KqCursors; f : KqFmt; n : int64) : int64 {
@@ -814,6 +825,11 @@ def private kq_take(var cur : KqCursors; f : KqFmt; n : int64) : int64 {
     if (f == KqFmt.q40) {
         let o = cur.q40
         cur.q40 += n
+        return o
+    }
+    if (f == KqFmt.q51) {
+        let o = cur.q51
+        cur.q51 += n
         return o
     }
     let o = cur.wo
@@ -1099,7 +1115,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         fo += dim
     }
     return LayoutSizes(fblob_n = fo, wblob_n = cur.wo, mx_n = mx, bf16_n = bf16,
-                       k4_n = cur.k4, k5_n = cur.k5, k6_n = cur.k6, q40_n = cur.q40)
+                       k4_n = cur.k4, k5_n = cur.k5, k6_n = cur.k6, q40_n = cur.q40, q51_n = cur.q51)
 }
 
 // Reserve exact capacity then size — avoids the array allocator's power-of-2 rounding on big arrays.
@@ -1214,6 +1230,8 @@ def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var 
         gguf_transcode_q6k(m, bytes, name, t.k6q, t.k6s, woff, n, src_off)
     } elif (fmt == KqFmt.q40) {
         gguf_transcode_q40(m, bytes, name, t.q40q, t.q40s, woff, n, src_off)
+    } elif (fmt == KqFmt.q51) {
+        gguf_transcode_q51(m, bytes, name, t.q51q, t.q51s, woff, n, src_off)
     } elif (t.quant == QuantMode.q8) {
         let gt = gguf_tensor_type(m, name)
         if (gt == GGML_TYPE_Q8_0) {
@@ -1425,6 +1443,19 @@ def public get_kq_q50_native() : bool {
     return g_kq_q50_native
 }
 
+// The q51 tier's bring-up knob: OFF keeps Q5_1 tensors on the q8-requant fallback (~1.4x expert
+// memory, exact) — the zero-risk A/B rail while the tier proves out.
+var private g_kq_q51_native = true
+
+//! Enable/disable the native Q5_1 plane tier for subsequent loads (A/B rail; default ON;
+//! requires kquant_native). Expert stacks only — dense positions always requant to q8.
+def public set_kq_q51_native(on : bool) {
+    g_kq_q51_native = on
+}
+def public get_kq_q51_native() : bool {
+    return g_kq_q51_native
+}
+
 def private count_fmt(a : array<KqFmt>; f : KqFmt) : int {
     var n = 0
     for (x in a) {
@@ -1452,8 +1483,8 @@ def private log_load_report(t : Model) {
     to_log(LOG_INFO, "dasLLAMA noisy: backend '{active_kernel_backend()}' | kquant_native {g_kquant_native} q40_native {g_kq_q40_native} q50_native {g_kq_q50_native}\n")
     // the tier arms at [init], before a --noisy CLI flag can land — restate it here so the flag alone suffices
     to_log(LOG_INFO, "dasLLAMA noisy: GPU tier installed {moe_gpu_tier_installed()} | want auto {gpu_want_auto()}, moe layers {gpu_want_moe_layers()}, stream {gpu_want_moe_stream()}\n")
-    to_log(LOG_INFO, "dasLLAMA noisy: format tags — q8 {tally_fmt(t, KqFmt.q8)}, k4 {tally_fmt(t, KqFmt.k4)}, k5 {tally_fmt(t, KqFmt.k5)}, k6 {tally_fmt(t, KqFmt.k6)}, q40 {tally_fmt(t, KqFmt.q40)}\n")
-    to_log(LOG_INFO, "dasLLAMA noisy: plane MB — q8 {float(long_length(t.qblob)) / mb} (+scales {float(long_length(t.qscales) * 4l) / mb}), k4 {float(long_length(t.k4q) + long_length(t.k4s)) / mb}, k5 {float(long_length(t.k5q) + long_length(t.k5s)) / mb}, k6 {float(long_length(t.k6q) + long_length(t.k6s)) / mb}, q40 {float(long_length(t.q40q) + long_length(t.q40s)) / mb}, f32 {float(long_length(t.wblob) * 4l) / mb}\n")
+    to_log(LOG_INFO, "dasLLAMA noisy: format tags — q8 {tally_fmt(t, KqFmt.q8)}, k4 {tally_fmt(t, KqFmt.k4)}, k5 {tally_fmt(t, KqFmt.k5)}, k6 {tally_fmt(t, KqFmt.k6)}, q40 {tally_fmt(t, KqFmt.q40)}, q51 {tally_fmt(t, KqFmt.q51)}\n")
+    to_log(LOG_INFO, "dasLLAMA noisy: plane MB — q8 {float(long_length(t.qblob)) / mb} (+scales {float(long_length(t.qscales) * 4l) / mb}), k4 {float(long_length(t.k4q) + long_length(t.k4s)) / mb}, k5 {float(long_length(t.k5q) + long_length(t.k5s)) / mb}, k6 {float(long_length(t.k6q) + long_length(t.k6s)) / mb}, q40 {float(long_length(t.q40q) + long_length(t.q40s)) / mb}, q51 {float(long_length(t.q51q) + long_length(t.q51s)) / mb}, f32 {float(long_length(t.wblob) * 4l) / mb}\n")
 }
 
 // GGML disk type -> plane format tag (non-K-quant types ride the classic q8 path)
@@ -1473,13 +1504,25 @@ def private kq_fmt_of(gt : int) : KqFmt {
     if (gt == GGML_TYPE_Q5_0 && g_kq_q50_native) {
         return KqFmt.k5
     }
+    if (gt == GGML_TYPE_Q5_1 && g_kq_q51_native) {
+        return KqFmt.q51
+    }
     return KqFmt.q8
 }
 
-// q40/q50 demotion: Q4_0 and Q5_0 guarantee rows % 32 only, but the kq tier's superblock walkers
-// need % 256 — a misaligned tensor falls back to the q8 requant path. `n` = the tensor's ROW length.
-// The k5 arm fires only for a Q5_0 source; a genuine Q5_K row is always % 256.
-def private kq_fmt_row_ok(f : KqFmt; n : int64) : KqFmt => (f == KqFmt.q40 || f == KqFmt.k5) && n % 256l != 0l ? KqFmt.q8 : f
+// Dense-position demotion: q40/k5-from-Q5_0 need % 256 rows (superblock walkers); q51 always
+// demotes — dense positions have no q51 dispatch (v1 is expert stacks — kq_fmt_expert_ok).
+def private kq_fmt_row_ok(f : KqFmt; n : int64) : KqFmt {
+    if (f == KqFmt.q51) return KqFmt.q8
+    return (f == KqFmt.q40 || f == KqFmt.k5) && n % 256l != 0l ? KqFmt.q8 : f
+}
+
+// Expert-stack tag rule: q51 serves natively off per-32 planes (its whole reason to exist — the
+// 26B-A4B down stacks are 704-wide); the superblock formats keep the % 256 rule.
+def private kq_fmt_expert_ok(f : KqFmt; n : int64) : KqFmt {
+    if (f == KqFmt.q51) return n % 32l == 0l ? f : KqFmt.q8
+    return kq_fmt_row_ok(f, n)
+}
 
 // Fill the per-kind weight format tags from the file's tensor types (q8-mode loads with the
 // kquant_native knob on). Fused-projection arches (Phi3) split attn_qkv/ffn_up at row-aligned
@@ -1530,14 +1573,14 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
         let fused_gu = t.config.moe_dense_shexp   // gemma4: experts ship fused as ffn_gate_up_exps
         for (l in range64(layers)) {
             if (fused_gu) {
-                let f = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate_up_exps.weight")), t.config.dim)
+                let f = kq_fmt_expert_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate_up_exps.weight")), t.config.dim)
                 t.we1_fmt[l] = f
                 t.we3_fmt[l] = f
             } else {
-                t.we1_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate_exps.weight")), t.config.dim)
-                t.we3_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up_exps.weight")), t.config.dim)
+                t.we1_fmt[l] = kq_fmt_expert_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate_exps.weight")), t.config.dim)
+                t.we3_fmt[l] = kq_fmt_expert_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up_exps.weight")), t.config.dim)
             }
-            t.we2_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_down_exps.weight")), t.config.n_ff_exp)
+            t.we2_fmt[l] = kq_fmt_expert_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_down_exps.weight")), t.config.n_ff_exp)
             any ||= t.we1_fmt[l] != KqFmt.q8 || t.we2_fmt[l] != KqFmt.q8 || t.we3_fmt[l] != KqFmt.q8
         }
     }
@@ -1575,6 +1618,12 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
 // Any K-quant-tagged expert stack in layer `l`? (The MoE dispatch and prefill gates branch on this.)
 def private moe_layer_kq(t : Model; l : int64) : bool {
     return fmt_at(t.we1_fmt, l) != KqFmt.q8 || fmt_at(t.we2_fmt, l) != KqFmt.q8 || fmt_at(t.we3_fmt, l) != KqFmt.q8
+}
+
+// Any expert stack on the SUPERBLOCK kq lattice? (q51 excluded — its grouped-prefill kernels are
+// always available, so it never gates on kq_repacked / the kq batch tile.)
+def private moe_layer_sb_kq(t : Model; l : int64) : bool {
+    return kq_sb(fmt_at(t.we1_fmt, l)) || kq_sb(fmt_at(t.we2_fmt, l)) || kq_sb(fmt_at(t.we3_fmt, l))
 }
 
 // Convert the (already repacked/permuted) f32 scale plane to raw binary16 halfwords and free the
@@ -3276,6 +3325,12 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             t.q40s |> reserve((sz.q40_n / 256l) * Q40_SSB)
             t.q40s |> resize((sz.q40_n / 256l) * Q40_SSB)
         }
+        if (sz.q51_n > 0l) {
+            t.q51q |> reserve((sz.q51_n / 32l) * Q51_QB)
+            t.q51q |> resize((sz.q51_n / 32l) * Q51_QB)
+            t.q51s |> reserve((sz.q51_n / 32l) * Q51_SB)
+            t.q51s |> resize((sz.q51_n / 32l) * Q51_SB)
+        }
         if (mode == QuantMode.q8) {
             t.qblob |> reserve(sz.wblob_n)
             t.qblob |> resize(sz.wblob_n)
@@ -3631,8 +3686,8 @@ def footprint(t : Model) : MemFootprint {
     let q4s = long_length(t.q4scales) * 4l
     let mx4 = long_length(t.mxq)                  // uint8 (two nibbles) -> 1 byte each
     let mx4s = long_length(t.mxs)                 // raw E8M0 -> 1 byte per 32-block
-    let kq = long_length(t.k4q) + long_length(t.k5q) + long_length(t.k6q) + long_length(t.q40q)
-    let kqs = long_length(t.k4s) + long_length(t.k5s) + long_length(t.k6s) + long_length(t.q40s)
+    let kq = long_length(t.k4q) + long_length(t.k5q) + long_length(t.k6q) + long_length(t.q40q) + long_length(t.q51q)
+    let kqs = long_length(t.k4s) + long_length(t.k5s) + long_length(t.k6s) + long_length(t.q40s) + long_length(t.q51s)
     return MemFootprint(aux_fp32_bytes = aux, weight_fp32_bytes = wf, q8_bytes = q8, q8_scale_bytes = q8s,
                         q4_bytes = q4, q4_scale_bytes = q4s, mx4_bytes = mx4, mx4_scale_bytes = mx4s,
                         kq_bytes = kq, kq_scale_bytes = kqs,
@@ -5354,6 +5409,20 @@ def private mm_at_mx4_groupn(var y : array<float>; t : Model; offs, boffs : arra
     matmul_mx4q8_groupn(y, t.mxq, t.mxs, offs, nregions, xq, xs, t.fblob, boffs, n, d)
 }
 
+// ===== native q51 dispatch (Q8_0-form activations — NOT the kq Q8_K image) =====
+
+def private mm_at_q51_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    matmul_q51q8_groupn(y, t.q51q, t.q51s, offs, nregions, xq, xs, n, d)
+}
+
+def private mm_b_q51_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
+    matmul_q51q8_batch(y, t.q51q, t.q51s, woff, xqb, xsb, n, d, npos)
+}
+
+def private mm_b_q51_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    matmul_q51q8_batch_groupn(y, t.q51q, t.q51s, offs, nregions, xq, xs, n, d)
+}
+
 // ===== native K-quant dispatch (kquant_native; fmt != q8 tags) =====
 
 // KqFmt -> the kernel-layer format id (matmul_kq*/kq_rows_fn/kq_qsb take the int form). q8 maps
@@ -5513,18 +5582,18 @@ def private kq_rows_for(fmt : KqFmt) : MatmulKqRowsFn {
     return kq_rows_fn(kq_fi(fmt))
 }
 
-// Can the fused chains serve a weight of this format? q8 always; kq only off a repacked load
-// (the backend rows cores read the grp layout the loader wrote).
-def private kq_servable(t : Model; fmt : KqFmt) : bool => fmt == KqFmt.q8 || t.kq_repacked
+// Can the fused chains serve a weight of this format? q8 always; superblock kq only off a
+// repacked load (the backend rows cores read the grp layout). q51 NEVER — no chain/rows arms.
+def private kq_servable(t : Model; fmt : KqFmt) : bool => fmt == KqFmt.q8 || (kq_sb(fmt) && t.kq_repacked)
 
-// kq v2 activation form: every kq format reads Q8_K-form activations (per-256 scale + per-16
-// bsums). The MoE gate/up pair shares ONE gathered/quantized activation plane, so its two
-// stacks must agree on the form: both kq (Q8_K) or both q8 (Q8_0).
+// Do the gate/up stacks read the Q8_K-form scratch? Superblock formats only — q8 AND q51 read
+// the Q8_0-form image. The pair shares ONE gathered activation plane, so both stacks must
+// agree on the form (mixed sb/non-sb panics).
 def private moe_pair_kform(f1, f3 : KqFmt) : bool {
-    let k1 = f1 != KqFmt.q8
-    let k3 = f3 != KqFmt.q8
+    let k1 = kq_sb(f1)
+    let k3 = kq_sb(f3)
     if (k1 != k3) {
-        panic("dasLLAMA: MoE gate/up expert stacks mix q8 and K-quant weights — unsupported until per-stack activation planes land")
+        panic("dasLLAMA: MoE gate/up expert stacks mix Q8_K-form and Q8_0-form weights — unsupported until per-stack activation planes land")
     }
     return k1
 }
@@ -7311,6 +7380,14 @@ def private heat_armed() : bool {
 
 def private heat_advise_layer(t : Model; l : int64; h : HeatLayer) {
     let c = t.config
+    // same fmt rule as the resident walk: a stack the tier has no kernels for (q51) never pools
+    let hf1 = fmt_at(t.we1_fmt, l)
+    let hf2 = fmt_at(t.we2_fmt, l)
+    let hf3 = fmt_at(t.we3_fmt, l)
+    if (!((hf1 == KqFmt.q8 || moe_gpu_fmt_kq(hf1)) && (hf2 == KqFmt.q8 || moe_gpu_fmt_kq(hf2))
+            && (hf3 == KqFmt.q8 || moe_gpu_fmt_kq(hf3)))) {
+        return
+    }
     var ids <- [for (i in range(length(h.cnt))); int64(i)]
     ids |> sort() $(a, b) => h.cnt[a] > h.cnt[b]
     var want = min(g_heat_want, int64(length(ids)))
@@ -7632,8 +7709,10 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
                         mi++
                     }
                 }
-                if (f1 != KqFmt.q8) {
+                if (kq_sb(f1)) {
                     mm_at_kq_groupn(s.moe_gu, t, f1, s.moe_offs, m, s.kxq, s.kxs, s.kxbs, dim, nfe)
+                } elif (f1 == KqFmt.q51) {
+                    mm_at_q51_groupn(s.moe_gu, t, s.moe_offs, m, s.moe_xq, s.moe_xs, dim, nfe)
                 } else {
                     mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, m, s.moe_xq, s.moe_xs, dim, nfe)
                 }
@@ -7645,8 +7724,10 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
                         mi++
                     }
                 }
-                if (f3 != KqFmt.q8) {
+                if (kq_sb(f3)) {
                     mm_at_kq_groupn(s.moe_gu2, t, f3, s.moe_offs, m, s.kxq, s.kxs, s.kxbs, dim, nfe)
+                } elif (f3 == KqFmt.q51) {
+                    mm_at_q51_groupn(s.moe_gu2, t, s.moe_offs, m, s.moe_xq, s.moe_xs, dim, nfe)
                 } else {
                     mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, m, s.moe_xq, s.moe_xs, dim, nfe)
                 }
@@ -7654,7 +7735,7 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
                 let ts_act = ref_time_ticks()
                 gate_batch(s.moe_gu, s.moe_gu2, c.ffn_act, nfe, m)
                 prof_add("act", ts_act)
-                if (f2 != KqFmt.q8) {
+                if (kq_sb(f2)) {
                     requant_rows_q8k_bs(s.moe_gu, nfe, m, s.moe_dq, s.moe_ds, s.moe_dbs)
                 } else {
                     requant_rows_q8(s.moe_gu, nfe, m, s.moe_dq, s.moe_ds)
@@ -7668,8 +7749,10 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
                         mi++
                     }
                 }
-                if (f2 != KqFmt.q8) {
+                if (kq_sb(f2)) {
                     mm_at_kq_groupn(s.moe_dn, t, f2, s.moe_offs, m, s.moe_dq, s.moe_ds, s.moe_dbs, nfe, dim)
+                } elif (f2 == KqFmt.q51) {
+                    mm_at_q51_groupn(s.moe_dn, t, s.moe_offs, m, s.moe_dq, s.moe_ds, nfe, dim)
                 } else {
                     mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, m, s.moe_dq, s.moe_ds, nfe, dim)
                 }
@@ -7699,8 +7782,10 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
                 s.moe_offs[j * 2l + 1l] = 0l   // gates share the single hoisted xb image
                 s.moe_boffs[j] = t.web1_off + e * nfe
             }
-            if (f1 != KqFmt.q8) {   // native K-quant expert stack reads the Q8_K-form scratch (never biased — detect guards that)
+            if (kq_sb(f1)) {   // native K-quant expert stack reads the Q8_K-form scratch (never biased — detect guards that)
                 mm_at_kq_groupn(s.moe_gu, t, f1, s.moe_offs, k, s.kxq, s.kxs, s.kxbs, dim, nfe)
+            } elif (f1 == KqFmt.q51) {   // native Q5_1 stack reads the Q8_0-form image (never biased)
+                mm_at_q51_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
             } elif (t.experts_mx4) {   // native 4-bit expert weights — half the Q8 traffic
                 if (biased) {
                     mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
@@ -7718,8 +7803,10 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
                 s.moe_offs[j * 2l + 1l] = 0l   // ups read the same hoisted xb image (explicit, not inherited from the gate pass)
                 s.moe_boffs[j] = t.web3_off + e * nfe
             }
-            if (f3 != KqFmt.q8) {   // kq v2: Q8_K-form scratch
+            if (kq_sb(f3)) {   // kq v2: Q8_K-form scratch
                 mm_at_kq_groupn(s.moe_gu2, t, f3, s.moe_offs, k, s.kxq, s.kxs, s.kxbs, dim, nfe)
+            } elif (f3 == KqFmt.q51) {
+                mm_at_q51_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
             } elif (t.experts_mx4) {
                 if (biased) {
                     mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
@@ -7735,7 +7822,7 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             let ts_act = ref_time_ticks()
             gate_batch(s.moe_gu, s.moe_gu2, c.ffn_act, nfe, k)
             prof_add("act", ts_act)
-            if (f2 != KqFmt.q8) {   // kq v2: the down stack reads Q8_K-form rows
+            if (kq_sb(f2)) {   // kq v2: the down stack reads Q8_K-form rows; q51/q8 the Q8_0 form
                 requant_rows_q8k_bs(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds, s.moe_dbs)
             } else {
                 requant_rows_q8(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds)   // books mm_requant
@@ -7747,8 +7834,10 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
                 s.moe_offs[j * 2l + 1l] = j * nfe   // each down reads its own requantized row
                 s.moe_boffs[j] = t.web2_off + e * dim   // down bias inside the routed weight (ggml_add_id order)
             }
-            if (f2 != KqFmt.q8) {
+            if (kq_sb(f2)) {
                 mm_at_kq_groupn(s.moe_dn, t, f2, s.moe_offs, k, s.moe_dq, s.moe_ds, s.moe_dbs, nfe, dim)
+            } elif (f2 == KqFmt.q51) {
+                mm_at_q51_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
             } elif (t.experts_mx4) {
                 if (biased) {
                     mm_at_mx4_groupn(s.moe_dn, t, s.moe_offs, s.moe_boffs, k, s.moe_dq, s.moe_ds, nfe, dim)
@@ -8080,7 +8169,7 @@ def private ffn_gemma4_prefill(t : Model; var s : Session; l : int64; npos : int
     }
     let dim = c.dim
     // kq-expert layers ride grouped buckets via the kq batch tile; portable/no-kq backends take the per-position path
-    let kq_grouped_ok = !moe_layer_kq(t, l) || (t.kq_repacked && kernel_backend_has_kq_batch())
+    let kq_grouped_ok = !moe_layer_sb_kq(t, l) || (t.kq_repacked && kernel_backend_has_kq_batch())
     if (t.quant == QuantMode.q8 && g_moe_grouped_prefill && kq_grouped_ok) {
         gemma4_moe_prefill_grouped(t, s, l, npos)
     } else {
@@ -10499,9 +10588,12 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     let f1 = fmt_at(t.we1_fmt, l)
     let f2 = fmt_at(t.we2_fmt, l)
     let f3 = fmt_at(t.we3_fmt, l)
-    // fused single-dispatch GEMMs: native mx4-batch backends, or kq layers whose stacks are ALL K-quant
-    let fused_kq = (kq_layer && f1 != KqFmt.q8 && f2 != KqFmt.q8 && f3 != KqFmt.q8
-        && t.kq_repacked && kernel_backend_has_kq_batch_groupn() && g_moe_fused_expert_gemms)
+    // fused single-dispatch GEMMs: all stacks native-plane (sb-kq needs repack+tile; q51 always)
+    let sb_fusable = t.kq_repacked && kernel_backend_has_kq_batch_groupn()
+    let fused_kq = (kq_layer && g_moe_fused_expert_gemms
+        && (kq_sb(f1) ? sb_fusable : f1 == KqFmt.q51)
+        && (kq_sb(f2) ? sb_fusable : f2 == KqFmt.q51)
+        && (kq_sb(f3) ? sb_fusable : f3 == KqFmt.q51))
     // GPU MoE tier: offloaded layers run the whole expert FFN chain device-side; tiny batches stay CPU (GPU submit cost > the GEMM)
     let fused_gpu = (!c.moe_exps_bias && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai
         && (moe_gpu_layer_on_gpu(l) || moe_gpu_layer_streamed(l)) && g_moe_fused_expert_gemms && npos >= 32l && gpu_prefill_route_on())
@@ -10665,9 +10757,17 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
                 s.moe_gxq, s.moe_gxs, dim, nfe, nk, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
             prof_add("moe_gpu", ts_g1)
         } else {
-            if (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
-                mm_b_kq_groupn(s.moe_ghb, t, f1, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
-                mm_b_kq_groupn(s.moe_ghb2, t, f3, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
+            if (fused_kq) {   // native-plane: one batched region-list GEMM per projection (never biased)
+                if (kq_sb(f1)) {
+                    mm_b_kq_groupn(s.moe_ghb, t, f1, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
+                } else {
+                    mm_b_q51_groupn(s.moe_ghb, t, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+                }
+                if (kq_sb(f3)) {
+                    mm_b_kq_groupn(s.moe_ghb2, t, f3, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
+                } else {
+                    mm_b_q51_groupn(s.moe_ghb2, t, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+                }
             } elif (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
                 matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, t.fblob, s.moe_boffs1, dim, nfe)
                 matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, t.fblob, s.moe_boffs3, dim, nfe)
@@ -10679,14 +10779,16 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             let ts_act = ref_time_ticks()
             gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, nk)
             prof_add("act", ts_act)
-            if (fused_kq) {   // kq v2: the down stacks read Q8_K-form rows (+ the per-16 sums the fold consumes)
+            if (fused_kq && kq_sb(f2)) {   // kq v2: sb down stacks read Q8_K-form rows (+ per-16 sums); q51/q8 the Q8_0 form
                 requant_rows_q8k_bs(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs, s.moe_hbs)
             } else {
                 requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
             }
             let ts_g3 = ref_time_ticks()
-            if (fused_kq) {
+            if (fused_kq && kq_sb(f2)) {
                 mm_b_kq_groupn(s.moe_gout, t, f2, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim)
+            } elif (fused_kq) {
+                mm_b_q51_groupn(s.moe_gout, t, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim)
             } elif (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
                 matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, s.moe_boffs2, nfe, dim)
             } else {
@@ -10731,13 +10833,17 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         let eg = l * ne + e
         let base = e * dim * nfe
         if (kq_layer) {   // native kq batch tiles off the repacked planes, per-kind fmt (down may differ)
-            if (f1 != KqFmt.q8) {
+            if (kq_sb(f1)) {
                 mm_b_kq_pre(s.moe_ghb, t, f1, t.we1_offs[l] + base, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe, cnt)
+            } elif (f1 == KqFmt.q51) {
+                mm_b_q51_pre(s.moe_ghb, t, t.we1_offs[l] + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
             } else {
                 mm_b_q8_pre(s.moe_ghb, t, t.we1_offs[l] + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
             }
-            if (f3 != KqFmt.q8) {
+            if (kq_sb(f3)) {
                 mm_b_kq_pre(s.moe_ghb2, t, f3, t.we3_offs[l] + base, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe, cnt)
+            } elif (f3 == KqFmt.q51) {
+                mm_b_q51_pre(s.moe_ghb2, t, t.we3_offs[l] + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
             } else {
                 mm_b_q8_pre(s.moe_ghb2, t, t.we3_offs[l] + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
             }
@@ -10771,13 +10877,15 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         let ts_act = ref_time_ticks()
         gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, cnt)
         prof_add("act", ts_act)
-        if (f2 != KqFmt.q8) {   // kq v2: Q8_K-form rows + the per-16 sums the fold consumes
+        if (kq_sb(f2)) {   // kq v2: Q8_K-form rows + the per-16 sums the fold consumes; q51/q8 the Q8_0 form
             requant_rows_q8k_bs(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs, s.moe_hbs)
         } else {
             requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)
         }
-        if (f2 != KqFmt.q8) {
+        if (kq_sb(f2)) {
             mm_b_kq_pre(s.moe_gout, t, f2, t.we2_offs[l] + base, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim, cnt)
+        } elif (f2 == KqFmt.q51) {
+            mm_b_q51_pre(s.moe_gout, t, t.we2_offs[l] + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
         } elif (t.experts_mx4 && g_active_mx4_native_batch) {
             mm_b_mx4_pre(s.moe_gout, t, t.we2_offs[l] + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
         } elif (t.experts_mx4) {
@@ -11066,23 +11174,30 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
         moe_gather_rows(s, b0, cnt, dim, k, moe_kform, moe_kform)
         prof_add("moe_gather", ts_gather)
         let base = e * dim * nfe
-        if (f1 != KqFmt.q8) {
+        if (kq_sb(f1)) {
             mm_b_kq_pre(s.moe_ghb, t, f1, t.we1_offs[l] + base, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe, cnt)
+        } elif (f1 == KqFmt.q51) {
+            mm_b_q51_pre(s.moe_ghb, t, t.we1_offs[l] + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
         } else {
             mm_b_q8_pre(s.moe_ghb, t, t.we1_offs[l] + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
         }
-        if (f3 != KqFmt.q8) {
+        if (kq_sb(f3)) {
             mm_b_kq_pre(s.moe_ghb2, t, f3, t.we3_offs[l] + base, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe, cnt)
+        } elif (f3 == KqFmt.q51) {
+            mm_b_q51_pre(s.moe_ghb2, t, t.we3_offs[l] + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
         } else {
             mm_b_q8_pre(s.moe_ghb2, t, t.we3_offs[l] + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
         }
         let ts_act = ref_time_ticks()
         gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, cnt)
         prof_add("act", ts_act)
-        if (f2 != KqFmt.q8) {
+        if (kq_sb(f2)) {
             // kq v2: Q8_K-form rows + the per-16 sums the fold consumes
             requant_rows_q8k_bs(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs, s.moe_hbs)
             mm_b_kq_pre(s.moe_gout, t, f2, t.we2_offs[l] + base, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim, cnt)
+        } elif (f2 == KqFmt.q51) {
+            requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)
+            mm_b_q51_pre(s.moe_gout, t, t.we2_offs[l] + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
         } else {
             requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)
             mm_b_q8_pre(s.moe_gout, t, t.we2_offs[l] + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
@@ -11163,7 +11278,7 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
     // native-MXFP4 grouped path pays a per-touched-expert Q8 expansion (~120MB/expert); under ~8 rows/expert the per-position mx4 GEMVs are cheaper
     let mx4_grouped_pays = !t.experts_mx4 || npos * c.n_expert_used >= 8l * c.n_expert
     // kq-expert layers ride grouped buckets via the kq batch tile; portable/no-kq backends take the per-position path
-    let kq_grouped_ok = !moe_layer_kq(t, l) || (t.kq_repacked && kernel_backend_has_kq_batch())
+    let kq_grouped_ok = !moe_layer_sb_kq(t, l) || (t.kq_repacked && kernel_backend_has_kq_batch())
     if (t.quant == QuantMode.q8 && g_moe_grouped_prefill && mx4_grouped_pays && kq_grouped_ok) {
         ffn_moe_prefill_grouped(t, s, l, npos)
     } else {
