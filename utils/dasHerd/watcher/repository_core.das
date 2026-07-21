@@ -163,7 +163,7 @@ def private load_config : string {
     return ""
 }
 
-def public repository_init(config_path, bootstrap_checkout : string) : string {
+def public repository_init(config_path : string; bootstrap_checkout : string) : string {
     g_config_path = config_path
     let load_error = load_config()
     if (!empty(load_error)) return load_error
@@ -274,7 +274,9 @@ def public repository_build_file_diff_argv(worktree_path : string;
     return ""
 }
 
-def public repository_file_diff_argv(repository_id, worktree_path, file_path,
+def public repository_file_diff_argv(repository_id : string;
+                                     worktree_path : string;
+                                     file_path : string;
                                      comparison : string;
                                      var argv : array<string>&;
                                      var expected_exit_code : int64&;
@@ -359,7 +361,8 @@ def public repository_read_file_bytes(path : string; max_bytes : int;
     return loaded ? "" : "could not read file bytes"
 }
 
-def public repository_working_preview_path(worktree_path, file_path : string;
+def public repository_working_preview_path(worktree_path : string;
+                                           file_path : string;
                                            var absolute_path : string&) : string {
     absolute_path = ""
     if (!repository_valid_relative_file_path(file_path)) {

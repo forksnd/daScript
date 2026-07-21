@@ -515,7 +515,7 @@ def public watcher_compact_session(session_id : string;
     return true
 }
 
-def public watcher_session_artifact_path(session_id, name : string) : string {
+def public watcher_session_artifact_path(session_id : string; name : string) : string {
     if (empty(name) || name == "." || name == ".." || find(name, "/") >= 0
             || find(name, "\\") >= 0 || find(name, ":") >= 0) return ""
     let index = watcher_find_session(session_id)
