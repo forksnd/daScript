@@ -833,6 +833,7 @@ struct BenchModel {
     @optional params_b : double    // total parameters, from llama-bench's model_n_params
     @optional active_b : double    // per-token active parameters (MoE-aware), from Config geometry
     @optional size_bytes : int64
+    @optional note : string        // board caveat for this model (quant substitution, capability gap)
 }
 
 //! True on a macOS box — the gate for Metal cells in the record driver.
@@ -892,6 +893,9 @@ def upsert_bench_model(var models : array<BenchModel>; var incoming : BenchModel
             }
             if (incoming.size_bytes > 0l) {
                 m.size_bytes = incoming.size_bytes
+            }
+            if (!empty(incoming.note)) {
+                m.note = incoming.note
             }
             for (i in range(length(incoming.runs))) {
                 upsert_bench_run(m.runs, incoming.runs[i])

@@ -193,7 +193,9 @@
       if (m.size_bytes) meta.push(fmt(m.size_bytes / 1073741824, 1) + ' GB');
       return '<div class="dl-bench-model"><div class="dl-bench-model__head">' +
         '<span class="dl-bench-model__name">' + esc(m.gguf) + '</span>' +
-        '<span class="dl-bench-model__meta">' + meta.join(' · ') + '</span></div>' + boxHTML + '</div>';
+        '<span class="dl-bench-model__meta">' + meta.join(' · ') + '</span></div>' +
+        (m.note ? '<div class="dl-bench-model__note">' + esc(m.note) + '</div>' : '') +
+        boxHTML + '</div>';
     }).join('');
 
     document.getElementById('bench-groups').innerHTML = html;

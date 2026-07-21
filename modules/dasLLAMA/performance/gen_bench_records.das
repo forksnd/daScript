@@ -52,20 +52,27 @@ struct Args {
     help : bool
 }
 
+struct private PubEntry {
+    file : string
+    note : string   // board caveat, stamped into the model record ("" = none)
+}
+
 // The public catalog: community-popular GGUFs, one popular quant each — NOT the internal quant
 // matrix. Curated to what people run THIS year (2026 spring/summer lists: Qwen3.6 family, gemma-4
 // daily drivers, the standing staples). Absent files skip with a warning, so one list serves
 // every box.
-def private pub_catalog() : array<string> {
+def private pub_catalog() : array<PubEntry> {
     return <- [
-        "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf",
-        "Qwen3.6-27B-MTP-Q4_K_M.gguf",
-        "gemma-4-26B-A4B-it-Q4_K_M.gguf",
-        "gemma-4-12B-it-Q4_K_M.gguf",
-        "gemma-4-E4B-it-Q8_0.gguf",
-        "gpt-oss-20b-mxfp4.gguf",
-        "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-        "Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+        PubEntry(file = "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf"),
+        PubEntry(file = "Qwen3.6-27B-MTP-Q4_K_M.gguf"),
+        PubEntry(file = "gemma-4-26B-A4B-it-Q8_0.gguf",
+            note = "the widespread Q4_K_M file stores its expert tensors as Q5_1, which das does not run yet — benched at Q8_0 until that lands"),
+        PubEntry(file = "gemma-4-12B-it-Q4_K_M.gguf"),
+        PubEntry(file = "gemma-4-E4B-it-Q8_0.gguf",
+            note = "das Metal decode does not serve the E-series graph yet — das rows are CPU only"),
+        PubEntry(file = "gpt-oss-20b-mxfp4.gguf"),
+        PubEntry(file = "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"),
+        PubEntry(file = "Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf")
     ]
 }
 
@@ -78,11 +85,14 @@ def private elapsed_ms(t0 : int64) : int {
     return get_time_usec(t0) / 1000
 }
 
-// Stamp source and upsert every run of `cell` into the store, then persist.
-def private absorb_cell(var models : array<BenchModel>; var cell : array<BenchModel>; store : string) {
+// Stamp source + the catalog note and upsert every run of `cell` into the store, then persist.
+def private absorb_cell(var models : array<BenchModel>; var cell : array<BenchModel>; store, note : string) {
     for (c in cell) {
         for (r in c.runs) {
             r.source = "official"
+        }
+        if (!empty(note)) {
+            c.note = note
         }
         upsert_bench_model(models, c)
     }
@@ -133,9 +143,11 @@ def main : int {
     let box = box_name()
     let threads = cfg.threads > 0 ? cfg.threads : profile_threads()
     let cellPath = "modules/dasLLAMA/performance/records/_cell_{box}.json"
+    let hasMetal = !empty(backends) && backends[length(backends) - 1] == "metal"
     var failed : array<string>
     var cat <- pub_catalog()
-    for (file in cat) {
+    for (ent in cat) {
+        let file = ent.file
         if (!empty(cfg.only) && find(file, cfg.only) < 0) {
             continue
         }
@@ -146,7 +158,7 @@ def main : int {
         }
         for (be in backends) {
             let t0 = ref_time_ticks()
-            to_log(LOG_INFO, "gen_bench_records: START {file} {be}\n")
+            to_log(LOG_INFO, "gen_bench_records: START {file} das {be}\n")
             var args <- [daslang_bin(), "-jit", "modules/dasLLAMA/benchmarks/lcpp_bench.das", "--",
                          "-m", path, "-p", "{cfg.plen}", "-n", "{cfg.ngen}", "-r", "{cfg.reps}",
                          "-t", "{threads}", "-o", "json", "--json-path", cellPath]
@@ -154,42 +166,43 @@ def main : int {
                 args |> push("--ngl")
                 args |> push("99")
             }
-            let ref = be == "metal" ? refStock : refClean
-            if (!empty(ref)) {
-                args |> push("--ref")
-                args |> push(ref)
-                args |> push("--ref-flavor")
-                args |> push(be == "metal" ? "stock" : "clean-cpu")
-            }
             var out = ""
             let rc = run_and_capture(args, out)
             var cell : array<BenchModel>
             if (rc != 0 || !read_bench_records(cellPath, cell)) {
                 let tail = slice(out, max(0, length(out) - 400))
-                to_log(LOG_ERROR, "gen_bench_records: FAILED {file} {be} rc={rc} ({elapsed_ms(t0)} ms) — tail: {tail}\n")
-                failed |> push("{file} {be}")
+                to_log(LOG_ERROR, "gen_bench_records: FAILED {file} das {be} rc={rc} ({elapsed_ms(t0)} ms) — tail: {tail}\n")
+                failed |> push("{file} das {be}")
                 continue
             }
-            absorb_cell(models, cell, store)
+            absorb_cell(models, cell, store, ent.note)
             remove(cellPath)
-            to_log(LOG_INFO, "gen_bench_records: DONE {file} {be} ({elapsed_ms(t0)} ms)\n")
+            to_log(LOG_INFO, "gen_bench_records: DONE {file} das {be} ({elapsed_ms(t0)} ms)\n")
         }
-        // the stock CPU row — llama.cpp as shipped (Accelerate on macOS), -ngl 0, direct
-        if (!empty(refStock)) {
+        // reference rows run independently of the das cells — a das capability gap must not cost
+        // the board its llama.cpp rows (or vice versa)
+        for (rp in range(3)) {
+            let bin = rp == 0 ? refClean : refStock
+            let ngl = rp == 2 ? 99 : 0
+            let flavor = rp == 0 ? "clean-cpu" : "stock"
+            if (empty(bin) || (ngl != 0 && !hasMetal)) {
+                continue
+            }
+            let backend = ngl != 0 ? "metal" : "cpu"
             let t0 = ref_time_ticks()
-            let aff = affinity_on() ? lcpp_affinity_args(threads) : ""
-            let cmd = "{refStock} -m {path} -ngl 0 -t {threads}{aff} -p {cfg.plen} -n {cfg.ngen} -r {cfg.reps} -o json"
-            to_log(LOG_INFO, "gen_bench_records: START {file} cpu stock ref\n")
+            let aff = ngl == 0 && affinity_on() ? lcpp_affinity_args(threads) : ""
+            let cmd = "{bin} -m {path} -ngl {ngl} -t {threads}{aff} -p {cfg.plen} -n {cfg.ngen} -r {cfg.reps} -o json"
+            to_log(LOG_INFO, "gen_bench_records: START {file} ref {flavor} {backend}\n")
             var rows : array<LlamaBenchRow>
-            if (!run_llama_bench(cmd, rows)) {
-                to_log(LOG_ERROR, "gen_bench_records: FAILED {file} stock cpu ref ({elapsed_ms(t0)} ms)\n")
-                failed |> push("{file} cpu stock-ref")
+            if (!run_llama_bench(cmd, rows) || empty(rows)) {
+                to_log(LOG_ERROR, "gen_bench_records: FAILED {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms)\n")
+                failed |> push("{file} ref {flavor} {backend}")
                 continue
             }
             var rr = BenchRun(
                 engine = "llama.cpp",
-                backend = "cpu",
-                flavor = "stock",
+                backend = backend,
+                flavor = flavor,
                 box = box,
                 threads = threads,
                 date = date,
@@ -201,11 +214,11 @@ def main : int {
                 let tag = row.n_gen == 0 ? "pp{row.n_prompt}" : "tg{row.n_gen}"
                 rr.tests |> insert(tag, BenchTest(tok_s = row.avg_ts, stddev = row.stddev_ts))
             }
-            var bm = BenchModel(gguf = file, params_b = double(rows[0].model_n_params) / 1.0e9lf)
+            var bm = BenchModel(gguf = file, params_b = double(rows[0].model_n_params) / 1.0e9lf, note = ent.note)
             bm.runs |> emplace(rr)
             upsert_bench_model(models, bm)
             write_bench_records(store, models)
-            to_log(LOG_INFO, "gen_bench_records: DONE {file} cpu stock ref ({elapsed_ms(t0)} ms)\n")
+            to_log(LOG_INFO, "gen_bench_records: DONE {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms)\n")
         }
     }
     if (!empty(failed)) {
