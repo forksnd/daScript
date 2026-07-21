@@ -61,9 +61,10 @@ def test_private_global(t : T?) {
         // result-type(0), result-id(1), storage-class(2).
         t |> success(op_has_operand_at(words, SpvOp.Variable, 2, uint(SpvStorageClass.Private)),
             "privg: private global is a Private OpVariable")
-        // a Private global is not a descriptor: no DescriptorSet / Binding decoration anywhere.
-        t |> success(!has_op(words, SpvOp.Decorate) ||
-            !op_has_operand(words, SpvOp.Decorate, uint(SpvDecoration.DescriptorSet)),
+        // a Private global is not a descriptor: no DescriptorSet decoration anywhere. OpDecorate
+        // operands: target-id(0), decoration(1) -- positional, so a target id that happens to equal
+        // DescriptorSet cannot false-positive.
+        t |> success(!op_has_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.DescriptorSet)),
             "privg: no DescriptorSet decoration (Private is not a descriptor)")
         validate(t, words, "privg")
         delete words

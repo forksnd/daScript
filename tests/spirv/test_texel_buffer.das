@@ -52,7 +52,8 @@ def test_texel_buffer(t : T?) {
         t |> success(count_op(words, SpvOp.Image) == 0, "no OpImage (the global IS the image)")
         t |> success(count_op(words, SpvOp.ImageFetch) == 1, "one OpImageFetch")
         t |> success(operand_count(words, SpvOp.ImageFetch) == 4, "OpImageFetch carries no image operands (no Lod)")
-        t |> success(op_has_operand(words, SpvOp.Capability, uint(SpvCapability.SampledBuffer)),
+        // The capability is operand 0 of OpCapability, so an id equal to the enum cannot match.
+        t |> success(op_has_operand_at(words, SpvOp.Capability, 0, uint(SpvCapability.SampledBuffer)),
             "OpCapability SampledBuffer")
         // The host binds a buffer view, not an image view, so the descriptor kind is its own.
         let refl = decode_reflection(tb_spv_reflect)

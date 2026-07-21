@@ -20,7 +20,7 @@ require spirv/spirv_builtins public // image types + imageStore / imageLoad / im
 require spirv/spirv_dis             // foreach_inst / op_has_operand_pair
 require spirv/spirv_grammar         // SpvOp / SpvDim / SpvImageFormat / SpvCapability
 
-// writeonly, exactly as comp_lut.glsl_inc declares them
+// writeonly, the way a LUT-baking compute shader declares its outputs
 var @binding = 0 @format = "rgba32f" @writeonly g_tex_big : image2DArray
 var @binding = 1 @format = "rgba16f" @writeonly g_tex_noise : image3D
 // the cube-arrayed + extended-format pair these shaders declare
@@ -56,6 +56,9 @@ let SAMPLED_OPERAND = 6
 let FORMAT_OPERAND = 7
 let SAMPLED_STORAGE = 2u
 
+// The capability is operand 0 of OpCapability; positional, so an id equal to the enum can't match.
+let CAP_OPERAND = 0
+
 // words[1] is the SPIR-V version word of the module header (magic, version, generator, bound, schema).
 let VERSION_WORD = 1
 
@@ -74,7 +77,7 @@ def private has_storage_image(words : array<uint>; dim : SpvDim; arrayed : uint;
 }
 
 def private has_cap(words : array<uint>; cap : SpvCapability) : bool {
-    return op_has_operand(words, SpvOp.Capability, uint(cap))
+    return op_has_operand_at(words, SpvOp.Capability, CAP_OPERAND, uint(cap))
 }
 
 // How many OpAccessChain instructions are based on the descriptor-array VARIABLE -- i.e. how many

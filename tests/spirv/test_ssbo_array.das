@@ -55,7 +55,8 @@ def test_ssbo_array(t : T?) {
             "ArrayStride on the two element arrays only (none on the descriptor array)")
         t |> success(count_op_with_operands(words, SpvOp.AccessChain, 6) == 2,
             "both descriptor-array accesses are a single 4-index OpAccessChain")
-        t |> success(op_has_operand(words, SpvOp.Capability, uint(SpvCapability.RuntimeDescriptorArray)),
+        // The capability is operand 0 of OpCapability, so an id equal to the enum cannot match.
+        t |> success(op_has_operand_at(words, SpvOp.Capability, 0, uint(SpvCapability.RuntimeDescriptorArray)),
             "OpCapability RuntimeDescriptorArray")
         // The host sizes the pool, so the binding reflects a variable descriptor count (0).
         let refl = decode_reflection(sa_spv_reflect)

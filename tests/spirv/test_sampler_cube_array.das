@@ -46,13 +46,15 @@ def test_sampler_cube_array(t : T?) {
         t |> success(count_op(words, SpvOp.TypeRuntimeArray) >= 1, "the descriptor array is an OpTypeRuntimeArray")
         // The read: chain one slot off the array, load the sampled image, sample it with an explicit Lod.
         t |> success(count_op(words, SpvOp.ImageSampleExplicitLod) == 1, "one OpImageSampleExplicitLod")
-        t |> success(op_has_operand(words, SpvOp.ImageSampleExplicitLod, uint(SpvImageOperands.Lod)),
+        // OpImageSampleExplicitLod operands: [result_type, result_id, sampled_image, coord, mask, lod].
+        t |> success(op_has_operand_at(words, SpvOp.ImageSampleExplicitLod, 4, uint(SpvImageOperands.Lod)),
             "the sample carries an explicit Lod operand")
         // An implicit-lod sample would be fragment-only and is not declared, so none may appear.
         t |> success(count_op(words, SpvOp.ImageSampleImplicitLod) == 0, "no implicit-lod sample")
-        t |> success(op_has_operand(words, SpvOp.Capability, uint(SpvCapability.SampledCubeArray)),
+        // The capability is operand 0 of OpCapability, so an id equal to the enum cannot match.
+        t |> success(op_has_operand_at(words, SpvOp.Capability, 0, uint(SpvCapability.SampledCubeArray)),
             "OpCapability SampledCubeArray")
-        t |> success(op_has_operand(words, SpvOp.Capability, uint(SpvCapability.RuntimeDescriptorArray)),
+        t |> success(op_has_operand_at(words, SpvOp.Capability, 0, uint(SpvCapability.RuntimeDescriptorArray)),
             "OpCapability RuntimeDescriptorArray")
         // The host sizes the pool, so the binding reports a variable descriptor count (0).
         let refl = decode_reflection(sca_spv_reflect)

@@ -21,6 +21,9 @@ require spirv/spirv_grammar         // SpvOp / SpvCapability / SpvGroupOperation
 // scope(2), GroupOperation(3), value(4).
 let GROUP_OP_OPERAND = 3
 
+// The capability is operand 0 of OpCapability; positional, so an id equal to the enum can't match.
+let CAP_OPERAND = 0
+
 var @ssbo @binding = 0 sg_in : array<float>
 var @ssbo @binding = 1 sg_out : array<float>
 var @ssbo @binding = 2 sg_iout : array<int>
@@ -104,7 +107,7 @@ def private has_group_op(words : array<uint>; op : SpvOp; gop : SpvGroupOperatio
 }
 
 def private has_cap(words : array<uint>; cap : SpvCapability) : bool {
-    return op_has_operand(words, SpvOp.Capability, uint(cap))
+    return op_has_operand_at(words, SpvOp.Capability, CAP_OPERAND, uint(cap))
 }
 
 def private has_builtin(words : array<uint>; bi : SpvBuiltIn) : bool {

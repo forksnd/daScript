@@ -61,8 +61,7 @@ def test_fragment_barycentric(t : T?) {
             "the @pervertex input is decorated PerVertexKHR")
         t |> success(op_has_operand_pair(words, SpvOp.Decorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.BaryCoordKHR)),
             "gl_BaryCoordEXT decorated BuiltIn BaryCoordKHR")
-        t |> success(op_has_operand(words, SpvOp.Capability, uint(SpvCapability.FragmentBarycentricKHR)),
-            "OpCapability FragmentBarycentricKHR")
+        // The capability is operand 0 of OpCapability, so an id equal to the enum cannot match.
         t |> success(count_op_operand_at(words, SpvOp.Capability, 0, uint(SpvCapability.FragmentBarycentricKHR)) == 1,
             "FragmentBarycentricKHR declared exactly once")
         t |> success(has_extension(words, "SPV_KHR_fragment_shader_barycentric"),
