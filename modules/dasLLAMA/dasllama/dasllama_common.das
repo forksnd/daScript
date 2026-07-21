@@ -1872,6 +1872,77 @@ def private moe_gpu_gather_upload(t : Model; f : KqFmt; woff : int64; n, rows, s
     return moe_gpu_upload_stack(wq, ws, woff, n, rows, int(f), stream)
 }
 
+//! What a whole-model resident load would cost on the device. The resident driver is all-or-nothing
+//! by construction — a half-resident whole-stack driver cannot run at all — so this is the decision,
+//! and it is computed from Model metadata BEFORE a single byte uploads.
+struct ResidentPlan {
+    weight_bytes : int64
+    kv_bytes : int64
+    budget_bytes : int64
+    fits : bool
+    reason : string       //!< "" when it fits; otherwise why, with a remedy where one exists
+}
+
+//! Size `t` for the resident driver at `seq_cap` context. Declines (fits = false) carry a reason:
+//! the commonest support question on this tier is "why did it decline", so the answer is the API.
+def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype) : ResidentPlan {
+    let c = t.config
+    var p = ResidentPlan(budget_bytes = moe_gpu_weight_budget())
+    if (p.budget_bytes <= 0l) {
+        p.reason = "no GPU tier armed"
+        return p
+    }
+    if (c.n_expert > 0l) {
+        p.reason = "MoE — the per-op offload tier serves routed experts, not the resident driver"
+        return p
+    }
+    // KV is reserved BEFORE weights and never grows: on a discrete card it competes directly with
+    // them, and evicting weights to grow it would mean re-uploading gigabytes.
+    var krow = 0l
+    var vrow = 0l
+    for (l in range64(c.n_layers)) {
+        krow += kv_row_bytes(kdt, layer_kv_dim(c, l))
+        vrow += kv_row_bytes(vdt, layer_kv_dim(c, l))
+    }
+    p.kv_bytes = seq_cap * (krow + vrow)
+    // every 2D plane a dense forward reads: the attention quad, the FFN triple, the classifier
+    for (l in range64(c.n_layers)) {
+        let qd = layer_qd(c, l)
+        let kvd = layer_kv_dim(c, l)
+        let hid = layer_hidden(t, l)
+        if (t.wq_offs[l] >= 0l) {
+            p.weight_bytes += moe_gpu_plane_bytes(c.dim, qd * (c.q_gated ? 2l : 1l), int(fmt_at(t.wq_fmt, l)))
+        }
+        if (t.wk_offs[l] >= 0l) {
+            p.weight_bytes += moe_gpu_plane_bytes(c.dim, kvd, int(fmt_at(t.wk_fmt, l)))
+        }
+        if (t.wv_offs[l] >= 0l) {
+            p.weight_bytes += moe_gpu_plane_bytes(c.dim, kvd, int(fmt_at(t.wv_fmt, l)))
+        }
+        if (t.wo_offs[l] >= 0l) {
+            p.weight_bytes += moe_gpu_plane_bytes(qd, c.dim, int(fmt_at(t.wo_fmt, l)))
+        }
+        if (t.w1_offs[l] >= 0l) {
+            p.weight_bytes += moe_gpu_plane_bytes(c.dim, hid, int(fmt_at(t.w1_fmt, l)))
+            p.weight_bytes += moe_gpu_plane_bytes(c.dim, hid, int(fmt_at(t.w3_fmt, l)))
+            p.weight_bytes += moe_gpu_plane_bytes(hid, c.dim, int(fmt_at(t.w2_fmt, l)))
+        }
+    }
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    p.weight_bytes += moe_gpu_plane_bytes(c.dim, c.vocab_size, int(cls_fmt))
+    let total = p.weight_bytes + p.kv_bytes
+    p.fits = total <= p.budget_bytes
+    if (!p.fits) {
+        // a shorter context is the remedy that actually works — weights are fixed, KV is not
+        let kv_fit = max(p.budget_bytes - p.weight_bytes, 0l)
+        let cap_fit = (krow + vrow) > 0l ? kv_fit / (krow + vrow) : 0l
+        p.reason = (cap_fit >= 512l
+            ? "needs {total >> 20l} MB of {p.budget_bytes >> 20l} MB at ctx {seq_cap} — would fit at ctx {cap_fit}"
+            : "needs {total >> 20l} MB of {p.budget_bytes >> 20l} MB (weights alone {p.weight_bytes >> 20l} MB)")
+    }
+    return p
+}
+
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
 // the end of every load rail so DASLLAMA_GPU_MOE_LAYERS behaves identically however the model
 // arrived. Layers go resident from the end while the tier's VRAM budget holds.

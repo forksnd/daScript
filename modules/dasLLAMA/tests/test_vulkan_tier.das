@@ -2283,6 +2283,69 @@ def test_vulkan_attention(t : T?) {
     }
 }
 
+// The resident driver's fused residual-add + RMSNorm — the kernel that collapses the layer
+// boundary to one dispatch. ascale != 1 and a non-zero addend on purpose: with ascale = 1 or a = 0
+// a dropped term would still land inside tolerance.
+// The in-place residual check is NOT redundant with the y check and must not be dropped: RMSNorm
+// is SCALE-INVARIANT, so a lost uniform factor (ascale) divides straight back out of y and is
+// invisible there — mutation-probed, y stayed in tolerance while x was off by 1.125 on a 0.003 bar.
+[test]
+def test_vulkan_add_rms(t : T?) {
+    t |> run("vulkan add+rms == CPU reference (fused arm + norm-only arm)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let AD = 512l
+            let EPS = 1e-5
+            let ASCALE = 0.75
+            for (arm in range(2)) {
+                let add_on = arm == 0
+                var x : array<float>
+                var a : array<float>
+                var w : array<float>
+                var y : array<float>
+                x |> resize(int(AD))
+                a |> resize(int(AD))
+                w |> resize(int(AD))
+                y |> resize(int(AD))
+                for (i in range(int(AD))) {
+                    x[i] = float((i % 17) - 8) * 0.25
+                    a[i] = float((i % 11) - 5) * 0.5
+                    w[i] = 1.0 + float(i % 7) * 0.125
+                }
+                // CPU reference over the pre-call x
+                var vv : array<float>
+                vv |> resize(int(AD))
+                var ss = 0.0lf
+                for (i in range(int(AD))) {
+                    vv[i] = add_on ? (x[i] + a[i]) * ASCALE : x[i]
+                    ss += double(vv[i]) * double(vv[i])
+                }
+                let inv = 1.0lf / sqrt(ss / double(AD) + double(EPS))
+                var refy : array<float>
+                refy |> resize(int(AD))
+                for (i in range(int(AD))) {
+                    refy[i] = float(double(w[i]) * double(vv[i]) * inv)
+                }
+                vk_add_rms(x, a, w, y, AD, EPS, ASCALE, add_on)
+                let cy = compare_gout(y, refy)
+                t |> success(cy.maxdiff <= float(REL_TOL) * cy.maxref,
+                    "add_rms arm {arm} y within tolerance (maxdiff {cy.maxdiff} vs {float(REL_TOL) * cy.maxref} bar)")
+                // x IS the residual stream — the kernel must have updated it in place
+                let cx = compare_gout(x, vv)
+                t |> success(cx.maxdiff <= float(REL_TOL) * cx.maxref,
+                    "add_rms arm {arm} residual updated in place (maxdiff {cx.maxdiff} vs {float(REL_TOL) * cx.maxref} bar)")
+                delete x
+                delete a
+                delete w
+                delete y
+                delete vv
+                delete refy
+            }
+        } else {
+            feint("dasVulkan not installed; add_rms untestable here\n")
+        }
+    }
+}
+
 // The resident driver's weight arena: many tensors in ONE buffer pair per format, addressed by
 // block index, so a whole dense model costs one descriptor set per format instead of one per plane
 // (the MAX_STACKS cap). TWO tensors on purpose — a single one lands at block 0 and would pass even

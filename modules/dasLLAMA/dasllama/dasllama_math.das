@@ -1783,9 +1783,14 @@ var g_moe_gpu_total_layers = 0l       // loader contract: n_layers of the loaded
 def private moe_gpu_no_arm : bool => false
 def private moe_gpu_no_vram : int64 => 0l
 def private moe_gpu_no_device : string => ""
+def private moe_gpu_no_budget : int64 => 0l
+[unused_argument(n, rows, fmt)]
+def private moe_gpu_no_plane_bytes(n, rows : int64; fmt : int) : int64 => 0l
 var g_moe_gpu_arm = @@moe_gpu_no_arm
 var g_moe_gpu_vram_report = @@moe_gpu_no_vram
 var g_moe_gpu_device_report = @@moe_gpu_no_device
+var g_moe_gpu_budget_report = @@moe_gpu_no_budget
+var g_moe_gpu_plane_bytes_fn = @@moe_gpu_no_plane_bytes
 
 def public set_gpu_tier_want(want : GpuTierWant) {
     g_gpu_want = want
@@ -1890,6 +1895,20 @@ def public set_moe_gpu_vram_report(f : function<() : int64>) {
 def public set_moe_gpu_device_report(f : function<() : string>) {
     g_moe_gpu_device_report = f
 }
+
+//! The tier reports its weight budget + its device-layout plane sizing through these. The
+//! resident driver needs both BEFORE any upload: it sums a whole model and either fits or declines,
+//! so the sizing must come from the backend that owns the layout, not a second copy of the strides.
+def public set_moe_gpu_budget_hooks(budget : function<() : int64>; plane : function<(n, rows : int64; fmt : int) : int64>) {
+    g_moe_gpu_budget_report = budget
+    g_moe_gpu_plane_bytes_fn = plane
+}
+
+//! Device-local bytes the armed tier may spend on resident weights (0 = no tier).
+def public moe_gpu_weight_budget() : int64 => invoke(g_moe_gpu_budget_report)
+
+//! Device-layout bytes one [rows x n] plane of `fmt` occupies (quants + scales). 0 = no tier.
+def public moe_gpu_plane_bytes(n, rows : int64; fmt : int) : int64 => invoke(g_moe_gpu_plane_bytes_fn, n, rows, fmt)
 
 def public moe_gpu_tier_installed : bool {
     return g_moe_gpu_installed

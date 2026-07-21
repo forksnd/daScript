@@ -1054,6 +1054,54 @@ def at_attn {
     }
 }
 
+// ===== the resident driver's residual-stream kernels =====
+// x = (x + a) * ascale then y = rms(x) * w in ONE dispatch — collapses the layer boundary. meta[1]
+// = 0 skips the add (the prologue's plain norm). Bindings 0 x | 1 a | 2 meta | 3 w | 5 y.
+
+var @workgroup ar_row : float[4096]   // AR_MAX_DIM — staged so the reread after the reduce needs
+                                      // no device-memory barrier (barrier() is a workgroup fence)
+var @workgroup ar_part : float[32]    // one partial per subgroup (32 covers subgroup size >= 8)
+var @workgroup ar_inv : float[1]
+
+[compute_shader(local_size_x=256, name="ar_add_rms_spv")]
+def ar_add_rms {
+    let dim = vk_meta[0u]
+    let add_on = vk_meta[1u]
+    let eps = vk_xs[0u]
+    let ascale = vk_xs[1u]
+    let tid = gl_LocalInvocationID.x
+    var ss = 0.0
+    var k = tid
+    while (k < dim) {
+        let vv = add_on != 0u ? (vk_upf[k] + vk_wsf[k]) * ascale : vk_upf[k]
+        vk_upf[k] = vv
+        ar_row[k] = vv
+        ss += vv * vv
+        k += 256u
+    }
+    ss = subgroupAdd(ss)
+    if (gl_SubgroupInvocationID == 0u) {
+        ar_part[gl_SubgroupID] = ss
+    }
+    barrier()
+    if (tid == 0u) {
+        var tot = 0.0
+        var sgi = 0u
+        while (sgi < gl_NumSubgroups) {
+            tot += ar_part[sgi]
+            sgi++
+        }
+        ar_inv[0u] = 1.0 / sqrt(tot / float(dim) + eps)   // the CPU rmsnorm's own form, not rsqrt
+    }
+    barrier()
+    let inv = ar_inv[0u]
+    k = tid
+    while (k < dim) {
+        vk_y[k] = vk_xqf[k] * (ar_row[k] * inv)
+        k += 256u
+    }
+}
+
 // plain Q8_K requant (no act) — the kq wo GEMM's activation image; input floats at vk_upf base
 // vk_meta[10], one thread per 256-weight superblock ([18] = superblock count). Mirrors
 // quantize_q8_k_into_ptr like q8k_moe_actrq does, minus the act.
@@ -1880,6 +1928,7 @@ let private AT_MAX_QD = 8_192l
 let private AT_MAX_KV = 1_024l
 let private AT_MAX_HS = 256l
 let private AT_META_BYTES = 128l
+let private AR_MAX_DIM = 4_096l   // the add+rms row cap — == the ar_row workgroup slab
 // smalls plane float offsets: [eps, scale] consts, the per-head qk-rms weight rows, then the
 // window's cos/sin rope rows packed contiguously (sin offset = AT_SM_COS + rows*half, meta [13])
 let private AT_SM_RMSQ = 16l
@@ -2030,6 +2079,7 @@ struct private GpuState {
     at_prep_k_pipeline : Pipeline   // attention k rms + rope, written at absolute batch positions
     at_attn_pipeline : Pipeline     // flash-style causal attention (GQA, online softmax, out-gate)
     q8k_rq_pipeline : Pipeline      // plain Q8_K requant (the kq wo GEMM's activation image)
+    ar_pipeline : Pipeline          // resident driver: fused residual-add + RMSNorm (meta[1]=0 = norm only)
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
@@ -2039,6 +2089,16 @@ struct private GpuState {
     // from `stacks` on purpose: the two tiers never co-arm on one model, and the arena has no
     // per-plane descriptor set to cap.
     arenas : table<int; ArenaFmt>
+    // residual-stream state (lazy — the add+rms kernel's buffers and its one descriptor set)
+    ar_x_dev : uint64
+    ar_a_dev : uint64
+    ar_w_dev : uint64
+    ar_y_dev : uint64
+    ar_meta : HostBuf
+    ar_scal : HostBuf
+    ar_host : HostBuf
+    ar_set : VkDescriptorSet
+    ar_ready : bool
     ffn_cmds : table<int64; FfnCmd>   // (gate, up, down stack idx triple) -> decode FFN chain
     resident_bytes : int64
     // heat-pinned expert cache (decode split-FFN) + the one-in-flight async FFN discipline
@@ -2346,6 +2406,8 @@ def private vk_moe_init : bool {
     g_gpu.at_attn_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, atshader)
     var qkrshader <- create_shader_module(g_gpu.device, q8k_requant_spv)
     g_gpu.q8k_rq_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, qkrshader)
+    var arshader <- create_shader_module(g_gpu.device, ar_add_rms_spv)
+    g_gpu.ar_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, arshader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -2407,11 +2469,9 @@ def private write_buf_desc(var writes : array<WriteDescriptorSet>; set_ : VkDesc
 
 // weight plane byte sizes for one [rows x n] stack in the tier's device layout
 def private stack_plane_bytes(n, rows : int64; fmt : int) : tuple<wq : int64; ws : int64> {
-    assert(fmt == 0 || n % 256l == 0l, "dasLLAMA vulkan tier: kq stack row length must be a superblock multiple")
-    let nsb = rows * (n / 256l)
-    let wqbytes = fmt == 0 ? rows * n : nsb * (fmt == 2 ? 160l : (fmt == 3 ? 192l : 128l))   // k4 and q40 share 128B
-    let wsbytes = fmt == 0 ? rows * (n / 32l) * 2l : nsb * 20l
-    return (wq = wqbytes, ws = wsbytes)
+    let nb = arena_blocks_for(n, rows, fmt)   // strides live in arena_block_bytes — one source
+    let bb = arena_block_bytes(fmt)
+    return (wq = nb * bb.wq, ws = nb * bb.ws)
 }
 
 // build a VkStack shell (weight plane buffers only — the GEMV/cls scratch is lazy, see
@@ -2663,6 +2723,72 @@ def private arena_ensure_scratch(fmt : int) {
         let no_copies : array<CopyDescriptorSet>
         update_descriptor_sets(g_gpu.device, writes, no_copies)
         a.ready = true
+    }
+}
+
+// residual-stream scratch for the add+rms kernel (lazy — only a resident-driver run creates it)
+def private ensure_ar_state {
+    if (g_gpu.ar_ready) {
+        return
+    }
+    let bytes = AR_MAX_DIM * 4l
+    g_gpu.ar_x_dev = make_device_buf(bytes)
+    g_gpu.ar_a_dev = make_device_buf(bytes)
+    g_gpu.ar_w_dev = make_device_buf(bytes)
+    g_gpu.ar_y_dev = make_device_buf(bytes)
+    g_gpu.ar_meta = make_host_buf(META_BYTES, true)
+    g_gpu.ar_scal = make_host_buf(XS_BYTES, true)
+    g_gpu.ar_host = make_host_buf(bytes, false, [cached = true])   // x and y readback
+    g_gpu.ar_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    write_buf_desc(writes, g_gpu.ar_set, 0u, g_gpu.ar_x_dev, bytes)
+    write_buf_desc(writes, g_gpu.ar_set, 1u, g_gpu.ar_a_dev, bytes)
+    write_buf_desc(writes, g_gpu.ar_set, 2u, g_gpu.ar_meta.buf, META_BYTES)
+    write_buf_desc(writes, g_gpu.ar_set, 3u, g_gpu.ar_w_dev, bytes)
+    write_buf_desc(writes, g_gpu.ar_set, 4u, g_gpu.ar_scal.buf, XS_BYTES)
+    write_buf_desc(writes, g_gpu.ar_set, 5u, g_gpu.ar_y_dev, bytes)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.ar_ready = true
+}
+
+//! Resident-driver seam: x = (x + a) * ascale then y = rms(x) * w, in ONE dispatch. `add` false
+//! runs the plain norm (the stack prologue). x is updated in place — it IS the residual stream.
+def vk_add_rms(var x : array<float>; a : array<float>; w : array<float>; var y : array<float>;
+               dim : int64; eps, ascale : float; add : bool) {
+    verify(vk_moe_init())   // assert() refuses side-effecting expressions; the probe must run
+    assert(dim <= AR_MAX_DIM, "dasLLAMA vulkan: add_rms dim exceeds AR_MAX_DIM")
+    ensure_ar_state()
+    let bytes = dim * 4l
+    unsafe {
+        var mp = reinterpret<uint?>(g_gpu.ar_meta.mapped)
+        mp[0] = uint(dim)
+        mp[1] = add ? 1u : 0u
+        var sp = reinterpret<float?>(g_gpu.ar_scal.mapped)
+        sp[0] = eps
+        sp[1] = ascale
+        upload_region_at(g_gpu.ar_x_dev, 0l, addr<uint8 const?>(x[0]), bytes)
+        upload_region_at(g_gpu.ar_w_dev, 0l, addr<uint8 const?>(w[0]), bytes)
+        if (add) {
+            upload_region_at(g_gpu.ar_a_dev, 0l, addr<uint8 const?>(a[0]), bytes)
+        }
+        var raw = alloc_cmd()
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.ar_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, g_gpu.ar_set, 1u)   // one workgroup owns the whole row (it reduces)
+        comp_barrier(raw)
+        cmd_copy_whole(raw, g_gpu.ar_y_dev, g_gpu.ar_host.buf, bytes)
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(raw)
+        memcpy(addr<void?>(y[0]), g_gpu.ar_host.mapped, int(bytes))
+        // x is the residual stream: read the updated row back too
+        var raw2 = alloc_cmd()
+        vk_check(vkBeginCommandBuffer(raw2, begin), null)
+        cmd_copy_whole(raw2, g_gpu.ar_x_dev, g_gpu.ar_host.buf, bytes)
+        vk_check(vkEndCommandBuffer(raw2), null)
+        submit_wait(raw2)
+        memcpy(addr<void?>(x[0]), g_gpu.ar_host.mapped, int(bytes))
     }
 }
 
@@ -4503,6 +4629,16 @@ def private vulkan_repack_noop(var wp : int8?; var sp : float?; n, d : int64) {}
 
 def private vk_resident_bytes : int64 => g_gpu != null ? g_gpu.resident_bytes : 0l
 
+// The resident driver sizes a whole model against these BEFORE uploading anything. Probing the
+// device here (rather than reporting 0 until something else arms it) is what lets the gate answer
+// "would this fit?" on a cold tier.
+def private vk_weight_budget : int64 => vk_moe_init() ? g_gpu.weight_budget : 0l
+
+def private vk_plane_bytes(n, rows : int64; fmt : int) : int64 {
+    let pb = stack_plane_bytes(n, rows, fmt)
+    return pb.wq + pb.ws
+}
+
 def private vk_device_name : string {
     if (g_gpu == null) {
         return ""
@@ -4557,6 +4693,7 @@ def dasllama_math_vulkan_register() {
     set_moe_gpu_arm("vulkan", @@vulkan_moe_gpu_arm)
     set_moe_gpu_vram_report(@@vk_resident_bytes)
     set_moe_gpu_device_report(@@vk_device_name)
+    set_moe_gpu_budget_hooks(@@vk_weight_budget, @@vk_plane_bytes)
     set_moe_gpu_dn_state_hooks(@@vk_dn_step_flush, @@vk_dn_step_invalidate)
     set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
     set_moe_gpu_qkv_hook(@@vk_moe_qkv)
