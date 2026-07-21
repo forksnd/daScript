@@ -2285,6 +2285,102 @@ def test_vulkan_attention(t : T?) {
     }
 }
 
+// Fused rope + KV-row store, BOTH rope arms — llama's NORM (adjacent pairs) and qwen/gemma's NEOX
+// (half-offset). This is the family-ledger kernel: llama is non-NEOX, which the attention rail's
+// existing rope arm does not cover. Verifies roped q + the stored K row (roped) + V row (raw).
+[test]
+def test_vulkan_rope_kv_store(t : T?) {
+    t |> run("vulkan rope+kv-store == CPU reference (NORM + NEOX arms)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let HS = 64l        // llama-family head size (the closed-rail case)
+            let NH = 4l
+            let NKV = 2l
+            let QD = NH * HS
+            let KVD = NKV * HS
+            let half = HS / 2l
+            let POS = 7l
+            if (!vk_device_ready()) {
+                feint("no Vulkan device; rope_kv_store untestable here\n")
+                return
+            }
+            for (arm in range(2)) {
+                let neox = arm == 1
+                var qkv : array<float>
+                qkv |> resize(int(QD + 2l * KVD))
+                for (i in range(int(QD + 2l * KVD))) {
+                    qkv[i] = float((i % 23) - 11) * 0.1
+                }
+                var cossin : array<float>
+                cossin |> resize(int(HS))
+                for (j in range(int(half))) {
+                    let ang = float(POS) * (1.0 / pow(10000.0, float(2l * int64(j)) / float(HS)))
+                    cossin[j] = cos(ang)
+                    cossin[int(half) + j] = sin(ang)
+                }
+                var qout : array<float>
+                var krow : array<float>
+                var vrow : array<float>
+                qout |> resize(int(QD))
+                krow |> resize(int(KVD))
+                vrow |> resize(int(KVD))
+                vk_rope_kv_store(qkv, qout, krow, vrow, cossin, QD, KVD, HS, POS, neox)
+                // CPU reference
+                var rq : array<float>
+                var rk : array<float>
+                var rv : array<float>
+                rq |> resize(int(QD))
+                rk |> resize(int(KVD))
+                rv |> resize(int(KVD))
+                for (i in range(int(QD))) { rq[i] = qkv[i] }
+                for (i in range(int(KVD))) {
+                    rk[i] = qkv[int(QD) + i]
+                    rv[i] = qkv[int(QD + KVD) + i]
+                }
+                // rope rq (NH heads) and rk (NKV heads) in place; same pair rule as the kernel
+                for (hh in range(int(NH + NKV))) {
+                    let is_q = hh < int(NH)
+                    let h = is_q ? hh : hh - int(NH)
+                    for (j in range(int(half))) {
+                        let e0 = neox ? h * int(HS) + j : h * int(HS) + j * 2
+                        let e1 = neox ? h * int(HS) + j + int(half) : h * int(HS) + j * 2 + 1
+                        let a0 = is_q ? rq[e0] : rk[e0]
+                        let a1 = is_q ? rq[e1] : rk[e1]
+                        let r0 = a0 * cossin[j] - a1 * cossin[int(half) + j]
+                        let r1 = a0 * cossin[int(half) + j] + a1 * cossin[j]
+                        if (is_q) {
+                            rq[e0] = r0
+                            rq[e1] = r1
+                        } else {
+                            rk[e0] = r0
+                            rk[e1] = r1
+                        }
+                    }
+                }
+                let cq = compare_gout(qout, rq)
+                let ck = compare_gout(krow, rk)
+                let cv = compare_gout(vrow, rv)
+                let tag = neox ? "NEOX" : "NORM"
+                t |> success(cq.maxdiff <= float(REL_TOL) * cq.maxref + 1e-6,
+                    "rope_kv {tag} q roped (maxdiff {cq.maxdiff})")
+                t |> success(ck.maxdiff <= float(REL_TOL) * ck.maxref + 1e-6,
+                    "rope_kv {tag} K stored roped (maxdiff {ck.maxdiff})")
+                t |> success(cv.maxdiff <= 1e-6,
+                    "rope_kv {tag} V stored raw (maxdiff {cv.maxdiff})")
+                delete qkv
+                delete cossin
+                delete qout
+                delete krow
+                delete vrow
+                delete rq
+                delete rk
+                delete rv
+            }
+        } else {
+            feint("dasVulkan not installed; rope_kv_store untestable here\n")
+        }
+    }
+}
+
 // The whole dense FFN against arena-resident planes: gate GEMV -> up GEMV -> fused act+requant ->
 // down GEMV, ONE submit. No new kernels — q8_moe_actrq is already region-free, so this is the
 // per-op chain with the weight base coming from an arena block index instead of a stack.

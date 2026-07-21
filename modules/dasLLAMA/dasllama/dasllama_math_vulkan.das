@@ -1102,6 +1102,48 @@ def ar_add_rms {
     }
 }
 
+// fused rope + KV-row store (decode, one token), f32 mirror. One thread per rotation pair; each
+// owns 2 distinct K + 2 V slots (no packing, no hazard). q roped in vk_y, k roped into vk_wsf, v raw
+// into vk_xqf at absolute pos. meta 0=qd 1=kvd 2=hs 3=half 4=neox 5=kpair0 6=npairs 7=krow_f 8=vrow_f.
+[compute_shader(local_size_x=256, name="rope_kv_store_spv")]
+def rope_kv_store {
+    let gid = gl_GlobalInvocationID.x
+    let npairs = vk_meta[6u]
+    if (gid < npairs) {
+        let qd = vk_meta[0u]
+        let hs = vk_meta[2u]
+        let half = vk_meta[3u]
+        let neox = vk_meta[4u]
+        let kpair0 = vk_meta[5u]
+        let is_k = gid >= kpair0
+        let lp = is_k ? gid - kpair0 : gid           // local pair index within q or k
+        let h = lp / half
+        let j = lp % half
+        let fcr = vk_xs[j]
+        let fci = vk_xs[half + j]
+        // NORM (llama): adjacent pair (2j, 2j+1). NEOX (qwen/gemma): (j, j+half).
+        let e0 = neox != 0u ? j : j * 2u
+        let e1 = neox != 0u ? j + half : j * 2u + 1u
+        if (is_k) {
+            let kb = qd + h * hs
+            let a0 = vk_upf[kb + e0]
+            let a1 = vk_upf[kb + e1]
+            vk_wsf[vk_meta[7u] + h * hs + e0] = a0 * fcr - a1 * fci
+            vk_wsf[vk_meta[7u] + h * hs + e1] = a0 * fci + a1 * fcr
+            // v is not roped — copy the same two elements raw into the V plane
+            let vb = qd + vk_meta[1u] + h * hs
+            vk_xqf[vk_meta[8u] + h * hs + e0] = vk_upf[vb + e0]
+            vk_xqf[vk_meta[8u] + h * hs + e1] = vk_upf[vb + e1]
+        } else {
+            let qb = h * hs
+            let a0 = vk_y[qb + e0]
+            let a1 = vk_y[qb + e1]
+            vk_y[qb + e0] = a0 * fcr - a1 * fci
+            vk_y[qb + e1] = a0 * fci + a1 * fcr
+        }
+    }
+}
+
 // plain Q8_K requant (no act) — the kq wo GEMM's activation image; input floats at vk_upf base
 // vk_meta[10], one thread per 256-weight superblock ([18] = superblock count). Mirrors
 // quantize_q8_k_into_ptr like q8k_moe_actrq does, minus the act.
@@ -2080,6 +2122,7 @@ struct private GpuState {
     at_attn_pipeline : Pipeline     // flash-style causal attention (GQA, online softmax, out-gate)
     q8k_rq_pipeline : Pipeline      // plain Q8_K requant (the kq wo GEMM's activation image)
     ar_pipeline : Pipeline          // resident driver: fused residual-add + RMSNorm (meta[1]=0 = norm only)
+    rks_pipeline : Pipeline         // resident driver: fused rope + KV-row store (f32 mirror)
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
@@ -2114,6 +2157,17 @@ struct private GpuState {
     af_actrq_set : VkDescriptorSet
     af_down_set : VkDescriptorSet
     af_ready : bool
+    // rope+KV-store state: qkv in, roped q out, K/V planes = one contiguous device KV scratch
+    rks_qkv_dev : uint64
+    rks_q_dev : uint64
+    rks_scal : HostBuf
+    rks_meta : HostBuf
+    rks_k_dev : uint64        // f32 K mirror (rows x kv_dim, absolute positions)
+    rks_v_dev : uint64        // f32 V mirror
+    rks_q_host : HostBuf
+    rks_kv_host : HostBuf      // K then V readback (test/parity only; the driver keeps them device-side)
+    rks_set : VkDescriptorSet
+    rks_ready : bool
     ffn_cmds : table<int64; FfnCmd>   // (gate, up, down stack idx triple) -> decode FFN chain
     resident_bytes : int64
     // heat-pinned expert cache (decode split-FFN) + the one-in-flight async FFN discipline
@@ -2423,6 +2477,8 @@ def private vk_moe_init : bool {
     g_gpu.q8k_rq_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, qkrshader)
     var arshader <- create_shader_module(g_gpu.device, ar_add_rms_spv)
     g_gpu.ar_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, arshader)
+    var rksshader <- create_shader_module(g_gpu.device, rope_kv_store_spv)
+    g_gpu.rks_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rksshader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -2879,6 +2935,82 @@ def private fill_af_meta(hb : HostBuf; n, d, blk : int64) {
         mp[3] = 0u
         mp[4] = uint(blk)   // the arena block index
         mp[5] = 0u
+    }
+}
+
+//! True when a Vulkan device is up (probes lazily). Non-panicking — the resident-driver seams that
+//! `verify(vk_moe_init())` are fine on this hardware, but a test wants to feint on a headless box.
+def vk_device_ready() : bool => vk_moe_init()
+
+let private RKS_MAX_QD = 8_192l
+let private RKS_MAX_KVD = 1_024l
+let private RKS_MAX_CTX = 4_096l   // K/V mirror rows in the standalone-kernel scratch
+
+def private ensure_rks_state {
+    if (g_gpu.rks_ready) {
+        return
+    }
+    g_gpu.rks_qkv_dev = make_device_buf((RKS_MAX_QD + 2l * RKS_MAX_KVD) * 4l)
+    g_gpu.rks_q_dev = make_device_buf(RKS_MAX_QD * 4l)
+    g_gpu.rks_k_dev = make_device_buf(RKS_MAX_CTX * RKS_MAX_KVD * 4l)
+    g_gpu.rks_v_dev = make_device_buf(RKS_MAX_CTX * RKS_MAX_KVD * 4l)
+    g_gpu.rks_scal = make_host_buf(XS_BYTES, true)
+    g_gpu.rks_meta = make_host_buf(META_BYTES, true)
+    g_gpu.rks_q_host = make_host_buf(RKS_MAX_QD * 4l, false, [cached = true])
+    g_gpu.rks_kv_host = make_host_buf(2l * RKS_MAX_KVD * 4l, false, [cached = true])
+    g_gpu.rks_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    write_buf_desc(writes, g_gpu.rks_set, 0u, g_gpu.rks_qkv_dev, (RKS_MAX_QD + 2l * RKS_MAX_KVD) * 4l)
+    write_buf_desc(writes, g_gpu.rks_set, 1u, g_gpu.rks_k_dev, RKS_MAX_CTX * RKS_MAX_KVD * 4l)
+    write_buf_desc(writes, g_gpu.rks_set, 2u, g_gpu.rks_meta.buf, META_BYTES)
+    write_buf_desc(writes, g_gpu.rks_set, 3u, g_gpu.rks_v_dev, RKS_MAX_CTX * RKS_MAX_KVD * 4l)
+    write_buf_desc(writes, g_gpu.rks_set, 4u, g_gpu.rks_scal.buf, XS_BYTES)
+    write_buf_desc(writes, g_gpu.rks_set, 5u, g_gpu.rks_q_dev, RKS_MAX_QD * 4l)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.rks_ready = true
+}
+
+//! Resident-driver seam (standalone-kernel form): rope the q row in place, rope the k row into the
+//! device K mirror at row `pos`, copy v raw into the V mirror at `pos`; then read q + that row's
+//! K/V back for parity. `neox` picks llama's adjacent-pair vs qwen/gemma's half-offset rope.
+def vk_rope_kv_store(var qkv : array<float>; var qout : array<float>; var krow : array<float>; var vrow : array<float>;
+                     cossin : array<float>; qd, kv_dim, head_size, pos : int64; neox : bool) {
+    verify(vk_moe_init())
+    let half = head_size / 2l
+    assert(qd <= RKS_MAX_QD && kv_dim <= RKS_MAX_KVD && pos < RKS_MAX_CTX, "dasLLAMA vulkan: rope_kv geometry over scratch")
+    ensure_rks_state()
+    let kpair0 = qd / 2l
+    let npairs = kpair0 + kv_dim / 2l
+    unsafe {
+        var mp = reinterpret<uint?>(g_gpu.rks_meta.mapped)
+        mp[0] = uint(qd)
+        mp[1] = uint(kv_dim)
+        mp[2] = uint(head_size)
+        mp[3] = uint(half)
+        mp[4] = neox ? 1u : 0u
+        mp[5] = uint(kpair0)
+        mp[6] = uint(npairs)
+        mp[7] = uint(pos * kv_dim)   // K mirror row offset (f32 elements)
+        mp[8] = uint(pos * kv_dim)   // V mirror row offset
+        memcpy(g_gpu.rks_scal.mapped, addr<void? -const>(cossin[0]), int(head_size * 4l))   // cos[half] + sin[half]
+        upload_region_at(g_gpu.rks_qkv_dev, 0l, addr<uint8 const?>(qkv[0]), (qd + 2l * kv_dim) * 4l)
+        // q enters the kernel via vk_y (binding 5) = rks_q_dev — seed it with the raw q rows
+        upload_region_at(g_gpu.rks_q_dev, 0l, addr<uint8 const?>(qkv[0]), qd * 4l)
+        var raw = alloc_cmd()
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.rks_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, g_gpu.rks_set, uint((npairs + int64(WG_X) - 1l) / int64(WG_X)))
+        comp_barrier(raw)
+        cmd_copy_whole(raw, g_gpu.rks_q_dev, g_gpu.rks_q_host.buf, qd * 4l)
+        cmd_copy_range(raw, g_gpu.rks_k_dev, pos * kv_dim * 4l, g_gpu.rks_kv_host.buf, 0l, kv_dim * 4l)
+        cmd_copy_range(raw, g_gpu.rks_v_dev, pos * kv_dim * 4l, g_gpu.rks_kv_host.buf, kv_dim * 4l, kv_dim * 4l)
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(raw)
+        memcpy(addr<void?>(qout[0]), g_gpu.rks_q_host.mapped, int(qd * 4l))
+        memcpy(addr<void?>(krow[0]), g_gpu.rks_kv_host.mapped, int(kv_dim * 4l))
+        memcpy(addr<void?>(vrow[0]), reinterpret<float?>(g_gpu.rks_kv_host.mapped) + kv_dim, int(kv_dim * 4l))
     }
 }
 
