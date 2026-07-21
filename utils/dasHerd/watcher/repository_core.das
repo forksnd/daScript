@@ -115,7 +115,17 @@ def private normalized_path(path : string) : string {
 }
 
 def private repository_id(target_id, path : string) : string {
-    return "{target_id}:{to_lower(path)}"
+    let identity_path = get_platform_name() == "windows" ? to_lower(path) : path
+    return "{target_id}:{identity_path}"
+}
+
+def public repository_valid_relative_file_path(path : string) : bool {
+    if (!valid_path(path) || starts_with(path, "/") || starts_with(path, "\\")
+            || is_absolute(path)) return false
+    if (get_platform_name() == "windows" && length(path) >= 2
+            && byte_at(path, 1) == ':') return false
+    return (path != ".." && !ends_with(path, "/..") && !ends_with(path, "\\..")
+        && find(path, "../") < 0 && find(path, "..\\") < 0)
 }
 
 def private changed(var runtime : RepositoryRuntime?) {
@@ -318,8 +328,7 @@ def public repository_working_file_text(repository_id, worktree_path, file_path 
         }
     }
     if (!file_found) return "file has no observed working-tree change"
-    if (starts_with(file_path, "/") || starts_with(file_path, "\\")
-            || find(file_path, "../") >= 0 || find(file_path, "..\\") >= 0) {
+    if (!repository_valid_relative_file_path(file_path)) {
         return "invalid worktree-relative file path"
     }
     let absolute_path = path_join(worktree_path, file_path)
@@ -348,8 +357,7 @@ def public repository_working_file_bytes(repository_id, worktree_path, file_path
         }
     }
     if (!file_found) return "file has no observed working-tree change"
-    if (starts_with(file_path, "/") || starts_with(file_path, "\\")
-            || find(file_path, "../") >= 0 || find(file_path, "..\\") >= 0) {
+    if (!repository_valid_relative_file_path(file_path)) {
         return "invalid worktree-relative file path"
     }
     let absolute_path = path_join(worktree_path, file_path)

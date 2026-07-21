@@ -260,13 +260,16 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
         unsafe { delete session }
         return WatcherLaunchResult(error = "could not open session logs")
     }
-    if (!write_text_file(path_join(session_dir, "session.json"), sprint_json(request, true))) {
+    let columns = clamp(request.columns, 20, 400)
+    let rows = clamp(request.rows, 5, 200)
+    var inscope persisted_request := request
+    persisted_request.columns = columns
+    persisted_request.rows = rows
+    if (!write_text_file(path_join(session_dir, "session.json"), sprint_json(persisted_request, true))) {
         unsafe { delete session }
         return WatcherLaunchResult(error = "could not write session metadata")
     }
 
-    let columns = clamp(request.columns, 20, 400)
-    let rows = clamp(request.rows, 5, 200)
     if (!empty(request.argv)) {
         var inscope launched <- terminal_launch_argv(request.argv, request.cwd, columns, rows)
         session.terminal := launched

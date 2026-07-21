@@ -46,11 +46,16 @@ def test_watcher_process_lifecycle(t : T?) {
         let missing_command = path_join(root, "missing-watcher-command.exe")
         let failed = watcher_launch(WatcherLaunchRequest(
             command_line = "\"{missing_command}\"", cwd = root,
-            columns = 80, rows = 20, timeout_ms = 5000l))
+            columns = 1, rows = 999, timeout_ms = 5000l))
         t |> success(!failed.ok, "failed PTY launch is reported to the caller")
         t |> success(!empty(failed.session_id), "failed PTY launch retains its diagnostic session")
         t |> success(find(watcher_snapshot_json(failed.session_id), "\"state\":\"failed\"") >= 0,
             "failed PTY launch is retained in watcher state")
+        let failed_metadata = fread(path_join(path_join(path_join(root, "sessions"),
+            failed.session_id), "session.json"))
+        t |> success(find(failed_metadata, "\"columns\":20") >= 0
+                && find(failed_metadata, "\"rows\":200") >= 0,
+            "session metadata retains the clamped launch dimensions")
         watcher_tick()
         t |> success(find(watcher_snapshot_json(failed.session_id), "\"state\":\"failed\"") >= 0,
             "process exit observation preserves the failed state")

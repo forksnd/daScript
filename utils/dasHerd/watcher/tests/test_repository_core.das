@@ -87,3 +87,18 @@ def test_repository_untracked_diff_contract(t : T?) {
         t |> equal(argv[9], "--unified=20")
     }
 }
+
+[test]
+def test_repository_relative_file_path_contract(t : T?) {
+    t |> run("file previews cannot escape their observed worktree") <| @(t : T?) {
+        t |> success(repository_valid_relative_file_path("src/main.das"))
+        t |> success(!repository_valid_relative_file_path("../outside.txt"))
+        t |> success(!repository_valid_relative_file_path("src/../../outside.txt"))
+        t |> success(!repository_valid_relative_file_path("/etc/passwd"))
+        t |> success(!repository_valid_relative_file_path("\\\\server\\share\\file.txt"))
+        if (get_platform_name() == "windows") {
+            t |> success(!repository_valid_relative_file_path("C:\\Windows\\win.ini"))
+            t |> success(!repository_valid_relative_file_path("C:drive-relative.txt"))
+        }
+    }
+}
