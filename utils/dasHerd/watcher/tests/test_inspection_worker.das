@@ -1,0 +1,228 @@
+options gen2
+options gc
+options persistent_heap
+
+require dastest/testing_boost public
+require ../inspection_worker.das
+require daslib/jobque_boost
+require daslib/utf8_utils
+require daslib/base64
+require daslib/fio
+require imgui/imgui_text_tree_sitter
+
+[test]
+def test_inspection_prepare_worker(t : T?) {
+    t |> run("installed syntax providers highlight representative Diff sources") <| @(tt : T?) {
+        var cpp <- tree_sitter_source_document(
+            "#include <string>\n\nstatic std::string greeting() \{\n    const auto value = std::string\{\"working tree\"\};\n    return value;\n\}\n",
+            "cpp", 1)
+        tt |> equal(length(cpp.spans) > 1, true)
+        text_source_document_dispose(cpp)
+    }
+    t |> run("worker prepares syntax off-thread and shuts down cleanly") <| @(t : T?) {
+        t |> equal(is_utf8_string_valid("Καλημέρα, мир, こんにちは, 🐑"), true)
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        t |> equal(inspector_prepare_worker_start(worker), true)
+        t |> equal(inspector_prepare_worker_queue(worker, 7,
+            "diff --git a/a.das b/a.das\n--- a/a.das\n+++ b/a.das\n@@ -1 +1 @@\n-let answer = 41\n+let answer = \"🐑\"\n",
+            "options gen2\nlet answer = \"🐑\"\n", "das"), true)
+
+        var ready = false
+        var started = false
+        var completed = false
+        var span_count = 0
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            var event : InspectorPrepareEvent
+            if (inspector_prepare_worker_take_event(worker, event)) {
+                if (event.kind == InspectorPrepareEventKind.ready) {
+                    ready = true
+                } elif (event.kind == InspectorPrepareEventKind.started) {
+                    started = true
+                } elif (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    span_count = length(event.new_document.spans)
+                    t |> equal(event.generation, 7)
+                    t |> equal(length(event.parsed.rows), 1)
+                    t |> equal(length(event.old_document.line_numbers), 1)
+                    t |> equal(length(event.new_document.line_numbers), 1)
+                    t |> equal(event.old_document.line_numbers[0], 1)
+                    t |> equal(event.new_document.line_numbers[0], 1)
+                    t |> equal(event.view_source,
+                        "options gen2\nlet answer = \"🐑\"\n")
+                    t |> success(length(event.view_document.spans) > 1,
+                        "full View syntax is prepared by the worker")
+                    t |> equal(length(event.view_document.line_marks), 1,
+                        "full View change marks are prepared by the worker")
+                }
+            }
+        }
+        t |> equal(ready, true)
+        t |> equal(started, true)
+        t |> equal(completed, true)
+        t |> equal(span_count > 1, true)
+        t |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("worker prepares Markdown View parsing and fenced syntax") <| @(tt : T?) {
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        let patch = "diff --git a/readme.md b/readme.md\n--- a/readme.md\n+++ b/readme.md\n@@ -1,5 +1,5 @@\n-# Old\n+# New\n \n ```das\n let answer = 42\n ```\n"
+        let view = "# New\n\n```das\nlet answer = 42\n```\n"
+        tt |> equal(inspector_prepare_worker_queue(
+            worker, 9, patch, view, "markdown"), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> success(event.markdown_document.ok,
+                        "Markdown View parses off-thread")
+                    tt |> success(length(event.view_document.spans) > 1,
+                        "Markdown source View is styled off-thread")
+                    tt |> equal(length(event.changed_source_ranges), 1,
+                        "Markdown change gutter ranges are prepared off-thread")
+                    tt |> success(!empty(event.markdown_view.syntax_bindings),
+                        "fenced code syntax is prepared off-thread")
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("worker reports malformed patches and still shuts down") <| @(tt : T?) {
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 11,
+            "not a unified patch", "", "das"), true)
+        var failed = false
+        var failure = ""
+        let wait_started = ref_time_ticks()
+        while (!failed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.failed) {
+                    failed = true
+                    failure = clone_string(event.error)
+                    tt |> equal(event.generation, 11)
+                }
+            }
+        }
+        tt |> equal(failed, true)
+        tt |> equal(empty(failure), false)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("binary image bytes decode off-thread with exact transport size") <| @(tt : T?) {
+        var encoded = ""
+        var byte_count = 0
+        fopen("3rdparty/fmt/doc/html/_static/file.png", "rb") $(file) {
+            if (file != null) {
+                fmap(file) $(var data : array<uint8>#) {
+                    byte_count = length(data)
+                    encoded = base64_encode(data)
+                }
+            }
+        }
+        tt |> success(byte_count > 0, "tracked PNG fixture is readable")
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 13,
+            "diff --git a/file.png b/file.png\nBinary files a/file.png and b/file.png differ\n",
+            "", "", encoded, byte_count), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.parsed.binary, true)
+                    tt |> equal(event.preview_byte_count, byte_count)
+                    tt |> equal(event.preview_error, "")
+                    tt |> success(event.preview_width > 0 && event.preview_height > 0,
+                        "stb_image reports image dimensions")
+                    tt |> equal(length(event.preview_pixels),
+                        event.preview_width * event.preview_height * 4)
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("unsupported binary completes with an unavailable-preview reason") <| @(tt : T?) {
+        let bytes : array<uint8> <- [uint8(0), uint8(1), uint8(2), uint8(3)]
+        let encoded = base64_encode(bytes)
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 14,
+            "diff --git a/file.bin b/file.bin\nBinary files a/file.bin and b/file.bin differ\n",
+            "", "", encoded, length(bytes)), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.parsed.binary, true)
+                    tt |> equal(empty(event.preview_pixels), true)
+                    tt |> equal(empty(event.preview_error), false)
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("empty binary preview completes without decoding") <| @(tt : T?) {
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 15,
+            "diff --git a/empty.bin b/empty.bin\nBinary files a/empty.bin and b/empty.bin differ\n",
+            "", "", "", 0), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.parsed.binary, true)
+                    tt |> equal(event.preview_error, "Binary preview is empty")
+                    tt |> equal(empty(event.preview_pixels), true)
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("explicit empty full View does not fall back to diff context") <| @(tt : T?) {
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 16,
+            "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n",
+            "", "plain", "", 0, true), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.view_source, "")
+                    tt |> equal(event.view_document.source, "")
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+}

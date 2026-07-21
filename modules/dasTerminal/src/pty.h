@@ -4,11 +4,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace das_terminal {
 
 struct PtyProcessOptions {
     std::string command_line;
+    std::vector<std::string> arguments;
     std::string working_directory;
     int columns = 80;
     int rows = 25;

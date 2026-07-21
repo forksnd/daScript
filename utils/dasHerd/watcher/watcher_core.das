@@ -9,6 +9,7 @@ module watcher_core shared public
 require terminal/terminal public
 require daslib/fio public
 require daslib/json_boost public
+require daslib/strings_boost
 require strings public
 require math
 
@@ -20,10 +21,20 @@ let private RAW_HISTORY_TRIM_SLACK = 1024 * 1024
 
 struct public WatcherLaunchRequest {
     command_line : string
+    argv : array<string>
     cwd : string
+    display_name : string
+    kind : string
+    target_id : string = "local"
+    repository_id : string
+    worktree_path : string
     columns : int = 100
     rows : int = 30
     timeout_ms : int64
+}
+
+def public watcher_target_id_or_local(target_id : string) : string {
+    return empty(target_id) ? "local" : target_id
 }
 
 struct public WatcherInputRequest {
@@ -52,9 +63,14 @@ struct public WatcherSessionInfo {
     id : string
     command_line : string
     cwd : string
+    display_name : string
+    kind : string
+    target_id : string
+    repository_id : string
+    worktree_path : string
     state : string
     reason : string
-    pid : int
+    pid : int = 0
     exit_code : int64 = -1l
     elapsed_ms : int64
     output_bytes : int64
@@ -95,11 +111,17 @@ class private WatcherSession {
     id : string
     command_line : string
     cwd : string
+    display_name : string
+    kind : string
+    target_id : string
+    repository_id : string
+    worktree_path : string
     session_dir : string
     output_path : string
     events_path : string
     state : string = "starting"
     reason : string
+    pid : int = 0
     terminal : Terminal = Terminal()
     output_file : FILE const? = null
     events_file : FILE const? = null
@@ -127,6 +149,7 @@ class private WatcherSession {
             events_file = null
         }
         terminal_dispose(terminal)
+        delete raw_history
     }
 }
 
@@ -171,8 +194,11 @@ def private append_event(session : WatcherSession?; event, detail : string) {
 
 def private session_info(session : WatcherSession?) : WatcherSessionInfo {
     return WatcherSessionInfo(id = session.id, command_line = session.command_line,
-        cwd = session.cwd, state = session.state, reason = session.reason,
-        pid = terminal_process_id(session.terminal), exit_code = session.exit_code,
+        cwd = session.cwd, display_name = session.display_name, kind = session.kind,
+        target_id = session.target_id, repository_id = session.repository_id,
+        worktree_path = session.worktree_path,
+        state = session.state, reason = session.reason,
+        pid = session.pid, exit_code = session.exit_code,
         elapsed_ms = elapsed_ms(session), output_bytes = session.output_bytes,
         input_bytes = session.input_bytes,
         columns = session.terminal.columns, rows = session.terminal.rows,
@@ -202,11 +228,21 @@ def public watcher_accepts_input(session_id : string) : bool {
 }
 
 def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult {
-    if (empty(request.command_line)) {
-        return WatcherLaunchResult(error = "command_line is required")
+    if (empty(request.command_line) && empty(request.argv)) {
+        return WatcherLaunchResult(error = "command_line or argv is required")
     }
     if (length(request.command_line) > MAX_COMMAND_BYTES) {
         return WatcherLaunchResult(error = "command_line is too large")
+    }
+    if (length(request.display_name) > MAX_COMMAND_BYTES) {
+        return WatcherLaunchResult(error = "display_name is too large")
+    }
+    var argv_bytes = max(0, length(request.argv) - 1)
+    for (argument in request.argv) {
+        argv_bytes += length(argument)
+        if (argv_bytes > MAX_COMMAND_BYTES) {
+            return WatcherLaunchResult(error = "argv is too large")
+        }
     }
     if (empty(g_log_root)) {
         return WatcherLaunchResult(error = "watcher core is not initialized")
@@ -219,8 +255,15 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
         return WatcherLaunchResult(error = "could not create session directory: {mkdir_error}")
     }
 
+    var visible_command = request.display_name
+    if (empty(visible_command)) {
+        visible_command = !empty(request.command_line) ? request.command_line : join(request.argv, " ")
+    }
     var session = new WatcherSession(id = session_id,
-        command_line = request.command_line, cwd = request.cwd,
+        command_line = visible_command, cwd = request.cwd,
+        display_name = request.display_name, kind = request.kind,
+        target_id = request.target_id, repository_id = request.repository_id,
+        worktree_path = request.worktree_path,
         session_dir = session_dir,
         output_path = path_join(session_dir, "output.raw"),
         events_path = path_join(session_dir, "events.jsonl"),
@@ -231,16 +274,23 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
         unsafe { delete session }
         return WatcherLaunchResult(error = "could not open session logs")
     }
-    let spec = WatcherLaunchRequest(command_line = request.command_line, cwd = request.cwd,
-        columns = clamp(request.columns, 20, 400), rows = clamp(request.rows, 5, 200),
-        timeout_ms = max(0l, request.timeout_ms))
-    if (!write_text_file(path_join(session_dir, "session.json"), sprint_json(spec, true))) {
+    let columns = clamp(request.columns, 20, 400)
+    let rows = clamp(request.rows, 5, 200)
+    var inscope persisted_request := request
+    persisted_request.columns = columns
+    persisted_request.rows = rows
+    if (!write_text_file(path_join(session_dir, "session.json"), sprint_json(persisted_request, true))) {
         unsafe { delete session }
         return WatcherLaunchResult(error = "could not write session metadata")
     }
 
-    var inscope launched <- terminal_launch(spec.command_line, spec.cwd, spec.columns, spec.rows)
-    session.terminal := launched
+    if (!empty(request.argv)) {
+        var inscope launched <- terminal_launch_argv(request.argv, request.cwd, columns, rows)
+        session.terminal := launched
+    } else {
+        var inscope launched <- terminal_launch(request.command_line, request.cwd, columns, rows)
+        session.terminal := launched
+    }
     if (terminal_process_id(session.terminal) == 0) {
         session.state = "failed"
         session.reason = terminal_transport_error(session.terminal)
@@ -249,6 +299,7 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
         session.status_revision++
         append_event(session, "launch_failed", session.reason)
     } else {
+        session.pid = terminal_process_id(session.terminal)
         session.state = "running"
         session.status_revision++
         append_event(session, "launched", "pid={terminal_process_id(session.terminal)}")
@@ -358,6 +409,139 @@ def public watcher_output_since(session_id : string; requested_offset : int64;
     return <- result
 }
 
+def public watcher_get_session_info(session_id : string; var info : WatcherSessionInfo) : bool {
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return false
+    info = session_info(g_sessions[index])
+    return true
+}
+
+def public watcher_output_text(session_id : string) : string {
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return ""
+    return string(g_sessions[index].raw_history)
+}
+
+def public watcher_strip_terminal_controls(value : string) : string {
+    // Task processes launched through ConPTY are wrapped in cursor, screen,
+    // title, and mode sequences even when the child itself emits plain text.
+    // Machine consumers need the original printable byte stream, not a
+    // bounded reconstructed screen.
+    var inscope output : array<uint8>
+    output |> reserve(length(value))
+    var state = 0 // 0=text, 1=ESC, 2=CSI, 3=OSC, 4=OSC ESC, 5=ST string, 6=ST ESC
+    peek_data(value) $(bytes) {
+        for (index in range(length(value))) {
+            let byte = int(bytes[index])
+            if (state == 0) {
+                if (byte == 0x1b) {
+                    state = 1
+                }
+                elif (byte == '\t' || byte == '\r' || byte == '\n' || byte >= 0x20) {
+                    output |> push(uint8(byte))
+                }
+            } elif (state == 1) {
+                if (byte == '[') {
+                    state = 2
+                } elif (byte == ']') {
+                    state = 3
+                } elif (byte == 'P' || byte == '^' || byte == '_' || byte == 'X') {
+                    state = 5
+                } else {
+                    state = 0
+                }
+            } elif (state == 2) {
+                if (byte >= 0x40 && byte <= 0x7e) {
+                    state = 0
+                }
+            } elif (state == 3) {
+                if (byte == 0x07) {
+                    state = 0
+                } elif (byte == 0x1b) {
+                    state = 4
+                }
+            } elif (state == 4) {
+                state = byte == '\\' ? 0 : 3
+            } elif (state == 5) {
+                if (byte == 0x1b) {
+                    state = 6
+                }
+            } else {
+                state = byte == '\\' ? 0 : 5
+            }
+        }
+    }
+    return string(output)
+}
+
+def public watcher_machine_output_text(session_id : string;
+                                       var truncated : bool) : string {
+    truncated = false
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return ""
+    let session = g_sessions[index]
+    truncated = session.raw_history_start != 0l
+    return watcher_strip_terminal_controls(string(session.raw_history))
+}
+
+def public watcher_terminal_text(session_id : string; var scrollback_rows : int) : string {
+    scrollback_rows = 0
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return ""
+    var viewport = TerminalViewportSnapshot()
+    terminal_viewport_snapshot(g_sessions[index].terminal, 0, viewport)
+    scrollback_rows = viewport.buffer.scrollback_rows
+    let result = viewport.screen_text
+    terminal_viewport_snapshot_dispose(viewport)
+    return result
+}
+
+def public watcher_compact_session(session_id : string;
+                                   columns : int = 160; rows : int = 50) : bool {
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return false
+    var session = g_sessions[index]
+    if (!session.drained || session.state == "running" || session.state == "terminating") return false
+    let compact_columns = clamp(columns, 20, 400)
+    let compact_rows = clamp(rows, 5, 200)
+    if (session.terminal.transport == null && session.terminal.columns == compact_columns
+            && session.terminal.rows == compact_rows) return true
+    var inscope compact <- terminal_create(compact_columns, compact_rows)
+    terminal_feed_bytes(compact, session.raw_history)
+    terminal_dispose(session.terminal)
+    session.terminal := compact
+    session.status_revision++
+    append_event(session, "terminal_compacted", "{compact_columns}x{compact_rows}")
+    return true
+}
+
+def public watcher_session_artifact_path(session_id : string; name : string) : string {
+    if (empty(name) || name == "." || name == ".." || find(name, "/") >= 0
+            || find(name, "\\") >= 0 || find(name, ":") >= 0) return ""
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return ""
+    return path_join(g_sessions[index].session_dir, name)
+}
+
+def public watcher_prune_completed_sessions(kind : string;
+                                            repository_id : string;
+                                            worktree_path : string) : int {
+    var removed = 0
+    var index = length(g_sessions)
+    while (index > 0) {
+        index--
+        var session = g_sessions[index]
+        if (session == null || !session.drained || session.state == "running"
+                || session.state == "terminating" || session.kind != kind
+                || session.repository_id != repository_id
+                || session.worktree_path != worktree_path) continue
+        unsafe { delete session }
+        g_sessions |> erase(index)
+        removed++
+    }
+    return removed
+}
+
 def private input_session(var session : WatcherSession?; text : string; client_id : int) : string {
     if (session.controller_id != 0 && session.controller_id != client_id) return "controller lease is held by another client"
     if (session.state != "running" || session.drained) return "session is not running"
@@ -366,7 +550,7 @@ def private input_session(var session : WatcherSession?; text : string; client_i
     return ""
 }
 
-def public watcher_input(session_id, text : string; client_id : int = 0) : string {
+def public watcher_input(session_id : string; text : string; client_id : int = 0) : string {
     let index = watcher_find_session(session_id)
     if (index < 0) return "unknown session"
     if (length(text) > MAX_INPUT_BYTES) return "input is too large"
@@ -380,14 +564,16 @@ def private resize_session(var session : WatcherSession?; columns, rows, client_
     return ""
 }
 
-def public watcher_resize(session_id : string; columns, rows, client_id : int) : string {
+def public watcher_resize(session_id : string; columns : int; rows : int;
+                          client_id : int) : string {
     let index = watcher_find_session(session_id)
     if (index < 0) return "unknown session"
     return resize_session(g_sessions[index], columns, rows, client_id)
 }
 
 def private terminate_session(var session : WatcherSession?; detail : string) : string {
-    if (terminal_process_exited(session.terminal)) return ""
+    if ((session.state != "running" && session.state != "terminating")
+            || terminal_process_exited(session.terminal)) return ""
     session.reason = detail
     session.state = "terminating"
     session.status_revision++
@@ -430,7 +616,7 @@ def public watcher_release_controller(session_id : string; client_id : int; deta
 }
 
 def public watcher_list_json : string {
-    var result : array<WatcherSessionInfo>
+    var inscope result : array<WatcherSessionInfo>
     result |> reserve(length(g_sessions))
     for (session in g_sessions) {
         if (session != null) result |> push(session_info(session))
@@ -448,7 +634,9 @@ def private snapshot_session_json(session : WatcherSession?) : string {
         scrollback_rows = viewport.buffer.scrollback_rows,
         cursor_row = cursor.row, cursor_column = cursor.column,
         cursor_visible = cursor.visible, cursor_blinking = cursor.blinking)
-    return sprint_json(snapshot, false)
+    let result = sprint_json(snapshot, false)
+    terminal_viewport_snapshot_dispose(viewport)
+    return result
 }
 
 def public watcher_snapshot_json(session_id : string) : string {
@@ -484,4 +672,5 @@ def public watcher_shutdown(terminate_running : bool = false) {
         unsafe { delete session }
     }
     g_sessions |> clear()
+    unsafe { delete g_sessions }
 }

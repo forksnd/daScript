@@ -181,6 +181,18 @@ struct private TerminalBuffer {
     scroll_bottom : int
 }
 
+def private clear_rows(var rows : array<TerminalRow>) {
+    for (row in rows) {
+        delete row.cells
+    }
+    rows |> clear()
+}
+
+def private delete_rows(var rows : array<TerminalRow>) {
+    clear_rows(rows)
+    delete rows
+}
+
 typedef public Pty = smart_ptr<pty_handle>
 
 struct public Terminal {
@@ -225,14 +237,14 @@ def private blank_row(columns, row : int) : TerminalRow {
 }
 
 def private reset_buffer(var buffer : TerminalBuffer; columns, rows : int) {
-    buffer.screen |> clear()
+    clear_rows(buffer.screen)
     buffer.screen |> reserve(rows)
     for (row in range(rows)) {
         var next <- blank_row(columns, row)
         buffer.screen |> emplace(next)
     }
     buffer.screen_start = 0
-    buffer.history |> clear()
+    clear_rows(buffer.history)
     buffer.history_start = 0
     buffer.cursor = TerminalCursor()
     buffer.saved_cursor = TerminalCursor()
@@ -274,7 +286,7 @@ def private push_ascii(var bytes : array<uint8>; value : int) {
 
 def private bytes_slice_string(bytes : array<uint8> const; first, past_last : int) : string {
     if (past_last <= first) return ""
-    var slice : array<uint8>
+    var inscope slice : array<uint8>
     slice |> resize_no_init(past_last - first)
     unsafe {
         memcpy(addr(slice[0]), addr(bytes[first]), past_last - first)
@@ -397,13 +409,13 @@ def private erased_cell(buffer : TerminalBuffer const; row, column : int) : Term
         background = buffer.pen.background)
 }
 
-def private erased_row(buffer : TerminalBuffer const; columns, row : int) : TerminalRow {
-    var result = TerminalRow()
-    result.cells |> reserve(columns)
+def private reset_row(var target : TerminalRow; buffer : TerminalBuffer const;
+                      columns, row : int) {
+    target.cells |> clear()
+    target.cells |> reserve(columns)
     for (column in range(columns)) {
-        result.cells |> push(erased_cell(buffer, row, column))
+        target.cells |> push(erased_cell(buffer, row, column))
     }
-    return <- result
 }
 
 def private clear_cell(terminal : Terminal const; var buffer : TerminalBuffer;
@@ -428,6 +440,7 @@ def private append_history_row(var buffer : TerminalBuffer; var row : TerminalRo
     if (length(buffer.history) < MAX_SCROLLBACK_ROWS) {
         buffer.history |> emplace(row)
     } else {
+        delete buffer.history[buffer.history_start].cells
         buffer.history[buffer.history_start] <- row
         buffer.history_start = (buffer.history_start + 1) % MAX_SCROLLBACK_ROWS
     }
@@ -438,7 +451,7 @@ def private scroll_up(terminal : Terminal const; var buffer : TerminalBuffer; no
     if (normal) append_history_row(buffer, buffer.screen[first])
     buffer.screen_start = (buffer.screen_start + 1) % terminal.rows
     let last = screen_index(buffer, terminal.rows - 1)
-    buffer.screen[last] <- erased_row(buffer, terminal.columns, terminal.rows - 1)
+    reset_row(buffer.screen[last], buffer, terminal.columns, terminal.rows - 1)
 }
 
 def private scroll_rows_up(terminal : Terminal const; var buffer : TerminalBuffer;
@@ -456,11 +469,12 @@ def private scroll_rows_up(terminal : Terminal const; var buffer : TerminalBuffe
     for (row in range(first, last - count + 1)) {
         let destination = screen_index(buffer, row)
         let source = screen_index(buffer, row + count)
+        delete buffer.screen[destination].cells
         buffer.screen[destination] <- buffer.screen[source]
     }
     for (row in range(last - count + 1, last + 1)) {
         let destination = screen_index(buffer, row)
-        buffer.screen[destination] <- erased_row(buffer, terminal.columns, row)
+        reset_row(buffer.screen[destination], buffer, terminal.columns, row)
     }
 }
 
@@ -474,7 +488,7 @@ def private scroll_rows_down(terminal : Terminal const; var buffer : TerminalBuf
         for (_ in range(count)) {
             buffer.screen_start = (buffer.screen_start + terminal.rows - 1) % terminal.rows
             let top = screen_index(buffer, 0)
-            buffer.screen[top] <- erased_row(buffer, terminal.columns, 0)
+            reset_row(buffer.screen[top], buffer, terminal.columns, 0)
         }
         return
     }
@@ -482,12 +496,13 @@ def private scroll_rows_down(terminal : Terminal const; var buffer : TerminalBuf
     while (row >= first + count) {
         let destination = screen_index(buffer, row)
         let source = screen_index(buffer, row - count)
+        delete buffer.screen[destination].cells
         buffer.screen[destination] <- buffer.screen[source]
         row--
     }
     for (blank in range(first, first + count)) {
         let destination = screen_index(buffer, blank)
-        buffer.screen[destination] <- erased_row(buffer, terminal.columns, blank)
+        reset_row(buffer.screen[destination], buffer, terminal.columns, blank)
     }
 }
 
@@ -601,7 +616,7 @@ def private record_unknown_text(var terminal : Terminal; value : string) {
         } else {
             let suffix = "...[truncated]"
             let suffix_length = length(suffix)
-            var bytes : array<uint8>
+            var inscope bytes : array<uint8>
             bytes |> resize_no_init(MAX_UNKNOWN_SEQUENCE_BYTES)
             peek_data(value) $(data) {
                 for (index in range(MAX_UNKNOWN_SEQUENCE_BYTES - suffix_length)) {
@@ -639,23 +654,23 @@ def private erase_display(terminal : Terminal const; var buffer : TerminalBuffer
     if (mode == 2 || mode == 3) {
         for (row in range(terminal.rows)) {
             let physical = screen_index(buffer, row)
-            buffer.screen[physical] <- erased_row(buffer, terminal.columns, row)
+            reset_row(buffer.screen[physical], buffer, terminal.columns, row)
         }
         if (mode == 3) {
-            buffer.history |> clear()
+            clear_rows(buffer.history)
             buffer.history_start = 0
         }
     } elif (mode == 0) {
         erase_line(terminal, buffer, 0)
         for (row in range(buffer.cursor.row + 1, terminal.rows)) {
             let physical = screen_index(buffer, row)
-            buffer.screen[physical] <- erased_row(buffer, terminal.columns, row)
+            reset_row(buffer.screen[physical], buffer, terminal.columns, row)
         }
     } elif (mode == 1) {
         erase_line(terminal, buffer, 1)
         for (row in range(0, buffer.cursor.row)) {
             let physical = screen_index(buffer, row)
-            buffer.screen[physical] <- erased_row(buffer, terminal.columns, row)
+            reset_row(buffer.screen[physical], buffer, terminal.columns, row)
         }
     }
 }
@@ -744,7 +759,7 @@ def private select_graphic_rendition(var buffer : TerminalBuffer;
 }
 
 def private append_reply_text(var terminal : Terminal; text : string) {
-    var bytes : array<uint8>
+    var inscope bytes : array<uint8>
     append_string_bytes(bytes, text)
     terminal.replies |> emplace(bytes)
 }
@@ -752,7 +767,7 @@ def private append_reply_text(var terminal : Terminal; text : string) {
 def private process_csi(var terminal : Terminal; final_byte : int) {
     terminal.parse_state = TerminalParseState.ground
     var private_marker = 0
-    var parameters : array<int>
+    var inscope parameters : array<int>
     parse_parameters(terminal.csi_parameters, private_marker, parameters)
     var buffer = active_buffer(terminal)
     let first = parameter_or(parameters, 0, 1)
@@ -993,10 +1008,10 @@ def public terminal_create(columns : int = 80; rows : int = 25) : Terminal {
 }
 
 def public terminal_dispose(var terminal : Terminal&) {
-    delete terminal.normal.screen
-    delete terminal.normal.history
-    delete terminal.alternate.screen
-    delete terminal.alternate.history
+    delete_rows(terminal.normal.screen)
+    delete_rows(terminal.normal.history)
+    delete_rows(terminal.alternate.screen)
+    delete_rows(terminal.alternate.history)
     delete terminal.unknown_sequences
     delete terminal.replies
     delete terminal.events
@@ -1013,6 +1028,16 @@ def public terminal_launch(command_line : string;
                            columns : int = 80; rows : int = 25) : Terminal {
     var inscope terminal <- terminal_create(columns, rows)
     var inscope pty <- _pty_launch(command_line, length(command_line),
+        working_directory, length(working_directory), columns, rows)
+    move(terminal.transport) <| pty
+    return <- terminal
+}
+
+def public terminal_launch_argv(arguments : array<string> const;
+                                working_directory : string = "";
+                                columns : int = 80; rows : int = 25) : Terminal {
+    var inscope terminal <- terminal_create(columns, rows)
+    var inscope pty <- _pty_launch_argv(arguments,
         working_directory, length(working_directory), columns, rows)
     move(terminal.transport) <| pty
     return <- terminal
@@ -1095,6 +1120,7 @@ def private resize_buffer(var buffer : TerminalBuffer; old_columns, old_rows,
         }
         replacement |> emplace(next)
     }
+    delete_rows(buffer.screen)
     buffer.screen <- replacement
     buffer.screen_start = 0
     for (logical in range(length(buffer.history))) {
@@ -1119,7 +1145,7 @@ def private resize_buffer(var buffer : TerminalBuffer; old_columns, old_rows,
     buffer.scroll_bottom = rows - 1
 }
 
-def public terminal_resize(var terminal : Terminal; columns_, rows_ : int) {
+def public terminal_resize(var terminal : Terminal; columns_ : int; rows_ : int) {
     let columns = max(1, columns_)
     let rows = max(1, rows_)
     if ((columns == terminal.columns && rows == terminal.rows) ||
@@ -1167,6 +1193,15 @@ def public terminal_snapshot(terminal : Terminal const; var snapshot : TerminalS
     snapshot.unknown_sequences := terminal.unknown_sequences
 }
 
+def public terminal_snapshot_dispose(var snapshot : TerminalSnapshot) {
+    delete snapshot.normal.cells
+    delete snapshot.normal.scrollback
+    delete snapshot.alternate.cells
+    delete snapshot.alternate.scrollback
+    delete snapshot.unknown_sequences
+    snapshot = default<TerminalSnapshot>
+}
+
 def public terminal_drain_replies_bytes(var terminal : Terminal;
                                         var replies : array<array<uint8>>) {
     replies <- terminal.replies
@@ -1175,7 +1210,7 @@ def public terminal_drain_replies_bytes(var terminal : Terminal;
 //! Compatibility boundary for callers which still consume terminal replies as
 //! strings. Parser and transport storage remain raw bytes end to end.
 def public terminal_drain_replies(var terminal : Terminal; var replies : array<string>) {
-    var raw_replies : array<array<uint8>>
+    var inscope raw_replies : array<array<uint8>>
     terminal_drain_replies_bytes(terminal, raw_replies)
     replies |> clear()
     replies |> reserve(length(raw_replies))
@@ -1194,7 +1229,7 @@ def private string_to_bytes(text : string; var bytes : array<uint8>) {
 }
 
 def public terminal_write(terminal : Terminal const; text : string) : bool {
-    var bytes : array<uint8>
+    var inscope bytes : array<uint8>
     string_to_bytes(text, bytes)
     return terminal_write_bytes(terminal, bytes)
 }
@@ -1289,7 +1324,7 @@ def public terminal_encode_key_bytes(terminal : Terminal const;
 
 def public terminal_encode_key(terminal : Terminal const;
                                event : TerminalKeyEvent const) : string {
-    var bytes : array<uint8>
+    var inscope bytes : array<uint8>
     terminal_encode_key_bytes(terminal, event, bytes)
     return string(bytes)
 }
@@ -1303,19 +1338,19 @@ def public terminal_encode_paste_bytes(terminal : Terminal const; text : string;
 }
 
 def public terminal_encode_paste(terminal : Terminal const; text : string) : string {
-    var bytes : array<uint8>
+    var inscope bytes : array<uint8>
     terminal_encode_paste_bytes(terminal, text, bytes)
     return string(bytes)
 }
 
 def public terminal_send_key(terminal : Terminal const; event : TerminalKeyEvent const) : bool {
-    var bytes : array<uint8>
+    var inscope bytes : array<uint8>
     terminal_encode_key_bytes(terminal, event, bytes)
     return terminal_write_bytes(terminal, bytes)
 }
 
 def public terminal_send_paste(terminal : Terminal const; text : string) : bool {
-    var bytes : array<uint8>
+    var inscope bytes : array<uint8>
     terminal_encode_paste_bytes(terminal, text, bytes)
     return terminal_write_bytes(terminal, bytes)
 }
@@ -1361,7 +1396,7 @@ def private emit_group(group : TerminalTextRunGroup const; global_row : int;
 
 def private append_text_runs_for_row(row : TerminalRow const; global_row : int;
                                      var runs : array<TerminalTextRun>) {
-    var groups : array<TerminalTextRunGroup>
+    var inscope groups : array<TerminalTextRunGroup>
     groups |> reserve(17)
     var too_many_colors = false
     for (column in range(length(row.cells))) {
@@ -1414,7 +1449,7 @@ def private append_text_runs_for_row(row : TerminalRow const; global_row : int;
         let run_start = column
         var ink_end = column
         var glyph_cells = 0
-        var text : array<uint8>
+        var inscope text : array<uint8>
         while (column < length(row.cells)) {
             let cell = row.cells[column]
             let cell_background = (cell.attributes & TERMINAL_ATTR_INVERSE) != 0
@@ -1444,7 +1479,7 @@ def private append_paint_cells_for_row(row : TerminalRow const; logical_row : in
 }
 
 def private screen_text(buffer : TerminalBuffer const; rows : int) : string {
-    var bytes : array<uint8>
+    var inscope bytes : array<uint8>
     var last_content_end = 0
     for (row in range(rows)) {
         if (row != 0) bytes |> push(uint8('\n'))
@@ -1501,4 +1536,11 @@ def public terminal_viewport_snapshot(terminal : Terminal const; scroll_offset :
     snapshot.text_run_projection_us = get_time_usec(runs_started)
     snapshot.buffer.scrollback_rows = history_rows
     snapshot.buffer.cursor = buffer.cursor
+}
+
+def public terminal_viewport_snapshot_dispose(var snapshot : TerminalViewportSnapshot) {
+    delete snapshot.buffer.cells
+    delete snapshot.buffer.scrollback
+    delete snapshot.text_runs
+    snapshot = default<TerminalViewportSnapshot>
 }
