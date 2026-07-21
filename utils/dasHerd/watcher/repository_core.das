@@ -246,7 +246,6 @@ def public repository_build_file_diff_argv(worktree_path : string;
         expected_exit_code = 1l
     }
     argv |> push("--no-ext-diff")
-    argv |> push("--text")
     argv |> push(comparison == "working" ? "--unified=3" : "--unified=1000000")
     argv |> push("--")
     if (comparison == "working" && file.code == "??") argv |> push("NUL")
@@ -313,6 +312,41 @@ def public repository_working_file_text(repository_id, worktree_path, file_path 
     if (!fexist(absolute_path)) return "working file does not exist"
     text = fread(absolute_path)
     return ""
+}
+
+def public repository_working_file_bytes(repository_id, worktree_path, file_path : string;
+                                         var bytes : array<uint8>) : string {
+    delete bytes
+    let repository_index = find_repository(repository_id)
+    if (repository_index < 0 || g_repositories[repository_index] == null) {
+        return "unknown repository"
+    }
+    let runtime = g_repositories[repository_index]
+    var file_found = false
+    for (file in runtime.snapshot.files) {
+        if (file.worktree_path == worktree_path && file.path == file_path
+                && (file.code == "??" || byte_at(file.code, 1) != ' ')) {
+            file_found = true
+            break
+        }
+    }
+    if (!file_found) return "file has no observed working-tree change"
+    if (starts_with(file_path, "/") || starts_with(file_path, "\\")
+            || find(file_path, "../") >= 0 || find(file_path, "..\\") >= 0) {
+        return "invalid worktree-relative file path"
+    }
+    let absolute_path = path_join(worktree_path, file_path)
+    if (!fexist(absolute_path)) return "working file does not exist"
+    var loaded = false
+    fopen(absolute_path, "rb") $(file) {
+        if (file != null) {
+            fmap(file) $(var data : array<uint8>#) {
+                bytes := data
+                loaded = true
+            }
+        }
+    }
+    return loaded ? "" : "could not read working file bytes"
 }
 
 def private launch_git(var runtime : RepositoryRuntime?; argv : array<string>;

@@ -28,6 +28,40 @@ enum public InspectorContentState {
     failed
 }
 
+def private strip_local_suffix(path : string) : string {
+    let lower = to_lower(path)
+    if (ends_with(lower, ".local")) {
+        return slice(lower, 0, length(lower) - length(".local"))
+    }
+    return lower
+}
+
+def public inspector_language_for_path(path : string;
+                                       requested : string = "auto") : string {
+    //! Resolve the syntax producer independently from the renderer. An empty
+    //! result deliberately means plain text. `.local` is a Git/worktree
+    //! convention in this repository, so `notes.md.local` remains Markdown.
+    let choice = to_lower(requested)
+    if (!empty(choice) && choice != "auto") {
+        if (choice == "plain" || choice == "text") return ""
+        if (choice == "das" || choice == "dascript") return "daslang"
+        if (choice == "c++") return "cpp"
+        if (choice == "md") return "markdown"
+        return choice
+    }
+    let candidate = strip_local_suffix(path)
+    if (ends_with(candidate, ".das")) return "daslang"
+    if (ends_with(candidate, ".c")) return "c"
+    if (ends_with(candidate, ".cc") || ends_with(candidate, ".cpp")
+            || ends_with(candidate, ".cxx") || ends_with(candidate, ".h")
+            || ends_with(candidate, ".hh") || ends_with(candidate, ".hpp")
+            || ends_with(candidate, ".hxx")) return "cpp"
+    if (ends_with(candidate, ".md")
+            || ends_with(candidate, ".markdown")) return "markdown"
+    if (ends_with(candidate, ".json")) return "json"
+    return ""
+}
+
 // Request lifetime and installed content deliberately do not collapse into a
 // single state. A replacement can be running while the previous successful
 // payload remains visible, and a failed replacement does not destroy it.
@@ -111,12 +145,20 @@ struct public GitDiffRow {
     new_kind : GitDiffLineKind = GitDiffLineKind.empty
 }
 
+struct public GitDiffHunk {
+    row_start : int
+    row_count : int
+    old_start : int
+    new_start : int
+}
+
 struct public GitParsedPatch {
     old_text : string
     new_text : string
     old_aligned_text : string
     new_aligned_text : string
     rows : array<GitDiffRow>
+    hunks : array<GitDiffHunk>
     old_changed_lines : array<int>
     new_changed_lines : array<int>
     new_deleted_anchors : array<int>
@@ -126,6 +168,7 @@ struct public GitParsedPatch {
 
 def public git_parsed_patch_dispose(var patch : GitParsedPatch) {
     delete patch.rows
+    delete patch.hunks
     delete patch.old_changed_lines
     delete patch.new_changed_lines
     delete patch.new_deleted_anchors
@@ -147,7 +190,7 @@ def private byte_at(value : string; index : int) : int {
     return result
 }
 
-def private parse_decimal(value : string; var index : int) : int {
+def private parse_decimal(value : string; var index : int&) : int {
     var result = 0
     let value_length = length(value)
     while (index < value_length && is_number(byte_at(value, index))) {
@@ -157,12 +200,13 @@ def private parse_decimal(value : string; var index : int) : int {
     return result
 }
 
-def private parse_hunk_starts(header : string; var old_line, new_line : int) : bool {
+def private parse_hunk_starts(header : string;
+                              var old_line : int&; var new_line : int&) : bool {
     let old_marker = find(header, "-")
     let new_marker = find(header, "+", max(0, old_marker + 1))
     if (old_marker < 0 || new_marker < 0) return false
-    let old_at = old_marker + 1
-    let new_at = new_marker + 1
+    var old_at = old_marker + 1
+    var new_at = new_marker + 1
     old_line = parse_decimal(header, old_at)
     new_line = parse_decimal(header, new_at)
     return old_line >= 0 && new_line >= 0
@@ -214,10 +258,17 @@ def public git_parse_unified_patch(patch : string) : GitParsedPatch {
         if (starts_with(line, "@@")) {
             append_change_rows(result, removed_text, removed_lines,
                 added_text, added_lines)
+            if (!empty(result.hunks)) {
+                let previous = length(result.hunks) - 1
+                result.hunks[previous].row_count = length(result.rows) - result.hunks[previous].row_start
+            }
             if (!parse_hunk_starts(line, old_line, new_line)) {
                 result.error = "invalid unified diff hunk header"
                 return <- result
             }
+            result.hunks |> push(GitDiffHunk(
+                row_start = length(result.rows), old_start = old_line,
+                new_start = new_line))
             in_hunk = true
             continue
         }
@@ -252,6 +303,10 @@ def public git_parse_unified_patch(patch : string) : GitParsedPatch {
     }
     append_change_rows(result, removed_text, removed_lines,
         added_text, added_lines)
+    if (!empty(result.hunks)) {
+        let last = length(result.hunks) - 1
+        result.hunks[last].row_count = length(result.rows) - result.hunks[last].row_start
+    }
     if (!in_hunk && !result.binary) {
         result.error = "diff contains no text hunks"
         return <- result

@@ -7,8 +7,14 @@ module inspection_worker shared public
 
 require daslib/jobque_boost
 require daslib/rtti
+require daslib/base64
+require daslib/safe_addr
 require imgui/imgui_text_tree_sitter
+require stbimage/stbimage_boost
 require ./file_inspection.das
+
+let private MAX_BINARY_PREVIEW_BYTES = 32 * 1024 * 1024
+let private MAX_BINARY_PREVIEW_PIXELS = 64l * 1024l * 1024l
 
 enum public InspectorPrepareEventKind {
     ready
@@ -22,6 +28,8 @@ struct public InspectorPrepareJob {
     generation : int
     patch : string
     view_text : string
+    view_base64 : string
+    view_byte_count : int
     language : string
     stop : bool
 }
@@ -34,6 +42,11 @@ struct public InspectorPrepareEvent {
     old_document : TextSourceDocument = TextSourceDocument()
     new_document : TextSourceDocument = TextSourceDocument()
     view_source : string
+    preview_pixels : array<uint8>
+    preview_width : int
+    preview_height : int
+    preview_byte_count : int
+    preview_error : string
     error : string
     elapsed_usec : int64
 }
@@ -98,6 +111,10 @@ def private prepare_worker_main(var jobs : Channel?&;
             var old_document = TextSourceDocument()
             var new_document = TextSourceDocument()
             var view_source = ""
+            var preview_pixels : array<uint8>
+            var preview_width = 0
+            var preview_height = 0
+            var preview_error = ""
             let failed = catch_prepare_panic(failure) {
                 var prepared_patch <- git_parse_unified_patch(job.patch)
                 if (!empty(prepared_patch.error)) {
@@ -109,7 +126,13 @@ def private prepare_worker_main(var jobs : Channel?&;
                     var prepared_new <- tree_sitter_source_document(
                         prepared_patch.new_aligned_text, job.language,
                         job.generation)
+                    prepared_old.line_numbers |> reserve(length(prepared_patch.rows))
+                    prepared_new.line_numbers |> reserve(length(prepared_patch.rows))
                     for (index in range(length(prepared_patch.rows))) {
+                        prepared_old.line_numbers |> push(
+                            prepared_patch.rows[index].old_line)
+                        prepared_new.line_numbers |> push(
+                            prepared_patch.rows[index].new_line)
                         if (prepared_patch.rows[index].old_kind
                                 == GitDiffLineKind.removed) {
                             prepared_old.line_marks |> push(TextSourceLineMark(
@@ -124,6 +147,42 @@ def private prepare_worker_main(var jobs : Channel?&;
                         }
                     }
                     view_source = !empty(job.view_text) ? job.view_text : prepared_patch.new_text
+                    if (prepared_patch.binary) {
+                        if (job.view_byte_count > MAX_BINARY_PREVIEW_BYTES) {
+                            preview_error = "Binary preview exceeds the 32 MiB transport limit"
+                        } elif (empty(job.view_base64)) {
+                            preview_error = "No working-file bytes were provided"
+                        } else {
+                            var inscope encoded : array<uint8>
+                            let decoded = base64_decode(job.view_base64, encoded)
+                            if (decoded < 0 || decoded != job.view_byte_count) {
+                                preview_error = "Binary transport failed exact-byte validation"
+                            } else {
+                                var width, height, channels : int
+                                let image_info = stbi_info_from_memory(
+                                    unsafe(addr<uint8 const?>(encoded[0])),
+                                    length(encoded), safe_addr(width),
+                                    safe_addr(height), safe_addr(channels))
+                                if (image_info == 0) {
+                                    preview_error = stbi_failure_reason()
+                                } elif (width <= 0 || height <= 0 ||
+                                        int64(width) * int64(height)
+                                            > MAX_BINARY_PREVIEW_PIXELS) {
+                                    preview_error = "Image dimensions exceed the 64 megapixel preview limit"
+                                } else {
+                                    var image : Image
+                                    let (image_ok, image_error) = image->load_from_memory(encoded, 4)
+                                    if (image_ok) {
+                                        preview_width = image.width
+                                        preview_height = image.height
+                                        preview_pixels <- image.bytes
+                                    } else {
+                                        preview_error = image_error
+                                    }
+                                }
+                            }
+                        }
+                    }
                     parsed <- prepared_patch
                     old_document <- prepared_old
                     new_document <- prepared_new
@@ -141,18 +200,25 @@ def private prepare_worker_main(var jobs : Channel?&;
                     kind = InspectorPrepareEventKind.completed,
                     generation = job.generation,
                     view_source = view_source,
+                    preview_width = preview_width,
+                    preview_height = preview_height,
+                    preview_byte_count = job.view_byte_count,
+                    preview_error = preview_error,
                     elapsed_usec = elapsed_usec)
                 event.parsed <- parsed
                 event.old_document <- old_document
                 event.new_document <- new_document
+                event.preview_pixels <- preview_pixels
                 emit_prepare_event(events, event)
                 git_parsed_patch_dispose(event.parsed)
                 text_source_document_dispose(event.old_document)
                 text_source_document_dispose(event.new_document)
+                delete event.preview_pixels
             }
             git_parsed_patch_dispose(parsed)
             text_source_document_dispose(old_document)
             text_source_document_dispose(new_document)
+            delete preview_pixels
             delete job
         }
     }
@@ -178,11 +244,14 @@ def public inspector_prepare_worker_start(var worker : InspectorPrepareWorker) :
 
 def public inspector_prepare_worker_queue(var worker : InspectorPrepareWorker;
                                           generation : int;
-                                          patch, view_text, language : string) : bool {
+                                          patch, view_text, language : string;
+                                          view_base64 : string = "";
+                                          view_byte_count : int = 0) : bool {
     if (!worker.started || worker.stopped || worker.jobs == null) return false
     worker.jobs |> push_clone(InspectorPrepareJob(
         generation = generation, patch = patch, view_text = view_text,
-        language = language))
+        language = language, view_base64 = view_base64,
+        view_byte_count = view_byte_count))
     return true
 }
 

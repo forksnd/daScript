@@ -44,7 +44,14 @@ def test_repository_untracked_diff_contract(t : T?) {
         t |> equal(error, "")
         t |> equal(expected_exit_code, 1l)
         t |> equal(argv[7], "--no-index")
-        t |> equal(argv[10], "--unified=3")
+        t |> equal(argv[9], "--unified=3")
+        var forces_text = false
+        for (argument in argv) {
+            if (argument == "--text") {
+                forces_text = true
+            }
+        }
+        t |> equal(forces_text, false, "Git retains native binary detection")
         t |> equal(argv[length(argv) - 2], "NUL")
         t |> equal(argv[length(argv) - 1], "new file.das")
 
@@ -55,7 +62,7 @@ def test_repository_untracked_diff_contract(t : T?) {
         t |> equal(staged_error, "")
         t |> equal(expected_exit_code, 0l)
         t |> equal(argv[7], "--cached")
-        t |> equal(argv[10], "--unified=1000000")
+        t |> equal(argv[9], "--unified=1000000")
         t |> equal(argv[length(argv) - 1], "staged.das")
     }
 }

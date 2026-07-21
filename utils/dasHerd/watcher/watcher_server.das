@@ -12,9 +12,11 @@ require dashv/dashv_boost public
 require ./watcher_core.das public
 require ./repository_core.das public
 require daslib/json_boost
+require daslib/base64
 require strings
 
 let private MAX_REQUEST_BODY_BYTES = 1024 * 1024
+let private MAX_BINARY_PREVIEW_BYTES = 32 * 1024 * 1024
 let private CONTROLLER_HEARTBEAT_TIMEOUT_MS = 5000l
 var private g_watcher_gc_requested = false
 
@@ -69,6 +71,8 @@ struct public RepositoryFileInspectionMessage {
     loading : bool
     patch : string
     view_text : string
+    view_base64 : string
+    view_byte_count : int
     status : string
     error : string
 }
@@ -331,7 +335,9 @@ class DasHerdWatcherServer : HvWebServer {
 
     def send_file_inspection(var client : WatcherClient?;
                              loading : bool; patch, error : string;
-                             view_text : string = ""; status : string = "") {
+                             view_text : string = ""; status : string = "";
+                             view_base64 : string = "";
+                             view_byte_count : int = 0) {
         if (client == null) return
         let message = RepositoryFileInspectionMessage(
             request_id = client.inspection_request_id,
@@ -341,6 +347,7 @@ class DasHerdWatcherServer : HvWebServer {
             comparison = client.inspection_comparison,
             task_session_id = client.inspection_session_id,
             loading = loading, patch = patch, view_text = view_text,
+            view_base64 = view_base64, view_byte_count = view_byte_count,
             status = status, error = error)
         send(client.channel, sprint_json(message, false),
             ws_opcode.WS_OPCODE_TEXT, true)
@@ -411,17 +418,37 @@ class DasHerdWatcherServer : HvWebServer {
                 "git diff exited with {info.exit_code}: {patch}")
         } else {
             var view_text = ""
+            var view_base64 = ""
+            var view_byte_count = 0
             if (client.inspection_comparison == "working") {
-                let view_error = repository_working_file_text(
-                    client.inspection_repository_id,
-                    client.inspection_worktree_path,
-                    client.inspection_file_path, view_text)
+                let binary = find(patch, "Binary files ") >= 0 || find(patch, "GIT binary patch") >= 0
+                var view_error = ""
+                if (binary) {
+                    var inscope bytes : array<uint8>
+                    view_error = repository_working_file_bytes(
+                        client.inspection_repository_id,
+                        client.inspection_worktree_path,
+                        client.inspection_file_path, bytes)
+                    if (empty(view_error)) {
+                        view_byte_count = length(bytes)
+                        if (!empty(bytes)
+                                && view_byte_count <= MAX_BINARY_PREVIEW_BYTES) {
+                            view_base64 = base64_encode(bytes)
+                        }
+                    }
+                } else {
+                    view_error = repository_working_file_text(
+                        client.inspection_repository_id,
+                        client.inspection_worktree_path,
+                        client.inspection_file_path, view_text)
+                }
                 if (!empty(view_error)) {
                     self.send_file_inspection(client, false, "", view_error)
                     return
                 }
             }
-            self.send_file_inspection(client, false, patch, "", view_text)
+            self.send_file_inspection(client, false, patch, "", view_text,
+                "", view_base64, view_byte_count)
         }
     }
 

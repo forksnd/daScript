@@ -22,6 +22,7 @@ require ./watcher_core.das
 require ./repository_core.das
 require ./file_inspection.das
 require ./inspection_worker.das
+require ./image_preview_gl.das
 require math
 require strings
 
@@ -71,6 +72,8 @@ struct private WatcherFileInspectionMessage {
     loading : bool
     patch : string
     view_text : string
+    view_base64 : string
+    view_byte_count : int
     status : string
     error : string
 }
@@ -100,6 +103,11 @@ enum private GitInspectorMode {
     view
 }
 
+let INSPECTOR_SYNTAX_LABELS : array<string> <- [
+    "Auto", "Plain text", "daScript", "C", "C++", "Markdown", "JSON"]
+let INSPECTOR_SYNTAX_VALUES : array<string> <- [
+    "auto", "plain", "daslang", "c", "cpp", "markdown", "json"]
+
 struct private GitInspectorState {
     request_id : int
     repository_id : string
@@ -128,9 +136,21 @@ struct private GitInspectorState {
     view_source : string
     view_prepared : bool
     markdown_gutter_segments : int
+    source_patch : string
+    source_view_text : string
+    source_view_base64 : string
+    source_view_byte_count : int
+    syntax_choice : int
+    resolved_language : string
+    preview_texture : uint
+    preview_width : int
+    preview_height : int
+    preview_byte_count : int
+    preview_error : string
     diff_scroll_y : float
-    diff_left_hovered_last : bool
-    diff_right_hovered_last : bool
+    diff_scroll_jump_pending : bool
+    diff_split_fraction : float = 0.5f
+    diff_current_hunk : int
 }
 
 var private g_terminal = Terminal()
@@ -209,11 +229,6 @@ def private feed_terminal_frame(message : string#; byte_count : int) {
     }
 }
 
-def private markdown_file(path : string) : bool {
-    let lower = to_lower(path)
-    return ends_with(lower, ".md") || ends_with(lower, ".markdown")
-}
-
 def private changed_source_ranges(source : string;
                                   lines : array<int> const) : array<TextSourceRange> {
     var result : array<TextSourceRange>
@@ -246,7 +261,21 @@ def private changed_source_ranges(source : string;
     return <- result
 }
 
+def private upload_inspector_preview(event : InspectorPrepareEvent#) {
+    g_inspector.preview_width = event.preview_width
+    g_inspector.preview_height = event.preview_height
+    g_inspector.preview_byte_count = event.preview_byte_count
+    g_inspector.preview_error = clone_string(event.preview_error)
+    if (empty(event.preview_pixels)) return
+    inspector_preview_texture_upload(event.preview_pixels,
+        event.preview_width, event.preview_height,
+        g_inspector.preview_texture)
+}
+
 def private release_inspector_content() {
+    if (g_inspector.preview_texture != 0u) {
+        inspector_preview_texture_release(g_inspector.preview_texture)
+    }
     git_parsed_patch_dispose(g_inspector.parsed)
     text_source_view_invalidate(g_inspector.old_view)
     text_source_view_invalidate(g_inspector.new_view)
@@ -261,9 +290,29 @@ def private release_inspector_content() {
     g_inspector.view_source = ""
     g_inspector.view_prepared = false
     g_inspector.markdown_gutter_segments = 0
+    g_inspector.preview_width = 0
+    g_inspector.preview_height = 0
+    g_inspector.preview_byte_count = 0
+    g_inspector.preview_error = ""
     g_inspector.diff_scroll_y = 0.0f
-    g_inspector.diff_left_hovered_last = false
-    g_inspector.diff_right_hovered_last = false
+    g_inspector.diff_scroll_jump_pending = false
+    g_inspector.diff_current_hunk = 0
+}
+
+def private queue_inspector_prepare(status : string) {
+    let choice = clamp(g_inspector.syntax_choice, 0,
+        length(INSPECTOR_SYNTAX_VALUES) - 1)
+    g_inspector.resolved_language = inspector_language_for_path(
+        g_inspector.file_path, INSPECTOR_SYNTAX_VALUES[choice])
+    let generation = inspector_load_queue(g_inspector.prepare, status)
+    g_inspector.error = ""
+    if (!inspector_prepare_worker_queue(g_prepare_worker, generation,
+            g_inspector.source_patch, g_inspector.source_view_text,
+            g_inspector.resolved_language, g_inspector.source_view_base64,
+            g_inspector.source_view_byte_count)) {
+        inspector_load_fail(g_inspector.prepare, generation,
+            "Diff preparation worker is unavailable")
+    }
 }
 
 def private install_file_inspection(message : WatcherFileInspectionMessage const) {
@@ -278,14 +327,11 @@ def private install_file_inspection(message : WatcherFileInspectionMessage const
             g_inspector.prepare.generation, message.error)
         return
     }
-    let language = extension(g_inspector.file_path)
-    let generation = inspector_load_queue(
-        g_inspector.prepare, "Preparing diff...")
-    if (!inspector_prepare_worker_queue(g_prepare_worker, generation,
-            message.patch, message.view_text, language)) {
-        inspector_load_fail(g_inspector.prepare, generation,
-            "Diff preparation worker is unavailable")
-    }
+    g_inspector.source_patch = clone_string(message.patch)
+    g_inspector.source_view_text = clone_string(message.view_text)
+    g_inspector.source_view_base64 = clone_string(message.view_base64)
+    g_inspector.source_view_byte_count = message.view_byte_count
+    queue_inspector_prepare("Preparing diff...")
 }
 
 def private drain_inspector_prepare_events() {
@@ -310,6 +356,7 @@ def private drain_inspector_prepare_events() {
                 g_inspector.old_document := event.old_document
                 g_inspector.new_document := event.new_document
                 g_inspector.view_source = clone_string(event.view_source)
+                upload_inspector_preview(event)
                 g_inspector.error = ""
                 g_inspector.prepare_elapsed_usec = event.elapsed_usec
             }
@@ -330,6 +377,15 @@ def private begin_file_inspection(repository_id, worktree_path, file_path,
     g_inspector.loading = true
     g_inspector.status = "Requesting diff..."
     g_inspector.error = ""
+    if (!same_identity) {
+        g_inspector.source_patch = ""
+        g_inspector.source_view_text = ""
+        g_inspector.source_view_base64 = ""
+        g_inspector.source_view_byte_count = 0
+        g_inspector.syntax_choice = 0
+        g_inspector.resolved_language = inspector_language_for_path(file_path)
+        DIFF_SYNTAX.value = 0
+    }
     if (same_content) {
         inspector_load_supersede(g_inspector.prepare, "Requesting diff...")
     } else {
@@ -947,57 +1003,156 @@ def private inspector_content_state_name(state : InspectorContentState) : string
     return "absent"
 }
 
-def private draw_side_by_side_diff() {
+def private draw_binary_preview() {
+    text("Binary file ({g_inspector.preview_byte_count} bytes)")
+    if (g_inspector.preview_texture == 0u) {
+        text_disabled(INSPECTOR_BINARY_UNAVAILABLE,
+            (text = empty(g_inspector.preview_error)
+                ? "Preview unavailable"
+                : "Preview unavailable: {g_inspector.preview_error}"))
+        return
+    }
+    text_disabled(INSPECTOR_BINARY_DIMENSIONS,
+        (text = "Decoded by the bundled stb_image: " +
+            "{g_inspector.preview_width} x {g_inspector.preview_height}"))
     let available = GetContentRegionAvail()
-    let gap = GetStyle().ItemSpacing.x
-    let pane_width = max(1.0f, (available.x - gap) * 0.5f)
-    child(DIFF_LEFT_PANE, (text = "before", size = float2(pane_width, available.y),
+    let scale = min(1.0f, min(
+        available.x / max(1.0f, float(g_inspector.preview_width)),
+        available.y / max(1.0f, float(g_inspector.preview_height))))
+    unsafe {
+        image(INSPECTOR_BINARY_PREVIEW,
+            (user_texture_id = inspector_preview_texture_ref(
+                g_inspector.preview_texture),
+             size = float2(max(1.0f, float(g_inspector.preview_width) * scale),
+                           max(1.0f, float(g_inspector.preview_height) * scale)),
+             uv0 = float2(0.0f, 0.0f), uv1 = float2(1.0f, 1.0f),
+             tint_col = float4(1.0f, 1.0f, 1.0f, 1.0f),
+             border_col = float4(0.35f, 0.35f, 0.35f, 1.0f)))
+    }
+}
+
+def private draw_side_by_side_diff() {
+    if (g_inspector.parsed.binary) {
+        draw_binary_preview()
+        return
+    }
+    let hunk_count = length(g_inspector.parsed.hunks)
+    g_inspector.diff_current_hunk = hunk_count > 0 ? clamp(g_inspector.diff_current_hunk, 0, hunk_count - 1) : 0
+    SetNextItemWidth(150.0f)
+    combo(DIFF_SYNTAX, (text = "Syntax", items <- INSPECTOR_SYNTAX_LABELS))
+    let selected_syntax = clamp(DIFF_SYNTAX.value, 0,
+        length(INSPECTOR_SYNTAX_VALUES) - 1)
+    if (selected_syntax != g_inspector.syntax_choice) {
+        g_inspector.syntax_choice = selected_syntax
+        g_inspector.resolved_language = inspector_language_for_path(
+            g_inspector.file_path,
+            INSPECTOR_SYNTAX_VALUES[g_inspector.syntax_choice])
+        if (!empty(g_inspector.source_patch)) {
+            queue_inspector_prepare("Applying syntax...")
+        }
+    }
+    same_line()
+    if (small_button(DIFF_PREVIOUS_CHANGE, (text = "Previous change",
+            enabled = g_inspector.diff_current_hunk > 0))) {
+        g_inspector.diff_current_hunk = max(0,
+            g_inspector.diff_current_hunk - 1)
+        if (g_inspector.diff_current_hunk < hunk_count) {
+            let row = g_inspector.parsed.hunks[g_inspector.diff_current_hunk].row_start
+            g_inspector.diff_scroll_y = float(row) * max(
+                GetTextLineHeight(), g_inspector.new_view.key.line_height)
+            g_inspector.diff_scroll_jump_pending = true
+        }
+    }
+    same_line()
+    if (small_button(DIFF_NEXT_CHANGE, (text = "Next change",
+            enabled = g_inspector.diff_current_hunk + 1 < hunk_count))) {
+        g_inspector.diff_current_hunk = min(hunk_count - 1,
+            g_inspector.diff_current_hunk + 1)
+        if (g_inspector.diff_current_hunk >= 0
+                && g_inspector.diff_current_hunk < hunk_count) {
+            let row = g_inspector.parsed.hunks[g_inspector.diff_current_hunk].row_start
+            g_inspector.diff_scroll_y = float(row) * max(
+                GetTextLineHeight(), g_inspector.new_view.key.line_height)
+            g_inspector.diff_scroll_jump_pending = true
+        }
+    }
+    same_line()
+    text_disabled(DIFF_CHANGE_POSITION, (text = hunk_count > 0
+        ? "Change {g_inspector.diff_current_hunk + 1} of {hunk_count}"
+        : "No text changes"))
+
+    let available = GetContentRegionAvail()
+    let splitter_width = 8.0f
+    let usable_width = max(2.0f, available.x - splitter_width)
+    var left_width = usable_width * clamp(
+        g_inspector.diff_split_fraction, 0.12f, 0.88f)
+    var right_width = usable_width - left_width
+    let origin = GetCursorScreenPos()
+    let split_min = min(120.0f, usable_width * 0.4f)
+    let split_box = float4(origin.x + left_width, origin.y,
+        origin.x + left_width + splitter_width, origin.y + available.y)
+    let splitting = SplitterBehavior(split_box, GetID("git_diff_splitter"),
+        ImGuiAxis.X, left_width, right_width, split_min, split_min)
+    g_inspector.diff_split_fraction = left_width / max(1.0f, left_width + right_width)
+
+    child(DIFF_LEFT_PANE, (text = "before", size = float2(left_width, available.y),
             child_flags = ImGuiChildFlags.Borders,
-            window_flags = ImGuiWindowFlags.HorizontalScrollbar)) {
+            window_flags = ImGuiWindowFlags.NoScrollbar)) {
         let hovered = IsWindowHovered(ImGuiHoveredFlags.None)
-        let entering = hovered && !g_inspector.diff_left_hovered_last
-        if (!hovered || entering) SetScrollY(g_inspector.diff_scroll_y)
+        if (g_inspector.diff_scroll_jump_pending || !hovered) {
+            SetScrollY(g_inspector.diff_scroll_y)
+        } else {
+            g_inspector.diff_scroll_y = GetScrollY()
+        }
         text_disabled("BEFORE")
         separator()
         var style = source_view_style(true)
         let _ = text_source_view("git diff before", g_inspector.old_document,
             g_inspector.old_view, style)
-        if (hovered) {
-            g_inspector.diff_scroll_y = GetScrollY()
-        }
-        g_inspector.diff_left_hovered_last = hovered
     }
-    same_line()
-    child(DIFF_RIGHT_PANE, (text = "after", size = float2(pane_width, available.y),
+    same_line((spacing = 0.0f))
+    dummy(DIFF_SPLITTER_SPACE, (size = float2(splitter_width, available.y)))
+    let splitter_hot = IsItemHovered() || splitting
+    if (splitter_hot) SetMouseCursor(ImGuiMouseCursor.ResizeEW)
+    let splitter_color = GetColorU32(splitter_hot
+        ? ImGuiCol.SeparatorActive : ImGuiCol.Separator)
+    with_window_drawlist() $(var dl) {
+        dl |> add_line(
+            float2(origin.x + left_width + splitter_width * 0.5f, origin.y),
+            float2(origin.x + left_width + splitter_width * 0.5f,
+                origin.y + available.y), splitter_color, 1.0f)
+    }
+    same_line((spacing = 0.0f))
+    child(DIFF_RIGHT_PANE, (text = "after", size = float2(right_width, available.y),
             child_flags = ImGuiChildFlags.Borders,
             window_flags = ImGuiWindowFlags.HorizontalScrollbar)) {
         let hovered = IsWindowHovered(ImGuiHoveredFlags.None)
-        let entering = hovered && !g_inspector.diff_right_hovered_last
-        if (!hovered || entering) SetScrollY(g_inspector.diff_scroll_y)
+        if (g_inspector.diff_scroll_jump_pending || !hovered) {
+            SetScrollY(g_inspector.diff_scroll_y)
+        } else {
+            g_inspector.diff_scroll_y = GetScrollY()
+        }
         text_disabled("AFTER")
         separator()
         var style = source_view_style(true)
         let _ = text_source_view("git diff after", g_inspector.new_document,
             g_inspector.new_view, style)
-        if (hovered) {
-            g_inspector.diff_scroll_y = GetScrollY()
-        }
-        g_inspector.diff_right_hovered_last = hovered
     }
+    g_inspector.diff_scroll_jump_pending = false
 }
 
 def private prepare_file_view() {
     if (g_inspector.view_prepared) return
-    let language = extension(g_inspector.file_path)
     var view_document <- tree_sitter_source_document(
-        g_inspector.view_source, language, g_inspector.revision)
+        g_inspector.view_source, g_inspector.resolved_language,
+        g_inspector.revision)
     view_document.line_marks |> reserve(length(g_inspector.parsed.new_changed_lines))
     for (line in g_inspector.parsed.new_changed_lines) {
         view_document.line_marks |> push(TextSourceLineMark(
             line_index = line, kind = TextSourceLineMarkKind.added))
     }
     g_inspector.view_document <- view_document
-    if (markdown_file(g_inspector.file_path)) {
+    if (g_inspector.resolved_language == "markdown") {
         var markdown_document <- md_parse(g_inspector.view_source)
         var markdown_changes <- changed_source_ranges(
             g_inspector.view_source, g_inspector.parsed.new_changed_lines)
@@ -1008,11 +1163,15 @@ def private prepare_file_view() {
 }
 
 def private draw_file_view() {
+    if (g_inspector.parsed.binary) {
+        draw_binary_preview()
+        return
+    }
     prepare_file_view()
     child(FILE_VIEW_PANE, (text = "file view", size = float2(0.0f, 0.0f),
             child_flags = ImGuiChildFlags.None,
             window_flags = ImGuiWindowFlags.HorizontalScrollbar)) {
-        if (markdown_file(g_inspector.file_path)) {
+        if (g_inspector.resolved_language == "markdown") {
             var style = MarkdownViewStyle(
                 fonts = g_fonts,
                 typography = MarkdownTypography(
@@ -1061,6 +1220,18 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         task_session_id = g_inspector.task_session_id,
         revision = g_inspector.revision,
         diff_row_count = length(g_inspector.parsed.rows),
+        diff_hunk_count = length(g_inspector.parsed.hunks),
+        diff_current_hunk = g_inspector.diff_current_hunk,
+        diff_scroll_y = g_inspector.diff_scroll_y,
+        diff_split_fraction = g_inspector.diff_split_fraction,
+        syntax_choice = g_inspector.syntax_choice,
+        resolved_language = g_inspector.resolved_language,
+        binary = g_inspector.parsed.binary,
+        preview_texture_ready = g_inspector.preview_texture != 0u,
+        preview_width = g_inspector.preview_width,
+        preview_height = g_inspector.preview_height,
+        preview_byte_count = g_inspector.preview_byte_count,
+        preview_error = g_inspector.preview_error,
         old_changed_line_count = length(g_inspector.parsed.old_changed_lines),
         new_changed_line_count = length(g_inspector.parsed.new_changed_lines),
         old_byte_count = length(g_inspector.parsed.old_text),
@@ -1072,6 +1243,8 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         view_prepared = g_inspector.view_prepared,
         old_line_mark_count = length(g_inspector.old_document.line_marks),
         new_line_mark_count = length(g_inspector.new_document.line_marks),
+        old_line_number_count = length(g_inspector.old_document.line_numbers),
+        new_line_number_count = length(g_inspector.new_document.line_numbers),
         view_line_mark_count = length(g_inspector.view_document.line_marks),
         changed_source_range_count = length(g_inspector.changed_source_ranges),
         old_syntax_span_count = length(g_inspector.old_document.spans),
@@ -1253,6 +1426,7 @@ def private draw_terminal_window() {
 def init() {
     harness_init("dasHerd", 1280, 800)
     harness_maximize_window()
+    DIFF_SYNTAX.value = 0
     var io & = unsafe(GetIO())
     io.ConfigFlags |= ImGuiConfigFlags.DockingEnable
     g_fonts = load_unicode_font_roles(14.0f, g_font_sources)

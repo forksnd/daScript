@@ -4,6 +4,22 @@ require dastest/testing_boost public
 require ../file_inspection.das
 
 [test]
+def test_inspector_language_resolution(t : T?) {
+    t |> run("auto syntax resolves compound local filenames") <| @(tt : T?) {
+        tt |> equal(inspector_language_for_path("notes.md.local"), "markdown")
+        tt |> equal(inspector_language_for_path("DATA.JSON.LOCAL"), "json")
+        tt |> equal(inspector_language_for_path("src/widget.cpp"), "cpp")
+        tt |> equal(inspector_language_for_path("script.das"), "daslang")
+        tt |> equal(inspector_language_for_path("README"), "")
+    }
+    t |> run("explicit syntax overrides auto and supports plain text") <| @(tt : T?) {
+        tt |> equal(inspector_language_for_path("wrong.bin", "C++"), "cpp")
+        tt |> equal(inspector_language_for_path("sample.das", "plain"), "")
+        tt |> equal(inspector_language_for_path("sample.txt", "markdown"), "markdown")
+    }
+}
+
+[test]
 def test_unified_patch_projection(t : T?) {
     t |> run("unified hunks become aligned Diff and resulting View text") <| @(t : T?) {
         let source = "diff --git a/sample.das b/sample.das\n--- a/sample.das\n+++ b/sample.das\n@@ -1,4 +1,5 @@\n options gen2\n-let old = 1\n+let next = 2\n+let added = 3\n keep()\n-last()\n"
@@ -12,6 +28,9 @@ def test_unified_patch_projection(t : T?) {
         t |> equal(parsed.old_text, "options gen2\nlet old = 1\nkeep()\nlast()")
         t |> equal(parsed.new_text, "options gen2\nlet next = 2\nlet added = 3\nkeep()")
         t |> equal(length(parsed.rows), 5)
+        t |> equal(length(parsed.hunks), 1)
+        t |> equal(parsed.hunks[0].row_start, 0)
+        t |> equal(parsed.hunks[0].row_count, 5)
         t |> equal(parsed.rows[1].old_kind, GitDiffLineKind.removed)
         t |> equal(parsed.rows[1].new_kind, GitDiffLineKind.added)
         t |> equal(parsed.rows[2].old_kind, GitDiffLineKind.empty)
@@ -19,6 +38,20 @@ def test_unified_patch_projection(t : T?) {
         t |> equal(parsed.rows[4].old_kind, GitDiffLineKind.removed)
         t |> equal(parsed.rows[4].new_kind, GitDiffLineKind.empty)
         t |> equal(length(parsed.new_changed_lines), 2)
+    }
+    t |> run("separated hunks retain navigation boundaries") <| @(tt : T?) {
+        let source = "diff --git a/a.das b/a.das\n--- a/a.das\n+++ b/a.das\n@@ -2,2 +2,2 @@\n-old one\n+new one\n keep\n@@ -20 +20 @@\n-old two\n+new two\n"
+        var inscope parsed <- git_parse_unified_patch(source)
+        tt |> equal(parsed.error, "")
+        tt |> equal(length(parsed.hunks), 2)
+        tt |> equal(parsed.hunks[0].row_start, 0)
+        tt |> equal(parsed.hunks[0].row_count, 2)
+        tt |> equal(parsed.hunks[0].old_start, 2)
+        tt |> equal(parsed.hunks[0].new_start, 2)
+        tt |> equal(parsed.hunks[1].row_start, 2)
+        tt |> equal(parsed.hunks[1].row_count, 1)
+        tt |> equal(parsed.hunks[1].old_start, 20)
+        tt |> equal(parsed.hunks[1].new_start, 20)
     }
 }
 

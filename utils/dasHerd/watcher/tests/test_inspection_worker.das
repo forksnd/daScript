@@ -6,6 +6,8 @@ require dastest/testing_boost public
 require ../inspection_worker.das
 require daslib/jobque_boost
 require daslib/utf8_utils
+require daslib/base64
+require daslib/fio
 require imgui/imgui_text_tree_sitter
 
 [test]
@@ -42,6 +44,10 @@ def test_inspection_prepare_worker(t : T?) {
                     span_count = length(event.new_document.spans)
                     t |> equal(event.generation, 7)
                     t |> equal(length(event.parsed.rows), 1)
+                    t |> equal(length(event.old_document.line_numbers), 1)
+                    t |> equal(length(event.new_document.line_numbers), 1)
+                    t |> equal(event.old_document.line_numbers[0], 1)
+                    t |> equal(event.new_document.line_numbers[0], 1)
                     t |> equal(event.view_source,
                         "options gen2\nlet answer = \"🐑\"\n")
                 }
@@ -74,6 +80,69 @@ def test_inspection_prepare_worker(t : T?) {
         }
         tt |> equal(failed, true)
         tt |> equal(empty(failure), false)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("binary image bytes decode off-thread with exact transport size") <| @(tt : T?) {
+        var encoded = ""
+        var byte_count = 0
+        fopen("3rdparty/fmt/doc/html/_static/file.png", "rb") $(file) {
+            if (file != null) {
+                fmap(file) $(var data : array<uint8>#) {
+                    byte_count = length(data)
+                    encoded = base64_encode(data)
+                }
+            }
+        }
+        tt |> success(byte_count > 0, "tracked PNG fixture is readable")
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 13,
+            "diff --git a/file.png b/file.png\nBinary files a/file.png and b/file.png differ\n",
+            "", "", encoded, byte_count), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.parsed.binary, true)
+                    tt |> equal(event.preview_byte_count, byte_count)
+                    tt |> equal(event.preview_error, "")
+                    tt |> success(event.preview_width > 0 && event.preview_height > 0,
+                        "stb_image reports image dimensions")
+                    tt |> equal(length(event.preview_pixels),
+                        event.preview_width * event.preview_height * 4)
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("unsupported binary completes with an unavailable-preview reason") <| @(tt : T?) {
+        var bytes : array<uint8> <- [uint8(0), uint8(1), uint8(2), uint8(3)]
+        let encoded = base64_encode(bytes)
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 14,
+            "diff --git a/file.bin b/file.bin\nBinary files a/file.bin and b/file.bin differ\n",
+            "", "", encoded, length(bytes)), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.parsed.binary, true)
+                    tt |> equal(empty(event.preview_pixels), true)
+                    tt |> equal(empty(event.preview_error), false)
+                }
+            }
+        }
+        tt |> equal(completed, true)
         tt |> equal(inspector_prepare_worker_shutdown(worker), true)
         destroy_job_que()
     }
