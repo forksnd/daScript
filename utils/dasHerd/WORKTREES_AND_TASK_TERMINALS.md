@@ -477,6 +477,66 @@ scrolling is exact in both directions, and the prepared View renders at roughly
 multi-second cost and remains the next focused optimization, not a reason to
 replace Git's native diff.
 
+### Diff vertical slice
+
+Discussion status: scope agreed; implementation in progress
+
+Diff is the first inspector projection taken to near-production depth before
+the rest of Git inspection expands. It establishes the reusable cost and test
+baseline for later View, PR, history, and other asynchronous projections.
+The slice includes failure, replacement, large-input, and binary behavior; it
+is not complete merely when the happy-path text comparison renders.
+
+The first complete Diff surface has:
+
+- one vertical scroll position and one visible vertical scrollbar for both
+  panes, including wheel, keyboard, live-command, and scrollbar-drag input;
+- a draggable center splitter with a useful minimum width on both sides;
+- absolute old/new line-number gutters, with absent lines rendered as gaps;
+- retained hunk identity and previous/next-change navigation;
+- compact, expanded-context, and full-file modes over the same aligned-row
+  model;
+- automatic syntax selection plus an explicit override for Plain, daScript,
+  C, C++, Markdown, and JSON; compound suffixes such as `.md.local` resolve to
+  the underlying Markdown language;
+- Git-native binary detection and an image preview only when the bundled
+  stb_image decoder accepts the bytes.
+
+The bundled stb_image 2.30 build currently enables its stock PNG, JPEG, BMP,
+TGA, PSD-composite, GIF-first-frame, HDR, PIC, and binary PNM decoders. This is
+a capability boundary, not a promise to grow an extension list. WebP,
+animation, and video are deferred; future video work belongs with dasVideo.
+The watcher transports exact bytes, because a rich client must not assume it
+can open a target-local path once execution targets include SSH. CPU decoding
+may run on a worker; ImGui and graphics-resource creation remain on the UI
+thread.
+
+Each inspector projection exposes request state separately from retained
+content. Request state is idle, queued, or running; content is absent, ready,
+or failed. Starting a refresh does not erase the last successful content, and
+a failed refresh may report its error while leaving that content inspectable.
+Every request carries a monotonically increasing generation. The UI installs
+only results matching the current generation, so selecting another file
+supersedes work without waiting for or joining the old request.
+
+One persistent rich-client worker initially services preparation jobs through
+bounded/coalescing queues. It performs CPU-only parsing, syntax preparation,
+and image decoding and catches failures into result events. The UI thread
+drains those events once per frame. Watcher-hosted Git remains a separate
+asynchronous stage, and any graphics upload is an explicit final UI-thread
+stage. Shutdown closes the worker channel and releases captured channel
+references; it must neither leak a thread nor stall client exit.
+
+The dedicated fixture worktree covers at least staged and unstaged text,
+untracked files, rename, deletion, conflicts where practical, Markdown and a
+compound Markdown suffix, JSON, daScript, C/C++, a decodable image, an
+unsupported binary, no-final-newline input, Unicode paths/content, separated
+hunks, and a large file. Test coverage is counted in six groups: pure diff and
+language models, deterministic worker-state transitions, widget/render
+behavior, real watcher/Git integration, semantic live-command inspection, and
+performance/regression probes. The resulting count and the defects these tests
+catch become the estimating baseline for later projections.
+
 Questions still to settle:
 
 - How completed task terminals are grouped and pruned from the activity UI.

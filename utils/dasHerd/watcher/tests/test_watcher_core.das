@@ -13,6 +13,9 @@ def test_watcher_machine_output(t : T?) {
         let bel = to_char(7)
         let wrapped = "{esc}[?9001h{esc}[2J{esc}[Hfirst\r\nsecond\tvalue{esc}]0;git.exe{bel}{esc}[?25h"
         t |> equal(watcher_strip_terminal_controls(wrapped), "first\r\nsecond\tvalue")
+        let unicode_wrapped = "{esc}[31mΚαλημέρα, мир, こんにちは, 🐑{esc}[0m"
+        t |> equal(watcher_strip_terminal_controls(unicode_wrapped),
+            "Καλημέρα, мир, こんにちは, 🐑")
     }
 }
 

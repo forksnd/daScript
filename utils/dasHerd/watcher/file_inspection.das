@@ -16,6 +16,92 @@ enum public GitDiffLineKind {
     empty
 }
 
+enum public InspectorRequestState {
+    idle
+    queued
+    running
+}
+
+enum public InspectorContentState {
+    absent
+    ready
+    failed
+}
+
+// Request lifetime and installed content deliberately do not collapse into a
+// single state. A replacement can be running while the previous successful
+// payload remains visible, and a failed replacement does not destroy it.
+struct public InspectorLoadState {
+    generation : int
+    request : InspectorRequestState = InspectorRequestState.idle
+    latest_outcome : InspectorContentState = InspectorContentState.absent
+    has_retained_content : bool
+    retained_generation : int
+    status : string
+    error : string
+}
+
+def public inspector_load_queue(var state : InspectorLoadState;
+                                status : string = "Queued") : int {
+    state.generation++
+    state.request = InspectorRequestState.queued
+    state.status = status
+    state.error = ""
+    return state.generation
+}
+
+def public inspector_load_start(var state : InspectorLoadState;
+                                generation : int;
+                                status : string = "Loading") : bool {
+    if (generation != state.generation
+            || state.request != InspectorRequestState.queued) return false
+    state.request = InspectorRequestState.running
+    state.status = status
+    return true
+}
+
+def public inspector_load_succeed(var state : InspectorLoadState;
+                                  generation : int;
+                                  status : string = "Ready") : bool {
+    if (generation != state.generation) return false
+    state.request = InspectorRequestState.idle
+    state.latest_outcome = InspectorContentState.ready
+    state.has_retained_content = true
+    state.retained_generation = generation
+    state.status = status
+    state.error = ""
+    return true
+}
+
+def public inspector_load_fail(var state : InspectorLoadState;
+                               generation : int;
+                               error : string) : bool {
+    if (generation != state.generation) return false
+    state.request = InspectorRequestState.idle
+    state.latest_outcome = InspectorContentState.failed
+    state.status = "Failed"
+    state.error = error
+    return true
+}
+
+def public inspector_load_reset(var state : InspectorLoadState) {
+    state.generation++
+    state.request = InspectorRequestState.idle
+    state.latest_outcome = InspectorContentState.absent
+    state.has_retained_content = false
+    state.retained_generation = 0
+    state.status = ""
+    state.error = ""
+}
+
+def public inspector_load_supersede(var state : InspectorLoadState;
+                                    status : string = "Refreshing") {
+    state.generation++
+    state.request = InspectorRequestState.idle
+    state.status = status
+    state.error = ""
+}
+
 struct public GitDiffRow {
     old_text : string
     new_text : string

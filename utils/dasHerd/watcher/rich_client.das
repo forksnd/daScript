@@ -15,10 +15,13 @@ require clipboard/clipboard
 require daslib/safe_addr
 require daslib/json
 require daslib/json_boost
+require daslib/jobque_boost
+require daslib/utf8_utils
 require live/live_commands
 require ./watcher_core.das
 require ./repository_core.das
 require ./file_inspection.das
+require ./inspection_worker.das
 require math
 require strings
 
@@ -108,6 +111,8 @@ struct private GitInspectorState {
     status : string
     error : string
     revision : int
+    prepare : InspectorLoadState = InspectorLoadState()
+    prepare_elapsed_usec : int64
     mode : GitInspectorMode = GitInspectorMode.diff
     parsed : GitParsedPatch = GitParsedPatch()
     old_document : TextSourceDocument = TextSourceDocument()
@@ -142,6 +147,8 @@ var private g_selected_worktree_path : string
 var private g_selected_repository_id : string
 var private g_focus_terminal_pending = false
 var private g_inspector = GitInspectorState()
+var private g_prepare_worker = InspectorPrepareWorker()
+var private g_jobque_owned = false
 var private SESSION_ROW : table<int; ToggleState>
 var private WORKTREE_ROW : table<int; ToggleState>
 var private GIT_FILE_ROW : table<int; ToggleState>
@@ -266,42 +273,54 @@ def private install_file_inspection(message : WatcherFileInspectionMessage const
     g_inspector.status = message.status
     if (message.loading) return
     g_inspector.error = message.error
-    if (!empty(message.error)) return
-
-    var inscope parsed <- git_parse_unified_patch(message.patch)
-    if (!empty(parsed.error)) {
-        g_inspector.error = parsed.error
+    if (!empty(message.error)) {
+        inspector_load_fail(g_inspector.prepare,
+            g_inspector.prepare.generation, message.error)
         return
     }
-    release_inspector_content()
-    g_inspector.revision++
     let language = extension(g_inspector.file_path)
-    let view_source = (!empty(message.view_text)
-        ? message.view_text : parsed.new_text)
-    var old_document <- tree_sitter_source_document(
-        parsed.old_aligned_text, language, g_inspector.revision)
-    var new_document <- tree_sitter_source_document(
-        parsed.new_aligned_text, language, g_inspector.revision)
-    old_document.line_marks |> reserve(length(parsed.old_changed_lines))
-    new_document.line_marks |> reserve(length(parsed.new_changed_lines))
-    for (index in range(length(parsed.rows))) {
-        if (parsed.rows[index].old_kind == GitDiffLineKind.removed) {
-            old_document.line_marks |> push(TextSourceLineMark(
-                line_index = index, kind = TextSourceLineMarkKind.removed))
-        }
-        if (parsed.rows[index].new_kind == GitDiffLineKind.added) {
-            new_document.line_marks |> push(TextSourceLineMark(
-                line_index = index, kind = TextSourceLineMarkKind.added))
+    let generation = inspector_load_queue(
+        g_inspector.prepare, "Preparing diff...")
+    if (!inspector_prepare_worker_queue(g_prepare_worker, generation,
+            message.patch, message.view_text, language)) {
+        inspector_load_fail(g_inspector.prepare, generation,
+            "Diff preparation worker is unavailable")
+    }
+}
+
+def private drain_inspector_prepare_events() {
+    var draining = true
+    while (draining) {
+        draining = inspector_prepare_worker_try_event(g_prepare_worker) $(event : InspectorPrepareEvent#) {
+            if (event.kind == InspectorPrepareEventKind.started) {
+                inspector_load_start(g_inspector.prepare, event.generation,
+                    "Preparing diff...")
+            } elif (event.kind == InspectorPrepareEventKind.failed) {
+                if (inspector_load_fail(g_inspector.prepare,
+                        event.generation, clone_string(event.error))) {
+                    g_inspector.error = clone_string(event.error)
+                    g_inspector.prepare_elapsed_usec = event.elapsed_usec
+                }
+            } elif (event.kind == InspectorPrepareEventKind.completed) {
+                if (!inspector_load_succeed(g_inspector.prepare,
+                        event.generation)) return
+                release_inspector_content()
+                g_inspector.revision++
+                g_inspector.parsed := event.parsed
+                g_inspector.old_document := event.old_document
+                g_inspector.new_document := event.new_document
+                g_inspector.view_source = clone_string(event.view_source)
+                g_inspector.error = ""
+                g_inspector.prepare_elapsed_usec = event.elapsed_usec
+            }
         }
     }
-    g_inspector.parsed <- parsed
-    g_inspector.old_document <- old_document
-    g_inspector.new_document <- new_document
-    g_inspector.view_source = view_source
 }
 
 def private begin_file_inspection(repository_id, worktree_path, file_path,
                                   comparison : string) {
+    let same_identity = g_inspector.repository_id == repository_id && g_inspector.worktree_path == worktree_path && g_inspector.file_path == file_path && g_inspector.comparison == comparison
+    let same_content = g_inspector.prepare.has_retained_content && same_identity
     g_inspector.request_id++
     g_inspector.repository_id = repository_id
     g_inspector.worktree_path = worktree_path
@@ -311,7 +330,12 @@ def private begin_file_inspection(repository_id, worktree_path, file_path,
     g_inspector.loading = true
     g_inspector.status = "Requesting diff..."
     g_inspector.error = ""
-    release_inspector_content()
+    if (same_content) {
+        inspector_load_supersede(g_inspector.prepare, "Requesting diff...")
+    } else {
+        release_inspector_content()
+        inspector_load_reset(g_inspector.prepare)
+    }
     g_inspector.mode = GitInspectorMode.diff
     INSPECTOR_DIFF_TAB.pending_select = true
 }
@@ -911,6 +935,18 @@ def private syntax_style_cell_count(state : TextSourceViewState const;
     return count
 }
 
+def private inspector_request_state_name(state : InspectorRequestState) : string {
+    if (state == InspectorRequestState.queued) return "queued"
+    if (state == InspectorRequestState.running) return "running"
+    return "idle"
+}
+
+def private inspector_content_state_name(state : InspectorContentState) : string {
+    if (state == InspectorContentState.ready) return "ready"
+    if (state == InspectorContentState.failed) return "failed"
+    return "absent"
+}
+
 def private draw_side_by_side_diff() {
     let available = GetContentRegionAvail()
     let gap = GetStyle().ItemSpacing.x
@@ -1011,6 +1047,15 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         comparison = g_inspector.comparison,
         mode = g_inspector.mode == GitInspectorMode.diff ? "diff" : "view",
         loading = g_inspector.loading,
+        prepare_request = inspector_request_state_name(g_inspector.prepare.request),
+        prepare_outcome = inspector_content_state_name(
+            g_inspector.prepare.latest_outcome),
+        prepare_generation = g_inspector.prepare.generation,
+        prepare_has_retained_content = g_inspector.prepare.has_retained_content,
+        prepare_retained_generation = g_inspector.prepare.retained_generation,
+        prepare_status = g_inspector.prepare.status,
+        prepare_error = g_inspector.prepare.error,
+        prepare_elapsed_usec = g_inspector.prepare_elapsed_usec,
         status = g_inspector.status,
         error = g_inspector.error,
         task_session_id = g_inspector.task_session_id,
@@ -1020,6 +1065,9 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         new_changed_line_count = length(g_inspector.parsed.new_changed_lines),
         old_byte_count = length(g_inspector.parsed.old_text),
         new_byte_count = length(g_inspector.parsed.new_text),
+        new_document_byte_count = length(g_inspector.new_document.source),
+        new_document_utf8_valid = is_utf8_string_valid(
+            g_inspector.new_document.source),
         view_byte_count = length(g_inspector.view_source),
         view_prepared = g_inspector.view_prepared,
         old_line_mark_count = length(g_inspector.old_document.line_marks),
@@ -1093,12 +1141,16 @@ def herder_file_inspector_text(input : JsonValue?) : JsonValue? {
             syntax_span_count = length(g_inspector.old_document.spans)))
     }
     if (side == "after" || side == "new" || side == "view") {
-        let source = (side == "view"
-            ? g_inspector.view_source : g_inspector.parsed.new_text)
+        let is_view = side == "view"
+        let source = is_view ? g_inspector.view_source : g_inspector.parsed.new_text
         return JV((ok = true, side = side == "view" ? "view" : "after",
             text = source,
-            line_mark_count = length(g_inspector.view_document.line_marks),
-            syntax_span_count = length(g_inspector.view_document.spans)))
+            line_mark_count = is_view
+                ? length(g_inspector.view_document.line_marks)
+                : length(g_inspector.new_document.line_marks),
+            syntax_span_count = is_view
+                ? length(g_inspector.view_document.spans)
+                : length(g_inspector.new_document.spans)))
     }
     return JV((ok = false, error = "side must be before, after, or view"))
 }
@@ -1128,7 +1180,7 @@ def private draw_file_inspector_window() {
     if (g_inspector.loading) {
         text_disabled(INSPECTOR_LOADING,
             (text = empty(g_inspector.status) ? "Loading diff..." : g_inspector.status))
-        return
+        if (!g_inspector.prepare.has_retained_content) return
     }
     if (!empty(g_inspector.error)) {
         text_colored(INSPECTOR_ERROR,
@@ -1136,7 +1188,13 @@ def private draw_file_inspector_window() {
         if (!empty(g_inspector.task_session_id)) {
             text_disabled("Task: {g_inspector.task_session_id}")
         }
-        return
+        if (!g_inspector.prepare.has_retained_content) return
+    }
+    if (g_inspector.prepare.request != InspectorRequestState.idle) {
+        text_disabled(INSPECTOR_LOADING,
+            (text = empty(g_inspector.prepare.status)
+                ? "Preparing diff..." : g_inspector.prepare.status))
+        if (!g_inspector.prepare.has_retained_content) return
     }
     tab_bar(INSPECTOR_MODE_TABS,
             (text = "InspectorModes", flags = ImGuiTabBarFlags.None)) {
@@ -1200,6 +1258,9 @@ def init() {
     g_fonts = load_unicode_font_roles(14.0f, g_font_sources)
     g_terminal_font = g_fonts.monospace
     reset_terminal()
+    create_job_que()
+    g_jobque_owned = true
+    inspector_prepare_worker_start(g_prepare_worker)
     g_selected_worktree_path = get_das_root()
     SETTINGS_WIN.open = false
     let port = clamp(to_int(option_value("--port=", "9191")), 1024, 65535)
@@ -1220,6 +1281,7 @@ def init() {
 def update() {
     if (!harness_begin_frame()) return
     if (g_client != null) g_client->pump()
+    drain_inspector_prepare_events()
     harness_new_frame()
     GetStyle().FontScaleMain = float(g_zoom_percent) / 100.0f
     draw_main_menu()
@@ -1258,6 +1320,7 @@ def update() {
 
 [export]
 def shutdown() {
+    let prepare_stopped = inspector_prepare_worker_shutdown(g_prepare_worker)
     if (g_client != null) {
         g_client->close()
         g_client->cleanup()
@@ -1276,6 +1339,10 @@ def shutdown() {
     terminal_dispose(g_terminal)
     delete g_font_sources
     harness_shutdown()
+    if (g_jobque_owned && prepare_stopped) {
+        destroy_job_que()
+        g_jobque_owned = false
+    }
 }
 
 [export]
