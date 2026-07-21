@@ -10814,22 +10814,27 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
     let f1 = fmt_at(t.we1_fmt, l)
     let f2 = fmt_at(t.we2_fmt, l)
     let f3 = fmt_at(t.we3_fmt, l)
+    // GPU tier: offloaded layers run the routed chain device-side; the fused arm gathers ALL nk bucket rows at once (grows)
+    let fused_gpu = (!c.moe_exps_bias && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai
+        && (moe_gpu_layer_on_gpu(l) || moe_gpu_layer_streamed(l)) && g_moe_fused_expert_gemms && npos >= 32l)
+    let gpu_comb = fused_gpu && gpu_combine_on()
+    let grows = fused_gpu ? nk : npos
     s.moe_rlog |> resize(npos * ne)
     s.moe_idx_b |> resize(nk)
     s.moe_w_b |> resize(nk)
     s.moe_cnt |> resize(ne)
     s.moe_bkt |> resize(nk)
-    s.moe_gxq |> resize(npos * dim)
-    s.moe_gxs |> resize(npos * nb)
-    s.moe_ghb |> resize(npos * nfe)
-    s.moe_ghb2 |> resize(npos * nfe)
-    s.moe_hq |> resize(npos * nfe)
-    s.moe_hs |> resize(npos * nfe / 32l)
-    s.moe_gout |> resize(npos * dim)
+    s.moe_gxq |> resize(grows * dim)
+    s.moe_gxs |> resize(grows * nb)
+    s.moe_ghb |> resize(grows * nfe)
+    s.moe_ghb2 |> resize(grows * nfe)
+    s.moe_hq |> resize(grows * nfe)
+    s.moe_hs |> resize(grows * nfe / 32l)
+    s.moe_gout |> resize(grows * dim)
     s.moe_eout |> resize(nk * dim)
     if (kq_layer) {
-        s.moe_gxbs |> resize(npos * dim / 16l)
-        s.moe_hbs |> resize(npos * nfe / 16l)
+        s.moe_gxbs |> resize(grows * dim / 16l)
+        s.moe_hbs |> resize(grows * nfe / 16l)
     }
 
     // 1. route every position: double-RMS router input, one batched GEMM, per-row select + down-scale fold
@@ -10876,9 +10881,83 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
         requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
     }
 
-    // 3. one batched GEMM chain per touched expert; raw down-projection rows park for the ordered reduce
-    trace_tag(TRACE_TAG_MOE)
-    for (e in range64(ne)) {
+    // 3F. GPU tier: gate/up -> act -> requant -> down as ONE region-list dispatch for the layer
+    if (fused_gpu) {
+        trace_tag(TRACE_TAG_MOE)
+        let ts_gather = ref_time_ticks()
+        // the GPU tile computes activation block sums in-kernel — skip the per-16 sum gather
+        moe_gather_rows(s, 0l, nk, dim, k, false, moe_kform)
+        prof_add("moe_gather", ts_gather)
+        // region triples (woff, row0, cnt) per touched expert; the three planes share row0/cnt
+        s.moe_offs1 |> clear(); s.moe_offs1 |> reserve(ne * 3l)
+        s.moe_offs3 |> clear(); s.moe_offs3 |> reserve(ne * 3l)
+        s.moe_offs2 |> clear(); s.moe_offs2 |> reserve(ne * 3l)
+        // LPT order (biggest buckets first) front-loads expensive spans
+        s.moe_ord |> clear()
+        s.moe_ord |> reserve(int(ne))   // capacity persists across layers — no per-layer alloc
+        for (e in range64(ne)) {
+            let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
+            let cnt = s.moe_cnt[e] - b0
+            if (cnt > 0l) {
+                s.moe_ord |> push(int2(int(e), int(cnt)))
+            }
+        }
+        lpt_order(s.moe_ord)
+        var nreg = 0l
+        for (oe in s.moe_ord) {
+            let e = int64(oe.x)
+            let cnt = int64(oe.y)
+            let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
+            let base = e * dim * nfe
+            s.moe_offs1 |> push(t.we1_offs[l] + base)   // nolint:STYLE012 — loop-append into reused scratch
+            s.moe_offs1 |> push(b0)
+            s.moe_offs1 |> push(cnt)
+            s.moe_offs3 |> push(t.we3_offs[l] + base)   // nolint:STYLE012 — loop-append into reused scratch
+            s.moe_offs3 |> push(b0)
+            s.moe_offs3 |> push(cnt)
+            s.moe_offs2 |> push(t.we2_offs[l] + base)   // nolint:STYLE012 — loop-append into reused scratch
+            s.moe_offs2 |> push(b0)
+            s.moe_offs2 |> push(cnt)
+            nreg++
+        }
+        let ts_g1 = ref_time_ticks()
+        if (gpu_comb) {   // gout comes back as npos combined rows — the park + CPU reduce disappear
+            s.moe_inv |> resize(nk)
+            for (j in range64(nk)) {
+                s.moe_inv[s.moe_bkt[j]] = uint(j)
+            }
+            matmul_moe_gpu_ffn_combined(s.moe_eout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
+                s.moe_gxq, s.moe_gxs, s.moe_w_b, s.moe_inv, dim, nfe, nk, npos, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
+        } else {
+            matmul_moe_gpu_ffn(s.moe_gout, s.moe_offs1, s.moe_offs3, s.moe_offs2, nreg,
+                s.moe_gxq, s.moe_gxs, dim, nfe, nk, int(f1), int(f3), int(f2), c.ffn_act == FfnAct.gelu)
+        }
+        prof_add("moe_gpu", ts_g1)
+        if (!gpu_comb) {   // combine off: park the raw down rows in bucket order for the reduce
+            trace_tag(TRACE_TAG_PARK)
+            let ts_park = ref_time_ticks()
+            unsafe {
+                let gp = addr<float const?>(s.moe_gout[0])
+                var ep = addr(s.moe_eout[0])
+                let bp = addr<int64 const?>(s.moe_bkt[0])
+                maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(nk), get_dispatch_lanes()) $(rb, re) {
+                    unsafe {
+                        for (j in range(rb, re)) {
+                            let jj = int64(j)
+                            copy_floats(ep + bp[jj] * dim, gp + jj * dim, dim)
+                        }
+                    }
+                }
+            }
+            prof_add("moe_park", ts_park)
+        }
+    }
+
+    // 3. one batched GEMM chain per touched expert, parking raw down rows (skipped when 3F ran)
+    if (!fused_gpu) {
+        trace_tag(TRACE_TAG_MOE)
+    }
+    for (e in range64(fused_gpu ? 0l : ne)) {
         let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
         let cnt = s.moe_cnt[e] - b0
         if (cnt == 0l) {
@@ -10927,14 +11006,21 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
                 for (p in range(rb, re)) {
                     let pp = int64(p)
                     var arow = ap + pp * dim
-                    for (i in range64(dim)) {
-                        arow[i] = 0.0
-                    }
-                    for (j in range64(k)) {
-                        let w = wp[pp * k + j]
-                        let er = ep + (pp * k + j) * dim
+                    if (gpu_comb) {   // the device already reduced: eout's head IS the combined row
+                        let cr = ep + pp * dim
                         for (i in range64(dim)) {
-                            arow[i] += w * er[i]
+                            arow[i] = cr[i]
+                        }
+                    } else {
+                        for (i in range64(dim)) {
+                            arow[i] = 0.0
+                        }
+                        for (j in range64(k)) {
+                            let w = wp[pp * k + j]
+                            let er = ep + (pp * k + j) * dim
+                            for (i in range64(dim)) {
+                                arow[i] += w * er[i]
+                            }
                         }
                     }
                 }
