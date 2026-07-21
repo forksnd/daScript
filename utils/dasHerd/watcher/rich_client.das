@@ -9,6 +9,7 @@ require imgui/imgui_drawlist_builtin
 require imgui/imgui_terminal
 require imgui/imgui_fonts
 require imgui/imgui_docking_builtin
+require imgui/imgui_table_builtin
 require imgui/imgui_markdown_tree_sitter
 require imgui/imgui_text_source_view
 require imgui/imgui_text_tree_sitter
@@ -229,8 +230,10 @@ var private g_jobque_owned = false
 var private SESSION_ROW : table<int; ToggleState>
 var private WORKTREE_ROW : table<int; ToggleState>
 var private GIT_FILE_ROW : table<int; ToggleState>
-var private GIT_COMMIT_TEXT : table<int; NarrativeState>
-var private GIT_HISTORY_COMMIT_ROW : table<int; ToggleState>
+var private GIT_COMMIT_TITLE_TEXT : table<int; NarrativeState>
+var private GIT_COMMIT_AUTHOR_TEXT : table<int; NarrativeState>
+var private GIT_PR_COMMIT_HOVER : table<int; EmptyMarkerState>
+var private GIT_HISTORY_COMMIT_ROW : table<int; ClickState>
 var private GIT_COMMIT_FILE_ROW : table<int; ToggleState>
 var private REPOSITORY_ERROR : table<int; NarrativeState>
 var private REPOSITORY_TITLE : table<int; NarrativeState>
@@ -256,12 +259,16 @@ def private setup_default_layout(dock_id : uint) {
     var git_id : uint = 0u
     var inspector_id : uint = 0u
     DockBuilderSplitNode(upper_id, ImGuiDir.Left, 0.34f, git_id, inspector_id)
+    var changelist_id : uint = 0u
+    var activity_id : uint = 0u
+    DockBuilderSplitNode(git_id, ImGuiDir.Up, 0.35f, changelist_id, activity_id)
     DockBuilderDockWindow("Sessions & Activity", left_id)
     DockBuilderDockWindow("Repositories & Worktrees", left_id)
-    DockBuilderDockWindow("Git Status", git_id)
+    DockBuilderDockWindow("Git Changelist", changelist_id)
+    DockBuilderDockWindow("Git Activity", activity_id)
     DockBuilderDockWindow("File Inspector", inspector_id)
     DockBuilderDockWindow("Terminal", terminal_id)
-    DockBuilderDockWindow("Settings", git_id)
+    DockBuilderDockWindow("Settings", activity_id)
     DockBuilderFinish(dock_id)
 }
 
@@ -911,7 +918,8 @@ def private open_dock_window(var state : DockWindowState) {
 def private reset_layout() {
     REPOSITORIES_WIN.open = true
     SESSIONS_WIN.open = true
-    GIT_STATUS_WIN.open = true
+    GIT_CHANGELIST_WIN.open = true
+    GIT_ACTIVITY_WIN.open = true
     FILE_INSPECTOR_WIN.open = true
     TERMINAL_WIN.open = true
     SETTINGS_WIN.open = false
@@ -956,9 +964,13 @@ def private draw_main_menu() {
                     (text = "Sessions & Activity", selected = SESSIONS_WIN.open))) {
                 open_dock_window(SESSIONS_WIN)
             }
-            if (menu_label(VIEW_GIT_STATUS,
-                    (text = "Git Status", selected = GIT_STATUS_WIN.open))) {
-                open_dock_window(GIT_STATUS_WIN)
+            if (menu_label(VIEW_GIT_CHANGELIST,
+                    (text = "Git Changelist", selected = GIT_CHANGELIST_WIN.open))) {
+                open_dock_window(GIT_CHANGELIST_WIN)
+            }
+            if (menu_label(VIEW_GIT_ACTIVITY,
+                    (text = "Git Activity", selected = GIT_ACTIVITY_WIN.open))) {
+                open_dock_window(GIT_ACTIVITY_WIN)
             }
             if (menu_label(VIEW_FILE_INSPECTOR,
                     (text = "File Inspector", selected = FILE_INSPECTOR_WIN.open))) {
@@ -1025,8 +1037,9 @@ def private draw_repositories_window() {
                     g_client->refresh_repository(repository.record.id)
                     g_client->request_repository_review(
                         repository.record.id, worktree.path)
-                    GIT_STATUS_WIN.open = true
-                    GIT_STATUS_WIN.pending_raise = true
+                    GIT_CHANGELIST_WIN.open = true
+                    GIT_CHANGELIST_WIN.pending_raise = true
+                    GIT_ACTIVITY_WIN.open = true
                 }
                 WORKTREE_ROW[row].value = (repository.record.id == g_selected_repository_id && worktree.path == g_selected_worktree_path)
                 if (worktree.is_main) separator(WORKTREE_SEPARATOR[row])
@@ -1372,19 +1385,51 @@ def private draw_pr_review(repository : RepositorySnapshot const;
     text(GIT_GROUP_TITLE[12],
         (text = "OUTGOING COMMITS  {commit_count}   -> {base}"))
     separator(GIT_GROUP_SEPARATOR[12])
-    var commit_row = 0
-    for (commit in repository.review_commits) {
-        if (commit.worktree_path != worktree.path) continue
-        with_item_flag(ImGuiItemFlags.None | ImGuiItemFlagsPrivate.AllowOverlap, true) {
-            text(GIT_COMMIT_TEXT[commit_row],
-                (text = "{commit.short_hash}  {commit.subject}  - {commit.author}"))
-        }
-        draw_sha_copy_icon(commit.hash, "pr-commit:{commit.hash}")
-        commit_row++
+    if (worktree.review_loading) text_disabled("Reading outgoing commits...")
+    if (!empty(worktree.review_error)) {
+        text_colored(GIT_ERROR,
+            (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
+            text = worktree.review_error))
     }
-    if (commit_count == 0 && !worktree.review_loading
-            && empty(worktree.review_error)) {
-        text_disabled("No outgoing commits")
+    if (commit_count == 0) {
+        if (!worktree.review_loading && empty(worktree.review_error)) {
+            text_disabled("No outgoing commits")
+        }
+        return
+    }
+    var commit_row = 0
+    let table_flags = (ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg |
+        ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.ScrollY |
+        ImGuiTableFlags.SizingStretchProp)
+    data_table(GIT_PR_COMMIT_TABLE, (text = "##pr-commits", columns = 3,
+            flags = table_flags, outer_size = float2(0.0f, 0.0f),
+            inner_width = 0.0f)) {
+        table_setup_scroll_freeze(0, 1)
+        table_setup_column("SHA", ImGuiTableColumnFlags.WidthFixed, 112.0f)
+        table_setup_column("Title", ImGuiTableColumnFlags.WidthStretch, 0.72f)
+        table_setup_column("Author", ImGuiTableColumnFlags.WidthStretch, 0.28f)
+        table_headers_row()
+        for (commit in repository.review_commits) {
+            if (commit.worktree_path != worktree.path) continue
+            table_next_row()
+            table_set_column_index(0)
+            with_style((ImGuiCol.Text, float4(0.36f, 0.76f, 0.96f, 1.0f))) {
+                selectable_hover(GIT_PR_COMMIT_HOVER[commit_row],
+                    (text = "{commit.short_hash}##pr:{commit.hash}",
+                    flags = ImGuiSelectableFlags.SpanAllColumns |
+                        ImGuiSelectableFlags.AllowOverlap))
+            }
+            draw_sha_copy_icon(commit.hash, "pr-commit:{commit.hash}")
+            table_set_column_index(1)
+            text_colored(GIT_COMMIT_TITLE_TEXT[commit_row],
+                (color = float4(0.91f, 0.93f, 0.96f, 1.0f),
+                text = commit.subject))
+            table_set_column_index(2)
+            text_colored(GIT_COMMIT_AUTHOR_TEXT[commit_row],
+                (color = float4(0.64f, 0.70f, 0.80f, 1.0f),
+                text = commit.author))
+            commit_row++
+        }
     }
 }
 
@@ -1461,42 +1506,72 @@ def private draw_commit_files(repository : RepositorySnapshot const;
 }
 
 def private draw_history_commits(repository : RepositorySnapshot const;
-                                 worktree : WorktreeState const) {
-    var count = 0
-    for (commit in repository.history_commits) {
-        if (commit.worktree_path == worktree.path) count++
+                                 worktree : WorktreeState const;
+                                 heading : string) {
+    var inscope commit_indices : array<int>
+    commit_indices |> reserve(length(repository.history_commits))
+    for (index in range(length(repository.history_commits))) {
+        if (repository.history_commits[index].worktree_path == worktree.path) {
+            commit_indices |> push(index)
+        }
     }
-    text(GIT_GROUP_TITLE[20],
-        (text = "COMMITS ON {worktree.history_ref}  {count}"))
+    let count = length(commit_indices)
+    text(GIT_GROUP_TITLE[20], (text = "{heading}  {count}"))
     separator(GIT_GROUP_SEPARATOR[20])
-    var row = 0
-    for (commit in repository.history_commits) {
-        if (commit.worktree_path != worktree.path) continue
-        let selected_commit = !empty(g_requested_history_commit) ? g_requested_history_commit : worktree.history_commit
-        GIT_HISTORY_COMMIT_ROW[row].value = commit.hash == selected_commit
-        var selected = false
-        with_item_flag(ImGuiItemFlags.None | ImGuiItemFlagsPrivate.AllowOverlap, true) {
-            selected = selectable(GIT_HISTORY_COMMIT_ROW[row],
-                (text = "{commit.short_hash}  {commit.subject}  - {commit.author}##history:{commit.hash}"))
-        }
-        if (selected && g_client != null && commit.hash != selected_commit) {
-            request_commit_files(repository, worktree, commit.hash)
-        }
-        draw_sha_copy_icon(commit.hash, "history:{commit.hash}")
-        row++
-    }
     if (worktree.history_loading) text_disabled("Reading Git history...")
     if (!empty(worktree.history_error)) {
         text_colored(GIT_ERROR,
             (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
             text = worktree.history_error))
     }
+    if (count == 0) return
+    let table_flags = (ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg |
+        ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.ScrollY |
+        ImGuiTableFlags.SizingStretchProp)
+    data_table(GIT_HISTORY_COMMIT_TABLE, (text = "##history-commits", columns = 3,
+            flags = table_flags, outer_size = float2(0.0f, 0.0f),
+            inner_width = 0.0f)) {
+        table_setup_scroll_freeze(0, 1)
+        table_setup_column("SHA", ImGuiTableColumnFlags.WidthFixed, 112.0f)
+        table_setup_column("Title", ImGuiTableColumnFlags.WidthStretch, 0.72f)
+        table_setup_column("Author", ImGuiTableColumnFlags.WidthStretch, 0.28f)
+        table_headers_row()
+        list_clipper(count) $(start, end_) {
+            for (row in range(start, end_)) {
+                let commit = repository.history_commits[commit_indices[row]]
+                let selected_commit = !empty(g_requested_history_commit) ? g_requested_history_commit : worktree.history_commit
+                table_next_row()
+                table_set_column_index(0)
+                var selected = false
+                with_style((ImGuiCol.Text, float4(0.36f, 0.76f, 0.96f, 1.0f))) {
+                    selected = selectable_label(GIT_HISTORY_COMMIT_ROW[row],
+                        (text = "{commit.short_hash}##history:{commit.hash}",
+                        selected = commit.hash == selected_commit,
+                        flags = ImGuiSelectableFlags.SpanAllColumns |
+                            ImGuiSelectableFlags.AllowOverlap))
+                }
+                draw_sha_copy_icon(commit.hash, "history:{commit.hash}")
+                table_set_column_index(1)
+                text_colored(GIT_COMMIT_TITLE_TEXT[row],
+                    (color = float4(0.91f, 0.93f, 0.96f, 1.0f),
+                    text = commit.subject))
+                table_set_column_index(2)
+                text_colored(GIT_COMMIT_AUTHOR_TEXT[row],
+                    (color = float4(0.64f, 0.70f, 0.80f, 1.0f),
+                    text = commit.author))
+                if (selected && g_client != null && commit.hash != selected_commit) {
+                    request_commit_files(repository, worktree, commit.hash)
+                }
+            }
+        }
+    }
 }
 
 def private draw_history_review(repository : RepositorySnapshot const;
                                 worktree : WorktreeState const) {
     ensure_history(repository, worktree, worktree.branch)
-    draw_history_commits(repository, worktree)
+    draw_history_commits(repository, worktree,
+        "COMMITS ON {worktree.history_ref}")
 }
 
 def private git_lane_index(lanes : array<string> const; hash : string) : int {
@@ -1652,15 +1727,15 @@ def private draw_commit_graph(repository : RepositorySnapshot const;
         for (row in range(start, end_)) {
             let commit = repository.history_commits[commit_indices[row]]
             let selected_commit = !empty(g_requested_history_commit) ? g_requested_history_commit : worktree.history_commit
-            GIT_HISTORY_COMMIT_ROW[row].value = commit.hash == selected_commit
             let refs = git_graph_refs(repository, worktree, commit)
             let ref_text = empty(refs) ? "" : "{refs}  "
             let space_width = max(1.0f, CalcTextSize(" ").x)
             let graph_pad = repeat(" ", int(56.0f / space_width) + 1)
             var selected = false
             with_item_flag(ImGuiItemFlags.None | ImGuiItemFlagsPrivate.AllowOverlap, true) {
-                selected = selectable(GIT_HISTORY_COMMIT_ROW[row],
-                    (text = "{graph_pad}{commit.short_hash}  {ref_text}{commit.subject}  - {commit.author}##graph:{commit.hash}"))
+                selected = selectable_label(GIT_HISTORY_COMMIT_ROW[row],
+                    (text = "{graph_pad}{commit.short_hash}  {ref_text}{commit.subject}  - {commit.author}##graph:{commit.hash}",
+                    selected = commit.hash == selected_commit))
             }
             draw_commit_graph_decoration(commit, observed, lanes,
                 "graph:{commit.hash}")
@@ -1694,10 +1769,10 @@ def private draw_tree_review(repository : RepositorySnapshot const;
             text = worktree.refs_error))
     }
     ensure_history(repository, worktree, "__all__")
-    draw_commit_graph(repository, worktree)
+    draw_history_commits(repository, worktree, "COMMITS ACROSS WORKTREE REFS")
 }
 
-def private draw_git_status_window() {
+def private draw_git_changelist_window() {
     var found = false
     if (g_client != null) {
         for (repository in g_client.repositories) {
@@ -1735,7 +1810,20 @@ def private draw_git_status_window() {
                 } else {
                     draw_shared_pr_files(repository, worktree)
                 }
-                separator()
+            }
+        }
+    }
+    if (!found) text_disabled("Select a worktree to inspect its changelist")
+}
+
+def private draw_git_activity_window() {
+    var found = false
+    if (g_client != null) {
+        for (repository in g_client.repositories) {
+            if (repository.record.id != g_selected_repository_id) continue
+            for (worktree in repository.worktrees) {
+                if (worktree.path != g_selected_worktree_path) continue
+                found = true
                 tab_bar(GIT_PERSPECTIVE_TABS,
                         (text = "Git perspectives", flags = ImGuiTabBarFlags.None)) {
                     tab_item(GIT_PR_TAB, (text = "PR", closable = false,
@@ -1754,7 +1842,7 @@ def private draw_git_status_window() {
             }
         }
     }
-    if (!found) text_disabled("Select a worktree to inspect Git status")
+    if (!found) text_disabled("Select a worktree to inspect Git activity")
 }
 
 def private source_view_style(diff_background : bool = false) : TextSourceViewStyle {
@@ -2000,6 +2088,12 @@ def herder_client_state(_input : JsonValue?) : JsonValue? {
         selected_worktree_path = g_selected_worktree_path))
 }
 
+[live_command(description = "Restore the rich client's default dock layout.")]
+def herder_reset_layout(_input : JsonValue?) : JsonValue? {
+    reset_layout()
+    return JV((ok = true))
+}
+
 [live_command(description = "Select a worktree for Git review. Args: repository_id, worktree_path.")]
 def herder_git_select_worktree(input : JsonValue?) : JsonValue? {
     if (g_client == null || !g_client.connected) {
@@ -2020,8 +2114,9 @@ def herder_git_select_worktree(input : JsonValue?) : JsonValue? {
                 args.repository_id, args.worktree_path, worktree.branch)
             g_client->request_repository_refs(
                 args.repository_id, args.worktree_path)
-            GIT_STATUS_WIN.open = true
-            GIT_STATUS_WIN.pending_raise = true
+            GIT_CHANGELIST_WIN.open = true
+            GIT_CHANGELIST_WIN.pending_raise = true
+            GIT_ACTIVITY_WIN.open = true
             return JV((ok = true, repository_id = args.repository_id,
                 worktree_path = args.worktree_path))
         }
@@ -2207,8 +2302,9 @@ def herder_git_perspective(input : JsonValue?) : JsonValue? {
     } else {
         return JV((ok = false, error = "perspective must be pr, history, or tree"))
     }
-    GIT_STATUS_WIN.open = true
-    GIT_STATUS_WIN.pending_raise = true
+    GIT_CHANGELIST_WIN.open = true
+    GIT_ACTIVITY_WIN.open = true
+    GIT_ACTIVITY_WIN.pending_raise = true
     return JV((ok = true, perspective = perspective))
 }
 
@@ -2523,9 +2619,13 @@ def update() {
                 flags = ImGuiWindowFlags.None)) {
             draw_session_list()
         }
-        dock_window(GIT_STATUS_WIN, (text = "Git Status", closable = true,
+        dock_window(GIT_ACTIVITY_WIN, (text = "Git Activity", closable = true,
                 flags = ImGuiWindowFlags.None)) {
-            draw_git_status_window()
+            draw_git_activity_window()
+        }
+        dock_window(GIT_CHANGELIST_WIN, (text = "Git Changelist", closable = true,
+                flags = ImGuiWindowFlags.None)) {
+            draw_git_changelist_window()
         }
         dock_window(FILE_INSPECTOR_WIN, (text = "File Inspector", closable = true,
                 flags = ImGuiWindowFlags.None)) {
