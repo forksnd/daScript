@@ -311,6 +311,22 @@ def public repository_file_diff_argv(repository_id, worktree_path, file_path,
         diff_context)
 }
 
+def public repository_read_text_file(path : string; var text : string&) : string {
+    text = ""
+    let file_status = stat(path)
+    if (!file_status.is_valid || !file_status.is_reg) {
+        return "could not read working file text"
+    }
+    var loaded = false
+    fopen(path, "rb") $(file) {
+        if (file != null) {
+            text = fread(file)
+            loaded = true
+        }
+    }
+    return loaded ? "" : "could not read working file text"
+}
+
 def public repository_working_file_text(repository_id, worktree_path, file_path : string;
                                         var text : string&) : string {
     text = ""
@@ -333,8 +349,7 @@ def public repository_working_file_text(repository_id, worktree_path, file_path 
     }
     let absolute_path = path_join(worktree_path, file_path)
     if (!fexist(absolute_path)) return "working file does not exist"
-    text = fread(absolute_path)
-    return ""
+    return repository_read_text_file(absolute_path, text)
 }
 
 def public repository_working_file_bytes(repository_id, worktree_path, file_path : string;

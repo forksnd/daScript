@@ -102,3 +102,25 @@ def test_repository_relative_file_path_contract(t : T?) {
         }
     }
 }
+
+[test]
+def test_repository_text_read_contract(t : T?) {
+    t |> run("empty files remain distinct from read failures") <| @(t : T?) {
+        let temp = create_temp_directory_result("dasherd_repository_text_")
+        if (!(temp is value)) {
+            t |> failure("could not create temporary test directory")
+            return
+        }
+        let root = temp as value
+        let empty_path = path_join(root, "empty.txt")
+        t |> success(fwrite(empty_path, ""), "empty fixture is written")
+
+        var text : string
+        t |> equal(repository_read_text_file(empty_path, text), "")
+        t |> equal(text, "", "an opened empty file is a successful preview")
+        t |> success(!empty(repository_read_text_file(root, text)),
+            "a path that cannot be read as a regular file reports an error")
+
+        rmdir_rec(root)
+    }
+}
