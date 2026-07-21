@@ -4990,6 +4990,21 @@ class SpirvEmit : AstVisitor {
         return expr
     }
 
+    // Parameterised hints take a NON-NEGATIVE int literal. A wrong type must not fall through to
+    // "unknown hint" (the hint is known, the value is not), and a negative would wrap to a huge
+    // uint and emit invalid SPIR-V that only fails later, at pipeline creation.
+    def loop_hint_literal(a : AnnotationArgument) : uint {
+        if (a.basicType != Type.tInt) {
+            errs |> push("vulkan loop hint '{a.name}' takes an int value")
+            return 0u
+        }
+        if (a.iValue < 0) {
+            errs |> push("vulkan loop hint '{a.name}' must be >= 0, got {a.iValue}")
+            return 0u
+        }
+        return uint(a.iValue)
+    }
+
     // Vulkan-native loop hints: argument names map 1:1 onto SPIR-V LoopControl bits, so nothing is
     // translated from another backend's vocabulary and no hint can alias onto an assertion.
     def loop_control_of(args : AnnotationArgumentList; var lits : array<uint>) : uint {
@@ -5007,24 +5022,24 @@ class SpirvEmit : AstVisitor {
                 mask |= uint(SpvLoopControl.DontUnroll)
             } elif (a.name == "dependency_infinite") {
                 mask |= uint(SpvLoopControl.DependencyInfinite)
-            } elif (a.name == "dependency_length" && a.basicType == Type.tInt) {
+            } elif (a.name == "dependency_length") {
                 mask |= uint(SpvLoopControl.DependencyLength)
-                dep_len = uint(a.iValue)
-            } elif (a.name == "min_iterations" && a.basicType == Type.tInt) {
+                dep_len = loop_hint_literal(a)
+            } elif (a.name == "min_iterations") {
                 mask |= uint(SpvLoopControl.MinIterations)
-                min_it = uint(a.iValue)
-            } elif (a.name == "max_iterations" && a.basicType == Type.tInt) {
+                min_it = loop_hint_literal(a)
+            } elif (a.name == "max_iterations") {
                 mask |= uint(SpvLoopControl.MaxIterations)
-                max_it = uint(a.iValue)
-            } elif (a.name == "iteration_multiple" && a.basicType == Type.tInt) {
+                max_it = loop_hint_literal(a)
+            } elif (a.name == "iteration_multiple") {
                 mask |= uint(SpvLoopControl.IterationMultiple)
-                it_mul = uint(a.iValue)
-            } elif (a.name == "peel_count" && a.basicType == Type.tInt) {
+                it_mul = loop_hint_literal(a)
+            } elif (a.name == "peel_count") {
                 mask |= uint(SpvLoopControl.PeelCount)
-                peel = uint(a.iValue)
-            } elif (a.name == "partial_count" && a.basicType == Type.tInt) {
+                peel = loop_hint_literal(a)
+            } elif (a.name == "partial_count") {
                 mask |= uint(SpvLoopControl.PartialCount)
-                partial = uint(a.iValue)
+                partial = loop_hint_literal(a)
             } else {
                 errs |> push("unknown vulkan loop hint '{a.name}'")
             }

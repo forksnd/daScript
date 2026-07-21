@@ -1018,6 +1018,10 @@ def quantize_k5_plane(src : array<float> | #; n : int64; var kq : array<uint8>; 
     if (n % 256l != 0l) {
         panic("quantize_k5_plane: n={n} is not a multiple of 256")
     }
+    // O(1) source guard — the loop below reads n weights through a raw pointer, bypassing bounds checks
+    if (n > long_length(src)) {
+        panic("quantize_k5_plane: n={n} exceeds src length {long_length(src)}")
+    }
     let nb = n / 256l
     if (nb <= 0l) {
         return
