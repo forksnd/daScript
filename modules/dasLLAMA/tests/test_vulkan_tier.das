@@ -2381,6 +2381,114 @@ def test_vulkan_rope_kv_store(t : T?) {
     }
 }
 
+// Decode attention over the device K/V mirror. Populates the mirror through vk_rope_kv_store (the
+// real producer), capturing each stored row for the CPU reference, then attends with a fresh query
+// and checks GQA + online softmax against a plain CPU attention over the captured cache.
+[test]
+def test_vulkan_decode_attn(t : T?) {
+    t |> run("vulkan decode attention == CPU reference (GQA over the device KV mirror)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let HS = 64l
+            let NH = 4l
+            let NKV = 2l
+            let QD = NH * HS
+            let KVD = NKV * HS
+            let CNT = 5l
+            let SCALE = 1.0 / sqrt(float(HS))
+            let kv_mul = NH / NKV
+            if (!vk_device_ready()) {
+                feint("no Vulkan device; decode_attn untestable here\n")
+                return
+            }
+            var cpuK : array<float>
+            var cpuV : array<float>
+            cpuK |> resize(int(CNT * KVD))
+            cpuV |> resize(int(CNT * KVD))
+            // build the cache one position at a time via the real rope_kv_store producer
+            for (p in range(int(CNT))) {
+                var qkv : array<float>
+                qkv |> resize(int(QD + 2l * KVD))
+                for (i in range(int(QD + 2l * KVD))) {
+                    qkv[i] = float(((i + p * 13) % 19) - 9) * 0.1
+                }
+                var cossin : array<float>
+                cossin |> resize(int(HS))
+                for (j in range(int(HS / 2l))) {
+                    let ang = float(p) * (1.0 / pow(10000.0, float(2 * j) / float(HS)))
+                    cossin[j] = cos(ang)
+                    cossin[int(HS / 2l) + j] = sin(ang)
+                }
+                var qout : array<float>
+                var krow : array<float>
+                var vrow : array<float>
+                qout |> resize(int(QD))
+                krow |> resize(int(KVD))
+                vrow |> resize(int(KVD))
+                vk_rope_kv_store(qkv, qout, krow, vrow, cossin, QD, KVD, HS, int64(p), false)
+                for (i in range(int(KVD))) {
+                    cpuK[p * int(KVD) + i] = krow[i]
+                    cpuV[p * int(KVD) + i] = vrow[i]
+                }
+                delete qkv
+                delete cossin
+                delete qout
+                delete krow
+                delete vrow
+            }
+            // a fresh query, then decode attention over the cnt cached rows
+            var q : array<float>
+            q |> resize(int(QD))
+            for (i in range(int(QD))) {
+                q[i] = float((i % 7) - 3) * 0.2
+            }
+            var out : array<float>
+            out |> resize(int(QD))
+            vk_decode_attn(q, out, CNT, QD, KVD, HS, kv_mul, SCALE)
+            // CPU reference: per head, softmax(q.k*scale) then weighted V
+            var refo : array<float>
+            refo |> resize(int(QD))
+            for (h in range(int(NH))) {
+                let kvh = h / int(kv_mul)
+                var sc : array<float>
+                sc |> resize(int(CNT))
+                var mx = -1.0e30
+                for (p in range(int(CNT))) {
+                    var s = 0.0
+                    for (d in range(int(HS))) {
+                        s += q[h * int(HS) + d] * cpuK[p * int(KVD) + kvh * int(HS) + d]
+                    }
+                    s *= SCALE
+                    sc[p] = s
+                    mx = max(mx, s)
+                }
+                var den = 0.0
+                for (p in range(int(CNT))) {
+                    sc[p] = exp(sc[p] - mx)
+                    den += sc[p]
+                }
+                for (d in range(int(HS))) {
+                    var acc = 0.0
+                    for (p in range(int(CNT))) {
+                        acc += sc[p] * cpuV[p * int(KVD) + kvh * int(HS) + d]
+                    }
+                    refo[h * int(HS) + d] = float(acc / den)
+                }
+                delete sc
+            }
+            let ca = compare_gout(out, refo)
+            t |> success(ca.maxdiff <= float(REL_TOL) * ca.maxref + 1e-5,
+                "decode attention within tolerance (maxdiff {ca.maxdiff} vs {float(REL_TOL) * ca.maxref} bar, maxref {ca.maxref})")
+            delete cpuK
+            delete cpuV
+            delete q
+            delete out
+            delete refo
+        } else {
+            feint("dasVulkan not installed; decode_attn untestable here\n")
+        }
+    }
+}
+
 // The whole dense FFN against arena-resident planes: gate GEMV -> up GEMV -> fused act+requant ->
 // down GEMV, ONE submit. No new kernels — q8_moe_actrq is already region-free, so this is the
 // per-op chain with the weight base coming from an arena block index instead of a stack.

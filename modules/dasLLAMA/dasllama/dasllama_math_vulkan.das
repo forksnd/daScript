@@ -1144,6 +1144,98 @@ def rope_kv_store {
     }
 }
 
+// decode attention (one query row): one wg/head, GQA head->kv-head, reads the f32 K/V mirror (K
+// vk_wsf, V vk_xqf). 3 phases (scores+max, exp+sum, thread c owns out dim c) dodge a per-position
+// barrier. Low-occupancy — split-K next. meta 0=cnt 2=kvd 3=hs 4=kv_mul; scale vk_xs[0].
+var @workgroup da_q : float[256]      // this head's query row (hs <= 256)
+var @workgroup da_sc : float[4096]    // per-position scores (DA_MAX_CNT)
+var @workgroup da_part : float[8]     // per-subgroup reduction partials
+var @workgroup da_ml : float[2]       // [0] = row max, [1] = softmax denom
+
+[compute_shader(local_size_x=256, name="da_attn_spv")]
+def da_attn {
+    let cnt = vk_meta[0u]
+    let kvd = vk_meta[2u]
+    let hs = vk_meta[3u]
+    let kv_mul = vk_meta[4u]
+    let scale = vk_xs[0u]
+    let h = gl_WorkGroupID.x
+    let kvh = h / kv_mul
+    let tid = gl_LocalInvocationID.x
+    var i = tid
+    while (i < hs) {
+        da_q[i] = vk_upf[h * hs + i]
+        i += 256u
+    }
+    barrier()
+    // phase 1: scores + running max (per thread over a strided set of positions)
+    var tmax = -3.0e38
+    var j = tid
+    while (j < cnt) {
+        var s = 0.0
+        var d = 0u
+        while (d < hs) {
+            s += da_q[d] * vk_wsf[j * kvd + kvh * hs + d]
+            d++
+        }
+        s *= scale
+        da_sc[j] = s
+        tmax = max(tmax, s)
+        j += 256u
+    }
+    tmax = subgroupMax(tmax)
+    if (gl_SubgroupInvocationID == 0u) {
+        da_part[gl_SubgroupID] = tmax
+    }
+    barrier()
+    if (tid == 0u) {
+        var m = -3.0e38
+        var sgi = 0u
+        while (sgi < gl_NumSubgroups) {
+            m = max(m, da_part[sgi])
+            sgi++
+        }
+        da_ml[0u] = m
+    }
+    barrier()
+    let m = da_ml[0u]
+    // phase 2: exp in place + running sum
+    var tsum = 0.0
+    j = tid
+    while (j < cnt) {
+        let e = exp(da_sc[j] - m)
+        da_sc[j] = e
+        tsum += e
+        j += 256u
+    }
+    tsum = subgroupAdd(tsum)
+    if (gl_SubgroupInvocationID == 0u) {
+        da_part[gl_SubgroupID] = tsum
+    }
+    barrier()
+    if (tid == 0u) {
+        var l = 0.0
+        var sgi = 0u
+        while (sgi < gl_NumSubgroups) {
+            l += da_part[sgi]
+            sgi++
+        }
+        da_ml[1u] = l
+    }
+    barrier()
+    let linv = 1.0 / da_ml[1u]
+    // phase 3: thread c owns output dim c, weighted V sum over all positions
+    if (tid < hs) {
+        var acc = 0.0
+        var jj = 0u
+        while (jj < cnt) {
+            acc += da_sc[jj] * vk_xqf[jj * kvd + kvh * hs + tid]
+            jj++
+        }
+        vk_y[h * hs + tid] = acc * linv
+    }
+}
+
 // plain Q8_K requant (no act) — the kq wo GEMM's activation image; input floats at vk_upf base
 // vk_meta[10], one thread per 256-weight superblock ([18] = superblock count). Mirrors
 // quantize_q8_k_into_ptr like q8k_moe_actrq does, minus the act.
@@ -2123,6 +2215,7 @@ struct private GpuState {
     q8k_rq_pipeline : Pipeline      // plain Q8_K requant (the kq wo GEMM's activation image)
     ar_pipeline : Pipeline          // resident driver: fused residual-add + RMSNorm (meta[1]=0 = norm only)
     rks_pipeline : Pipeline         // resident driver: fused rope + KV-row store (f32 mirror)
+    da_pipeline : Pipeline          // resident driver: decode attention over the f32 KV mirror
     staging : HostBuf
     fence : VkFence          // the one reusable submit fence (reset after every wait)
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
@@ -2168,6 +2261,14 @@ struct private GpuState {
     rks_kv_host : HostBuf      // K then V readback (test/parity only; the driver keeps them device-side)
     rks_set : VkDescriptorSet
     rks_ready : bool
+    // decode-attention state: q in, out; reads the rks K/V mirror planes
+    da_q_dev : uint64
+    da_scal : HostBuf
+    da_meta : HostBuf
+    da_out_dev : uint64
+    da_out_host : HostBuf
+    da_set : VkDescriptorSet
+    da_ready : bool
     ffn_cmds : table<int64; FfnCmd>   // (gate, up, down stack idx triple) -> decode FFN chain
     resident_bytes : int64
     // heat-pinned expert cache (decode split-FFN) + the one-in-flight async FFN discipline
@@ -2479,6 +2580,8 @@ def private vk_moe_init : bool {
     g_gpu.ar_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, arshader)
     var rksshader <- create_shader_module(g_gpu.device, rope_kv_store_spv)
     g_gpu.rks_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rksshader)
+    var dashader <- create_shader_module(g_gpu.device, da_attn_spv)
+    g_gpu.da_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, dashader)
 
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
@@ -2969,6 +3072,61 @@ def private ensure_rks_state {
     let no_copies : array<CopyDescriptorSet>
     update_descriptor_sets(g_gpu.device, writes, no_copies)
     g_gpu.rks_ready = true
+}
+
+let private DA_MAX_CNT = 4_096l   // == da_sc workgroup slab
+
+def private ensure_da_state {
+    if (g_gpu.da_ready) {
+        return
+    }
+    ensure_rks_state()   // shares the K/V mirror planes
+    g_gpu.da_q_dev = make_device_buf(RKS_MAX_QD * 4l)
+    g_gpu.da_out_dev = make_device_buf(RKS_MAX_QD * 4l)
+    g_gpu.da_scal = make_host_buf(XS_BYTES, true)
+    g_gpu.da_meta = make_host_buf(META_BYTES, true)
+    g_gpu.da_out_host = make_host_buf(RKS_MAX_QD * 4l, false, [cached = true])
+    g_gpu.da_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    write_buf_desc(writes, g_gpu.da_set, 0u, g_gpu.da_q_dev, RKS_MAX_QD * 4l)
+    write_buf_desc(writes, g_gpu.da_set, 1u, g_gpu.rks_k_dev, RKS_MAX_CTX * RKS_MAX_KVD * 4l)
+    write_buf_desc(writes, g_gpu.da_set, 2u, g_gpu.da_meta.buf, META_BYTES)
+    write_buf_desc(writes, g_gpu.da_set, 3u, g_gpu.rks_v_dev, RKS_MAX_CTX * RKS_MAX_KVD * 4l)
+    write_buf_desc(writes, g_gpu.da_set, 4u, g_gpu.da_scal.buf, XS_BYTES)
+    write_buf_desc(writes, g_gpu.da_set, 5u, g_gpu.da_out_dev, RKS_MAX_QD * 4l)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.da_ready = true
+}
+
+//! Resident-driver seam: decode attention of the roped q row against the `cnt` cached positions in
+//! the device K/V mirror (the same planes vk_rope_kv_store wrote), GQA per kv_mul, into out[0..qd).
+def vk_decode_attn(var q : array<float>; var out : array<float>; cnt, qd, kv_dim, head_size, kv_mul : int64; scale : float) {
+    verify(vk_moe_init())
+    assert(cnt <= DA_MAX_CNT && head_size <= 256l && qd <= RKS_MAX_QD, "dasLLAMA vulkan: decode-attn geometry over scratch")
+    ensure_da_state()
+    let n_heads = qd / head_size
+    unsafe {
+        var mp = reinterpret<uint?>(g_gpu.da_meta.mapped)
+        mp[0] = uint(cnt)
+        mp[1] = uint(qd)
+        mp[2] = uint(kv_dim)
+        mp[3] = uint(head_size)
+        mp[4] = uint(kv_mul)
+        var sp = reinterpret<float?>(g_gpu.da_scal.mapped)
+        sp[0] = scale
+        upload_region_at(g_gpu.da_q_dev, 0l, addr<uint8 const?>(q[0]), qd * 4l)
+        var raw = alloc_cmd()
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.da_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, g_gpu.da_set, uint(n_heads))
+        comp_barrier(raw)
+        cmd_copy_whole(raw, g_gpu.da_out_dev, g_gpu.da_out_host.buf, qd * 4l)
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(raw)
+        memcpy(addr<void?>(out[0]), g_gpu.da_out_host.mapped, int(qd * 4l))
+    }
 }
 
 //! Resident-driver seam (standalone-kernel form): rope the q row in place, rope the k row into the
