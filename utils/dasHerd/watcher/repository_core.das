@@ -257,8 +257,8 @@ def public repository_build_file_diff_argv(worktree_path : string;
     } elif (diff_context != "compact") {
         return "diff context is not implemented"
     }
-    var inscope common <- ["git", "-C", worktree_path, "--no-pager", "-c",
-        "color.ui=false", "diff"]
+    var inscope common <- ["git", "--literal-pathspecs", "-C", worktree_path,
+        "--no-pager", "-c", "color.ui=false", "diff"]
     argv := common
     if (comparison == "staged") argv |> push("--cached")
     if (comparison == "working" && file.code == "??") {
