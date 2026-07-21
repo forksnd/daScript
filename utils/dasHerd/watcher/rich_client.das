@@ -1139,7 +1139,7 @@ def private draw_side_by_side_diff() {
         let window_size = GetWindowSize()
         g_inspector.diff_left_rect = float4(window_pos.x, window_pos.y,
             window_pos.x + window_size.x, window_pos.y + window_size.y)
-        let hovered = IsWindowHovered(ImGuiHoveredFlags.None)
+        let hovered = IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem)
         if (g_inspector.diff_scroll_jump_pending || !hovered) {
             SetScrollY(g_inspector.diff_scroll_y)
         } else {
@@ -1175,7 +1175,7 @@ def private draw_side_by_side_diff() {
         g_inspector.diff_scrollbar_rect = float4(
             window_pos.x + window_size.x - scrollbar_width, window_pos.y,
             window_pos.x + window_size.x, window_pos.y + window_size.y)
-        let hovered = IsWindowHovered(ImGuiHoveredFlags.None)
+        let hovered = IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem)
         if (g_inspector.diff_scroll_jump_pending || !hovered) {
             SetScrollY(g_inspector.diff_scroll_y)
         } else {
@@ -1253,6 +1253,7 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         worktree_path = g_inspector.worktree_path,
         file_path = g_inspector.file_path,
         comparison = g_inspector.comparison,
+        zoom_percent = g_zoom_percent,
         diff_context = g_inspector.diff_context,
         diff_context_choice = g_inspector.diff_context_choice,
         mode = g_inspector.mode == GitInspectorMode.diff ? "diff" : "view",
@@ -1397,6 +1398,11 @@ def herder_file_inspector_mode(input : JsonValue?) : JsonValue? {
 }
 
 def private draw_file_inspector_window() {
+    let io & = unsafe(GetIO())
+    if (IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows) && io.KeyCtrl) {
+        if (io.MouseWheel > 0.0f) zoom_by(5)
+        elif (io.MouseWheel < 0.0f) zoom_by(-5)
+    }
     if (empty(g_inspector.file_path)) {
         text_disabled("Select a changed file")
         return

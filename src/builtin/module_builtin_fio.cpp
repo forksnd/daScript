@@ -298,10 +298,42 @@ namespace das {
         return mode && strchr("rwa", mode[0]) && mode[1 + strspn(mode + 1, "+btx")] == '\0';
     }
 
+#if defined(_WIN32)
+    static wstring utf8_file_path_to_wide ( const char * path ) {
+        if ( !path || !*path ) return wstring();
+        const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+            path, -1, nullptr, 0);
+        if ( count <= 0 ) return wstring();
+        wstring result(size_t(count), L'\0');
+        if ( MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                path, -1, result.data(), count) != count ) {
+            return wstring();
+        }
+        result.resize(size_t(count - 1));
+        return result;
+    }
+
+    static FILE * das_fopen_utf8 ( const char * name, const char * mode ) {
+        auto wideName = utf8_file_path_to_wide(name);
+        if ( wideName.empty() ) return nullptr;
+        wchar_t wideMode[8] = {};
+        size_t index = 0;
+        while ( mode[index] && index + 1 < sizeof(wideMode) / sizeof(wideMode[0]) ) {
+            wideMode[index] = wchar_t(uint8_t(mode[index]));
+            ++index;
+        }
+        return _wfopen(wideName.c_str(), wideMode);
+    }
+#else
+    static FILE * das_fopen_utf8 ( const char * name, const char * mode ) {
+        return fopen(name, mode);
+    }
+#endif
+
     const FILE * builtin_fopen  ( const char * name, const char * mode, Context * context, LineInfoArg * at ) {
         if ( !name ) context->throw_error_at(at, "can't fopen NULL name");
         if ( !is_valid_fopen_mode(mode) ) context->throw_error_at(at, "invalid fopen mode '%s'", mode ? mode : "<null>");
-        FILE * f = fopen(name, mode);
+        FILE * f = das_fopen_utf8(name, mode);
         if ( f ) setvbuf(f, NULL, _IOFBF, 65536);
         return f;
     }
@@ -337,7 +369,8 @@ namespace das {
     // stat/fstat truncate st_size to 32 bits and FAIL outright past 2GB.
     static int das_stat64 ( const char * path, das_filestat & st ) {
 #if defined(_WIN32)
-        return _stat64(path, &st);
+        auto widePath = utf8_file_path_to_wide(path);
+        return widePath.empty() ? -1 : _wstat64(widePath.c_str(), &st);
 #else
         return stat(path, &st);
 #endif
@@ -389,7 +422,7 @@ namespace das {
         if ( !size ) context->throw_error_at(at, "fmap_open: null size out-param");
         *size = 0;
         if ( !name ) context->throw_error_at(at, "fmap_open: null path");
-        FILE * f = fopen(name, "rb");
+        FILE * f = das_fopen_utf8(name, "rb");
         if ( !f ) return nullptr;
         das_filestat st;
         int fd = fileno(f);
@@ -1477,12 +1510,24 @@ namespace das {
 
     bool builtin_remove_file ( const char * path ) {
         if ( !path ) return false;
+#if defined(_WIN32)
+        auto widePath = utf8_file_path_to_wide(path);
+        return !widePath.empty() && _wremove(widePath.c_str()) == 0;
+#else
         return remove(path) == 0;
+#endif
     }
 
     bool builtin_rename_file ( const char * old_path, const char * new_path ) {
         if ( !old_path || !new_path ) return false;
+#if defined(_WIN32)
+        auto wideOldPath = utf8_file_path_to_wide(old_path);
+        auto wideNewPath = utf8_file_path_to_wide(new_path);
+        return !wideOldPath.empty() && !wideNewPath.empty()
+            && _wrename(wideOldPath.c_str(), wideNewPath.c_str()) == 0;
+#else
         return rename(old_path, new_path) == 0;
+#endif
     }
 
     bool builtin_rmdir ( const char * path ) {

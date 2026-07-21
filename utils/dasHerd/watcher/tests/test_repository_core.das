@@ -31,6 +31,14 @@ def test_repository_porcelain_parsing(t : T?) {
         t |> equal(files[4].path, "new name")
         t |> equal(files[0].worktree_path, "D:/Work/daScript")
     }
+    t |> run("unquoted porcelain retains UTF-8 file paths") <| @(t : T?) {
+        var worktree = WorktreeState(path = "D:/Work/fixture")
+        var files : array<GitFileState>
+        repository_parse_status("## fixture\r\n M unicode-Привет.txt\r\n",
+            worktree, files)
+        t |> equal(length(files), 1)
+        t |> equal(files[0].path, "unicode-Привет.txt")
+    }
 }
 
 [test]
