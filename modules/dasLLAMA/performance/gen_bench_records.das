@@ -53,18 +53,19 @@ struct Args {
 }
 
 // The public catalog: community-popular GGUFs, one popular quant each — NOT the internal quant
-// matrix. Absent files skip with a warning, so one list serves every box.
+// matrix. Curated to what people run THIS year (2026 spring/summer lists: Qwen3.6 family, gemma-4
+// daily drivers, the standing staples). Absent files skip with a warning, so one list serves
+// every box.
 def private pub_catalog() : array<string> {
     return <- [
-        "SmolLM2-135M-Instruct-Q8_0.gguf",
-        "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-        "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-        "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
-        "Mistral-7B-Instruct-v0.3-Q8_0.gguf",
-        "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-        "gemma-3-4b-it-Q8_0.gguf",
+        "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf",
+        "Qwen3.6-27B-MTP-Q4_K_M.gguf",
+        "gemma-4-26B-A4B-it-Q4_K_M.gguf",
+        "gemma-4-12B-it-Q4_K_M.gguf",
+        "gemma-4-E4B-it-Q8_0.gguf",
         "gpt-oss-20b-mxfp4.gguf",
-        "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
+        "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+        "Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
     ]
 }
 
