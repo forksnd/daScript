@@ -6,6 +6,7 @@ require dasllama/dasllama_quant  // nolint:STYLE030 — used only inside the App
 require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — the Phase-6 prefill kernel set (Apple builds)
 require ?das_metal dasllama/dasllama_metal_kernels  // nolint:STYLE030 — the Wave C MoE routing kernel set (Apple builds)
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — device/pipeline/buffer plumbing + the leak gate
+require llvm/daslib/f16_cvt  // f32_to_f16: the q51 gates hand-pack f16 d/m scale halfwords
 require math
 
 // The Phase-6 GPU prefill kernels vs their dasLLAMA CPU twins on synthetic data. rmsnorm /
@@ -472,6 +473,15 @@ def test_metal_prefill_kernels(t : T?) {
                 moe_gemv_gate(t, dev, queue, 64, 24, 5, 3, 3, false)   // batch streams, shared-x form
                 moe_gemv_gate(t, dev, queue, 64, 24, 5, 3, 3, true)    // batch streams, down form
                 moe_combine_gate(t, dev, queue, 200, 4)
+
+                // ===== q51 expert kernels (the 26B-A4B Q4_K_M down stacks) =====
+                // exact-arithmetic q51 planes (pow2 d, quarter m, int x) — BIT-exact both kernels;
+                // n = 96 covers 3 blocks/row, the mulmm shapes cover padded CSR tails (ce % 32)
+                moe_gemv_q51_gate(t, dev, queue, 96, 24, 5, 3, 1, false)   // gate/up site (shared x)
+                moe_gemv_q51_gate(t, dev, queue, 64, 32, 7, 4, 1, true)    // down site (per-slot x)
+                moe_gemv_q51_gate(t, dev, queue, 64, 24, 5, 3, 3, true)    // batch streams, down form
+                moe_mulmm_q51_gate(t, dev, queue, 64, 64, [32, 40, 64])    // padded tail on expert 1
+                moe_mulmm_q51_gate(t, dev, queue, 96, 128, [8, 96])        // 2 col tiles, tiny run + multi-tile
 
                 // ===== deltanet kernels (Wave D) =====
                 // the chain gates compare each stage at its seam vs a sequential CPU mirror;
@@ -948,6 +958,238 @@ def private moe_gemv_gate(t : T?; dev, queue; n, d, net, k, nst : int; perslot :
     delete wq
     delete ws
     delete sel
+    delete xv
+    delete want
+}
+
+// Build q51 plane pairs for `rows` rows of n elements: patterned 5-bit quants (position-
+// dependent), pow2 f16 d + quarter-value f16 m — every product/sum dyadic, so the CPU float
+// reference is BIT-exact under any GPU reduction order.
+def private q51_test_planes(rows, n : int; var qp : array<uint8>; var sp : array<uint8>; var wref : array<float>) {
+    let nb = n / 32
+    let dlut = fixed_array(0.25, 0.5, 1.0, 2.0)
+    let mlut = fixed_array(-1.0, 0.5, 1.25, -0.25)
+    qp |> resize(rows * nb * 20)
+    sp |> resize(rows * nb * 4)
+    wref |> resize(rows * n)
+    for (b in range(rows * nb)) {
+        let d = dlut[(b / 3) % 4]
+        let m = mlut[(b * 5 + 1) % 4]
+        let dbits = f32_to_f16(d)
+        let mbits = f32_to_f16(m)
+        sp[b * 4] = uint8(dbits & 0xFF)
+        sp[b * 4 + 1] = uint8(dbits >> 8u)
+        sp[b * 4 + 2] = uint8(mbits & 0xFF)
+        sp[b * 4 + 3] = uint8(mbits >> 8u)
+        var qh = 0u
+        for (i in range(32)) {
+            let q = (b * 11 + i * 7 + i / 3) % 32
+            wref[b * 32 + i] = d * float(q) + m
+            if ((q & 16) != 0) {
+                qh |= 1u << uint(i)
+            }
+            if (i < 16) {
+                qp[b * 20 + i] = uint8(q & 15)
+            } else {
+                qp[b * 20 + i - 16] = uint8(uint(qp[b * 20 + i - 16]) | (uint(q & 15) << 4u))
+            }
+        }
+        for (i in range(4)) {
+            qp[b * 20 + 16 + i] = uint8(qh >> uint(i * 8))
+        }
+    }
+}
+
+// The expert-indexed q51 GEMV on exact-arithmetic q51 planes — moe_gemv_gate's shapes, BIT-exact.
+def private moe_gemv_q51_gate(t : T?; dev, queue; n, d, net, k, nst : int; perslot : bool) {
+    var err : string
+    var pso = pipeline_from_source(dev, metal_moe_gemv_q51_msl, metal_moe_gemv_q51_msl_entry, metal_moe_gemv_q51_msl_fastmath, err)
+    t |> success(pso != null, "moe q51 gemv pipeline: {err}")
+    if (pso == null) {
+        return
+    }
+    let nb = n / 32
+    var qp : array<uint8>
+    var sp : array<uint8>
+    var wref : array<float>
+    q51_test_planes(net * d, n, qp, sp, wref)
+    var sel : array<uint>
+    sel |> resize(nst * 2 * k)
+    for (s in range(nst)) {
+        for (j in range(k)) {
+            sel[s * 2 * k + j] = uint((s + j * 3 + net - 1) % net)
+        }
+    }
+    let xrows = perslot ? nst * k : nst
+    var xv : array<float>
+    xv |> resize(xrows * n)
+    for (i in range(xrows * n)) {
+        xv[i] = float((i * 3) % 9 - 4)
+    }
+    var want : array<float>
+    want |> resize(nst * k * d)
+    for (s in range(nst)) {
+        for (j in range(k)) {
+            let e = int(sel[s * 2 * k + j])
+            let x0 = (perslot ? s * k + j : s) * n
+            for (r in range(d)) {
+                var acc = 0.0
+                for (c in range(n)) {
+                    acc += wref[((e * d + r) * nb) * 32 + c] * xv[x0 + c]
+                }
+                want[(s * k + j) * d + r] = acc
+            }
+        }
+    }
+    var bw = buf_upload(dev, qp)
+    var bs = buf_upload(dev, sp)
+    var bx = buf_upload(dev, xv)
+    var by = buf_fill(dev, nst * k * d, -1000.0)
+    var bn = buf_u32(dev, uint(n))
+    var bd = buf_u32(dev, uint(d))
+    var bsel = buf_upload(dev, sel)
+    var beblk = buf_u32(dev, uint(d * nb))
+    var bxs = buf_u32(dev, perslot ? uint(n) : 0u)
+    var bss = buf_u32(dev, uint(2 * k))
+    var bbxs = buf_u32(dev, uint((perslot ? k : 1) * n))
+    var bbys = buf_u32(dev, uint(k * d))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bw, 0ul, 0)
+        metal_set_buffer(enc, bs, 0ul, 1)
+        metal_set_buffer(enc, bx, 0ul, 2)
+        metal_set_buffer(enc, by, 0ul, 3)
+        metal_set_buffer(enc, bn, 0ul, 4)
+        metal_set_buffer(enc, bd, 0ul, 5)
+        metal_set_buffer(enc, bsel, 0ul, 6)
+        metal_set_buffer(enc, beblk, 0ul, 7)
+        metal_set_buffer(enc, bxs, 0ul, 8)
+        metal_set_buffer(enc, bss, 0ul, 9)
+        metal_set_buffer(enc, bbxs, 0ul, 10)
+        metal_set_buffer(enc, bbys, 0ul, 11)
+        metal_dispatch_threadgroups(enc, uint3(uint((d + 3) / 4), uint(k), uint(nst)), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "moe q51 gemv dispatch n={n} d={d} net={net} k={k} nst={nst}: {err}")
+    t |> equal(buf_mismatch_exact(by, want), 0)
+    metal_release(bw)
+    metal_release(bs)
+    metal_release(bx)
+    metal_release(by)
+    metal_release(bn)
+    metal_release(bd)
+    metal_release(bsel)
+    metal_release(beblk)
+    metal_release(bxs)
+    metal_release(bss)
+    metal_release(bbxs)
+    metal_release(bbys)
+    metal_release(pso)
+    delete qp
+    delete sp
+    delete wref
+    delete sel
+    delete xv
+    delete want
+}
+
+// The gathered q51 mul_mm: ne experts with padded-CSR row runs (gather = 0 bucket-rows mode);
+// exact-arithmetic planes (the A tile's f16(d*q + m) values are dyadic <= 63.25 — f16-exact),
+// int x rows — every simdgroup accumulate is exact, so the whole padded y compares BIT-exact.
+def private moe_mulmm_q51_gate(t : T?; dev, queue; kdim, ndim : int; counts : array<int>) {
+    var err : string
+    var pso = pipeline_from_source(dev, metal_moe_mulmm_q51_msl, metal_moe_mulmm_q51_msl_entry, metal_moe_mulmm_q51_msl_fastmath, err)
+    t |> success(pso != null, "moe q51 mulmm pipeline: {err}")
+    if (pso == null) {
+        return
+    }
+    let ne = length(counts)
+    let nb = kdim / 32
+    var qp : array<uint8>
+    var sp : array<uint8>
+    var wref : array<float>
+    q51_test_planes(ne * ndim, kdim, qp, sp, wref)
+    // padded CSR: each expert's rows start at a 32-aligned base (the route prefix contract)
+    var cnt : array<uint>
+    var basep : array<uint>
+    cnt |> reserve(ne)
+    basep |> reserve(ne)
+    var pad = 0
+    for (c in range(ne)) {
+        cnt |> push(uint(counts[c]))
+        basep |> push(uint(pad))
+        pad += (counts[c] + 31) / 32 * 32
+    }
+    var xv : array<float>
+    xv |> resize(pad * kdim)
+    for (i in range(pad * kdim)) {
+        xv[i] = float((i * 5) % 9 - 4)
+    }
+    // padded tail rows are computed from their (defined) x rows too — want covers the WHOLE buffer
+    var want : array<float>
+    want |> resize(pad * ndim)
+    for (e in range(ne)) {
+        let rows = (counts[e] + 31) / 32 * 32
+        for (r in range(rows)) {
+            let row = int(basep[e]) + r
+            for (col in range(ndim)) {
+                var acc = 0.0
+                for (c in range(kdim)) {
+                    acc += wref[(e * ndim + col) * kdim + c] * xv[row * kdim + c]
+                }
+                want[row * ndim + col] = acc
+            }
+        }
+    }
+    var bw = buf_upload(dev, qp)
+    var bs = buf_upload(dev, sp)
+    var bx = buf_upload(dev, xv)
+    var by = buf_fill(dev, pad * ndim, -1000.0)
+    var bkdim = buf_u32(dev, uint(kdim))
+    var bndim = buf_u32(dev, uint(ndim))
+    var bcnt = buf_upload(dev, cnt)
+    var bbase = buf_upload(dev, basep)
+    var bbkt = buf_u32(dev, 0u)   // gather = 0: bkt unread
+    var beblk = buf_u32(dev, uint(ndim * nb))
+    var bnk = buf_u32(dev, 1u)
+    var bgather = buf_u32(dev, 0u)
+    let tiles = (pad + 31) / 32
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_q51_msl_tgmem, 0)
+        metal_set_buffer(enc, bs, 0ul, 0)
+        metal_set_buffer(enc, bw, 0ul, 1)
+        metal_set_buffer(enc, bx, 0ul, 2)
+        metal_set_buffer(enc, by, 0ul, 3)
+        metal_set_buffer(enc, bkdim, 0ul, 4)
+        metal_set_buffer(enc, bndim, 0ul, 5)
+        metal_set_buffer(enc, bcnt, 0ul, 6)
+        metal_set_buffer(enc, bbase, 0ul, 7)
+        metal_set_buffer(enc, bbkt, 0ul, 8)
+        metal_set_buffer(enc, beblk, 0ul, 9)
+        metal_set_buffer(enc, bnk, 0ul, 10)
+        metal_set_buffer(enc, bgather, 0ul, 11)
+        metal_dispatch_threadgroups(enc, uint3(uint(tiles), uint(ndim / 64), uint(ne)), uint3(128u, 1u, 1u))
+    }
+    t |> success(ran, "moe q51 mulmm dispatch kdim={kdim} ndim={ndim} ne={ne} pad={pad}: {err}")
+    t |> equal(buf_mismatch_exact(by, want), 0)
+    metal_release(bw)
+    metal_release(bs)
+    metal_release(bx)
+    metal_release(by)
+    metal_release(bkdim)
+    metal_release(bndim)
+    metal_release(bcnt)
+    metal_release(bbase)
+    metal_release(bbkt)
+    metal_release(beblk)
+    metal_release(bnk)
+    metal_release(bgather)
+    metal_release(pso)
+    delete qp
+    delete sp
+    delete wref
+    delete cnt
+    delete basep
     delete xv
     delete want
 }

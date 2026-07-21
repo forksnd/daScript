@@ -1084,6 +1084,71 @@ class MetalMoeGemvMx4 {
     }
 }
 
+// Expert-indexed Q5_1 GEMV — per-32 planes (a 20B quant block = 5 uints: 16 nibble bytes in the
+// k/k+16 split-half pairing + the qh u32; 4B scales = f16 d, m). value = d*q + m with
+// q = nibble | qh_bit << 4, folded as acc += d*Σ(q·x) + m*Σx per block (f32 activations).
+class MetalMoeGemvQ51 {
+    @ssbo @binding = 0 wqu : array<uint>    // quant plane, uint view (block at 5*blk; qh at +4)
+    @ssbo @binding = 1 wsh : array<float16> // scale plane (d at 2*blk, m at 2*blk+1)
+    @ssbo @binding = 2 xf : array<float4>   // activations, float4 view (xoff always % 4)
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 ndim : uint
+    @uniform @binding = 5 ddim : uint
+    @ssbo @binding = 6 sel : array<uint>    // [streams x 2k] selection rows (idx section read)
+    @uniform @binding = 7 eblk : uint       // 32-elem blocks per expert plane (ege / 32)
+    @uniform @binding = 8 xs : uint         // per-slot x stride, elements (0 = shared)
+    @uniform @binding = 9 ss : uint         // per-stream sel row stride, uints (2k; 0 single)
+    @uniform @binding = 10 bxs : uint       // per-stream x stride, elements (0 single)
+    @uniform @binding = 11 bys : uint       // per-stream y stride, elements (0 single)
+
+    [metal_kernel(name="metal_moe_gemv_q51_msl")]
+    def metal_moe_gemv_q51 {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u    // 4-way block stride
+        let it = lane % 8u    // 8 threads per block, one float4 (4 elems) each
+        let nb = ndim / 32u
+        let slot = gl_WorkGroupID.y
+        let st = gl_WorkGroupID.z
+        let eb = sel[st * ss + slot] * eblk
+        let xoff = st * bxs + slot * xs
+        let y0 = st * bys + slot * ddim
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        // this thread's 4 elems: half = it/4 selects the nibble half, ku = it%4 the quant uint
+        let half = it / 4u
+        let ku = it % 4u
+        let nsh = half * 4u
+        let hb = ku * 4u + half * 16u
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let xv = xf[(xoff + ib * 32u) / 4u + it]
+            let sx = xv.x + xv.y + xv.z + xv.w
+            for [unroll_full] (r in range(2)) {
+                let blk = eb + (first_row + uint(r)) * nb + ib
+                let qb = blk * 5u
+                let u = wqu[qb + ku]
+                let qh = wqu[qb + 4u] >> hb
+                var qx = float((u >> nsh) & 15u) * xv.x
+                qx += float((u >> (8u + nsh)) & 15u) * xv.y
+                qx += float((u >> (16u + nsh)) & 15u) * xv.z
+                qx += float((u >> (24u + nsh)) & 15u) * xv.w
+                var hx = (qh & 1u) != 0u ? xv.x : 0.0
+                hx += (qh & 2u) != 0u ? xv.y : 0.0
+                hx += (qh & 4u) != 0u ? xv.z : 0.0
+                hx += (qh & 8u) != 0u ? xv.w : 0.0
+                sumf[r] += float(wsh[blk * 2u]) * (qx + 16.0 * hx) + float(wsh[blk * 2u + 1u]) * sx
+            }
+            ib += 4u
+        }
+        for [unroll_full] (r in range(2)) {
+            let sr = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[y0 + first_row + uint(r)] = sr
+            }
+        }
+    }
+}
+
 // Gathered MXFP4 mul_mm — the gathered-GEMM shape with the mx4 A stage: each thread's 16-elem
 // half IS one nibble half of the 32-block (il0 = 0 low, 1 high). Bias rides MetalMoeBiasRows.
 class MetalMoeMulMmMx4 {
@@ -1758,6 +1823,110 @@ class MetalMoeMulMmK5 {
                 for [unroll_full] (c in range(4)) {
                     let q = ((u >> (8u * uint(c) + nsh)) & 15u) | (((hu >> (8u * uint(c) + js)) & 1u) << 4u)
                     va[k * 4 + c] = float16(dsc * float(q) - dmn)
+                }
+            }
+            barrier()
+            for [unroll_full] (i in range(16)) {
+                ta[tA0 + uint(i / 8) * 512u + uint(i % 8) * 8u] = va[i]
+            }
+            tg_store_half4(tb, ibB, b0)
+            tg_store_half4(tb, ibB + 4u, b1)
+            barrier()
+            var acur = unsafe(addr(ta[aB]))
+            var bcur = unsafe(addr(tb[bB]))
+            for [unroll_full] (_ik in range(4)) {
+                for [unroll_full] (i in range(4)) {
+                    simdgroup_load(ma[i], acur, uint(i) * 64u, 8u)
+                }
+                for [unroll_full] (i in range(2)) {
+                    simdgroup_load(mb[i], bcur, uint(i) * 64u, 8u)
+                }
+                for [unroll_full] (i in range(8)) {
+                    simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i])
+                }
+                acur = unsafe(acur + 512)
+                bcur = unsafe(bcur + 256)
+            }
+            xcur = unsafe(xcur + 8)
+            kb++
+        }
+        let row0 = rbase + mBase + (sg / 2u) * 16u
+        let col0 = nBase + (sg % 2u) * 32u
+        for [unroll_full] (i in range(8)) {
+            simdgroup_store(mc[i], y, (row0 + uint(i / 4) * 8u) * ndim + col0 + uint(i % 4) * 8u, ndim)
+        }
+    }
+}
+
+// Gathered Q5_1 mul_mm — the k5 skeleton with the per-32 A stage: each thread's 16-elem half is
+// one nibble half of the 32-block (il0), value = d*q + m folded into the f16 A tile.
+class MetalMoeMulMmQ51 {
+    @ssbo @binding = 0 wsh : array<float16> // scale plane (d at 2*blk, m at 2*blk+1)
+    @ssbo @binding = 1 wqu : array<uint>    // quant plane, uint view (block at 5*blk; qh at +4)
+    @ssbo @binding = 2 xf : array<float4>
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 kdim : uint
+    @uniform @binding = 5 ndim : uint
+    @ssbo @binding = 6 cnt : array<uint>
+    @ssbo @binding = 7 basep : array<uint>
+    @ssbo @binding = 8 bkt : array<uint>
+    @uniform @binding = 9 eblk : uint       // 32-elem blocks per expert plane (ege / 32)
+    @uniform @binding = 10 nk : uint
+    @uniform @binding = 11 gather : uint
+    @workgroup ta : float16[2048]
+    @workgroup tb : float16[1024]
+
+    [metal_kernel(name="metal_moe_mulmm_q51_msl")]
+    def metal_moe_mulmm_q51 {
+        let e = gl_WorkGroupID.z
+        let ce = cnt[e]
+        let mBase = gl_WorkGroupID.x * 32u
+        if (mBase >= (ce + 31u) / 32u * 32u) {
+            return
+        }
+        let rbase = basep[e]
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let nBase = gl_WorkGroupID.y * 64u
+        var mc : simdgroup_float8x8[8]
+        var ma : simdgroup_half8x8[4]
+        var mb : simdgroup_half8x8[2]
+        var va : float16[16]
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u
+        let bB = (sg / 2u) * 128u
+        let ewb = e * eblk + (nBase + lr0) * nkb
+        let nsh = il0 * 4u
+        let hb0 = il0 * 16u
+        var srcrow = rbase + mBase + lr1
+        if (gather != 0u) {
+            srcrow = bkt[rbase + min(mBase + lr1, ce - 1u)] / nk
+        }
+        var xcur = unsafe(addr(xf[srcrow * kdim4 + iy / 4u]))
+        var kb = 0u
+        while (kb < nkb) {
+            let blk = ewb + kb
+            let b0 = unsafe(xcur[0])
+            let b1 = unsafe(xcur[1])
+            let d = float(wsh[blk * 2u])
+            let m = float(wsh[blk * 2u + 1u])
+            let qb = blk * 5u
+            let qh = wqu[qb + 4u]
+            for [unroll_full] (k in range(4)) {
+                let u = wqu[qb + uint(k)]
+                for [unroll_full] (c in range(4)) {
+                    let el = uint(k) * 4u + uint(c)
+                    let q = ((u >> (8u * uint(c) + nsh)) & 15u) | (((qh >> (el + hb0)) & 1u) << 4u)
+                    va[k * 4 + c] = float16(d * float(q) + m)
                 }
             }
             barrier()
@@ -4115,6 +4284,7 @@ var private g_pf_pso_g4rnorm : MetalComputePipeline?   // gemma4 MoE router-inpu
 var private g_pf_pso_moe_wscale : MetalComputePipeline?
 var private g_pf_pso_swiglu_oai : MetalComputePipeline?
 var private g_pf_pso_moe_mm_mx4 : MetalComputePipeline?
+var private g_pf_pso_moe_mm_q51 : MetalComputePipeline?
 var private g_pf_pso_moe_bias_rows : MetalComputePipeline?
 var private g_pf_e8m0_tab : MetalBuffer?
 var private g_mm_legacy = false             // set_metal_prefill_mulmm_legacy — tests' exact-parity rail
@@ -4300,7 +4470,7 @@ def public metal_prefill_shutdown {
                  g_pf_pso_moe_router, g_pf_pso_moe_router_b, g_pf_pso_moe_select, g_pf_pso_moe_count, g_pf_pso_moe_prefix,
                  g_pf_pso_moe_bucket, g_pf_pso_moe_reduce, g_pf_pso_moe_mm_q8, g_pf_pso_moe_mm_k4,
                  g_pf_pso_moe_mm_k5, g_pf_pso_moe_mm_k6, g_pf_pso_g4rnorm, g_pf_pso_moe_wscale, g_pf_pso_swiglu_oai,
-                 g_pf_pso_moe_mm_mx4, g_pf_pso_moe_bias_rows]) {
+                 g_pf_pso_moe_mm_mx4, g_pf_pso_moe_mm_q51, g_pf_pso_moe_bias_rows]) {
         if (pso != null) {
             metal_release(pso)
         }
@@ -4326,6 +4496,7 @@ def public metal_prefill_shutdown {
     g_pf_pso_moe_wscale = null
     g_pf_pso_swiglu_oai = null
     g_pf_pso_moe_mm_mx4 = null
+    g_pf_pso_moe_mm_q51 = null
     g_pf_pso_moe_bias_rows = null
     if (g_pf_e8m0_tab != null) {
         metal_release(g_pf_e8m0_tab)
@@ -4430,6 +4601,7 @@ def private metal_prefill_init : bool {
     g_pf_pso_moe_wscale = pf_compile_pso(metal_moe_wscale_msl, metal_moe_wscale_msl_entry, metal_moe_wscale_msl_fastmath, ok)
     g_pf_pso_swiglu_oai = pf_compile_pso(metal_swiglu_oai_msl, metal_swiglu_oai_msl_entry, metal_swiglu_oai_msl_fastmath, ok)
     g_pf_pso_moe_mm_mx4 = pf_compile_pso(metal_moe_mulmm_mx4_msl, metal_moe_mulmm_mx4_msl_entry, metal_moe_mulmm_mx4_msl_fastmath, ok)
+    g_pf_pso_moe_mm_q51 = pf_compile_pso(metal_moe_mulmm_q51_msl, metal_moe_mulmm_q51_msl_entry, metal_moe_mulmm_q51_msl_fastmath, ok)
     g_pf_pso_moe_bias_rows = pf_compile_pso(metal_moe_bias_rows_msl, metal_moe_bias_rows_msl_entry, metal_moe_bias_rows_msl_fastmath, ok)
     g_pf_pso_dn_conv = pf_compile_pso(metal_dn_conv_msl, metal_dn_conv_msl_entry, metal_dn_conv_msl_fastmath, ok)
     g_pf_pso_dn_hist = pf_compile_pso(metal_dn_conv_hist_msl, metal_dn_conv_hist_msl_entry, metal_dn_conv_hist_msl_fastmath, ok)
@@ -4733,6 +4905,23 @@ def private pf_enc_moe_mm(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; st
         metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_q8_msl_tgmem, 0)
         metal_set_buffer(enc, bw.buf, bw.boff, 0)
         metal_set_buffer(enc, bw.buf, bw.boff, 1)
+        metal_set_buffer(enc, bx, 0ul, 2)
+        metal_set_buffer(enc, by, 0ul, 3)
+        metal_set_buffer(enc, bkdim, 0ul, 4)
+        metal_set_buffer(enc, bndim, 0ul, 5)
+        metal_set_buffer(enc, bcnt, 0ul, 6)
+        metal_set_buffer(enc, bbase, 0ul, 7)
+        metal_set_buffer(enc, bbkt, 0ul, 8)
+        metal_set_buffer(enc, bes, 0ul, 9)
+        metal_set_buffer(enc, bnk, 0ul, 10)
+        metal_set_buffer(enc, bgather, 0ul, 11)
+        metal_dispatch_threadgroups(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
+    } elif (fmt == KqFmt.q51) {
+        let qp = q51_planes_of(g_pf_dev, t, stack_off)
+        metal_set_pipeline(enc, g_pf_pso_moe_mm_q51)
+        metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_q51_msl_tgmem, 0)
+        metal_set_buffer(enc, qp.sbuf, qp.soff, 0)
+        metal_set_buffer(enc, qp.qbuf, qp.qoff, 1)
         metal_set_buffer(enc, bx, 0ul, 2)
         metal_set_buffer(enc, by, 0ul, 3)
         metal_set_buffer(enc, bkdim, 0ul, 4)
@@ -5804,9 +5993,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                             pf_enc_moe_bias_rows(enc, bmg2, bwb3, bmcnt, bmbase, u_moe_nfe, c.n_ff_exp, npos, c.n_expert)
                         } else {
                             pf_enc_moe_mm(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg,
-                                u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe1 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
+                                u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe1 == KqFmt.q8 || fe1 == KqFmt.q51 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
                             pf_enc_moe_mm(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg2,
-                                u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe3 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
+                                u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe3 == KqFmt.q8 || fe3 == KqFmt.q51 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
                         }
                         if (nsh > 0l) {
                             // shexp gate/up: dense q8 mul_mm at the wsh planes (bhb/bhb2 sized max(hidden, nsh))
@@ -5834,7 +6023,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                             pf_enc_moe_bias_rows(enc, bmdn, bwb2, bmcnt, bmbase, u_dim, dim, npos, c.n_expert)
                         } else {
                             pf_enc_moe_mm(enc, t, fe2, t.we2_offs[l], dim, npos, bmg, bmdn,
-                                u_moe_nfe, u_dim, bmcnt, bmbase, bmbkt, fe2 == KqFmt.q8 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g0)
+                                u_moe_nfe, u_dim, bmcnt, bmbase, bmbkt, fe2 == KqFmt.q8 || fe2 == KqFmt.q51 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g0)
                         }
                         if (nsh > 0l) {
                             // shexp down into bxb2 (free post-residual) — bxb still feeds the reduce

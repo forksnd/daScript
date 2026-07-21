@@ -2317,6 +2317,7 @@ def private metal_blob_off_ok(off : int64; fmt : KqFmt) : bool {
     if (off < 0l) return true
     if (fmt == KqFmt.q8) return off % 256l == 0l
     if (fmt == KqFmt.k6) return off % 512l == 0l
+    if (fmt == KqFmt.q51) return off % 128l == 0l   // (off/32)*20 and (off/32)*4 both 16B-aligned
     return true
 }
 

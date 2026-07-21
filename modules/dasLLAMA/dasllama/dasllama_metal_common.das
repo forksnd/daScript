@@ -684,6 +684,20 @@ def kq_scales_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tupl
     }
 }
 
+//! One q51 tensor's plane pair bind: quant plane (20B/block, uint-viewable) at (off/32)*20 and
+//! the f16 d+m scale plane at (off/32)*4 — both verbatim disk splits, never rebaked (the blob
+//! transform leaves q51 planes untouched). off % 128 keeps both binds 16B-aligned.
+def q51_planes_of(dev : MetalDevice?; t : Model; off : int64) : tuple<qbuf : MetalBuffer?; qoff : uint64; sbuf : MetalBuffer?; soff : uint64> {
+    assert(t.metal_blob)
+    let b0 = off / 32l
+    unsafe {
+        return (qbuf = plane_buffer(dev, addr < void? >(t.q51q[0]), uint64(long_length(t.q51q)), t.image_map != null),
+                qoff = uint64(b0 * 20l),
+                sbuf = plane_buffer(dev, addr < void? >(t.q51s[0]), uint64(long_length(t.q51s)), t.image_map != null),
+                soff = uint64(b0 * 4l))
+    }
+}
+
 def uniform_u32(v : uint) : MetalBuffer? {
     var buf = pool_acquire_untracked(g_upool, g_dev, 4ul)
     var p = unsafe(reinterpret<uint?>(metal_buffer_contents(buf)))
@@ -1100,6 +1114,9 @@ def moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
     if (fmt == KqFmt.k6) {
         return off >= 0l && (off % 512l) == 0l && (ege % 256l) == 0l
     }
+    if (fmt == KqFmt.q51) {   // per-32 planes: off % 128 keeps the 20B/4B binds 16B-aligned
+        return off >= 0l && (off % 128l) == 0l && (ege % 32l) == 0l
+    }
     return false
 }
 
@@ -1173,12 +1190,18 @@ def moe_metal_ok(t : Model) : bool {
         let f1 = moe_fmt_at(t.we1_fmt, l)
         let f2 = moe_fmt_at(t.we2_fmt, l)
         let f3 = moe_fmt_at(t.we3_fmt, l)
-        // per-site alignment + (kq kernels iterate whole superblock rows) reduction dims %256
+        // per-site alignment + reduction dims: superblock kq kernels iterate whole 256-rows,
+        // q51 whole 32-blocks (+ the mul_mm's 64-col output tiles)
+        let sb1 = f1 == KqFmt.k4 || f1 == KqFmt.k5 || f1 == KqFmt.k6
+        let sb3 = f3 == KqFmt.k4 || f3 == KqFmt.k5 || f3 == KqFmt.k6
+        let sb2 = f2 == KqFmt.k4 || f2 == KqFmt.k5 || f2 == KqFmt.k6
         if (!moe_site_ok(f1, t.we1_offs[l], ege) ||
                 !moe_site_ok(f2, t.we2_offs[l], ege) ||
                 !moe_site_ok(f3, t.we3_offs[l], ege) ||
-                ((f1 != KqFmt.q8 || f3 != KqFmt.q8) && (c.dim % 256l) != 0l) ||
-                (f2 != KqFmt.q8 && (nfe % 256l) != 0l)) {
+                ((sb1 || sb3) && (c.dim % 256l) != 0l) ||
+                (sb2 && (nfe % 256l) != 0l) ||
+                ((f1 == KqFmt.q51 || f3 == KqFmt.q51) && ((c.dim % 32l) != 0l || (nfe % 64l) != 0l)) ||
+                (f2 == KqFmt.q51 && ((nfe % 32l) != 0l || (c.dim % 64l) != 0l))) {
             return false
         }
     }

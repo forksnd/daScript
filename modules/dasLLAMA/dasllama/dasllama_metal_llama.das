@@ -876,10 +876,10 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                         r.u_zero32, r.u_zero32, r.u_zero32, bwb3, r.u_moe_gmode, uint64(knfe * 4l))
                 } else {
                     enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
-                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 || fe1 == KqFmt.q51 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
                         r.u_zero32, r.u_zero32, r.u_zero32)
                     enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, 1l, bmx, r.bh12,
-                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                        r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 || fe3 == KqFmt.q51 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
                         r.u_zero32, r.u_zero32, r.u_zero32, uint64(knfe * 4l))
                 }
             }
@@ -895,7 +895,7 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                         r.u_zero32, r.u_zero32, r.u_zero32, bwb2, r.u_moe_gmode)
                 } else {
                     enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, 1l, r.bh12, r.bmoe_dn,
-                        r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
+                        r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 || fe2 == KqFmt.q51 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
                         r.u_zero32, r.u_zero32, r.u_zero32)
                 }
                 if (r.u_moe_nsh != null) {
@@ -1299,14 +1299,14 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
                 enc_moe_router(enc, bw_shg, r.bxb, r.bmoe_lg, r.u_dim, r.u_one32, r.u_dim, g_one, g_zero, 1l, 2l)
             }
             enc_moe_gemv(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, c.n_expert_used, 2l, r.bxb, r.bh12,
-                r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe1 == KqFmt.q8 || fe1 == KqFmt.q51 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
                 r.u_moe_ss, r.u_dim, r.u_moe_knfe)
             enc_moe_gemv(enc, t, fe3, t.we3_offs[l], c.n_ff_exp, c.n_expert_used, 2l, r.bxb, r.bh12,
-                r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
+                r.u_dim, r.u_moe_nfe, r.bmoe_sel, fe3 == KqFmt.q8 || fe3 == KqFmt.q51 ? r.u_moe_eblk : r.u_moe_esb, r.u_zero32,
                 r.u_moe_ss, r.u_dim, r.u_moe_knfe, uint64(2l * knfe * 4l))
             enc_ew2(enc, g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(2l * knfe * 4l), r.u_moe_tot, 2l * knfe)
             enc_moe_gemv(enc, t, fe2, t.we2_offs[l], dim, c.n_expert_used, 2l, r.bh12, r.bmoe_dn,
-                r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
+                r.u_moe_nfe, r.u_dim, r.bmoe_sel, fe2 == KqFmt.q8 || fe2 == KqFmt.q51 ? r.u_moe_eblk : r.u_moe_esb, r.u_moe_xs_dn,
                 r.u_moe_ss, r.u_moe_knfe, r.u_moe_kdim)
             if (r.u_moe_nsh != null) {
                 // shexp FFN reads bxb BEFORE combine overwrites it; bh12 is free after expert W2
