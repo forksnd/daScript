@@ -30,6 +30,8 @@ let WOFF1 = 1000000l   // gate / up / down stack base element offsets (arbitrary
 let WOFF3 = 2000000l   // the tier resolves regions by [base, base+elems) containment)
 let WOFF2 = 3000000l
 let REL_TOL = 1e-3
+// the q8 arena is process-global and shared by every arena arm — reserve once, generously
+let ARENA_BLOCKS = 4096l
 
 def private pow2_scale(i : int64) : float {
     let p = i % 5l
@@ -2283,6 +2285,124 @@ def test_vulkan_attention(t : T?) {
     }
 }
 
+// The whole dense FFN against arena-resident planes: gate GEMV -> up GEMV -> fused act+requant ->
+// down GEMV, ONE submit. No new kernels — q8_moe_actrq is already region-free, so this is the
+// per-op chain with the weight base coming from an arena block index instead of a stack.
+[test]
+def test_vulkan_arena_ffn(t : T?) {
+    t |> run("vulkan arena FFN chain == CPU reference (dense gate/up/down triple)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!vk_arena_reserve(0, ARENA_BLOCKS)) {
+                feint("no Vulkan device (or the arena reserve was refused); skipping\n")
+                return
+            }
+            var wq1 : array<int8>
+            var ws1 : array<float>
+            var wq3 : array<int8>
+            var ws3 : array<float>
+            var wq2 : array<int8>
+            var ws2 : array<float>
+            fill_stack(wq1, ws1, NFE, N, 11l, true)    // gate/up small scales — the sane silu regime
+            fill_stack(wq3, ws3, NFE, N, 23l, true)
+            fill_stack(wq2, ws2, N, NFE, 37l, false)
+            var p1 : array<uint8>
+            var s1 : array<uint8>
+            var p3 : array<uint8>
+            var s3 : array<uint8>
+            var p2 : array<uint8>
+            var s2 : array<uint8>
+            pack_upload(wq1, ws1, p1, s1)
+            pack_upload(wq3, ws3, p3, s3)
+            pack_upload(wq2, ws2, p2, s2)
+            let b1 = vk_arena_place(p1, s1, N, NFE, 0)
+            let b3 = vk_arena_place(p3, s3, N, NFE, 0)
+            let b2 = vk_arena_place(p2, s2, NFE, N, 0)
+            t |> success(b1 >= 0l && b3 >= 0l && b2 >= 0l, "arena admitted the FFN triple (blocks {b1}/{b3}/{b2})")
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, 1l)
+            var y : array<float>
+            y |> resize(int(N))
+            vk_arena_ffn(y, b1, b3, b2, N, NFE, 0, 0, 0, xq, xs, false)
+            // CPU mirror: gate/up GEMV -> silu(g)*u -> q8_0 requant -> down GEMV
+            let nb = int(N / 32l)
+            let nbh = int(NFE / 32l)
+            var h : array<float>
+            var hq : array<int>
+            var hs : array<float>
+            h |> resize(int(NFE))
+            hq |> resize(int(NFE))
+            hs |> resize(nbh)
+            for (i in range(int(NFE))) {
+                var ag = 0.0
+                var au = 0.0
+                for (b in range(nb)) {
+                    var dg = 0
+                    var du = 0
+                    for (j in range(32)) {
+                        let xv = int(xq[b * 32 + j])
+                        dg += int(wq1[i * int(N) + b * 32 + j]) * xv
+                        du += int(wq3[i * int(N) + b * 32 + j]) * xv
+                    }
+                    let xscl = xs[b]
+                    ag += float(dg) * ws1[i * nb + b] * xscl
+                    au += float(du) * ws3[i * nb + b] * xscl
+                }
+                h[i] = (ag / (1.0 + exp(-ag))) * au
+            }
+            for (b in range(nbh)) {
+                var amax = 0.0
+                for (j in range(32)) {
+                    amax = max(amax, abs(h[b * 32 + j]))
+                }
+                let d = amax / 127.0
+                let id = d != 0.0 ? 1.0 / d : 0.0
+                hs[b] = d
+                for (j in range(32)) {
+                    hq[b * 32 + j] = int(round(h[b * 32 + j] * id))
+                }
+            }
+            var refy : array<float>
+            refy |> resize(int(N))
+            for (o in range(int(N))) {
+                var acc = 0.0
+                for (b in range(nbh)) {
+                    var dd = 0
+                    for (j in range(32)) {
+                        dd += int(wq2[o * int(NFE) + b * 32 + j]) * hq[b * 32 + j]
+                    }
+                    acc += float(dd) * ws2[o * nbh + b] * hs[b]
+                }
+                refy[o] = acc
+            }
+            let cf = compare_gout(y, refy)
+            t |> success(cf.maxdiff <= float(REL_TOL) * cf.maxref,
+                "arena FFN within tolerance (maxdiff {cf.maxdiff} vs {float(REL_TOL) * cf.maxref} bar, maxref {cf.maxref})")
+            delete wq1
+            delete ws1
+            delete wq3
+            delete ws3
+            delete wq2
+            delete ws2
+            delete p1
+            delete s1
+            delete p3
+            delete s3
+            delete p2
+            delete s2
+            delete xq
+            delete xs
+            delete y
+            delete h
+            delete hq
+            delete hs
+            delete refy
+        } else {
+            feint("dasVulkan not installed; arena FFN untestable here\n")
+        }
+    }
+}
+
 // The resident driver's fused residual-add + RMSNorm — the kernel that collapses the layer
 // boundary to one dispatch. ascale != 1 and a non-zero addend on purpose: with ascale = 1 or a = 0
 // a dropped term would still land inside tolerance.
@@ -2356,7 +2476,7 @@ def test_vulkan_arena(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             let AROWS = 64l
             let ABLK = AROWS * (N / 32l)   // blocks one [AROWS x N] q8 tensor occupies
-            if (!vk_arena_reserve(0, 4l * ABLK)) {
+            if (!vk_arena_reserve(0, ARENA_BLOCKS)) {
                 feint("no Vulkan device (or the arena reserve was refused); skipping\n")
                 return
             }
@@ -2374,8 +2494,10 @@ def test_vulkan_arena(t : T?) {
             pack_upload(wqbv, wsbv, pqb, psb)
             let blk_a = vk_arena_place(pqa, psa, N, AROWS, 0)
             let blk_b = vk_arena_place(pqb, psb, N, AROWS, 0)
-            tt |> success(blk_a == 0l && blk_b == ABLK,
-                "arena bump cursor packs tensors back to back (a={blk_a}, b={blk_b}, expected 0 and {ABLK})")
+            // relative, not absolute: the arena is process-global, so another arm may have placed
+            // into it first. Back-to-back is the actual invariant.
+            tt |> success(blk_a >= 0l && blk_b == blk_a + ABLK,
+                "arena bump cursor packs tensors back to back (a={blk_a}, b={blk_b}, delta expected {ABLK})")
             var xq : array<int8>
             var xs : array<float>
             fill_acts(xq, xs, 1l)

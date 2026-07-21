@@ -2099,6 +2099,21 @@ struct private GpuState {
     ar_host : HostBuf
     ar_set : VkDescriptorSet
     ar_ready : bool
+    // arena FFN chain state (gate/up/act+requant/down as one submit against arena-resident planes)
+    af_meta_g : HostBuf
+    af_meta_u : HostBuf
+    af_meta_d : HostBuf
+    af_xq : HostBuf
+    af_xs : HostBuf
+    af_ya_dev : uint64        // gate output plane
+    af_yb_dev : uint64        // up output plane
+    af_yo_dev : uint64        // down output
+    af_yo_host : HostBuf
+    af_gate_set : VkDescriptorSet
+    af_up_set : VkDescriptorSet
+    af_actrq_set : VkDescriptorSet
+    af_down_set : VkDescriptorSet
+    af_ready : bool
     ffn_cmds : table<int64; FfnCmd>   // (gate, up, down stack idx triple) -> decode FFN chain
     resident_bytes : int64
     // heat-pinned expert cache (decode split-FFN) + the one-in-flight async FFN discipline
@@ -2414,6 +2429,12 @@ def private vk_moe_init : bool {
     g_gpu.staging = make_host_buf(STAGING_BYTES, false)
     g_init_failed = false
     to_log(LOG_INFO, "dasLLAMA vulkan tier: device ready (subgroup {int(sg)}, {g_gpu.rows_per_wg} rows/wg)\n")
+    if (dasllama_noisy()) {
+        // storage-range is the limit that actually binds the arena; allocs/descriptors do not
+        var lp : VkPhysicalDeviceProperties
+        vkGetPhysicalDeviceProperties(g_gpu.phys, lp)
+        to_log(LOG_INFO, "dasLLAMA vulkan tier: limits allocs {lp.limits.maxMemoryAllocationCount} storage-range {lp.limits.maxStorageBufferRange} desc-storage {lp.limits.maxDescriptorSetStorageBuffers}\n")
+    }
     return true
 }
 
@@ -2602,8 +2623,8 @@ def private find_stack(w0 : int64; fmt : int) : int {
 }
 
 // ===== the resident driver's weight arena =====
-// One buffer pair per FORMAT (the kernels index both planes off ONE base, so a shared cursor only
-// stays aligned at a constant stride), tensors addressed by block index — no per-plane MAX_STACKS.
+// One buffer pair per FORMAT (kernels index both planes off ONE base, so a shared cursor only stays
+// aligned at a constant stride); tensors by block index. Sub-allocation, not a hardware-limit dodge.
 
 struct private ArenaFmt {
     fmt : int                // int(KqFmt): 0 = q8, 1/2/3 = k4/k5/k6, 4 = q40
@@ -2789,6 +2810,120 @@ def vk_add_rms(var x : array<float>; a : array<float>; w : array<float>; var y :
         vk_check(vkEndCommandBuffer(raw2), null)
         submit_wait(raw2)
         memcpy(addr<void?>(x[0]), g_gpu.ar_host.mapped, int(bytes))
+    }
+}
+
+// The arena FFN chain's four sets. Bindings mirror ffn_cmd_for exactly — only bindings 0/1 change,
+// from a stack's own plane pair to its format's arena. Each role needs its OWN set because the
+// weight base lives at a fixed meta offset, so it cannot vary within one set.
+def private ensure_af_state(f1, f3, f2 : int) {
+    if (g_gpu.af_ready) {
+        return
+    }
+    ensure_ffn_state()
+    g_gpu.af_meta_g = make_host_buf(META_BYTES, true)
+    g_gpu.af_meta_u = make_host_buf(META_BYTES, true)
+    g_gpu.af_meta_d = make_host_buf(META_BYTES, true)
+    g_gpu.af_xq = make_host_buf(XQ_BYTES, true)
+    g_gpu.af_xs = make_host_buf(XS_BYTES, true)
+    g_gpu.af_ya_dev = make_device_buf(Y_BYTES)
+    g_gpu.af_yb_dev = make_device_buf(Y_BYTES)
+    g_gpu.af_yo_dev = make_device_buf(Y_BYTES)
+    g_gpu.af_yo_host = make_host_buf(Y_BYTES, false, [cached = true])
+    g_gpu.af_gate_set = alloc_desc_set()
+    g_gpu.af_up_set = alloc_desc_set()
+    g_gpu.af_actrq_set = alloc_desc_set()
+    g_gpu.af_down_set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    unsafe {
+        var a1 & = g_gpu.arenas[f1]
+        var a3 & = g_gpu.arenas[f3]
+        var a2 & = g_gpu.arenas[f2]
+        write_buf_desc(writes, g_gpu.af_gate_set, 0u, a1.wqbuf, a1.wqbytes)
+        write_buf_desc(writes, g_gpu.af_gate_set, 1u, a1.wsbuf, a1.wsbytes)
+        write_buf_desc(writes, g_gpu.af_up_set, 0u, a3.wqbuf, a3.wqbytes)
+        write_buf_desc(writes, g_gpu.af_up_set, 1u, a3.wsbuf, a3.wsbytes)
+        write_buf_desc(writes, g_gpu.af_down_set, 0u, a2.wqbuf, a2.wqbytes)
+        write_buf_desc(writes, g_gpu.af_down_set, 1u, a2.wsbuf, a2.wsbytes)
+        // the act+requant set has no weights: up@0, gate@5, hq/hs out (binding 1 is filler)
+        write_buf_desc(writes, g_gpu.af_actrq_set, 0u, g_gpu.af_yb_dev, Y_BYTES)
+        write_buf_desc(writes, g_gpu.af_actrq_set, 1u, a1.wsbuf, a1.wsbytes)
+        write_buf_desc(writes, g_gpu.af_actrq_set, 5u, g_gpu.af_ya_dev, Y_BYTES)
+    }
+    write_buf_desc(writes, g_gpu.af_gate_set, 2u, g_gpu.af_meta_g.buf, META_BYTES)
+    write_buf_desc(writes, g_gpu.af_gate_set, 3u, g_gpu.af_xq.buf, XQ_BYTES)
+    write_buf_desc(writes, g_gpu.af_gate_set, 4u, g_gpu.af_xs.buf, XS_BYTES)
+    write_buf_desc(writes, g_gpu.af_gate_set, 5u, g_gpu.af_ya_dev, Y_BYTES)
+    write_buf_desc(writes, g_gpu.af_up_set, 2u, g_gpu.af_meta_u.buf, META_BYTES)
+    write_buf_desc(writes, g_gpu.af_up_set, 3u, g_gpu.af_xq.buf, XQ_BYTES)
+    write_buf_desc(writes, g_gpu.af_up_set, 4u, g_gpu.af_xs.buf, XS_BYTES)
+    write_buf_desc(writes, g_gpu.af_up_set, 5u, g_gpu.af_yb_dev, Y_BYTES)
+    write_buf_desc(writes, g_gpu.af_actrq_set, 2u, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+    write_buf_desc(writes, g_gpu.af_actrq_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, g_gpu.af_actrq_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
+    write_buf_desc(writes, g_gpu.af_down_set, 2u, g_gpu.af_meta_d.buf, META_BYTES)
+    write_buf_desc(writes, g_gpu.af_down_set, 3u, g_gpu.hq_dev, BATCH_HQ_BYTES)
+    write_buf_desc(writes, g_gpu.af_down_set, 4u, g_gpu.hs_dev, BATCH_HS_BYTES)
+    write_buf_desc(writes, g_gpu.af_down_set, 5u, g_gpu.af_yo_dev, Y_BYTES)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    g_gpu.af_ready = true
+}
+
+def private fill_af_meta(hb : HostBuf; n, d, blk : int64) {
+    unsafe {
+        var mp = reinterpret<uint?>(hb.mapped)
+        mp[0] = uint(n)
+        mp[1] = uint(d)
+        mp[2] = 1u          // one region — a dense plane, not a routed expert set
+        mp[3] = 0u
+        mp[4] = uint(blk)   // the arena block index
+        mp[5] = 0u
+    }
+}
+
+//! Arena seam: one dense FFN layer against arena-resident planes — gate GEMV, up GEMV, fused
+//! act+requant, down GEMV, ONE submit. `blk1/blk3/blk2` are gate/up/down arena block indices.
+//! Gate and up must share a format class (they share the activation image); down is free.
+def vk_arena_ffn(var y : array<float>; blk1, blk3, blk2 : int64; n, nfe : int64;
+                 f1, f3, f2 : int; xq : array<int8>; xs : array<float>; is_gelu : bool) {
+    verify(vk_moe_init())
+    assert((f3 != 0) == (f1 != 0), "dasLLAMA vulkan arena: gate/up form mismatch — one activation image")
+    assert(nfe * 4l <= Y_BYTES && n * 4l <= Y_BYTES, "dasLLAMA vulkan arena: ffn planes exceed y capacity")
+    ensure_af_state(f1, f3, f2)
+    let xunit = f1 != 0 ? 256l : 32l
+    let dkq = f2 != 0
+    fill_af_meta(g_gpu.af_meta_g, n, nfe, blk1)
+    fill_af_meta(g_gpu.af_meta_u, n, nfe, blk3)
+    fill_af_meta(g_gpu.af_meta_d, nfe, n, blk2)
+    fill_ffn_meta(nfe, nfe / (dkq ? 256l : 32l), is_gelu)
+    unsafe {
+        memcpy(g_gpu.af_xq.mapped, addr<void? -const>(xq[0]), int(n))
+        memcpy(g_gpu.af_xs.mapped, addr<void? -const>(xs[0]), int((n / xunit) * 4l))
+        var raw = alloc_cmd()
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+        batch_barrier(raw, true)
+        let gwg = uint((nfe + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg)
+        bind_gemv_pipe(raw, f1)
+        cmd_bind_dispatch(raw, g_gpu.af_gate_set, gwg)
+        if (f3 != f1) {
+            bind_gemv_pipe(raw, f3)
+        }
+        cmd_bind_dispatch(raw, g_gpu.af_up_set, gwg)
+        comp_barrier(raw)
+        // the requant form follows the DOWN plane — its GEMV consumes hq/hs
+        cmd_bind_pipeline(vk_value_to_boost(raw), dkq ? g_gpu.actrq_k_pipeline : g_gpu.actrq_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, g_gpu.af_actrq_set, uint((nfe / (dkq ? 256l : 32l) + 255l) / 256l))
+        comp_barrier(raw)
+        bind_gemv_pipe(raw, f2)
+        cmd_bind_dispatch(raw, g_gpu.af_down_set, uint((n + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+        batch_barrier(raw, false)
+        cmd_copy_whole(raw, g_gpu.af_yo_dev, g_gpu.af_yo_host.buf, n * 4l)
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(raw)
+        memcpy(addr<void?>(y[0]), g_gpu.af_yo_host.mapped, int(n * 4l))
     }
 }
 
