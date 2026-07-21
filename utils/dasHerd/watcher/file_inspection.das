@@ -276,10 +276,14 @@ def public git_parse_unified_patch(patch : string) : GitParsedPatch {
     var inscope added_lines : array<int>
     var inscope lines <- split(patch, "\n")
     var in_hunk = false
+    var saw_diff_header = false
     var old_line = 0
     var new_line = 0
     for (raw_line in lines) {
         let line = trim_cr(raw_line)
+        if (starts_with(line, "diff --git ")) {
+            saw_diff_header = true
+        }
         if (git_patch_line_is_binary(line)) {
             result.binary = true
         }
@@ -335,7 +339,7 @@ def public git_parse_unified_patch(patch : string) : GitParsedPatch {
         let last = length(result.hunks) - 1
         result.hunks[last].row_count = length(result.rows) - result.hunks[last].row_start
     }
-    if (!in_hunk && !result.binary) {
+    if (!in_hunk && !result.binary && !saw_diff_header) {
         result.error = "diff contains no text hunks"
         return <- result
     }

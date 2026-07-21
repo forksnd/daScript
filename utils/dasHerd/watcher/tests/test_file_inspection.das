@@ -56,6 +56,17 @@ def test_unified_patch_projection(t : T?) {
         tt |> equal(parsed.hunks[1].old_start, 20)
         tt |> equal(parsed.hunks[1].new_start, 20)
     }
+    t |> run("header-only Git diffs remain valid") <| @(tt : T?) {
+        let source = "diff --git a/old.das b/new.das\nsimilarity index 100%\nrename from old.das\nrename to new.das\n"
+        var inscope parsed <- git_parse_unified_patch(source)
+        tt |> equal(parsed.error, "")
+        tt |> equal(parsed.binary, false)
+        tt |> equal(length(parsed.hunks), 0)
+        tt |> equal(length(parsed.rows), 0)
+
+        var inscope invalid <- git_parse_unified_patch("not a Git diff")
+        tt |> equal(invalid.error, "diff contains no text hunks")
+    }
 }
 
 [test]

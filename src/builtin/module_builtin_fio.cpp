@@ -299,15 +299,15 @@ namespace das {
     }
 
 #if defined(_WIN32)
-    static wstring utf8_file_path_to_wide ( const char * path ) {
-        if ( !path || !*path ) return wstring();
+    static std::wstring utf8_file_path_to_wide ( const char * path ) {
+        if ( !path || !*path ) return std::wstring();
         const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
             path, -1, nullptr, 0);
-        if ( count <= 0 ) return wstring();
-        wstring result(size_t(count), L'\0');
+        if ( count <= 0 ) return std::wstring();
+        std::wstring result(size_t(count), L'\0');
         if ( MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                 path, -1, result.data(), count) != count ) {
-            return wstring();
+            return std::wstring();
         }
         result.resize(size_t(count - 1));
         return result;
