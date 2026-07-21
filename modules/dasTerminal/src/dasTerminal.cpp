@@ -51,7 +51,7 @@ das::smart_ptr<PtyHandle> builtin_pty_launch(
 }
 
 das::smart_ptr<PtyHandle> builtin_pty_launch_argv(
-    const das::Array & arguments,
+    const das::TArray<char *> & arguments,
     const char * working_directory, int32_t directory_count,
     int32_t columns, int32_t rows, das::Context * context,
     das::LineInfoArg * at) {
@@ -60,15 +60,15 @@ das::smart_ptr<PtyHandle> builtin_pty_launch_argv(
         pty->error = "PTY argument array is empty";
         return pty;
     }
-    const char * const * values = reinterpret_cast<const char * const *>(arguments.data);
     PtyProcessOptions options;
     options.arguments.reserve(arguments.size);
     for (uint32_t index = 0; index != arguments.size; ++index) {
-        if (!values[index]) {
+        const char * value = arguments[index];
+        if (!value) {
             context->throw_error_at(at, "PTY argument %u is null", index);
             return pty;
         }
-        options.arguments.emplace_back(values[index]);
+        options.arguments.emplace_back(value);
     }
     if (working_directory && directory_count > 0)
         options.working_directory.assign(

@@ -21,7 +21,7 @@ das::smart_ptr<PtyHandle> builtin_pty_launch(
     const char * working_directory, int32_t directory_count,
     int32_t columns, int32_t rows);
 das::smart_ptr<PtyHandle> builtin_pty_launch_argv(
-    const das::Array & arguments,
+    const das::TArray<char *> & arguments,
     const char * working_directory, int32_t directory_count,
     int32_t columns, int32_t rows, das::Context * context,
     das::LineInfoArg * at);
