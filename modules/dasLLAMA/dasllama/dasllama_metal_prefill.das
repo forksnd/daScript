@@ -5449,9 +5449,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     // command-buffer split (DASLLAMA_METAL_NCB chunks): each chunk commits as soon as encoded, so
     // the scheduler analyzes chunk k while chunk k-1 executes. DASLLAMA_METAL_UNRETAINED=1 skips
     // per-dispatch retain/release too. Default ~4 layers/chunk (3B: slack 57ms -> 9ms, +10% pp512).
-    let ncb = clamp(int64(pf_env_int("DASLLAMA_METAL_NCB", int((c.n_layers + 3l) / 4l))), 1l, c.n_layers)
+    let ncb = clamp(int64(pf_env_int("DASLLAMA_METAL_NCB", int((n_enc_layers + 3l) / 4l))), 1l, n_enc_layers)
     let unret = get_env_variable("DASLLAMA_METAL_UNRETAINED") == "1"
-    let layers_per_cb = (c.n_layers + ncb - 1l) / ncb
+    let layers_per_cb = (n_enc_layers + ncb - 1l) / ncb
     var cbs : array<MetalCommandBuffer?>
     cbs |> reserve(int(ncb))
     var cb : MetalCommandBuffer?
