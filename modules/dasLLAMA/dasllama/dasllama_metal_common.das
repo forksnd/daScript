@@ -720,6 +720,27 @@ def mirror_evict_to_cap(cap_bytes : uint64; keep : uint64) {
     }
 }
 
+//! Cross-layer KV sharing (gemma-4 E-series): does layer l either own its rows or share a
+//! byte-compatible source? A shared layer aliases its source's mirror slab / prefill panel via
+//! kv_row_prefix, so the source must own rows and match l's class geometry exactly.
+def kv_share_ok(t : Model; l : int64) : bool {
+    if (l >= int64(length(t.kv_src))) {   // the MTP draft slab owns its rows
+        return true
+    }
+    let src = t.kv_src[l]
+    if (src == l) {
+        return true
+    }
+    return (src >= 0l && src < l && t.kv_src[src] == src && !layer_is_recurrent(t.config, src) &&
+        layer_kv_dim(t.config, l) == layer_kv_dim(t.config, src) &&
+        layer_head_size(t.config, l) == layer_head_size(t.config, src))
+}
+
+//! true when layer l reads another layer's KV (no rows of its own — Q-only attention)
+def kv_shared_layer(t : Model; l : int64) : bool {
+    return l < int64(length(t.kv_src)) && t.kv_src[l] != l
+}
+
 // Hetero-safe per-layer mirror addressing (gemma4's two kv-head classes): every KV codec is
 // linear bytes-per-element for kvd % 32 == 0, so the layout_offsets element prefix scales
 // straight to bytes. Uniform models reduce to the old l * cap * rowb addresses exactly.
@@ -727,7 +748,9 @@ def mirror_row_total(t : Model) : int64 {
     let c = t.config
     var tot = 0l
     for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the MTP draft slab (trunk-shaped attention)
-        tot += layer_kv_dim(c, l)   // the GPU gate pins kv_src[l] == l, so every layer owns rows
+        if (!kv_shared_layer(t, l)) {   // shared layers (E-series) alias their source's slab
+            tot += layer_kv_dim(c, l)
+        }
     }
     return tot
 }
@@ -907,6 +930,7 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
             var kdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + koff
             var vdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + voff
             for (l in range64(c.n_layers + c.n_layer_nextn)) {   // draft slab rides the watermark contract
+                continue if (kv_shared_layer(t, l))   // aliases the source slab — its upload covers l
                 let kvd_l = layer_kv_dim(c, l)
                 let krow = kv_row_bytes(s.kv_dtype_k, kvd_l)
                 let vrow = kv_row_bytes(s.kv_dtype_v, kvd_l)

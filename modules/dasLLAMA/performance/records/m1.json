@@ -513,16 +513,16 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":167.30516157478473,
-            "stddev":2.0537683963775635
+            "tok_s":190.03545401192628,
+            "stddev":2.2559540271759033
           },
           "tg128":{
-            "tok_s":21.55315940749556,
-            "stddev":0.11855021119117737
+            "tok_s":22.081554453555793,
+            "stddev":0.0094171296805143356
           }
         },
         "source":"official",
-        "sha":"dd21245c9",
+        "sha":"15ada7b6e",
         "version":"0.6.3",
         "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
       },
@@ -545,12 +545,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":121.73269999999999,
-            "stddev":0.17560700000000001
+            "tok_s":116.498143,
+            "stddev":0.92835299999999998
           },
           "tg128":{
-            "tok_s":19.921785,
-            "stddev":0.27912199999999998
+            "tok_s":20.351991999999999,
+            "stddev":0.02613
           }
         },
         "source":"official",
@@ -575,12 +575,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":181.44897,
-            "stddev":1.5306409999999999
+            "tok_s":190.26942500000001,
+            "stddev":1.1461680000000001
           },
           "tg128":{
-            "tok_s":19.330883,
-            "stddev":0.057210999999999998
+            "tok_s":20.282686000000002,
+            "stddev":0.043990000000000001
           }
         },
         "source":"official",
@@ -605,24 +605,55 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":765.32405100000005,
-            "stddev":207.48539299999999
+            "tok_s":917.29826700000001,
+            "stddev":0.92462800000000001
           },
           "tg128":{
-            "tok_s":40.159846999999999,
-            "stddev":1.800942
+            "tok_s":52.324300999999998,
+            "stddev":0.14776800000000001
           }
         },
         "source":"official",
         "sha":"ebd048f"
+      },
+      {
+        "engine":"das",
+        "backend":"metal",
+        "flavor":"tuned",
+        "box":"m1",
+        "threads":8,
+        "date":"2026-07-21",
+        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gemma-4-E4B-it-Q8_0.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
+        "hardware":{
+          "cpu":"Apple M1 Max",
+          "arch":"arm64",
+          "os":"macOS 26.4.1",
+          "perf_cores":8,
+          "total_cores":10,
+          "ram_gb":64,
+          "gpu":"Apple M1 Max (32-core)"
+        },
+        "tests":{
+          "pp512":{
+            "tok_s":785.46586477772325,
+            "stddev":5.3444986343383789
+          },
+          "tg128":{
+            "tok_s":50.485279926238185,
+            "stddev":0.16427034139633179
+          }
+        },
+        "source":"official",
+        "sha":"15ada7b6e",
+        "version":"0.6.3",
+        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
       }
     ],
     "arch":"gemma4",
     "quant":"q8",
     "params_b":7.5180692899999997,
     "active_b":4.5888307199999998,
-    "size_bytes":8031242688,
-    "note":"das Metal decode does not serve the E-series graph yet — das rows are CPU only"
+    "size_bytes":8031242688
   },
   {
     "gguf":"gpt-oss-20b-mxfp4.gguf",

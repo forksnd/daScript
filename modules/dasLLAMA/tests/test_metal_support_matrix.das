@@ -858,6 +858,118 @@ def private qwen2moe_row(t : T?; path : string) {
 }
 
 [unused_argument(t, path)]   // off-Apple the gated body is empty
+def private gemma4e_row(t : T?; path : string) {
+    // gemma-4 E-series (E4B): PLE (per-layer embeddings — MetalNeed.ple) + cross-layer KV
+    // sharing (the last 18 layers are Q-only and alias layer 22/23's slab/panels). Decode +
+    // prefill ENGAGE on the blob twin; batch has NO ple arm — the decline cell runs on the
+    // PLANAR model (the blob twin's CPU batch fallback would trip the blob-only panic).
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "gemma4e") || !arm_on(t, "fam-gemma4e") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let want_bits = (MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.v_norm | MetalNeed.attn_scale |
+            MetalNeed.sliding | MetalNeed.pre_post_norm | MetalNeed.out_scale | MetalNeed.geglu |
+            MetalNeed.ple | MetalNeed.qd_neq_dim)
+        let derived = metal_needs(tr)
+        t |> success((uint(derived) & uint(want_bits)) == uint(want_bits),
+            "gemma4e-e4b: metal_needs derives {want_bits} (got {derived})")
+        var nshared = 0l
+        for (l in range64(tr.config.n_layers)) {
+            if (tr.kv_src[l] != l) {
+                nshared++
+            }
+        }
+        t |> success(nshared > 0l, "gemma4e-e4b: fixture carries cross-layer KV sharing ({nshared} shared layers)")
+        var trg <- blob_twin(t, path, 512l)
+        let c = trg.config
+        let vocab = c.vocab_size
+        let pf0 = metal_prefill_stats().prefills
+        let de0 = metal_decode_stats().decodes
+        let ba0 = metal_batch_decode_stats().steps
+        var bad0 <- metal_batch_decode_declines()
+        with_job_que() {
+            setup_dasllama_jobque()
+            var sa = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            let pa <- encode(trg, counting_prompt(1, 40), true, false)
+            let pb <- encode(trg, counting_prompt(5, 44), true, false)
+            t |> success(select_prefill_override("metal"), "gemma4e-e4b: prefill override registered")
+            t |> success(select_decode_override("metal"), "gemma4e-e4b: decode override registered")
+            set_metal_prefill_min_npos(1l)
+            eval_(trg, sa, pa)
+            var cura = greedy_top(sa.logits, vocab)
+            for (_i in range(2)) {
+                var one <- [cura]
+                eval_(trg, sa, one)
+                delete one
+                cura = greedy_top(sa.logits, vocab)
+            }
+            // batch decline cell on the PLANAR model: the gate records need_ple, CPU serves
+            var sc = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            var sd = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            eval_(tr, sc, pa)
+            eval_(tr, sd, pb)
+            var ws <- create_batch_workspace_(tr)
+            var sess : array<Session?>
+            unsafe {
+                sess |> push(addr(sc))
+                sess |> push(addr(sd))
+            }
+            var cur <- [greedy_top(sc.logits, vocab), greedy_top(sd.logits, vocab)]
+            eval_batch_(tr, ws, sess, cur)
+            select_decode_override("")
+            select_prefill_override("")
+            set_metal_prefill_min_npos(64l)
+            sess |> clear()   // drop the borrowed handles: delete of array<T?> cascades to the pointees
+            unsafe {
+                delete ws
+                delete sess
+            }
+            delete cur
+            delete sa
+            delete sc
+            delete sd
+        }
+        t |> success(metal_prefill_stats().prefills - pf0 > 0l, "gemma4e-e4b prefill: ENGAGES on the GPU")
+        t |> success(metal_decode_stats().decodes - de0 > 0l, "gemma4e-e4b decode: ENGAGES on the GPU")
+        var bad <- metal_batch_decode_declines()
+        t |> equal(metal_batch_decode_stats().steps - ba0, 0l)
+        t |> success((bad?["need_ple"] ?? 0l) - (bad0?["need_ple"] ?? 0l) > 0l,
+            "gemma4e-e4b batch: declines with need_ple (no PLE batch arm)")
+        delete bad0
+        delete bad
+        let prompt <- encode(tr, counting_prompt(1, 30), true, false)
+        var cpu_ids : array<int64>
+        var gpu_ids : array<int64>
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids <- generate(tr, s, prompt, length(prompt) + 8)
+            cpu_ids := ids
+            delete s
+            select_decode_override("metal")
+            select_prefill_override("metal")
+            set_metal_prefill_min_npos(1l)
+            var s2 = make_run_state(trg.config, KVDtype.f16, KVDtype.f16)
+            let ids2 <- generate(trg, s2, prompt, length(prompt) + 8)
+            gpu_ids := ids2
+            delete s2
+            set_metal_prefill_min_npos(64l)
+            select_decode_override("")
+            select_prefill_override("")
+        }
+        t |> success(same(cpu_ids, gpu_ids),
+            "gemma4e-e4b: metal-overrides generate matches the CPU truth token-for-token")
+        delete cpu_ids
+        delete gpu_ids
+        cont_logits_cell(t, tr, trg, "gemma4e-e4b/q8/f16", 8.0)
+        delete trg
+        delete tr
+    }
+}
+
+[unused_argument(t, path)]   // off-Apple the gated body is empty
 def private gemma4moe_row(t : T?; path : string) {
     // gemma4-26B-A4B (Wave C stage 3): the parallel dense-shared + routed MoE graph. TOKEN
     // parity is NOT a valid instrument here (wave ruling): the CPU router's double norm is an
@@ -1430,6 +1542,10 @@ def test_metal_family_matrix(t : T?) {
             // gemma4-26B-A4B (Wave C stage 3): the parallel dense-shared + routed graph —
             // ENGAGE cells + shallow logits tolerances (see the row's ruling comment)
             gemma4moe_row(t, path_join(models_dir(), "gemma-4-26B-A4B-it-Q8_0.gguf"))
+            // gemma-4 E-series (E4B): PLE (MetalNeed.ple) + cross-layer KV sharing — decode +
+            // prefill serve, batch declines need_ple. 7.2GB — DASLLAMA_PARITY_FULL-gated.
+            // (E2B stays on the `layers` decline: per-layer FFN width, no per-layer u_hidden yet.)
+            gemma4e_row(t, path_join(models_dir(), "gemma-4-E4B-it-Q8_0.gguf"))
             // gpt-oss-20b (Wave C stage 4): mx4 experts + sinks + softmax_weight + biases
             gptoss_row(t, path_join(models_dir(), "gpt-oss-20b-mxfp4.gguf"))
             // qwen35 (Wave D): the Gated-DeltaNet hybrid — 3-in-4 recurrent layers (state

@@ -105,3 +105,15 @@ Always capture COMPLETE logs (the runner does this); grep afterwards, never at c
 a capture-time filter once hid the exact proof line a verification run existed to produce.
 When a fixture claims a size/depth property ("2030 tokens", "crosses 2048"), assert the
 actual number in the test; a resize cap is not evidence.
+
+## Stale truth caches (`<model>.ref.<key>.tsv`)
+
+`cached_ids`/`cached_vals` pin a CPU trajectory into `<gguf>.ref.<key>.tsv` beside the model.
+FREEFORM-prompt caches sit on sub-noise near-ties, so any numerics-adjacent master merge can
+legitimately move the CURRENT CPU trajectory off the cached one — the parity assert then fails
+with the GPU side actually CORRECT (it matches today's CPU). Before declaring a fam-row red a
+regression: (1) stash + clean-tree rerun (same red ⇒ not your diff), (2) `mv` the cell's `.ref`
+tsv aside and rerun — a fresh-truth green means stale cache, keep the refreshed tsv. Counting
+caches are tie-proof by construction and should NOT move; a counting-cache mismatch is a real
+red. (2026-07-21: gemma4-12b/k4 `gen_free_n24` flipped at token 22 after the #3518/#3530 window
+while both counting caches held.)

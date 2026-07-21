@@ -68,8 +68,7 @@ def private pub_catalog() : array<PubEntry> {
         PubEntry(file = "gemma-4-26B-A4B-it-Q8_0.gguf",
             note = "the widespread Q4_K_M file stores its expert tensors as Q5_1, which das does not run yet — benched at Q8_0 until that lands"),
         PubEntry(file = "gemma-4-12B-it-Q4_K_M.gguf"),
-        PubEntry(file = "gemma-4-E4B-it-Q8_0.gguf",
-            note = "das Metal decode does not serve the E-series graph yet — das rows are CPU only"),
+        PubEntry(file = "gemma-4-E4B-it-Q8_0.gguf"),
         PubEntry(file = "gpt-oss-20b-mxfp4.gguf"),
         PubEntry(file = "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"),
         PubEntry(file = "Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf")
@@ -91,12 +90,21 @@ def private absorb_cell(var models : array<BenchModel>; var cell : array<BenchMo
         for (r in c.runs) {
             r.source = "official"
         }
-        if (!empty(note)) {
-            c.note = note
-        }
         upsert_bench_model(models, c)
+        stamp_note(models, c.gguf, note)
     }
     write_bench_records(store, models)
+}
+
+// The catalog OWNS the note — stamp it verbatim after upsert (upsert's merge never clears, so a
+// resolved caveat would otherwise stick to the stored record forever).
+def private stamp_note(var models : array<BenchModel>; gguf, note : string) {
+    for (m in models) {
+        if (m.gguf == gguf) {
+            m.note = note
+            return
+        }
+    }
 }
 
 [export]
@@ -217,6 +225,7 @@ def main : int {
             var bm = BenchModel(gguf = file, params_b = double(rows[0].model_n_params) / 1.0e9lf, note = ent.note)
             bm.runs |> emplace(rr)
             upsert_bench_model(models, bm)
+            stamp_note(models, file, ent.note)
             write_bench_records(store, models)
             to_log(LOG_INFO, "gen_bench_records: DONE {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms)\n")
         }

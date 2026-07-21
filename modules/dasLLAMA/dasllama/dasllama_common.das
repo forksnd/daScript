@@ -1347,9 +1347,10 @@ def rebind_arch_blocks(var t : Model; arch : string) {
     }
     t.arch = arch
     t.blocks = g_arch_registry[arch].blocks
-    if (t.config.moe_optional && !t.config.moe && t.config.n_embd_per_layer == 0l) {
-        // the file-resolved dense flavor of a moe-optional arch (gemma4 12B/31B) — mirror the
-        // load_gguf patch so the GPU drivers' graph gate serves image loads too
+    if (t.config.moe_optional && !t.config.moe) {
+        // the file-resolved dense flavor of a moe-optional arch (gemma4 12B/31B/E-series) — mirror
+        // the load_gguf patch so the GPU drivers' graph gate serves image loads too. The E-series
+        // PLE block is a dense-stack epilogue, expressed as MetalNeed.ple, not a MoE graph.
         t.blocks.ffn_is_dense = true
     }
 }
@@ -2222,6 +2223,15 @@ def private metal_blob_layout_ok(t : Model) : bool {
             return false
         }
     }
+    // E-series PLE gate/proj q8 planes bind per layer; the token table / model-proj stay CPU-side
+    if (has_ple(c)) {
+        let ples = c.dim * c.n_embd_per_layer
+        if ((ples % 256l) != 0l ||
+                !metal_blob_off_ok(t.ple_gate_off, KqFmt.q8) ||
+                !metal_blob_off_ok(t.ple_proj_off, KqFmt.q8)) {
+            return false
+        }
+    }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     return (metal_blob_off_ok(t.wcls_off, cls_fmt) &&
         (!t.cls_q8 || metal_blob_off_ok(t.emb_q8_off, KqFmt.q8)))
@@ -2886,10 +2896,10 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                 && gguf_has(m, "{arch}.expert_count") && gguf_int(m, bytes, "{arch}.expert_count") > 0l) {
             t.config.moe = true
         }
-        if (t.config.moe_optional && !t.config.moe && t.config.n_embd_per_layer == 0l) {
+        if (t.config.moe_optional && !t.config.moe) {
             // the moe-optional arch registers ffn_is_dense = false for the shared descriptor, but
-            // THIS file resolved dense with no PLE (12B/31B) — its ffn IS the std dense stack
-            // (+ out_scale), so the GPU drivers' graph gate may serve it
+            // THIS file resolved dense (12B/31B/E-series) — its ffn IS the std dense stack
+            // (+ out_scale; the E-series PLE epilogue is MetalNeed.ple, not a MoE graph)
             t.blocks.ffn_is_dense = true
         }
         if (t.config.moe) {
