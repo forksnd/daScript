@@ -38,6 +38,9 @@ def test_watcher_process_lifecycle(t : T?) {
         t |> success(!empty(failed.session_id), "failed PTY launch retains its diagnostic session")
         t |> success(find(watcher_snapshot_json(failed.session_id), "\"state\":\"failed\"") >= 0,
             "failed PTY launch is retained in watcher state")
+        watcher_tick()
+        t |> success(find(watcher_snapshot_json(failed.session_id), "\"state\":\"failed\"") >= 0,
+            "process exit observation preserves the failed state")
 
         let quick = watcher_launch(WatcherLaunchRequest(
             command_line = "powershell.exe -NoProfile -Command \"Write-Output watcher-core-ok\"",

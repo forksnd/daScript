@@ -264,7 +264,9 @@ def private observe_exit(var session : WatcherSession?; now_ms : int64) {
     if (session.exit_seen_ms >= 0l || !terminal_process_exited(session.terminal)) return
     session.exit_seen_ms = now_ms
     session.exit_code = terminal_exit_code(session.terminal)
-    session.state = "exited"
+    if (session.state != "failed") {
+        session.state = "exited"
+    }
     session.status_revision++
     if (session.last_data_ms == 0l) {
         session.last_data_ms = now_ms
