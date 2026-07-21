@@ -22,6 +22,7 @@ enum SpirvDescriptorKind {
     comparison_sampler      //!< a `sampler2DShadow` (depth-compare combined sampler, sampled via textureCompare)
     input_attachment        //!< a `subpassInput` (Vulkan subpass-input attachment, sampled via subpassLoad)
     acceleration_structure  //!< an `accelerationStructureEXT` (VK_KHR_ray_tracing top-level AS, traced via traceRayEXT)
+    uniform_texel_buffer    //!< a `textureBuffer` (buffer-backed sampled image, read via texelFetch; the host binds a buffer view)
 }
 
 //! Stages a binding / push range is used in (the host maps to e.g. VkShaderStageFlags). A single
@@ -108,6 +109,7 @@ def private kind_from_int(k : int) : SpirvDescriptorKind {
     if (k == int(SpirvDescriptorKind.comparison_sampler)) return SpirvDescriptorKind.comparison_sampler
     if (k == int(SpirvDescriptorKind.input_attachment)) return SpirvDescriptorKind.input_attachment
     if (k == int(SpirvDescriptorKind.acceleration_structure)) return SpirvDescriptorKind.acceleration_structure
+    if (k == int(SpirvDescriptorKind.uniform_texel_buffer)) return SpirvDescriptorKind.uniform_texel_buffer
     return SpirvDescriptorKind.uniform_buffer
 }
 

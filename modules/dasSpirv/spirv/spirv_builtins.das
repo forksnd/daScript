@@ -27,6 +27,12 @@ var gl_DrawID               : int       // BuiltIn DrawIndex (Input) — multi-d
 // outside the WebGL2 / GL-4.1 portable floor).
 var gl_PrimitiveID          : int       // BuiltIn PrimitiveId (Input, fragment) — the per-primitive id a mesh shader wrote via gl_MeshPrimitivesEXT[i].gl_PrimitiveID
 
+// gl_BaryCoordEXT (BuiltIn BaryCoordKHR, Input, fragment): the perspective-correct barycentric weights
+// of the fragment within its primitive (one per triangle vertex, summing to 1). Reading it pulls in the
+// FragmentBarycentricKHR capability + SPV_KHR_fragment_shader_barycentric. Pairs with a `@pervertex` input
+// array (PerVertexKHR) to fetch per-vertex attributes and interpolate them by hand (VK_KHR_fragment_shader_barycentric).
+var gl_BaryCoordEXT         : float3     // BuiltIn BaryCoordKHR (Input, fragment) — perspective-correct barycentric coordinate
+
 // ===== descriptor indexing =====
 // nonuniformEXT marks an index value as varying across invocations within a wavefront/subgroup
 // (Vulkan's VK_EXT_descriptor_indexing semantics). Required when indexing a descriptor array
@@ -73,10 +79,78 @@ def public sampleTexture(tex : texture2D; smp : sampler; uv : float2) : float4 {
     return float4(0.0, 0.0, 0.0, 0.0)
 }
 
+// ===== uniform texel buffer =====
+// textureBuffer is a buffer-backed image (Dim=Buffer, no sampler): the host binds a VkBufferView
+// (VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER), so the shader reads format-converted texels by element
+// index rather than the raw std430 members an @ssbo exposes. Lowers to a UniformConstant OpTypeImage
+// with Dim=Buffer (Sampled=1, format Unknown) + the SampledBuffer capability. SPIR-V-only: the GL rail
+// spells the combined form (samplerBuffer), so the marker stays here rather than in the shared surface.
+// A buffer image has NO mips, and SPIR-V forbids a Lod operand on one, which is why its texelFetch
+// takes only (buffer, index) -- the two-argument form, distinct from the sampler one.
+struct textureBuffer {}
+
+[unused_argument(tb, index), sideeffects]
+def public texelFetch(tb : textureBuffer; index : int) : float4 {
+    return float4(0.0, 0.0, 0.0, 0.0)
+}
+
+// ===== sampled cube array =====
+// samplerCubeArray is a LAYERED cubemap: the sampled counterpart of imageCubeArray, and SPIR-V-only
+// here for the same reason -- the GLSL emitter declares samplerCube / sampler2DArray but not this one.
+// It samples by a float4 (direction.xyz, layer), the direction picking the face and the .w lane the
+// cube, and its Arrayed=1 image pulls in the SampledCubeArray capability. The EXPLICIT-lod textureLod
+// and the textureSize query ship (both forms the glslang reference carries); texture() stays out as an
+// untested lowering. textureSize returns int3 = (face-width, face-height, number-of-cubes).
+struct samplerCubeArray { textureCubeArray : uint }
+
+[unused_argument(s, uvl, lod), sideeffects]
+def public textureLod(s : samplerCubeArray; uvl : float4; lod : float) : float4 {
+    return float4(0.0, 0.0, 0.0, 0.0)
+}
+
+[unused_argument(s, lod), sideeffects]
+def public textureSize(s : samplerCubeArray; lod : int) : int3 {
+    return int3(0, 0, 0)
+}
+
 // ===== storage images =====
-// image2D + imageStore/imageLoad/imageSize live in shader_lingua_franca (shared). The emitter
-// recognizes image2D by name in classify_global and lowers it to a UniformConstant OpTypeImage with
-// a known Rgba8 format (no StorageImageRead/WriteWithoutFormat capability needed; lavapipe-safe).
+// image2D and image3D, with imageStore/imageLoad/imageSize, live in shader_lingua_franca (shared). The
+// emitter recognizes each by name in classify_global and lowers it to a UniformConstant OpTypeImage
+// with a known format (default Rgba8, or @format; no StorageImageRead/WriteWithoutFormat capability
+// needed; lavapipe-safe). @writeonly lowers to NonReadable and @readonly to NonWritable, both on the
+// OpVariable, and the emitter enforces them: no imageLoad from a @writeonly, no imageStore into a
+// @readonly. imageSize is a QUERY, not a read, so it stays legal on a @writeonly image.
+//
+// The ARRAYED storage images are SPIR-V-only for now -- the GLSL emitter can declare image2D / image3D
+// but not these -- so they live here rather than in the shared surface. Both are addressed with an
+// int3: image2DArray by (x, y, layer), imageCubeArray by (x, y, face + 6 * layer). A cube-arrayed
+// storage image pulls in the ImageCubeArray capability.
+struct image2DArray   { texture2DArray : uint }
+struct imageCubeArray { textureCubeArray : uint }
+
+[unused_argument(img, uvw, data), sideeffects]
+def public imageStore(img : image2DArray; uvw : int3; data : float4) : void {}
+[unused_argument(img, uvw, data), sideeffects]
+def public imageStore(img : imageCubeArray; uvw : int3; data : float4) : void {}
+
+[unused_argument(img, uvw), sideeffects]
+def public imageLoad(img : image2DArray; uvw : int3) : float4 {
+    return float4(0.0, 0.0, 0.0, 0.0)
+}
+[unused_argument(img, uvw), sideeffects]
+def public imageLoad(img : imageCubeArray; uvw : int3) : float4 {
+    return float4(0.0, 0.0, 0.0, 0.0)
+}
+
+// (width, height, layers); for imageCubeArray the layer count is 6 * cubes, matching GLSL.
+[unused_argument(img), sideeffects]
+def public imageSize(img : image2DArray) : int3 {
+    return int3(0, 0, 0)
+}
+[unused_argument(img), sideeffects]
+def public imageSize(img : imageCubeArray) : int3 {
+    return int3(0, 0, 0)
+}
 
 // ===== subpass input attachments (Vulkan deferred-rendering rail) =====
 // subpassInput is an opaque marker for a Vulkan subpass input attachment: a per-fragment read of a
@@ -116,8 +190,13 @@ def public subpassLoad(i : subpassInput) : float4 {
 // SMax/UMax by the operand's signedness). Lowered to OpAtomicIAdd/SMin/.../Exchange/CompareExchange
 // at Workgroup scope (shared) or Device scope (buffer). The stub bodies never run -- only the call
 // AST is read. Use as `let old = atomicAdd(counter, 1)`.
+// atomicAdd also takes a float (OpAtomicFAddEXT, GLSL's GL_EXT_shader_atomic_float), which pulls in
+// OpCapability AtomicFloat32AddEXT + OpExtension "SPV_EXT_shader_atomic_float_add". It is the only
+// float-capable family here: the float min/max opcodes sit behind a different capability, so a float
+// target on any other atomic is a compile error rather than a blob only the driver would reject.
 [unused_argument(value), sideeffects] def public atomicAdd(mem : int &; value : int) : int { return mem }
 [unused_argument(value), sideeffects] def public atomicAdd(mem : uint &; value : uint) : uint { return mem }
+[unused_argument(value), sideeffects] def public atomicAdd(mem : float &; value : float) : float { return mem }
 [unused_argument(value), sideeffects] def public atomicMin(mem : int &; value : int) : int { return mem }
 [unused_argument(value), sideeffects] def public atomicMin(mem : uint &; value : uint) : uint { return mem }
 [unused_argument(value), sideeffects] def public atomicMax(mem : int &; value : int) : int { return mem }
@@ -136,33 +215,39 @@ def public subpassLoad(i : subpassInput) : float4 {
 [unused_argument(compare, value), sideeffects] def public atomicCompSwap(mem : uint &; compare, value : uint) : uint { return mem }
 
 // ===== subgroup operations (Vulkan 1.1 / SPIR-V 1.3 GroupNonUniform*) =====
-// Cross-lane cooperation within one subgroup (warp/wave). The reduce family folds a value across
-// all active lanes and every lane receives the result; shuffleXor exchanges values across a
-// butterfly mask (lane ^ mask); broadcastFirst propagates the lowest active lane's value;
-// elect() is true on exactly one active lane (single-lane writeback guard). Lowered to
-// OpGroupNonUniform* at Subgroup scope, compute-only. The stub bodies model the one-invocation
-// view (identity / true) and never run in a shader -- only the call AST is read.
+// Cross-lane cooperation within one subgroup (warp/wave). The reduce family folds a value across all
+// active lanes and every lane receives the result; broadcastFirst propagates the lowest active lane's
+// value while broadcast/shuffle select a lane by id and shuffleXor exchanges across a butterfly mask
+// (lane ^ mask); elect() is true on exactly one active lane (single-lane writeback guard). Lowered to
+// OpGroupNonUniform* at Subgroup scope. subgroupMin/subgroupMax pick the S/U/F opcode from the
+// operand's scalar class, exactly as the atomics above do. The value-taking ops are generic over the
+// 32-bit scalars and their 2/3/4 vectors; any other operand type is rejected with a clean error at
+// emit. The stub bodies model the one-invocation view (identity / true) and never run in a shader --
+// only the call AST is read.
+[sideeffects] def public subgroupAll(pred : bool) : bool { return pred }
+[sideeffects] def public subgroupAny(pred : bool) : bool { return pred }
+[sideeffects] def public subgroupBroadcastFirst(v : auto(TT)) : TT { return v }
+[unused_argument(id), sideeffects] def public subgroupBroadcast(v : auto(TT); id : uint) : TT { return v }
+[unused_argument(id), sideeffects] def public subgroupShuffle(v : auto(TT); id : uint) : TT { return v }
+[unused_argument(mask), sideeffects] def public subgroupShuffleXor(v : auto(TT); mask : uint) : TT { return v }
+[sideeffects] def public subgroupAdd(v : auto(TT)) : TT { return v }
+[sideeffects] def public subgroupMin(v : auto(TT)) : TT { return v }
+[sideeffects] def public subgroupMax(v : auto(TT)) : TT { return v }
+[sideeffects] def public subgroupElect() : bool { return true }
+// cluster_size partitions the subgroup into equal clusters and reduces within each. SPIR-V requires the
+// ClusterSize operand to be a constant instruction that is a power of two, so the emitter demands a
+// compile-time constant here rather than letting an invalid blob reach spirv-val.
+[unused_argument(cluster_size), sideeffects]
+def public subgroupClusteredAdd(v : auto(TT); cluster_size : uint) : TT { return v }
+
+// The subgroup builtin variables (all uint Inputs). gl_SubgroupSize / gl_SubgroupInvocationID carry no
+// execution-model restriction -- any stage may read them. gl_SubgroupID / gl_NumSubgroups describe the
+// subgroup's place in a WORKGROUP, so they are legal only in the workgroup-dispatched stages
+// (compute / mesh / task); the emitter enforces that split.
 var gl_SubgroupSize         : uint      // BuiltIn SubgroupSize (Input) — lanes per subgroup (32 on NV, 32/64 on AMD)
 var gl_SubgroupInvocationID : uint      // BuiltIn SubgroupLocalInvocationId (Input) — this lane's index within its subgroup
 var gl_NumSubgroups         : uint      // BuiltIn NumSubgroups (Input) — subgroups per workgroup
 var gl_SubgroupID           : uint      // BuiltIn SubgroupId (Input) — this subgroup's index within the workgroup
-
-[unused_argument(value), sideeffects] def public subgroupAdd(value : float) : float { return value }
-[unused_argument(value), sideeffects] def public subgroupAdd(value : int) : int { return value }
-[unused_argument(value), sideeffects] def public subgroupAdd(value : uint) : uint { return value }
-[unused_argument(value), sideeffects] def public subgroupMin(value : float) : float { return value }
-[unused_argument(value), sideeffects] def public subgroupMin(value : int) : int { return value }
-[unused_argument(value), sideeffects] def public subgroupMin(value : uint) : uint { return value }
-[unused_argument(value), sideeffects] def public subgroupMax(value : float) : float { return value }
-[unused_argument(value), sideeffects] def public subgroupMax(value : int) : int { return value }
-[unused_argument(value), sideeffects] def public subgroupMax(value : uint) : uint { return value }
-[unused_argument(value, mask), sideeffects] def public subgroupShuffleXor(value : float; mask : uint) : float { return value }
-[unused_argument(value, mask), sideeffects] def public subgroupShuffleXor(value : int; mask : uint) : int { return value }
-[unused_argument(value, mask), sideeffects] def public subgroupShuffleXor(value : uint; mask : uint) : uint { return value }
-[unused_argument(value), sideeffects] def public subgroupBroadcastFirst(value : float) : float { return value }
-[unused_argument(value), sideeffects] def public subgroupBroadcastFirst(value : int) : int { return value }
-[unused_argument(value), sideeffects] def public subgroupBroadcastFirst(value : uint) : uint { return value }
-[sideeffects] def public subgroupElect() : bool { return true }
 
 // ===== 8-bit pack/unpack (GL_EXT_shader_explicit_arithmetic_types_int8 spellings) =====
 // unpack8 reinterprets one 32-bit scalar as four 8-bit lanes (input signedness picks the byte4 /
@@ -266,3 +351,36 @@ def public traceRayEXT(accel : accelerationStructureEXT; ray_flags : uint; cull_
                        sbt_offset : uint; sbt_stride : uint; miss_index : uint;
                        origin : float3; tmin : float; direction : float3; tmax : float;
                        var payload : auto(TT)&) : void {}
+
+// ===== inline ray query (VK_KHR_ray_query) =====
+// A ray query traces a ray against a TLAS from ANY stage (here: a compute shader), with no SBT and no
+// hit/miss shaders -- the caller drives it with a loop. The rayQueryEXT is an opaque LOCAL object
+// (OpTypeRayQueryKHR, Function storage), initialized against an accelerationStructureEXT and stepped
+// by rayQueryProceedEXT until it returns false, after which the rayQueryGetIntersection* accessors
+// read the committed hit. The emitter recognizes each name in visitExprCall and lowers it to the
+// matching OpRayQuery* opcode (SPV_KHR_ray_query / OpCapability RayQueryKHR); the stub bodies never
+// run -- only the call AST is read. `committed` is GLSL's bool (true = the committed intersection);
+// glslang lowers it to a 32-bit int operand, which the emitter emits.
+struct rayQueryEXT {}
+
+// The GLSL ray-query enum constants (gl_RayFlags*EXT, gl_RayQueryCommittedIntersectionNoneEXT) are
+// plain uints the CONSUMER declares -- a consumer that needs gl_RayFlagsOpaqueEXT defines it in its
+// own modules, so declaring them here too would collide. A module-scope `let` uint reference folds to an
+// OpConstant with no help from spirv_builtins.
+
+[unused_argument(rq, accel, ray_flags, cull_mask, origin, tmin, direction, tmax), sideeffects]
+def public rayQueryInitializeEXT(var rq : rayQueryEXT; accel : accelerationStructureEXT;
+                                 ray_flags : uint; cull_mask : uint; origin : float3; tmin : float;
+                                 direction : float3; tmax : float) : void {}
+[unused_argument(rq), sideeffects]
+def public rayQueryProceedEXT(var rq : rayQueryEXT) : bool { return false }
+[unused_argument(rq, committed), sideeffects]
+def public rayQueryGetIntersectionTypeEXT(var rq : rayQueryEXT; committed : bool) : uint { return 0u }
+[unused_argument(rq, committed), sideeffects]
+def public rayQueryGetIntersectionInstanceCustomIndexEXT(var rq : rayQueryEXT; committed : bool) : int { return 0 }
+[unused_argument(rq, committed), sideeffects]
+def public rayQueryGetIntersectionPrimitiveIndexEXT(var rq : rayQueryEXT; committed : bool) : int { return 0 }
+[unused_argument(rq, committed), sideeffects]
+def public rayQueryGetIntersectionBarycentricsEXT(var rq : rayQueryEXT; committed : bool) : float2 { return float2(0.0, 0.0) }
+[unused_argument(rq, committed), sideeffects]
+def public rayQueryGetIntersectionTEXT(var rq : rayQueryEXT; committed : bool) : float { return 0.0 }

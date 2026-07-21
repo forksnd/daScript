@@ -6,33 +6,16 @@ module glsl_common shared public
 require math
 require daslib/shader_lingua_franca public
 
-// The modern, backend-invariant builtin surface (sampler2D/sampler3D/image2D, gl_Position, the
+// The modern, backend-invariant builtin surface (sampler2D/sampler3D/image2D/image3D, gl_Position, the
 // compute IDs, texture()/textureSize()/imageLoad()/imageStore()/imageSize()/barrier()/
 // memoryBarrierShared()/discard()/dFdx()/dFdy()) now lives in shader_lingua_franca, re-exported
 // above so every existing `require glsl/glsl_common` consumer still sees it unchanged. This file
-// keeps only the GL-only surface: the image3D dimensionality Vulkan lacks, the modern GL-only
-// intrinsics with no Vulkan counterpart yet, the legacy GLSL 1.x builtins, and the host-side
-// sampler/image binding operators.
-
-// ===== GL-only resource types =====
-struct image3D {
-    texture3D : uint
-}
+// keeps only the GL-only surface: the modern GL-only intrinsics with no Vulkan counterpart yet, the
+// legacy GLSL 1.x builtins, and the host-side sampler/image binding operators.
 
 // ===== GL-only intrinsics (no Vulkan counterpart yet) =====
 [unused_argument(sample, uv, ofs)]
 def textureOffset(sample : sampler2D; uv : float2; ofs : int2) {
-    assert(false, "we should not be here\n")
-    return float4(0.)
-}
-
-[unused_argument(img, uvw, data), sideeffects]
-def imageStore(img : image3D; uvw : int3; data : float4) {
-    assert(false, "we should not be here\n")
-}
-
-[unused_argument(img, uvw)]
-def imageLoad(img : image3D; uvw : int3) {
     assert(false, "we should not be here\n")
     return float4(0.)
 }
@@ -62,9 +45,6 @@ def fract(x : float3) {
 def fract(x : float4) {
     return x - floor(x)
 }
-
-// ===== GL-only compute builtin =====
-var gl_WorkGroupSize : uint3        // local work group size we defined with layout
 
 // ===== Legacy GLSL 1.x builtins =====
 // GL-only; NOT in the lingua franca. Invalid in GLSL ES 3.00 and desktop core -- superseded by

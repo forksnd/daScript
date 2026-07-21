@@ -1,5 +1,5 @@
-// Fail-closed fixture (RT): an accelerationStructureEXT descriptor is RT-pipeline-only (ray queries
-// from other stages are a different extension, not yet supported); referencing one from a fragment
+// Fail-closed fixture (RT): an accelerationStructureEXT descriptor is valid only in an RT-pipeline
+// stage or a compute shader (SPV_KHR_ray_query inline ray query); referencing one from a FRAGMENT
 // shader must be rejected cleanly by classify_global. `_`-prefix + `expect 50501` keep dastest/lint
 // off the failing shader.
 expect 50501

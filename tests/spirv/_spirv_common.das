@@ -898,6 +898,24 @@ def public ssbostruct_words : array<uint> {
     return clone_to_move(ssbostruct_spv)
 }
 
+// ===== @readonly SSBO -> NonWritable. A rendering shader's shared-data buffers are declared readonly
+// in GLSL so the driver may optimize (and no accidental write compiles); the @readonly annotation must
+// lower to a NonWritable decoration on the OpVariable. Variable-level, NOT member-level: the block
+// struct type is deduped (shared across same-element SSBOs), so a member decoration would leak onto a
+// writable SSBO of the same element type. One readonly source + one writable dest -> exactly one
+// NonWritable; spirv-val proves variable-level NonWritable is legal. =====
+var @ssbo @readonly @binding = 0 ro_src : array<uint>
+var @ssbo @binding = 1 ro_dst : array<uint>
+[compute_shader(local_size_x=64, name="rossbo_spv"), marker(no_coverage)]
+def rossbo {
+    let i = gl_GlobalInvocationID.x
+    ro_dst[i] = ro_src[i] * 2u      // read the readonly source, write the writable dest
+}
+
+def public rossbo_words : array<uint> {
+    return clone_to_move(rossbo_spv)
+}
+
 // ===== Phase-10.2 composite/global swizzle: multi-component swizzle of a bare global (the Phase-8
 // out-of-scope note). A single-component global swizzle stays an lvalue (AccessChain); a multi-component
 // one loads the whole global and OpVectorShuffle's it. Covers a builtin global (gl_FragCoord.xy), an @in
@@ -943,6 +961,19 @@ def fragx {
 
 def public fragx_words : array<uint> {
     return clone_to_move(fragx_spv)
+}
+
+// ===== early_fragment_tests: [fragment_shader(early_fragment_tests=true)] -> the EarlyFragmentTests
+// execution mode. Depth/stencil run BEFORE the shader, so an occluded / stencil-killed fragment skips
+// the body (and its discard / side effects). GLSL layout(early_fragment_tests). =====
+var @out @location = 0 ef_color : float4
+[fragment_shader(name="early_frag_spv", early_fragment_tests=true), marker(no_coverage)]
+def early_frag {
+    ef_color = float4(1.0f, 0.0f, 0.0f, 1.0f)
+}
+
+def public early_frag_words : array<uint> {
+    return clone_to_move(early_frag_spv)
 }
 
 // ===== Phase-10.4 depth-compare (shadow) sampling: a sampler2DShadow sampled via textureCompare
@@ -999,6 +1030,27 @@ def subpass_load_frag {
 
 def public subpass_words : array<uint> {
     return clone_to_move(subpass_spv)
+}
+
+// ===== named layout-index constants: @set / @binding taking a module-scope `let` int constant
+// rather than a literal. The identifier is stored as a STRING annotation arg, so the emitter resolves
+// it to the constant's value in the DescriptorSet/Binding decorations. Guards that resolution -- the
+// pre-fix emitter silently bound 0 (the `?as tInt ?? 0` fallback swallowed the string). =====
+let BIND_CONST_SET  = 2
+let BIND_CONST_SLOT = 7
+// local_size_x takes a constant NAME too, so a shader can spell a platform-configured workgroup size.
+// The annotation stores the identifier as a string arg, which the pre-fix macro read with `?as tInt`
+// and silently turned into 1 -- a wrong LocalSize that still compiles and still passes spirv-val.
+let BIND_CONST_LOCAL_SIZE = 32
+var @ssbo @set = BIND_CONST_SET @binding = BIND_CONST_SLOT bindconst_data : array<uint>
+[compute_shader(local_size_x=BIND_CONST_LOCAL_SIZE, name="bindconst_spv"), marker(no_coverage)]
+def bindconst {
+    let i = gl_GlobalInvocationID.x
+    bindconst_data[i] = i
+}
+
+def public bindconst_words : array<uint> {
+    return clone_to_move(bindconst_spv)
 }
 
 // ===== Phase-10.5 compute-tier fixtures: shared memory + barriers + atomics =====
@@ -1071,6 +1123,32 @@ def public cshared_words : array<uint> {
 
 def public catomics_words : array<uint> {
     return clone_to_move(catomics_spv)
+}
+
+// ===== float atomicAdd + the single-component swizzle lvalue =====
+// cfatomic: atomicAdd onto ONE COMPONENT of an SSBO vector element (fout[i].x), the shape a scatter
+// pass accumulating an RGB radiance uses. Two features meet here:
+//   - the component of an addressable vector is an lvalue: OpAccessChain chains the component index
+//     off the element pointer, so the atomic target is a StorageBuffer float (NOT a loaded vector).
+//     The same pointer is what makes the plain component store below (fout[i].w = ...) work.
+//   - a float target picks OpAtomicFAddEXT and pulls in OpCapability AtomicFloat32AddEXT +
+//     OpExtension "SPV_EXT_shader_atomic_float_add".
+// Device scope, since the target lives in buffer memory. A READ of a component (fin[gid].y) stays a
+// CompositeExtract off the loaded vector -- the pointer path is taken only by a pointer consumer.
+var @ssbo @binding = 0 fin : array<float4>
+var @ssbo @binding = 1 fout : array<float4>
+
+[compute_shader(local_size_x=64, name="cfatomic_spv"), marker(no_coverage)]
+def cfatomic {
+    let gid = int(gl_GlobalInvocationID.x)
+    let v = fin[gid].y                  // component READ -> OpCompositeExtract off the loaded vector
+    let a = atomicAdd(fout[0].x, v)     // OpAtomicFAddEXT on a StorageBuffer float
+    let b = atomicAdd(fout[0].z, v * 2.0f)
+    fout[gid].w = a + b                 // component STORE through the same OpAccessChain
+}
+
+def public cfatomic_words : array<uint> {
+    return clone_to_move(cfatomic_spv)
 }
 
 // ===== Phase-10.6 storage-image size query + module-scope shader constants =====
@@ -1190,6 +1268,22 @@ def public userfn_ref_words : array<uint> {
 
 def public userfn_global_words : array<uint> {
     return clone_to_move(userfn_global_spv)
+}
+
+// ===== gl_WorkGroupSize fixture: the workgroup size is a compile-time CONSTANT, not a dispatch
+// input. wgs_flat_index reads it from a helper, the way a shared module does: the helper names no
+// local_size of its own and still lowers to the size of the shader that compiled it. =====
+def private wgs_flat_index() : uint {
+    return gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x
+}
+
+[compute_shader(local_size_x=64, name="wgsize_spv"), marker(no_coverage)]
+def wgsize {
+    data[wgs_flat_index()] = gl_WorkGroupSize.x
+}
+
+def public wgsize_words : array<uint> {
+    return clone_to_move(wgsize_spv)
 }
 
 // ===== spirv-val gate =====
@@ -1959,4 +2053,37 @@ def sdot_kernel {
 
 def public sdot_words : array<uint> {
     return clone_to_move(sdot_spv)
+}
+
+// ===== inline ray query (VK_KHR_ray_query) =====
+// A COMPUTE shader driving one inline ray query against a single TLAS descriptor: declare the opaque
+// rayQueryEXT local, initialize it, step it to completion, then read the committed intersection.
+// Exercises OpTypeRayQueryKHR (a Function-storage local, never zero-initialized), OpRayQueryInitializeKHR
+// / ProceedKHR and the four GetIntersection* accessors, plus the RayQueryKHR capability +
+// SPV_KHR_ray_query extension a compute stage must declare on its own (no RT-pipeline stage does it).
+
+var @set = 0 @binding = 0 rq_tlas : accelerationStructureEXT
+var @ssbo @binding = 1 rq_out : array<float>
+
+[compute_shader(local_size_x=64, name="ray_query_spv"), marker(no_coverage)]
+def ray_query {
+    let i = gl_GlobalInvocationID.x
+    var rq : rayQueryEXT
+    // ray flags 0x01 = opaque; the committed accessors below pass `true`
+    rayQueryInitializeEXT(rq, rq_tlas, 0x01u, 0xFFu,
+        float3(0.0, 0.0, 0.0), 0.001, float3(0.0, 0.0, 1.0), 100.0)
+    while (rayQueryProceedEXT(rq)) {}
+    var hit = 0.0
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != 0u) {
+        let gpool = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)
+        let tri = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true)
+        let ba = rayQueryGetIntersectionBarycentricsEXT(rq, true)
+        let ht = rayQueryGetIntersectionTEXT(rq, true)
+        hit = float(gpool + tri) + ba.x + ba.y + ht
+    }
+    rq_out[i] = hit
+}
+
+def public ray_query_words : array<uint> {
+    return clone_to_move(ray_query_spv)
 }

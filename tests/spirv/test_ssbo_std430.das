@@ -5,7 +5,9 @@ options indenting = 4
 // exact ArrayStride for each vector element (float2 -> 8, float3/float4 -> 16), the full std430 member
 // layout of a struct element (pos@0, vel@8, life@16) + its ArrayStride (24), that the element struct is
 // NOT Block-decorated (only the outer wrapper is: TypeStruct count == 2, exactly one Block), and that
-// field access lowers to chained OpAccessChain/OpLoad/OpStore. Every emitted module passes spirv-val.
+// field access lowers to chained OpAccessChain/OpLoad/OpStore. Also gates the @readonly access
+// qualifier -> a variable-level NonWritable decoration (not member-level: the block struct is deduped).
+// Every emitted module passes spirv-val.
 
 require dastest/testing_boost public
 require _spirv_common
@@ -82,6 +84,22 @@ def test_ssbo_struct_elements(t : T?) {
         t |> success(has_op(words, SpvOp.Load), "ssbostruct: field load via OpLoad")
         t |> success(has_op(words, SpvOp.Store), "ssbostruct: field store via OpStore")
         validate(t, words, "ssbostruct")
+        delete words
+    }
+}
+
+[test]
+def test_ssbo_readonly(t : T?) {
+    t |> run("ssbo @readonly: NonWritable on the variable, not the deduped block member") <| @(t : T?) {
+        var words <- rossbo_words()
+        // exactly one NonWritable OpDecorate -- the @readonly source variable (the writable dest has none)
+        t |> success(count_op_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.NonWritable)) == 1,
+            "rossbo: exactly one NonWritable OpDecorate (the @readonly source), got {count_op_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.NonWritable))}")
+        // and NONE at member level -- the deduped block struct must stay writable-capable so a writable
+        // SSBO sharing the element type does not inherit read-only-ness (NonWritable is member operand idx 2)
+        t |> success(count_op_operand_at(words, SpvOp.MemberDecorate, 2, uint(SpvDecoration.NonWritable)) == 0,
+            "rossbo: no member-level NonWritable, got {count_op_operand_at(words, SpvOp.MemberDecorate, 2, uint(SpvDecoration.NonWritable))}")
+        validate(t, words, "rossbo")
         delete words
     }
 }
