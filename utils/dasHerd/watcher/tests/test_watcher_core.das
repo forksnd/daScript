@@ -8,6 +8,10 @@ require strings
 
 [test]
 def test_watcher_machine_output(t : T?) {
+    t |> run("empty transport target defaults to local") <| @(t : T?) {
+        t |> equal(watcher_target_id_or_local(""), "local")
+        t |> equal(watcher_target_id_or_local("ssh-build"), "ssh-build")
+    }
     t |> run("ConPTY wrapper controls are removed without changing task text") <| @(t : T?) {
         let esc = to_char(27)
         let bel = to_char(7)

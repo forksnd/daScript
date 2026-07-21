@@ -513,7 +513,7 @@ class DasHerdWatcherServer : HvWebServer {
             let patch = client.inspection_patch
             client.inspection_patch = ""
             if (!empty(view_error)) {
-                self.send_file_inspection(client, false, "", view_error)
+                self.send_file_inspection(client, false, patch, view_error)
                 return
             }
             self.send_file_inspection(client, false, patch, "", view_text,
@@ -564,7 +564,7 @@ class DasHerdWatcherServer : HvWebServer {
                         MAX_FILE_PREVIEW_RAW_BYTES, view_text)
                 }
                 if (!empty(view_error)) {
-                    self.send_file_inspection(client, false, "", view_error)
+                    self.send_file_inspection(client, false, output, view_error)
                     return
                 }
             }
@@ -659,7 +659,8 @@ class DasHerdWatcherServer : HvWebServer {
             send_repositories(client, true)
         } elif (incoming.op == "repository_add") {
             let error = repository_add(RepositoryAddRequest(path = incoming.repository_path,
-                display_name = incoming.display_name, target_id = incoming.target_id))
+                display_name = incoming.display_name,
+                target_id = watcher_target_id_or_local(incoming.target_id)))
             if (!empty(error)) {
                 send_error(channel, error)
                 return
@@ -675,7 +676,8 @@ class DasHerdWatcherServer : HvWebServer {
             var inscope launch = WatcherLaunchRequest(
                 command_line = incoming.command_line, cwd = incoming.cwd,
                 display_name = incoming.display_name, kind = incoming.kind,
-                target_id = incoming.target_id, repository_id = incoming.repository_id,
+                target_id = watcher_target_id_or_local(incoming.target_id),
+                repository_id = incoming.repository_id,
                 worktree_path = incoming.worktree_path,
                 columns = incoming.columns, rows = incoming.rows,
                 timeout_ms = incoming.timeout_ms)

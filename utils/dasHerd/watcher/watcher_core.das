@@ -33,6 +33,10 @@ struct public WatcherLaunchRequest {
     timeout_ms : int64
 }
 
+def public watcher_target_id_or_local(target_id : string) : string {
+    return empty(target_id) ? "local" : target_id
+}
+
 struct public WatcherInputRequest {
     session_id : string
     text : string
