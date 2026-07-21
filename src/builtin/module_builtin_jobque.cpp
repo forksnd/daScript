@@ -512,6 +512,11 @@ namespace das {
     mutex              g_jobQueMutex;
     shared_ptr<JobQue> g_jobQue;
     shared_ptr<JobQue> g_persistentJobQue;  // extra ref held by create_job_que so a nested with_job_que's use_count==1 teardown can't reset a persistent queue
+    // Bound on the with_job_que scope-exit drain. Deliberately inside the interactive zone: work
+    // still outstanding when the scope ends is a bug in the caller, and waiting longer to say so
+    // only makes it look like a hang. A block whose jobs legitimately run longer should hold the
+    // queue open (create_job_que) rather than lean on this.
+    int g_jobQueDrainTimeoutMs = 3000;
 
     LockBox * lockBoxCreate( Context *, LineInfoArg * at ) {
         LockBox * ch = new LockBox();
@@ -682,6 +687,27 @@ namespace das {
         JobStatus::sJoinSpin.store(level, std::memory_order_relaxed);
     }
 
+    // A panic inside a job body used to unwind straight out of the worker's thread function into
+    // std::terminate -> abort, which is a fast-fail: no unhandled-exception filter runs, so the
+    // message and location were lost and the process died with no diagnostic at all. Catch it on
+    // the worker, report it the way the host reports a main-thread panic, then let it terminate as
+    // before -- a panic stays fatal, it just stops being silent.
+    __forceinline void invoke_job_lambda ( Context * forkContext, LineInfoArg * lineinfo, Lambda & flambda ) {
+        bool ok = forkContext->runWithCatch([&]() {
+            das_invoke_lambda<void>::invoke(forkContext, lineinfo, flambda);
+        });
+        if ( !ok ) {
+            // A panic stays fatal — it just stops being silent. DAS_FATAL_ERROR logs with a flush,
+            // prints the stack, and exits, instead of unwinding into terminate/abort where the
+            // message is lost. Whether one bad job should instead fail only that job is a policy
+            // question, deliberately not answered here.
+            auto what = forkContext->getException();
+            DAS_FATAL_ERROR("JOB EXCEPTION: %s at %s\n",
+                what ? what : "unknown",
+                forkContext->exceptionAt.describe().c_str());
+        }
+    }
+
     void new_job_invoke ( Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
         if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in a 'with_job_que' block, or call create_job_que() first");
         if ( context->keepForkContexts.load(std::memory_order_relaxed) ) {
@@ -698,7 +724,7 @@ namespace das {
             Job jobFn = [=]() mutable {
                 daScriptEnvironment::setBound(bound);
                 Lambda flambda(ptr);
-                das_invoke_lambda<void>::invoke(forkContext, lineinfo, flambda);
+                invoke_job_lambda(forkContext, lineinfo, flambda);
                 das_delete<Lambda>::clear(forkContext, flambda);
                 parent->releaseForkContext(forkContext);
             };
@@ -719,7 +745,7 @@ namespace das {
         Job jobFn = [=]() mutable {
             daScriptEnvironment::setBound(bound);
             Lambda flambda(ptr);
-            das_invoke_lambda<void>::invoke(forkContext.get(), lineinfo, flambda);
+            invoke_job_lambda(forkContext.get(), lineinfo, flambda);
             das_delete<Lambda>::clear(forkContext.get(), flambda);
         };
         if ( g_batchForkJobs ) g_pendingForkJobs.emplace_back(das::move(jobFn));
@@ -1111,7 +1137,10 @@ namespace das {
         thread([=]() mutable {
             daScriptEnvironment::setBound(bound);
             Lambda flambda(ptr);
-            das_invoke_lambda<void>::invoke(forkContext.get(), lineinfo, flambda);
+            // Same hole as new_job_invoke: the thread is detached, so an escaping panic unwinds into
+            // std::terminate -> abort with the message lost. A detached thread has no join point to
+            // report at, so it reports here and dies here.
+            invoke_job_lambda(forkContext.get(), lineinfo, flambda);
             das_delete<Lambda>::clear(forkContext.get(), flambda);
             g_jobQueTotalThreads --;
             shutdownThreadLocalDebugAgent();
@@ -1164,9 +1193,31 @@ namespace das {
         // in a dastest process, whose consume-before-join pattern would stall on unflushed jobs).
         flushPendingForkJobs();
         g_batchForkJobs = false;
+        // Drain before teardown. ~JobQue only join()s -- it flags shutdown and waits for the
+        // THREADS, and a worker tests that flag before the fifo, so anything still queued was
+        // silently discarded. A job pushed without a channel to wait on simply never ran.
+        // Failing to drain is an error, not something to swallow.
+        bool drained = true;
+        {
+            // Copy under the lock -- create_job_que / destroy_job_que and other with_job_que
+            // scopes assign g_jobQue, and a shared_ptr copy races an assignment to the same
+            // object. Drain OUTSIDE the lock: it can wait up to the timeout, and code reachable
+            // from a job may take this mutex.
+            shared_ptr<JobQue> jq;
+            {
+                lock_guard<mutex> guard(g_jobQueMutex);
+                jq = g_jobQue;
+            }
+            if ( jq ) drained = jq->drain(g_jobQueDrainTimeoutMs);
+        }
         {
             lock_guard<mutex> guard(g_jobQueMutex);
             if ( g_jobQue.use_count()==1 ) g_jobQue.reset();
+        }
+        if ( !drained ) {
+            context->throw_error_at(lineInfo,
+                "with_job_que: jobs did not complete within %d ms; queue torn down with work outstanding",
+                g_jobQueDrainTimeoutMs);
         }
     }
 

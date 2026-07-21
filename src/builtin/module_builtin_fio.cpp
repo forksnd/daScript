@@ -245,7 +245,7 @@ namespace das {
     bool builtin_stat ( const char *, FStat & ) GENERATE_IO_STUB_RET
     bool builtin_chdir ( const char * ) GENERATE_IO_STUB_RET
     bool builtin_mkdir ( const char * ) GENERATE_IO_STUB_RET
-    void builtin_exit ( int32_t ) GENERATE_IO_STUB
+    void builtin_exit ( int32_t, Context *, LineInfoArg * ) GENERATE_IO_STUB
     char * builtin_resolve_this_module_dir ( const char *, bool, Context * ) GENERATE_IO_STUB_RET
     bool builtin_remove_file ( const char * ) GENERATE_IO_STUB_RET
     bool builtin_rename_file ( const char *, const char * ) GENERATE_IO_STUB_RET
@@ -715,7 +715,16 @@ namespace das {
         }
     }
 
-    void builtin_exit ( int32_t ec ) {
+    void builtin_exit ( int32_t ec, Context * context, LineInfoArg * at ) {
+        // A script calling exit(1) produced a bare non-zero exit with no message, no stack and no
+        // EXCEPTION -- indistinguishable from every other silent failure. A non-zero exit is a
+        // failure worth naming; exit(0) is a normal shutdown and stays quiet.
+        if ( ec != 0 ) {
+            TextPrinter tp;
+            tp << "exit(" << ec << ") called from " << (at ? at->describe().c_str() : "<unknown>") << "\n";
+            tp.output();
+            if ( context ) context->stackWalk(at, false, false);
+        }
         exit(ec);
     }
 
@@ -2245,7 +2254,7 @@ namespace das {
                 SideEffects::modifyExternal, "getchar_wrapper");
             addExtern<DAS_BIND_FUN(builtin_exit)>(*this, lib, "exit",
                 SideEffects::modifyExternal, "builtin_exit")
-                    ->arg("exitCode")->unsafeOperation = true;
+                    ->args({"exitCode","context","line"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(builtin_popen)>(*this, lib, "popen",
                 SideEffects::modifyExternal, "builtin_popen")
                     ->args({"command","scope","context","at"})->unsafeOperation = true;

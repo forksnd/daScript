@@ -1,6 +1,9 @@
 #include "daScript/misc/crash_handler.h"
 
 #include <cstdio>
+#include <csignal>
+#include <cstdlib>
+#include <exception>
 
 namespace das {
     namespace {
@@ -119,12 +122,20 @@ namespace das {
             case EXCEPTION_BREAKPOINT:             return "EXCEPTION_BREAKPOINT";
             case EXCEPTION_DATATYPE_MISALIGNMENT:  return "EXCEPTION_DATATYPE_MISALIGNMENT";
             case EXCEPTION_IN_PAGE_ERROR:          return "EXCEPTION_IN_PAGE_ERROR";
+            case 0xE06D7363:                       return "UNHANDLED_CPP_EXCEPTION";
             default:                               return "UNKNOWN_EXCEPTION";
         }
     }
 
+    // MSVC raises a C++ throw as SEH code 0xE06D7363 ('msc'). Reaching the UNHANDLED filter with
+    // one means no catch site matched anywhere on the stack, so it is fatal by definition -- but it
+    // is not one of the machine faults below, and excluding it meant an escaping C++ exception got
+    // EXCEPTION_CONTINUE_SEARCH here and then fast-failed, silently, before std::terminate ran.
+    static const DWORD DAS_MSVC_CPP_EXCEPTION = 0xE06D7363;
+
     static bool is_fatal_exception(DWORD code) {
         switch (code) {
+            case DAS_MSVC_CPP_EXCEPTION:
             case EXCEPTION_ACCESS_VIOLATION:
             case EXCEPTION_STACK_OVERFLOW:
             case EXCEPTION_INT_DIVIDE_BY_ZERO:
@@ -169,6 +180,48 @@ namespace das {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // std::terminate and abort() end the process through __fastfail, which by design bypasses the
+    // unhandled-exception filter entirely -- so an uncaught C++ exception or an abort() died with
+    // no message at all, while the POSIX build already caught both via SIGABRT. These two hooks are
+    // the only window before that.
+    //
+    // Both then hand back to the default handling rather than exiting, matching the POSIX handler
+    // (signal(sig, SIG_DFL); raise(sig)) and the SEH filter's EXCEPTION_CONTINUE_SEARCH: printing
+    // must not cost the WER local dump. Calling _exit here would terminate immediately and suppress
+    // it, which is the wrong trade for exactly the family where the dump is the only other witness.
+    static void crash_abort_handler(int) {
+        fprintf(stderr, "\nCRASH: abort() (SIGABRT)\n");
+        print_current_stack_trace();
+        fflush(stderr);
+        // abort(), not raise(SIGABRT): under SIG_DFL the raise path terminates with plain code 3,
+        // while abort() takes the report-fault path and fast-fails (0xC0000409) so WER still
+        // collects the dump. Measured -- raise() here silently costs the dump.
+        signal(SIGABRT, SIG_DFL);
+        abort();
+    }
+
+    static void crash_terminate_handler() {
+        const char * what = "unknown";
+        // The exception is still in flight here; rethrow to read its message.
+        if ( auto ex = std::current_exception() ) {
+            try {
+                std::rethrow_exception(ex);
+            } catch ( const std::exception & e ) {
+                what = e.what();
+            } catch ( ... ) {
+                what = "non-std exception";
+            }
+        }
+        fprintf(stderr, "\nCRASH: std::terminate — uncaught exception: %s\n", what);
+        print_current_stack_trace();
+        fflush(stderr);
+        // Returning from a terminate handler is undefined; abort() is the sanctioned exit. The
+        // SIGABRT hook above has already been reset to SIG_DFL by then only if it ran, so restore
+        // the default here to avoid bouncing back into our own handler.
+        signal(SIGABRT, SIG_DFL);
+        abort();
+    }
+
     void install_crash_handler() {
         // SEM_NOGPFAULTERRORBOX suppresses Windows Error Reporting itself, including
         // app-local dumps. Keep WER active and disable only its interactive UI.
@@ -177,6 +230,8 @@ namespace das {
         ULONG stackGuarantee = 32 * 1024;
         SetThreadStackGuarantee(&stackGuarantee);
         SetUnhandledExceptionFilter(crash_handler_callback);
+        std::set_terminate(crash_terminate_handler);
+        signal(SIGABRT, crash_abort_handler);
     }
 
     void print_current_stack_trace() {

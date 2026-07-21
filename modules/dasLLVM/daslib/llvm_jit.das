@@ -4709,9 +4709,12 @@ class public LlvmJitVisitor : AstVisitor {
 // ExprAssert
     def override visitExprAssert(expr : ExprAssert?) : ExpressionPtr {
         var cond = getE(expr.arguments[0])
+        // Append, don't replace: the interpreter (simulate.cpp SimNode_Assert) and AOT (aot.h)
+        // both report "assert failed, <message>", and one failure should not read differently
+        // depending on which tier ran it.
         var message = "assert failed"
         if (length(expr.arguments) > 1) {
-            message = string((expr.arguments[1] as ExprConstString).value)
+            message += ", {(expr.arguments[1] as ExprConstString).value}"
         }
         var params = fixed_array(
             get_string_constant_ptr(g_builder, message + " at {describe(expr.at)}"),

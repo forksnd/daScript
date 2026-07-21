@@ -1327,7 +1327,6 @@ if (NOT ${DAS_TESTS_DISABLED})
     if(NOT ${DAS_AOT_EXAMPLES_DISABLED})
         include(examples/pathTracer/CMakeLists.txt)
     endif()
-    include(examples/crash/CMakeLists.txt)
     if(NOT ${DAS_AOT_EXAMPLES_DISABLED} AND NOT (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4))
         include(tests/aot/CMakeLists.txt)
     endif()
@@ -1982,12 +1981,16 @@ install(FILES
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/dasbind
 )
 
-# Install crash example
+# Install crash example. The native failure modes now live in packages/dascrash, installed via
+# `daspkg install` from this local path, so there is no example-specific CMake target to include.
 install(FILES
     ${PROJECT_SOURCE_DIR}/examples/crash/main.das
-    ${PROJECT_SOURCE_DIR}/examples/crash/stack_overflow.das
-    ${PROJECT_SOURCE_DIR}/examples/crash/main.cpp
-    ${PROJECT_SOURCE_DIR}/examples/crash/CMakeLists.txt
+    ${PROJECT_SOURCE_DIR}/examples/crash/crash_kinds.das
+    ${PROJECT_SOURCE_DIR}/examples/crash/README.md
+    ${PROJECT_SOURCE_DIR}/examples/crash/.das_package
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/crash
+)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/crash/packages
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/crash
 )
 

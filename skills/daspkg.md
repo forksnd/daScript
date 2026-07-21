@@ -192,6 +192,7 @@ def release() {
     release_include("*.png")
     release_exclude("data/secret/**")
     release_shared_module("dasSQLITE")  // force-include a dylib not auto-detected
+    release_include_symbols()           // ship debug symbols into <bundle>/symbols/
 }
 ```
 
@@ -222,6 +223,28 @@ If a module is loaded only at runtime (e.g. data files read while the .das is ne
 ```
 
 The bundle is the host platform only. Cross-compilation is deferred until daslang itself supports it; v1 has no platform-tag suffix or auto-archive (`--zip` etc.). Recipients can tar/zip the directory themselves.
+
+### Debug symbols — `release_include_symbols()`
+
+Opt-in. Ships the `.pdb` for every binary the release ships — the app exe, `libDaScriptDyn*.dll`, and each `.shared_module` — into `<bundle>/symbols/`, flat:
+
+```
+<out>/<bundle_name>/
+└── symbols/
+    ├── libDaScriptDyn.pdb            # 166 MB
+    ├── libDaScriptDyn_runtime.pdb    # 153 MB
+    └── dasModuleHV.pdb  ...
+```
+
+Point a debugger straight at it — `cdb -y <bundle>\symbols` (or add the dir to `_NT_SYMBOL_PATH`) — and a minidump taken from the deployed tree resolves without the build machine.
+
+**Why it is opt-in:** daslang's two runtime PDBs alone are ~320 MB, which dwarfs a typical ~25 MB bundle. Enable it for a deployment you intend to debug crashes in, not by default.
+
+**Why it is needed at all:** a released tree contains no PDBs, so anything looking for `<program>.pdb` beside the *deployed* binary finds nothing — which is why crash bundlers that probe that path record an empty artifact list. The collector instead resolves each PDB beside the **source** binary in the build tree, which is where the linker wrote it.
+
+Windows only. ELF carries DWARF inside the binary, and macOS `.dSYM` bundles need separate handling; on those platforms the flag logs a skip. The symbol files are recorded in `.daspkg_release.manifest`, so a re-release cleans them like any other shipped file.
+
+Known gap: an app whose exe is produced by the JIT `write_exe` path gets no PDB — that link does not pass `/DEBUG` and emits only a `.map`. Runtime and module frames are still covered.
 
 ### Runtime asset paths — `get_this_module_dir()`
 
@@ -254,6 +277,7 @@ The macro captures the call-site source file path at expansion, then walks the s
 - Source `.das` files compiled into the exe (daslib stdlib, project's own helpers, dep `.das` companions). The runtime exe doesn't need them — they're already baked in.
 - Source files alongside `.shared_module` dylibs (CMakeLists, README, etc.).
 - The `.das_package` and `daspkg.lock` files.
+- Debug symbols, unless the package declares `release_include_symbols()`.
 - Anything not matched by a `release_include` glob.
 
 ## WebAssembly (wasm64) — `build --wasm` / `release wasm`

@@ -1866,10 +1866,43 @@ def private ensure_dylib_alias(dst : string; var shipped : array<string>; rel_ds
 // (macOS), then strip absolute rpath entries from the copy. Symlinks/aliases
 // it creates are recorded in `shipped` (as siblings of `rel_dst`) so the
 // next release's manifest cleanup removes them too.
+// Destination for `release_include_symbols()`, set once per release; empty disables collection.
+// Held as state because finalize_shipped_binary is reached from three call sites that do not
+// otherwise carry the bundle root or the release spec.
+var private _symbols_dir = ""
+
+// Ship the debug symbols belonging to one binary. The PDB is looked up beside the SOURCE, not the
+// destination: MSVC writes `<stem>.pdb` next to the linker output, and every artifact a release
+// ships (the exe, libDaScriptDyn*.dll, each .shared_module) has one there. Looking beside the
+// *deployed* binary is what fails — a released tree has no PDBs, which is why crash bundles that
+// probe `<program>.pdb` come back empty.
+def private ship_symbols_for(src : string; var shipped : array<string>) {
+    if (empty(_symbols_dir) || get_platform_name() != "windows") {
+        return
+    }
+    let pdb = path_join(dir_name(src), "{stem(base_name(src))}.pdb")
+    if (!fexist(pdb)) {
+        // Not fatal: a module built without /DEBUG simply has no symbols, and a release should
+        // still complete. The log names the binary so a missing PDB is visible, not silent.
+        to_log(LOG_WARNING, "release: no symbols for {base_name(src)} (expected {base_name(pdb)})\n")
+        return
+    }
+    let rel_dst = "symbols/{base_name(pdb)}"
+    let dst = path_join(_symbols_dir, base_name(pdb))
+    var err : string
+    if (!copy_file(pdb, dst, true, err)) {
+        to_log(LOG_WARNING, "release: copy_file({pdb} -> {dst}) failed: {err}\n")
+        return
+    }
+    log("  ship symbols: {base_name(pdb)}\n")
+    shipped |> push(rel_dst)
+}
+
 def private finalize_shipped_binary(src, dst : string; var shipped : array<string>; rel_dst : string) {
     preserve_dylib_symlinks(dir_name(src), dir_name(dst), base_name(src), shipped, rel_dst)
     ensure_dylib_alias(dst, shipped, rel_dst)
     scrub_external_rpaths(dst)
+    ship_symbols_for(src, shipped)
 }
 
 // Copy each declared native shared library from the daslang install tree
@@ -2067,6 +2100,17 @@ def cmd_release(root : string; out_dir : string; tune_fast = false) : int {
         clean_previous_release(bundle_dir, preserve_project_files)
     }
     mkdir_rec(bundle_dir)
+    // Arm symbol collection for every finalize_shipped_binary below. Windows-only for now: ELF
+    // carries DWARF in the binary and macOS needs .dSYM handling, so neither has a .pdb to ship.
+    _symbols_dir = ""
+    if (spec.include_symbols) {
+        if (get_platform_name() == "windows") {
+            _symbols_dir = path_join(bundle_dir, "symbols")
+            mkdir_rec(_symbols_dir)
+        } else {
+            log("  symbols: skipped ({get_platform_name()} has no .pdb; DWARF/dSYM not handled yet)\n")
+        }
+    }
     var shipped : array<string>   // bundle-relative paths -> RELEASE_MANIFEST at the end
 
     // 1. Build the standalone exe; `--list-shared-modules` writes the deps JSON
