@@ -62,7 +62,19 @@ def test_repository_untracked_diff_contract(t : T?) {
         t |> equal(staged_error, "")
         t |> equal(expected_exit_code, 0l)
         t |> equal(argv[7], "--cached")
-        t |> equal(argv[9], "--unified=1000000")
+        t |> equal(argv[9], "--unified=3")
         t |> equal(argv[length(argv) - 1], "staged.das")
+
+        let full_error = repository_build_file_diff_argv(
+            "D:/Work/tree", staged_file, "staged", argv,
+            expected_exit_code, "full")
+        t |> equal(full_error, "")
+        t |> equal(argv[9], "--unified=1000000")
+
+        let expanded_error = repository_build_file_diff_argv(
+            "D:/Work/tree", staged_file, "staged", argv,
+            expected_exit_code, "expanded")
+        t |> equal(expanded_error, "")
+        t |> equal(argv[9], "--unified=20")
     }
 }

@@ -50,6 +50,7 @@ struct private WatcherWsMessage {
     worktree_path : string
     file_path : string
     comparison : string
+    diff_context : string
     request_id : int
     text : string
     columns : int
@@ -67,6 +68,7 @@ struct public RepositoryFileInspectionMessage {
     worktree_path : string
     file_path : string
     comparison : string
+    diff_context : string
     task_session_id : string
     loading : bool
     patch : string
@@ -93,6 +95,7 @@ class private WatcherClient {
     inspection_worktree_path : string
     inspection_file_path : string
     inspection_comparison : string
+    inspection_diff_context : string
     inspection_session_id : string
     inspection_expected_exit_code : int64
     inspection_delivered : bool = true
@@ -345,6 +348,7 @@ class DasHerdWatcherServer : HvWebServer {
             worktree_path = client.inspection_worktree_path,
             file_path = client.inspection_file_path,
             comparison = client.inspection_comparison,
+            diff_context = client.inspection_diff_context,
             task_session_id = client.inspection_session_id,
             loading = loading, patch = patch, view_text = view_text,
             view_base64 = view_base64, view_byte_count = view_byte_count,
@@ -365,6 +369,10 @@ class DasHerdWatcherServer : HvWebServer {
         client.inspection_worktree_path = incoming.worktree_path
         client.inspection_file_path = incoming.file_path
         client.inspection_comparison = incoming.comparison
+        client.inspection_diff_context = incoming.diff_context
+        if (empty(client.inspection_diff_context)) {
+            client.inspection_diff_context = "compact"
+        }
         client.inspection_session_id = ""
         client.inspection_delivered = true
 
@@ -373,7 +381,7 @@ class DasHerdWatcherServer : HvWebServer {
         let command_error = repository_file_diff_argv(
             incoming.repository_id, incoming.worktree_path,
             incoming.file_path, incoming.comparison,
-            argv, expected_exit_code)
+            argv, expected_exit_code, client.inspection_diff_context)
         if (!empty(command_error)) {
             self.send_file_inspection(client, false, "", command_error)
             return
@@ -397,7 +405,7 @@ class DasHerdWatcherServer : HvWebServer {
         }
         client.inspection_delivered = false
         self.send_file_inspection(client, true, "", "", "",
-            "Computing compact Git diff (15 second limit)...")
+            "Computing {client.inspection_diff_context} Git diff (15 second limit)...")
     }
 
     def poll_file_inspection(var client : WatcherClient?) {

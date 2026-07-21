@@ -68,6 +68,7 @@ struct private WatcherFileInspectionMessage {
     worktree_path : string
     file_path : string
     comparison : string
+    diff_context : string
     task_session_id : string
     loading : bool
     patch : string
@@ -92,6 +93,7 @@ struct private HerderInspectorOpenArgs {
     worktree_path : string
     file_path : string
     comparison : string = "working"
+    diff_context : string = "compact"
 }
 
 struct private HerderInspectorModeArgs {
@@ -107,6 +109,10 @@ let INSPECTOR_SYNTAX_LABELS : array<string> <- [
     "Auto", "Plain text", "daScript", "C", "C++", "Markdown", "JSON"]
 let INSPECTOR_SYNTAX_VALUES : array<string> <- [
     "auto", "plain", "daslang", "c", "cpp", "markdown", "json"]
+let INSPECTOR_CONTEXT_LABELS : array<string> <- [
+    "Compact (3)", "Expanded (20)", "Full file"]
+let INSPECTOR_CONTEXT_VALUES : array<string> <- [
+    "compact", "expanded", "full"]
 
 struct private GitInspectorState {
     request_id : int
@@ -114,6 +120,7 @@ struct private GitInspectorState {
     worktree_path : string
     file_path : string
     comparison : string
+    diff_context : string = "compact"
     task_session_id : string
     loading : bool
     status : string
@@ -141,6 +148,7 @@ struct private GitInspectorState {
     source_view_base64 : string
     source_view_byte_count : int
     syntax_choice : int
+    diff_context_choice : int
     resolved_language : string
     preview_texture : uint
     preview_width : int
@@ -365,7 +373,7 @@ def private drain_inspector_prepare_events() {
 }
 
 def private begin_file_inspection(repository_id, worktree_path, file_path,
-                                  comparison : string) {
+                                  comparison, diff_context : string) {
     let same_identity = g_inspector.repository_id == repository_id && g_inspector.worktree_path == worktree_path && g_inspector.file_path == file_path && g_inspector.comparison == comparison
     let same_content = g_inspector.prepare.has_retained_content && same_identity
     g_inspector.request_id++
@@ -373,6 +381,14 @@ def private begin_file_inspection(repository_id, worktree_path, file_path,
     g_inspector.worktree_path = worktree_path
     g_inspector.file_path = file_path
     g_inspector.comparison = comparison
+    g_inspector.diff_context = diff_context
+    g_inspector.diff_context_choice = 0
+    if (diff_context == "expanded") {
+        g_inspector.diff_context_choice = 1
+    } elif (diff_context == "full") {
+        g_inspector.diff_context_choice = 2
+    }
+    DIFF_CONTEXT.value = g_inspector.diff_context_choice
     g_inspector.task_session_id = ""
     g_inspector.loading = true
     g_inspector.status = "Requesting diff..."
@@ -587,15 +603,18 @@ class private WatcherRichClient : HvWebSocketClient {
     }
 
     def inspect_file(repository_id, worktree_path, file_path,
-                     comparison : string) {
+                     comparison : string;
+                     diff_context : string = "compact") {
         if (!connected || empty(repository_id) || empty(worktree_path)
                 || empty(file_path)) return
-        begin_file_inspection(repository_id, worktree_path, file_path, comparison)
+        begin_file_inspection(repository_id, worktree_path, file_path,
+            comparison, diff_context)
         send("\{\"op\":\"file_inspect\",\"request_id\":{g_inspector.request_id}," +
             "\"repository_id\":{sprint_json(repository_id, false)}," +
             "\"worktree_path\":{sprint_json(worktree_path, false)}," +
             "\"file_path\":{sprint_json(file_path, false)}," +
-            "\"comparison\":{sprint_json(comparison, false)}\}")
+            "\"comparison\":{sprint_json(comparison, false)}," +
+            "\"diff_context\":{sprint_json(diff_context, false)}\}")
     }
 
     def send_input(text : string) {
@@ -1039,6 +1058,18 @@ def private draw_side_by_side_diff() {
     let hunk_count = length(g_inspector.parsed.hunks)
     g_inspector.diff_current_hunk = hunk_count > 0 ? clamp(g_inspector.diff_current_hunk, 0, hunk_count - 1) : 0
     SetNextItemWidth(150.0f)
+    combo(DIFF_CONTEXT,
+        (text = "Context", items <- INSPECTOR_CONTEXT_LABELS))
+    let selected_context = clamp(DIFF_CONTEXT.value, 0,
+        length(INSPECTOR_CONTEXT_VALUES) - 1)
+    if (selected_context != g_inspector.diff_context_choice
+            && g_client != null && g_client.connected) {
+        g_client->inspect_file(g_inspector.repository_id,
+            g_inspector.worktree_path, g_inspector.file_path,
+            g_inspector.comparison, INSPECTOR_CONTEXT_VALUES[selected_context])
+    }
+    same_line()
+    SetNextItemWidth(150.0f)
     combo(DIFF_SYNTAX, (text = "Syntax", items <- INSPECTOR_SYNTAX_LABELS))
     let selected_syntax = clamp(DIFF_SYNTAX.value, 0,
         length(INSPECTOR_SYNTAX_VALUES) - 1)
@@ -1204,6 +1235,8 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         worktree_path = g_inspector.worktree_path,
         file_path = g_inspector.file_path,
         comparison = g_inspector.comparison,
+        diff_context = g_inspector.diff_context,
+        diff_context_choice = g_inspector.diff_context_choice,
         mode = g_inspector.mode == GitInspectorMode.diff ? "diff" : "view",
         loading = g_inspector.loading,
         prepare_request = inspector_request_state_name(g_inspector.prepare.request),
@@ -1296,7 +1329,7 @@ def herder_file_inspector_open(input : JsonValue?) : JsonValue? {
     }
     let comparison = empty(args.comparison) ? "working" : args.comparison
     g_client->inspect_file(args.repository_id, args.worktree_path,
-        args.file_path, comparison)
+        args.file_path, comparison, args.diff_context)
     FILE_INSPECTOR_WIN.open = true
     FILE_INSPECTOR_WIN.pending_raise = true
     return JV((ok = true, request_id = g_inspector.request_id,
@@ -1427,6 +1460,7 @@ def init() {
     harness_init("dasHerd", 1280, 800)
     harness_maximize_window()
     DIFF_SYNTAX.value = 0
+    DIFF_CONTEXT.value = 0
     var io & = unsafe(GetIO())
     io.ConfigFlags |= ImGuiConfigFlags.DockingEnable
     g_fonts = load_unicode_font_roles(14.0f, g_font_sources)

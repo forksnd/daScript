@@ -227,7 +227,8 @@ def public repository_build_file_diff_argv(worktree_path : string;
                                            file : GitFileState const;
                                            comparison : string;
                                            var argv : array<string>&;
-                                           var expected_exit_code : int64&) : string {
+                                           var expected_exit_code : int64&;
+                                           diff_context : string = "compact") : string {
     delete argv
     expected_exit_code = 0l
     let staged = file.code != "??" && byte_at(file.code, 0) != ' '
@@ -236,6 +237,14 @@ def public repository_build_file_diff_argv(worktree_path : string;
     if (comparison == "working" && !working) return "file has no working-tree change"
     if (comparison != "staged" && comparison != "working") {
         return "comparison is not implemented"
+    }
+    var context_lines = 3
+    if (diff_context == "expanded") {
+        context_lines = 20
+    } elif (diff_context == "full") {
+        context_lines = 1000000
+    } elif (diff_context != "compact") {
+        return "diff context is not implemented"
     }
     var inscope common <- ["git", "-C", worktree_path, "--no-pager", "-c",
         "color.ui=false", "diff"]
@@ -246,7 +255,7 @@ def public repository_build_file_diff_argv(worktree_path : string;
         expected_exit_code = 1l
     }
     argv |> push("--no-ext-diff")
-    argv |> push(comparison == "working" ? "--unified=3" : "--unified=1000000")
+    argv |> push("--unified={context_lines}")
     argv |> push("--")
     if (comparison == "working" && file.code == "??") argv |> push("NUL")
     argv |> push(file.path)
@@ -256,7 +265,8 @@ def public repository_build_file_diff_argv(worktree_path : string;
 def public repository_file_diff_argv(repository_id, worktree_path, file_path,
                                      comparison : string;
                                      var argv : array<string>&;
-                                     var expected_exit_code : int64&) : string {
+                                     var expected_exit_code : int64&;
+                                     diff_context : string = "compact") : string {
     delete argv
     expected_exit_code = 0l
     let repository_index = find_repository(repository_id)
@@ -284,7 +294,8 @@ def public repository_file_diff_argv(repository_id, worktree_path, file_path,
     if (file_index < 0) return "file is not present in the observed Git status"
     let file = runtime.snapshot.files[file_index]
     return repository_build_file_diff_argv(
-        worktree_path, file, comparison, argv, expected_exit_code)
+        worktree_path, file, comparison, argv, expected_exit_code,
+        diff_context)
 }
 
 def public repository_working_file_text(repository_id, worktree_path, file_path : string;
