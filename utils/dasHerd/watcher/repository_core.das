@@ -318,16 +318,21 @@ def public repository_read_text_file(path : string; max_bytes : int;
     if (!file_status.is_valid || !file_status.is_reg) {
         return "could not read file text"
     }
-    if (file_status.size > uint64(max_bytes)) {
-        return "file exceeds the raw-byte View limit"
-    }
     var loaded = false
+    var too_large = false
     fopen(path, "rb") $(file) {
         if (file != null) {
-            text = fread(file)
-            loaded = true
+            fmap(file) $(var data : array<uint8>#) {
+                if (length(data) <= max_bytes) {
+                    text = string(data)
+                } else {
+                    too_large = true
+                }
+                loaded = true
+            }
         }
     }
+    if (too_large) return "file exceeds the raw-byte View limit"
     return loaded ? "" : "could not read file text"
 }
 

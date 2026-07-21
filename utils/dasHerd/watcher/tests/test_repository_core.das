@@ -144,8 +144,11 @@ def test_repository_text_read_contract(t : T?) {
         t |> equal(repository_working_preview_path(
             root, "bytes.bin", preview_path), "")
         t |> equal(preview_path, bytes_path)
-        t |> success(!empty(repository_read_text_file(bytes_path, 2, text)),
-            "text View rejects files beyond its raw-byte limit")
+        t |> equal(repository_read_text_file(bytes_path, 2, text),
+            "file exceeds the raw-byte View limit")
+        t |> equal(text, "", "oversized mapped text is never materialized")
+        t |> equal(repository_read_text_file(bytes_path, 3, text), "")
+        t |> equal(text, "abc", "mapped text at the raw-byte limit is materialized")
         var bytes : array<uint8>
         var byte_count = 0
         t |> equal(repository_read_file_bytes(
