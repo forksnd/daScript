@@ -334,16 +334,28 @@ def public inspector_prepare_worker_queue(var worker : InspectorPrepareWorker;
     return true
 }
 
-def public inspector_prepare_worker_try_event(
-        var worker : InspectorPrepareWorker;
-        blk : block<(event : InspectorPrepareEvent#) : void>) : bool {
+def public inspector_prepare_worker_take_event(var worker : InspectorPrepareWorker;
+                                               var event : InspectorPrepareEvent) : bool {
     if (!worker.started || worker.events == null) return false
-    return worker.events |> try_pop_clone() $(event : InspectorPrepareEvent#) {
-        if (event.kind == InspectorPrepareEventKind.stopped) {
-            worker.stopped = true
-        }
-        invoke(blk, event)
+    delete event
+    let popped = _builtin_channel_try_pop(worker.events) $(data) {
+        event := *(unsafe(reinterpret<InspectorPrepareEvent?#>(data)))
     }
+    if (!popped) return false
+    if (event.kind == InspectorPrepareEventKind.stopped) {
+        worker.stopped = true
+    }
+    return true
+}
+
+def public inspector_prepare_worker_try_event(
+                                              var worker : InspectorPrepareWorker;
+                                              blk : block<(event : InspectorPrepareEvent#) : void>) : bool {
+    var event : InspectorPrepareEvent
+    if (!inspector_prepare_worker_take_event(worker, event)) return false
+    invoke(blk, unsafe(reinterpret<InspectorPrepareEvent -& -const#>(event)))
+    delete event
+    return true
 }
 
 def public inspector_prepare_worker_shutdown(var worker : InspectorPrepareWorker;

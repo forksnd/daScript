@@ -317,36 +317,36 @@ def private install_file_inspection(message : WatcherFileInspectionMessage const
 }
 
 def private drain_inspector_prepare_events() {
-    var draining = true
-    while (draining) {
-        draining = inspector_prepare_worker_try_event(g_prepare_worker) $(event : InspectorPrepareEvent#) {
-            if (event.kind == InspectorPrepareEventKind.started) {
-                inspector_load_start(g_inspector.prepare, event.generation,
-                    "Preparing diff...")
-            } elif (event.kind == InspectorPrepareEventKind.failed) {
-                if (inspector_load_fail(g_inspector.prepare,
-                        event.generation, clone_string(event.error))) {
-                    g_inspector.error = clone_string(event.error)
-                    g_inspector.prepare_elapsed_usec = event.elapsed_usec
-                }
-            } elif (event.kind == InspectorPrepareEventKind.completed) {
-                if (!inspector_load_succeed(g_inspector.prepare,
-                        event.generation)) return
-                release_inspector_content()
-                g_inspector.revision = event.generation
-                g_inspector.parsed := event.parsed
-                g_inspector.old_document := event.old_document
-                g_inspector.new_document := event.new_document
-                g_inspector.view_document := event.view_document
-                g_inspector.markdown_document := event.markdown_document
-                g_inspector.markdown_view := event.markdown_view
-                g_inspector.changed_source_ranges := event.changed_source_ranges
-                g_inspector.view_source = clone_string(event.view_source)
-                g_inspector.view_prepared = !event.parsed.binary
-                upload_inspector_preview(event)
-                g_inspector.error = ""
+    while (true) {
+        var event : InspectorPrepareEvent
+        if (!inspector_prepare_worker_take_event(g_prepare_worker, event)) break
+        if (event.kind == InspectorPrepareEventKind.started) {
+            inspector_load_start(g_inspector.prepare, event.generation,
+                "Preparing diff...")
+        } elif (event.kind == InspectorPrepareEventKind.failed) {
+            if (inspector_load_fail(g_inspector.prepare,
+                    event.generation, clone_string(event.error))) {
+                g_inspector.error = clone_string(event.error)
                 g_inspector.prepare_elapsed_usec = event.elapsed_usec
             }
+        } elif (event.kind == InspectorPrepareEventKind.completed) {
+            if (!inspector_load_succeed(g_inspector.prepare,
+                    event.generation)) continue
+            release_inspector_content()
+            g_inspector.revision = event.generation
+            g_inspector.parsed <- event.parsed
+            g_inspector.old_document <- event.old_document
+            g_inspector.new_document <- event.new_document
+            g_inspector.view_document <- event.view_document
+            g_inspector.markdown_document <- event.markdown_document
+            g_inspector.markdown_view <- event.markdown_view
+            g_inspector.changed_source_ranges <- event.changed_source_ranges
+            g_inspector.view_source = clone_string(event.view_source)
+            g_inspector.view_prepared = !g_inspector.parsed.binary
+            upload_inspector_preview(
+                unsafe(reinterpret<InspectorPrepareEvent const#>(event)))
+            g_inspector.error = ""
+            g_inspector.prepare_elapsed_usec = event.elapsed_usec
         }
     }
 }

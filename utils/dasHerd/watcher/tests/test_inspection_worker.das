@@ -34,7 +34,8 @@ def test_inspection_prepare_worker(t : T?) {
         var span_count = 0
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            var event : InspectorPrepareEvent
+            if (inspector_prepare_worker_take_event(worker, event)) {
                 if (event.kind == InspectorPrepareEventKind.ready) {
                     ready = true
                 } elif (event.kind == InspectorPrepareEventKind.started) {
