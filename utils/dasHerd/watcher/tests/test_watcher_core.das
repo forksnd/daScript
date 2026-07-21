@@ -71,6 +71,8 @@ def test_watcher_process_lifecycle(t : T?) {
             failed.session_id, "staged-view.raw")), "staged-view.raw")
         t |> equal(watcher_session_artifact_path(
             failed.session_id, "../outside.raw"), "")
+        t |> equal(watcher_session_artifact_path(
+            failed.session_id, "C:outside.raw"), "")
         let failed_metadata = fread(path_join(path_join(path_join(root, "sessions"),
             failed.session_id), "session.json"))
         t |> success(find(failed_metadata, "\"columns\":20") >= 0

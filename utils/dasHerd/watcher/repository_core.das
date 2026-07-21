@@ -539,6 +539,11 @@ def private conflict_code(code : string) : bool {
     return code == "DD" || code == "AU" || code == "UD" || code == "UA" || code == "DU" || code == "AA" || code == "UU"
 }
 
+def private rename_or_copy_code(code : string) : bool {
+    if (length(code) != 2) return false
+    return byte_at(code, 0) == 'R' || byte_at(code, 0) == 'C' || byte_at(code, 1) == 'R' || byte_at(code, 1) == 'C'
+}
+
 def private parse_counter(text, marker : string) : int {
     let start = find(text, marker)
     if (start < 0) return 0
@@ -570,7 +575,7 @@ def public repository_parse_status(text : string; var worktree : WorktreeState;
         var path = slice(line, 3)
         var old_path : string
         let rename_separator = find(path, " -> ")
-        if (rename_separator >= 0) {
+        if (rename_separator >= 0 && rename_or_copy_code(code)) {
             old_path = slice(path, 0, rename_separator)
             path = slice(path, rename_separator + 4)
         }

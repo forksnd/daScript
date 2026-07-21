@@ -19,16 +19,18 @@ def test_repository_porcelain_parsing(t : T?) {
             "detached, locked, and prunable markers are retained")
 
         var files : array<GitFileState>
-        repository_parse_status("## main-feature...origin/main [ahead 2, behind 3]\r\nM  staged file.das\r\n M unstaged file.das\r\n?? new file.txt\r\nUU conflict.txt\r\nR  old name -> new name\r\n", worktrees[0], files)
+        repository_parse_status("## main-feature...origin/main [ahead 2, behind 3]\r\nM  staged file.das\r\n M unstaged file.das\r\n?? new file.txt\r\nUU conflict.txt\r\nR  old name -> new name\r\n M literal -> name.txt\r\n", worktrees[0], files)
         t |> equal(worktrees[0].ahead, 2)
         t |> equal(worktrees[0].behind, 3)
         t |> equal(worktrees[0].staged, 3)
-        t |> equal(worktrees[0].unstaged, 2)
+        t |> equal(worktrees[0].unstaged, 3)
         t |> equal(worktrees[0].untracked, 1)
         t |> equal(worktrees[0].conflicted, 1)
-        t |> equal(length(files), 5)
+        t |> equal(length(files), 6)
         t |> equal(files[4].old_path, "old name")
         t |> equal(files[4].path, "new name")
+        t |> equal(files[5].old_path, "")
+        t |> equal(files[5].path, "literal -> name.txt")
         t |> equal(files[0].worktree_path, "D:/Work/daScript")
     }
     t |> run("unquoted porcelain retains UTF-8 file paths") <| @(t : T?) {

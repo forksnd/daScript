@@ -513,7 +513,7 @@ def public watcher_compact_session(session_id : string;
 
 def public watcher_session_artifact_path(session_id, name : string) : string {
     if (empty(name) || name == "." || name == ".." || find(name, "/") >= 0
-            || find(name, "\\") >= 0) return ""
+            || find(name, "\\") >= 0 || find(name, ":") >= 0) return ""
     let index = watcher_find_session(session_id)
     if (index < 0 || g_sessions[index] == null) return ""
     return path_join(g_sessions[index].session_dir, name)
