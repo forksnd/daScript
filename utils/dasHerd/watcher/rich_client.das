@@ -135,6 +135,10 @@ struct private HerderGitFileActionArgs {
     action : string
 }
 
+struct private HerderGitShaArgs {
+    sha : string
+}
+
 enum private GitInspectorMode {
     diff
     view
@@ -213,6 +217,12 @@ var private g_token : string
 var private g_selected_worktree_path : string
 var private g_selected_repository_id : string
 var private g_focus_terminal_pending = false
+var private g_requested_history_commit : string
+var private g_pending_clipboard_sha : string
+var private g_last_copied_sha : string
+var private g_clipboard_copy_status = ClipboardStatus.no_content
+var private g_clipboard_copy_attempts = 0
+var private g_clipboard_copy_verified = false
 var private g_inspector = GitInspectorState()
 var private g_prepare_worker = InspectorPrepareWorker()
 var private g_jobque_owned = false
@@ -1112,6 +1122,32 @@ def private git_line_stats(added_lines, deleted_lines : int;
     return "+{added_lines}  -{deleted_lines}"
 }
 
+def private service_sha_copy() {
+    if (empty(g_pending_clipboard_sha)) return
+    if (g_clipboard_copy_attempts >= 8) {
+        g_pending_clipboard_sha = ""
+        return
+    }
+    g_clipboard_copy_attempts++
+    g_clipboard_copy_status = clipboard_set_text(g_pending_clipboard_sha)
+    if (g_clipboard_copy_status != ClipboardStatus.ok) return
+    var copied_text = ""
+    g_clipboard_copy_status = clipboard_get_text(copied_text)
+    if (g_clipboard_copy_status == ClipboardStatus.ok
+            && copied_text == g_pending_clipboard_sha) {
+        g_last_copied_sha = g_pending_clipboard_sha
+        g_pending_clipboard_sha = ""
+        g_clipboard_copy_verified = true
+    }
+}
+
+def private queue_sha_copy(hash : string) {
+    g_pending_clipboard_sha = hash
+    g_clipboard_copy_attempts = 0
+    g_clipboard_copy_verified = false
+    service_sha_copy()
+}
+
 def private draw_git_path_text(path : string; p0, p1 : float2;
                                subdued : bool) {
     let alpha = subdued ? 0.55f : 1.0f
@@ -1136,11 +1172,30 @@ def private draw_git_path_text(path : string; p0, p1 : float2;
     }
 }
 
-def private draw_git_stats_text(position : float2; color : uint;
-                                stats : string) {
+def private draw_git_stats_text(position : float2;
+                                added_lines, deleted_lines : int;
+                                stats_known, binary, subdued : bool) {
+    let alpha = subdued ? 0.55f : 1.0f
     with_window_drawlist() $(var dl) {
-        dl |> add_text(position, color, stats)
+        if (binary || !stats_known) {
+            let stats = binary ? "binary" : "+?  -?"
+            dl |> add_text(position, GetColorU32(ImGuiCol.TextDisabled), stats)
+        } else {
+            let added = "+{added_lines}"
+            let deleted = "-{deleted_lines}"
+            dl |> add_text(position,
+                GetColorU32(float4(0.42f, 0.82f, 0.42f, alpha)), added)
+            dl |> add_text(float2(position.x + CalcTextSize(added).x
+                    + GetStyle().ItemSpacing.x, position.y),
+                GetColorU32(float4(0.37f, 0.65f, 0.96f, alpha)), deleted)
+        }
     }
+}
+
+def private git_visible_row_right(row_right : float) : float {
+    let style & = GetStyle()
+    let window_right = GetWindowPos().x + GetWindowSize().x - style.WindowPadding.x - style.ScrollbarSize
+    return min(row_right, window_right)
 }
 
 def private decorate_git_file_row(row_id, path : string;
@@ -1151,10 +1206,11 @@ def private decorate_git_file_row(row_id, path : string;
     let stats = git_line_stats(added_lines, deleted_lines, stats_known, binary)
     let row_min = GetItemRectMin()
     let row_max = GetItemRectMax()
+    let row_right = git_visible_row_right(row_max.x)
     let hovered = IsItemHovered()
     let icon_size = max(12.0f, GetTextLineHeight() - 3.0f)
     let icon_width = icon_size + GetStyle().FramePadding.x * 2.0f
-    let action_x = row_max.x - icon_width
+    let action_x = row_right - icon_width
     let stats_size = CalcTextSize(stats)
     let stats_x = max(row_min.x, action_x - stats_size.x - GetStyle().ItemSpacing.x)
     let text_y = row_min.y + max(0.0f,
@@ -1162,8 +1218,8 @@ def private decorate_git_file_row(row_id, path : string;
     draw_git_path_text(path,
         float2(row_min.x + GetStyle().FramePadding.x, text_y),
         float2(stats_x - GetStyle().ItemSpacing.x, row_max.y), subdued)
-    let stats_color = binary || !stats_known ? GetColorU32(ImGuiCol.TextDisabled) : GetColorU32(float4(0.61f, 0.78f, 0.52f, subdued ? 0.55f : 1.0f))
-    draw_git_stats_text(float2(stats_x, text_y), stats_color, stats)
+    draw_git_stats_text(float2(stats_x, text_y), added_lines, deleted_lines,
+        stats_known, binary, subdued)
     action_clicked = false
     if (!empty(action_glyph)) {
         action_clicked = icon_button_draw_at("##{row_id}:action", action_glyph,
@@ -1196,9 +1252,11 @@ def private draw_pr_included_files(repository : RepositorySnapshot const;
         let stats = git_line_stats(file.added_lines, file.deleted_lines,
             file.stats_known, file.binary)
         var selected = false
-        with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
-            selected = selectable(GIT_FILE_ROW[file_row],
-                (text = "{file.path}  {stats}##pr:{file.path}"))
+        with_item_flag(ImGuiItemFlags.None | ImGuiItemFlagsPrivate.AllowOverlap, true) {
+            with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
+                selected = selectable(GIT_FILE_ROW[file_row],
+                    (text = "{file.path}  {stats}##pr:{file.path}"))
+            }
         }
         decorate_git_file_row("pr:{file.path}", file.path, file.added_lines,
             file.deleted_lines, file.stats_known, file.binary, false,
@@ -1240,9 +1298,11 @@ def private draw_pr_not_included_files(repository : RepositorySnapshot const;
         let stats = git_line_stats(file.added_lines, file.deleted_lines,
             file.stats_known, file.binary)
         var selected = false
-        with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
-            selected = selectable(GIT_FILE_ROW[file_row],
-                (text = "{file.path}  {stats}##working:{file.path}"))
+        with_item_flag(ImGuiItemFlags.None | ImGuiItemFlagsPrivate.AllowOverlap, true) {
+            with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
+                selected = selectable(GIT_FILE_ROW[file_row],
+                    (text = "{file.path}  {stats}##working:{file.path}"))
+            }
         }
         decorate_git_file_row("working:{file.path}", file.path, file.added_lines,
             file.deleted_lines, file.stats_known, file.binary, true,
@@ -1287,13 +1347,14 @@ def private draw_shared_pr_files(repository : RepositorySnapshot const;
 def private draw_sha_copy_icon(hash, row_id : string) {
     let row_min = GetItemRectMin()
     let row_max = GetItemRectMax()
+    let row_right = git_visible_row_right(row_max.x)
     let hovered = IsItemHovered()
     let icon_size = max(12.0f, GetTextLineHeight() - 3.0f)
     let icon_width = icon_size + GetStyle().FramePadding.x * 2.0f
     if (icon_button_draw_at("##{row_id}:copy-sha", "duplicate",
-            float2(row_max.x - icon_width, row_min.y), icon_size, 1.0f,
+            float2(row_right - icon_width, row_min.y), icon_size, 1.0f,
             hovered)) {
-        let _ = clipboard_set_text(hash)
+        queue_sha_copy(hash)
     }
     if (hovered && IsItemHovered()) {
         set_tooltip(GIT_HOVER_TOOLTIP, "Copy full SHA")
@@ -1314,8 +1375,10 @@ def private draw_pr_review(repository : RepositorySnapshot const;
     var commit_row = 0
     for (commit in repository.review_commits) {
         if (commit.worktree_path != worktree.path) continue
-        text(GIT_COMMIT_TEXT[commit_row],
-            (text = "{commit.short_hash}  {commit.subject}  - {commit.author}"))
+        with_item_flag(ImGuiItemFlags.None | ImGuiItemFlagsPrivate.AllowOverlap, true) {
+            text(GIT_COMMIT_TEXT[commit_row],
+                (text = "{commit.short_hash}  {commit.subject}  - {commit.author}"))
+        }
         draw_sha_copy_icon(commit.hash, "pr-commit:{commit.hash}")
         commit_row++
     }
@@ -1335,29 +1398,55 @@ def private ensure_history(repository : RepositorySnapshot const;
     }
 }
 
+def private request_commit_files(repository : RepositorySnapshot const;
+                                 worktree : WorktreeState const;
+                                 commit_hash : string) {
+    if (g_client == null || empty(commit_hash)) return
+    g_requested_history_commit = commit_hash
+    g_client->request_repository_commit_files(
+        repository.record.id, worktree.path, commit_hash)
+}
+
 def private draw_commit_files(repository : RepositorySnapshot const;
                               worktree : WorktreeState const) {
+    if (!empty(g_requested_history_commit)
+            && g_requested_history_commit == worktree.history_commit) {
+        g_requested_history_commit = ""
+    }
+    let selected_commit = !empty(g_requested_history_commit) ? g_requested_history_commit : worktree.history_commit
     var count = 0
     for (file in repository.commit_files) {
         if (file.worktree_path == worktree.path
-                && file.commit_hash == worktree.history_commit) count++
+                && file.commit_hash == selected_commit) count++
     }
     text(GIT_GROUP_TITLE[21],
-        (text = "FILES IN {worktree.history_commit}  {count}"))
+        (text = "FILES IN {selected_commit}  {count}"))
     separator(GIT_GROUP_SEPARATOR[21])
+    if (!empty(g_requested_history_commit)) {
+        text_disabled("Loading selected commit files...")
+        return
+    }
     var row = 0
     for (file in repository.commit_files) {
         if (file.worktree_path != worktree.path
-                || file.commit_hash != worktree.history_commit) continue
+                || file.commit_hash != selected_commit) continue
         GIT_COMMIT_FILE_ROW[row].value = (g_inspector.repository_id == repository.record.id
             && g_inspector.worktree_path == worktree.path
             && g_inspector.file_path == file.path
             && g_inspector.comparison == "commit"
             && g_inspector.git_revision == file.commit_hash)
-        let old_label = !empty(file.old_path) ? "  (from {file.old_path})" : ""
-        if (selectable(GIT_COMMIT_FILE_ROW[row],
-                (text = "{file.code}  {file.path}{old_label}##commit:{file.commit_hash}:{file.path}"))
-                && g_client != null) {
+        let stats = git_line_stats(file.added_lines, file.deleted_lines,
+            file.stats_known, file.binary)
+        var selected = false
+        with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
+            selected = selectable(GIT_COMMIT_FILE_ROW[row],
+                (text = "{file.path}  {stats}##commit:{file.commit_hash}:{file.path}"))
+        }
+        var ignored_action = false
+        decorate_git_file_row("commit:{file.commit_hash}:{file.path}",
+            file.path, file.added_lines, file.deleted_lines,
+            file.stats_known, file.binary, false, "", "", ignored_action)
+        if (selected && g_client != null) {
             g_client->inspect_file(repository.record.id, worktree.path,
                 file.path, "commit", "compact", file.commit_hash)
             FILE_INSPECTOR_WIN.open = true
@@ -1383,12 +1472,15 @@ def private draw_history_commits(repository : RepositorySnapshot const;
     var row = 0
     for (commit in repository.history_commits) {
         if (commit.worktree_path != worktree.path) continue
-        GIT_HISTORY_COMMIT_ROW[row].value = commit.hash == worktree.history_commit
-        if (selectable(GIT_HISTORY_COMMIT_ROW[row],
+        let selected_commit = !empty(g_requested_history_commit) ? g_requested_history_commit : worktree.history_commit
+        GIT_HISTORY_COMMIT_ROW[row].value = commit.hash == selected_commit
+        var selected = false
+        with_item_flag(ImGuiItemFlags.None | ImGuiItemFlagsPrivate.AllowOverlap, true) {
+            selected = selectable(GIT_HISTORY_COMMIT_ROW[row],
                 (text = "{commit.short_hash}  {commit.subject}  - {commit.author}##history:{commit.hash}"))
-                && g_client != null && commit.hash != worktree.history_commit) {
-            g_client->request_repository_commit_files(
-                repository.record.id, worktree.path, commit.hash)
+        }
+        if (selected && g_client != null && commit.hash != selected_commit) {
+            request_commit_files(repository, worktree, commit.hash)
         }
         draw_sha_copy_icon(commit.hash, "history:{commit.hash}")
         row++
@@ -1399,8 +1491,6 @@ def private draw_history_commits(repository : RepositorySnapshot const;
             (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
             text = worktree.history_error))
     }
-    separator()
-    draw_commit_files(repository, worktree)
 }
 
 def private draw_history_review(repository : RepositorySnapshot const;
@@ -1427,6 +1517,7 @@ def private git_graph_color(hash : string; alpha : float = 1.0f) : uint {
 }
 
 def private git_prepare_lanes(commit : GitCommitState const;
+                              observed : table<string; bool> const;
                               var lanes : array<string>) : int {
     var lane = git_lane_index(lanes, commit.hash)
     if (lane < 0) {
@@ -1435,7 +1526,7 @@ def private git_prepare_lanes(commit : GitCommitState const;
     }
     var parent_number = 0
     for (parent in split(commit.parents, " ")) {
-        if (empty(parent)) continue
+        if (empty(parent) || !key_exists(observed, parent)) continue
         if (parent_number > 0 && git_lane_index(lanes, parent) < 0) {
             lanes |> push(parent)
         }
@@ -1445,10 +1536,11 @@ def private git_prepare_lanes(commit : GitCommitState const;
 }
 
 def private git_finish_lanes(commit : GitCommitState const; lane : int;
+                             observed : table<string; bool> const;
                              var lanes : array<string>) {
     var first_parent = ""
     for (parent in split(commit.parents, " ")) {
-        if (!empty(parent)) {
+        if (!empty(parent) && key_exists(observed, parent)) {
             first_parent = parent
             break
         }
@@ -1466,23 +1558,23 @@ def private git_finish_lanes(commit : GitCommitState const; lane : int;
 }
 
 def private git_advance_lanes(commit : GitCommitState const;
+                              observed : table<string; bool> const;
                               var lanes : array<string>) {
-    let lane = git_prepare_lanes(commit, lanes)
-    git_finish_lanes(commit, lane, lanes)
+    let lane = git_prepare_lanes(commit, observed, lanes)
+    git_finish_lanes(commit, lane, observed, lanes)
 }
 
-def private draw_commit_graph_decoration(repository : RepositorySnapshot const;
-                                         worktree : WorktreeState const;
-                                         commit : GitCommitState const;
+def private draw_commit_graph_decoration(commit : GitCommitState const;
+                                         observed : table<string; bool> const;
                                          var lanes : array<string>;
                                          row_id : string) {
-    let lane = git_prepare_lanes(commit, lanes)
+    let lane = git_prepare_lanes(commit, observed, lanes)
     let row_min = GetItemRectMin()
     let row_max = GetItemRectMax()
+    let row_right = git_visible_row_right(row_max.x)
     let center_y = (row_min.y + row_max.y) * 0.5f
     let lane_spacing = 14.0f
     let graph_x = row_min.x + 8.0f
-    let graph_width = 126.0f
     var inscope parents <- split(commit.parents, " ")
     with_window_drawlist() $(var dl) {
         for (index in range(length(lanes))) {
@@ -1493,7 +1585,7 @@ def private draw_commit_graph_decoration(repository : RepositorySnapshot const;
         let node_x = graph_x + float(lane) * lane_spacing
         var parent_number = 0
         for (parent in parents) {
-            if (empty(parent)) continue
+            if (empty(parent) || !key_exists(observed, parent)) continue
             if (parent_number > 0) {
                 let parent_lane = git_lane_index(lanes, parent)
                 let parent_x = graph_x + float(parent_lane) * lane_spacing
@@ -1506,75 +1598,75 @@ def private draw_commit_graph_decoration(repository : RepositorySnapshot const;
             git_graph_color(commit.hash), 12)
         dl |> add_circle(float2(node_x, center_y), 5.8f,
             GetColorU32(ImGuiCol.WindowBg), 12, 1.4f)
-
-        var text_x = row_min.x + graph_width
-        var label_count = 0
-        for (ref in repository.refs) {
-            if (ref.worktree_path != worktree.path || ref.hash != commit.hash
-                    || ends_with(ref.name, "/HEAD") || label_count >= 3) continue
-            let label_size = CalcTextSize(ref.name)
-            let label_min = float2(text_x, center_y - label_size.y * 0.5f - 2.0f)
-            let label_max = float2(text_x + label_size.x + 10.0f,
-                center_y + label_size.y * 0.5f + 2.0f)
-            dl |> add_rect_filled(label_min, label_max,
-                git_graph_color(commit.hash, ref.current ? 0.52f : 0.28f),
-                4.0f, ImDrawFlags.None)
-            dl |> add_text(float2(text_x + 5.0f,
-                center_y - label_size.y * 0.5f),
-                GetColorU32(ImGuiCol.Text), ref.name)
-            text_x = label_max.x + 6.0f
-            label_count++
-        }
-        dl |> add_text(float2(text_x, center_y - GetTextLineHeight() * 0.5f),
-            GetColorU32(ImGuiCol.Text), commit.subject)
     }
 
     let hovered = IsItemHovered()
     let icon_size = max(12.0f, GetTextLineHeight() - 3.0f)
     let icon_width = icon_size + GetStyle().FramePadding.x * 2.0f
     if (icon_button_draw_at("##{row_id}:copy-sha", "duplicate",
-            float2(row_max.x - icon_width, row_min.y), icon_size, 1.0f,
+            float2(row_right - icon_width, row_min.y), icon_size, 1.0f,
             hovered)) {
-        let _ = clipboard_set_text(commit.hash)
+        queue_sha_copy(commit.hash)
     }
     if (hovered && IsItemHovered()) {
         set_tooltip(GIT_HOVER_TOOLTIP, "Copy full SHA")
     }
 
-    git_finish_lanes(commit, lane, lanes)
+    git_finish_lanes(commit, lane, observed, lanes)
+}
+
+def private git_graph_refs(repository : RepositorySnapshot const;
+                           worktree : WorktreeState const;
+                           commit : GitCommitState const) : string {
+    var inscope names : array<string>
+    names |> reserve(3)
+    var count = 0
+    for (ref in repository.refs) {
+        if (ref.worktree_path != worktree.path || ref.hash != commit.hash
+                || ends_with(ref.name, "/HEAD") || count >= 3) continue
+        names |> push("[{ref.name}]")
+        count++
+    }
+    return join(names, " ")
 }
 
 def private draw_commit_graph(repository : RepositorySnapshot const;
                               worktree : WorktreeState const) {
     var inscope lanes : array<string>
     var inscope commit_indices : array<int>
+    var inscope observed : table<string; bool>
     commit_indices |> reserve(length(repository.history_commits))
     for (index in range(length(repository.history_commits))) {
         if (repository.history_commits[index].worktree_path == worktree.path) {
             commit_indices |> push(index)
+            observed[repository.history_commits[index].hash] = true
         }
     }
     var graph_cursor = 0
     list_clipper(length(commit_indices)) $(start, end_) {
         while (graph_cursor < start) {
             git_advance_lanes(repository.history_commits[
-                commit_indices[graph_cursor]], lanes)
+                commit_indices[graph_cursor]], observed, lanes)
             graph_cursor++
         }
         for (row in range(start, end_)) {
             let commit = repository.history_commits[commit_indices[row]]
-            GIT_HISTORY_COMMIT_ROW[row].value = commit.hash == worktree.history_commit
+            let selected_commit = !empty(g_requested_history_commit) ? g_requested_history_commit : worktree.history_commit
+            GIT_HISTORY_COMMIT_ROW[row].value = commit.hash == selected_commit
+            let refs = git_graph_refs(repository, worktree, commit)
+            let ref_text = empty(refs) ? "" : "{refs}  "
+            let space_width = max(1.0f, CalcTextSize(" ").x)
+            let graph_pad = repeat(" ", int(56.0f / space_width) + 1)
             var selected = false
-            with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
+            with_item_flag(ImGuiItemFlags.None | ImGuiItemFlagsPrivate.AllowOverlap, true) {
                 selected = selectable(GIT_HISTORY_COMMIT_ROW[row],
-                    (text = "{commit.short_hash}  {commit.subject}##graph:{commit.hash}"))
+                    (text = "{graph_pad}{commit.short_hash}  {ref_text}{commit.subject}  - {commit.author}##graph:{commit.hash}"))
             }
-            draw_commit_graph_decoration(repository, worktree, commit, lanes,
+            draw_commit_graph_decoration(commit, observed, lanes,
                 "graph:{commit.hash}")
             if (selected && g_client != null
-                    && commit.hash != worktree.history_commit) {
-                g_client->request_repository_commit_files(
-                    repository.record.id, worktree.path, commit.hash)
+                    && commit.hash != selected_commit) {
+                request_commit_files(repository, worktree, commit.hash)
             }
             graph_cursor++
         }
@@ -1603,8 +1695,6 @@ def private draw_tree_review(repository : RepositorySnapshot const;
     }
     ensure_history(repository, worktree, "__all__")
     draw_commit_graph(repository, worktree)
-    separator()
-    draw_commit_files(repository, worktree)
 }
 
 def private draw_git_status_window() {
@@ -1640,7 +1730,11 @@ def private draw_git_status_window() {
                         text = repository.error))
                 }
                 separator()
-                draw_shared_pr_files(repository, worktree)
+                if (GIT_HISTORY_TAB.selected || GIT_TREE_TAB.selected) {
+                    draw_commit_files(repository, worktree)
+                } else {
+                    draw_shared_pr_files(repository, worktree)
+                }
                 separator()
                 tab_bar(GIT_PERSPECTIVE_TABS,
                         (text = "Git perspectives", flags = ImGuiTabBarFlags.None)) {
@@ -1918,6 +2012,7 @@ def herder_git_select_worktree(input : JsonValue?) : JsonValue? {
             if (worktree.path != args.worktree_path) continue
             g_selected_repository_id = args.repository_id
             g_selected_worktree_path = args.worktree_path
+            g_requested_history_commit = ""
             g_client->refresh_repository(args.repository_id)
             g_client->request_repository_review(
                 args.repository_id, args.worktree_path)
@@ -2033,6 +2128,7 @@ def herder_git_history_state(_input : JsonValue?) : JsonValue? {
                     branch = worktree.branch,
                     history_ref = worktree.history_ref,
                     history_commit = worktree.history_commit,
+                    requested_history_commit = g_requested_history_commit,
                     history_loading = worktree.history_loading,
                     history_error = worktree.history_error,
                     refs_loading = worktree.refs_loading,
@@ -2042,6 +2138,54 @@ def herder_git_history_state(_input : JsonValue?) : JsonValue? {
         }
     }
     return JV((ok = false, error = "selected worktree is unavailable"))
+}
+
+[live_command(description = "Select a commit and load its changelist. Args: sha.")]
+def herder_git_select_commit(input : JsonValue?) : JsonValue? {
+    if (g_client == null || !g_client.connected) {
+        return JV((ok = false, error = "watcher is not connected"))
+    }
+    let args = from_JV(input, type<HerderGitShaArgs>)
+    for (repository in g_client.repositories) {
+        if (repository.record.id != g_selected_repository_id) continue
+        for (worktree in repository.worktrees) {
+            if (worktree.path != g_selected_worktree_path) continue
+            for (commit in repository.history_commits) {
+                if (commit.worktree_path == worktree.path
+                        && commit.hash == args.sha) {
+                    request_commit_files(repository, worktree, commit.hash)
+                    return JV((ok = true, sha = commit.hash))
+                }
+            }
+        }
+    }
+    return JV((ok = false, error = "commit is not present in the observed history"))
+}
+
+[live_command(description = "Copy a Git SHA through the same verified clipboard path used by hover controls. Args: sha.")]
+def herder_git_copy_sha(input : JsonValue?) : JsonValue? {
+    let args = from_JV(input, type<HerderGitShaArgs>)
+    if (empty(args.sha)) return JV((ok = false, error = "sha is empty"))
+    queue_sha_copy(args.sha)
+    return JV((ok = g_clipboard_copy_verified,
+        sha = args.sha,
+        status = int(g_clipboard_copy_status),
+        pending = !empty(g_pending_clipboard_sha)))
+}
+
+[live_command(description = "Inspect the last Git SHA clipboard write without exposing unrelated clipboard contents.")]
+def herder_git_clipboard_state(_input : JsonValue?) : JsonValue? {
+    var copied_text = ""
+    let read_status = clipboard_get_text(copied_text)
+    let expected = !empty(g_pending_clipboard_sha) ? g_pending_clipboard_sha : g_last_copied_sha
+    return JV((ok = g_clipboard_copy_verified && read_status == ClipboardStatus.ok
+            && copied_text == expected,
+        last_sha = g_last_copied_sha,
+        pending_sha = g_pending_clipboard_sha,
+        write_status = int(g_clipboard_copy_status),
+        read_status = int(read_status),
+        attempts = g_clipboard_copy_attempts,
+        matches = read_status == ClipboardStatus.ok && copied_text == expected))
 }
 
 [live_command(description = "Switch Git Status perspective. Args: perspective = pr | history | tree.")]
@@ -2361,6 +2505,7 @@ def init() {
 def update() {
     if (!harness_begin_frame()) return
     if (g_client != null) g_client->pump()
+    service_sha_copy()
     drain_inspector_prepare_events()
     harness_new_frame()
     GetStyle().FontScaleMain = float(g_zoom_percent) / 100.0f

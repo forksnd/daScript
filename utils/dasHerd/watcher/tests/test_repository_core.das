@@ -130,6 +130,14 @@ def test_repository_review_parsing(t : T?) {
         t |> equal(length(graph_commits), 1)
         t |> equal(graph_commits[0].subject, "Merge work")
         t |> equal(graph_commits[0].parents, "parent-one parent-two")
+        var collision_commits : array<GitCommitState>
+        repository_parse_review_commits(
+            "deadbeef<|dasHerd-field|>deadbeef<|dasHerd-field|>1721577900<|dasHerd-field|>Agent<|dasHerd-field|>Mention <|dasHerd-field|> literally<|dasHerd-field|>parent-one\n",
+            "D:/Work/tree", collision_commits)
+        t |> equal(length(collision_commits), 1)
+        t |> equal(collision_commits[0].subject,
+            "Mention <|dasHerd-field|> literally")
+        t |> equal(collision_commits[0].parents, "parent-one")
     }
     t |> run("aggregate PR files retain rename provenance") <| @(t : T?) {
         var files : array<GitReviewFileState>

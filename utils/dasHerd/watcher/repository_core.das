@@ -1275,7 +1275,7 @@ def public repository_parse_review_commits(text : string; worktree_path : string
         if (time_end < 0) continue
         let author_end = find(line, delimiter, time_end + delimiter_length)
         if (author_end < 0) continue
-        let subject_end = delimiter == GIT_FIELD_SEPARATOR ? find(line, delimiter, author_end + delimiter_length) : -1
+        let subject_end = delimiter == GIT_FIELD_SEPARATOR ? rfind(line, delimiter) : -1
         var subject = slice(line, author_end + delimiter_length)
         var parents : string
         if (subject_end >= 0) {
