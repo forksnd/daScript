@@ -56,8 +56,11 @@ Store: `modules/dasLLAMA/performance/records/<box>.json` (official) +
 Already a llama-bench mirror (`-m -p -n -r`, same test shapes, no-sampling tg, warmup+reps).
 Grows into the one user-facing bench; everything else becomes a driver of it.
 
-- Add: `-t` (threads), `-ngl` (0 = CPU, >0 = Metal — llama.cpp's spelling), `-o json|md`
+- Add: `-t` (threads), `--ngl` (0 = CPU, else Metal `required` — llama.cpp's spelling), `-o json|md`
   (`md` = the community-legible llama-bench-style table; `json` = complete records).
+- `--json-path <file>` is the machine rail: engine `[I]`/tune logs share stdout, and an untuned
+  box's tune-then-relaunch merges stderr into stdout, so record consumers (the driver, the server
+  button) read the file, never the pipe. `-o json` still prints the records last on stdout.
 - Auto-tune-first, then relaunch with winners (the existing server-bench-child behavior).
 - `--ref <llama-bench>`: also runs llama-bench on the same GGUF (parses its `-o json`, which
   self-reports `build_commit` — provenance is automatic whatever binary is supplied) and emits
