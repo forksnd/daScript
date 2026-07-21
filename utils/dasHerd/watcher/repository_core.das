@@ -621,6 +621,10 @@ def private fail_refresh(var runtime : RepositoryRuntime?; message : string) {
     runtime.snapshot.refreshing = false
     runtime.snapshot.error = message
     changed(runtime)
+    if (runtime.rerun_pending) {
+        runtime.rerun_pending = false
+        runtime.refresh_pending = true
+    }
 }
 
 def private advance_repository(var runtime : RepositoryRuntime?) {
