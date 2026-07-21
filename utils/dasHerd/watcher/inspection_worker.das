@@ -9,10 +9,12 @@ require daslib/jobque_boost
 require daslib/rtti
 require daslib/base64
 require daslib/safe_addr
+require daslib/strings_boost
 require imgui/imgui_text_tree_sitter
 require imgui/imgui_markdown_tree_sitter
 require stbimage/stbimage_boost
 require ./file_inspection.das
+require math
 
 let private MAX_BINARY_PREVIEW_PIXELS = 64l * 1024l * 1024l
 
@@ -112,6 +114,141 @@ def private prepare_changed_source_ranges(source : string;
     return <- result
 }
 
+def private source_lines(source : string) : array<string> {
+    return <- split(source, "\n")
+}
+
+def public inspector_reconstruct_old_source(new_source : string;
+                                            patch : GitParsedPatch const) : string {
+    //! Rebuild the complete pre-change file without asking Git for another
+    //! projection. Unified hunks contain every removed line and enough
+    //! coordinates to splice them back into the complete resulting file.
+    var inscope new_lines <- source_lines(new_source)
+    var inscope old_lines : array<string>
+    old_lines |> reserve(length(new_lines) + length(patch.rows))
+    var new_cursor = 0
+    for (hunk in patch.hunks) {
+        let hunk_start = max(0, hunk.new_start - 1)
+        while (new_cursor < hunk_start && new_cursor < length(new_lines)) {
+            old_lines |> push(new_lines[new_cursor])
+            new_cursor++
+        }
+        var hunk_new_end = hunk_start
+        let row_end = min(length(patch.rows), hunk.row_start + hunk.row_count)
+        for (row_index in range(hunk.row_start, row_end)) {
+            let row = patch.rows[row_index]
+            if (row.old_line > 0) {
+                old_lines |> push(row.old_text)
+            }
+            if (row.new_line > 0) {
+                hunk_new_end = max(hunk_new_end, row.new_line)
+            }
+        }
+        new_cursor = max(new_cursor, hunk_new_end)
+    }
+    while (new_cursor < length(new_lines)) {
+        old_lines |> push(new_lines[new_cursor])
+        new_cursor++
+    }
+    return join(old_lines, "\n")
+}
+
+def private line_starts(source : string) : array<int> {
+    var result : array<int>
+    result |> reserve(max(1, length(source) / 40))
+    result |> push(0)
+    peek_data(source) $(bytes) {
+        for (index in range(length(bytes))) {
+            if (int(bytes[index]) == '\n') {
+                result |> push(index + 1)
+            }
+        }
+    }
+    return <- result
+}
+
+def private inspector_byte_at(source : string; index : int) : int {
+    var result = 0
+    peek_data(source) $(bytes) {
+        result = int(bytes[index])
+    }
+    return result
+}
+
+def private line_body_end(source : string; starts : array<int> const;
+                          line_index : int) : int {
+    var result = line_index + 1 < length(starts) ? starts[line_index + 1] - 1 : length(source)
+    if (result > starts[line_index] && inspector_byte_at(source, result - 1) == '\r') {
+        result--
+    }
+    return result
+}
+
+def private append_projected_span(var document : TextSourceDocument;
+                                  start_byte, end_byte : int;
+                                  style : TextSourceSyntaxStyle) {
+    if (end_byte <= start_byte) return
+    document.spans |> push(TextSourceSpan(
+        source = TextSourceRange(start_byte = start_byte, end_byte = end_byte),
+        syntax_style = style))
+}
+
+def public inspector_project_full_syntax(full : TextSourceDocument const;
+                                         aligned_source : string;
+                                         rows : array<GitDiffRow> const;
+                                         old_side : bool;
+                                         revision : int) : TextSourceDocument {
+    //! The visible diff remains compact, but every syntax decision originates
+    //! in the complete file. This avoids truncated declarations/comments
+    //! changing Tree-sitter's interpretation when context mode changes.
+    var result = TextSourceDocument(source = aligned_source, revision = revision)
+    var inscope full_starts <- line_starts(full.source)
+    var inscope aligned_starts <- line_starts(aligned_source)
+    var full_span_index = 0
+    for (row_index in range(min(length(rows), length(aligned_starts)))) {
+        let source_number = old_side ? rows[row_index].old_line : rows[row_index].new_line
+        let destination_start = aligned_starts[row_index]
+        let destination_end = line_body_end(aligned_source, aligned_starts, row_index)
+        var covered = destination_start
+        if (source_number > 0 && source_number <= length(full_starts)) {
+            let source_start = full_starts[source_number - 1]
+            let source_end = line_body_end(full.source, full_starts, source_number - 1)
+            while (full_span_index < length(full.spans)
+                    && full.spans[full_span_index].source.end_byte <= source_start) {
+                full_span_index++
+            }
+            var scan = full_span_index
+            while (scan < length(full.spans)) {
+                let span = full.spans[scan]
+                if (span.source.start_byte >= source_end) break
+                let clipped_start = max(source_start, span.source.start_byte)
+                let clipped_end = min(source_end, span.source.end_byte)
+                let projected_start = min(destination_end,
+                    destination_start + clipped_start - source_start)
+                let projected_end = min(destination_end,
+                    destination_start + clipped_end - source_start)
+                append_projected_span(result, covered, projected_start,
+                    TextSourceSyntaxStyle.none)
+                append_projected_span(result, projected_start, projected_end,
+                    span.syntax_style)
+                covered = max(covered, projected_end)
+                scan++
+            }
+        }
+        append_projected_span(result, covered, destination_end,
+            TextSourceSyntaxStyle.none)
+        if (row_index + 1 < length(aligned_starts)) {
+            append_projected_span(result, destination_end,
+                aligned_starts[row_index + 1], TextSourceSyntaxStyle.none)
+        }
+    }
+    if (empty(result.spans) && !empty(aligned_source)) {
+        append_projected_span(result, 0, length(aligned_source),
+            TextSourceSyntaxStyle.none)
+    }
+    return <- result
+}
+
 def private prepare_worker_main(var jobs : Channel?&;
                                 var events : Channel?&) {
     this_context().name := "dasHerd_inspector_prepare"
@@ -161,12 +298,20 @@ def private prepare_worker_main(var jobs : Channel?&;
                 if (!empty(prepared_patch.error)) {
                     failure = prepared_patch.error
                 } else {
-                    var prepared_old <- tree_sitter_source_document(
-                        prepared_patch.old_aligned_text, job.language,
-                        job.generation)
-                    var prepared_new <- tree_sitter_source_document(
-                        prepared_patch.new_aligned_text, job.language,
-                        job.generation)
+                    view_source = (job.view_available || !empty(job.view_text)) ? job.view_text : prepared_patch.new_text
+                    let old_source = inspector_reconstruct_old_source(
+                        view_source, prepared_patch)
+                    var full_old <- tree_sitter_source_document(
+                        old_source, job.language, job.generation)
+                    var full_new <- tree_sitter_source_document(
+                        view_source, job.language, job.generation)
+                    var prepared_old <- inspector_project_full_syntax(
+                        full_old, prepared_patch.old_aligned_text,
+                        prepared_patch.rows, true, job.generation)
+                    var prepared_new <- inspector_project_full_syntax(
+                        full_new, prepared_patch.new_aligned_text,
+                        prepared_patch.rows, false, job.generation)
+                    text_source_document_dispose(full_old)
                     prepared_old.line_numbers |> reserve(length(prepared_patch.rows))
                     prepared_new.line_numbers |> reserve(length(prepared_patch.rows))
                     for (index in range(length(prepared_patch.rows))) {
@@ -187,17 +332,14 @@ def private prepare_worker_main(var jobs : Channel?&;
                                 kind = TextSourceLineMarkKind.added))
                         }
                     }
-                    view_source = (job.view_available || !empty(job.view_text)) ? job.view_text : prepared_patch.new_text
                     if (!prepared_patch.binary) {
-                        var prepared_view <- tree_sitter_source_document(
-                            view_source, job.language, job.generation)
-                        prepared_view.line_marks |> reserve(
+                        full_new.line_marks |> reserve(
                             length(prepared_patch.new_changed_lines))
                         for (line in prepared_patch.new_changed_lines) {
-                            prepared_view.line_marks |> push(TextSourceLineMark(
+                            full_new.line_marks |> push(TextSourceLineMark(
                                 line_index = line, kind = TextSourceLineMarkKind.added))
                         }
-                        view_document <- prepared_view
+                        view_document <- full_new
                         if (job.language == "markdown") {
                             var prepared_markdown <- md_parse(view_source)
                             if (!prepared_markdown.ok) {
@@ -214,6 +356,8 @@ def private prepare_worker_main(var jobs : Channel?&;
                                     view_source, prepared_patch.new_changed_lines)
                             }
                         }
+                    } else {
+                        text_source_document_dispose(full_new)
                     }
                     if (prepared_patch.binary) {
                         if (job.view_byte_count > MAX_FILE_PREVIEW_RAW_BYTES) {

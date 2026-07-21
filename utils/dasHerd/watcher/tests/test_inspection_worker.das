@@ -3,6 +3,7 @@ options gc
 options persistent_heap
 
 require dastest/testing_boost public
+require ../file_inspection.das
 require ../inspection_worker.das
 require daslib/jobque_boost
 require daslib/utf8_utils
@@ -18,6 +19,37 @@ def test_inspection_prepare_worker(t : T?) {
             "cpp", 1)
         tt |> equal(length(cpp.spans) > 1, true)
         text_source_document_dispose(cpp)
+    }
+    t |> run("compact Diff projects syntax from complete files") <| @(tt : T?) {
+        let complete_new = "options gen2\n\nstruct Sample \{\n    value : int\n\}\n\ndef answer(sample : Sample) : int \{\n    return sample.value + 1\n\}\n"
+        let compact_patch = "diff --git a/a.das b/a.das\n--- a/a.das\n+++ b/a.das\n@@ -8 +8 @@\n-    return sample.value\n+    return sample.value + 1\n"
+        var parsed <- git_parse_unified_patch(compact_patch)
+        let complete_old = inspector_reconstruct_old_source(complete_new, parsed)
+        tt |> equal(complete_old,
+            "options gen2\n\nstruct Sample \{\n    value : int\n\}\n\ndef answer(sample : Sample) : int \{\n    return sample.value\n\}\n")
+        var full_old <- tree_sitter_source_document(complete_old, "daslang", 21)
+        var full_new <- tree_sitter_source_document(complete_new, "daslang", 21)
+        var compact_old <- inspector_project_full_syntax(full_old,
+            parsed.old_aligned_text, parsed.rows, true, 21)
+        var compact_new <- inspector_project_full_syntax(full_new,
+            parsed.new_aligned_text, parsed.rows, false, 21)
+        tt |> success(length(compact_old.spans) > 1,
+            "old compact row retains complete-file syntax")
+        tt |> success(length(compact_new.spans) > 1,
+            "new compact row retains complete-file syntax")
+        var saw_keyword = false
+        for (span in compact_new.spans) {
+            if (span.syntax_style == TextSourceSyntaxStyle.keyword) {
+                saw_keyword = true
+            }
+        }
+        tt |> success(saw_keyword,
+            "the return keyword remains highlighted outside full context")
+        text_source_document_dispose(compact_old)
+        text_source_document_dispose(compact_new)
+        text_source_document_dispose(full_old)
+        text_source_document_dispose(full_new)
+        git_parsed_patch_dispose(parsed)
     }
     t |> run("worker prepares syntax off-thread and shuts down cleanly") <| @(t : T?) {
         t |> equal(is_utf8_string_valid("Καλημέρα, мир, こんにちは, 🐑"), true)

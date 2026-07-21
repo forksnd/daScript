@@ -443,8 +443,9 @@ perspectives share one file list and the existing Diff/View inspector:
 - **PR** answers what this worktree will send for review. Its included result
   is the aggregate change from the worktree's recorded merge base through the
   index: outgoing commits plus staged changes. Unstaged and untracked files
-  remain visible in a subdued Not Included section because they may be work an
-  agent forgot to stage. A path with staged and later unstaged edits appears in
+  remain visible first as subdued rows because they may be work an agent forgot
+  to stage; color carries that state without a redundant Not Included label. A
+  path with staged and later unstaged edits appears in
   both layers; the included row inspects the index result and the subdued row
   inspects the remaining working delta.
 - **History** shows the selected worktree's current branch, newest-first commit
@@ -471,11 +472,17 @@ History and graph loading are bounded and incremental. The initial target is
 200 commits with additional pages requested near the end, rather than an
 unbounded UI-thread query.
 
-The first vertical slice implements PR, History, and Tree as tabs. History and
-Tree share the same 200-commit result, selected-commit file result, and
-revision-pinned Diff/View inspector. Tree currently groups all local and remote
-branch refs; drawing parent edges and paging beyond 200 commits remain the next
-graph-specific layer. Git 2.17 cannot capture a blob with `git show --output`,
+The first vertical slice implements PR, History, and Tree as tabs over a shared
+top file surface. Rows show exact added/deleted counts, style path components
+and separators separately, keep local-only changes subdued and first, and
+reveal stage/unstage controls only on hover. History and Tree share the same
+selected-commit file result and revision-pinned Diff/View inspector. Tree reads
+up to 200 commits across all refs and renders virtualized, stable-color parent
+lanes, merge connectors, commit nodes, and local/remote ref labels; paging
+beyond 200 commits remains the next graph-specific layer. Hovering a commit
+reveals a copy control for its full SHA, establishing the context-icon pattern
+that a future GitHub PR-number label will reuse. Git 2.17 cannot capture a blob
+with `git show --output`,
 so full staged/commit View runs a small daScript capture helper as a hosted task.
 It uses argv-based Git execution and binary pipes, preserving image bytes
 without shell redirection or quoting.
@@ -520,13 +527,16 @@ inspection semantic and avoids screenshot-only validation.
 The implemented working-tree path deliberately separates compact Diff from
 complete View. Git emits three context lines into the hosted terminal, while
 the resulting working file is read as exact bytes after the task succeeds.
-Large unwrapped Views virtualize visible lines; disconnected daScript hunks use
-lexical recovery for Tree-sitter gaps. The current measured stress case is a
+Large unwrapped Views virtualize visible lines. Every compact, expanded, or
+full Diff request now reconstructs the complete pre-change file from the
+complete result plus its unified patch, runs syntax preparation on both
+complete files, and projects those stable syntax roles onto the visible aligned
+rows. Context switching therefore cannot reinterpret a truncated declaration,
+comment, or scope. The current measured stress case is a
 628 KiB/12,116-line file: Diff is ready in about 0.6 seconds, synchronized
 scrolling is exact in both directions, and the prepared View renders at roughly
-50 FPS at 4K/150% zoom. Full-file syntax preparation is still a one-time
-multi-second cost and remains the next focused optimization, not a reason to
-replace Git's native diff.
+50 FPS at 4K/150% zoom. Syntax preparation remains off the UI thread and newest
+request wins; the projection pass is linear in source spans and visible rows.
 
 ### Diff vertical slice
 

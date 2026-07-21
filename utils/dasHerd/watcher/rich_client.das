@@ -4,6 +4,8 @@ options persistent_heap
 options no_unused_function_arguments = false
 
 require imgui/imgui_harness
+require imgui/imgui_icons
+require imgui/imgui_drawlist_builtin
 require imgui/imgui_terminal
 require imgui/imgui_fonts
 require imgui/imgui_docking_builtin
@@ -16,6 +18,7 @@ require daslib/safe_addr
 require daslib/json
 require daslib/json_boost
 require daslib/jobque_boost
+require daslib/strings_boost
 require daslib/utf8_utils
 require live/live_commands
 require ./watcher_core.das
@@ -216,13 +219,9 @@ var private g_jobque_owned = false
 var private SESSION_ROW : table<int; ToggleState>
 var private WORKTREE_ROW : table<int; ToggleState>
 var private GIT_FILE_ROW : table<int; ToggleState>
-var private GIT_ACTION_BUTTON : table<int; ClickState>
-var private GIT_ACTION_DISABLED : table<int; NarrativeState>
-var private GIT_ACTION_SAME_LINE : table<int; EmptyMarkerState>
 var private GIT_COMMIT_TEXT : table<int; NarrativeState>
 var private GIT_HISTORY_COMMIT_ROW : table<int; ToggleState>
 var private GIT_COMMIT_FILE_ROW : table<int; ToggleState>
-var private GIT_REF_ROW : table<int; ToggleState>
 var private REPOSITORY_ERROR : table<int; NarrativeState>
 var private REPOSITORY_TITLE : table<int; NarrativeState>
 var private REPOSITORY_EMPTY : table<int; NarrativeState>
@@ -231,6 +230,7 @@ var private REPOSITORY_SEPARATOR : table<int; EmptyMarkerState>
 var private WORKTREE_SEPARATOR : table<int; EmptyMarkerState>
 var private GIT_GROUP_SEPARATOR : table<int; EmptyMarkerState>
 var private GIT_GROUP_SPACING : table<int; EmptyMarkerState>
+var private GIT_HOVER_TOOLTIP : NarrativeState
 
 def private setup_default_layout(dock_id : uint) {
     DockBuilderRemoveNode(dock_id)
@@ -1105,44 +1105,109 @@ def private git_status_file_code(repository : RepositorySnapshot const;
     return ""
 }
 
+def private git_line_stats(added_lines, deleted_lines : int;
+                           stats_known, binary : bool) : string {
+    if (binary) return "binary"
+    if (!stats_known) return "+?  -?"
+    return "+{added_lines}  -{deleted_lines}"
+}
+
+def private draw_git_path_text(path : string; p0, p1 : float2;
+                               subdued : bool) {
+    let alpha = subdued ? 0.55f : 1.0f
+    let directory_color = GetColorU32(float4(0.43f, 0.64f, 0.82f, alpha))
+    let separator_color = GetColorU32(float4(0.78f, 0.55f, 0.30f, alpha))
+    let name_color = GetColorU32(float4(0.90f, 0.91f, 0.93f, alpha))
+    var inscope components <- split(replace(path, "\\", "/"), "/")
+    var position = p0
+    with_window_drawlist() $(var dl) {
+        dl |> with_drawlist_clip_rect(p0, p1, true) {
+            for (index in range(length(components))) {
+                let component = components[index]
+                let color = index + 1 == length(components) ? name_color : directory_color
+                dl |> add_text(position, color, component)
+                position.x += CalcTextSize(component).x
+                if (index + 1 < length(components)) {
+                    dl |> add_text(position, separator_color, "/")
+                    position.x += CalcTextSize("/").x
+                }
+            }
+        }
+    }
+}
+
+def private draw_git_stats_text(position : float2; color : uint;
+                                stats : string) {
+    with_window_drawlist() $(var dl) {
+        dl |> add_text(position, color, stats)
+    }
+}
+
+def private decorate_git_file_row(row_id, path : string;
+                                  added_lines, deleted_lines : int;
+                                  stats_known, binary, subdued : bool;
+                                  action_glyph, action_tip : string;
+                                  var action_clicked : bool&) {
+    let stats = git_line_stats(added_lines, deleted_lines, stats_known, binary)
+    let row_min = GetItemRectMin()
+    let row_max = GetItemRectMax()
+    let hovered = IsItemHovered()
+    let icon_size = max(12.0f, GetTextLineHeight() - 3.0f)
+    let icon_width = icon_size + GetStyle().FramePadding.x * 2.0f
+    let action_x = row_max.x - icon_width
+    let stats_size = CalcTextSize(stats)
+    let stats_x = max(row_min.x, action_x - stats_size.x - GetStyle().ItemSpacing.x)
+    let text_y = row_min.y + max(0.0f,
+        (row_max.y - row_min.y - GetTextLineHeight()) * 0.5f)
+    draw_git_path_text(path,
+        float2(row_min.x + GetStyle().FramePadding.x, text_y),
+        float2(stats_x - GetStyle().ItemSpacing.x, row_max.y), subdued)
+    let stats_color = binary || !stats_known ? GetColorU32(ImGuiCol.TextDisabled) : GetColorU32(float4(0.61f, 0.78f, 0.52f, subdued ? 0.55f : 1.0f))
+    draw_git_stats_text(float2(stats_x, text_y), stats_color, stats)
+    action_clicked = false
+    if (!empty(action_glyph)) {
+        action_clicked = icon_button_draw_at("##{row_id}:action", action_glyph,
+            float2(action_x, row_min.y), icon_size, 1.0f, hovered)
+        if (hovered && IsItemHovered()) {
+            set_tooltip(GIT_HOVER_TOOLTIP, action_tip)
+        }
+    }
+}
+
 def private draw_pr_included_files(repository : RepositorySnapshot const;
                                    worktree : WorktreeState const;
-                                   var file_row : int&;
-                                   var action_row : int&) : int {
+                                   var file_row : int&) : int {
     var count = 0
     for (file in repository.review_files) {
         if (file.worktree_path == worktree.path) count++
     }
-    text(GIT_GROUP_TITLE[10], (text = "PR TOTAL  {count}"))
-    separator(GIT_GROUP_SEPARATOR[10])
     for (file in repository.review_files) {
         if (file.worktree_path != worktree.path) continue
         let status_code = git_status_file_code(
             repository, worktree.path, file.path)
         let staged = (!empty(status_code) && status_code != "??"
             && git_status_byte(status_code, 0) != ' ')
-        if (staged) {
-            let busy = g_client != null && g_client.git_action_loading
-            let action_label = ((busy && g_client.git_action_file_path == file.path)
-                ? "Unstaging..." : "Unstage")
-            if (busy) {
-                text_disabled(GIT_ACTION_DISABLED[action_row],
-                    (text = action_label))
-            } elif (small_button(GIT_ACTION_BUTTON[action_row],
-                    (text = "{action_label}##pr-unstage:{file.path}"))
-                    && g_client != null) {
-                g_client->git_file_action(repository.record.id,
-                    worktree.path, file.path, "unstage")
-            }
-            same_line(GIT_ACTION_SAME_LINE[action_row])
-        }
         GIT_FILE_ROW[file_row].value = (g_inspector.repository_id == repository.record.id
             && g_inspector.worktree_path == worktree.path
             && g_inspector.file_path == file.path
             && g_inspector.comparison == "pr")
-        let old_label = !empty(file.old_path) ? "  (from {file.old_path})" : ""
-        if (selectable(GIT_FILE_ROW[file_row],
-                (text = "{file.code}  {file.path}{old_label}##pr:{file.path}"))) {
+        let busy = g_client != null && g_client.git_action_loading
+        var action_clicked = false
+        let stats = git_line_stats(file.added_lines, file.deleted_lines,
+            file.stats_known, file.binary)
+        var selected = false
+        with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
+            selected = selectable(GIT_FILE_ROW[file_row],
+                (text = "{file.path}  {stats}##pr:{file.path}"))
+        }
+        decorate_git_file_row("pr:{file.path}", file.path, file.added_lines,
+            file.deleted_lines, file.stats_known, file.binary, false,
+            staged && !busy ? "minus" : "",
+            "Remove from the staged PR result", action_clicked)
+        if (action_clicked && g_client != null) {
+            g_client->git_file_action(repository.record.id,
+                worktree.path, file.path, "unstage")
+        } elif (selected) {
             if (g_client != null) {
                 g_client->inspect_file(repository.record.id, worktree.path,
                     file.path, "pr")
@@ -1151,58 +1216,88 @@ def private draw_pr_included_files(repository : RepositorySnapshot const;
             }
         }
         file_row++
-        action_row++
     }
     return count
 }
 
 def private draw_pr_not_included_files(repository : RepositorySnapshot const;
                                        worktree : WorktreeState const;
-                                       var file_row : int&;
-                                       var action_row : int&) : int {
+                                       var file_row : int&) : int {
     var count = 0
     for (file in repository.files) {
         if (file.worktree_path != worktree.path) continue
         if (file.code == "??" || git_status_byte(file.code, 1) != ' ') count++
     }
-    text(GIT_GROUP_TITLE[11], (text = "NOT INCLUDED  {count}"))
-    separator(GIT_GROUP_SEPARATOR[11])
     for (file in repository.files) {
         if (file.worktree_path != worktree.path
                 || (file.code != "??" && git_status_byte(file.code, 1) == ' ')) continue
-        let busy = g_client != null && g_client.git_action_loading
-        let action_label = ((busy && g_client.git_action_file_path == file.path)
-            ? "Staging..." : "Stage")
-        if (busy) {
-            text_disabled(GIT_ACTION_DISABLED[action_row],
-                (text = action_label))
-        } elif (small_button(GIT_ACTION_BUTTON[action_row],
-                (text = "{action_label}##pr-stage:{file.path}"))
-                && g_client != null) {
-            g_client->git_file_action(repository.record.id,
-                worktree.path, file.path, "stage")
-        }
-        same_line(GIT_ACTION_SAME_LINE[action_row])
         GIT_FILE_ROW[file_row].value = (g_inspector.repository_id == repository.record.id
             && g_inspector.worktree_path == worktree.path
             && g_inspector.file_path == file.path
             && g_inspector.comparison == "working")
-        let old_label = !empty(file.old_path) ? "  (from {file.old_path})" : ""
+        let busy = g_client != null && g_client.git_action_loading
+        var action_clicked = false
+        let stats = git_line_stats(file.added_lines, file.deleted_lines,
+            file.stats_known, file.binary)
         var selected = false
-        with_style((ImGuiCol.Text, GetStyleColorVec4(ImGuiCol.TextDisabled))) {
+        with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
             selected = selectable(GIT_FILE_ROW[file_row],
-                (text = "{file.code}  {file.path}{old_label}##working:{file.path}"))
+                (text = "{file.path}  {stats}##working:{file.path}"))
         }
-        if (selected && g_client != null) {
+        decorate_git_file_row("working:{file.path}", file.path, file.added_lines,
+            file.deleted_lines, file.stats_known, file.binary, true,
+            busy ? "" : "check", "Add to the staged PR result",
+            action_clicked)
+        if (action_clicked && g_client != null) {
+            g_client->git_file_action(repository.record.id,
+                worktree.path, file.path, "stage")
+        } elif (selected && g_client != null) {
             g_client->inspect_file(repository.record.id, worktree.path,
                 file.path, "working")
             FILE_INSPECTOR_WIN.open = true
             FILE_INSPECTOR_WIN.pending_raise = true
         }
         file_row++
-        action_row++
     }
     return count
+}
+
+def private draw_shared_pr_files(repository : RepositorySnapshot const;
+                                 worktree : WorktreeState const) {
+    var file_row = 0
+    let not_included = draw_pr_not_included_files(
+        repository, worktree, file_row)
+    if (not_included > 0) {
+        separator(GIT_GROUP_SEPARATOR[11])
+    }
+    let included = draw_pr_included_files(
+        repository, worktree, file_row)
+    if (included == 0 && not_included == 0 && !worktree.review_loading
+            && empty(worktree.review_error)) {
+        text_disabled("Nothing to send or stage")
+    }
+    if (worktree.review_loading) text_disabled("Refreshing worktree PR...")
+    if (!empty(worktree.review_error)) {
+        text_colored(GIT_ERROR,
+            (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
+            text = worktree.review_error))
+    }
+}
+
+def private draw_sha_copy_icon(hash, row_id : string) {
+    let row_min = GetItemRectMin()
+    let row_max = GetItemRectMax()
+    let hovered = IsItemHovered()
+    let icon_size = max(12.0f, GetTextLineHeight() - 3.0f)
+    let icon_width = icon_size + GetStyle().FramePadding.x * 2.0f
+    if (icon_button_draw_at("##{row_id}:copy-sha", "duplicate",
+            float2(row_max.x - icon_width, row_min.y), icon_size, 1.0f,
+            hovered)) {
+        let _ = clipboard_set_text(hash)
+    }
+    if (hovered && IsItemHovered()) {
+        set_tooltip(GIT_HOVER_TOOLTIP, "Copy full SHA")
+    }
 }
 
 def private draw_pr_review(repository : RepositorySnapshot const;
@@ -1221,31 +1316,12 @@ def private draw_pr_review(repository : RepositorySnapshot const;
         if (commit.worktree_path != worktree.path) continue
         text(GIT_COMMIT_TEXT[commit_row],
             (text = "{commit.short_hash}  {commit.subject}  - {commit.author}"))
+        draw_sha_copy_icon(commit.hash, "pr-commit:{commit.hash}")
         commit_row++
     }
     if (commit_count == 0 && !worktree.review_loading
             && empty(worktree.review_error)) {
         text_disabled("No outgoing commits")
-    }
-    if (worktree.review_loading) {
-        text_disabled("Refreshing worktree PR...")
-    }
-    if (!empty(worktree.review_error)) {
-        text_colored(GIT_ERROR,
-            (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
-            text = worktree.review_error))
-    }
-    separator()
-    var file_row = 0
-    var action_row = 0
-    let included = draw_pr_included_files(
-        repository, worktree, file_row, action_row)
-    dummy(GIT_GROUP_SPACING[10], (size = float2(0.0f, GetStyle().ItemSpacing.y)))
-    let not_included = draw_pr_not_included_files(
-        repository, worktree, file_row, action_row)
-    if (included == 0 && not_included == 0 && !worktree.review_loading
-            && empty(worktree.review_error)) {
-        text_disabled("Nothing to send or stage")
     }
 }
 
@@ -1314,6 +1390,7 @@ def private draw_history_commits(repository : RepositorySnapshot const;
             g_client->request_repository_commit_files(
                 repository.record.id, worktree.path, commit.hash)
         }
+        draw_sha_copy_icon(commit.hash, "history:{commit.hash}")
         row++
     }
     if (worktree.history_loading) text_disabled("Reading Git history...")
@@ -1332,30 +1409,182 @@ def private draw_history_review(repository : RepositorySnapshot const;
     draw_history_commits(repository, worktree)
 }
 
-def private draw_ref_group(repository : RepositorySnapshot const;
-                           worktree : WorktreeState const; remote : bool;
-                           var row : int&) : int {
-    var count = 0
-    for (ref in repository.refs) {
-        if (ref.worktree_path == worktree.path && ref.remote == remote) count++
+def private git_lane_index(lanes : array<string> const; hash : string) : int {
+    for (index in range(length(lanes))) {
+        if (lanes[index] == hash) return index
     }
-    let group = remote ? 23 : 22
-    text(GIT_GROUP_TITLE[group],
-        (text = remote ? "REMOTE BRANCHES  {count}" : "LOCAL BRANCHES  {count}"))
-    separator(GIT_GROUP_SEPARATOR[group])
-    for (ref in repository.refs) {
-        if (ref.worktree_path != worktree.path || ref.remote != remote) continue
-        GIT_REF_ROW[row].value = ref.name == worktree.history_ref
-        let marker = ref.current ? "* " : "  "
-        if (selectable(GIT_REF_ROW[row],
-                (text = "{marker}{ref.name}##ref:{ref.full_name}"))
-                && g_client != null && ref.name != worktree.history_ref) {
-            g_client->request_repository_history(
-                repository.record.id, worktree.path, ref.name)
+    return -1
+}
+
+def private git_graph_color(hash : string; alpha : float = 1.0f) : uint {
+    let slot = empty(hash) ? 0 : git_status_byte(hash, 0) % 6
+    if (slot == 0) return GetColorU32(float4(0.33f, 0.72f, 0.95f, alpha))
+    if (slot == 1) return GetColorU32(float4(0.94f, 0.53f, 0.37f, alpha))
+    if (slot == 2) return GetColorU32(float4(0.53f, 0.82f, 0.43f, alpha))
+    if (slot == 3) return GetColorU32(float4(0.76f, 0.55f, 0.94f, alpha))
+    if (slot == 4) return GetColorU32(float4(0.96f, 0.76f, 0.31f, alpha))
+    return GetColorU32(float4(0.34f, 0.83f, 0.75f, alpha))
+}
+
+def private git_prepare_lanes(commit : GitCommitState const;
+                              var lanes : array<string>) : int {
+    var lane = git_lane_index(lanes, commit.hash)
+    if (lane < 0) {
+        lanes |> push(commit.hash)
+        lane = length(lanes) - 1
+    }
+    var parent_number = 0
+    for (parent in split(commit.parents, " ")) {
+        if (empty(parent)) continue
+        if (parent_number > 0 && git_lane_index(lanes, parent) < 0) {
+            lanes |> push(parent)
         }
-        row++
+        parent_number++
     }
-    return count
+    return lane
+}
+
+def private git_finish_lanes(commit : GitCommitState const; lane : int;
+                             var lanes : array<string>) {
+    var first_parent = ""
+    for (parent in split(commit.parents, " ")) {
+        if (!empty(parent)) {
+            first_parent = parent
+            break
+        }
+    }
+    if (empty(first_parent)) {
+        lanes |> erase(lane)
+    } else {
+        lanes[lane] = first_parent
+        var duplicate = length(lanes) - 1
+        while (duplicate > lane) {
+            if (lanes[duplicate] == first_parent) lanes |> erase(duplicate)
+            duplicate--
+        }
+    }
+}
+
+def private git_advance_lanes(commit : GitCommitState const;
+                              var lanes : array<string>) {
+    let lane = git_prepare_lanes(commit, lanes)
+    git_finish_lanes(commit, lane, lanes)
+}
+
+def private draw_commit_graph_decoration(repository : RepositorySnapshot const;
+                                         worktree : WorktreeState const;
+                                         commit : GitCommitState const;
+                                         var lanes : array<string>;
+                                         row_id : string) {
+    let lane = git_prepare_lanes(commit, lanes)
+    let row_min = GetItemRectMin()
+    let row_max = GetItemRectMax()
+    let center_y = (row_min.y + row_max.y) * 0.5f
+    let lane_spacing = 14.0f
+    let graph_x = row_min.x + 8.0f
+    let graph_width = 126.0f
+    var inscope parents <- split(commit.parents, " ")
+    with_window_drawlist() $(var dl) {
+        for (index in range(length(lanes))) {
+            let x = graph_x + float(index) * lane_spacing
+            dl |> add_line(float2(x, row_min.y), float2(x, row_max.y),
+                git_graph_color(lanes[index], 0.72f), 2.0f)
+        }
+        let node_x = graph_x + float(lane) * lane_spacing
+        var parent_number = 0
+        for (parent in parents) {
+            if (empty(parent)) continue
+            if (parent_number > 0) {
+                let parent_lane = git_lane_index(lanes, parent)
+                let parent_x = graph_x + float(parent_lane) * lane_spacing
+                dl |> add_line(float2(node_x, center_y),
+                    float2(parent_x, row_max.y), git_graph_color(parent, 0.85f), 2.0f)
+            }
+            parent_number++
+        }
+        dl |> add_circle_filled(float2(node_x, center_y), 4.5f,
+            git_graph_color(commit.hash), 12)
+        dl |> add_circle(float2(node_x, center_y), 5.8f,
+            GetColorU32(ImGuiCol.WindowBg), 12, 1.4f)
+
+        var text_x = row_min.x + graph_width
+        var label_count = 0
+        for (ref in repository.refs) {
+            if (ref.worktree_path != worktree.path || ref.hash != commit.hash
+                    || ends_with(ref.name, "/HEAD") || label_count >= 3) continue
+            let label_size = CalcTextSize(ref.name)
+            let label_min = float2(text_x, center_y - label_size.y * 0.5f - 2.0f)
+            let label_max = float2(text_x + label_size.x + 10.0f,
+                center_y + label_size.y * 0.5f + 2.0f)
+            dl |> add_rect_filled(label_min, label_max,
+                git_graph_color(commit.hash, ref.current ? 0.52f : 0.28f),
+                4.0f, ImDrawFlags.None)
+            dl |> add_text(float2(text_x + 5.0f,
+                center_y - label_size.y * 0.5f),
+                GetColorU32(ImGuiCol.Text), ref.name)
+            text_x = label_max.x + 6.0f
+            label_count++
+        }
+        dl |> add_text(float2(text_x, center_y - GetTextLineHeight() * 0.5f),
+            GetColorU32(ImGuiCol.Text), commit.subject)
+    }
+
+    let hovered = IsItemHovered()
+    let icon_size = max(12.0f, GetTextLineHeight() - 3.0f)
+    let icon_width = icon_size + GetStyle().FramePadding.x * 2.0f
+    if (icon_button_draw_at("##{row_id}:copy-sha", "duplicate",
+            float2(row_max.x - icon_width, row_min.y), icon_size, 1.0f,
+            hovered)) {
+        let _ = clipboard_set_text(commit.hash)
+    }
+    if (hovered && IsItemHovered()) {
+        set_tooltip(GIT_HOVER_TOOLTIP, "Copy full SHA")
+    }
+
+    git_finish_lanes(commit, lane, lanes)
+}
+
+def private draw_commit_graph(repository : RepositorySnapshot const;
+                              worktree : WorktreeState const) {
+    var inscope lanes : array<string>
+    var inscope commit_indices : array<int>
+    commit_indices |> reserve(length(repository.history_commits))
+    for (index in range(length(repository.history_commits))) {
+        if (repository.history_commits[index].worktree_path == worktree.path) {
+            commit_indices |> push(index)
+        }
+    }
+    var graph_cursor = 0
+    list_clipper(length(commit_indices)) $(start, end_) {
+        while (graph_cursor < start) {
+            git_advance_lanes(repository.history_commits[
+                commit_indices[graph_cursor]], lanes)
+            graph_cursor++
+        }
+        for (row in range(start, end_)) {
+            let commit = repository.history_commits[commit_indices[row]]
+            GIT_HISTORY_COMMIT_ROW[row].value = commit.hash == worktree.history_commit
+            var selected = false
+            with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
+                selected = selectable(GIT_HISTORY_COMMIT_ROW[row],
+                    (text = "{commit.short_hash}  {commit.subject}##graph:{commit.hash}"))
+            }
+            draw_commit_graph_decoration(repository, worktree, commit, lanes,
+                "graph:{commit.hash}")
+            if (selected && g_client != null
+                    && commit.hash != worktree.history_commit) {
+                g_client->request_repository_commit_files(
+                    repository.record.id, worktree.path, commit.hash)
+            }
+            graph_cursor++
+        }
+    }
+    if (worktree.history_loading) text_disabled("Reading commit graph...")
+    if (!empty(worktree.history_error)) {
+        text_colored(GIT_ERROR,
+            (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
+            text = worktree.history_error))
+    }
 }
 
 def private draw_tree_review(repository : RepositorySnapshot const;
@@ -1366,22 +1595,16 @@ def private draw_tree_review(repository : RepositorySnapshot const;
             g_client->request_repository_refs(repository.record.id, worktree.path)
         }
     }
-    var row = 0
-    let local_count = draw_ref_group(repository, worktree, false, row)
-    dummy(GIT_GROUP_SPACING[22], (size = float2(0.0f, GetStyle().ItemSpacing.y)))
-    let remote_count = draw_ref_group(repository, worktree, true, row)
     if (worktree.refs_loading) text_disabled("Reading local and remote branches...")
     if (!empty(worktree.refs_error)) {
         text_colored(GIT_ERROR,
             (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
             text = worktree.refs_error))
     }
-    if (local_count + remote_count == 0 && !worktree.refs_loading
-            && empty(worktree.refs_error)) {
-        text_disabled("No branches found")
-    }
+    ensure_history(repository, worktree, "__all__")
+    draw_commit_graph(repository, worktree)
     separator()
-    draw_history_commits(repository, worktree)
+    draw_commit_files(repository, worktree)
 }
 
 def private draw_git_status_window() {
@@ -1416,6 +1639,8 @@ def private draw_git_status_window() {
                     text_colored(GIT_ERROR, (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
                         text = repository.error))
                 }
+                separator()
+                draw_shared_pr_files(repository, worktree)
                 separator()
                 tab_bar(GIT_PERSPECTIVE_TABS,
                         (text = "Git perspectives", flags = ImGuiTabBarFlags.None)) {
@@ -1724,7 +1949,8 @@ def herder_git_review_state(_input : JsonValue?) : JsonValue? {
                     commits |> push(JV((hash = commit.hash,
                         short_hash = commit.short_hash,
                         authored_at = commit.authored_at,
-                        author = commit.author, subject = commit.subject)))
+                        author = commit.author, subject = commit.subject,
+                        parents = commit.parents)))
                 }
                 for (file in repository.review_files) {
                     if (file.worktree_path != worktree.path) continue
@@ -1732,6 +1958,9 @@ def herder_git_review_state(_input : JsonValue?) : JsonValue? {
                         repository, worktree.path, file.path)
                     included |> push(JV((code = file.code, path = file.path,
                         old_path = file.old_path,
+                        added_lines = file.added_lines,
+                        deleted_lines = file.deleted_lines,
+                        stats_known = file.stats_known, binary = file.binary,
                         staged = (!empty(status_code) && status_code != "??"
                             && git_status_byte(status_code, 0) != ' '))))
                 }
@@ -1740,7 +1969,10 @@ def herder_git_review_state(_input : JsonValue?) : JsonValue? {
                             || (file.code != "??"
                                 && git_status_byte(file.code, 1) == ' ')) continue
                     not_included |> push(JV((code = file.code,
-                        path = file.path, old_path = file.old_path)))
+                        path = file.path, old_path = file.old_path,
+                        added_lines = file.added_lines,
+                        deleted_lines = file.deleted_lines,
+                        stats_known = file.stats_known, binary = file.binary)))
                 }
                 return JV((ok = empty(worktree.review_error),
                     repository_id = repository.record.id,
@@ -1781,14 +2013,18 @@ def herder_git_history_state(_input : JsonValue?) : JsonValue? {
                     commits |> push(JV((hash = commit.hash,
                         short_hash = commit.short_hash,
                         authored_at = commit.authored_at,
-                        author = commit.author, subject = commit.subject)))
+                        author = commit.author, subject = commit.subject,
+                        parents = commit.parents)))
                 }
                 for (file in repository.commit_files) {
                     if (file.worktree_path != worktree.path
                             || file.commit_hash != worktree.history_commit) continue
                     files |> push(JV((commit_hash = file.commit_hash,
                         code = file.code, path = file.path,
-                        old_path = file.old_path)))
+                        old_path = file.old_path,
+                        added_lines = file.added_lines,
+                        deleted_lines = file.deleted_lines,
+                        stats_known = file.stats_known, binary = file.binary)))
                 }
                 return JV((ok = empty(worktree.history_error)
                         && empty(worktree.refs_error),
@@ -1818,6 +2054,12 @@ def herder_git_perspective(input : JsonValue?) : JsonValue? {
         GIT_HISTORY_TAB.pending_select = true
     } elif (perspective == "tree") {
         GIT_TREE_TAB.pending_select = true
+        if (g_client != null && g_client.connected
+                && !empty(g_selected_repository_id)
+                && !empty(g_selected_worktree_path)) {
+            g_client->request_repository_history(g_selected_repository_id,
+                g_selected_worktree_path, "__all__")
+        }
     } else {
         return JV((ok = false, error = "perspective must be pr, history, or tree"))
     }

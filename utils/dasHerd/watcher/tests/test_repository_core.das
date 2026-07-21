@@ -123,6 +123,13 @@ def test_repository_review_parsing(t : T?) {
         t |> equal(commits[0].short_hash, "01234567")
         t |> equal(commits[0].authored_at, 1721577600l)
         t |> equal(commits[1].subject, "Subject\twith tab")
+        var graph_commits : array<GitCommitState>
+        repository_parse_review_commits(
+            "feedface<|dasHerd-field|>feedface<|dasHerd-field|>1721577800<|dasHerd-field|>Agent<|dasHerd-field|>Merge work<|dasHerd-field|>parent-one parent-two\n",
+            "D:/Work/tree", graph_commits)
+        t |> equal(length(graph_commits), 1)
+        t |> equal(graph_commits[0].subject, "Merge work")
+        t |> equal(graph_commits[0].parents, "parent-one parent-two")
     }
     t |> run("aggregate PR files retain rename provenance") <| @(t : T?) {
         var files : array<GitReviewFileState>
@@ -134,6 +141,17 @@ def test_repository_review_parsing(t : T?) {
         t |> equal(files[1].path, "docs/new.md")
         t |> equal(files[2].old_path, "old name.cpp")
         t |> equal(files[2].path, "new name.cpp")
+        var stats : array<GitReviewFileState>
+        repository_parse_review_files(
+            "12  3  src/main.das\n0  0  old.cpp => src/new.cpp\n-  -  assets/image.png\n",
+            "D:/Work/tree", stats)
+        t |> equal(length(stats), 3)
+        t |> equal(stats[0].added_lines, 12)
+        t |> equal(stats[0].deleted_lines, 3)
+        t |> success(stats[0].stats_known)
+        t |> equal(stats[1].path, "src/new.cpp")
+        t |> success(stats[2].binary)
+        t |> success(!stats[2].stats_known)
     }
     t |> run("aggregate PR diffs compare the merge base with the index") <| @(t : T?) {
         var argv : array<string>
@@ -165,6 +183,19 @@ def test_repository_review_parsing(t : T?) {
         t |> success(refs[0].current)
         t |> success(!refs[0].remote)
         t |> success(refs[1].remote)
+    }
+    t |> run("working numstat updates only matching worktree files") <| @(t : T?) {
+        var files : array<GitFileState> <- [
+            GitFileState(worktree_path = "D:/Work/tree", code = " M",
+                path = "src/main.das"),
+            GitFileState(worktree_path = "D:/Work/other", code = " M",
+                path = "src/main.das")]
+        repository_apply_working_numstat(
+            "9  4  src/main.das\n", "D:/Work/tree", files)
+        t |> equal(files[0].added_lines, 9)
+        t |> equal(files[0].deleted_lines, 4)
+        t |> success(files[0].stats_known)
+        t |> success(!files[1].stats_known)
     }
     t |> run("commit inspection uses one observed revision") <| @(t : T?) {
         var argv : array<string>

@@ -18,6 +18,7 @@ let private GIT_TIMEOUT_MS = 15000l
 let private GIT_CAPTURE_COLUMNS = 240
 let private GIT_CAPTURE_ROWS = 512
 let private GIT_FIELD_SEPARATOR = "<|dasHerd-field|>"
+let private UNTRACKED_NUMSTAT_MAX_BYTES = 32 * 1024 * 1024
 
 struct public RepositoryRecord {
     id : string
@@ -32,6 +33,10 @@ struct public GitFileState {
     code : string
     path : string
     old_path : string
+    added_lines : int
+    deleted_lines : int
+    stats_known : bool
+    binary : bool
 }
 
 struct public GitCommitState {
@@ -41,6 +46,7 @@ struct public GitCommitState {
     authored_at : int64
     author : string
     subject : string
+    parents : string
 }
 
 struct public GitReviewFileState {
@@ -48,6 +54,10 @@ struct public GitReviewFileState {
     code : string
     path : string
     old_path : string
+    added_lines : int
+    deleted_lines : int
+    stats_known : bool
+    binary : bool
 }
 
 struct public GitRefState {
@@ -65,6 +75,10 @@ struct public GitCommitFileState {
     code : string
     path : string
     old_path : string
+    added_lines : int
+    deleted_lines : int
+    stats_known : bool
+    binary : bool
 }
 
 struct public WorktreeState {
@@ -634,7 +648,7 @@ def public repository_history(repository_id : string; worktree_path : string;
     if (empty(resolved_ref)) {
         resolved_ref = runtime.snapshot.worktrees[worktree_index].branch
     }
-    var allowed = resolved_ref == runtime.snapshot.worktrees[worktree_index].branch
+    var allowed = resolved_ref == "__all__" || resolved_ref == runtime.snapshot.worktrees[worktree_index].branch
     for (ref in runtime.snapshot.refs) {
         if (ref.worktree_path == worktree_path && ref.name == resolved_ref) {
             allowed = true
@@ -928,11 +942,20 @@ def public repository_parse_status(text : string; var worktree : WorktreeState;
 
 def private launch_status(var runtime : RepositoryRuntime?) : bool {
     if (runtime.worktree_index >= length(runtime.snapshot.worktrees)) return false
+    runtime.phase = 2
     let path = runtime.snapshot.worktrees[runtime.worktree_index].path
     runtime.snapshot.record.checkout_path = runtime.snapshot.worktrees[0].path
     return launch_git(runtime, ["git", "-C", path, "-c", "core.quotePath=false",
         "status", "--porcelain=1", "--branch", "--untracked-files=all"],
         "git-status", path)
+}
+
+def private launch_working_stats(var runtime : RepositoryRuntime?) {
+    let path = runtime.snapshot.worktrees[runtime.worktree_index].path
+    runtime.phase = 10
+    let _ = launch_git(runtime, ["git", "--literal-pathspecs", "-C", path,
+        "--no-pager", "diff", "--numstat", "--find-renames", "--"],
+        "git-working-numstat", path)
 }
 
 def private launch_review_upstream(var runtime : RepositoryRuntime?) {
@@ -971,7 +994,7 @@ def private launch_review_commits(var runtime : RepositoryRuntime?) {
     runtime.phase = 5
     let revision_range = "{runtime.review_merge_base}..HEAD"
     let _ = launch_git(runtime, ["git", "-C", path, "--no-pager", "log",
-        "--max-count=200", "--format=%H{GIT_FIELD_SEPARATOR}%h{GIT_FIELD_SEPARATOR}%at{GIT_FIELD_SEPARATOR}%an{GIT_FIELD_SEPARATOR}%s", revision_range],
+        "--max-count=200", "--format=%H{GIT_FIELD_SEPARATOR}%h{GIT_FIELD_SEPARATOR}%at{GIT_FIELD_SEPARATOR}%an{GIT_FIELD_SEPARATOR}%s{GIT_FIELD_SEPARATOR}%P", revision_range],
         "git-review-commits", path)
 }
 
@@ -979,7 +1002,7 @@ def private launch_review_files(var runtime : RepositoryRuntime?) {
     let path = runtime.snapshot.worktrees[runtime.review_worktree_index].path
     runtime.phase = 6
     let _ = launch_git(runtime, ["git", "--literal-pathspecs", "-C", path,
-        "--no-pager", "diff", "--cached", "--name-only", "--find-renames",
+        "--no-pager", "diff", "--cached", "--numstat", "--find-renames",
         runtime.review_merge_base, "--"], "git-review-files", path)
 }
 
@@ -1001,9 +1024,10 @@ def private launch_history(var runtime : RepositoryRuntime?) {
     runtime.phase = 7
     changed(runtime)
     let path = runtime.snapshot.worktrees[index].path
-    let _ = launch_git(runtime, ["git", "-C", path, "--no-pager", "log",
-        "--max-count=200", "--format=%H{GIT_FIELD_SEPARATOR}%h{GIT_FIELD_SEPARATOR}%at{GIT_FIELD_SEPARATOR}%an{GIT_FIELD_SEPARATOR}%s",
-        runtime.history_ref], "git-history", path)
+    var inscope argv <- ["git", "-C", path, "--no-pager", "log",
+        "--max-count=200", "--format=%H{GIT_FIELD_SEPARATOR}%h{GIT_FIELD_SEPARATOR}%at{GIT_FIELD_SEPARATOR}%an{GIT_FIELD_SEPARATOR}%s{GIT_FIELD_SEPARATOR}%P"]
+    argv |> push(runtime.history_ref == "__all__" ? "--all" : runtime.history_ref)
+    let _ = launch_git(runtime, argv, "git-history", path)
 }
 
 def private launch_commit_files(var runtime : RepositoryRuntime?;
@@ -1026,7 +1050,7 @@ def private launch_commit_files(var runtime : RepositoryRuntime?;
     runtime.phase = 8
     changed(runtime)
     let _ = launch_git(runtime, ["git", "--literal-pathspecs", "-C", requested_path,
-        "--no-pager", "show", "--format=", "--name-only", "--find-renames",
+        "--no-pager", "show", "--format=", "--numstat", "--find-renames",
         "--first-parent", requested_hash, "--"], "git-commit-files", requested_path)
 }
 
@@ -1251,13 +1275,139 @@ def public repository_parse_review_commits(text : string; worktree_path : string
         if (time_end < 0) continue
         let author_end = find(line, delimiter, time_end + delimiter_length)
         if (author_end < 0) continue
+        let subject_end = delimiter == GIT_FIELD_SEPARATOR ? find(line, delimiter, author_end + delimiter_length) : -1
+        var subject = slice(line, author_end + delimiter_length)
+        var parents : string
+        if (subject_end >= 0) {
+            subject = slice(line, author_end + delimiter_length, subject_end)
+            parents = slice(line, subject_end + delimiter_length)
+        }
         commits |> push(GitCommitState(
             worktree_path = worktree_path,
             hash = slice(line, 0, hash_end),
             short_hash = slice(line, hash_end + delimiter_length, short_end),
             authored_at = to_int64(slice(line, short_end + delimiter_length, time_end)),
             author = slice(line, time_end + delimiter_length, author_end),
-            subject = slice(line, author_end + delimiter_length)))
+            subject = subject,
+            parents = parents))
+    }
+}
+
+struct private GitNumstatLine {
+    path : string
+    added_lines : int
+    deleted_lines : int
+    known : bool
+    binary : bool
+}
+
+def private numstat_token_end(line : string; start : int) : int {
+    var result = start
+    let line_length = length(line)
+    while (result < line_length && !is_white_space(byte_at(line, result))) {
+        result++
+    }
+    return result
+}
+
+def private numstat_skip_space(line : string; start : int) : int {
+    var result = start
+    let line_length = length(line)
+    while (result < line_length && is_white_space(byte_at(line, result))) {
+        result++
+    }
+    return result
+}
+
+def private numstat_count_token(token : string) : bool {
+    if (token == "-") return true
+    if (empty(token)) return false
+    for (index in range(length(token))) {
+        if (!is_number(byte_at(token, index))) return false
+    }
+    return true
+}
+
+def private expanded_numstat_path(path : string) : string {
+    let arrow = find(path, " => ")
+    var tail_text : string // nolint:LINT003 daScript loses let lifetime after the early-return guard
+    var end_pos : int // nolint:LINT003 daScript loses let lifetime after the early-return guard
+    if (arrow < 0) {
+        return path
+    }
+    let brace_start = find(path, "{")
+    tail_text = slice(path, arrow + 4)
+    end_pos = find(tail_text, "}")
+    if (brace_start >= 0 && end_pos >= 0) {
+        return "{slice(path, 0, brace_start)}{slice(tail_text, 0, end_pos)}{slice(tail_text, end_pos + 1)}"
+    }
+    return slice(path, arrow + 4)
+}
+
+def private parse_numstat_line(line : string; var result : GitNumstatLine&) : bool {
+    let added_end = numstat_token_end(line, 0)
+    let deleted_start = numstat_skip_space(line, added_end)
+    let deleted_end = numstat_token_end(line, deleted_start)
+    let path_start = numstat_skip_space(line, deleted_end)
+    if (added_end == 0 || deleted_start >= deleted_end || path_start >= length(line)) return false
+    let added = slice(line, 0, added_end)
+    let deleted = slice(line, deleted_start, deleted_end)
+    if (!numstat_count_token(added) || !numstat_count_token(deleted)) return false
+    result.path = expanded_numstat_path(slice(line, path_start))
+    result.binary = added == "-" || deleted == "-"
+    result.known = !result.binary
+    result.added_lines = result.known ? to_int(added) : 0
+    result.deleted_lines = result.known ? to_int(deleted) : 0
+    return true
+}
+
+def private count_untracked_lines(worktree_path, relative_path : string;
+                                  var added_lines : int&; var binary : bool&) : bool {
+    let full_path = path_join(worktree_path, relative_path)
+    let file_status = stat(full_path)
+    if (!file_status.is_valid || !file_status.is_reg
+            || file_status.size > uint64(UNTRACKED_NUMSTAT_MAX_BYTES)) return false
+    var loaded = false
+    fopen(full_path, "rb") $(file) {
+        if (file != null) {
+            fmap(file) $(var data : array<uint8>#) {
+                added_lines = 0
+                binary = false
+                for (raw_byte in data) {
+                    let byte = int(raw_byte)
+                    if (byte == 0) {
+                        binary = true
+                        break
+                    }
+                    if (byte == '\n') added_lines++
+                }
+                if (!binary && !empty(data) && data[length(data) - 1] != uint8('\n')) added_lines++
+                loaded = true
+            }
+        }
+    }
+    return loaded
+}
+
+def public repository_apply_working_numstat(text : string; worktree_path : string;
+                                            var files : array<GitFileState>) {
+    for (raw_line in split(text, "\n")) {
+        var parsed = GitNumstatLine()
+        if (!parse_numstat_line(trim_cr(raw_line), parsed)) continue
+        for (file in files) {
+            if (file.worktree_path == worktree_path && file.path == parsed.path) {
+                file.added_lines = parsed.added_lines
+                file.deleted_lines = parsed.deleted_lines
+                file.stats_known = parsed.known
+                file.binary = parsed.binary
+                break
+            }
+        }
+    }
+    for (file in files) {
+        if (file.worktree_path != worktree_path || file.code != "??") continue
+        file.stats_known = count_untracked_lines(worktree_path, file.path,
+            file.added_lines, file.binary) && !file.binary
     }
 }
 
@@ -1266,6 +1416,15 @@ def public repository_parse_review_files(text : string; worktree_path : string;
     for (raw_line in split(text, "\n")) {
         let line = trim_cr(raw_line)
         if (empty(line)) continue
+        var numstat = GitNumstatLine()
+        if (parse_numstat_line(line, numstat)) {
+            files |> push(GitReviewFileState(
+                worktree_path = worktree_path, path = numstat.path,
+                added_lines = numstat.added_lines,
+                deleted_lines = numstat.deleted_lines,
+                stats_known = numstat.known, binary = numstat.binary))
+            continue
+        }
         let delimiter = find(line, GIT_FIELD_SEPARATOR) >= 0 ? GIT_FIELD_SEPARATOR : "\t"
         let fields = split(line, delimiter)
         if (length(fields) < 2) continue
@@ -1289,6 +1448,15 @@ def public repository_parse_commit_files(text : string; worktree_path : string;
     for (raw_line in split(text, "\n")) {
         let line = trim_cr(raw_line)
         if (empty(line)) continue
+        var numstat = GitNumstatLine()
+        if (parse_numstat_line(line, numstat)) {
+            files |> push(GitCommitFileState(
+                worktree_path = worktree_path, commit_hash = commit_hash,
+                path = numstat.path, added_lines = numstat.added_lines,
+                deleted_lines = numstat.deleted_lines,
+                stats_known = numstat.known, binary = numstat.binary))
+            continue
+        }
         let fields = split(line, "\t")
         if (length(fields) < 2) continue
         let code = fields[0]
@@ -1302,30 +1470,6 @@ def public repository_parse_commit_files(text : string; worktree_path : string;
         files |> push(GitCommitFileState(
             worktree_path = worktree_path, commit_hash = commit_hash,
             code = code, path = path, old_path = old_path))
-    }
-}
-
-def private repository_parse_review_file_names(text : string;
-                                               worktree_path : string;
-                                               var files : array<GitReviewFileState>) {
-    for (raw_line in split(text, "\n")) {
-        let path = trim_cr(raw_line)
-        if (empty(path)) continue
-        files |> push(GitReviewFileState(
-            worktree_path = worktree_path, code = "", path = path))
-    }
-}
-
-def private repository_parse_commit_file_names(text : string;
-                                               worktree_path : string;
-                                               commit_hash : string;
-                                               var files : array<GitCommitFileState>) {
-    for (raw_line in split(text, "\n")) {
-        let path = trim_cr(raw_line)
-        if (empty(path)) continue
-        files |> push(GitCommitFileState(
-            worktree_path = worktree_path, commit_hash = commit_hash,
-            code = "", path = path))
     }
 }
 
@@ -1365,7 +1509,8 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
     if (scrollback_rows > 0) {
         let _compacted_overflow = watcher_compact_session(runtime.snapshot.task_session_id)
         let message = "Git structured output exceeded the {GIT_CAPTURE_ROWS}-row capture window; inspect session {runtime.snapshot.task_session_id}"
-        if (runtime.phase >= 7) fail_history(runtime, message)
+        if (runtime.phase == 10) fail_refresh(runtime, message)
+        elif (runtime.phase >= 7) fail_history(runtime, message)
         elif (runtime.phase >= 3) fail_review(runtime, message)
         else fail_refresh(runtime, message)
         return
@@ -1377,6 +1522,8 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
             runtime.review_base_ref = "origin/main"
             runtime.review_tried_origin_main = true
             launch_review_merge_base(runtime)
+        } elif (runtime.phase == 10) {
+            fail_refresh(runtime, "git exited with {info.exit_code}: {output}")
         } elif (runtime.phase >= 7) {
             fail_history(runtime, "git exited with {info.exit_code}: {output}")
         } elif (runtime.phase >= 3) {
@@ -1438,6 +1585,12 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
     }
     if (runtime.phase == 2) {
         repository_parse_status(output, runtime.snapshot.worktrees[runtime.worktree_index], runtime.snapshot.files)
+        launch_working_stats(runtime)
+        return
+    }
+    if (runtime.phase == 10) {
+        let stats_path = runtime.snapshot.worktrees[runtime.worktree_index].path
+        repository_apply_working_numstat(output, stats_path, runtime.snapshot.files)
         runtime.worktree_index++
         if (runtime.worktree_index < length(runtime.snapshot.worktrees)) {
             let _next_status_started = launch_status(runtime)
@@ -1474,14 +1627,14 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
         repository_parse_review_commits(output, path, runtime.pending_review_commits)
         launch_review_files(runtime)
     } elif (runtime.phase == 6) {
-        repository_parse_review_file_names(
+        repository_parse_review_files(
             output, path, runtime.pending_review_files)
         finish_review(runtime)
     } elif (runtime.phase == 7) {
         repository_parse_review_commits(output, path, runtime.pending_history_commits)
         finish_history_commits(runtime)
     } elif (runtime.phase == 8) {
-        repository_parse_commit_file_names(
+        repository_parse_commit_files(
             output, path, runtime.history_commit, runtime.pending_commit_files)
         finish_commit_files(runtime)
     } else {
