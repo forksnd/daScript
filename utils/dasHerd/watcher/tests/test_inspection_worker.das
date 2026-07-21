@@ -180,11 +180,34 @@ def test_inspection_prepare_worker(t : T?) {
         tt |> equal(inspector_prepare_worker_shutdown(worker), true)
         destroy_job_que()
     }
-    t |> run("explicit empty full View does not fall back to diff context") <| @(tt : T?) {
+    t |> run("empty binary preview completes without decoding") <| @(tt : T?) {
         create_job_que()
         var worker = InspectorPrepareWorker()
         tt |> equal(inspector_prepare_worker_start(worker), true)
         tt |> equal(inspector_prepare_worker_queue(worker, 15,
+            "diff --git a/empty.bin b/empty.bin\nBinary files a/empty.bin and b/empty.bin differ\n",
+            "", "", "", 0), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.parsed.binary, true)
+                    tt |> equal(event.preview_error, "Binary preview is empty")
+                    tt |> equal(empty(event.preview_pixels), true)
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("explicit empty full View does not fall back to diff context") <| @(tt : T?) {
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 16,
             "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n",
             "", "plain", "", 0, true), true)
         var completed = false

@@ -218,6 +218,10 @@ def private prepare_worker_main(var jobs : Channel?&;
                     if (prepared_patch.binary) {
                         if (job.view_byte_count > MAX_FILE_PREVIEW_RAW_BYTES) {
                             preview_error = "Binary preview exceeds the 8 MiB raw-byte limit"
+                        } elif (job.view_byte_count == 0) {
+                            preview_error = "Binary preview is empty"
+                        } elif (job.view_byte_count < 0) {
+                            preview_error = "Binary transport reported an invalid byte count"
                         } elif (empty(job.view_base64)) {
                             preview_error = "Binary preview bytes are unavailable for this comparison"
                         } else {
