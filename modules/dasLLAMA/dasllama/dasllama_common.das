@@ -10385,6 +10385,17 @@ def set_gpu_combine_route(on : bool) {
     g_gpu_combine = on
 }
 
+var private g_gpu_prefill_route = true
+
+//! Runtime routing gate over the GPU MoE PREFILL arm (`fused_gpu`) in both grouped prefills —
+//! the generic one and gemma-4's twin. Routing-only: uploads and residency stay put, so an
+//! in-process A/B isolates device-side prefill against the same resident set (decode is untouched).
+def set_moe_gpu_prefill_route(on : bool) {
+    g_gpu_prefill_route = on
+}
+
+def private gpu_prefill_route_on() : bool => g_gpu_prefill_route
+
 def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
     let dim = c.dim
@@ -10405,7 +10416,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         && t.kq_repacked && kernel_backend_has_kq_batch_groupn() && g_moe_fused_expert_gemms)
     // GPU MoE tier: offloaded layers run the whole expert FFN chain device-side; tiny batches stay CPU (GPU submit cost > the GEMM)
     let fused_gpu = (!c.moe_exps_bias && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai
-        && (moe_gpu_layer_on_gpu(l) || moe_gpu_layer_streamed(l)) && g_moe_fused_expert_gemms && npos >= 32l)
+        && (moe_gpu_layer_on_gpu(l) || moe_gpu_layer_streamed(l)) && g_moe_fused_expert_gemms && npos >= 32l && gpu_prefill_route_on())
     // device-side combine rides fused_gpu; DASLLAMA_GPU_COMBINE=0 falls back to park + CPU reduce
     let gpu_comb = fused_gpu && gpu_combine_on()
     let fused = (t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms) || fused_kq || fused_gpu
@@ -10816,7 +10827,7 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
     let f3 = fmt_at(t.we3_fmt, l)
     // GPU tier: offloaded layers run the routed chain device-side; the fused arm gathers ALL nk bucket rows at once (grows)
     let fused_gpu = (!c.moe_exps_bias && !t.experts_mx4 && c.ffn_act != FfnAct.swiglu_oai
-        && (moe_gpu_layer_on_gpu(l) || moe_gpu_layer_streamed(l)) && g_moe_fused_expert_gemms && npos >= 32l)
+        && (moe_gpu_layer_on_gpu(l) || moe_gpu_layer_streamed(l)) && g_moe_fused_expert_gemms && npos >= 32l && gpu_prefill_route_on())
     let gpu_comb = fused_gpu && gpu_combine_on()
     let grows = fused_gpu ? nk : npos
     s.moe_rlog |> resize(npos * ne)
