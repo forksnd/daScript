@@ -726,7 +726,7 @@ def mirror_evict_to_cap(cap_bytes : uint64; keep : uint64) {
 def mirror_row_total(t : Model) : int64 {
     let c = t.config
     var tot = 0l
-    for (l in range64(c.n_layers)) {
+    for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the MTP draft slab (trunk-shaped attention)
         tot += layer_kv_dim(c, l)   // the GPU gate pins kv_src[l] == l, so every layer owns rows
     }
     return tot
@@ -906,7 +906,7 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
         unsafe {
             var kdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + koff
             var vdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + voff
-            for (l in range64(c.n_layers)) {
+            for (l in range64(c.n_layers + c.n_layer_nextn)) {   // draft slab rides the watermark contract
                 let kvd_l = layer_kv_dim(c, l)
                 let krow = kv_row_bytes(s.kv_dtype_k, kvd_l)
                 let vrow = kv_row_bytes(s.kv_dtype_v, kvd_l)
@@ -945,9 +945,12 @@ def dn_metal_ok(t : Model) : bool {
 
 struct DnMirror {
     uid : uint64
-    @do_not_delete buf : MetalBuffer?   // [state planes f32][conv planes f32]
-    conv_off : uint64                   // byte offset of the conv-history region
-    bytes : uint64
+    @do_not_delete buf : MetalBuffer?   // regions x [state planes f32][conv planes f32]
+    conv_off : uint64                   // byte offset of the conv-history region within a region
+    region_bytes : uint64
+    regions : int64                     // 2 for MTP-verify dual-store (cur flips on reject), else 1
+    cur : int64                         // live region index
+    bytes : uint64                      // regions * region_bytes
     pos : int64                         // next position the GPU state expects (forward-only)
     tick : int64
 }
@@ -955,26 +958,31 @@ var g_dn_mirrors : table<uint64; DnMirror>
 let DN_MIRRORS_MAX = 4      // per-session state is big (35B: ~60MB) — oldest evicts; a returning
                             // evicted session declines unless it restarts at pos 0 or off CPU state
 
+// MTP-capable models verify at B=2 with dual-store — their mirrors carry the shadow region
+def dn_mirror_regions(t : Model) : int64 => t.config.n_layer_nextn > 0l ? 2l : 1l
+
 def dn_mirror_release(mr : DnMirror) {
     if (mr.buf != null) {
         metal_release(mr.buf)
     }
 }
 
-def dn_mirror_prepare(var s : Session; pos : int64) : tuple<ok : bool; buf : MetalBuffer?; conv_off : uint64> {
+def dn_mirror_prepare(var s : Session; pos : int64; regions : int64) : tuple<ok : bool; buf : MetalBuffer?; state_off : uint64; conv_off : uint64; state_alt : uint64; conv_alt : uint64> {
     let sbytes = uint64(length(s.dn_state)) * 4ul
     let cbytes = uint64(length(s.dn_conv_state)) * 4ul
+    let rb = sbytes + cbytes
+    let total = rb * uint64(regions)
     if (sbytes == 0ul) {
-        return (ok = false, buf = null, conv_off = 0ul)
+        return (ok = false, buf = null, state_off = 0ul, conv_off = 0ul, state_alt = 0ul, conv_alt = 0ul)
     }
-    if (key_exists(g_dn_mirrors, s.uid) && g_dn_mirrors[s.uid].bytes != sbytes + cbytes) {
+    if (key_exists(g_dn_mirrors, s.uid) && g_dn_mirrors[s.uid].bytes != total) {
         dn_mirror_release(g_dn_mirrors[s.uid])
         g_dn_mirrors |> erase(s.uid)
     }
     let have = key_exists(g_dn_mirrors, s.uid)
     let cpu_prefix = s.dn_pos == pos
     if (!have && pos != 0l && !cpu_prefix) {
-        return (ok = false, buf = null, conv_off = 0ul)
+        return (ok = false, buf = null, state_off = 0ul, conv_off = 0ul, state_alt = 0ul, conv_alt = 0ul)
     }
     if (!have) {
         while (length(g_dn_mirrors) >= DN_MIRRORS_MAX) {
@@ -989,38 +997,51 @@ def dn_mirror_prepare(var s : Session; pos : int64) : tuple<ok : bool; buf : Met
             dn_mirror_release(g_dn_mirrors[victim])
             g_dn_mirrors |> erase(victim)
         }
-        g_dn_mirrors[s.uid] = DnMirror(uid = s.uid, buf = metal_new_buffer(g_dev, sbytes + cbytes),
-            conv_off = sbytes, bytes = sbytes + cbytes, pos = -1l)
+        g_dn_mirrors[s.uid] = DnMirror(uid = s.uid, buf = metal_new_buffer(g_dev, total),
+            conv_off = sbytes, region_bytes = rb, regions = regions, cur = 0l, bytes = total, pos = -1l)
     }
     if (pos == 0l) {
-        // fresh conversation: zero both regions (dn_reset's GPU half). Safe on unified memory —
+        // fresh conversation: zero every region (dn_reset's GPU half). Safe on unified memory —
         // no step of this session is in flight at pos 0 (spec is clipped for recurrent models)
         unsafe {
-            memset8(metal_buffer_contents(g_dn_mirrors[s.uid].buf), uint8(0), int(sbytes + cbytes))
+            memset8(metal_buffer_contents(g_dn_mirrors[s.uid].buf), uint8(0), int(total))
         }
+        g_dn_mirrors[s.uid].cur = 0l
         g_dn_mirrors[s.uid].pos = 0l
     } elif (g_dn_mirrors[s.uid].pos != pos) {
         if (!cpu_prefix) {
-            return (ok = false, buf = null, conv_off = 0ul)
+            return (ok = false, buf = null, state_off = 0ul, conv_off = 0ul, state_alt = 0ul, conv_alt = 0ul)
         }
-        // the CPU ran positions [0, pos) — its state is the source of truth; sync it up
+        // the CPU ran positions [0, pos) — its state is the source of truth; sync it into region 0
         unsafe {
             var dst = reinterpret<uint8?>(metal_buffer_contents(g_dn_mirrors[s.uid].buf))
             memcpy(reinterpret<void?>(dst), addr<void?>(s.dn_state[0]), int(sbytes))
             memcpy(reinterpret<void?>(dst + sbytes), addr<void?>(s.dn_conv_state[0]), int(cbytes))
         }
+        g_dn_mirrors[s.uid].cur = 0l
         g_dn_mirrors[s.uid].pos = pos
     }
     g_tick++
     g_dn_mirrors[s.uid].tick = g_tick
     var mr = g_dn_mirrors[s.uid]   // cheap copy — one lookup per statement (table re-hash safety)
-    return (ok = true, buf = mr.buf, conv_off = mr.conv_off)
+    let base = uint64(mr.cur) * mr.region_bytes
+    let alt = mr.regions == 2l ? uint64(mr.cur ^ 1l) * mr.region_bytes : base
+    return (ok = true, buf = mr.buf, state_off = base, conv_off = base + mr.conv_off,
+        state_alt = alt, conv_alt = alt + mr.conv_off)
 }
 
 // the step served and its command buffer completed — the GPU state now holds position pos's update
 def dn_mirror_advance(uid : uint64; pos : int64) {
     if (key_exists(g_dn_mirrors, uid)) {
         g_dn_mirrors[uid].pos = pos + 1l
+    }
+}
+
+// MTP verify reject: the shadow region holds the post-row0 state — make it live (zero copies)
+def dn_mirror_flip(uid : uint64; pos : int64) {
+    if (key_exists(g_dn_mirrors, uid) && g_dn_mirrors[uid].regions == 2l) {
+        g_dn_mirrors[uid].cur ^= 1l
+        g_dn_mirrors[uid].pos = pos
     }
 }
 

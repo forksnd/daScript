@@ -1109,6 +1109,17 @@ def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
             hwant[ch * taps + k] = src >= 0 ? xq[src * cd + ch] : hist[ch * taps + src + taps]
         }
     }
+    // dual-store mirror (npos >= 2): the npos-1 window's history — the MTP verify's shadow store
+    var hmid_want : array<float>
+    if (npos >= 2) {
+        hmid_want |> resize(cd * taps)
+        for (ch in range(cd)) {
+            for (k in range(taps)) {
+                let src = npos - 1 - taps + k
+                hmid_want[ch * taps + k] = src >= 0 ? xq[src * cd + ch] : hist[ch * taps + src + taps]
+            }
+        }
+    }
     var bx = buf_upload(dev, xq)
     var bh = buf_upload(dev, hist)
     var bw = buf_upload(dev, cw)
@@ -1129,6 +1140,8 @@ def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
     }
     t |> success(cran, "dn conv dispatch npos={npos}: {err}")
     t |> equal(buf_mismatch_approx(by, cv), 0)
+    var bmid = buf_u32(dev, npos >= 2 ? 1u : 0u)
+    var bhm = npos >= 2 ? buf_fill(dev, cd * taps, -1000.0) : null
     let hran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso_hist)
         metal_set_buffer(enc, bx, 0ul, 0)
@@ -1136,10 +1149,15 @@ def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
         metal_set_buffer(enc, bcd, 0ul, 2)
         metal_set_buffer(enc, bdc, 0ul, 3)
         metal_set_buffer(enc, bnp, 0ul, 4)
+        metal_set_buffer(enc, npos >= 2 ? bhm : bh, 0ul, 5)
+        metal_set_buffer(enc, bmid, 0ul, 6)
         metal_dispatch_threadgroups(enc, uint3(uint((cd + 255) / 256), 1u, 1u), uint3(256u, 1u, 1u))
     }
     t |> success(hran, "dn hist dispatch npos={npos}: {err}")
     t |> equal(buf_mismatch_approx(bh, hwant), 0)
+    if (npos >= 2) {
+        t |> equal(buf_mismatch_approx(bhm, hmid_want), 0)
+    }
     // stage 2 mirror: per-head L2 over q/k + q pre-scale (double square-sum like the CPU)
     for (p in range(npos)) {
         for (blk in range(2 * nkh)) {
@@ -1173,9 +1191,13 @@ def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
     // stage 3 mirror: the sequential delta rule per v-head (k-heads fan via h % nkh)
     var owant : array<float>
     var stw : array<float>
+    var stmid : array<float>
     var skd : array<float>
     owant |> resize(npos * di)
     stw := st0
+    if (npos >= 2) {
+        stmid |> resize(nvh * ds * ds)
+    }
     skd |> resize(ds)
     for (h in range(nvh)) {
         let kh = h % nkh
@@ -1211,6 +1233,11 @@ def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
                     owant[p * di + h * ds + j] += qi * sv
                 }
             }
+            if (npos >= 2 && p == npos - 2) {   // the dual-store point: state after token npos-2
+                for (k in range(ds * ds)) {
+                    stmid[sb + k] = stw[sb + k]
+                }
+            }
         }
     }
     var bst = buf_upload(dev, st0)
@@ -1222,6 +1249,7 @@ def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
     var bnvh = buf_u32(dev, uint(nvh))
     var bnkh = buf_u32(dev, uint(nkh))
     var bdi = buf_u32(dev, uint(di))
+    var bstm = npos >= 2 ? buf_fill(dev, nvh * ds * ds, -1000.0) : null
     let sran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso_scan)
         metal_set_buffer(enc, by, 0ul, 0)
@@ -1238,11 +1266,16 @@ def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
         metal_set_buffer(enc, bnkh, 0ul, 11)
         metal_set_buffer(enc, bdi, 0ul, 12)
         metal_set_buffer(enc, bnp, 0ul, 13)
+        metal_set_buffer(enc, npos >= 2 ? bstm : bst, 0ul, 14)
+        metal_set_buffer(enc, bmid, 0ul, 15)
         metal_dispatch_threadgroups(enc, uint3(uint(ds / 4), uint(nvh), 1u), uint3(128u, 1u, 1u))
     }
     t |> success(sran, "dn scan dispatch npos={npos} nkh={nkh} nvh={nvh}: {err}")
     t |> equal(buf_mismatch_approx(bo, owant), 0)
     t |> equal(buf_mismatch_approx(bst, stw), 0)
+    if (npos >= 2) {
+        t |> equal(buf_mismatch_approx(bstm, stmid), 0)
+    }
     // stage 4 mirror: per-head RMS with the shared weight, ⊙ SiLU(z)
     var gwant : array<float>
     gwant |> resize(npos * di)
@@ -1297,6 +1330,13 @@ def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
     metal_release(bdi)
     metal_release(bz)
     metal_release(bwn)
+    metal_release(bmid)
+    if (bhm != null) {
+        metal_release(bhm)
+    }
+    if (bstm != null) {
+        metal_release(bstm)
+    }
     metal_release(pso_conv)
     metal_release(pso_hist)
     metal_release(pso_l2)
@@ -1314,8 +1354,10 @@ def private dn_chain_gate(t : T?; dev, queue; nkh, nvh, dconv, npos : int) {
     delete wn
     delete cv
     delete hwant
+    delete hmid_want
     delete owant
     delete stw
+    delete stmid
     delete skd
     delete gwant
 }

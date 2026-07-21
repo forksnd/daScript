@@ -5016,6 +5016,7 @@ class MetalRopeStoreBF16 {
     @uniform @binding = 13 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
     @ssbo @binding = 14 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 15 has_bias : uint
+    @uniform @binding = 16 rot : uint       // partial rotary width; == head_size for full
 
     [metal_kernel(name="metal_rope_store_b16_msl")]
     def metal_rope_store_b16 {
@@ -5027,14 +5028,17 @@ class MetalRopeStoreBF16 {
         let rrow = rt[bb]
         let qbase = bb * qstride
         let half = head_size / 2u
+        let halfr = rot / 2u
         let isK = gid >= npairs_q
         let lgid = isK ? gid - npairs_q : gid
         let j = lgid % half
         let hbase = (lgid / half) * head_size
-        let i = neox != 0u ? hbase + j : hbase + 2u * j
-        let i2 = neox != 0u ? i + half : i + 1u
-        let fcr = tcos[bb * half + j]
-        let fci = tsin[bb * half + j]
+        // threads j < rot/2 rotate the (j, j+rot/2) pair; the rest identity-cover [rot, hs)
+        let rotp = j < halfr
+        let i = neox != 0u ? (rotp ? hbase + j : hbase + rot + (j - halfr)) : hbase + 2u * j
+        let i2 = neox != 0u ? (rotp ? i + halfr : i + (half - halfr)) : i + 1u
+        let fcr = rotp ? tcos[bb * halfr + j] : 1.0
+        let fci = rotp ? tsin[bb * halfr + j] : 0.0
         if (isK) {
             let kdst = rrow.x + lay * rrow.z + (rrow.w - 1u) * kv_dim   // lay = element prefix
             let vdst = rrow.y + lay * rrow.z + (rrow.w - 1u) * kv_dim
@@ -5075,6 +5079,7 @@ class MetalRopeStoreBF32 {
     @uniform @binding = 13 neox : uint
     @ssbo @binding = 14 bias : array<float>
     @uniform @binding = 15 has_bias : uint
+    @uniform @binding = 16 rot : uint       // partial rotary width; == head_size for full
 
     [metal_kernel(name="metal_rope_store_b32_msl")]
     def metal_rope_store_b32 {
@@ -5086,14 +5091,17 @@ class MetalRopeStoreBF32 {
         let rrow = rt[bb]
         let qbase = bb * qstride
         let half = head_size / 2u
+        let halfr = rot / 2u
         let isK = gid >= npairs_q
         let lgid = isK ? gid - npairs_q : gid
         let j = lgid % half
         let hbase = (lgid / half) * head_size
-        let i = neox != 0u ? hbase + j : hbase + 2u * j
-        let i2 = neox != 0u ? i + half : i + 1u
-        let fcr = tcos[bb * half + j]
-        let fci = tsin[bb * half + j]
+        // threads j < rot/2 rotate the (j, j+rot/2) pair; the rest identity-cover [rot, hs)
+        let rotp = j < halfr
+        let i = neox != 0u ? (rotp ? hbase + j : hbase + rot + (j - halfr)) : hbase + 2u * j
+        let i2 = neox != 0u ? (rotp ? i + halfr : i + (half - halfr)) : i + 1u
+        let fcr = rotp ? tcos[bb * halfr + j] : 1.0
+        let fci = rotp ? tsin[bb * halfr + j] : 0.0
         if (isK) {
             let kdst = rrow.x + lay * rrow.z + (rrow.w - 1u) * kv_dim   // lay = element prefix
             let vdst = rrow.y + lay * rrow.z + (rrow.w - 1u) * kv_dim
@@ -6401,13 +6409,15 @@ def enc_dn_conv(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uin
 }
 
 def enc_dn_conv_hist(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uint64;
-                     bcd, bdconv, bnp : MetalBuffer?; cd : int64) {
+                     bcd, bdconv, bnp : MetalBuffer?; cd : int64; hmoff : uint64; bmid : MetalBuffer?) {
     metal_set_pipeline(enc, g_pso_dn_hist)
     metal_set_buffer(enc, bx, 0ul, 0)
     metal_set_buffer(enc, bhist, hoff, 1)
     metal_set_buffer(enc, bcd, 0ul, 2)
     metal_set_buffer(enc, bdconv, 0ul, 3)
     metal_set_buffer(enc, bnp, 0ul, 4)
+    metal_set_buffer(enc, bhist, hmoff, 5)
+    metal_set_buffer(enc, bmid, 0ul, 6)
     metal_dispatch_threadgroups(enc, uint3(uint((cd + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6423,7 +6433,8 @@ def enc_dn_l2norm(enc : MetalComputeEncoder?; by, bcd, bkd, bds, beps, bqscale :
 }
 
 def enc_dn_scan(enc : MetalComputeEncoder?; bcv, bst : MetalBuffer?; stoff : uint64;
-                bbraw, bgraw, baa, bdtb, bo, bcd, bkd, bds, bnvh, bnkh, bdi, bnp : MetalBuffer?; ds, nvh : int64) {
+                bbraw, bgraw, baa, bdtb, bo, bcd, bkd, bds, bnvh, bnkh, bdi, bnp : MetalBuffer?; ds, nvh : int64;
+                stmoff : uint64; bmid : MetalBuffer?) {
     metal_set_pipeline(enc, g_pso_dn_scan)
     metal_set_buffer(enc, bcv, 0ul, 0)
     metal_set_buffer(enc, bst, stoff, 1)
@@ -6439,6 +6450,8 @@ def enc_dn_scan(enc : MetalComputeEncoder?; bcv, bst : MetalBuffer?; stoff : uin
     metal_set_buffer(enc, bnkh, 0ul, 11)
     metal_set_buffer(enc, bdi, 0ul, 12)
     metal_set_buffer(enc, bnp, 0ul, 13)
+    metal_set_buffer(enc, bst, stmoff, 14)
+    metal_set_buffer(enc, bmid, 0ul, 15)
     metal_dispatch_threadgroups(enc, uint3(uint(ds / 4l), uint(nvh), 1u), uint3(128u, 1u, 1u))
 }
 
@@ -6827,14 +6840,14 @@ def enc_gemm64_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
 // owns a bit; a barrier is inserted iff a dispatch's read hits a pending write (RAW), or its
 // write hits a pending write/read (WAW/WAR) — read-after-read runs concurrently.
 
-def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
+def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null; rtoff : uint64 = 0ul) {
     metal_set_pipeline(enc, f16 ? g_pso_attnb16 : g_pso_attnb32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_b16_msl_tgmem : metal_sq_attn_b32_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
     metal_set_buffer(enc, g_arena, 0ul, 1)
     metal_set_buffer(enc, bq, 0ul, 2)
     metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, brt, 0ul, 4)
+    metal_set_buffer(enc, brt, rtoff, 4)
     metal_set_buffer(enc, blay, 0ul, 5)
     metal_set_buffer(enc, bkvd, 0ul, 6)
     metal_set_buffer(enc, bnh, 0ul, 7)
@@ -6848,14 +6861,14 @@ def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, 
     metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
+def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64; rtoff : uint64 = 0ul) {
     metal_set_pipeline(enc, f16 ? g_pso_attnpb16 : g_pso_attnpb32)
     metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_part_b16_msl_tgmem : metal_sq_attn_part_b32_msl_tgmem, 0)
     metal_set_buffer(enc, g_arena, 0ul, 0)
     metal_set_buffer(enc, g_arena, 0ul, 1)
     metal_set_buffer(enc, bq, 0ul, 2)
     metal_set_buffer(enc, bpart, 0ul, 3)
-    metal_set_buffer(enc, brt, 0ul, 4)
+    metal_set_buffer(enc, brt, rtoff, 4)
     metal_set_buffer(enc, blay, 0ul, 5)
     metal_set_buffer(enc, bkvd, 0ul, 6)
     metal_set_buffer(enc, bnh, 0ul, 7)
@@ -7008,11 +7021,11 @@ def enc_attn_d_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, 
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
 }
 
-def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs, bwin : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
+def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs, bwin : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null; rtoff : uint64 = 0ul) {
     metal_set_pipeline(enc, g_pso_attncombb)
     metal_set_buffer(enc, bpart, 0ul, 0)
     metal_set_buffer(enc, by, 0ul, 1)
-    metal_set_buffer(enc, brt, 0ul, 2)
+    metal_set_buffer(enc, brt, rtoff, 2)
     metal_set_buffer(enc, bnch, 0ul, 3)
     metal_set_buffer(enc, bnh, 0ul, 4)
     metal_set_buffer(enc, bhs, 0ul, 5)
@@ -7054,14 +7067,14 @@ def enc_attn_comb_d(enc : MetalComputeEncoder?; bpart, by, brt, bnsg, bnh, bhs :
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, brt, blay, bkvd, bqd, bhs, bnpq, bnpall, bqs, bneox, bbias, bhasb : MetalBuffer?; npairs, nrows : int64) {
+def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, brt, blay, bkvd, bqd, bhs, bnpq, bnpall, bqs, bneox, bbias, bhasb : MetalBuffer?; npairs, nrows : int64; rtoff : uint64 = 0ul; brot : MetalBuffer? = null) {
     metal_set_pipeline(enc, f16 ? g_pso_rpstb16 : g_pso_rpstb32)
     metal_set_buffer(enc, bqkv, 0ul, 0)
     metal_set_buffer(enc, g_arena, 0ul, 1)
     metal_set_buffer(enc, g_arena, 0ul, 2)
     metal_set_buffer(enc, bcos, 0ul, 3)
     metal_set_buffer(enc, bsin, 0ul, 4)
-    metal_set_buffer(enc, brt, 0ul, 5)
+    metal_set_buffer(enc, brt, rtoff, 5)
     metal_set_buffer(enc, blay, 0ul, 6)
     metal_set_buffer(enc, bkvd, 0ul, 7)
     metal_set_buffer(enc, bqd, 0ul, 8)
@@ -7072,6 +7085,7 @@ def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, b
     metal_set_buffer(enc, bneox, 0ul, 13)
     metal_set_buffer(enc, bbias, 0ul, 14)
     metal_set_buffer(enc, bhasb, 0ul, 15)
+    metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 16)   // rot defaults to head_size (full rope)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
 }
 
