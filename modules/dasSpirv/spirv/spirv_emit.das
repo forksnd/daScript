@@ -4990,6 +4990,84 @@ class SpirvEmit : AstVisitor {
         return expr
     }
 
+    // Vulkan-native loop hints: argument names map 1:1 onto SPIR-V LoopControl bits, so nothing is
+    // translated from another backend's vocabulary and no hint can alias onto an assertion.
+    def loop_control_of(args : AnnotationArgumentList; var lits : array<uint>) : uint {
+        var mask = 0u
+        var dep_len = 0u
+        var min_it = 0u
+        var max_it = 0u
+        var it_mul = 0u
+        var peel = 0u
+        var partial = 0u
+        for (a in args) {
+            if (a.name == "unroll") {
+                mask |= uint(SpvLoopControl.Unroll)
+            } elif (a.name == "dont_unroll") {
+                mask |= uint(SpvLoopControl.DontUnroll)
+            } elif (a.name == "dependency_infinite") {
+                mask |= uint(SpvLoopControl.DependencyInfinite)
+            } elif (a.name == "dependency_length" && a.basicType == Type.tInt) {
+                mask |= uint(SpvLoopControl.DependencyLength)
+                dep_len = uint(a.iValue)
+            } elif (a.name == "min_iterations" && a.basicType == Type.tInt) {
+                mask |= uint(SpvLoopControl.MinIterations)
+                min_it = uint(a.iValue)
+            } elif (a.name == "max_iterations" && a.basicType == Type.tInt) {
+                mask |= uint(SpvLoopControl.MaxIterations)
+                max_it = uint(a.iValue)
+            } elif (a.name == "iteration_multiple" && a.basicType == Type.tInt) {
+                mask |= uint(SpvLoopControl.IterationMultiple)
+                it_mul = uint(a.iValue)
+            } elif (a.name == "peel_count" && a.basicType == Type.tInt) {
+                mask |= uint(SpvLoopControl.PeelCount)
+                peel = uint(a.iValue)
+            } elif (a.name == "partial_count" && a.basicType == Type.tInt) {
+                mask |= uint(SpvLoopControl.PartialCount)
+                partial = uint(a.iValue)
+            } else {
+                errs |> push("unknown vulkan loop hint '{a.name}'")
+            }
+        }
+        if ((mask & uint(SpvLoopControl.Unroll)) != 0u && (mask & uint(SpvLoopControl.DontUnroll)) != 0u) {
+            errs |> push("loop hints 'unroll' and 'dont_unroll' are mutually exclusive")
+        }
+        // parameterised bits append their literal to OpLoopMerge in ASCENDING BIT ORDER (SPIR-V spec)
+        if ((mask & uint(SpvLoopControl.DependencyLength)) != 0u) {
+            lits |> push(dep_len)
+        }
+        if ((mask & uint(SpvLoopControl.MinIterations)) != 0u) {
+            lits |> push(min_it)
+        }
+        if ((mask & uint(SpvLoopControl.MaxIterations)) != 0u) {
+            lits |> push(max_it)
+        }
+        if ((mask & uint(SpvLoopControl.IterationMultiple)) != 0u) {
+            lits |> push(it_mul)
+        }
+        if ((mask & uint(SpvLoopControl.PeelCount)) != 0u) {
+            lits |> push(peel)
+        }
+        if ((mask & uint(SpvLoopControl.PartialCount)) != 0u) {
+            lits |> push(partial)
+        }
+        return mask
+    }
+
+    def emit_loop_merge(var bm : SpirvModule; ids : LoopIds; args : AnnotationArgumentList) {
+        var lits : array<uint>
+        let mask = loop_control_of(args, lits)
+        if (empty(lits)) {
+            emit(bm, SEC_FUNCS, SpvOp.LoopMerge, ids.merge, ids.cont_l, mask)
+        } else {
+            var ops <- [ids.merge, ids.cont_l, mask]
+            ops |> push_from(lits)
+            emit_n(bm, SEC_FUNCS, SpvOp.LoopMerge, ops)
+            delete ops
+        }
+        delete lits
+    }
+
     // ----- while (OpLoopMerge 4-block, multi-phase) -----
     def override preVisitExprWhile(var expr : ExprWhile?) : void {
         var bm & = unsafe(*m)
@@ -4999,7 +5077,7 @@ class SpirvEmit : AstVisitor {
         emit(bm, SEC_FUNCS, SpvOp.Branch, ids.header)
         emit(bm, SEC_FUNCS, SpvOp.Label, ids.header)
         ctx.terminated = false
-        emit(bm, SEC_FUNCS, SpvOp.LoopMerge, ids.merge, ids.cont_l, uint(SpvLoopControl.None))
+        emit_loop_merge(bm, ids, expr.annotations)
         emit(bm, SEC_FUNCS, SpvOp.Branch, ids.cond_l)
         emit(bm, SEC_FUNCS, SpvOp.Label, ids.cond_l)
         ctx.terminated = false
@@ -5091,7 +5169,7 @@ class SpirvEmit : AstVisitor {
         emit(bm, SEC_FUNCS, SpvOp.Branch, ids.header)
         emit(bm, SEC_FUNCS, SpvOp.Label, ids.header)
         ctx.terminated = false
-        emit(bm, SEC_FUNCS, SpvOp.LoopMerge, ids.merge, ids.cont_l, uint(SpvLoopControl.None))
+        emit_loop_merge(bm, ids, expr.annotations)
         emit(bm, SEC_FUNCS, SpvOp.Branch, ids.cond_l)
         emit(bm, SEC_FUNCS, SpvOp.Label, ids.cond_l)
         ctx.terminated = false
