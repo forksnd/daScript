@@ -175,6 +175,7 @@ class DasHerdWatcherServer : HvWebServer {
     xterm_unicode_js : string
     xterm_web_links_js : string
     clients : array<WatcherClient?>
+    pending_inspection_artifacts : array<string>
     next_client_id : int
 
     def authorized(url : string) : bool {
@@ -363,10 +364,29 @@ class DasHerdWatcherServer : HvWebServer {
             ws_opcode.WS_OPCODE_TEXT, true)
     }
 
+    def remember_inspection_artifact(path : string) {
+        for (pending in pending_inspection_artifacts) {
+            if (pending == path) return
+        }
+        pending_inspection_artifacts |> push(clone_string(path))
+    }
+
+    def retry_inspection_artifact_cleanup() {
+        var index = length(pending_inspection_artifacts)
+        while (index > 0) {
+            index--
+            let path = pending_inspection_artifacts[index]
+            if (!fexist(path) || remove(path)) {
+                pending_inspection_artifacts |> erase(index)
+            }
+        }
+    }
+
     def cleanup_inspection_artifact(var client : WatcherClient?) {
         if (client == null || empty(client.inspection_artifact_path)) return
-        if (fexist(client.inspection_artifact_path)) {
-            let _removed = remove(client.inspection_artifact_path)
+        let path = client.inspection_artifact_path
+        if (fexist(path) && !remove(path)) {
+            self.remember_inspection_artifact(path)
         }
         client.inspection_artifact_path = ""
     }
@@ -742,6 +762,7 @@ class DasHerdWatcherServer : HvWebServer {
     def override onTick {
         watcher_tick()
         repository_tick()
+        self.retry_inspection_artifact_cleanup()
         for (index in range(length(clients))) {
             var client = clients[index]
             if (client == null) continue
@@ -768,5 +789,10 @@ class DasHerdWatcherServer : HvWebServer {
         }
         clients |> clear()
         unsafe { delete clients }
+    }
+
+    def cleanup_inspection_artifacts {
+        self.retry_inspection_artifact_cleanup()
+        delete pending_inspection_artifacts
     }
 }

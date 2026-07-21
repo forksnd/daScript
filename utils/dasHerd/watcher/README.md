@@ -68,11 +68,12 @@ daScript fragments receive a lexical recovery pass only where Tree-sitter left
 unstyled ranges, preserving keyword/type/function colors across disconnected
 hunks and parser recovery nodes.
 
-Completed observation terminals are compacted to 160x50. When a later refresh
-replaces the same repository/worktree observation, only the newest emulator is
-kept in memory; every older `session.json`, `output.raw`, and `events.jsonl`
-remains on disk for postmortem inspection. Interactive sessions are not pruned
-by this policy.
+Completed repository-refresh observation terminals are compacted to 160x50;
+the shorter-lived file Diff/View task terminals compact to 80x25. When a later
+refresh replaces the same repository/worktree observation, only the newest
+emulator is kept in memory; every older `session.json`, `output.raw`, and
+`events.jsonl` remains on disk for postmortem inspection. Interactive sessions
+are not pruned by this policy.
 
 The script exposes `init`, `update`, and `shutdown` for lifecycle hosts. Its
 standalone loop performs optional GC only after `update` returns, when request

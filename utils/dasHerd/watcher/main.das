@@ -205,9 +205,6 @@ def shutdown() {
     g_server_started = false
     if (g_server != null) {
         g_server->cleanup_clients()
-        g_server->cleanup()
-        unsafe { delete g_server }
-        g_server = null
     }
     if (g_watcher_initialized) {
         if (g_repositories_initialized) {
@@ -216,6 +213,14 @@ def shutdown() {
         }
         watcher_shutdown()
         g_watcher_initialized = false
+    }
+    if (g_server != null) {
+        // Watcher shutdown releases any staged-view file handles before the
+        // final artifact-removal retry.
+        g_server->cleanup_inspection_artifacts()
+        g_server->cleanup()
+        unsafe { delete g_server }
+        g_server = null
     }
     watcher_reset_gc_request()
 }

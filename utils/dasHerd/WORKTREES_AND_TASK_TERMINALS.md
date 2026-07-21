@@ -268,9 +268,10 @@ refresh; no fetch is implied. ConPTY's raw bytes contain console-generated VT
 cursor operations, so this slice parses the terminal model's reconstructed
 240x100 screen and fails visibly if output reaches scrollback. An unbounded
 machine-output sidecar is a follow-up, not a reason to parse truncated state.
-Completed observation terminals compact to 160x50. A replacement refresh keeps
-only the newest matching emulator in memory while preserving every older raw,
-event, and launch log on disk; interactive sessions are unaffected.
+Completed repository-refresh observation terminals compact to 160x50, while
+file Diff/View task terminals compact to 80x25. A replacement refresh keeps only
+the newest matching emulator in memory while preserving every older raw, event,
+and launch log on disk; interactive sessions are unaffected.
 
 Questions to settle:
 
