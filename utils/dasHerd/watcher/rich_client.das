@@ -290,8 +290,10 @@ def private queue_inspector_prepare(status : string) {
             g_inspector.source_patch, g_inspector.source_view_text,
             g_inspector.resolved_language, g_inspector.source_view_base64,
             g_inspector.source_view_byte_count)) {
+        let failure = "File inspection preparation worker is unavailable"
         inspector_load_fail(g_inspector.prepare, generation,
-            "Diff preparation worker is unavailable")
+            failure)
+        g_inspector.error = failure
     }
 }
 
