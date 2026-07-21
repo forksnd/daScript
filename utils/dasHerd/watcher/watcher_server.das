@@ -381,7 +381,7 @@ class DasHerdWatcherServer : HvWebServer {
             artifact_path, argv)
         if (!empty(command_error)) {
             client.inspection_delivered = true
-            self.send_file_inspection(client, false, "", command_error)
+            self.send_file_inspection(client, false, patch, command_error)
             return
         }
         let _pruned = watcher_prune_completed_sessions(
@@ -405,7 +405,7 @@ class DasHerdWatcherServer : HvWebServer {
             client.inspection_delivered = true
             self.cleanup_inspection_artifact(client)
             client.inspection_patch = ""
-            self.send_file_inspection(client, false, "", result.error)
+            self.send_file_inspection(client, false, patch, result.error)
             return
         }
         client.inspection_delivered = false
