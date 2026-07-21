@@ -333,6 +333,23 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 textarea { resize: vertical; min-height: 92px; }
 select { cursor: pointer; }
 
+/* Label row for a field that carries an action (e.g. "use built-in" on a prompt override). */
+.cad-field__head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.cad-field__head > label { margin-bottom: 6px; }
+.cad-copy {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg-faint);
+    border-bottom: 1px solid transparent;
+    white-space: nowrap;
+    margin-bottom: 6px;
+}
+.cad-copy:hover { color: var(--amber); border-bottom-color: var(--amber-dim); }
+.cad-copy[disabled] { opacity: 0.4; cursor: default; }
+.cad-copy[disabled]:hover { color: var(--fg-faint); border-bottom-color: transparent; }
+
 .cad-row { display: flex; gap: 10px; align-items: flex-end; }
 .cad-row > .cad-field { flex: 1; }
 .cad-actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
@@ -673,7 +690,7 @@ function setToast(text,bad){const el=$("toast");el.textContent=text;el.className
 
 function renderFeatures(){const box=$("features");box.textContent="";for(const [key,label] of Object.entries(FEATURE_LABELS)){const row=document.createElement("label");row.className="cad-switch";const input=document.createElement("input");input.type="checkbox";input.id="feature-"+key;input.checked=!!surface.runtime.features[key];row.append(input,document.createTextNode(label));box.append(row)}}
 function makeKnob(parent,id,key,value){const wrap=document.createElement("div");wrap.className="cad-knob";const label=document.createElement("label");label.htmlFor=id;label.textContent=key;const input=document.createElement("input");input.id=id;input.type="number";input.value=String(value);input.step=key==="top_k"||key==="max_tokens"?"1":"0.05";wrap.append(label,input);parent.append(wrap)}
-function renderStages(){const box=$("stages");box.textContent="";for(const [stage,label] of Object.entries(STAGE_LABELS)){const detail=document.createElement("details");detail.className="cad-stage";detail.open=stage==="planner";const summary=document.createElement("summary");summary.textContent=label;detail.append(summary);const body=document.createElement("div");body.className="cad-stage__body";const prompt=document.createElement("div");prompt.className="cad-field";const pl=document.createElement("label");pl.htmlFor="prompt-"+stage;pl.textContent="system prompt override";const ta=document.createElement("textarea");ta.id="prompt-"+stage;ta.value=surface.runtime.prompts[stage]||"";ta.placeholder=builtinPrompt(stage)||"(built-in prompt)";prompt.append(pl,ta);body.append(prompt);const grid=document.createElement("div");grid.className="cad-knobs";for(const key of KNOBS)makeKnob(grid,`stage-${stage}-${key}`,key,surface.runtime.generation[stage][key]);const think=document.createElement("label");think.className="cad-knob think";const cb=document.createElement("input");cb.type="checkbox";cb.id=`stage-${stage}-thinking`;cb.checked=!!surface.runtime.generation[stage].thinking;think.append(cb,document.createTextNode("thinking"));grid.append(think);body.append(grid);detail.append(body);box.append(detail)}}
+function renderStages(){const box=$("stages");box.textContent="";for(const [stage,label] of Object.entries(STAGE_LABELS)){const detail=document.createElement("details");detail.className="cad-stage";detail.open=stage==="planner";const summary=document.createElement("summary");summary.textContent=label;detail.append(summary);const body=document.createElement("div");body.className="cad-stage__body";const prompt=document.createElement("div");prompt.className="cad-field";const head=document.createElement("div");head.className="cad-field__head";const pl=document.createElement("label");pl.htmlFor="prompt-"+stage;pl.textContent="system prompt override";const ta=document.createElement("textarea");ta.id="prompt-"+stage;ta.value=surface.runtime.prompts[stage]||"";const builtin=builtinPrompt(stage);ta.placeholder=builtin||"(built-in prompt)";const copy=document.createElement("button");copy.type="button";copy.className="cad-copy";copy.textContent="copy built-in";copy.title="Load the built-in prompt into the editor so you can edit from it";copy.disabled=!builtin;copy.addEventListener("click",()=>{if(!builtin)return;if(ta.value.trim()&&!confirm("Replace this override with the built-in prompt?"))return;ta.value=builtin;ta.focus();ta.setSelectionRange(ta.value.length,ta.value.length)});head.append(pl,copy);prompt.append(head,ta);body.append(prompt);const grid=document.createElement("div");grid.className="cad-knobs";for(const key of KNOBS)makeKnob(grid,`stage-${stage}-${key}`,key,surface.runtime.generation[stage][key]);const think=document.createElement("label");think.className="cad-knob think";const cb=document.createElement("input");cb.type="checkbox";cb.id=`stage-${stage}-thinking`;cb.checked=!!surface.runtime.generation[stage].thinking;think.append(cb,document.createTextNode("thinking"));grid.append(think);body.append(grid);detail.append(body);box.append(detail)}}
 function renderPlayKnobs(){const box=$("play-knobs");box.textContent="";for(const key of KNOBS)makeKnob(box,"play-"+key,key,0);const think=document.createElement("label");think.className="cad-knob think";const cb=document.createElement("input");cb.type="checkbox";cb.id="play-thinking";think.append(cb,document.createTextNode("thinking"));box.append(think)}
 // Built-in prompt text comes from the bot (cadmus-defaults.json via /api/settings), never restated
 // here — a local copy would drift from what the bot actually sends.
