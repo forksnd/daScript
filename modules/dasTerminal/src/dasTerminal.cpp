@@ -50,6 +50,35 @@ das::smart_ptr<PtyHandle> builtin_pty_launch(
     return pty;
 }
 
+das::smart_ptr<PtyHandle> builtin_pty_launch_argv(
+    const das::Array & arguments,
+    const char * working_directory, int32_t directory_count,
+    int32_t columns, int32_t rows, das::Context * context,
+    das::LineInfoArg * at) {
+    das::smart_ptr<PtyHandle> pty = das::make_smart<PtyHandle>();
+    if (!arguments.size) {
+        pty->error = "PTY argument array is empty";
+        return pty;
+    }
+    const char * const * values = reinterpret_cast<const char * const *>(arguments.data);
+    PtyProcessOptions options;
+    options.arguments.reserve(arguments.size);
+    for (uint32_t index = 0; index != arguments.size; ++index) {
+        if (!values[index]) {
+            context->throw_error_at(at, "PTY argument %u is null", index);
+            return pty;
+        }
+        options.arguments.emplace_back(values[index]);
+    }
+    if (working_directory && directory_count > 0)
+        options.working_directory.assign(
+            working_directory, static_cast<size_t>(directory_count));
+    options.columns = columns;
+    options.rows = rows;
+    pty->process = launchPtyProcess(options, pty->error);
+    return pty;
+}
+
 int32_t builtin_pty_read(
     const das::smart_ptr<PtyHandle> & pty, das::TArray<uint8_t> & bytes,
     int32_t maximum_bytes, das::Context * context, das::LineInfoArg * at) {
@@ -152,6 +181,11 @@ public:
             "das_terminal::builtin_pty_launch")
                 ->args({"command_line", "command_count", "working_directory",
                     "directory_count", "columns", "rows"});
+        addExtern<DAS_BIND_FUN(das_terminal::builtin_pty_launch_argv)>(*this, lib,
+            "_pty_launch_argv", SideEffects::modifyExternal,
+            "das_terminal::builtin_pty_launch_argv")
+                ->args({"arguments", "working_directory", "directory_count",
+                    "columns", "rows", "context", "at"});
         addExtern<DAS_BIND_FUN(das_terminal::builtin_pty_read)>(*this, lib,
             "_pty_read", SideEffects::modifyArgumentAndExternal,
             "das_terminal::builtin_pty_read")

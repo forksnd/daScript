@@ -118,6 +118,41 @@ void ConPtyProcess::closePty() {
     pseudo_console_ = nullptr;
 }
 
+std::string escapeWindowsArgument(const std::string & argument) {
+    if (!argument.empty() &&
+        argument.find_first_of(" \t\n\v\"") == std::string::npos)
+        return argument;
+    std::string result = "\"";
+    for (size_t index = 0; index < argument.size();) {
+        size_t backslashes = 0;
+        while (index < argument.size() && argument[index] == '\\') {
+            ++backslashes;
+            ++index;
+        }
+        if (index == argument.size()) {
+            result.append(backslashes * 2, '\\');
+        } else if (argument[index] == '"') {
+            result.append(backslashes * 2 + 1, '\\');
+            result += '"';
+            ++index;
+        } else {
+            result.append(backslashes, '\\');
+            result += argument[index++];
+        }
+    }
+    result += '"';
+    return result;
+}
+
+std::string buildWindowsCommandLine(const std::vector<std::string> & arguments) {
+    std::string result;
+    for (const std::string & argument : arguments) {
+        if (!result.empty()) result += ' ';
+        result += escapeWindowsArgument(argument);
+    }
+    return result;
+}
+
 ConPtyProcess::~ConPtyProcess() {
     closePty();
     closeHandle(process_);
@@ -128,7 +163,7 @@ bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & erro
         error = "ConPTY process is already launched";
         return false;
     }
-    if (options.command_line.empty()) {
+    if (options.command_line.empty() && options.arguments.empty()) {
         error = "ConPTY command line is empty";
         return false;
     }
@@ -200,7 +235,9 @@ bool ConPtyProcess::launch(const PtyProcessOptions & options, std::string & erro
         return false;
     }
 
-    std::wstring command = utf8ToWide(options.command_line, error);
+    const std::string command_line = options.arguments.empty()
+        ? options.command_line : buildWindowsCommandLine(options.arguments);
+    std::wstring command = utf8ToWide(command_line, error);
     std::wstring directory = utf8ToWide(options.working_directory, error);
     if (command.empty() || (!options.working_directory.empty() && directory.empty())) {
         DeleteProcThreadAttributeList(startup.lpAttributeList);

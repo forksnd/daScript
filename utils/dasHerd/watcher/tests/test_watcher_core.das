@@ -6,6 +6,16 @@ require ../watcher_core.das
 require daslib/fio
 require strings
 
+[test]
+def test_watcher_machine_output(t : T?) {
+    t |> run("ConPTY wrapper controls are removed without changing task text") <| @(t : T?) {
+        let esc = to_char(27)
+        let bel = to_char(7)
+        let wrapped = "{esc}[?9001h{esc}[2J{esc}[Hfirst\r\nsecond\tvalue{esc}]0;git.exe{bel}{esc}[?25h"
+        t |> equal(watcher_strip_terminal_controls(wrapped), "first\r\nsecond\tvalue")
+    }
+}
+
 def private wait_for(session_id, state : string; timeout_ms : int64) : bool {
     let started = ref_time_ticks()
     while (get_time_nsec(started) / 1000000l < timeout_ms) {
@@ -58,6 +68,47 @@ def test_watcher_process_lifecycle(t : T?) {
         t |> equal(length(raw_tail.bytes), 0, "raw replay offset does not duplicate output")
         t |> success(fexist(path_join(path_join(path_join(root, "sessions"), quick.session_id), "output.raw")),
             "raw output log exists")
+
+        let spaced_dir = path_join(root, "argv space")
+        var mkdir_error : string
+        t |> success(mkdir_rec(spaced_dir, mkdir_error), mkdir_error)
+        let echo_script = path_join(spaced_dir, "echo args.ps1")
+        t |> success(fwrite(echo_script, "[Console]::Write(($args -join '|'))"),
+            "argv echo script is written")
+        var structured_argv <- ["powershell.exe", "-NoLogo", "-NoProfile", "-File", echo_script,
+            "space value", "quote\"value", "trailing\\"]
+        let structured = watcher_launch(WatcherLaunchRequest(argv <- structured_argv,
+            cwd = root, display_name = "structured argv test", kind = "test",
+            target_id = "local", repository_id = "test-repository", worktree_path = root,
+            columns = 80, rows = 20, timeout_ms = 5000l))
+        t |> success(structured.ok, structured.error)
+        t |> success(wait_for(structured.session_id, "exited", 5000l),
+            "structured argv command exits and drains")
+        let structured_snapshot = watcher_snapshot_json(structured.session_id)
+        t |> success(find(structured_snapshot, "space value|quote\\\"value|trailing\\\\") >= 0,
+            "structured argv preserves spaces, quotes, and trailing backslashes")
+        t |> success(find(structured_snapshot, "\"worktree_path\":") >= 0,
+            "session snapshot retains launch worktree association")
+        var before_compact = WatcherSessionInfo()
+        t |> success(watcher_get_session_info(structured.session_id, before_compact),
+            "completed structured session remains addressable")
+        t |> success(watcher_compact_session(structured.session_id, 60, 10),
+            "completed session can release its oversized terminal state")
+        var after_compact = WatcherSessionInfo()
+        t |> success(watcher_get_session_info(structured.session_id, after_compact),
+            "compacted session remains addressable")
+        t |> equal(after_compact.pid, before_compact.pid,
+            "compaction retains the original process id")
+        t |> equal(after_compact.exit_code, before_compact.exit_code,
+            "compaction retains the exit code")
+        t |> success(find(watcher_snapshot_json(structured.session_id), "space value") >= 0,
+            "compaction replays retained raw output into an inspectable terminal")
+        let structured_log = path_join(path_join(path_join(root, "sessions"), structured.session_id), "output.raw")
+        t |> equal(watcher_prune_completed_sessions("test", "test-repository", root), 1,
+            "completed observation session can leave the in-memory working set")
+        t |> equal(watcher_find_session(structured.session_id), -1,
+            "pruned observation session is removed from the live list")
+        t |> success(fexist(structured_log), "pruning preserves its durable raw log")
 
         for (iteration in range(6)) {
             let close_race = watcher_launch(WatcherLaunchRequest(

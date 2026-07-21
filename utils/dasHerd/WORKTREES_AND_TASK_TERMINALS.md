@@ -182,7 +182,7 @@ live-command terminal schema.
 
 ## Section 1: repository, base, and worktree identity
 
-Discussion status: open
+Discussion status: initial identity and configuration decisions settled
 
 The first model needs to distinguish:
 
@@ -200,24 +200,38 @@ therefore include at least `target ID + repository Git-common-dir` for a
 repository and `repository ID + canonical worktree path` for an initial
 worktree identity. Session records get their own generated IDs.
 
+Repositories are registered explicitly by checkout path; dasHerd does not
+recursively scan arbitrary directory trees. One global user configuration owns
+per-repository records. A repository record may contain its display name,
+target ID, checkout path, default/base ref, managed-worktree parent and naming
+rule, setup trust and recipe selection, protected branches/removal policy, and
+preferred Git remote. Targets themselves remain global. Repository-local
+configuration is deferred; a future shared file must never execute setup merely
+because a repository was opened.
+
+The main checkout is the first, visually distinct worktree row. Linked
+worktrees remain ordinary children of the registered repository. Interactive
+sessions retain the worktree association chosen at launch even if their live
+shell working directory later changes; current-directory observation is
+separate from ownership.
+
 Questions to settle:
 
-- Is the base ref stored per repository, per worktree, or both with an
-  override?
 - Are externally created worktrees fully manageable or initially read-only?
 - Where are default managed worktrees placed, and how editable is that path?
-- Do we show a virtual base row, or show the base only in the repository header
-  until it has a real worktree?
+- Whether a worktree needs an explicit base override in addition to the
+  repository default.
 
 ## Section 2: asynchronous Git observation
 
-Discussion status: open
+Discussion status: first local slice implemented; SSH transport deferred
 
 Background observation needs structured, non-interactive results. It submits
 commands through the detachable host, uses Git's porcelain/plumbing output
 without color, and publishes versioned snapshots to the UI. Its hosted
-terminal and log remain addressable for diagnostics, but terminal text is
-never the authority for repository state.
+terminal and log remain addressable for diagnostics. The intended authority is
+an unbounded machine-output sidecar; the bounded first slice below uses the
+terminal model only with explicit overflow detection.
 
 The initial observer covers:
 
@@ -245,6 +259,19 @@ Worker rules:
 - refresh after every mutation;
 - do not fetch the network implicitly.
 
+The first implementation registers explicit repositories in the global user
+configuration, resolves the first Git 2.17 porcelain worktree as Main, and
+runs inventory/status queries as watcher-owned structured-argv task sessions.
+It publishes staged, unstaged, untracked, conflicted, ahead/behind, locked, and
+prunable state plus filenames. Selecting a worktree requests an immediate local
+refresh; no fetch is implied. ConPTY's raw bytes contain console-generated VT
+cursor operations, so this slice parses the terminal model's reconstructed
+240x100 screen and fails visibly if output reaches scrollback. An unbounded
+machine-output sidecar is a follow-up, not a reason to parse truncated state.
+Completed observation terminals compact to 160x50. A replacement refresh keeps
+only the newest matching emulator in memory while preserving every older raw,
+event, and launch log on disk; interactive sessions are unaffected.
+
 Questions to settle:
 
 - Refresh triggers and cadence for selected and unselected worktrees.
@@ -255,7 +282,7 @@ Questions to settle:
 
 ## Section 3: execution targets and command sessions
 
-Discussion status: open
+Discussion status: partially settled
 
 Git cannot be designed as "run a Windows process in this local directory."
 Commands run against an execution target. The first target implementation is
@@ -272,6 +299,20 @@ Target-specific path syntax stays behind this boundary. UI and persisted
 records carry a target ID together with paths rather than treating local
 absolute paths as universal.
 
+The data model includes `target_id` from the first version, but the UI does not
+offer inert SSH checkboxes or disabled remote controls. It shows the active
+Local target in repository context. A target selector appears only when more
+than one functional target exists; SSH will be a structured target containing
+host, authentication, remote paths, shell, and capabilities rather than a
+boolean session option.
+
+The initial Commands menu has one immediate action: PowerShell in the selected
+worktree, using `powershell.exe -NoLogo -NoProfile`. A successful launch opens,
+selects, controls, and focuses that session's terminal. A later dockable Session
+Launcher will customize shell or agent, new/resume mode, worktree, target,
+arguments, environment, and command preview. `Codex` and `Codex resume` are
+modes of that launcher, not separate proliferating profiles.
+
 Questions to settle:
 
 - How much of the target protocol is defined before implementing local-only
@@ -283,7 +324,7 @@ Questions to settle:
 
 ## Section 4: Git and setup task terminals
 
-Discussion status: open
+Discussion status: initial dockspace and session behavior settled
 
 User-initiated Git mutations, setup recipes, and repair work are activities
 with terminals. Their terminal provides:
@@ -358,16 +399,28 @@ Questions to settle:
 
 ## Section 6: basic application layout and navigation
 
-Discussion status: open
+Discussion status: partially settled
 
-The first application shape is:
+The rich client is a real ImGui dockspace. Repositories/worktrees,
+sessions/activity, Git status, settings, session launchers, diffs, and every
+open terminal are independent dockable windows. Opening an item creates or
+focuses its window; users may dock, float, tab, or arrange multiple instances
+side by side. Closing a terminal window detaches its client and never
+terminates the watcher-owned session.
 
-- a repository header that shows target and base;
-- a draggable left rail containing the main checkout and linked worktrees;
-- a right workspace for inspection and the selected terminal;
+The default layout is:
+
+- a left repository/worktree rail with the main checkout visually distinct;
+- Git status above an always-visible terminal on the right;
 - a Git/tasks activity window containing running and retained jobs;
 - status and failure affordances that always navigate to the relevant
   terminal or recovery terminal.
+
+The top menu bar owns File, Commands, Edit, View, and Settings. View contains
+zoom, the exited-session filter, and Reset Layout. Docking state and window
+visibility persist in global user configuration; Reset Layout restores the
+default arrangement. Exited sessions are retained but hidden by default. A
+newly launched session becomes the active controlled terminal immediately.
 
 Each worktree row eventually shows branch/HEAD, dirty/conflict state,
 refresh/error state, setup state, and live terminal/agent activity. Switching
@@ -377,13 +430,61 @@ The Git/tasks window is a terminal when a task has a terminal, not a custom
 plain-text log approximation. Structured Git observations may appear as debug
 records beside the terminal activities.
 
-Questions to settle:
+### Git file inspection workspace
 
-- Default docking: fixed worktree rail plus terminal, or fully dockable
-  inspector/activity windows from the first version.
-- Whether inspection sits above the terminal, in a separate dock, or behind a
-  tab.
+The useful center of Git inspection is a selected file with two instantly
+switchable projections, not a longer status table:
+
+- **Diff** is a synchronized side-by-side comparison. Both sides remain plain
+  source text and use extension-driven syntax highlighting for daScript, C,
+  C++, Markdown, and other installed syntax providers.
+- **View** shows the resulting file without diff furniture. Source files use
+  the shared read-only source view with a thin changed-line gutter. Markdown
+  uses the shared rich Markdown viewer; it is not flattened into code text.
+
+File selection updates the inspector immediately. Loading is asynchronous and
+must never block the UI thread; a new selection supersedes stale work without
+requiring an Apply/Open button. The inspector is an independent dockable
+window so status, file view/diff, and terminal can be arranged together.
+
+Comparison scope is explicit and shares the same inspector:
+
+- **Working** compares the index with unstaged and untracked content.
+- **Staged** compares `HEAD` with the index.
+- **PR** compares the selected PR/head with its merge base. PR discovery,
+  selection, and base policy are a later slice, but this is the primary review
+  surface and must not be modeled as an alias for staged files.
+
+The first file list is flat, grouped by conflicts, staged, modified, and
+untracked, and shows the full repository-relative path. A tree projection may
+be added as a switch over the same model; it must not become a separate data
+path. Files which have both index and working-tree changes legitimately appear
+in both comparison groups.
+
+The document/source model owns exact UTF-8 bytes, syntax spans, aligned diff
+rows, and changed-line marks. Rendering owns layout, synchronized scrolling,
+selection, the narrow View gutter, and Diff line tint. This keeps live-command
+inspection semantic and avoids screenshot-only validation.
+
+The implemented working-tree path deliberately separates compact Diff from
+complete View. Git emits three context lines into the hosted terminal, while
+the resulting working file is read as exact bytes after the task succeeds.
+Large unwrapped Views virtualize visible lines; disconnected daScript hunks use
+lexical recovery for Tree-sitter gaps. The current measured stress case is a
+628 KiB/12,116-line file: Diff is ready in about 0.6 seconds, synchronized
+scrolling is exact in both directions, and the prepared View renders at roughly
+50 FPS at 4K/150% zoom. Full-file syntax preparation is still a one-time
+multi-second cost and remains the next focused optimization, not a reason to
+replace Git's native diff.
+
+Questions still to settle:
+
 - How completed task terminals are grouped and pruned from the activity UI.
+- Whether closing the last visible window for a running session should leave a
+  persistent reopen affordance beyond the Sessions window.
+- Exact PR/base discovery and multi-PR selection policy.
+- Whether flat or tree file projection becomes the eventual default after both
+  can be tested with large real changesets.
 
 ## Section 7: worktree creation and setup recipes
 

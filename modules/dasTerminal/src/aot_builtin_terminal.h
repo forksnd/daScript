@@ -20,6 +20,11 @@ das::smart_ptr<PtyHandle> builtin_pty_launch(
     const char * command_line, int32_t command_count,
     const char * working_directory, int32_t directory_count,
     int32_t columns, int32_t rows);
+das::smart_ptr<PtyHandle> builtin_pty_launch_argv(
+    const das::Array & arguments,
+    const char * working_directory, int32_t directory_count,
+    int32_t columns, int32_t rows, das::Context * context,
+    das::LineInfoArg * at);
 int32_t builtin_pty_read(
     const das::smart_ptr<PtyHandle> & pty, das::TArray<uint8_t> & bytes,
     int32_t maximum_bytes, das::Context * context, das::LineInfoArg * at);

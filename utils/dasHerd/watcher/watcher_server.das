@@ -10,6 +10,7 @@ module watcher_server shared public
 
 require dashv/dashv_boost public
 require ./watcher_core.das public
+require ./repository_core.das public
 require daslib/json_boost
 require strings
 
@@ -37,13 +38,39 @@ struct private WatcherWsMessage {
     op : string
     session_id : string
     command_line : string
+    argv : array<string>
     cwd : string
+    display_name : string
+    kind : string
+    target_id : string
+    repository_id : string
+    repository_path : string
+    worktree_path : string
+    file_path : string
+    comparison : string
+    request_id : int
     text : string
     columns : int
     rows : int
     timeout_ms : int64
     control : bool
     raw : bool
+}
+
+struct public RepositoryFileInspectionMessage {
+    @rename = "type"
+    _type : string = "file_inspection"
+    request_id : int
+    repository_id : string
+    worktree_path : string
+    file_path : string
+    comparison : string
+    task_session_id : string
+    loading : bool
+    patch : string
+    view_text : string
+    status : string
+    error : string
 }
 
 class private WatcherClient {
@@ -56,6 +83,15 @@ class private WatcherClient {
     last_update_key : string
     raw : bool
     raw_offset : int64
+    repository_revision : int64 = -1l
+    inspection_request_id : int
+    inspection_repository_id : string
+    inspection_worktree_path : string
+    inspection_file_path : string
+    inspection_comparison : string
+    inspection_session_id : string
+    inspection_expected_exit_code : int64
+    inspection_delivered : bool = true
 }
 
 struct private WatcherOk {
@@ -79,7 +115,7 @@ def private hex_nibble(value : int) : int {
 }
 
 def private percent_decode(value : string) : string {
-    var decoded : array<uint8>
+    var inscope decoded : array<uint8>
     decoded |> reserve(length(value))
     peek_data(value) $(data) {
         var index = 0
@@ -177,6 +213,10 @@ class DasHerdWatcherServer : HvWebServer {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
             return resp |> JSON(watcher_list_json(), http_status.OK)
         }
+        GET("/api/v1/repositories") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> JSON(repository_list_json(), http_status.OK)
+        }
         POST("/api/v1/gc") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
             let coalesced = watcher_request_gc()
@@ -188,13 +228,39 @@ class DasHerdWatcherServer : HvWebServer {
             if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
                 return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
             }
-            var launch = WatcherLaunchRequest()
+            var inscope launch = WatcherLaunchRequest()
             if (!sscan_json(string(req.body), launch)) {
                 return self.respond_error(resp, http_status.BAD_REQUEST, "invalid launch JSON")
             }
             let result = watcher_launch(launch)
             return resp |> JSON(sprint_json(result, false),
                 result.ok ? http_status.CREATED : http_status.BAD_REQUEST)
+        }
+        POST("/api/v1/repositories") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var request = RepositoryAddRequest()
+            if (!sscan_json(string(req.body), request)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid repository JSON")
+            }
+            let error = repository_add(request)
+            if (!empty(error)) return self.respond_error(resp, http_status.CONFLICT, error)
+            return resp |> JSON(sprint_json(WatcherOk(), false), http_status.CREATED)
+        }
+        POST("/api/v1/repositories/refresh") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var request = RepositoryRefreshRequest()
+            if (!sscan_json(string(req.body), request)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid refresh JSON")
+            }
+            let error = repository_refresh(request.repository_id)
+            if (!empty(error)) return self.respond_error(resp, http_status.CONFLICT, error)
+            return resp |> JSON(sprint_json(WatcherOk(), false), http_status.ACCEPTED)
         }
         POST("/api/v1/input") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
@@ -254,6 +320,111 @@ class DasHerdWatcherServer : HvWebServer {
             ws_opcode.WS_OPCODE_TEXT, true)
     }
 
+    def send_repositories(var client : WatcherClient?; force : bool = false) {
+        if (client == null) return
+        let revision = repository_revision()
+        if (!force && client.repository_revision == revision) return
+        client.repository_revision = revision
+        send(client.channel, "\{\"type\":\"repositories\",\"data\":{repository_list_json()}\}",
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def send_file_inspection(var client : WatcherClient?;
+                             loading : bool; patch, error : string;
+                             view_text : string = ""; status : string = "") {
+        if (client == null) return
+        let message = RepositoryFileInspectionMessage(
+            request_id = client.inspection_request_id,
+            repository_id = client.inspection_repository_id,
+            worktree_path = client.inspection_worktree_path,
+            file_path = client.inspection_file_path,
+            comparison = client.inspection_comparison,
+            task_session_id = client.inspection_session_id,
+            loading = loading, patch = patch, view_text = view_text,
+            status = status, error = error)
+        send(client.channel, sprint_json(message, false),
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def start_file_inspection(var client : WatcherClient?;
+                              incoming : WatcherWsMessage const) {
+        if (client == null) return
+        if (!empty(client.inspection_session_id)
+                && watcher_accepts_input(client.inspection_session_id)) {
+            let _ = watcher_terminate(client.inspection_session_id, "superseded")
+        }
+        client.inspection_request_id = incoming.request_id
+        client.inspection_repository_id = incoming.repository_id
+        client.inspection_worktree_path = incoming.worktree_path
+        client.inspection_file_path = incoming.file_path
+        client.inspection_comparison = incoming.comparison
+        client.inspection_session_id = ""
+        client.inspection_delivered = true
+
+        var inscope argv : array<string>
+        var expected_exit_code = 0l
+        let command_error = repository_file_diff_argv(
+            incoming.repository_id, incoming.worktree_path,
+            incoming.file_path, incoming.comparison,
+            argv, expected_exit_code)
+        if (!empty(command_error)) {
+            self.send_file_inspection(client, false, "", command_error)
+            return
+        }
+        let _pruned = watcher_prune_completed_sessions(
+            "git-file-diff", incoming.repository_id, incoming.worktree_path)
+        var inscope request = WatcherLaunchRequest(
+            cwd = incoming.worktree_path,
+            display_name = "Git diff: {incoming.file_path}",
+            kind = "git-file-diff", target_id = "local",
+            repository_id = incoming.repository_id,
+            worktree_path = incoming.worktree_path,
+            columns = 80, rows = 25, timeout_ms = 15000l)
+        request.argv := argv
+        let result = watcher_launch(request)
+        client.inspection_session_id = result.session_id
+        client.inspection_expected_exit_code = expected_exit_code
+        if (!result.ok) {
+            self.send_file_inspection(client, false, "", result.error)
+            return
+        }
+        client.inspection_delivered = false
+        self.send_file_inspection(client, true, "", "", "",
+            "Computing compact Git diff (15 second limit)...")
+    }
+
+    def poll_file_inspection(var client : WatcherClient?) {
+        if (client == null || client.inspection_delivered
+                || empty(client.inspection_session_id)) return
+        var info = WatcherSessionInfo()
+        if (!watcher_get_session_info(client.inspection_session_id, info)
+                || !info.drained) return
+        var truncated = false
+        let patch = watcher_machine_output_text(client.inspection_session_id, truncated)
+        let _compacted = watcher_compact_session(client.inspection_session_id, 80, 25)
+        client.inspection_delivered = true
+        if (truncated) {
+            self.send_file_inspection(client, false, "",
+                "diff exceeded the retained machine-output limit")
+        } elif (info.exit_code != client.inspection_expected_exit_code) {
+            self.send_file_inspection(client, false, "",
+                "git diff exited with {info.exit_code}: {patch}")
+        } else {
+            var view_text = ""
+            if (client.inspection_comparison == "working") {
+                let view_error = repository_working_file_text(
+                    client.inspection_repository_id,
+                    client.inspection_worktree_path,
+                    client.inspection_file_path, view_text)
+                if (!empty(view_error)) {
+                    self.send_file_inspection(client, false, "", view_error)
+                    return
+                }
+            }
+            self.send_file_inspection(client, false, patch, "", view_text)
+        }
+    }
+
     def send_snapshot(var client : WatcherClient?; force : bool = false) {
         if (client == null || empty(client.session_id)) return
         let update_key = watcher_update_key(client.session_id)
@@ -270,7 +441,7 @@ class DasHerdWatcherServer : HvWebServer {
 
     def send_raw_output(var client : WatcherClient?) {
         if (client == null || !client.raw || empty(client.session_id)) return
-        var chunk <- watcher_output_since(client.session_id, client.raw_offset)
+        var inscope chunk <- watcher_output_since(client.session_id, client.raw_offset)
         if (chunk.reset) {
             let start_offset = chunk.next_offset - int64(length(chunk.bytes))
             send(client.channel, "\{\"type\":\"raw_reset\",\"offset\":{start_offset}\}",
@@ -309,6 +480,7 @@ class DasHerdWatcherServer : HvWebServer {
         send(channel, "\{\"type\":\"connected\",\"client_id\":{next_client_id}\}",
             ws_opcode.WS_OPCODE_TEXT, true)
         send_sessions(channel)
+        send_repositories(clients[length(clients) - 1], true)
     }
 
     def override onWsClose(channel : WebSocketChannel) {
@@ -323,7 +495,7 @@ class DasHerdWatcherServer : HvWebServer {
     def override onWsMessage(channel : WebSocketChannel; message : string#) {
         let index = find_client(channel)
         if (index < 0) return
-        var incoming : WatcherWsMessage
+        var inscope incoming : WatcherWsMessage
         if (length(message) > MAX_REQUEST_BODY_BYTES || !sscan_json(string(message), incoming)) {
             send_error(channel, "invalid WebSocket message")
             return
@@ -335,11 +507,31 @@ class DasHerdWatcherServer : HvWebServer {
             send(channel, "\{\"type\":\"heartbeat\"\}", ws_opcode.WS_OPCODE_TEXT, true)
         } elif (incoming.op == "list") {
             send_sessions(channel)
+            send_repositories(client, true)
+        } elif (incoming.op == "repository_add") {
+            let error = repository_add(RepositoryAddRequest(path = incoming.repository_path,
+                display_name = incoming.display_name, target_id = incoming.target_id))
+            if (!empty(error)) {
+                send_error(channel, error)
+                return
+            }
+            send_repositories(client, true)
+        } elif (incoming.op == "repository_refresh") {
+            let error = repository_refresh(incoming.repository_id)
+            if (!empty(error)) send_error(channel, error)
+            send_repositories(client, true)
+        } elif (incoming.op == "file_inspect") {
+            self.start_file_inspection(client, incoming)
         } elif (incoming.op == "launch") {
-            let result = watcher_launch(WatcherLaunchRequest(
+            var inscope launch = WatcherLaunchRequest(
                 command_line = incoming.command_line, cwd = incoming.cwd,
+                display_name = incoming.display_name, kind = incoming.kind,
+                target_id = incoming.target_id, repository_id = incoming.repository_id,
+                worktree_path = incoming.worktree_path,
                 columns = incoming.columns, rows = incoming.rows,
-                timeout_ms = incoming.timeout_ms))
+                timeout_ms = incoming.timeout_ms)
+            launch.argv := incoming.argv
+            let result = watcher_launch(launch)
             if (!result.ok) {
                 send_error(channel, result.error)
                 return
@@ -396,6 +588,7 @@ class DasHerdWatcherServer : HvWebServer {
 
     def override onTick {
         watcher_tick()
+        repository_tick()
         for (index in range(length(clients))) {
             var client = clients[index]
             if (client == null) continue
@@ -406,6 +599,8 @@ class DasHerdWatcherServer : HvWebServer {
             }
             send_snapshot(client)
             send_raw_output(client)
+            send_repositories(client)
+            self.poll_file_inspection(client)
         }
     }
 
@@ -417,6 +612,6 @@ class DasHerdWatcherServer : HvWebServer {
                 unsafe { delete client }
             }
         }
-        clients |> clear()
+        unsafe { delete clients }
     }
 }
