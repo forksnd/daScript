@@ -2035,6 +2035,10 @@ struct private GpuState {
     rows_per_wg : int64      // subgroups per workgroup = output rows per workgroup
     weight_budget : int64    // resident-weight cap — queried heap budget minus reserve, or VRAM_BUDGET
     @do_not_delete stacks : array<VkStack>
+    // the resident driver's weight arenas, one per format present (see the arena section). Separate
+    // from `stacks` on purpose: the two tiers never co-arm on one model, and the arena has no
+    // per-plane descriptor set to cap.
+    arenas : table<int; ArenaFmt>
     ffn_cmds : table<int64; FfnCmd>   // (gate, up, down stack idx triple) -> decode FFN chain
     resident_bytes : int64
     // heat-pinned expert cache (decode split-FFN) + the one-in-flight async FFN discipline
@@ -2362,16 +2366,22 @@ def private staged_upload(dst : uint64; dst_off : int64; bytes : int64) {
     }
 }
 
-def private upload_region(dst : uint64; src : uint8 const?; total : int64) {
+// Stage `total` bytes into `dst` starting at `dst_off`. The arena packs many tensors into one
+// buffer, so it needs the offset; the per-op tier's own planes start at 0.
+def private upload_region_at(dst : uint64; dst_off : int64; src : uint8 const?; total : int64) {
     var off = 0l
     while (off < total) {
         let chunk = min(total - off, STAGING_BYTES)
         unsafe {
             par_memcpy(g_gpu.staging.mapped, reinterpret<void? -const>(src + off), chunk)
         }
-        staged_upload(dst, off, chunk)
+        staged_upload(dst, dst_off + off, chunk)
         off += chunk
     }
+}
+
+def private upload_region(dst : uint64; src : uint8 const?; total : int64) {
+    upload_region_at(dst, 0l, src, total)
 }
 
 def private alloc_desc_set : VkDescriptorSet {
@@ -2529,6 +2539,167 @@ def private find_stack(w0 : int64; fmt : int) : int {
         panic("dasLLAMA vulkan tier: dispatch against a non-resident weight region (fmt {fmt} element offset {w0})")
     }
     return i
+}
+
+// ===== the resident driver's weight arena =====
+// One buffer pair per FORMAT (the kernels index both planes off ONE base, so a shared cursor only
+// stays aligned at a constant stride), tensors addressed by block index — no per-plane MAX_STACKS.
+
+struct private ArenaFmt {
+    fmt : int                // int(KqFmt): 0 = q8, 1/2/3 = k4/k5/k6, 4 = q40
+    wqbuf : uint64           // device-local quants for every tensor of this format
+    wsbuf : uint64           // ... and their scale rows, at the SAME block index
+    wqbytes : int64
+    wsbytes : int64
+    blocks : int64           // bump cursor: 32-weight blocks (q8) or 256-weight superblocks (kq)
+    cap_blocks : int64
+    // dispatch scratch — ONE set per format: bindings 0/1 stay put, only the meta changes per call
+    raw_set : VkDescriptorSet
+    meta : HostBuf
+    xq : HostBuf
+    xs : HostBuf
+    y : HostBuf              // host-cached readback (the same-submit DMA lands here)
+    y_dev : uint64
+    ready : bool
+}
+
+// per-block plane strides — the block is 32 weights for q8 and a 256-weight superblock for kq.
+// Mirrors stack_plane_bytes: it computes the same totals as count * these strides.
+def private arena_block_bytes(fmt : int) : tuple<wq : int64; ws : int64> {
+    if (fmt == 0) {
+        return (wq = 32l, ws = 2l)            // 32 int8 quants + one f16 scale
+    }
+    let q = fmt == 2 ? 160l : (fmt == 3 ? 192l : 128l)   // k4 and q40 share the 128B nibble tiling
+    return (wq = q, ws = 20l)                 // decoded scale row: [f16 d][f16 dmin][8 sc][8 mn]
+}
+
+def private arena_blocks_for(n, rows : int64; fmt : int) : int64 {
+    assert(fmt == 0 || n % 256l == 0l, "dasLLAMA vulkan arena: kq row length must be a superblock multiple")
+    assert(fmt != 0 || n % 32l == 0l, "dasLLAMA vulkan arena: q8 row length must be a 32-block multiple")
+    return rows * (n / (fmt == 0 ? 32l : 256l))
+}
+
+// Reserve one format's arena up front. Sizing is a decision, not a walk: the resident driver knows
+// every tensor's shape from Model metadata before a byte moves, so it either fits or declines.
+def private arena_reserve(fmt : int; cap_blocks : int64) : bool {
+    if (key_exists(g_gpu.arenas, fmt)) {
+        return true
+    }
+    let bb = arena_block_bytes(fmt)
+    let qbytes = cap_blocks * bb.wq
+    let sbytes = cap_blocks * bb.ws
+    // maxStorageBufferRange, not uint32 indexing (that reaches 16GiB), is the real ceiling
+    if (qbytes > 2_147_483_648l || sbytes > 2_147_483_648l) {
+        to_log(LOG_WARNING, "dasLLAMA vulkan arena: fmt {fmt} needs {qbytes} quant bytes — over the 2GiB shard cap\n")
+        return false
+    }
+    var a = ArenaFmt(fmt = fmt, cap_blocks = cap_blocks, wqbytes = qbytes, wsbytes = sbytes,
+                     wqbuf = make_device_buf(qbytes), wsbuf = make_device_buf(sbytes))
+    g_gpu.arenas |> insert(fmt, a)
+    return true
+}
+
+//! Place one [rows x n] tensor in its format's arena and upload it. Returns the BLOCK INDEX the
+//! meta needs (mp[4 + row*2] = block + row * blocks_per_row), or -1 if the arena is exhausted.
+def private arena_place(wq : uint8 const?; ws : uint8 const?; n, rows : int64; fmt : int) : int64 {
+    if (!key_exists(g_gpu.arenas, fmt)) {
+        return -1l
+    }
+    let need = arena_blocks_for(n, rows, fmt)
+    unsafe {
+        var a & = g_gpu.arenas[fmt]
+        if (a.blocks + need > a.cap_blocks) {
+            return -1l
+        }
+        let blk = a.blocks
+        a.blocks += need
+        let bb = arena_block_bytes(fmt)
+        upload_region_at(a.wqbuf, blk * bb.wq, wq, need * bb.wq)
+        upload_region_at(a.wsbuf, blk * bb.ws, ws, need * bb.ws)
+        return blk
+    }
+}
+
+//! Arena seam: reserve one format's arena for `cap_blocks` 32-weight blocks (q8) or 256-weight
+//! superblocks (kq). false = over the shard cap or no device — the caller turns that into a decline.
+def vk_arena_reserve(fmt : int; cap_blocks : int64) : bool {
+    if (!vk_moe_init()) {
+        return false
+    }
+    return arena_reserve(fmt, cap_blocks)
+}
+
+//! Arena seam: place + upload one [rows x n] tensor from the loader's gathered device-layout
+//! planes. Returns its block index (what the meta's weight base wants), or -1 if exhausted.
+def vk_arena_place(wq : array<uint8>; ws : array<uint8>; n : int64; rows : int64; fmt : int) : int64 {
+    if (!vk_moe_init() || empty(wq) || empty(ws)) {
+        return -1l
+    }
+    return arena_place(unsafe(addr(wq[0])), unsafe(addr(ws[0])), n, rows, fmt)
+}
+
+// Bindings 0/1 are the arena planes; 2-5 are per-dispatch scratch, written exactly as
+// ensure_gemv_scratch writes them for a per-op stack — so an arena-resident tensor runs the SAME
+// kernels with the same meta convention. Lazy: a format only pays when it actually dispatches.
+def private arena_ensure_scratch(fmt : int) {
+    unsafe {
+        var a & = g_gpu.arenas[fmt]
+        if (a.ready) {
+            return
+        }
+        a.meta = make_host_buf(META_BYTES, true)
+        a.xq = make_host_buf(XQ_BYTES, true)
+        a.xs = make_host_buf(XS_BYTES, true)
+        a.y = make_host_buf(Y_BYTES, false, [cached = true])
+        a.y_dev = make_device_buf(Y_BYTES)
+        a.raw_set = alloc_desc_set()
+        var writes : array<WriteDescriptorSet>
+        write_buf_desc(writes, a.raw_set, 0u, a.wqbuf, a.wqbytes)
+        write_buf_desc(writes, a.raw_set, 1u, a.wsbuf, a.wsbytes)
+        write_buf_desc(writes, a.raw_set, 2u, a.meta.buf, META_BYTES)
+        write_buf_desc(writes, a.raw_set, 3u, a.xq.buf, XQ_BYTES)
+        write_buf_desc(writes, a.raw_set, 4u, a.xs.buf, XS_BYTES)
+        write_buf_desc(writes, a.raw_set, 5u, a.y_dev, Y_BYTES)
+        let no_copies : array<CopyDescriptorSet>
+        update_descriptor_sets(g_gpu.device, writes, no_copies)
+        a.ready = true
+    }
+}
+
+//! Arena seam: one GEMV of the [d x n] tensor at block index `blk` into y[0..d). Same kernels and
+//! meta layout as the per-op tier — only the weight base is an arena index, not stack-relative.
+def vk_arena_gemv(var y : array<float>; blk : int64; n, d : int64; fmt : int; xq : array<int8>; xs : array<float>) {
+    assert(g_gpu != null && key_exists(g_gpu.arenas, fmt), "dasLLAMA vulkan arena: format not reserved")
+    var yp = unsafe(addr(y[0]))
+    let xqp = unsafe(addr(xq[0]))
+    let xsp = unsafe(addr(xs[0]))
+    arena_ensure_scratch(fmt)
+    let unit = fmt != 0 ? 256l : 32l
+    let nb = n / unit
+    assert(n <= XQ_BYTES && nb * 4l <= XS_BYTES, "dasLLAMA vulkan arena: activations exceed scratch capacity")
+    assert(d * 4l <= Y_BYTES, "dasLLAMA vulkan arena: gemv output exceeds y capacity")
+    unsafe {
+        var a & = g_gpu.arenas[fmt]
+        var mp = reinterpret<uint?>(a.meta.mapped)
+        mp[0] = uint(n)
+        mp[1] = uint(d)
+        mp[2] = 1u          // one region: the whole tensor
+        mp[3] = 0u          // y base row
+        mp[4] = uint(blk)   // THE arena base — a stack-relative offset in the per-op tier
+        mp[5] = 0u          // activation block base
+        memcpy(a.xq.mapped, reinterpret<void? -const>(xqp), int(n))   // one int8 quant per weight
+        memcpy(a.xs.mapped, reinterpret<void? -const>(xsp), int(nb * 4l))
+        var raw = alloc_cmd()
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        bind_gemv_pipe(raw, fmt)
+        cmd_bind_dispatch(raw, a.raw_set, uint((d + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg))
+        comp_barrier(raw)
+        cmd_copy_whole(raw, a.y_dev, a.y.buf, d * 4l)
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(raw)
+        memcpy(reinterpret<void?>(yp), a.y.mapped, int(d * 4l))
+    }
 }
 
 def private alloc_cmd : VkCommandBuffer {

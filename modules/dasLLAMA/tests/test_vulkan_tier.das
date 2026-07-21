@@ -2282,3 +2282,79 @@ def test_vulkan_attention(t : T?) {
         }
     }
 }
+
+// The resident driver's weight arena: many tensors in ONE buffer pair per format, addressed by
+// block index, so a whole dense model costs one descriptor set per format instead of one per plane
+// (the MAX_STACKS cap). TWO tensors on purpose — a single one lands at block 0 and would pass even
+// if the arena base were ignored entirely; the second only matches if its offset is honored.
+[test]
+def test_vulkan_arena(t : T?) {
+    t |> run("vulkan resident arena == CPU reference (two q8 tensors, distinct block offsets)") @(tt : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let AROWS = 64l
+            let ABLK = AROWS * (N / 32l)   // blocks one [AROWS x N] q8 tensor occupies
+            if (!vk_arena_reserve(0, 4l * ABLK)) {
+                feint("no Vulkan device (or the arena reserve was refused); skipping\n")
+                return
+            }
+            var wqa : array<int8>
+            var wsa : array<float>
+            var wqbv : array<int8>
+            var wsbv : array<float>
+            fill_stack(wqa, wsa, AROWS, N, 31l, false)
+            fill_stack(wqbv, wsbv, AROWS, N, 57l, false)   // different seed => different content
+            var pqa : array<uint8>
+            var psa : array<uint8>
+            var pqb : array<uint8>
+            var psb : array<uint8>
+            pack_upload(wqa, wsa, pqa, psa)
+            pack_upload(wqbv, wsbv, pqb, psb)
+            let blk_a = vk_arena_place(pqa, psa, N, AROWS, 0)
+            let blk_b = vk_arena_place(pqb, psb, N, AROWS, 0)
+            tt |> success(blk_a == 0l && blk_b == ABLK,
+                "arena bump cursor packs tensors back to back (a={blk_a}, b={blk_b}, expected 0 and {ABLK})")
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, 1l)
+            let nb = int(N / 32l)
+            for (arm in range(2)) {
+                let blk = arm == 0 ? blk_a : blk_b
+                var y : array<float>
+                y |> resize(int(AROWS))
+                vk_arena_gemv(y, blk, N, AROWS, 0, xq, xs)
+                var refy : array<float>
+                refy |> resize(int(AROWS))
+                for (c in range(int(AROWS))) {
+                    var acc = 0.0lf
+                    for (b in range(nb)) {
+                        var id = 0
+                        for (k in range(32)) {
+                            let wi = c * int(N) + b * 32 + k
+                            id += int(xq[b * 32 + k]) * int(arm == 0 ? wqa[wi] : wqbv[wi])
+                        }
+                        let si = c * nb + b
+                        acc += double(arm == 0 ? wsa[si] : wsbv[si]) * double(xs[b]) * double(id)
+                    }
+                    refy[c] = float(acc)
+                }
+                let cc = compare_gout(y, refy)
+                tt |> success(cc.maxdiff <= float(REL_TOL) * cc.maxref,
+                    "arena tensor {arm} within tolerance (maxdiff {cc.maxdiff} vs {float(REL_TOL) * cc.maxref} bar, maxref {cc.maxref})")
+                delete y
+                delete refy
+            }
+            delete wqa
+            delete wsa
+            delete wqbv
+            delete wsbv
+            delete pqa
+            delete psa
+            delete pqb
+            delete psb
+            delete xq
+            delete xs
+        } else {
+            feint("dasVulkan not installed; resident arena untestable here\n")
+        }
+    }
+}

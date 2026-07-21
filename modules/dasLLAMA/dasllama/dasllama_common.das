@@ -1899,13 +1899,12 @@ def moe_gpu_upload_resident(var t : Model) {
                 && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())) {
         return   // tier absent or nothing requested
     }
-    // capability guard: the tier serves q8-mode MoE models only — record WHY for the status
-    // surface when it is armed but this model cannot ride it
+    // capability guard: the tier needs q8 serving mode — record WHY for the status surface when it
+    // is armed but this model cannot ride it. Dense archs pass: every non-expert rail (cls, dense
+    // planes, attn quads, qkv) keys on wq/wk/wv/wo/wcls offsets and never on experts.
     var reason = ""
     if (t.quant != QuantMode.q8) {
         reason = "GPU tier needs q8 serving mode"
-    } elif (t.config.n_expert <= 0l) {
-        reason = "dense-only architecture — the GPU tier serves MoE models today"
     } elif (t.experts_mx4) {
         reason = "mx4 expert planes are not tier-servable"
     } elif (t.config.moe_exps_bias) {
@@ -1922,7 +1921,10 @@ def moe_gpu_upload_resident(var t : Model) {
     let ne = t.config.n_expert
     let nfe = t.config.n_ff_exp
     let want_raw = moe_gpu_layer_count()
-    let want = want_raw < 0l ? layers : min(want_raw, layers)   // -1 = auto: fill the budget
+    // a dense arch has no expert stacks at all — we*_offs are never populated (they are built only
+    // under n_expert > 0), so the expert + streamed walks below MUST resolve to zero iterations
+    let has_experts = ne > 0l
+    let want = has_experts ? (want_raw < 0l ? layers : min(want_raw, layers)) : 0l   // -1 = auto: fill the budget
     set_moe_gpu_layer_count(want)   // publish the resolved count — downstream status reads it
     let repacked = kernel_backend_needs_repack(active_kernel_backend())
     let mr = repacked ? active_q8_layout_mr() : 1l
@@ -2206,7 +2208,7 @@ def moe_gpu_upload_resident(var t : Model) {
     // prefill streaming — device-layout planes gathered into pinned host mirrors the tier DMAs per
     // prefill. CPU planes stay (decode runs them); the walk is contiguous descending.
     var sfrom = from_l
-    for (i in range64(max(nstream, 0l))) {
+    for (i in range64(has_experts ? max(nstream, 0l) : 0l)) {
         let l = from_l - 1l - i
         if (l < t.config.n_layer_dense_lead || t.we1_offs[l] < 0l) {
             break
