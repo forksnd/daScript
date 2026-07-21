@@ -9,6 +9,7 @@ This plan records the agreed direction for the rich client's Git review surface.
 - Keep only the PR, History, and Tree perspectives in Activity.
 - Use real resizable tables for commits: SHA, title, and author are separate columns and colors.
 - Show Tree with the same readable table as History until topology has a trustworthy implementation.
+- Reserve a permanent bottom status bar in each Git window; loading and error text replaces the stable summary there without moving content.
 
 This prevents asynchronous file-list replacement from resizing or shifting the activity view.
 
