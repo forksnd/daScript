@@ -123,9 +123,11 @@ def server_bench_running : bool {
 }
 
 // ===== benchmark button (the llama.cpp A/B) =====
-// POST /bench runs, QUIESCED ONLY, our lcpp_bench (a child daslang process — same model, same
-// thread budget, llama-bench methodology) then llama-bench itself, on a worker thread; progress
-// and results flow back over a channel the tick loop drains. GET /bench serves state/log/result.
+// POST /bench runs, QUIESCED ONLY, one lcpp_bench child (--ref runs llama-bench inside it — same
+// model, same thread budget, llama-bench methodology) on a worker thread; progress and results
+// flow back over a channel the tick loop drains. GET /bench serves state/log/result. Numbers come
+// from the child's --json-path record file (the machine rail — stdout carries engine logs), and
+// the raw record rides along in the result as `record` for the copy-record affordance.
 
 var private g_lcpp_bin = ""
 var private g_daslang_bin = ""
@@ -151,36 +153,6 @@ def private bench_emit(events : Channel?; kind : int; text : string) {
     events |> push_clone(BenchEvent(kind = kind, text = text))
 }
 
-// parse "pp512: 202.54 ± 1.23 tok/s (3 reps)" (ours) — the number after "<tag>:"
-def private parse_ours_row(out : string; tag : string) : float {
-    for (ln in split(out, "\n")) {
-        if (ln |> starts_with("{tag}:")) {
-            return to_float(strip(slice(ln, length(tag) + 1)))
-        }
-    }
-    return 0.0
-}
-
-// parse llama-bench's markdown table — the row whose test cell equals `tag`, value = next cell
-def private parse_theirs_row(out : string; tag : string) : float {
-    for (ln in split(out, "\n")) {
-        continue if (find(ln, "|") < 0)
-        var cells <- split(ln, "|")
-        var found = 0.0
-        for (i in range(length(cells) - 1)) {
-            if (strip(cells[i]) == tag) {
-                found = to_float(strip(cells[i + 1]))
-                break
-            }
-        }
-        delete cells
-        if (found > 0.0) {
-            return found
-        }
-    }
-    return 0.0
-}
-
 // argv joined into a copy-pasteable shell line (quotes only where a space demands one)
 def private cmdline(args : array<string>) : string {
     var parts <- [for (a in args); find(a, " ") >= 0 ? "\"{a}\"" : a]
@@ -198,42 +170,67 @@ def private bench_worker(daslang_bin, lcpp_bin, model_path : string; threads : i
         events |> release
     }
     let t0 = ref_time_ticks()
-    bench_emit(events, 0, "our bench: lcpp_bench pp512/tg128 x 3 reps (llama-bench methodology) — minutes-class, hold on")
-    var ours = ""
+    let record_path = path_join(get_das_root(), "logs/server_bench_record.json")
+    bench_emit(events, 0, "lcpp_bench A/B: das + llama-bench, pp512/tg128 x 3 reps (llama-bench methodology) — minutes-class, hold on")
+    var out = ""
     var args <- [daslang_bin, "-jit", path_join(get_das_root(), "modules/dasLLAMA/benchmarks/lcpp_bench.das"), "--",
-                 "-m", model_path, "-r", "3"]
+                 "-m", model_path, "-r", "3", "-t", "{threads}",
+                 "--ref", lcpp_bin, "-o", "json", "--json-path", record_path]
     bench_emit(events, 0, "$ {cmdline(args)}")
-    var rc1 = run_and_capture(args, ours, 3600.0)
-    if (rc1 == 3 && find(ours, "restart to apply") >= 0) {
+    var rc = run_and_capture(args, out, 3600.0)
+    if (rc == 3 && find(out, "restart to apply") >= 0) {
         // [tune] bootstrap: the child tuned this box's kernels and exited with the restart code
         // (the watchdog convention) — relaunch once to run with the winners
         bench_emit(events, 0, "bench child tuned this box's kernels first — relaunching with the winners")
-        ours = ""
-        rc1 = run_and_capture(args, ours, 3600.0)
+        out = ""
+        rc = run_and_capture(args, out, 3600.0)
     }
     delete args
-    let ours_pp = parse_ours_row(ours, "pp512")
-    let ours_tg = parse_ours_row(ours, "tg128")
-    if (rc1 != 0 || ours_pp <= 0.0 || ours_tg <= 0.0) {
-        bench_emit(events, 2, "our bench failed (rc={rc1}) — tail: {slice(ours, max(0, length(ours) - 300))}")
+    var record_text = ""
+    if (stat(record_path).is_valid) {
+        record_text = fread(record_path)
+    }
+    var jerr = ""
+    var js = read_json(record_text, jerr)
+    if (rc != 0 || js == null) {
+        bench_emit(events, 2, "bench failed (rc={rc}) — tail: {slice(out, max(0, length(out) - 300))}")
+        return
+    }
+    var ours_pp = 0.0lf
+    var ours_tg = 0.0lf
+    var theirs_pp = 0.0lf
+    var theirs_tg = 0.0lf
+    let runs = js?[0]?["runs"]
+    if (runs != null && runs is _array) {
+        for (rv in runs as _array) {
+            let eng : string = rv?["engine"] ?? ""
+            let pp : double = rv?["tests"]?["pp512"]?["tok_s"] ?? 0.0lf
+            let tg : double = rv?["tests"]?["tg128"]?["tok_s"] ?? 0.0lf
+            if (eng == "das") {
+                ours_pp = pp
+                ours_tg = tg
+            } elif (eng == "llama.cpp") {
+                theirs_pp = pp
+                theirs_tg = tg
+            }
+        }
+    }
+    unsafe {
+        delete js
+    }
+    if (ours_pp <= 0.0lf || ours_tg <= 0.0lf) {
+        bench_emit(events, 2, "bench produced no das rows — tail: {slice(out, max(0, length(out) - 300))}")
         return
     }
     bench_emit(events, 0, "ours: pp512 {ours_pp} tok/s · tg128 {ours_tg} tok/s")
-    var theirs = ""
-    var targs <- [lcpp_bin, "-m", model_path, "-p", "512", "-n", "128", "-r", "3", "-t", "{threads}"]
-    bench_emit(events, 0, "$ {cmdline(targs)}")
-    let rc2 = run_and_capture(targs, theirs, 3600.0)
-    delete targs
-    let theirs_pp = parse_theirs_row(theirs, "pp512")
-    let theirs_tg = parse_theirs_row(theirs, "tg128")
-    if (rc2 != 0 || theirs_pp <= 0.0 || theirs_tg <= 0.0) {
-        bench_emit(events, 2, "llama-bench failed (rc={rc2}) — tail: {slice(theirs, max(0, length(theirs) - 300))}")
+    if (theirs_pp <= 0.0lf || theirs_tg <= 0.0lf) {
+        bench_emit(events, 2, "llama-bench rows missing from the record — tail: {slice(out, max(0, length(out) - 300))}")
         return
     }
     bench_emit(events, 0, "theirs: pp512 {theirs_pp} tok/s · tg128 {theirs_tg} tok/s")
     let elapsed = int64(get_time_usec(t0)) / 1000000l
     bench_emit(events, 1,
-        "\{\"ours_pp\":{ours_pp},\"ours_tg\":{ours_tg},\"theirs_pp\":{theirs_pp},\"theirs_tg\":{theirs_tg},\"pp_ratio\":{ours_pp / theirs_pp},\"tg_ratio\":{ours_tg / theirs_tg},\"threads\":{threads},\"elapsed_s\":{elapsed},\"ts\":{created_ts()}}")
+        "\{\"ours_pp\":{ours_pp},\"ours_tg\":{ours_tg},\"theirs_pp\":{theirs_pp},\"theirs_tg\":{theirs_tg},\"pp_ratio\":{ours_pp / theirs_pp},\"tg_ratio\":{ours_tg / theirs_tg},\"threads\":{threads},\"elapsed_s\":{elapsed},\"ts\":{created_ts()},\"record\":{record_text}}")
 }
 
 def private drain_bench_events() {

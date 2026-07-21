@@ -322,6 +322,10 @@ button:disabled { opacity: 0.45; cursor: default; }
             <tbody id="bench-body"></tbody>
         </table>
         <div class="cfg-file" id="bench-meta"></div>
+        <div class="controls" id="bench-record-row" style="display:none;margin-top:8px">
+            <button id="b-bench-copy" type="button">copy record</button>
+            <span class="ctl-note">the full bench record (hardware, command lines, shas) — paste into a benchmark submission</span>
+        </div>
     </div>
 
     <footer class="reveal">
@@ -1372,6 +1376,7 @@ $("b-drain").addEventListener("click", async () => {
 
 // ===== benchmark panel =====
 let benchPolling = false;
+let benchRecord = null;
 
 function renderBench(b) {
     const log = $("bench-log");
@@ -1390,6 +1395,10 @@ function renderBench(b) {
             "<td class=\"" + (r.tg_ratio >= 1 ? "hit" : "") + "\">" + r.tg_ratio.toFixed(2) + "x</td></tr>";
         $("bench-meta").textContent = (b.hardware || "") + " · " + r.threads + " threads · " +
             new Date(r.ts * 1000).toLocaleString() + " · " + r.elapsed_s + "s run";
+        if (r.record) {
+            $("bench-record-row").style.display = "flex";
+            benchRecord = r.record;
+        }
     }
     $("bench-note").textContent = b.state === "running" ? "running — both benches finish before results appear"
         : b.state === "failed" ? "failed — see the log above"
@@ -1410,6 +1419,16 @@ function renderBench(b) {
         setTimeout(tickB, 2000);
     }
 }
+
+$("b-bench-copy").addEventListener("click", async () => {
+    if (!benchRecord) return;
+    try {
+        await navigator.clipboard.writeText(JSON.stringify(benchRecord, null, 2));
+        $("bench-note").textContent = "record copied to clipboard";
+    } catch (_e) {
+        $("bench-note").textContent = "clipboard blocked — copy from the log instead";
+    }
+});
 
 $("b-bench").addEventListener("click", async () => {
     try {

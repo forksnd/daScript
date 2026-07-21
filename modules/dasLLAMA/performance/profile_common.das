@@ -835,6 +835,73 @@ struct BenchModel {
     @optional size_bytes : int64
 }
 
+//! True on a macOS box — the gate for Metal cells in the record driver.
+def is_apple_box : bool {
+    return !is_windows() && run_capture("uname -s", true) == "Darwin"
+}
+
+//! The official per-box record store the site build merges.
+def bench_records_path : string {
+    return "modules/dasLLAMA/performance/records/{box_name()}.json"
+}
+
+def read_bench_records(path : string; var models : array<BenchModel>) : bool {
+    if (!stat(path).is_valid) {
+        return false
+    }
+    return sscan_json(fread(path), models)
+}
+
+def write_bench_records(path : string; models : array<BenchModel>) {
+    let text = sprint_json(models, true)
+    fopen(path, "wb") $(f) {
+        if (f != null) {
+            fwrite(f, text)
+        }
+    }
+}
+
+//! Update-or-insert one run; the identity is (box, engine, backend, flavor) — a re-measure
+//! replaces its row in place (fresh date/sha), never appends a superseded copy.
+def upsert_bench_run(var runs : array<BenchRun>; var r : BenchRun) {
+    for (c in runs) {
+        if (c.box == r.box && c.engine == r.engine && c.backend == r.backend && c.flavor == r.flavor) {
+            c <- r
+            return
+        }
+    }
+    runs |> emplace(r)
+}
+
+//! Merge one incoming model (e.g. a --json-path cell from lcpp_bench) into the store: identity
+//! fields refresh when the incoming side knows them, runs upsert per (box, engine, backend, flavor).
+def upsert_bench_model(var models : array<BenchModel>; var incoming : BenchModel) {
+    for (m in models) {
+        if (m.gguf == incoming.gguf) {
+            if (!empty(incoming.arch)) {
+                m.arch = incoming.arch
+            }
+            if (!empty(incoming.quant)) {
+                m.quant = incoming.quant
+            }
+            if (incoming.params_b > 0.0lf) {
+                m.params_b = incoming.params_b
+            }
+            if (incoming.active_b > 0.0lf) {
+                m.active_b = incoming.active_b
+            }
+            if (incoming.size_bytes > 0l) {
+                m.size_bytes = incoming.size_bytes
+            }
+            for (i in range(length(incoming.runs))) {
+                upsert_bench_run(m.runs, incoming.runs[i])
+            }
+            return
+        }
+    }
+    models |> emplace(incoming)
+}
+
 // ===== llama-bench invocation (shared by lcpp_bench --ref and the establisher) =====
 
 //! One llama-bench `-o json` result row (prefill rows have n_gen=0, decode rows n_prompt=0).
