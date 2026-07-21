@@ -969,8 +969,8 @@ def private gemma4e_row(t : T?; path : string) {
     }
 }
 
-[unused_argument(t, path)]   // off-Apple the gated body is empty
-def private gemma4moe_row(t : T?; path : string) {
+[unused_argument(t, path, tag, tol_pf, tol_step)]   // off-Apple the gated body is empty
+def private gemma4moe_row(t : T?; path : string; tag : string; tol_pf : float = 8.0; tol_step : float = 16.0) {
     // gemma4-26B-A4B (Wave C stage 3): the parallel dense-shared + routed MoE graph. TOKEN
     // parity is NOT a valid instrument here (wave ruling): the CPU router's double norm is an
     // inverse TEMPERATURE on the expert softmax and the model amplifies ANY float-class
@@ -986,11 +986,11 @@ def private gemma4moe_row(t : T?; path : string) {
         tr.config.seq_len = min(tr.config.seq_len, 512l)
         let c = tr.config
         t |> success(c.moe && c.moe_dense_shexp && c.n_expert == 128l && c.n_expert_used == 8l,
-            "gemma4moe-26b: MoE geometry loads (ne={c.n_expert} k={c.n_expert_used} nfe={c.n_ff_exp})")
+            "{tag}: MoE geometry loads (ne={c.n_expert} k={c.n_expert_used} nfe={c.n_ff_exp})")
         let derived = metal_needs(tr)
         let expected = MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding | MetalNeed.v_norm
         t |> success((derived & expected) == expected,
-            "gemma4moe-26b: metal_needs derives {expected} (got {derived})")
+            "{tag}: metal_needs derives {expected} (got {derived})")
         let vocab = c.vocab_size
         var prompt <- encode(tr, counting_prompt(1, 20), true, false)
         var lg0 : array<float>
@@ -1010,7 +1010,7 @@ def private gemma4moe_row(t : T?; path : string) {
         }
         delete tr
         var trg <- blob_twin(t, path, 512l)
-        matrix_cell(t, trg, KVDtype.f16, "gemma4moe-26b/q8/f16", "", "", "")
+        matrix_cell(t, trg, KVDtype.f16, "{tag}/q8/f16", "", "", "")
         var mpf = 0.0
         var m1 = 0.0
         var served = 0l
@@ -1038,10 +1038,10 @@ def private gemma4moe_row(t : T?; path : string) {
             select_decode_override("")
             delete s
         }
-        t |> success(served == 2l, "gemma4moe-26b: GPU prefill + forced step both served ({served}/2)")
-        t |> success(mpf <= 8.0, "gemma4moe-26b: post-prefill logits within 8.0 of the CPU truth (measured {mpf})")
-        t |> success(m1 <= 16.0, "gemma4moe-26b: one forced step within 16.0 of the CPU truth (measured {m1})")
-        to_log(LOG_INFO, "gemma4moe-26b tolerance cells: post-prefill maxd={mpf} (tol 8), forced step maxd={m1} (tol 16)\n")
+        t |> success(served == 2l, "{tag}: GPU prefill + forced step both served ({served}/2)")
+        t |> success(mpf <= tol_pf, "{tag}: post-prefill logits within {tol_pf} of the CPU truth (measured {mpf})")
+        t |> success(m1 <= tol_step, "{tag}: one forced step within {tol_step} of the CPU truth (measured {m1})")
+        to_log(LOG_INFO, "{tag} tolerance cells: post-prefill maxd={mpf} (tol {tol_pf}), forced step maxd={m1} (tol {tol_step})\n")
         delete lg0
         delete lg1
         delete prompt
@@ -1541,7 +1541,12 @@ def test_metal_family_matrix(t : T?) {
                 "", KVDtype.f16, 6.0)
             // gemma4-26B-A4B (Wave C stage 3): the parallel dense-shared + routed graph —
             // ENGAGE cells + shallow logits tolerances (see the row's ruling comment)
-            gemma4moe_row(t, path_join(models_dir(), "gemma-4-26B-A4B-it-Q8_0.gguf"))
+            gemma4moe_row(t, path_join(models_dir(), "gemma-4-26B-A4B-it-Q8_0.gguf"), "gemma4moe-26b")
+            // ... and the community Q4_K_M file: k4 gate_up + NATIVE q51 down expert stacks —
+            // the q51 Metal GEMV/mul_mm twins' model-level pin (15.9GB, PARITY_FULL-gated).
+            // Wider step bar: the k4/q51 f16-tile paths measure 13.8 under the same double-router
+            // amplifier (post-prefill stays 2.5-class); 24 keeps the ~2x margin discipline
+            gemma4moe_row(t, path_join(models_dir(), "gemma-4-26B-A4B-it-Q4_K_M.gguf"), "gemma4moe-26b-k", 8.0, 24.0)
             // gemma-4 E-series (E4B): PLE (MetalNeed.ple) + cross-layer KV sharing — decode +
             // prefill serve, batch declines need_ple. 7.2GB — DASLLAMA_PARITY_FULL-gated.
             // (E2B stays on the `layers` decline: per-layer FFN width, no per-layer u_hidden yet.)

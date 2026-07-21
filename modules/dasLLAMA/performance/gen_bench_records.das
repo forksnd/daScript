@@ -65,8 +65,7 @@ def private pub_catalog() : array<PubEntry> {
     return <- [
         PubEntry(file = "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf"),
         PubEntry(file = "Qwen3.6-27B-MTP-Q4_K_M.gguf"),
-        PubEntry(file = "gemma-4-26B-A4B-it-Q8_0.gguf",
-            note = "the widespread Q4_K_M file stores its expert tensors as Q5_1, which das does not run yet — benched at Q8_0 until that lands"),
+        PubEntry(file = "gemma-4-26B-A4B-it-Q4_K_M.gguf"),
         PubEntry(file = "gemma-4-12B-it-Q4_K_M.gguf"),
         PubEntry(file = "gemma-4-E4B-it-Q8_0.gguf"),
         PubEntry(file = "gpt-oss-20b-mxfp4.gguf"),
