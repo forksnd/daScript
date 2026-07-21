@@ -119,7 +119,7 @@ class ChatClient : HvWebSocketClient {
 
     def override onMessage(msg : string#) {
         print("[{name}] received: {msg}\n")
-        received |> push_clone(string(msg))
+        received |> push(string(msg))
     }
     def override onMessageFrame(msg : string#; byte_count : int; opcode : ws_opcode) {
         if (opcode == ws_opcode.WS_OPCODE_TEXT) onMessage(msg)

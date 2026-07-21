@@ -295,8 +295,7 @@ def private enforce_timeout(var session : WatcherSession?; now_ms : int64) {
 
 def public watcher_tick(maximum_bytes_per_session : int = 64 * 1024) {
     let bounded_bytes = clamp(maximum_bytes_per_session, 1024, 1024 * 1024)
-    for (index in range(length(g_sessions))) {
-        var session = g_sessions[index]
+    for (session in g_sessions) {
         if (session == null) continue
         let now_ms = elapsed_ms(session)
         if (session.drained) {
@@ -464,8 +463,7 @@ def public watcher_update_key(session_id : string) : string {
 }
 
 def public watcher_shutdown(terminate_running : bool = false) {
-    for (index in range(length(g_sessions))) {
-        var session = g_sessions[index]
+    for (session in g_sessions) {
         if (session == null) continue
         if (terminate_running && !terminal_process_exited(session.terminal)) {
             let _ = terminal_terminate(session.terminal)

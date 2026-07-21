@@ -27,7 +27,7 @@ def test_watcher_process_lifecycle(t : T?) {
             t |> failure("could not create temporary test directory")
             return
         }
-        var root = temp as value
+        let root = temp as value
         t |> equal(watcher_init(path_join(root, "sessions")), "")
 
         let missing_command = path_join(root, "missing-watcher-command.exe")
@@ -49,9 +49,9 @@ def test_watcher_process_lifecycle(t : T?) {
         let quick_snapshot = watcher_snapshot_json(quick.session_id)
         t |> success(find(quick_snapshot, "watcher-core-ok") >= 0, "viewport retains command output")
         t |> success(find(quick_snapshot, "\"exit_code\":0") >= 0, "exit code is retained")
-        var raw <- watcher_output_since(quick.session_id, 0l)
+        let raw <- watcher_output_since(quick.session_id, 0l)
         t |> success(find(string(raw.bytes), "watcher-core-ok") >= 0, "raw PTY history can be replayed")
-        var raw_tail <- watcher_output_since(quick.session_id, raw.next_offset)
+        let raw_tail <- watcher_output_since(quick.session_id, raw.next_offset)
         t |> equal(length(raw_tail.bytes), 0, "raw replay offset does not duplicate output")
         t |> success(fexist(path_join(path_join(path_join(root, "sessions"), quick.session_id), "output.raw")),
             "raw output log exists")

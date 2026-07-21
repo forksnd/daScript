@@ -236,8 +236,8 @@ class private WatcherRichClient : HvWebSocketClient {
     }
 
     def flush_resize() {
-        if (!controls || desired_columns <= 0 || desired_rows <= 0) return
-        if (desired_columns == sent_columns && desired_rows == sent_rows) return
+        if (!controls || desired_columns <= 0 || desired_rows <= 0 ||
+            (desired_columns == sent_columns && desired_rows == sent_rows)) return
         send("\{\"op\":\"resize\",\"columns\":{desired_columns},\"rows\":{desired_rows}\}")
         sent_columns = desired_columns
         sent_rows = desired_rows

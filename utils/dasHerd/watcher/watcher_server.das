@@ -11,7 +11,6 @@ module watcher_server shared public
 require dashv/dashv_boost public
 require ./watcher_core.das public
 require daslib/json_boost
-require daslib/fio
 require strings
 
 let private MAX_REQUEST_BODY_BYTES = 1024 * 1024
@@ -73,7 +72,7 @@ def private json_error(message : string) : string {
 }
 
 def private hex_nibble(value : int) : int {
-    if (value >= '0' && value <= '9') return value - '0'
+    if (is_number(value)) return value - '0'
     if (value >= 'a' && value <= 'f') return value - 'a' + 10
     if (value >= 'A' && value <= 'F') return value - 'A' + 10
     return -1
@@ -106,10 +105,11 @@ def private query_value(url, key : string) : string {
     let query = find(url, "?")
     if (query < 0) return ""
     let wanted = key + "="
+    let url_length = length(url)
     var position = query + 1
-    while (position < length(url)) {
+    while (position < url_length) {
         let amp = find(url, "&", position)
-        let end = amp < 0 ? length(url) : amp
+        let end = amp < 0 ? url_length : amp
         if (starts_with(slice(url, position, end), wanted)) {
             return percent_decode(slice(url, position + length(wanted), end))
         }

@@ -90,7 +90,7 @@ class TestWsClient : HvWebSocketClient {
     }
 
     def override onMessage(msg : string#) {
-        received |> push_clone(string(msg))
+        received |> push(string(msg))
     }
     def override onMessageFrame(msg : string#; byte_count : int; opcode : ws_opcode) {
         if (opcode == ws_opcode.WS_OPCODE_TEXT) {
@@ -118,7 +118,7 @@ class LegacyTextWsClient : HvWebSocketClient {
         closed = true
     }
     def override onMessage(msg : string#) {
-        received |> push_clone(string(msg))
+        received |> push(string(msg))
     }
 }
 
@@ -131,7 +131,7 @@ def wait_messages(var client : TestWsClient?; count : int; max_ms : int = 3000) 
     while (length(client.received) < count && elapsed < max_ms) {
         client->process_event_que()
         sleep(1u)
-        elapsed += 1
+        elapsed++
     }
 }
 
@@ -140,7 +140,7 @@ def wait_binary_frames(var client : TestWsClient?; count : int; max_ms : int = 3
     while (client.binary_frames < count && elapsed < max_ms) {
         client->process_event_que()
         sleep(1u)
-        elapsed += 1
+        elapsed++
     }
 }
 
@@ -150,7 +150,7 @@ def wait_closed(var client : TestWsClient?; max_ms : int = 3000) {
     while (!client.closed && elapsed < max_ms) {
         client->process_event_que()
         sleep(1u)
-        elapsed += 1
+        elapsed++
     }
 }
 
@@ -195,7 +195,7 @@ def with_ws_test_server(port : int; blk : block<(ws_url : string; http_url : str
 
 [test]
 def test_websockets(t : T?) {
-    with_ws_test_server(PORT_WEBSOCKETS) <| $(ws_url, http_url) {
+    with_ws_test_server(PORT_WEBSOCKETS) $(ws_url, http_url) {
 
         t |> run("connect and receive welcome") @(t : T?) {
             var client = new TestWsClient()
