@@ -5892,9 +5892,16 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
             memcpy(addr < void? >(s.x_b[0]), metal_buffer_contents(bx), int(npos * dim * 4l))
             if (gpu_logits) {
                 memcpy(addr < void? >(s.logits[0]), metal_buffer_contents(blog), int(c.vocab_size * 4l))
+                if (c.n_layer_nextn > 0l) {
+                    // forward_prefill's mtp_h contract — bxf holds the last row's post-final-norm hidden
+                    memcpy(addr < void? >(s.mtp_h[0]), metal_buffer_contents(bxf), int(dim * 4l))
+                }
             }
         }
         if (gpu_logits) {
+            if (c.n_layer_nextn > 0l) {
+                s.mtp_h_pos1 = start_pos + npos
+            }
             prefill_override_logits_done()
         }
         readback_us += int64(get_time_usec(ts_rb))
