@@ -159,6 +159,9 @@ struct private GitInspectorState {
     diff_scroll_jump_pending : bool
     diff_split_fraction : float = 0.5f
     diff_current_hunk : int
+    diff_left_rect : float4
+    diff_right_rect : float4
+    diff_scrollbar_rect : float4
 }
 
 var private g_terminal = Terminal()
@@ -305,6 +308,9 @@ def private release_inspector_content() {
     g_inspector.diff_scroll_y = 0.0f
     g_inspector.diff_scroll_jump_pending = false
     g_inspector.diff_current_hunk = 0
+    g_inspector.diff_left_rect = float4()
+    g_inspector.diff_right_rect = float4()
+    g_inspector.diff_scrollbar_rect = float4()
 }
 
 def private queue_inspector_prepare(status : string) {
@@ -1129,6 +1135,10 @@ def private draw_side_by_side_diff() {
     child(DIFF_LEFT_PANE, (text = "before", size = float2(left_width, available.y),
             child_flags = ImGuiChildFlags.Borders,
             window_flags = ImGuiWindowFlags.NoScrollbar)) {
+        let window_pos = GetWindowPos()
+        let window_size = GetWindowSize()
+        g_inspector.diff_left_rect = float4(window_pos.x, window_pos.y,
+            window_pos.x + window_size.x, window_pos.y + window_size.y)
         let hovered = IsWindowHovered(ImGuiHoveredFlags.None)
         if (g_inspector.diff_scroll_jump_pending || !hovered) {
             SetScrollY(g_inspector.diff_scroll_y)
@@ -1157,6 +1167,14 @@ def private draw_side_by_side_diff() {
     child(DIFF_RIGHT_PANE, (text = "after", size = float2(right_width, available.y),
             child_flags = ImGuiChildFlags.Borders,
             window_flags = ImGuiWindowFlags.HorizontalScrollbar)) {
+        let window_pos = GetWindowPos()
+        let window_size = GetWindowSize()
+        let scrollbar_width = GetStyle().ScrollbarSize
+        g_inspector.diff_right_rect = float4(window_pos.x, window_pos.y,
+            window_pos.x + window_size.x, window_pos.y + window_size.y)
+        g_inspector.diff_scrollbar_rect = float4(
+            window_pos.x + window_size.x - scrollbar_width, window_pos.y,
+            window_pos.x + window_size.x, window_pos.y + window_size.y)
         let hovered = IsWindowHovered(ImGuiHoveredFlags.None)
         if (g_inspector.diff_scroll_jump_pending || !hovered) {
             SetScrollY(g_inspector.diff_scroll_y)
@@ -1257,6 +1275,9 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         diff_current_hunk = g_inspector.diff_current_hunk,
         diff_scroll_y = g_inspector.diff_scroll_y,
         diff_split_fraction = g_inspector.diff_split_fraction,
+        diff_left_rect = g_inspector.diff_left_rect,
+        diff_right_rect = g_inspector.diff_right_rect,
+        diff_scrollbar_rect = g_inspector.diff_scrollbar_rect,
         syntax_choice = g_inspector.syntax_choice,
         resolved_language = g_inspector.resolved_language,
         binary = g_inspector.parsed.binary,
