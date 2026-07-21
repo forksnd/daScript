@@ -182,8 +182,8 @@ struct private TerminalBuffer {
 }
 
 def private clear_rows(var rows : array<TerminalRow>) {
-    for (index in range(length(rows))) {
-        delete rows[index].cells
+    for (row in rows) {
+        delete row.cells
     }
     rows |> clear()
 }

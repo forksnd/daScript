@@ -571,8 +571,8 @@ def public watcher_resize(session_id : string; columns, rows, client_id : int) :
 }
 
 def private terminate_session(var session : WatcherSession?; detail : string) : string {
-    if (session.state != "running" && session.state != "terminating") return ""
-    if (terminal_process_exited(session.terminal)) return ""
+    if ((session.state != "running" && session.state != "terminating")
+            || terminal_process_exited(session.terminal)) return ""
     session.reason = detail
     session.state = "terminating"
     session.status_revision++

@@ -156,7 +156,7 @@ def test_inspection_prepare_worker(t : T?) {
         destroy_job_que()
     }
     t |> run("unsupported binary completes with an unavailable-preview reason") <| @(tt : T?) {
-        var bytes : array<uint8> <- [uint8(0), uint8(1), uint8(2), uint8(3)]
+        let bytes : array<uint8> <- [uint8(0), uint8(1), uint8(2), uint8(3)]
         let encoded = base64_encode(bytes)
         create_job_que()
         var worker = InspectorPrepareWorker()

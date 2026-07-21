@@ -121,9 +121,8 @@ def private repository_id(target_id, path : string) : string {
 
 def public repository_valid_relative_file_path(path : string) : bool {
     if (!valid_path(path) || starts_with(path, "/") || starts_with(path, "\\")
-            || is_absolute(path)) return false
-    if (get_platform_name() == "windows" && length(path) >= 2
-            && byte_at(path, 1) == ':') return false
+            || is_absolute(path) || (get_platform_name() == "windows"
+                && length(path) >= 2 && byte_at(path, 1) == ':')) return false
     return (path != ".." && !ends_with(path, "/..") && !ends_with(path, "\\..")
         && find(path, "../") < 0 && find(path, "..\\") < 0)
 }
@@ -501,7 +500,7 @@ def private byte_at(value : string; index : int) : int {
 }
 
 def private append_worktree(var worktrees : array<WorktreeState>;
-                            var current : WorktreeState) {
+                            current : WorktreeState) {
     worktrees |> push(WorktreeState(path = current.path, head = current.head,
         branch = current.branch, is_main = empty(worktrees), detached = current.detached,
         bare = current.bare, locked = current.locked, prunable = current.prunable))
@@ -554,7 +553,8 @@ def private parse_counter(text, marker : string) : int {
     if (start < 0) return 0
     let value_start = start + length(marker)
     var value_end = value_start
-    while (value_end < length(text) && is_number(byte_at(text, value_end))) {
+    let text_length = length(text)
+    while (value_end < text_length && is_number(byte_at(text, value_end))) {
         value_end++
     }
     return to_int(slice(text, value_start, value_end))
@@ -630,7 +630,7 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
     }
     var info = WatcherSessionInfo()
     if (!watcher_get_session_info(runtime.snapshot.task_session_id, info) || !info.drained) return
-    var scrollback_rows = 0
+    let scrollback_rows = 0
     let output = watcher_terminal_text(runtime.snapshot.task_session_id, scrollback_rows)
     if (scrollback_rows > 0) {
         let _compacted_overflow = watcher_compact_session(runtime.snapshot.task_session_id)

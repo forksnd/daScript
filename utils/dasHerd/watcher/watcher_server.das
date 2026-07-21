@@ -473,7 +473,7 @@ class DasHerdWatcherServer : HvWebServer {
         var info = WatcherSessionInfo()
         if (!watcher_get_session_info(client.inspection_session_id, info)
                 || !info.drained) return
-        var truncated = false
+        let truncated = false
         let output = watcher_machine_output_text(client.inspection_session_id, truncated)
         let _compacted = watcher_compact_session(client.inspection_session_id, 80, 25)
         if (client.inspection_phase == "staged-view") {
