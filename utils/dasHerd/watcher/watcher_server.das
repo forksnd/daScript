@@ -480,15 +480,17 @@ class DasHerdWatcherServer : HvWebServer {
             client.inspection_delivered = true
             if (truncated) {
                 self.cleanup_inspection_artifact(client)
+                let patch = client.inspection_patch
                 client.inspection_patch = ""
-                self.send_file_inspection(client, false, "",
+                self.send_file_inspection(client, false, patch,
                     "staged file command exceeded the retained machine-output limit")
                 return
             }
             if (info.exit_code != client.inspection_expected_exit_code) {
                 self.cleanup_inspection_artifact(client)
+                let patch = client.inspection_patch
                 client.inspection_patch = ""
-                self.send_file_inspection(client, false, "",
+                self.send_file_inspection(client, false, patch,
                     "git show exited with {info.exit_code}: {output}")
                 return
             }

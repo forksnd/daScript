@@ -341,8 +341,8 @@ def public inspector_prepare_worker_take_event(var worker : InspectorPrepareWork
                                                var event : InspectorPrepareEvent) : bool {
     if (!worker.started || worker.events == null) return false
     delete event
-    let popped = _builtin_channel_try_pop(worker.events) $(data) {
-        event := *(unsafe(reinterpret<InspectorPrepareEvent?#>(data)))
+    let popped = worker.events |> try_pop_clone() $(next : InspectorPrepareEvent#) {
+        event := next
     }
     if (!popped) return false
     if (event.kind == InspectorPrepareEventKind.stopped) {

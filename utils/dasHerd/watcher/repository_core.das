@@ -435,7 +435,7 @@ def public repository_working_file_bytes(repository_id, worktree_path, file_path
     if (!empty(path_error)) return path_error
     let read_error = repository_read_file_bytes(
         absolute_path, max_bytes, bytes, byte_count)
-    return empty(read_error) ? "" : "could not read working file bytes"
+    return read_error
 }
 
 def public repository_staged_file_view_argv(worktree_path, file_path,
