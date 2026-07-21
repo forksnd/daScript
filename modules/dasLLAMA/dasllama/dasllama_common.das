@@ -1203,7 +1203,13 @@ def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var 
     if (fmt == KqFmt.k4) {
         gguf_transcode_q4k(m, bytes, name, t.k4q, t.k4s, woff, n, src_off)
     } elif (fmt == KqFmt.k5) {
-        gguf_transcode_q5k(m, bytes, name, t.k5q, t.k5s, woff, n, src_off)
+        if (gguf_tensor_type(m, name) == GGML_TYPE_Q5_K) {
+            gguf_transcode_q5k(m, bytes, name, t.k5q, t.k5s, woff, n, src_off)
+        } else {   // Q5_0 source: no exact embedding exists, so dequant and re-encode (lossy)
+            scratch |> resize(n)
+            gguf_read_tensor_f32(m, bytes, name, scratch, 0l, n, src_off)
+            quantize_k5_plane(scratch, n, t.k5q, t.k5s, woff)
+        }
     } elif (fmt == KqFmt.k6) {
         gguf_transcode_q6k(m, bytes, name, t.k6q, t.k6s, woff, n, src_off)
     } elif (fmt == KqFmt.q40) {
@@ -1404,6 +1410,51 @@ def public get_kq_q40_native() : bool {
     return g_kq_q40_native
 }
 
+// Q5_0 -> k5 re-encode knob. Unlike the other tags this one is NOT a relabel: Q5_0 has no exact
+// Q5_K embedding, so the load re-quantizes (measured +0.031 rel-rmse on GLM's ffn_down) to buy
+// 9.0 -> 5.625 bits. OFF keeps the bit-exact Q5_0 -> Q8 path — the A/B rail, and the quality out.
+var private g_kq_q50_native = false
+
+//! Enable/disable re-encoding Q5_0 tensors into the k5 plane for subsequent loads. LOSSY by
+//! construction (see g_kq_q50_native); default OFF. Requires kquant_native.
+def public set_kq_q50_native(on : bool) {
+    g_kq_q50_native = on
+}
+def public get_kq_q50_native() : bool {
+    return g_kq_q50_native
+}
+
+def private count_fmt(a : array<KqFmt>; f : KqFmt) : int {
+    var n = 0
+    for (x in a) {
+        if (x == f) {
+            n++
+        }
+    }
+    return n
+}
+
+def private tally_fmt(t : Model; f : KqFmt) : int {
+    return (count_fmt(t.wq_fmt, f) + count_fmt(t.wk_fmt, f) + count_fmt(t.wv_fmt, f)
+        + count_fmt(t.wo_fmt, f) + count_fmt(t.w1_fmt, f) + count_fmt(t.w2_fmt, f)
+        + count_fmt(t.w3_fmt, f) + count_fmt(t.we1_fmt, f) + count_fmt(t.we2_fmt, f)
+        + count_fmt(t.we3_fmt, f))
+}
+
+// The load's self-report: knob states, per-tensor format tags, and plane bytes. Plane bytes are
+// the ONLY direct evidence that a format tag actually engaged — a timing delta can never prove it.
+def private log_load_report(t : Model) {
+    if (!dasllama_noisy()) {
+        return
+    }
+    let mb = 1048576.0
+    to_log(LOG_INFO, "dasLLAMA noisy: backend '{active_kernel_backend()}' | kquant_native {g_kquant_native} q40_native {g_kq_q40_native} q50_native {g_kq_q50_native}\n")
+    // the tier arms at [init], before a --noisy CLI flag can land — restate it here so the flag alone suffices
+    to_log(LOG_INFO, "dasLLAMA noisy: GPU tier installed {moe_gpu_tier_installed()} | want auto {gpu_want_auto()}, moe layers {gpu_want_moe_layers()}, stream {gpu_want_moe_stream()}\n")
+    to_log(LOG_INFO, "dasLLAMA noisy: format tags — q8 {tally_fmt(t, KqFmt.q8)}, k4 {tally_fmt(t, KqFmt.k4)}, k5 {tally_fmt(t, KqFmt.k5)}, k6 {tally_fmt(t, KqFmt.k6)}, q40 {tally_fmt(t, KqFmt.q40)}\n")
+    to_log(LOG_INFO, "dasLLAMA noisy: plane MB — q8 {float(long_length(t.qblob)) / mb} (+scales {float(long_length(t.qscales) * 4l) / mb}), k4 {float(long_length(t.k4q) + long_length(t.k4s)) / mb}, k5 {float(long_length(t.k5q) + long_length(t.k5s)) / mb}, k6 {float(long_length(t.k6q) + long_length(t.k6s)) / mb}, q40 {float(long_length(t.q40q) + long_length(t.q40s)) / mb}, f32 {float(long_length(t.wblob) * 4l) / mb}\n")
+}
+
 // GGML disk type -> plane format tag (non-K-quant types ride the classic q8 path)
 def private kq_fmt_of(gt : int) : KqFmt {
     if (gt == GGML_TYPE_Q4_K) {
@@ -1418,13 +1469,16 @@ def private kq_fmt_of(gt : int) : KqFmt {
     if (gt == GGML_TYPE_Q4_0 && g_kq_q40_native) {
         return KqFmt.q40
     }
+    if (gt == GGML_TYPE_Q5_0 && g_kq_q50_native) {
+        return KqFmt.k5
+    }
     return KqFmt.q8
 }
 
-// q40 demotion: Q4_0 guarantees rows % 32 only (K-quants are % 256 by construction), and the
-// kq tier's superblock walkers/activation image need % 256 — a misaligned tensor falls back to
-// the q8 requant path per tensor. `n` = the tensor's ROW length (the matmul's input dim).
-def private kq_fmt_row_ok(f : KqFmt; n : int64) : KqFmt => f == KqFmt.q40 && n % 256l != 0l ? KqFmt.q8 : f
+// q40/q50 demotion: Q4_0 and Q5_0 guarantee rows % 32 only, but the kq tier's superblock walkers
+// need % 256 — a misaligned tensor falls back to the q8 requant path. `n` = the tensor's ROW length.
+// The k5 arm fires only for a Q5_0 source; a genuine Q5_K row is always % 256.
+def private kq_fmt_row_ok(f : KqFmt; n : int64) : KqFmt => (f == KqFmt.q40 || f == KqFmt.k5) && n % 256l != 0l ? KqFmt.q8 : f
 
 // Fill the per-kind weight format tags from the file's tensor types (q8-mode loads with the
 // kquant_native knob on). Fused-projection arches (Phi3) split attn_qkv/ffn_up at row-aligned
@@ -3505,6 +3559,7 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             wscale_convert_f16(t)
         }
         to_log(LOG_INFO, "dasLLAMA: load stage wscale: {get_time_usec(ts_stage) / 1000} ms, total {get_time_usec(ts_load) / 1000} ms\n")
+        log_load_report(t)
         moe_gpu_upload_resident(t)
     }
 }
@@ -4086,6 +4141,9 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "gemv_chunks_per_lane") $(v) { set_gemv_chunks_per_lane(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "wscale_f16") $(v) { set_wscale_f16(v != 0l) }
     apply_i64_knob(rt, "kquant_native") $(v) { set_kquant_native(v != 0l) }
+    apply_i64_knob(rt, "kq_q40_native") $(v) { set_kq_q40_native(v != 0l) }
+    apply_i64_knob(rt, "kq_q50_native") $(v) { set_kq_q50_native(v != 0l) }
+    apply_i64_knob(rt, "noisy") $(v) { set_dasllama_noisy(v != 0l) }
     apply_i64_knob(rt, "gemv_lane_cap") $(v) { set_gemv_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_lane_cap") $(v) { set_batch_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_grid_2d") $(v) { set_batch_grid_2d(int(min(v, 2l))) }

@@ -1793,6 +1793,21 @@ def public set_gpu_tier_want(want : GpuTierWant) {
 
 def private env_int64(name : string) : int64 => int64(to_int(get_env_variable(name)))
 
+// Noisy mode: the engine says what it did instead of leaving it to be inferred from timings.
+// Lives here (not dasllama_common) so the GPU drivers can report too.
+var private g_noisy = -1
+
+//! Enable/disable noisy diagnostics. Also DASLLAMA_NOISY=1.
+def public set_dasllama_noisy(on : bool) {
+    g_noisy = on ? 1 : 0
+}
+def public dasllama_noisy() : bool {
+    if (g_noisy < 0) {
+        g_noisy = get_env_variable("DASLLAMA_NOISY") == "1" ? 1 : 0
+    }
+    return g_noisy == 1
+}
+
 //! One switch for the measured-best rail set: expert stacks sized to the VRAM budget, plus the
 //! deltanet/attention/dense/shared-expert/classifier rails. qkv and heat stay off (measured
 //! negative and a wash). Any DASLLAMA_GPU_* knob still overrides individually.

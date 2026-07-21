@@ -4283,6 +4283,8 @@ def vk_moe_cls(var yp : float?; woff : int64; xqp : int8 const?; xsp : float con
 
 var private g_vk_probed = false
 var private g_vk_available = false
+var private g_vk_why = ""   // why the device probe said no — discarded before, which made it silent
+var private g_vk_arm_said = -1   // last logged arm outcome; -1 = nothing said yet
 
 def private vulkan_backend_available : bool {
     if (g_vk_probed) {
@@ -4291,11 +4293,14 @@ def private vulkan_backend_available : bool {
     g_vk_probed = true
     // raw calls, not boost creators — those panic on failure instead of reporting absence
     if (volkInitialize() != 0) {
+        g_vk_why = "no vulkan loader (volkInitialize failed)"
         return false
     }
     let ci = VkInstanceCreateInfo()
     var inst : VkInstance
-    if (vkCreateInstance(ci, null, inst) != VkResult.SUCCESS) {
+    let cr = vkCreateInstance(ci, null, inst)
+    if (cr != VkResult.SUCCESS) {
+        g_vk_why = "vkCreateInstance refused ({cr})"
         return false
     }
     volkLoadInstance(inst)
@@ -4303,6 +4308,7 @@ def private vulkan_backend_available : bool {
     vkEnumeratePhysicalDevices(inst, count, null)
     vkDestroyInstance(inst, null)
     g_vk_available = count > 0u
+    g_vk_why = g_vk_available ? "" : "vulkan loader present but 0 physical devices"
     return g_vk_available
 }
 
@@ -4337,6 +4343,16 @@ def private vk_device_name : string {
     }
 }
 
+// vulkan_moe_gpu_arm is idempotent and re-runs on every re-arm, so log only on OUTCOME CHANGE.
+// An unconditional line here floods the log (14k lines in one GLM run) and gets tuned out.
+def private arm_say(outcome : int; msg : string) {
+    if (!dasllama_noisy() || g_vk_arm_said == outcome) {
+        return
+    }
+    g_vk_arm_said = outcome
+    to_log(LOG_INFO, "dasLLAMA noisy: {msg}\n")
+}
+
 //! Arm the vulkan MoE tier from the effective GPU want (env-else-programmatic). Registered as
 //! the ``moe_gpu_tier_arm`` probe; ``[init]`` also runs it directly for the env-only path.
 //! Idempotent — re-arming after ``set_gpu_tier_want`` just refreshes the layer count.
@@ -4344,15 +4360,21 @@ def vulkan_moe_gpu_arm : bool {
     let layers = gpu_want_moe_layers()
     // counts test == 0, NOT <= 0: -1 is the auto sentinel and must read as a REQUEST, or an
     // auto-sized-layers-only want would silently fail to arm
-    if ((layers == 0l && gpu_want_moe_stream() == 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd()
-                && gpu_want_heat() <= 0l && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())
-            || !vulkan_backend_available()) {
-        return false   // nothing requested (checked first — the device probe is not free)
+    let nothing_wanted = (layers == 0l && gpu_want_moe_stream() == 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd()
+        && gpu_want_heat() <= 0l && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())
+    if (nothing_wanted) {   // checked first — the device probe is not free
+        arm_say(0, "GPU tier NOT armed — no rail requested (set DASLLAMA_GPU=1 or call set_gpu_tier_want)")
+        return false
+    }
+    if (!vulkan_backend_available()) {
+        arm_say(2, "GPU tier NOT armed — {g_vk_why}")
+        return false
     }
     set_moe_gpu_layer_count(layers)
     if (!moe_gpu_tier_installed()) {
         install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
     }
+    arm_say(1, "GPU tier armed — vulkan, moe layers {layers}{layers < 0l ? " (auto)" : ""}, stream {gpu_want_moe_stream()}")
     return true
 }
 

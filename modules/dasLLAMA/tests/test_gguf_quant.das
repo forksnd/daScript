@@ -128,3 +128,83 @@ def test_gguf_q5_0(t : T?) {
         delete m
     }
 }
+
+// Deterministic pseudo-weights with a per-sub-block scale ladder (1x..8x across the 8 sub-blocks
+// of a superblock), so a packing regression in the 6-bit split-nibble scale strip shows up as ONE
+// band blowing up rather than a slightly worse whole-tensor average.
+def private k5_src(sb, i : int64) : float {
+    let amp = 0.001 * float(i / 32l + 1l)
+    return amp * float(int((i * 37l + sb * 11l) % 31l) - 15)
+}
+
+def private sub_rel(x, y : array<float>; off : int64) : float {
+    var se = 0.0
+    var sx = 0.0
+    for (l in range64(32l)) {
+        let d = y[off + l] - x[off + l]
+        se += d * d
+        sx += x[off + l] * x[off + l]
+    }
+    return sx == 0.0 ? 0.0 : sqrt(se / 32.0) / sqrt(sx / 32.0)
+}
+
+[test]
+def test_q5k_encoder(t : T?) {
+    let nsb = 8l
+    let n = nsb * 256l
+    // The ceiling is a regression gate, not a spec: measured rel-rmse is ~0.036 on synthetic
+    // gaussian and ~0.031 on GLM-4.5-Air's real ffn_down. A mis-packed scale strip lands near 1.0.
+    t |> run("q5_k encode round-trip stays within the 5-bit budget") @(t : T?) {
+        var x : array<float>
+        var y : array<float>
+        x |> resize(n)
+        y |> resize(n)
+        for (sb in range64(nsb)) {
+            for (i in range64(256l)) {
+                x[sb * 256l + i] = k5_src(sb, i)
+            }
+        }
+        var kq : array<uint8>
+        var ks : array<uint8>
+        kq |> resize(nsb * 160l)
+        ks |> resize(nsb * 20l)
+        quantize_k5_plane(x, n, kq, ks, 0l)
+        for (sb in range64(nsb)) {
+            dequant_k5_plane_superblock(kq, sb * 160l, ks, sb * 20l, y, sb * 256l)
+        }
+        for (sb in range64(nsb)) {
+            for (j in range64(8l)) {
+                let rel = sub_rel(x, y, sb * 256l + j * 32l)
+                t |> success(rel < 0.15, "superblock {sb} sub-block {j} rel-rmse {rel} must stay under 0.15")
+            }
+            // the repack + GPU upload read the 20B scale block whole; the 4B tail must stay zeroed
+            for (b in range64(16l, 20l)) {
+                t |> equal(int(ks[sb * 20l + b]), 0)
+            }
+        }
+        delete x
+        delete y
+        delete kq
+        delete ks
+    }
+    // All-zero input takes the d == 0 early-out; it must still emit a well-formed, zeroed block.
+    t |> run("q5_k encode handles an all-zero superblock") @(t : T?) {
+        var x : array<float>
+        var y : array<float>
+        x |> resize(256l)
+        y |> resize(256l)
+        var kq : array<uint8>
+        var ks : array<uint8>
+        kq |> resize(160l)
+        ks |> resize(20l)
+        quantize_k5_plane(x, 256l, kq, ks, 0l)
+        dequant_k5_plane_superblock(kq, 0l, ks, 0l, y, 0l)
+        for (i in range64(256l)) {
+            t |> equal(y[i], 0.0)
+        }
+        delete x
+        delete y
+        delete kq
+        delete ks
+    }
+}
