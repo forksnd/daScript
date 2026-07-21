@@ -18,11 +18,13 @@ require math
 var private g_server : DasHerdWatcherServer?
 var private g_args_parsed = false
 var private g_watcher_initialized = false
+var private g_repositories_initialized = false
 var private g_server_started = false
 var private g_exit_code = 0
 var private g_port = 9191
 var private g_token : string
 var private g_log_root : string
+var private g_config_path : string
 var private g_last_memory_log_at = 0l
 var private g_last_gc_at = 0l
 let GC_MIN_INTERVAL_SECONDS = 60l
@@ -53,6 +55,7 @@ def private parse_watcher_args() {
     }
     g_log_root = option_value("--log-root=",
         path_join(get_das_root(), "logs/dasHerd/watcher/sessions"))
+    g_config_path = option_value("--config=", repository_default_config_path())
 }
 
 // Log das-managed memory independently of process RSS. All formatting temporaries die before
@@ -140,6 +143,14 @@ def init() {
         return
     }
     g_watcher_initialized = true
+    let repository_error = repository_init(g_config_path, get_das_root())
+    if (!empty(repository_error)) {
+        print("dasHerd watcher: could not initialize repositories: {repository_error}\n")
+        g_exit_code = 5
+        request_exit()
+        return
+    }
+    g_repositories_initialized = true
 
     g_server = new DasHerdWatcherServer()
     g_server.token = g_token
@@ -170,6 +181,7 @@ def init() {
     print("dasHerd watcher ready\n")
     print("  control: http://127.0.0.1:{g_port}/?token={g_token}\n")
     print("  logs:    {g_log_root}\n")
+    print("  config:  {g_config_path}\n")
     print("  bind:    127.0.0.1:{g_port}\n")
 }
 
@@ -193,13 +205,22 @@ def shutdown() {
     g_server_started = false
     if (g_server != null) {
         g_server->cleanup_clients()
+    }
+    if (g_watcher_initialized) {
+        if (g_repositories_initialized) {
+            repository_shutdown()
+            g_repositories_initialized = false
+        }
+        watcher_shutdown()
+        g_watcher_initialized = false
+    }
+    if (g_server != null) {
+        // Watcher shutdown releases any staged-view file handles before the
+        // final artifact-removal retry.
+        g_server->cleanup_inspection_artifacts()
         g_server->cleanup()
         unsafe { delete g_server }
         g_server = null
-    }
-    if (g_watcher_initialized) {
-        watcher_shutdown()
-        g_watcher_initialized = false
     }
     watcher_reset_gc_request()
 }

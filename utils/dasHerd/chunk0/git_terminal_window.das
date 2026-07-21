@@ -190,7 +190,9 @@ def shutdown() {
         fclose(g_log_file)
         g_log_file = null
     }
+    terminal_viewport_snapshot_dispose(g_terminal_cache.snapshot)
     terminal_dispose(g_terminal)
+    delete g_font_sources
     harness_shutdown()
 }
 

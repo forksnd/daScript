@@ -17,25 +17,63 @@ Run the docked native client with the token printed by the watcher:
 bin\Release\daslang-live.exe utils\dasHerd\watcher\rich_client.das -- --token=<token>
 ```
 
-The client opens maximized at 150% zoom. Its left pane lists sessions and can
-launch or terminate them; the right pane attaches with control and renders raw
-PTY bytes through the daScript terminal emulator. `--port=9191` is available on
-both processes when the default port is occupied.
+The client opens maximized at 150% zoom. It is a real ImGui dockspace with
+repository/worktree, Git status, session/activity, terminal, and settings
+windows. Windows can be resized, rearranged, tabbed, floated, closed, and
+reopened from the View menu. Commands > PowerShell launches in the selected
+worktree, attaches with control, and raises the terminal. `--port=9191` is
+available on both processes when the default port is occupied.
 
 The watcher prints a token-bearing control-panel URL. Optional arguments after
-`--` are `--port=9191`, `--token=<token>`, and `--log-root=<directory>`.
+`--` are `--port=9191`, `--token=<token>`, `--log-root=<directory>`, and
+`--config=<path>`. The default global configuration is
+`%APPDATA%\daScript\dasHerd.json` on Windows. Repositories are registered by
+explicit checkout path; the Git observer resolves the first porcelain entry as
+the visually distinct main checkout and lists linked worktrees without scanning
+unrelated directories.
 
 This first slice binds only to `127.0.0.1`. Its startup token prevents
 accidental access from an unrelated local page; it is not the future remote
 authentication design. Do not expose this port through a proxy or tunnel.
 
-HTTP endpoints under `/api/v1/` provide health, session listing, launch,
-input, resize, termination, and a deferred `POST /gc` diagnostic. `/ws` provides attach/detach, controller
-leases, heartbeats, session listing/launch/termination, input, resize, terminal
-snapshots, and bounded raw PTY replay.
+HTTP endpoints under `/api/v1/` provide health, session and repository listing,
+session launch/input/resize/termination, repository registration/refresh, and a
+deferred `POST /gc` diagnostic. `/ws` provides attach/detach, controller leases,
+heartbeats, session and repository updates, launch/termination, input, resize,
+terminal snapshots, and bounded raw PTY replay. A launch accepts either the
+existing interactive `command_line` or a structured `argv`; repository Git
+observation always uses the latter.
 Raw output is delivered as binary WebSocket frames, so the browser can render
 the same color and control sequences and send keyboard input back to the PTY.
 Every request must include the startup token as the `token` query parameter.
+
+Git observation runs exclusively inside watcher-owned task sessions and never
+blocks the UI thread. The current local-first slice uses Git 2.17-compatible
+`worktree list --porcelain` and `status --porcelain=1 --branch`, retaining the
+branch/HEAD, staged, unstaged, untracked, conflicted, ahead/behind, locked, and
+prunable state. ConPTY rewrites console output into VT cursor operations, so the
+structured parser consumes the terminal model's reconstructed 240x100 screen;
+if output enters scrollback it reports a visible error and points at the task
+session rather than silently parsing truncated data. An unbounded structured
+capture sidecar remains a follow-up.
+
+File inspection uses the same hosted-task primitive and a 15-second external
+timeout. Working-tree diffs request three context lines, then read the complete
+working file separately for View; this keeps a 12,000-line file out of the PTY
+diff stream without changing Git semantics. The rich client aligns compact
+hunks for Diff, synchronizes both vertical scroll positions, and lazily prepares
+the complete View. Unwrapped source files at least 128 KiB use a clipped
+large-file renderer, so frame cost follows visible lines rather than file size.
+daScript fragments receive a lexical recovery pass only where Tree-sitter left
+unstyled ranges, preserving keyword/type/function colors across disconnected
+hunks and parser recovery nodes.
+
+Completed repository-refresh observation terminals are compacted to 160x50;
+the shorter-lived file Diff/View task terminals compact to 80x25. When a later
+refresh replaces the same repository/worktree observation, only the newest
+emulator is kept in memory; every older `session.json`, `output.raw`, and
+`events.jsonl` remains on disk for postmortem inspection. Interactive sessions
+are not pruned by this policy.
 
 The script exposes `init`, `update`, and `shutdown` for lifecycle hosts. Its
 standalone loop performs optional GC only after `update` returns, when request
@@ -56,3 +94,9 @@ The native terminal registers its full `ImGuiTerminalState` with the live-comman
 surface. `imgui_snapshot` can therefore read terminal text, selection, geometry,
 cursor/blink state, performance counters, and input revisions without a screenshot;
 `imgui_click` plus `imgui_key_type` drives the same input path as a human user.
+
+The Git inspector is likewise semantic: `herder_file_inspector_open` selects a
+repository/worktree/file/comparison, `herder_file_inspector_mode` switches Diff
+or View, `herder_file_inspector_state` exposes loading, byte/row/change counts,
+syntax and renderer telemetry, and `herder_file_inspector_text` returns exact
+before/after/View text. Visual inspection is therefore optional for automation.

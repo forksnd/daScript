@@ -14,7 +14,7 @@ require daslib/fio
 
 // dasLLAMA Vulkan GPU tier — per-layer MoE expert-stack offload. The loader gathers offloaded
 // layers' PREPARED planes into row-major device planes — q8 stacks as int8 quant words + f16
-// scales, native K-quant stacks (k4/k5/k6, fmt-tagged) as superblock quant payloads + decoded
+// scales, native K-quant stacks (k4/k5/k6/q40, fmt-tagged) as superblock quant payloads + decoded
 // 20B scale rows — and hands them to vk_moe_upload_stack (moe_gpu_upload_resident — every load
 // rail, gguf and mapped image alike); the MoE dispatches then route those layers' whole expert
 // FFN chain (gate+up GEMMs -> act -> requant -> down) through vk_moe_ffn — decode row counts on
@@ -1137,6 +1137,52 @@ def kq_moe_gemv_k4 {
     }
 }
 
+// Q4_0: w = d*(q - 8), q in [0,15] — the k4 nibble tiling with no min plane, so the -8 folds as an
+// integer subtract against the block sums and one f16 d per 32-block scales the whole term.
+[compute_shader(local_size_x=64, local_size_x_id=0, name="kq_moe_gemv_q40_spv")]
+def kq_moe_gemv_q40 {
+    let n = vk_meta[0u]
+    let d = vk_meta[1u]
+    let nreg = vk_meta[2u]
+    let rg = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID
+    if (rg < nreg * d) {
+        let r = rg / d
+        let row = rg % d
+        let nsb = n / 256u
+        let wsb0 = vk_meta[4u + r * 2u] + row * nsb
+        let xsb0 = vk_meta[5u + r * 2u]
+        let lane = gl_SubgroupInvocationID
+        let j = lane % 4u
+        let brel = lane / 4u
+        let bstride = gl_SubgroupSize / 4u
+        let nb = nsb * 8u
+        var acc = 0.0
+        var b0 = 0u
+        while (b0 < nb) {
+            let bb = b0 + brel
+            if (bb < nb) {
+                let sb = bb / 8u
+                let blk = bb % 8u
+                let wsb = wsb0 + sb
+                let w = vk_wq[wsb * 32u + blk * 4u + j]
+                let xw = (xsb0 + sb) * 64u + blk * 8u + j
+                let xlo = vk_xq[xw]
+                let xhi = vk_xq[xw + 4u]
+                let idot = sdot4(w & 0x0F0F0F0F, xlo) + sdot4((w >> 4u) & 0x0F0F0F0F, xhi)
+                let bs = sdot4(xlo, 0x01010101) + sdot4(xhi, 0x01010101)
+                let dp = unpackHalf2x16(vk_wsu[wsb * 5u + blk / 2u])   // 8 f16 d packed in words 0..3
+                let dv = blk % 2u == 0u ? dp.x : dp.y
+                acc += vk_xs[xsb0 + sb] * dv * float(idot - 8 * bs)
+            }
+            b0 += bstride
+        }
+        let total = subgroupAdd(acc)
+        if (subgroupElect()) {
+            vk_y[vk_meta[3u] + rg] = total
+        }
+    }
+}
+
 // Q5_K: the k4 fold with the 5th bit OR'd in from the 32B qh region (quants in [0, 31])
 [compute_shader(local_size_x=64, local_size_x_id=0, name="kq_moe_gemv_k5_spv")]
 def kq_moe_gemv_k5 {
@@ -1346,6 +1392,123 @@ def kq_moe_batch_k4 {
             f1 += xscl * (bt_ws[bu * 32u + word + 8u] * float(i1) - bt_wsb[bu * 32u + word + 8u] * float(bs))
             f2 += xscl * (bt_ws[bu * 32u + word + 16u] * float(i2) - bt_wsb[bu * 32u + word + 16u] * float(bs))
             f3 += xscl * (bt_ws[bu * 32u + word + 24u] * float(i3) - bt_wsb[bu * 32u + word + 24u] * float(bs))
+        }
+        barrier()
+        s++
+    }
+    if (xrow < cnt) {
+        let yb = (row0 + xrow) * d + wt * 32u + word
+        if (wt * 32u + word < d) {
+            vk_y[yb] = f0
+        }
+        if (wt * 32u + word + 8u < d) {
+            vk_y[yb + 8u] = f1
+        }
+        if (wt * 32u + word + 16u < d) {
+            vk_y[yb + 16u] = f2
+        }
+        if (wt * 32u + word + 24u < d) {
+            vk_y[yb + 24u] = f3
+        }
+    }
+}
+
+// Q4_0 tile: the k4 staging with one scale plane — per block acc += xs * d * (idot - 8*bsum)
+[compute_shader(local_size_x=256, name="kq_moe_batch_q40_spv")]
+def kq_moe_batch_q40 {
+    let n = vk_meta[0u]
+    let d = vk_meta[1u]
+    let rid = vk_meta[vk_meta[3u] + gl_WorkGroupID.x]
+    let rb = 4u + rid * 4u
+    let wsb0 = vk_meta[rb]
+    let row0 = vk_meta[rb + 1u]
+    let cnt = vk_meta[rb + 2u]
+    let tix = gl_WorkGroupID.x - vk_meta[rb + 3u]
+    let wtiles = (d + 31u) / 32u
+    let xt = tix / wtiles
+    let wt = tix % wtiles
+    let nsb = n / 256u
+    let tid = gl_LocalInvocationID.x
+    let word = tid % 8u
+    let grp = tid / 8u
+    let xrow = xt * 32u + grp
+    let wcol = wt * 32u + grp
+    let slane = tid % 32u
+    let sblk = tid / 32u
+    var f0 = 0.0
+    var f1 = 0.0
+    var f2 = 0.0
+    var f3 = 0.0
+    var s = 0u
+    while (s < nsb) {
+        for (ki in range(2)) {
+            let k = word + uint(ki) * 8u
+            let bu = k / 2u
+            let hh = k % 2u          // 0 = lo-nibble words 0..3 of the block, 1 = hi words 4..7
+            var xv = uint4(0u)
+            if (xrow < cnt) {
+                let xb4 = ((row0 + xrow) * nsb + s) * 64u + bu * 8u + hh * 4u
+                xv = uint4(vk_xq[xb4], vk_xq[xb4 + 1u], vk_xq[xb4 + 2u], vk_xq[xb4 + 3u])
+            }
+            bt_xw4[grp * 17u + k] = xv
+            var wv = uint4(0u)
+            if (wcol < d) {
+                let wsb = wsb0 + wcol * nsb + s
+                let rb4 = wsb * 32u + bu * 4u
+                let r0 = vk_wq[rb4]
+                let r1 = vk_wq[rb4 + 1u]
+                let r2 = vk_wq[rb4 + 2u]
+                let r3 = vk_wq[rb4 + 3u]
+                if (hh == 0u) {
+                    wv = uint4(r0 & 0x0F0F0F0F, r1 & 0x0F0F0F0F, r2 & 0x0F0F0F0F, r3 & 0x0F0F0F0F)
+                } else {
+                    wv = uint4((r0 >> 4u) & 0x0F0F0F0F, (r1 >> 4u) & 0x0F0F0F0F,
+                        (r2 >> 4u) & 0x0F0F0F0F, (r3 >> 4u) & 0x0F0F0F0F)
+                }
+            }
+            bt_ww4[grp * 17u + k] = wv
+        }
+        if (tid < 32u) {
+            var xs = 0.0
+            if (xt * 32u + tid < cnt) {
+                xs = vk_xs[(row0 + xt * 32u + tid) * nsb + s]
+            }
+            bt_xs[tid] = xs
+        }
+        var sa = 0.0
+        if (wt * 32u + slane < d) {
+            let wsb = wsb0 + (wt * 32u + slane) * nsb + s
+            let dp = unpackHalf2x16(vk_wsu[wsb * 5u + sblk / 2u])
+            sa = sblk % 2u == 0u ? dp.x : dp.y
+        }
+        bt_ws[sblk * 32u + slane] = sa
+        barrier()
+        let xscl = bt_xs[grp]
+        for (bb in range(8)) {
+            let bu = uint(bb)
+            var i0 = 0
+            var i1 = 0
+            var i2 = 0
+            var i3 = 0
+            var bs = 0
+            for (kk in range(2)) {
+                let k = bu * 2u + uint(kk)
+                let xw = bt_xw4[grp * 17u + k]
+                let wv0 = bt_ww4[word * 17u + k]
+                let wv1 = bt_ww4[(word + 8u) * 17u + k]
+                let wv2 = bt_ww4[(word + 16u) * 17u + k]
+                let wv3 = bt_ww4[(word + 24u) * 17u + k]
+                bs += sdot4(xw.x, 0x01010101) + sdot4(xw.y, 0x01010101) + sdot4(xw.z, 0x01010101) + sdot4(xw.w, 0x01010101)
+                i0 += sdot4(wv0.x, xw.x) + sdot4(wv0.y, xw.y) + sdot4(wv0.z, xw.z) + sdot4(wv0.w, xw.w)
+                i1 += sdot4(wv1.x, xw.x) + sdot4(wv1.y, xw.y) + sdot4(wv1.z, xw.z) + sdot4(wv1.w, xw.w)
+                i2 += sdot4(wv2.x, xw.x) + sdot4(wv2.y, xw.y) + sdot4(wv2.z, xw.z) + sdot4(wv2.w, xw.w)
+                i3 += sdot4(wv3.x, xw.x) + sdot4(wv3.y, xw.y) + sdot4(wv3.z, xw.z) + sdot4(wv3.w, xw.w)
+            }
+            let off = 8 * bs
+            f0 += xscl * bt_ws[bu * 32u + word] * float(i0 - off)
+            f1 += xscl * bt_ws[bu * 32u + word + 8u] * float(i1 - off)
+            f2 += xscl * bt_ws[bu * 32u + word + 16u] * float(i2 - off)
+            f3 += xscl * bt_ws[bu * 32u + word + 24u] * float(i3 - off)
         }
         barrier()
         s++
@@ -1852,10 +2015,12 @@ struct private GpuState {
     gemv_k4 : Pipeline          // native K-quant GEMVs (per-format decode kernels)
     gemv_k5 : Pipeline
     gemv_k6 : Pipeline
+    gemv_q40 : Pipeline
     actrq_k_pipeline : Pipeline // fused act + Q8_K requant twin (per-256 scale) for the kq chains
     batch_k4 : Pipeline         // native K-quant prefill tiles (per-format batch kernels)
     batch_k5 : Pipeline
     batch_k6 : Pipeline
+    batch_q40 : Pipeline
     comb_pipeline : Pipeline    // routed weighted-sum combine (device-side reduce, prefill batches)
     dn_conv_pipeline : Pipeline // deltanet conv + SiLU + q/k L2-norm (one workgroup per position)
     dnd_fused_pipeline : Pipeline // deltanet decode step, whole chain fused (one workgroup per v-head)
@@ -2147,6 +2312,8 @@ def private vk_moe_init : bool {
     g_gpu.gemv_k5 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, k5shader)
     var k6shader <- create_shader_module(g_gpu.device, kq_moe_gemv_k6_spv)
     g_gpu.gemv_k6 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, k6shader)
+    var q40shader <- create_shader_module(g_gpu.device, kq_moe_gemv_q40_spv)
+    g_gpu.gemv_q40 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, q40shader)
     var rkshader <- create_shader_module(g_gpu.device, q8k_moe_actrq_spv)
     g_gpu.actrq_k_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, rkshader)
     var bk4shader <- create_shader_module(g_gpu.device, kq_moe_batch_k4_spv)
@@ -2155,6 +2322,8 @@ def private vk_moe_init : bool {
     g_gpu.batch_k5 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bk5shader)
     var bk6shader <- create_shader_module(g_gpu.device, kq_moe_batch_k6_spv)
     g_gpu.batch_k6 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bk6shader)
+    var bq40shader <- create_shader_module(g_gpu.device, kq_moe_batch_q40_spv)
+    g_gpu.batch_q40 <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, bq40shader)
     var cshader <- create_shader_module(g_gpu.device, moe_combine_spv)
     g_gpu.comb_pipeline <- create_compute_pipeline(g_gpu.device, g_gpu.pipe_layout, cshader)
     var dcshader <- create_shader_module(g_gpu.device, dn_conv_spv)
@@ -2230,7 +2399,7 @@ def private write_buf_desc(var writes : array<WriteDescriptorSet>; set_ : VkDesc
 def private stack_plane_bytes(n, rows : int64; fmt : int) : tuple<wq : int64; ws : int64> {
     assert(fmt == 0 || n % 256l == 0l, "dasLLAMA vulkan tier: kq stack row length must be a superblock multiple")
     let nsb = rows * (n / 256l)
-    let wqbytes = fmt == 0 ? rows * n : nsb * (fmt == 1 ? 128l : (fmt == 2 ? 160l : 192l))
+    let wqbytes = fmt == 0 ? rows * n : nsb * (fmt == 2 ? 160l : (fmt == 3 ? 192l : 128l))   // k4 and q40 share 128B
     let wsbytes = fmt == 0 ? rows * (n / 32l) * 2l : nsb * 20l
     return (wq = wqbytes, ws = wsbytes)
 }
@@ -2381,7 +2550,7 @@ def private cmd_bind_dispatch(raw : VkCommandBuffer; var set_ : VkDescriptorSet;
     vkCmdDispatch(raw, groups, 1u, 1u)
 }
 
-// bind the GEMV pipeline for a stack's format (0 = the q8 kernel, 1/2/3 = kq_moe_gemv_k4/5/6)
+// bind the GEMV pipeline for a stack's format (0 = the q8 kernel, 1/2/3/4 = kq_moe_gemv_k4/5/6/q40)
 def private bind_gemv_pipe(raw : VkCommandBuffer; fmt : int) {
     if (fmt == 0) {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.pipeline, VkPipelineBindPoint.COMPUTE)
@@ -2389,12 +2558,16 @@ def private bind_gemv_pipe(raw : VkCommandBuffer; fmt : int) {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.gemv_k4, VkPipelineBindPoint.COMPUTE)
     } elif (fmt == 2) {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.gemv_k5, VkPipelineBindPoint.COMPUTE)
-    } else {
+    } elif (fmt == 3) {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.gemv_k6, VkPipelineBindPoint.COMPUTE)
+    } elif (fmt == 4) {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.gemv_q40, VkPipelineBindPoint.COMPUTE)
+    } else {
+        panic("dasLLAMA vulkan tier: no GEMV kernel for stack format {fmt}")
     }
 }
 
-// ... and the batch-tile twin (0 = q8_moe_batch, 1/2/3 = kq_moe_batch_k4/5/6)
+// ... and the batch-tile twin (0 = q8_moe_batch, 1/2/3/4 = kq_moe_batch_k4/5/6/q40)
 def private bind_batch_pipe(raw : VkCommandBuffer; fmt : int) {
     if (fmt == 0) {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_pipeline, VkPipelineBindPoint.COMPUTE)
@@ -2402,8 +2575,12 @@ def private bind_batch_pipe(raw : VkCommandBuffer; fmt : int) {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_k4, VkPipelineBindPoint.COMPUTE)
     } elif (fmt == 2) {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_k5, VkPipelineBindPoint.COMPUTE)
-    } else {
+    } elif (fmt == 3) {
         cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_k6, VkPipelineBindPoint.COMPUTE)
+    } elif (fmt == 4) {
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_q40, VkPipelineBindPoint.COMPUTE)
+    } else {
+        panic("dasLLAMA vulkan tier: no batch tile for stack format {fmt}")
     }
 }
 
@@ -4106,6 +4283,8 @@ def vk_moe_cls(var yp : float?; woff : int64; xqp : int8 const?; xsp : float con
 
 var private g_vk_probed = false
 var private g_vk_available = false
+var private g_vk_why = ""   // why the device probe said no — discarded before, which made it silent
+var private g_vk_arm_said = -1   // last logged arm outcome; -1 = nothing said yet
 
 def private vulkan_backend_available : bool {
     if (g_vk_probed) {
@@ -4114,11 +4293,14 @@ def private vulkan_backend_available : bool {
     g_vk_probed = true
     // raw calls, not boost creators — those panic on failure instead of reporting absence
     if (volkInitialize() != 0) {
+        g_vk_why = "no vulkan loader (volkInitialize failed)"
         return false
     }
     let ci = VkInstanceCreateInfo()
     var inst : VkInstance
-    if (vkCreateInstance(ci, null, inst) != VkResult.SUCCESS) {
+    let cr = vkCreateInstance(ci, null, inst)
+    if (cr != VkResult.SUCCESS) {
+        g_vk_why = "vkCreateInstance refused ({cr})"
         return false
     }
     volkLoadInstance(inst)
@@ -4126,6 +4308,7 @@ def private vulkan_backend_available : bool {
     vkEnumeratePhysicalDevices(inst, count, null)
     vkDestroyInstance(inst, null)
     g_vk_available = count > 0u
+    g_vk_why = g_vk_available ? "" : "vulkan loader present but 0 physical devices"
     return g_vk_available
 }
 
@@ -4160,6 +4343,16 @@ def private vk_device_name : string {
     }
 }
 
+// vulkan_moe_gpu_arm is idempotent and re-runs on every re-arm, so log only on OUTCOME CHANGE.
+// An unconditional line here floods the log (14k lines in one GLM run) and gets tuned out.
+def private arm_say(outcome : int; msg : string) {
+    if (!dasllama_noisy() || g_vk_arm_said == outcome) {
+        return
+    }
+    g_vk_arm_said = outcome
+    to_log(LOG_INFO, "dasLLAMA noisy: {msg}\n")
+}
+
 //! Arm the vulkan MoE tier from the effective GPU want (env-else-programmatic). Registered as
 //! the ``moe_gpu_tier_arm`` probe; ``[init]`` also runs it directly for the env-only path.
 //! Idempotent — re-arming after ``set_gpu_tier_want`` just refreshes the layer count.
@@ -4167,15 +4360,21 @@ def vulkan_moe_gpu_arm : bool {
     let layers = gpu_want_moe_layers()
     // counts test == 0, NOT <= 0: -1 is the auto sentinel and must read as a REQUEST, or an
     // auto-sized-layers-only want would silently fail to arm
-    if ((layers == 0l && gpu_want_moe_stream() == 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd()
-                && gpu_want_heat() <= 0l && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())
-            || !vulkan_backend_available()) {
-        return false   // nothing requested (checked first — the device probe is not free)
+    let nothing_wanted = (layers == 0l && gpu_want_moe_stream() == 0l && !gpu_want_dn() && !gpu_want_attn() && !gpu_want_dnd()
+        && gpu_want_heat() <= 0l && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())
+    if (nothing_wanted) {   // checked first — the device probe is not free
+        arm_say(0, "GPU tier NOT armed — no rail requested (set DASLLAMA_GPU=1 or call set_gpu_tier_want)")
+        return false
+    }
+    if (!vulkan_backend_available()) {
+        arm_say(2, "GPU tier NOT armed — {g_vk_why}")
+        return false
     }
     set_moe_gpu_layer_count(layers)
     if (!moe_gpu_tier_installed()) {
         install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
     }
+    arm_say(1, "GPU tier armed — vulkan, moe layers {layers}{layers < 0l ? " (auto)" : ""}, stream {gpu_want_moe_stream()}")
     return true
 }
 
