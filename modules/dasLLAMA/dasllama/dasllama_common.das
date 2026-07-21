@@ -1789,6 +1789,19 @@ def moe_gpu_gather_stack_kq(t : Model; fmt : KqFmt; woff : int64; n, rows, slice
 
 def private moe_gpu_fmt_kq(f : KqFmt) : bool => f == KqFmt.k4 || f == KqFmt.k5 || f == KqFmt.k6 || f == KqFmt.q40
 
+// a plane the dense rail can serve: a format the tier has kernels for, repacked if native-kq
+def private dense_plane_ok(t : Model; f : KqFmt) : bool => (f == KqFmt.q8 || moe_gpu_fmt_kq(f)) && kq_servable(t, f)
+
+// layer l carries a parallel-dense shared expert whose whole w1/w3/w2 triple the tier can serve
+def private dense_shexp_uploadable(t : Model; l : int64) : bool {
+    if (!t.config.moe_dense_shexp || !gpu_want_dense_shexp() || int64(length(t.w1_offs)) <= l
+            || t.w1_offs[l] < 0l || t.w2_offs[l] < 0l || t.w3_offs[l] < 0l) {
+        return false
+    }
+    return (dense_plane_ok(t, fmt_at(t.w1_fmt, l)) && dense_plane_ok(t, fmt_at(t.w2_fmt, l))
+        && dense_plane_ok(t, fmt_at(t.w3_fmt, l)))
+}
+
 // Gather one stack through its format's reader (q8 planes or native kq planes) and hand it to
 // the tier's upload hook with the format tag.
 def private moe_gpu_gather_upload(t : Model; f : KqFmt; woff : int64; n, rows, slice_rows : int64;
@@ -1891,12 +1904,19 @@ def moe_gpu_upload_resident(var t : Model) {
                 let qd = layer_qd(t.config, l)
                 let fq = fmt_at(t.wq_fmt, l)
                 let fo = fmt_at(t.wo_fmt, l)
-                if (t.wq_offs[l] >= 0l && t.wo_offs[l] >= 0l
+                if (gpu_want_dense_attn() && t.wq_offs[l] >= 0l && t.wo_offs[l] >= 0l
                         && (fq == KqFmt.q8 || moe_gpu_fmt_kq(fq)) && (fo == KqFmt.q8 || moe_gpu_fmt_kq(fo))
                         && kq_servable(t, fq) && kq_servable(t, fo)) {
                     uploads |> push((f = fq, woff = t.wq_offs[l], n = dim, rows = t.config.q_gated ? 2l * qd : qd))
                     uploads |> push((f = fo, woff = t.wo_offs[l], n = qd, rows = dim))
                 }
+            }
+            // gemma-4's parallel dense shared expert triple — opt-in, measured a wash (see the gate's doc)
+            if (dense_shexp_uploadable(t, l)) {
+                let hid = empty(t.ffn_w) ? t.config.hidden_dim : t.ffn_w[l]
+                uploads |> push((f = fmt_at(t.w1_fmt, l), woff = t.w1_offs[l], n = dim, rows = hid))
+                uploads |> push((f = fmt_at(t.w3_fmt, l), woff = t.w3_offs[l], n = dim, rows = hid))
+                uploads |> push((f = fmt_at(t.w2_fmt, l), woff = t.w2_offs[l], n = hid, rows = dim))
             }
             for (u in uploads) {
                 if (!moe_gpu_gather_upload(t, u.f, u.woff, u.n, u.rows, u.rows, mr, kgroup, wbias, wq, ws)) {

@@ -1823,6 +1823,18 @@ def public gpu_want_attn : bool
 def public gpu_want_dense : bool
     => has_env_variable("DASLLAMA_GPU_DENSE") ? get_env_variable("DASLLAMA_GPU_DENSE") == "1" : (g_gpu_want.dense || gpu_want_auto())
 
+//! Dense-rail sub-arm for gemma-4's parallel dense shared expert (moe_dense_shexp) w1/w3/w2 triple.
+//! Opt-IN: MEASURED a wash-to-loss (3 dispatches each paying acts-up + y-down around a CPU gate)
+//! and the uploads displace 1-2 expert layers. Kept as the upload half of a future FUSED chain.
+def public gpu_want_dense_shexp : bool
+    => get_env_variable("DASLLAMA_GPU_DENSE_SHEXP") == "1"
+
+//! The dense rail's attention half (per-layer q/o pairs). Opt-OUT (``DASLLAMA_GPU_DENSE_ATTN=0``)
+//! — measured a LOSS on gemma-4 where the shexp triple is a large win, so the two halves need
+//! independent control rather than one DENSE gate.
+def public gpu_want_dense_attn : bool
+    => get_env_variable("DASLLAMA_GPU_DENSE_ATTN") != "0"
+
 def public gpu_want_dnd : bool
     => has_env_variable("DASLLAMA_GPU_DND") ? get_env_variable("DASLLAMA_GPU_DND") == "1" : (g_gpu_want.dnd || gpu_want_auto())
 
