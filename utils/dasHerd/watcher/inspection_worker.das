@@ -359,10 +359,10 @@ def public inspector_prepare_worker_take_event(var worker : InspectorPrepareWork
 
 def public inspector_prepare_worker_try_event(
                                               var worker : InspectorPrepareWorker;
-                                              blk : block<(event : InspectorPrepareEvent#) : void>) : bool {
+                                              blk : block<(event : InspectorPrepareEvent const) : void>) : bool {
     var event : InspectorPrepareEvent
     if (!inspector_prepare_worker_take_event(worker, event)) return false
-    invoke(blk, unsafe(reinterpret<InspectorPrepareEvent -& -const#>(event)))
+    invoke(blk, event)
     delete event
     return true
 }

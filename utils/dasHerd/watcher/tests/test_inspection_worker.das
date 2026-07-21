@@ -76,7 +76,7 @@ def test_inspection_prepare_worker(t : T?) {
         var completed = false
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.completed) {
                     completed = true
                     tt |> success(event.markdown_document.ok,
@@ -104,7 +104,7 @@ def test_inspection_prepare_worker(t : T?) {
         var failure = ""
         let wait_started = ref_time_ticks()
         while (!failed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.failed) {
                     failed = true
                     failure = clone_string(event.error)
@@ -138,7 +138,7 @@ def test_inspection_prepare_worker(t : T?) {
         var completed = false
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.completed) {
                     completed = true
                     tt |> equal(event.parsed.binary, true)
@@ -167,7 +167,7 @@ def test_inspection_prepare_worker(t : T?) {
         var completed = false
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.completed) {
                     completed = true
                     tt |> equal(event.parsed.binary, true)
@@ -190,7 +190,7 @@ def test_inspection_prepare_worker(t : T?) {
         var completed = false
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.completed) {
                     completed = true
                     tt |> equal(event.parsed.binary, true)
@@ -213,7 +213,7 @@ def test_inspection_prepare_worker(t : T?) {
         var completed = false
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.completed) {
                     completed = true
                     tt |> equal(event.view_source, "")
