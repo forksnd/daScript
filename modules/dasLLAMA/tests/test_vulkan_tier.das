@@ -684,6 +684,9 @@ def private ref_ffn_kq(offs1, offs3, offs2 : array<int64>; nreg : int;
                        w1, w3, w2 : array<float>;
                        xq : array<int8>; xs : array<float>; nrows : int64; var gout : array<float>;
                        midblk : int = 256) {
+    // a midblk that does not divide KNFE would silently drop h's tail and produce a WRONG
+    // baseline — masking a real kernel failure. verify, not assert: this must hold in release too
+    verify(int(KNFE) % midblk == 0, "ref_ffn_kq: midblk must divide KNFE")
     gout |> resize(int(nrows * KN))
     let nsb = int(KN / 256l)
     let nsbh = int(KNFE) / midblk
@@ -990,6 +993,19 @@ def test_vulkan_moe_ffn_mixed(t : T?) {
             t |> success(c.maxref > 0.0, "mixed batch arm produced non-trivial outputs")
             t |> success(c.maxdiff <= float(REL_TOL) * c.maxref,
                 "mixed k4/k4/q8 batch arm within tolerance (maxdiff {c.maxdiff} vs {float(REL_TOL) * c.maxref} bar, maxref {c.maxref})")
+            delete wq1
+            delete ws1
+            delete wq3
+            delete ws3
+            delete dq2
+            delete ds2
+            delete wqb
+            delete wsb
+            delete w1
+            delete w3
+            delete w2
+            delete xq
+            delete xs
             delete gout
             delete refv
         } else {
