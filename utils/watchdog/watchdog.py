@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.wintypes as wt
+import importlib.util
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -32,15 +33,48 @@ from urllib.request import Request, urlopen
 IS_WINDOWS = os.name == "nt"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SOURCE_REPO_ROOT = SCRIPT_DIR.parent.parent
-DEFAULT_CWD = (
-    SOURCE_REPO_ROOT
-    if (SOURCE_REPO_ROOT / "utils/dasllama-server/main.das").is_file()
-    else SCRIPT_DIR
-)
+# In a deployed bundle the watchdog sits beside what it supervises, so the bundle dir is the right
+# default. In-repo it lives in utils/watchdog/ next to nothing runnable, so those runs pass --cwd.
+DEFAULT_CWD = SCRIPT_DIR
 TUNE_RESTART_EXIT = 3
 CONFIG_RESTART_EXIT = 4
+# Per-program wiring shipped beside watchdog.py by `daspkg release`. Every key sets the DEFAULT for
+# the flag of the same name, so an explicit flag still wins. Absent config = discovery (below).
+CONFIG_NAME = "watchdog.json"
+# Optional per-program control surface (the dictation bot's settings page, say). Supervision stays
+# generic; anything that knows about a specific program's config lives in this sibling module.
+CONTROL_MODULE = "watchdog_control.py"
+CONFIG_PATH_KEYS = frozenset(
+    {"program", "daslang", "script", "cwd", "log", "pid_file", "stop_file",
+     "dump_dir", "crash_dir", "jit_dir", "control_page"}
+)
+# How often to restate "still healthy" once health has settled. Health is otherwise logged only on
+# transition, so this is the only proof-of-life in a long quiet run.
+HEALTH_HEARTBEAT_SECONDS = 300.0
 JIT_ARTIFACT_SUFFIXES = {".dll", ".exp", ".lib", ".map", ".o", ".obj", ".pdb"}
 WER_LOCAL_DUMPS = r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
+
+
+# Supervision state, published for the control plugin (which runs on HTTP threads) to read.
+STATE_LOCK = threading.Lock()
+STATE: dict[str, object] = {
+    "watchdog_started_at": time.time(),
+    "child_pid": 0,
+    "child_started_at": 0.0,
+    "child_exit_code": None,
+    "restart_delay": 0.0,
+    "stage": None,
+}
+
+
+def set_state(**fields: object) -> None:
+    with STATE_LOCK:
+        STATE.update(fields)
+
+
+def read_state() -> dict[str, object]:
+    with STATE_LOCK:
+        return dict(STATE)
 
 
 def find_daslang() -> Path:
@@ -69,9 +103,9 @@ def resolve_from(path: Path, base: Path) -> Path:
     return (base / path).resolve()
 
 
-def make_logger(path: Path) -> logging.Logger:
+def make_logger(path: Path, name: str = "watchdog") -> logging.Logger:
     path.parent.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("dasllama-watchdog")
+    logger = logging.getLogger(f"{name}-watchdog")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     formatter = logging.Formatter("%(message)s")
@@ -478,11 +512,65 @@ def request_shutdown(url: str, logger: logging.Logger) -> None:
         emit(logger, "shutdown_request_failed", error=str(error))
 
 
+# Startup is several minutes of work with no single progress signal, and a cold start after a JIT
+# cache invalidation re-tunes every kernel family. Without these the log is only `health ok:false`
+# repeated for the whole window, which says the server is down but never what it is doing.
+#
+# Ranked and monotonic: a tune codegens each kernel variant, so the JIT lines fire hundreds of times
+# mid-tune and would otherwise flap the stage back and forth once a second. Only a forward move is
+# reported. `tune_restart` is the one legitimate rewind — the process restarts to apply the winners
+# — so it resets the rank and the sequence starts over.
+STARTUP_STAGES: list[tuple[str, int, str]] = [
+    ("jit_cached",   1, r"LLVM JIT: DLL cache hit"),
+    ("jit_codegen",  1, r"LLVM JIT: DLL cache miss, codegen for"),
+    ("jit_linked",   2, r"Library .+ linked - ok"),
+    ("tuning",       3, r"llvm_tune: tuning scope"),
+    ("tune_restart", 4, r"llvm_tune: restart to apply the winners"),
+    ("model_load",   5, r"dasLLAMA: prepared image mapped"),
+    ("asr_init",     6, r"starting \d+ asynchronous ASR worker"),
+    ("ready",        7, r"listening on http"),
+]
+TUNE_RESTART_RANK = 4
+
+
+def detect_stage(message: str) -> tuple[str, int] | None:
+    for name, rank, pattern in STARTUP_STAGES:
+        if re.search(pattern, message):
+            return name, rank
+    return None
+
+
+def advance_stage(stage: dict[str, object], message: str, now: float) -> dict[str, object] | None:
+    """Return the fields to log for a forward stage move, or None. Mutates `stage` on a move.
+
+    Split out so it can be replayed against a real startup log — the rank/reset rule is the part
+    that is easy to get wrong, and a naive version flaps once per kernel variant during a tune.
+    """
+    found = detect_stage(message)
+    if found is None:
+        return None
+    name, rank = found
+    if rank <= int(stage.get("rank", 0)):
+        return None
+    fields: dict[str, object] = {"stage": name}
+    if stage.get("name") is not None:
+        fields["after"] = stage["name"]
+        began = stage.get("since")
+        if isinstance(began, float):
+            fields["elapsed_s"] = round(now - began, 1)
+    stage["name"] = name
+    # The restart re-runs codegen from scratch, so let the sequence replay.
+    stage["rank"] = 0 if rank == TUNE_RESTART_RANK else rank
+    stage["since"] = now
+    return fields
+
+
 def stream_child(
     proc: subprocess.Popen[str],
     logger: logging.Logger,
     tune_restart_seen: threading.Event,
     jit_dlls: set[Path],
+    stage: dict[str, object],
 ) -> None:
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -495,22 +583,104 @@ def stream_child(
         )
         if match is not None:
             jit_dlls.add(Path(match.group(1)))
+        moved = advance_stage(stage, message, time.monotonic())
+        if moved is not None:
+            emit(logger, "stage", pid=proc.pid, **moved)
+            set_state(stage=moved["stage"])
         emit(logger, "child", pid=proc.pid, message=message)
+
+
+def start_control_plugin(script_dir: Path, logger: logging.Logger, args: argparse.Namespace):
+    """Start the sibling control module if the program ships one. It must expose
+    start(logger, args). A control surface that fails to load is reported and skipped, never
+    fatal — keeping the program alive outranks being able to reconfigure it."""
+    path = script_dir / CONTROL_MODULE
+    if not path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("watchdog_control", path)
+        module = importlib.util.module_from_spec(spec)
+        # Injected before exec so the plugin can reuse emit() and friends. Sharing the host beats
+        # re-declaring emit in every plugin, where the log envelope would drift.
+        module.host = sys.modules[__name__]
+        spec.loader.exec_module(module)
+        handle = module.start(logger, args)
+    except Exception as exc:  # noqa: BLE001 - a broken plugin must not take supervision down
+        emit(logger, "control_failed", path=str(path), error=repr(exc))
+        return None
+    emit(logger, "control_started", path=str(path))
+    return handle
+
+
+def load_config(script_dir: Path) -> dict[str, object]:
+    """Read watchdog.json beside this script. Missing is fine; malformed is fatal."""
+    path = script_dir / CONFIG_NAME
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"watchdog: cannot read {path}: {exc}")
+    except ValueError as exc:
+        raise SystemExit(f"watchdog: {path} is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"watchdog: {path} must hold a JSON object, got {type(data).__name__}")
+    return data
+
+
+def apply_config(parser: argparse.ArgumentParser, config: dict[str, object], where: Path) -> None:
+    """Fold config into the parser's defaults. An unknown key is fatal: silently ignoring a typo
+    would supervise the program with wrong wiring and nothing would say so."""
+    if not config:
+        return
+    valid = set(vars(parser.parse_args([])))
+    unknown = sorted(set(config) - valid)
+    if unknown:
+        raise SystemExit(
+            f"watchdog: {where} has unknown key(s): {', '.join(unknown)}\n"
+            f"  known keys: {', '.join(sorted(valid - {'server_args'}))}"
+        )
+    # set_defaults bypasses each action's type=, so path-valued keys convert here.
+    resolved = {k: (Path(str(v)) if k in CONFIG_PATH_KEYS and v is not None else v)
+                for k, v in config.items()}
+    parser.set_defaults(**resolved)
+
+
+def discover_target(script_dir: Path) -> dict[str, object]:
+    """Infer what to supervise from the bundle layout, so a deployed `python watchdog.py` with no
+    config and no flags just runs. Ambiguity is reported, never guessed."""
+    script = script_dir / "main.das"
+    daslang = script_dir / "bin/Release/daslang.exe"
+    if script.is_file() and daslang.is_file():
+        return {"script": script, "daslang": daslang}
+    exes = sorted(p for p in script_dir.glob("*.exe") if p.is_file())
+    if len(exes) == 1:
+        return {"program": exes[0], "name": exes[0].stem}
+    if len(exes) > 1:
+        raise SystemExit(
+            f"watchdog: {script_dir} holds {len(exes)} executables "
+            f"({', '.join(p.name for p in exes)}); pick one with --program or {CONFIG_NAME}"
+        )
+    raise SystemExit(
+        f"watchdog: nothing to supervise in {script_dir} — expected a single *.exe, or "
+        f"main.das beside bin/Release/daslang.exe. Use --program/--script or ship {CONFIG_NAME}."
+    )
 
 
 def parse_cli() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--name", default="dasllama")
+    # None means "derive from the discovered program"; see resolve_identity.
+    parser.add_argument("--name", default=None)
     parser.add_argument(
         "--program",
         type=Path,
         help="Run this standalone program instead of daslang -jit <script>; relative paths use --cwd",
     )
-    parser.add_argument("--daslang", type=Path, default=find_daslang())
-    parser.add_argument("--script", type=Path, default=SCRIPT_DIR / "main.das")
+    parser.add_argument("--daslang", type=Path, default=None)
+    parser.add_argument("--script", type=Path, default=None)
     parser.add_argument("--cwd", type=Path, default=DEFAULT_CWD)
-    parser.add_argument("--log", type=Path, default=Path("logs/dasllama-watchdog.log"))
-    parser.add_argument("--pid-file", type=Path, default=Path("logs/dasllama-watchdog.pid"))
+    parser.add_argument("--log", type=Path, default=None)
+    parser.add_argument("--pid-file", type=Path, default=None)
     parser.add_argument("--health-url", default="http://127.0.0.1:8080/v1/models")
     parser.add_argument("--shutdown-url", default="http://127.0.0.1:8080/shutdown")
     parser.add_argument("--no-health", action="store_true")
@@ -563,10 +733,33 @@ def parse_cli() -> argparse.Namespace:
     )
     parser.add_argument("--no-crash-bundle", action="store_true")
     parser.add_argument("server_args", nargs=argparse.REMAINDER)
+    apply_config(parser, load_config(SCRIPT_DIR), SCRIPT_DIR / CONFIG_NAME)
     args = parser.parse_args()
     if args.server_args[:1] == ["--"]:
         args.server_args = args.server_args[1:]
+    resolve_identity(args)
     return args
+
+
+def resolve_identity(args: argparse.Namespace) -> None:
+    """Fill in whatever neither the CLI nor watchdog.json pinned down: what to run, and the
+    name that the log, pid file and notifications are keyed on."""
+    if args.program is None and args.script is None:
+        for key, value in discover_target(args.cwd.resolve()).items():
+            if getattr(args, key) is None:
+                setattr(args, key, value)
+    if args.name is None:
+        # An executable names itself; a script is almost always main.das, so the bundle directory
+        # is the meaningful identity there.
+        args.name = (
+            Path(args.program).stem if args.program is not None else args.cwd.resolve().name
+        )
+    if args.daslang is None:
+        args.daslang = find_daslang()
+    if args.log is None:
+        args.log = Path(f"logs/{args.name}-watchdog.log")
+    if args.pid_file is None:
+        args.pid_file = Path(f"logs/{args.name}-watchdog.pid")
 
 
 def main() -> int:
@@ -574,7 +767,8 @@ def main() -> int:
     args.cwd = args.cwd.resolve()
     args.log = resolve_from(args.log, args.cwd)
     args.pid_file = resolve_from(args.pid_file, args.cwd)
-    args.script = resolve_from(args.script, args.cwd)
+    if args.script is not None:
+        args.script = resolve_from(args.script, args.cwd)
     args.dump_dir = resolve_from(args.dump_dir, args.cwd)
     args.crash_dir = resolve_from(args.crash_dir, args.cwd)
     args.jit_dir = resolve_from(args.jit_dir, args.cwd)
@@ -582,7 +776,8 @@ def main() -> int:
         args.program = resolve_from(args.program, args.cwd)
     if args.stop_file is not None:
         args.stop_file = resolve_from(args.stop_file, args.cwd)
-    logger = make_logger(args.log)
+    logger = make_logger(args.log, args.name)
+    start_control_plugin(SCRIPT_DIR, logger, args)
     daslang_candidate = resolve_from(args.daslang, args.cwd)
     daslang = daslang_candidate if daslang_candidate.is_file() else args.daslang
     if args.program is not None:
@@ -696,16 +891,22 @@ def main() -> int:
                 return 2
 
             emit(logger, "child_started", pid=child.pid)
+            set_state(child_pid=child.pid, child_started_at=started_at,
+                      child_exit_code=None, restart_delay=0.0, stage=None)
             tune_restart_seen = threading.Event()
             jit_dlls: set[Path] = set()
+            stage: dict[str, object] = {"name": None, "rank": 0, "since": time.monotonic()}
             output = threading.Thread(
                 target=stream_child,
-                args=(child, logger, tune_restart_seen, jit_dlls),
+                args=(child, logger, tune_restart_seen, jit_dlls, stage),
                 daemon=True,
             )
             output.start()
             next_memory = time.monotonic()
             next_health = time.monotonic()
+            last_health: bool | None = None
+            last_health_change = time.monotonic()
+            next_heartbeat = time.monotonic() + HEALTH_HEARTBEAT_SECONDS
             shutdown_sent = False
             shutdown_requested_at = 0.0
             while child.poll() is None:
@@ -732,7 +933,25 @@ def main() -> int:
                     next_memory = now + max(args.memory_interval, 1.0)
                 if not args.no_health and now >= next_health:
                     healthy = health_ok(args.health_url)
-                    emit(logger, "health", pid=child.pid, ok=healthy)
+                    # Log transitions, not every poll. A cold start is minutes of `ok:false` that
+                    # says nothing the `stage` events do not say better; a steady-state run is
+                    # hours of `ok:true`. Both drown the events that matter. The periodic
+                    # heartbeat keeps "still alive and healthy" observable at a readable rate.
+                    if healthy != last_health:
+                        fields: dict[str, object] = {"pid": child.pid, "ok": healthy}
+                        if last_health is not None:
+                            fields["was"] = last_health
+                            fields["after_s"] = round(now - last_health_change, 1)
+                        if not healthy and stage.get("name") is not None:
+                            fields["stage"] = stage["name"]
+                        emit(logger, "health", **fields)
+                        last_health = healthy
+                        last_health_change = now
+                        next_heartbeat = now + HEALTH_HEARTBEAT_SECONDS
+                    elif healthy and now >= next_heartbeat:
+                        emit(logger, "health_heartbeat", pid=child.pid,
+                             ok=True, healthy_for_s=round(now - last_health_change))
+                        next_heartbeat = now + HEALTH_HEARTBEAT_SECONDS
                     if healthy and recovery_pending:
                         windows_balloon(f"{args.name} recovered", f"Server is healthy (pid {child.pid})")
                         emit(logger, "recovered", pid=child.pid)
@@ -750,6 +969,7 @@ def main() -> int:
             output.join(timeout=2.0)
             uptime = time.time() - started_at
             emit(logger, "child_exited", pid=child_pid, code=return_code, uptime_seconds=uptime)
+            set_state(child_pid=0, child_exit_code=return_code)
             child = None
             if stopping.is_set():
                 return 0
@@ -783,6 +1003,7 @@ def main() -> int:
                 wer=wer or "",
                 dump=str(dump_path) if dump_path is not None else "",
             )
+            set_state(restart_delay=delay)
             bundle_path: Path | None = None
             if not args.no_crash_bundle:
                 try:
@@ -817,7 +1038,10 @@ def main() -> int:
                 child.kill()
                 child.wait(timeout=10.0)
         try:
-            args.pid_file.unlink()
+            # Only clear the file if it is still ours. A second watchdog that took over the slot
+            # owns it now, and deleting its claim would let a third start alongside it.
+            if args.pid_file.read_text(encoding="ascii").strip() == str(os.getpid()):
+                args.pid_file.unlink()
         except OSError:
             pass
         if stop_file is not None:

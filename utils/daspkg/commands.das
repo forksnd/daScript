@@ -1916,6 +1916,41 @@ def private finalize_shipped_binary(src, dst : string; var shipped : array<strin
 //   2. Build-tree config dirs in fixed preference: Release > RelWithDebInfo >
 //      MinSizeRel > Debug, e.g. `<search_root>/Release/<name>`.
 //   3. Fall through to `**/<name>` and pick the first match.
+// `release_include_from` entries, as "source@dest" (dest empty = source's file name). Source is
+// relative to <das_root>; dest to the bundle root. A missing source fails the release rather than
+// shipping a bundle that is quietly short a file.
+def private ship_external_files(bundle_name, dst_dir : string; external_files : array<string>;
+                                var shipped : array<string>) : int {
+    let das_root = get_das_root()
+    shipped |> reserve(length(shipped) + length(external_files))
+    for (entry in external_files) {
+        let at = find(entry, "@")
+        if (at < 0) {
+            to_log(LOG_ERROR, "release: `{bundle_name}` has a malformed release_include_from entry `{entry}` (expected \"source@dest\")\n")
+            return 1
+        }
+        let source = slice(entry, 0, at)
+        let requested = slice(entry, at + 1)
+        let dest = empty(requested) ? base_name(source) : requested
+        let src = path_join(das_root, source)
+        if (!fexist(src)) {
+            to_log(LOG_ERROR, "release: `{bundle_name}` declared release_include_from(\"{source}\") but `{src}` does not exist\n")
+            return 1
+        }
+        let dst = path_join(dst_dir, dest)
+        mkdir_rec(dir_name(dst))
+        var err : string
+        if (!copy_file(src, dst, true, err)) {
+            to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
+            return 1
+        }
+        shipped |> push(dest)
+    }
+    log("  ship external: {length(external_files)} file(s)\n")
+    return 0
+}
+
+
 def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<string>;
                              var shipped : array<string>; rel_prefix : string) : int {
     let platform = get_platform_name()
@@ -2374,6 +2409,10 @@ def cmd_release(root : string; out_dir : string; tune_fast = false) : int {
     if (!empty(spec.native_dlls)) {
         let rc3 = ship_native_dlls(bundle_name, bundle_dir, spec.native_dlls, shipped, "")
         if (rc3 != 0) return rc3
+    }
+    if (!empty(spec.external_files)) {
+        let rc4 = ship_external_files(bundle_name, bundle_dir, spec.external_files, shipped)
+        if (rc4 != 0) return rc4
     }
 
     // 5. macOS .app: write Contents/Info.plist. Bundle ID source priority:
