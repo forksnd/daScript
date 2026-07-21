@@ -201,13 +201,20 @@ Telegram Desktop produces more pages; use `--include-last-page` only after the e
 bin/daslang utils/daspkg/main.das -- release --root examples/telegram/dictation --out <staging>
 ```
 
-The release contains a standalone executable, `watchdog.py`, `control.html`, runtime DLLs, required shared modules,
-and initializes the config template only when `dictation.toml` is absent. Re-releasing preserves the
-deployed `dictation.toml`; `cadmus.db` and logs are not release-owned and are preserved as well.
+The release contains a standalone executable, the shared watchdog (`watchdog.py` from
+`utils/watchdog/`, plus `watchdog_control.py` and `watchdog.json`), `control.html`, runtime DLLs,
+required shared modules, and initializes the config template only when `dictation.toml` is absent.
+Re-releasing preserves the deployed `dictation.toml`; `cadmus.db` and logs are not release-owned and
+are preserved as well.
 
-The bundled watchdog has the Cadmus executable, config, working directory, logs, dump directory,
-and graceful-stop handshake built in. It shows a Windows notification after a crash, saves a crash
-bundle, and restarts with bounded backoff. Start it from the released directory with no arguments:
+The watchdog is the shared one — it finds the bundle's single executable on its own, and
+`watchdog.json` supplies only what discovery cannot know: the name logs are keyed on (`cadmus`),
+the graceful-stop file, and that this program has no HTTP health endpoint. The control page lives in
+`watchdog_control.py`, a plugin the watchdog loads if present; it owns `dictation.toml`, the prompt
+set, generation defaults and the activity feed. See `utils/watchdog/README.md`.
+
+It shows a Windows notification after a crash, saves a crash bundle, and restarts with bounded
+backoff. Start it from the released directory with no arguments:
 
 ```powershell
 Set-Location E:/dictation-bot

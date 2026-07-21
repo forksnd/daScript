@@ -47,6 +47,7 @@ struct PackageReleaseInfo {
     wasm_archives : array<string>
     requires_jit : bool
     include_symbols : bool
+    external_files : array<string>
 }
 
 
@@ -151,6 +152,9 @@ def run_das_package_release(das_package_path : string; var info : PackageRelease
             }
             info.requires_jit = src.requires_jit
             info.include_symbols = src.include_symbols
+            for (e in src.external_files) {
+                info.external_files |> push(clone_string(e))
+            }
         }
     }
     return ok

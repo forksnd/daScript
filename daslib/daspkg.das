@@ -145,6 +145,7 @@ struct ReleaseSpec {
     wasm_archives : array<string>       //!< archives (relative to module dir) produced by wasm_build_command, staged into the release wasm lib dir
     requires_jit : bool                 //!< app is JIT-only (per-box [tune]/[llvm_code] kernels); a baked -exe would run broken, so `daspkg release` refuses it
     include_symbols : bool              //!< ship debug symbols for every shipped binary into `<bundle>/symbols/`
+    external_files : array<string>      //!< "src@dst" pairs shipped from outside the package; src is relative to <das_root>, dst to the bundle root
 }
 
 var _release_spec : ReleaseSpec
@@ -183,6 +184,17 @@ def release_include(pattern : string) {
 //! Ship starter content only when the destination does not already exist.
 def release_include_if_missing(pattern : string) {
     _release_spec.include_if_missing_globs |> push(pattern)
+}
+
+//! Ship a file that lives OUTSIDE this package — `release_include` only globs downward from the package root, so shared tooling (e.g. `utils/watchdog/watchdog.py`) is unreachable to it. `source` is relative to `<das_root>`; `dest` is relative to the bundle root and defaults to `source`'s file name. Errors loudly if the source is missing, so a moved file fails the release instead of silently shipping nothing.
+def release_include_from(source, dest : string) {
+    _release_spec.external_files |> push("{source}@{dest}")
+}
+
+def release_include_from(source : string) {
+    // Empty dest = "use the source file name"; resolved by the shipper, which has fio. This
+    // module is requires-free by design, so base_name() is not available here.
+    _release_spec.external_files |> push("{source}@")
 }
 
 def release_exclude(pattern : string) {

@@ -1,18 +1,18 @@
-#!/usr/bin/env python3
-"""Supervise the released dictation bot with no command-line configuration."""
+"""Dictation-bot control page, loaded by utils/watchdog/watchdog.py as its control plugin.
 
+The watchdog supervises; this module owns everything that knows what a dictation bot is --
+dictation.toml, the prompt set, generation defaults and the recent-activity feed. The watchdog
+calls start(logger, args) and injects `host`, its own module, before executing this file.
+
+Saving settings writes cadmus-runtime.json and asks the watchdog for a config restart (exit 4).
+"""
 from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
-import shutil
-import signal
-import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -21,24 +21,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+# Injected by watchdog.py before this module is executed; see start_control_plugin there.
+host: object
 
-IS_WINDOWS = os.name == "nt"
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
-PROGRAM = ROOT / ("dictation-bot.exe" if IS_WINDOWS else "dictation-bot")
 CONFIG = ROOT / "dictation.toml"
 CONTROL_PAGE = ROOT / "control.html"
 RUNTIME_CONFIG = ROOT / "cadmus-runtime.json"
 DEFAULTS_FILE = ROOT / "cadmus-defaults.json"
-LOG = LOGS / "cadmus-watchdog.log"
-PID_FILE = LOGS / "cadmus-watchdog.pid"
-STOP_FILE = LOGS / "cadmus.stop"
-DUMP_DIR = LOGS / "dumps"
-CRASH_DIR = LOGS / "crashes"
-CRASH_BUNDLES = 10
-STABLE_SECONDS = 300.0
-MAX_RESTART_DELAY = 60.0
-STOP_TIMEOUT = 1200.0
 CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 8091
 MAX_CONTROL_BODY = 512 * 1024
@@ -49,190 +40,13 @@ ACTIVITY_WINDOW = 64 * 1024
 ALLOWED_HOSTS = frozenset(
     {f"{CONTROL_HOST}:{CONTROL_PORT}", f"localhost:{CONTROL_PORT}", f"[::1]:{CONTROL_PORT}"}
 )
-ALLOWED_ORIGINS = frozenset(f"http://{host}" for host in ALLOWED_HOSTS)
-WER_LOCAL_DUMPS = r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
+# Loop name is not `host`: that would read as the injected supervisor module.
+ALLOWED_ORIGINS = frozenset(f"http://{hostport}" for hostport in ALLOWED_HOSTS)
 
-STATE_LOCK = threading.Lock()
 # Saving settings is a read-modify-write (merge current, bump version, replace the file) and the
 # control server is threaded, so concurrent savers must not interleave.
 SETTINGS_LOCK = threading.Lock()
-STATE: dict[str, object] = {
-    "watchdog_started_at": time.time(),
-    "child_pid": 0,
-    "child_started_at": 0.0,
-    "child_exit_code": None,
-    "restart_delay": 0.0,
-}
 CONTROL_LOGGER: logging.Logger | None = None
-
-
-def make_logger() -> logging.Logger:
-    LOGS.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("cadmus-watchdog")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    formatter = logging.Formatter("%(message)s")
-    rotating = RotatingFileHandler(
-        LOG, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"
-    )
-    rotating.setFormatter(formatter)
-    logger.addHandler(rotating)
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(formatter)
-    logger.addHandler(console)
-    return logger
-
-
-def emit(logger: logging.Logger, event: str, **fields: object) -> None:
-    logger.info(
-        json.dumps(
-            {
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "event": event,
-                **fields,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-    )
-
-
-def windows_balloon(title: str, message: str) -> None:
-    if not IS_WINDOWS:
-        return
-    safe_title = title.replace("'", "''")
-    safe_message = message.replace("'", "''")
-    script = (
-        "Add-Type -AssemblyName System.Windows.Forms;"
-        "Add-Type -AssemblyName System.Drawing;"
-        "$n=New-Object System.Windows.Forms.NotifyIcon;"
-        "$n.Icon=[System.Drawing.SystemIcons]::Error;"
-        "$n.Visible=$true;"
-        f"$n.ShowBalloonTip(10000,'{safe_title}','{safe_message}',"
-        "[System.Windows.Forms.ToolTipIcon]::Error);"
-        "Start-Sleep -Seconds 11;"
-        "$n.Dispose()"
-    )
-    try:
-        subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except OSError:
-        pass
-
-
-def windows_local_dump_config(exe_name: str) -> tuple[int | None, Path | None]:
-    if not IS_WINDOWS:
-        return None, None
-    import winreg
-
-    for subkey, app_specific in (
-        (f"{WER_LOCAL_DUMPS}\\{exe_name}", True),
-        (WER_LOCAL_DUMPS, False),
-    ):
-        try:
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                subkey,
-                0,
-                winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
-            ) as key:
-                if not app_specific:
-                    try:
-                        winreg.QueryValueEx(key, "DumpType")
-                    except FileNotFoundError:
-                        continue
-                try:
-                    dump_type = int(winreg.QueryValueEx(key, "DumpType")[0])
-                except FileNotFoundError:
-                    dump_type = 1
-                try:
-                    folder = Path(
-                        os.path.expandvars(str(winreg.QueryValueEx(key, "DumpFolder")[0]))
-                    )
-                except FileNotFoundError:
-                    folder = Path(os.environ["LOCALAPPDATA"]) / "CrashDumps"
-                return dump_type, folder
-        except (FileNotFoundError, OSError):
-            continue
-    return None, None
-
-
-def wait_for_dump(exe_name: str, started_at: float) -> Path | None:
-    deadline = time.monotonic() + 15.0
-    prefix = exe_name.lower()
-    while time.monotonic() < deadline:
-        try:
-            candidates = [
-                path
-                for path in DUMP_DIR.glob("*.dmp")
-                if path.name.lower().startswith(prefix)
-                and path.stat().st_mtime >= started_at - 5.0
-            ]
-        except OSError:
-            candidates = []
-        if candidates:
-            newest = max(candidates, key=lambda path: path.stat().st_mtime)
-            try:
-                with newest.open("rb"):
-                    pass
-                return newest
-            except OSError:
-                pass
-        time.sleep(0.25)
-    return None
-
-
-def prune_crash_bundles() -> None:
-    if not CRASH_DIR.is_dir():
-        return
-    bundles = sorted(
-        (path for path in CRASH_DIR.glob("cadmus-*") if path.is_dir()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for path in bundles[CRASH_BUNDLES:]:
-        shutil.rmtree(path, ignore_errors=True)
-
-
-def collect_crash_bundle(
-    child_pid: int, return_code: int, started_at: float, dump_path: Path | None
-) -> Path:
-    bundle = CRASH_DIR / f"cadmus-{time.strftime('%Y%m%d-%H%M%S')}-pid{child_pid}"
-    bundle.mkdir(parents=True, exist_ok=False)
-    artifacts = [PROGRAM, PROGRAM.with_suffix(".map"), PROGRAM.with_suffix(".pdb")]
-    metadata = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "pid": child_pid,
-        "exit_code": return_code,
-        "exit_code_hex": f"0x{return_code & 0xFFFFFFFF:08X}",
-        "started_at": started_at,
-        "command": [str(PROGRAM), "--config", str(CONFIG)],
-        "cwd": str(ROOT),
-        "dump": dump_path.name if dump_path is not None else "",
-        "program_artifacts": [path.name for path in artifacts if path.is_file()],
-    }
-    (bundle / "crash.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    if LOG.is_file():
-        shutil.copy2(LOG, bundle / LOG.name)
-    if dump_path is not None and dump_path.is_file():
-        shutil.copy2(dump_path, bundle / dump_path.name)
-    for source in artifacts:
-        if source.is_file():
-            shutil.copy2(source, bundle / source.name)
-    prune_crash_bundles()
-    return bundle
-
-
-def stream_child(proc: subprocess.Popen[str], logger: logging.Logger) -> None:
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        emit(logger, "child", pid=proc.pid, message=line.rstrip("\r\n"))
 
 
 CONFIG_CACHE: tuple[object, dict[str, object]] = (None, {})
@@ -558,8 +372,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self.wfile.write(payload)
                 return
             if route == "/api/status":
-                with STATE_LOCK:
-                    state = dict(STATE)
+                state = host.read_state()
                 state["watchdog_pid"] = os.getpid()
                 state["watchdog_uptime_s"] = time.time() - float(state["watchdog_started_at"])
                 try:
@@ -602,7 +415,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                     settings = validate_runtime_config(body)
                     write_runtime_config(settings)
                 if CONTROL_LOGGER is not None:
-                    emit(CONTROL_LOGGER, "runtime_settings_saved", version=settings["version"])
+                    host.emit(CONTROL_LOGGER, "runtime_settings_saved", version=settings["version"])
                 self.send_json(200, {"saved": True, "runtime": settings})
                 return
             if route == "/api/playground":
@@ -654,164 +467,12 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": str(error)})
 
 
-def start_control_server(logger: logging.Logger) -> ThreadingHTTPServer:
+def start(logger: logging.Logger, args) -> ThreadingHTTPServer:
+    """Entry point the watchdog calls; args is the supervisor's parsed namespace."""
     global CONTROL_LOGGER
     CONTROL_LOGGER = logger
     server = ThreadingHTTPServer((CONTROL_HOST, CONTROL_PORT), ControlHandler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, name="cadmus-control", daemon=True).start()
-    emit(logger, "control_started", url=f"http://{CONTROL_HOST}:{CONTROL_PORT}/")
+    host.emit(logger, "control_started", url=f"http://{CONTROL_HOST}:{CONTROL_PORT}/")
     return server
-
-
-def main() -> int:
-    global DUMP_DIR
-
-    logger = make_logger()
-    if not PROGRAM.is_file():
-        emit(logger, "program_missing", path=str(PROGRAM))
-        return 2
-    if not CONFIG.is_file():
-        emit(logger, "config_missing", path=str(CONFIG))
-        return 2
-    if not CONTROL_PAGE.is_file():
-        emit(logger, "control_page_missing", path=str(CONTROL_PAGE))
-        return 2
-
-    dump_type, configured_dump_dir = windows_local_dump_config(PROGRAM.name)
-    if configured_dump_dir is not None:
-        DUMP_DIR = configured_dump_dir
-    if dump_type == 1:
-        emit(logger, "wer_ready", dump_dir=str(DUMP_DIR), dump_type="minidump")
-    elif IS_WINDOWS:
-        emit(
-            logger,
-            "wer_not_ready",
-            reason="not configured" if dump_type is None else f"unsafe dump type {dump_type}",
-        )
-
-    command = [str(PROGRAM), "--config", str(CONFIG)]
-    child_env = os.environ.copy()
-    child_env["CADMUS_STOP_FILE"] = str(STOP_FILE)
-    stopping = threading.Event()
-    child: subprocess.Popen[str] | None = None
-    try:
-        control_server = start_control_server(logger)
-    except OSError as error:
-        # Binding the control port is the single-instance check, so claim the PID file only after it
-        # succeeds — otherwise a second watchdog would overwrite and then delete the running one's.
-        emit(logger, "control_start_failed", host=CONTROL_HOST, port=CONTROL_PORT, error=str(error))
-        return 2
-    PID_FILE.write_text(str(os.getpid()), encoding="ascii")
-
-    def stop_handler(_signum: int, _frame: object) -> None:
-        stopping.set()
-
-    signal.signal(signal.SIGINT, stop_handler)
-    signal.signal(signal.SIGTERM, stop_handler)
-    failures = 0
-    emit(logger, "watchdog_started", pid=os.getpid(), command=command, cwd=str(ROOT))
-
-    try:
-        while not stopping.is_set():
-            try:
-                STOP_FILE.unlink()
-            except FileNotFoundError:
-                pass
-            started_at = time.time()
-            try:
-                child = subprocess.Popen(
-                    command,
-                    cwd=ROOT,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    creationflags=(
-                        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                        if IS_WINDOWS
-                        else 0
-                    ),
-                    env=child_env,
-                )
-            except OSError as error:
-                emit(logger, "spawn_failed", error=str(error))
-                return 2
-
-            emit(logger, "child_started", pid=child.pid)
-            with STATE_LOCK:
-                STATE["child_pid"] = child.pid
-                STATE["child_started_at"] = started_at
-                STATE["child_exit_code"] = None
-                STATE["restart_delay"] = 0.0
-            output = threading.Thread(target=stream_child, args=(child, logger), daemon=True)
-            output.start()
-            stop_requested_at = 0.0
-            while child.poll() is None:
-                if stopping.is_set() and stop_requested_at == 0.0:
-                    STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    STOP_FILE.write_text("stop\n", encoding="ascii")
-                    stop_requested_at = time.monotonic()
-                    emit(logger, "stop_file_requested", path=str(STOP_FILE))
-                if stop_requested_at and time.monotonic() - stop_requested_at > STOP_TIMEOUT:
-                    child.terminate()
-                time.sleep(0.25)
-
-            child_pid = child.pid
-            return_code = child.wait()
-            output.join(timeout=2.0)
-            uptime = time.time() - started_at
-            emit(logger, "child_exited", pid=child_pid, code=return_code, uptime_seconds=uptime)
-            with STATE_LOCK:
-                STATE["child_pid"] = 0
-                STATE["child_exit_code"] = return_code
-            child = None
-            if stopping.is_set() or return_code == 0:
-                return 0
-
-            dump_path = wait_for_dump(PROGRAM.name, started_at) if dump_type == 1 else None
-            failures = 0 if uptime >= STABLE_SECONDS else failures + 1
-            delay = min(2.0 ** min(failures, 6), MAX_RESTART_DELAY)
-            with STATE_LOCK:
-                STATE["restart_delay"] = delay
-            bundle: Path | None = None
-            try:
-                bundle = collect_crash_bundle(child_pid, return_code, started_at, dump_path)
-            except OSError as error:
-                emit(logger, "crash_bundle_failed", error=str(error))
-            emit(
-                logger,
-                "crash",
-                code=return_code,
-                uptime_seconds=uptime,
-                restart_delay_seconds=delay,
-                dump=str(dump_path) if dump_path is not None else "",
-                bundle=str(bundle) if bundle is not None else "",
-            )
-            windows_balloon(
-                "Cadmus crashed",
-                f"Exit {return_code}; restarting in {delay:.0f}s"
-                + (f"\nDump: {dump_path}" if dump_path is not None else "\nNo minidump produced"),
-            )
-            stopping.wait(delay)
-    finally:
-        control_server.shutdown()
-        control_server.server_close()
-        if child is not None and child.poll() is None:
-            child.terminate()
-            try:
-                child.wait(timeout=10.0)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait(timeout=10.0)
-        try:
-            if PID_FILE.read_text(encoding="ascii").strip() == str(os.getpid()):
-                PID_FILE.unlink()
-        except OSError:
-            pass
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
