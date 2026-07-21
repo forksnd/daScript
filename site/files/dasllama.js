@@ -163,6 +163,7 @@
           var receipt = ['$ ' + r.cmd];
           receipt.push([r.engine, r.sha ? '@ ' + r.sha : '', r.version || '', r.date || ''].filter(Boolean).join(' · '));
           if (r.tune) receipt.push('tune: ' + r.tune);
+          if (r.exec_fmt) receipt.push('executes: ' + r.exec_fmt);
           receipt.push([hw.cpu, hw.total_cores ? hw.total_cores + ' cores' : '', hw.ram_gb ? hw.ram_gb + ' GB' : '',
             hw.gpu, hw.os].filter(Boolean).join(' · '));
           return '<div class="dl-bench-row dl-bench-row--' + (r.engine === 'das' ? 'das' : 'ref') +

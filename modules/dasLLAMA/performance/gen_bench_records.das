@@ -217,6 +217,7 @@ def main : int {
                 cmd = cmd,
                 sha = rows[0].build_commit,
                 source = "official",
+                exec_fmt = lcpp_exec_fmt(backend),
                 hardware = hw)
             for (row in rows) {
                 let tag = row.n_gen == 0 ? "pp{row.n_prompt}" : "tg{row.n_gen}"

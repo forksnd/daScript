@@ -665,7 +665,7 @@
         "box":"m1",
         "threads":8,
         "date":"2026-07-21",
-        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ref /Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-clean-cpu/bin/llama-bench --ref-flavor clean-cpu",
+        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -677,18 +677,19 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":209.23585585213263,
-            "stddev":0.29393297433853149
+            "tok_s":198.2205438278682,
+            "stddev":5.8886809349060059
           },
           "tg128":{
-            "tok_s":41.634577298994046,
-            "stddev":0.027743775397539139
+            "tok_s":41.514423449506886,
+            "stddev":0.055721234530210495
           }
         },
         "source":"official",
-        "sha":"dd21245c9",
+        "sha":"b85a5ac1d",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
+        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "exec_fmt":"weights mxfp4/q8 native; q8 activations; f16 scales; planar arm64-gen (repacked)"
       },
       {
         "engine":"llama.cpp",
@@ -709,16 +710,17 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":119.60631600000001,
-            "stddev":2.1013760000000001
+            "tok_s":119.75660499999999,
+            "stddev":0.68506800000000001
           },
           "tg128":{
-            "tok_s":41.798597999999998,
-            "stddev":0.47513
+            "tok_s":42.409554,
+            "stddev":0.096749000000000002
           }
         },
         "source":"official",
-        "sha":"ebd048f"
+        "sha":"ebd048f",
+        "exec_fmt":"native gguf formats; cpu runtime layout repack"
       },
       {
         "engine":"das",
@@ -727,7 +729,7 @@
         "box":"m1",
         "threads":8,
         "date":"2026-07-21",
-        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99 --ref /Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench --ref-flavor stock",
+        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -739,18 +741,19 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":885.19369849039867,
-            "stddev":1.8949406147003174
+            "tok_s":842.53338406139483,
+            "stddev":31.297445297241211
           },
           "tg128":{
-            "tok_s":33.284556403692797,
-            "stddev":0.0097357295453548431
+            "tok_s":33.437276195098548,
+            "stddev":0.19045644998550415
           }
         },
         "source":"official",
-        "sha":"dd21245c9",
+        "sha":"b85a5ac1d",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
+        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "exec_fmt":"weights mxfp4/q8 native; q8 activations; f16 scales; metal blob"
       },
       {
         "engine":"llama.cpp",
@@ -771,16 +774,17 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":1031.2996599999999,
-            "stddev":2.4573130000000001
+            "tok_s":1030.526257,
+            "stddev":2.8537840000000001
           },
           "tg128":{
-            "tok_s":83.367034000000004,
-            "stddev":0.065244999999999997
+            "tok_s":83.340371000000005,
+            "stddev":0.035358000000000001
           }
         },
         "source":"official",
-        "sha":"ebd048f"
+        "sha":"ebd048f",
+        "exec_fmt":"native gguf formats"
       },
       {
         "engine":"llama.cpp",
@@ -801,16 +805,17 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":114.086674,
-            "stddev":1.89838
+            "tok_s":119.619016,
+            "stddev":0.19315399999999999
           },
           "tg128":{
-            "tok_s":42.337879999999998,
-            "stddev":0.100775
+            "tok_s":42.466951000000002,
+            "stddev":0.068900000000000003
           }
         },
         "source":"official",
-        "sha":"ebd048f"
+        "sha":"ebd048f",
+        "exec_fmt":"native gguf formats; cpu runtime layout repack"
       }
     ],
     "arch":"gpt-oss",

@@ -199,6 +199,7 @@ def main() {
     var results : array<RowStat>
     var modelArch = ""
     var activeB = 0.0lf
+    var execFmt = ""
     with_job_que() {
         setup_dasllama_jobque_()
         // load INSIDE the que, on the image rail: the .dlim maps in ms, and the GPU tier's
@@ -210,6 +211,7 @@ def main() {
         say(fmt, "config: dim={c.dim} layers={c.n_layers} vocab={c.vocab_size} | backend {active_kernel_backend()} (batch {active_batch_backend()}) | t{threads} affinity {pinned ? "hard" : "env/off"} | pp{plen} tg{ngen} x {reps} reps\n")
         modelArch = "{t.arch}"
         activeB = active_params_b(t)
+        execFmt = model_exec_fmt(t)
         var s <- make_run_state(c)
         for (arm in range(ab ? 2 : 1)) {
             var dtag = ""
@@ -325,6 +327,7 @@ def main() {
         sha = run_capture("git rev-parse --short HEAD", true),
         version = das_version(),
         tune = tune_summary(),
+        exec_fmt = execFmt,
         hardware = hw,
         tests <- tests_of(results))
     m.runs |> emplace(dr)
@@ -338,6 +341,7 @@ def main() {
             date = date,
             cmd = refCmd,
             sha = refRows[0].build_commit,
+            exec_fmt = lcpp_exec_fmt(backend),
             hardware = hw)
         for (row in refRows) {
             let tag = row.n_gen == 0 ? "pp{row.n_prompt}" : "tg{row.n_gen}"

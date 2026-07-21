@@ -16,6 +16,7 @@ require daslib/strings_boost public
 require daslib/logger public              // structured, ISO-8601-timestamped ndjson event log
 require daslib/json public                // JV(...) for logger field payloads
 require dasllama/dasllama_common public   // QuantMode
+require dasllama/dasllama_math            // active_kernel_backend — the exec_fmt layout receipt
 require llvm/daslib/llvm_tune             // tune_status — stamp provenance for the platform block
 
 // ===== Box + model roots =====
@@ -190,6 +191,60 @@ def active_params_b(t : Model) : double {
         p += c.dim * c.vocab_size                          // untied classifier
     }
     return double(p) / 1.0e9lf
+}
+
+def private exec_fmt_add(var seen : table<string>; a : array<KqFmt>) {
+    if (empty(a)) {
+        seen |> insert("q8")
+        return
+    }
+    for (f in a) {
+        seen |> insert("{f}")
+    }
+}
+
+//! What this loaded das Model EXECUTES — per-site weight formats, activation/scale treatment,
+//! and the weight layout — the bench record's apples-to-apples receipt (`BenchRun.exec_fmt`).
+//! A kq entry (k4/k5/k6/q40) means the DISK format runs natively; q8 planes on a K-quant file
+//! are tensors the file itself ships as Q8_0 (norms/embeddings ride fblob, not listed).
+def model_exec_fmt(t : Model) : string {
+    if (t.quant != QuantMode.q8) {
+        return quant_str(t.quant)
+    }
+    var seen : table<string>
+    exec_fmt_add(seen, t.wq_fmt)
+    exec_fmt_add(seen, t.wk_fmt)
+    exec_fmt_add(seen, t.wv_fmt)
+    exec_fmt_add(seen, t.wo_fmt)
+    exec_fmt_add(seen, t.w1_fmt)
+    exec_fmt_add(seen, t.w2_fmt)
+    exec_fmt_add(seen, t.w3_fmt)
+    if (t.experts_mx4) {
+        seen |> insert("mxfp4")
+    } elif (t.config.moe) {
+        exec_fmt_add(seen, t.we1_fmt)
+        exec_fmt_add(seen, t.we2_fmt)
+        exec_fmt_add(seen, t.we3_fmt)
+    }
+    seen |> insert("{t.config.shared_weights ? t.emb_fmt : t.wcls_fmt}")
+    var names <- [for (k in keys(seen)); k]
+    sort(names)
+    let weights = join(names, "/")
+    let scales = t.wscale_f16 ? "f16 scales" : "f32 scales"
+    var layout = "planar {active_kernel_backend()}"
+    if (t.metal_blob) {
+        layout = "metal blob"
+    } elif (t.kq_repacked || t.mx4_repacked) {
+        layout = "planar {active_kernel_backend()} (repacked)"
+    }
+    return "weights {weights} native; q8 activations; {scales}; {layout}"
+}
+
+//! The llama.cpp sibling's execution receipt, derived from the build flavor: every gguf tensor
+//! runs in its disk format; the cpu backend additionally layout-repacks supported types at load
+//! (GGML_CPU_REPACK is ON in both pinned ref flavors).
+def lcpp_exec_fmt(backend : string) : string {
+    return backend == "cpu" ? "native gguf formats; cpu runtime layout repack" : "native gguf formats"
 }
 
 //! True when `m` is present on disk AND in the requested tier. `sz` receives the file size (0 if absent).
@@ -821,6 +876,9 @@ struct BenchRun {
     @optional sha : string      // engine commit (das: git HEAD; llama.cpp: build_commit)
     @optional version : string  // das release version
     @optional tune : string     // das gen-kernel stamp provenance — required for reproducibility
+    @optional exec_fmt : string // what this engine EXECUTES for this file (weight formats per site
+                                // class + activation/scale treatment) — the apples-to-apples receipt;
+                                // das derives it from the loaded Model, llama.cpp rows from flavor
 }
 
 //! One GGUF's identity plus every run measured against it. `gguf` (the exact filename) is the
