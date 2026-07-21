@@ -122,6 +122,89 @@
       ' · llama.cpp ' + d.platform.llama_cpp;
   }
 
+  /* ── per-model benchmark leaderboard (bench_records.json) ───── */
+  // Records are reviewed before they land, but community rows are third-party text — escape
+  // everything that reaches innerHTML.
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function renderBench() {
+    var recs = DATA.bench;
+    if (!recs) return;
+    var sortKey = document.querySelector('.js-bench-sort.is-active').dataset.sort;
+    function val(r, k) { return (r.tests && r.tests[k]) ? r.tests[k].tok_s : 0; }
+
+    var models = recs.slice().sort(function (a, b) { return (b.size_bytes || 0) - (a.size_bytes || 0); });
+    var html = models.map(function (m) {
+      var boxes = {};
+      (m.runs || []).forEach(function (r) { (boxes[r.box] = boxes[r.box] || []).push(r); });
+
+      var boxHTML = Object.keys(boxes).sort().map(function (bx) {
+        var runs = boxes[bx].slice().sort(function (a, b) { return val(b, sortKey) - val(a, sortKey); });
+        var maxV = runs.reduce(function (mx, r) { return Math.max(mx, val(r, sortKey)); }, 0);
+        // best llama.cpp row per backend, on the sort metric — the das ratio denominator
+        var bestRef = {};
+        runs.forEach(function (r) {
+          if (r.engine === 'llama.cpp') bestRef[r.backend] = Math.max(bestRef[r.backend] || 0, val(r, sortKey));
+        });
+        var rowsHTML = runs.map(function (r, i) {
+          var tags = [r.backend, r.flavor];
+          if (r.source === 'community') tags.push('community');
+          var v = val(r, sortKey);
+          var w = maxV > 0 && v > 0 ? Math.max(2, v / maxV * 100) : 0;
+          var ratioHTML = '';
+          if (r.engine === 'das' && v > 0 && bestRef[r.backend] > 0) {
+            var rr = v / bestRef[r.backend];
+            var cls = rr > 1.005 ? 'dl-win' : (rr < 0.995 ? 'dl-dim' : '');
+            ratioHTML = '<span class="' + cls + '">' + fmt(rr, 2) + '×</span>';
+          }
+          var hw = r.hardware || {};
+          var receipt = ['$ ' + r.cmd];
+          receipt.push([r.engine, r.sha ? '@ ' + r.sha : '', r.version || '', r.date || ''].filter(Boolean).join(' · '));
+          if (r.tune) receipt.push('tune: ' + r.tune);
+          receipt.push([hw.cpu, hw.total_cores ? hw.total_cores + ' cores' : '', hw.ram_gb ? hw.ram_gb + ' GB' : '',
+            hw.gpu, hw.os].filter(Boolean).join(' · '));
+          return '<div class="dl-bench-row dl-bench-row--' + (r.engine === 'das' ? 'das' : 'ref') +
+              (i === 0 ? ' dl-bench-row--win' : '') + '" data-bench-row>' +
+              '<div class="dl-bench-row__eng">' + esc(r.engine) +
+                ' <span class="dl-bench-row__tags">' + esc(tags.join(' · ')) + '</span></div>' +
+              '<div class="dl-bench-row__track"><div class="dl-bench-row__fill" style="width:' + w + '%"></div></div>' +
+              '<div class="dl-bench-row__num">' + tps(val(r, 'pp512')) + '</div>' +
+              '<div class="dl-bench-row__num">' + tps(val(r, 'tg128')) + '</div>' +
+              '<div class="dl-bench-row__ratio">' + ratioHTML + '</div>' +
+            '</div>' +
+            '<div class="dl-bench-receipt" hidden>' + esc(receipt.filter(Boolean).join('\n')) + '</div>';
+        }).join('');
+        var hw0 = runs[0].hardware || {};
+        var boxLabel = [hw0.cpu || bx, runs[0].threads ? runs[0].threads + ' threads' : '', hw0.os]
+          .filter(Boolean).join(' · ');
+        return '<div class="dl-bench-box"><div class="dl-bench-box__name">' + esc(boxLabel) + '</div>' +
+          '<div class="dl-bench-cols"><span>engine</span><span></span><span>pp512</span><span>tg128</span><span>vs lcpp</span></div>' +
+          rowsHTML + '</div>';
+      }).join('');
+
+      var meta = [];
+      if (m.arch) meta.push(esc(m.arch));
+      if (m.params_b) {
+        meta.push(fmt(m.params_b, 1) + 'B' +
+          (m.active_b && m.active_b < m.params_b * 0.9 ? ' (' + fmt(m.active_b, 1) + 'B active)' : ''));
+      }
+      if (m.size_bytes) meta.push(fmt(m.size_bytes / 1073741824, 1) + ' GB');
+      return '<div class="dl-bench-model"><div class="dl-bench-model__head">' +
+        '<span class="dl-bench-model__name">' + esc(m.gguf) + '</span>' +
+        '<span class="dl-bench-model__meta">' + meta.join(' · ') + '</span></div>' + boxHTML + '</div>';
+    }).join('');
+
+    document.getElementById('bench-groups').innerHTML = html;
+    document.querySelectorAll('#bench-groups [data-bench-row]').forEach(function (el) {
+      el.addEventListener('click', function () {
+        var n = el.nextElementSibling;
+        if (n) n.hidden = !n.hidden;
+      });
+    });
+  }
+
   /* ── ASR scoreboard ────────────────────────────────────────── */
   var ASR_FEATURE = {
     m1: ['Parakeet-TDT v2', 'Whisper tiny'],
@@ -260,4 +343,15 @@
     document.getElementById('llm-bars').innerHTML =
       '<div style="color:var(--red);font-family:var(--font-mono);font-size:13px">Could not load profiling data: ' + e + '</div>';
   });
+
+  // the record leaderboard loads independently — the section stays hidden until records ship
+  fetch('files/dasllama/bench_records.json')
+    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(function (j) {
+      DATA.bench = j;
+      document.getElementById('bench').hidden = false;
+      renderBench();
+      wireToggle('.js-bench-sort', renderBench);
+    })
+    .catch(function () { /* no records yet */ });
 })();
