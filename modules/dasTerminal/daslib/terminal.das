@@ -1145,7 +1145,7 @@ def private resize_buffer(var buffer : TerminalBuffer; old_columns, old_rows,
     buffer.scroll_bottom = rows - 1
 }
 
-def public terminal_resize(var terminal : Terminal; columns_, rows_ : int) {
+def public terminal_resize(var terminal : Terminal; columns_ : int; rows_ : int) {
     let columns = max(1, columns_)
     let rows = max(1, rows_)
     if ((columns == terminal.columns && rows == terminal.rows) ||

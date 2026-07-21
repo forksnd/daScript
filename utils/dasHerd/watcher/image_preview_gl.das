@@ -12,7 +12,7 @@ require daslib/safe_addr
 //! lifecycle rather than reaching into the backend directly.
 
 def public inspector_preview_texture_upload(pixels : array<uint8># const;
-                                            width, height : int;
+                                            width : int; height : int;
                                             var texture : uint&) {
     if (empty(pixels) || width <= 0 || height <= 0) return
     glGenTextures(1, unsafe(addr(texture)))

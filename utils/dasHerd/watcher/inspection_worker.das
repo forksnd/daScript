@@ -328,7 +328,9 @@ def public inspector_prepare_worker_start(var worker : InspectorPrepareWorker) :
 
 def public inspector_prepare_worker_queue(var worker : InspectorPrepareWorker;
                                           generation : int;
-                                          patch, view_text, language : string;
+                                          patch : string;
+                                          view_text : string;
+                                          language : string;
                                           view_base64 : string = "";
                                           view_byte_count : int = 0;
                                           view_available : bool = false) : bool {

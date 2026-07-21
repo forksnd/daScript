@@ -550,7 +550,7 @@ def private input_session(var session : WatcherSession?; text : string; client_i
     return ""
 }
 
-def public watcher_input(session_id, text : string; client_id : int = 0) : string {
+def public watcher_input(session_id : string; text : string; client_id : int = 0) : string {
     let index = watcher_find_session(session_id)
     if (index < 0) return "unknown session"
     if (length(text) > MAX_INPUT_BYTES) return "input is too large"
@@ -564,7 +564,8 @@ def private resize_session(var session : WatcherSession?; columns, rows, client_
     return ""
 }
 
-def public watcher_resize(session_id : string; columns, rows, client_id : int) : string {
+def public watcher_resize(session_id : string; columns : int; rows : int;
+                          client_id : int) : string {
     let index = watcher_find_session(session_id)
     if (index < 0) return "unknown session"
     return resize_session(g_sessions[index], columns, rows, client_id)

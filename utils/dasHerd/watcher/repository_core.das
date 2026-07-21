@@ -387,7 +387,9 @@ def public repository_working_preview_path(worktree_path : string;
     return ""
 }
 
-def public repository_working_file_text(repository_id, worktree_path, file_path : string;
+def public repository_working_file_text(repository_id : string;
+                                        worktree_path : string;
+                                        file_path : string;
                                         max_bytes : int; var text : string&) : string {
     text = ""
     let repository_index = find_repository(repository_id)
@@ -411,7 +413,9 @@ def public repository_working_file_text(repository_id, worktree_path, file_path 
     return repository_read_text_file(absolute_path, max_bytes, text)
 }
 
-def public repository_working_file_bytes(repository_id, worktree_path, file_path : string;
+def public repository_working_file_bytes(repository_id : string;
+                                         worktree_path : string;
+                                         file_path : string;
                                          max_bytes : int;
                                          var bytes : array<uint8>;
                                          var byte_count : int&) : string {
@@ -440,7 +444,8 @@ def public repository_working_file_bytes(repository_id, worktree_path, file_path
     return read_error
 }
 
-def public repository_staged_file_view_argv(worktree_path, file_path,
+def public repository_staged_file_view_argv(worktree_path : string;
+                                            file_path : string;
                                             output_path : string;
                                             var argv : array<string>&) : string {
     delete argv
