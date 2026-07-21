@@ -647,6 +647,7 @@ class DasHerdWatcherServer : HvWebServer {
                 unsafe { delete client }
             }
         }
+        clients |> clear()
         unsafe { delete clients }
     }
 }

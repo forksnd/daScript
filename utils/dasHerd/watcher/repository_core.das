@@ -173,6 +173,7 @@ def public repository_shutdown() {
             unsafe { delete runtime }
         }
     }
+    g_repositories |> clear()
     unsafe { delete g_repositories }
     g_config_path = ""
     g_revision = 0l
@@ -257,7 +258,9 @@ def public repository_build_file_diff_argv(worktree_path : string;
     argv |> push("--no-ext-diff")
     argv |> push("--unified={context_lines}")
     argv |> push("--")
-    if (comparison == "working" && file.code == "??") argv |> push("NUL")
+    if (comparison == "working" && file.code == "??") {
+        argv |> push(get_platform_name() == "windows" ? "NUL" : "/dev/null")
+    }
     argv |> push(file.path)
     return ""
 }

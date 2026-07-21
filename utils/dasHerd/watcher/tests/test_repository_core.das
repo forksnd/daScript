@@ -60,7 +60,8 @@ def test_repository_untracked_diff_contract(t : T?) {
             }
         }
         t |> equal(forces_text, false, "Git retains native binary detection")
-        t |> equal(argv[length(argv) - 2], "NUL")
+        let null_device = get_platform_name() == "windows" ? "NUL" : "/dev/null"
+        t |> equal(argv[length(argv) - 2], null_device)
         t |> equal(argv[length(argv) - 1], "new file.das")
 
         let staged_file = GitFileState(code = "M ", path = "staged.das")

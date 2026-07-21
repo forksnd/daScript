@@ -643,5 +643,6 @@ def public watcher_shutdown(terminate_running : bool = false) {
         }
         unsafe { delete session }
     }
+    g_sessions |> clear()
     unsafe { delete g_sessions }
 }
