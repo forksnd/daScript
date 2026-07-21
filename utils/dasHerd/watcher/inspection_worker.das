@@ -10,6 +10,7 @@ require daslib/rtti
 require daslib/base64
 require daslib/safe_addr
 require imgui/imgui_text_tree_sitter
+require imgui/imgui_markdown_tree_sitter
 require stbimage/stbimage_boost
 require ./file_inspection.das
 
@@ -41,6 +42,10 @@ struct public InspectorPrepareEvent {
     parsed : GitParsedPatch = GitParsedPatch()
     old_document : TextSourceDocument = TextSourceDocument()
     new_document : TextSourceDocument = TextSourceDocument()
+    view_document : TextSourceDocument = TextSourceDocument()
+    markdown_document : RichDocument = RichDocument()
+    markdown_view : MarkdownViewState = MarkdownViewState()
+    changed_source_ranges : array<TextSourceRange>
     view_source : string
     preview_pixels : array<uint8>
     preview_width : int
@@ -73,6 +78,38 @@ def private catch_prepare_panic(var failure : string&;
         failure = this_context().last_exception
     }
     return caught
+}
+
+def private prepare_changed_source_ranges(source : string;
+                                          lines : array<int> const) : array<TextSourceRange> {
+    var result : array<TextSourceRange>
+    if (empty(lines)) return <- result
+    var target = 0
+    var line_index = 0
+    var line_start = 0
+    peek_data(source) $(bytes) {
+        for (at in range(length(bytes))) {
+            if (int(bytes[at]) != '\n') continue
+            while (target < length(lines) && lines[target] < line_index) {
+                target++
+            }
+            if (target < length(lines) && lines[target] == line_index) {
+                result |> push(TextSourceRange(start_byte = line_start, end_byte = at + 1))
+                while (target < length(lines) && lines[target] == line_index) {
+                    target++
+                }
+            }
+            line_index++
+            line_start = at + 1
+        }
+    }
+    while (target < length(lines) && lines[target] < line_index) {
+        target++
+    }
+    if (target < length(lines) && lines[target] == line_index) {
+        result |> push(TextSourceRange(start_byte = line_start, end_byte = length(source)))
+    }
+    return <- result
 }
 
 def private prepare_worker_main(var jobs : Channel?&;
@@ -110,6 +147,10 @@ def private prepare_worker_main(var jobs : Channel?&;
             var parsed = GitParsedPatch()
             var old_document = TextSourceDocument()
             var new_document = TextSourceDocument()
+            var view_document = TextSourceDocument()
+            var markdown_document = RichDocument()
+            var markdown_view = MarkdownViewState()
+            var changed_ranges : array<TextSourceRange>
             var view_source = ""
             var preview_pixels : array<uint8>
             var preview_width = 0
@@ -147,9 +188,36 @@ def private prepare_worker_main(var jobs : Channel?&;
                         }
                     }
                     view_source = !empty(job.view_text) ? job.view_text : prepared_patch.new_text
+                    if (!prepared_patch.binary) {
+                        var prepared_view <- tree_sitter_source_document(
+                            view_source, job.language, job.generation)
+                        prepared_view.line_marks |> reserve(
+                            length(prepared_patch.new_changed_lines))
+                        for (line in prepared_patch.new_changed_lines) {
+                            prepared_view.line_marks |> push(TextSourceLineMark(
+                                line_index = line, kind = TextSourceLineMarkKind.added))
+                        }
+                        view_document <- prepared_view
+                        if (job.language == "markdown") {
+                            var prepared_markdown <- md_parse(view_source)
+                            if (!prepared_markdown.ok) {
+                                failure = (empty(prepared_markdown.error)
+                                    ? "Markdown preparation failed"
+                                    : prepared_markdown.error)
+                            } else {
+                                var prepared_markdown_view = MarkdownViewState()
+                                let _ = markdown_tree_sitter_prepare(prepared_markdown,
+                                    prepared_markdown_view, job.generation)
+                                markdown_document <- prepared_markdown
+                                markdown_view <- prepared_markdown_view
+                                changed_ranges <- prepare_changed_source_ranges(
+                                    view_source, prepared_patch.new_changed_lines)
+                            }
+                        }
+                    }
                     if (prepared_patch.binary) {
                         if (job.view_byte_count > MAX_BINARY_PREVIEW_BYTES) {
-                            preview_error = "Binary preview exceeds the 32 MiB transport limit"
+                            preview_error = "Binary preview exceeds the 32 MiB raw-byte limit"
                         } elif (empty(job.view_base64)) {
                             preview_error = "No working-file bytes were provided"
                         } else {
@@ -208,16 +276,28 @@ def private prepare_worker_main(var jobs : Channel?&;
                 event.parsed <- parsed
                 event.old_document <- old_document
                 event.new_document <- new_document
+                event.view_document <- view_document
+                event.markdown_document <- markdown_document
+                event.markdown_view <- markdown_view
+                event.changed_source_ranges <- changed_ranges
                 event.preview_pixels <- preview_pixels
                 emit_prepare_event(events, event)
                 git_parsed_patch_dispose(event.parsed)
                 text_source_document_dispose(event.old_document)
                 text_source_document_dispose(event.new_document)
+                text_source_document_dispose(event.view_document)
+                rich_document_dispose(event.markdown_document)
+                markdown_view_dispose(event.markdown_view)
+                delete event.changed_source_ranges
                 delete event.preview_pixels
             }
             git_parsed_patch_dispose(parsed)
             text_source_document_dispose(old_document)
             text_source_document_dispose(new_document)
+            text_source_document_dispose(view_document)
+            rich_document_dispose(markdown_document)
+            markdown_view_dispose(markdown_view)
+            delete changed_ranges
             delete preview_pixels
             delete job
         }

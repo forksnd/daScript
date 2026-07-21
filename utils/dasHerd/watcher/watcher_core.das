@@ -230,6 +230,16 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
     if (length(request.command_line) > MAX_COMMAND_BYTES) {
         return WatcherLaunchResult(error = "command_line is too large")
     }
+    if (length(request.display_name) > MAX_COMMAND_BYTES) {
+        return WatcherLaunchResult(error = "display_name is too large")
+    }
+    var argv_bytes = max(0, length(request.argv) - 1)
+    for (argument in request.argv) {
+        argv_bytes += length(argument)
+        if (argv_bytes > MAX_COMMAND_BYTES) {
+            return WatcherLaunchResult(error = "argv is too large")
+        }
+    }
     if (empty(g_log_root)) {
         return WatcherLaunchResult(error = "watcher core is not initialized")
     }

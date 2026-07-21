@@ -43,6 +43,19 @@ def test_watcher_process_lifecycle(t : T?) {
         let root = temp as value
         t |> equal(watcher_init(path_join(root, "sessions")), "")
 
+        let oversized_display = watcher_launch(WatcherLaunchRequest(
+            command_line = "cmd.exe /d /c exit 0", cwd = root,
+            display_name = repeat("x", 32 * 1024 + 1)))
+        t |> success(!oversized_display.ok
+                && find(oversized_display.error, "display_name") >= 0,
+            "oversized display metadata is rejected before session allocation")
+        var oversized_argv <- ["cmd.exe", repeat("x", 32 * 1024)]
+        let oversized_arguments = watcher_launch(WatcherLaunchRequest(
+            argv <- oversized_argv, cwd = root))
+        t |> success(!oversized_arguments.ok
+                && find(oversized_arguments.error, "argv") >= 0,
+            "oversized structured argv is rejected before display joining")
+
         let missing_command = path_join(root, "missing-watcher-command.exe")
         let failed = watcher_launch(WatcherLaunchRequest(
             command_line = "\"{missing_command}\"", cwd = root,

@@ -138,7 +138,6 @@ struct private GitInspectorState {
     view : TextSourceViewState = TextSourceViewState()
     markdown_document : RichDocument = RichDocument()
     markdown_view : MarkdownViewState = MarkdownViewState()
-    markdown_syntax : MarkdownTreeSitterState = MarkdownTreeSitterState()
     changed_source_ranges : array<TextSourceRange>
     view_source : string
     view_prepared : bool
@@ -240,38 +239,6 @@ def private feed_terminal_frame(message : string#; byte_count : int) {
     }
 }
 
-def private changed_source_ranges(source : string;
-                                  lines : array<int> const) : array<TextSourceRange> {
-    var result : array<TextSourceRange>
-    if (empty(lines)) return <- result
-    var target = 0
-    var line_index = 0
-    var line_start = 0
-    peek_data(source) $(bytes) {
-        for (at in range(length(bytes))) {
-            if (int(bytes[at]) != '\n') continue
-            while (target < length(lines) && lines[target] < line_index) {
-                target++
-            }
-            if (target < length(lines) && lines[target] == line_index) {
-                result |> push(TextSourceRange(start_byte = line_start, end_byte = at + 1))
-                while (target < length(lines) && lines[target] == line_index) {
-                    target++
-                }
-            }
-            line_index++
-            line_start = at + 1
-        }
-    }
-    while (target < length(lines) && lines[target] < line_index) {
-        target++
-    }
-    if (target < length(lines) && lines[target] == line_index) {
-        result |> push(TextSourceRange(start_byte = line_start, end_byte = length(source)))
-    }
-    return <- result
-}
-
 def private upload_inspector_preview(event : InspectorPrepareEvent#) {
     g_inspector.preview_width = event.preview_width
     g_inspector.preview_height = event.preview_height
@@ -294,10 +261,9 @@ def private release_inspector_content() {
     text_source_document_dispose(g_inspector.old_document)
     text_source_document_dispose(g_inspector.new_document)
     text_source_document_dispose(g_inspector.view_document)
-    markdown_view_invalidate(g_inspector.markdown_view)
-    delete g_inspector.markdown_document.nodes
+    markdown_view_dispose(g_inspector.markdown_view)
+    rich_document_dispose(g_inspector.markdown_document)
     delete g_inspector.changed_source_ranges
-    g_inspector.markdown_document = RichDocument()
     g_inspector.view_source = ""
     g_inspector.view_prepared = false
     g_inspector.markdown_gutter_segments = 0
@@ -365,11 +331,16 @@ def private drain_inspector_prepare_events() {
                 if (!inspector_load_succeed(g_inspector.prepare,
                         event.generation)) return
                 release_inspector_content()
-                g_inspector.revision++
+                g_inspector.revision = event.generation
                 g_inspector.parsed := event.parsed
                 g_inspector.old_document := event.old_document
                 g_inspector.new_document := event.new_document
+                g_inspector.view_document := event.view_document
+                g_inspector.markdown_document := event.markdown_document
+                g_inspector.markdown_view := event.markdown_view
+                g_inspector.changed_source_ranges := event.changed_source_ranges
                 g_inspector.view_source = clone_string(event.view_source)
+                g_inspector.view_prepared = !event.parsed.binary
                 upload_inspector_preview(event)
                 g_inspector.error = ""
                 g_inspector.prepare_elapsed_usec = event.elapsed_usec
@@ -1190,33 +1161,11 @@ def private draw_side_by_side_diff() {
     g_inspector.diff_scroll_jump_pending = false
 }
 
-def private prepare_file_view() {
-    if (g_inspector.view_prepared) return
-    var view_document <- tree_sitter_source_document(
-        g_inspector.view_source, g_inspector.resolved_language,
-        g_inspector.revision)
-    view_document.line_marks |> reserve(length(g_inspector.parsed.new_changed_lines))
-    for (line in g_inspector.parsed.new_changed_lines) {
-        view_document.line_marks |> push(TextSourceLineMark(
-            line_index = line, kind = TextSourceLineMarkKind.added))
-    }
-    g_inspector.view_document <- view_document
-    if (g_inspector.resolved_language == "markdown") {
-        var markdown_document <- md_parse(g_inspector.view_source)
-        var markdown_changes <- changed_source_ranges(
-            g_inspector.view_source, g_inspector.parsed.new_changed_lines)
-        g_inspector.markdown_document <- markdown_document
-        g_inspector.changed_source_ranges <- markdown_changes
-    }
-    g_inspector.view_prepared = true
-}
-
 def private draw_file_view() {
     if (g_inspector.parsed.binary) {
         draw_binary_preview()
         return
     }
-    prepare_file_view()
     child(FILE_VIEW_PANE, (text = "file view", size = float2(0.0f, 0.0f),
             child_flags = ImGuiChildFlags.None,
             window_flags = ImGuiWindowFlags.HorizontalScrollbar)) {
@@ -1227,9 +1176,6 @@ def private draw_file_view() {
                     inline_code_scale = 0.84f, code_block_scale = 0.90f),
                 zoom = float(g_zoom_percent) / 100.0f,
                 write_system_clipboard = !harness_is_headless())
-            markdown_tree_sitter_prepare(g_inspector.markdown_document,
-                g_inspector.markdown_syntax, g_inspector.markdown_view,
-                g_inspector.revision)
             let _ <- markdown_view_with_change_gutter("git markdown view",
                 g_inspector.markdown_document, g_inspector.markdown_view,
                 style, g_inspector.revision, g_inspector.changed_source_ranges,
@@ -1565,7 +1511,6 @@ def shutdown() {
         g_client = null
     }
     release_inspector_content()
-    markdown_tree_sitter_dispose(g_inspector.markdown_syntax)
     markdown_view_dispose(g_inspector.markdown_view)
     text_source_view_dispose(g_inspector.old_view)
     text_source_view_dispose(g_inspector.new_view)

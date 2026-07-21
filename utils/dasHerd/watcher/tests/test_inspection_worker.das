@@ -50,6 +50,10 @@ def test_inspection_prepare_worker(t : T?) {
                     t |> equal(event.new_document.line_numbers[0], 1)
                     t |> equal(event.view_source,
                         "options gen2\nlet answer = \"🐑\"\n")
+                    t |> success(length(event.view_document.spans) > 1,
+                        "full View syntax is prepared by the worker")
+                    t |> equal(length(event.view_document.line_marks), 1,
+                        "full View change marks are prepared by the worker")
                 }
             }
         }
@@ -58,6 +62,35 @@ def test_inspection_prepare_worker(t : T?) {
         t |> equal(completed, true)
         t |> equal(span_count > 1, true)
         t |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("worker prepares Markdown View parsing and fenced syntax") <| @(tt : T?) {
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        let patch = "diff --git a/readme.md b/readme.md\n--- a/readme.md\n+++ b/readme.md\n@@ -1,5 +1,5 @@\n-# Old\n+# New\n \n ```das\n let answer = 42\n ```\n"
+        let view = "# New\n\n```das\nlet answer = 42\n```\n"
+        tt |> equal(inspector_prepare_worker_queue(
+            worker, 9, patch, view, "markdown"), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> success(event.markdown_document.ok,
+                        "Markdown View parses off-thread")
+                    tt |> success(length(event.view_document.spans) > 1,
+                        "Markdown source View is styled off-thread")
+                    tt |> equal(length(event.changed_source_ranges), 1,
+                        "Markdown change gutter ranges are prepared off-thread")
+                    tt |> success(!empty(event.markdown_view.syntax_bindings),
+                        "fenced code syntax is prepared off-thread")
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
         destroy_job_que()
     }
     t |> run("worker reports malformed patches and still shuts down") <| @(tt : T?) {
