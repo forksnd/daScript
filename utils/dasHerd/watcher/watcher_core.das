@@ -66,7 +66,7 @@ struct public WatcherSessionInfo {
     worktree_path : string
     state : string
     reason : string
-    pid : int
+    pid : int = 0
     exit_code : int64 = -1l
     elapsed_ms : int64
     output_bytes : int64
@@ -117,7 +117,7 @@ class private WatcherSession {
     events_path : string
     state : string = "starting"
     reason : string
-    pid : int
+    pid : int = 0
     terminal : Terminal = Terminal()
     output_file : FILE const? = null
     events_file : FILE const? = null
