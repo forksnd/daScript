@@ -99,9 +99,105 @@ def test_repository_untracked_diff_contract(t : T?) {
         let staged_view_error = repository_staged_file_view_argv(
             "D:/Work/tree", "staged.das", "D:/Temp/staged-view.raw", argv)
         t |> equal(staged_view_error, "")
-        t |> equal(argv[length(argv) - 2],
+        t |> success(ends_with(to_lower(argv[0]),
+            get_platform_name() == "windows" ? "daslang.exe" : "daslang"))
+        t |> success(ends_with(replace(argv[1], "\\", "/"),
+            "utils/dasHerd/watcher/git_blob_capture.das"))
+        t |> equal(argv[length(argv) - 3], "--revision=:0")
+        t |> equal(argv[length(argv) - 2], "--file=staged.das")
+        t |> equal(argv[length(argv) - 1],
             "--output=D:/Temp/staged-view.raw")
-        t |> equal(argv[length(argv) - 1], ":0:staged.das")
+    }
+}
+
+[test]
+def test_repository_review_parsing(t : T?) {
+    t |> run("worktree PR commits retain descriptions and identity") <| @(t : T?) {
+        var commits : array<GitCommitState>
+        repository_parse_review_commits(
+            "0123456789abcdef\t01234567\t1721577600\tAgent One\tFirst change\r\n" +
+            "abcdef0123456789\tabcdef01\t1721577700\tAgent Two\tSubject\twith tab\n",
+            "D:/Work/tree", commits)
+        t |> equal(length(commits), 2)
+        t |> equal(commits[0].worktree_path, "D:/Work/tree")
+        t |> equal(commits[0].short_hash, "01234567")
+        t |> equal(commits[0].authored_at, 1721577600l)
+        t |> equal(commits[1].subject, "Subject\twith tab")
+    }
+    t |> run("aggregate PR files retain rename provenance") <| @(t : T?) {
+        var files : array<GitReviewFileState>
+        repository_parse_review_files(
+            "M\tsrc/main.das\r\nA\tdocs/new.md\nR095\told name.cpp\tnew name.cpp\n",
+            "D:/Work/tree", files)
+        t |> equal(length(files), 3)
+        t |> equal(files[0].code, "M")
+        t |> equal(files[1].path, "docs/new.md")
+        t |> equal(files[2].old_path, "old name.cpp")
+        t |> equal(files[2].path, "new name.cpp")
+    }
+    t |> run("aggregate PR diffs compare the merge base with the index") <| @(t : T?) {
+        var argv : array<string>
+        let error = repository_build_review_file_diff_argv(
+            "D:/Work/tree", "0123456789abcdef", "src/main.das", argv, "expanded")
+        t |> equal(error, "")
+        t |> equal(argv[1], "--literal-pathspecs")
+        t |> equal(argv[8], "--cached")
+        t |> equal(argv[10], "--unified=20")
+        t |> equal(argv[11], "0123456789abcdef")
+        t |> equal(argv[length(argv) - 1], "src/main.das")
+    }
+    t |> run("commit files and refs retain review identity") <| @(t : T?) {
+        var files : array<GitCommitFileState>
+        repository_parse_commit_files(
+            "M\tsrc/main.das\r\nR090\told.md\tnew.md\n",
+            "D:/Work/tree", "abcdef0123456789", files)
+        t |> equal(length(files), 2)
+        t |> equal(files[0].commit_hash, "abcdef0123456789")
+        t |> equal(files[1].old_path, "old.md")
+        t |> equal(files[1].path, "new.md")
+        var refs : array<GitRefState>
+        repository_parse_refs(
+            "refs/heads/main\tmain\tabcdef\t*\t\n" +
+            "refs/remotes/origin/main\torigin/main\tabcdef\t \t\n" +
+            "refs/remotes/origin/HEAD\torigin/HEAD\tabcdef\t \trefs/remotes/origin/main\n",
+            "D:/Work/tree", refs)
+        t |> equal(length(refs), 2)
+        t |> success(refs[0].current)
+        t |> success(!refs[0].remote)
+        t |> success(refs[1].remote)
+    }
+    t |> run("commit inspection uses one observed revision") <| @(t : T?) {
+        var argv : array<string>
+        t |> equal(repository_build_commit_file_diff_argv(
+            "D:/Work/tree", "abcdef0123456789", "src/main.das",
+            argv, "expanded"), "")
+        t |> equal(argv[1], "--literal-pathspecs")
+        t |> equal(argv[7], "show")
+        t |> equal(argv[12], "--unified=20")
+        t |> equal(argv[13], "abcdef0123456789")
+        t |> equal(argv[length(argv) - 1], "src/main.das")
+        t |> equal(repository_commit_file_view_argv(
+            "D:/Work/tree", "abcdef0123456789", "src/main.das",
+            "D:/Temp/view.raw", argv), "")
+        t |> equal(argv[length(argv) - 3],
+            "--revision=abcdef0123456789")
+        t |> equal(argv[length(argv) - 2], "--file=src/main.das")
+        t |> equal(argv[length(argv) - 1], "--output=D:/Temp/view.raw")
+    }
+    t |> run("file staging actions use literal Git paths") <| @(t : T?) {
+        var argv : array<string>
+        t |> equal(repository_build_file_action_argv(
+            "D:/Work/tree", ":(glob)**.das", "stage", argv), "")
+        t |> equal(argv[1], "--literal-pathspecs")
+        t |> equal(argv[4], "add")
+        t |> equal(argv[length(argv) - 1], ":(glob)**.das")
+        t |> equal(repository_build_file_action_argv(
+            "D:/Work/tree", "src/main.das", "unstage", argv), "")
+        t |> equal(argv[4], "reset")
+        t |> equal(argv[5], "--quiet")
+        t |> equal(argv[6], "HEAD")
+        t |> success(!empty(repository_build_file_action_argv(
+            "D:/Work/tree", "../outside.txt", "stage", argv)))
     }
 }
 

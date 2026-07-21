@@ -275,7 +275,7 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
         return WatcherLaunchResult(error = "could not open session logs")
     }
     let columns = clamp(request.columns, 20, 400)
-    let rows = clamp(request.rows, 5, 200)
+    let rows = clamp(request.rows, 5, 512)
     var inscope persisted_request := request
     persisted_request.columns = columns
     persisted_request.rows = rows
@@ -503,7 +503,7 @@ def public watcher_compact_session(session_id : string;
     var session = g_sessions[index]
     if (!session.drained || session.state == "running" || session.state == "terminating") return false
     let compact_columns = clamp(columns, 20, 400)
-    let compact_rows = clamp(rows, 5, 200)
+    let compact_rows = clamp(rows, 5, 512)
     if (session.terminal.transport == null && session.terminal.columns == compact_columns
             && session.terminal.rows == compact_rows) return true
     var inscope compact <- terminal_create(compact_columns, compact_rows)
@@ -559,7 +559,7 @@ def public watcher_input(session_id : string; text : string; client_id : int = 0
 
 def private resize_session(var session : WatcherSession?; columns, rows, client_id : int) : string {
     if (session.controller_id != 0 && session.controller_id != client_id) return "controller lease is held by another client"
-    terminal_resize(session.terminal, clamp(columns, 20, 400), clamp(rows, 5, 200))
+    terminal_resize(session.terminal, clamp(columns, 20, 400), clamp(rows, 5, 512))
     append_event(session, "resized", "{session.terminal.columns}x{session.terminal.rows}")
     return ""
 }

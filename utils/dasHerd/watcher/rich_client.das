@@ -68,6 +68,7 @@ struct private WatcherFileInspectionMessage {
     worktree_path : string
     file_path : string
     comparison : string
+    revision : string
     diff_context : string
     task_session_id : string
     loading : bool
@@ -76,6 +77,19 @@ struct private WatcherFileInspectionMessage {
     view_base64 : string
     view_byte_count : int
     view_available : bool
+    status : string
+    error : string
+}
+
+struct private WatcherGitFileActionMessage {
+    @rename = "type" _type : string
+    request_id : int
+    repository_id : string
+    worktree_path : string
+    file_path : string
+    action : string
+    task_session_id : string
+    loading : bool
     status : string
     error : string
 }
@@ -94,11 +108,28 @@ struct private HerderInspectorOpenArgs {
     worktree_path : string
     file_path : string
     comparison : string = "working"
+    revision : string
     diff_context : string = "compact"
 }
 
 struct private HerderInspectorModeArgs {
     mode : string
+}
+
+struct private HerderGitWorktreeArgs {
+    repository_id : string
+    worktree_path : string
+}
+
+struct private HerderGitPerspectiveArgs {
+    perspective : string
+}
+
+struct private HerderGitFileActionArgs {
+    repository_id : string
+    worktree_path : string
+    file_path : string
+    action : string
 }
 
 enum private GitInspectorMode {
@@ -121,6 +152,7 @@ struct private GitInspectorState {
     worktree_path : string
     file_path : string
     comparison : string
+    git_revision : string
     diff_context : string = "compact"
     task_session_id : string
     loading : bool
@@ -184,6 +216,13 @@ var private g_jobque_owned = false
 var private SESSION_ROW : table<int; ToggleState>
 var private WORKTREE_ROW : table<int; ToggleState>
 var private GIT_FILE_ROW : table<int; ToggleState>
+var private GIT_ACTION_BUTTON : table<int; ClickState>
+var private GIT_ACTION_DISABLED : table<int; NarrativeState>
+var private GIT_ACTION_SAME_LINE : table<int; EmptyMarkerState>
+var private GIT_COMMIT_TEXT : table<int; NarrativeState>
+var private GIT_HISTORY_COMMIT_ROW : table<int; ToggleState>
+var private GIT_COMMIT_FILE_ROW : table<int; ToggleState>
+var private GIT_REF_ROW : table<int; ToggleState>
 var private REPOSITORY_ERROR : table<int; NarrativeState>
 var private REPOSITORY_TITLE : table<int; NarrativeState>
 var private REPOSITORY_EMPTY : table<int; NarrativeState>
@@ -356,14 +395,16 @@ def private drain_inspector_prepare_events() {
 }
 
 def private begin_file_inspection(repository_id, worktree_path, file_path,
-                                  comparison, diff_context : string) {
-    let same_identity = g_inspector.repository_id == repository_id && g_inspector.worktree_path == worktree_path && g_inspector.file_path == file_path && g_inspector.comparison == comparison
+                                  comparison, diff_context : string;
+                                  git_revision : string = "") {
+    let same_identity = g_inspector.repository_id == repository_id && g_inspector.worktree_path == worktree_path && g_inspector.file_path == file_path && g_inspector.comparison == comparison && g_inspector.git_revision == git_revision
     let same_content = g_inspector.prepare.has_retained_content && same_identity
     g_inspector.request_id++
     g_inspector.repository_id = repository_id
     g_inspector.worktree_path = worktree_path
     g_inspector.file_path = file_path
     g_inspector.comparison = comparison
+    g_inspector.git_revision = git_revision
     g_inspector.diff_context = diff_context
     g_inspector.diff_context_choice = 0
     if (diff_context == "expanded") {
@@ -408,15 +449,26 @@ class private WatcherRichClient : HvWebSocketClient {
     error : string
     last_heartbeat : int64
     last_list : int64
+    last_reconnect : int64
     sent_input_bytes : int64
     desired_columns : int
     desired_rows : int
     sent_columns : int
     sent_rows : int
+    last_review_identity : string
+    last_history_identity : string
+    last_refs_identity : string
+    git_action_request_id : int
+    git_action_loading : bool
+    git_action_file_path : string
+    git_action_status : string
+    git_failure_revisions : table<string; int64>
+    git_failure_baseline_ready : bool
 
     def override onOpen {
         connected = true
         error = ""
+        last_reconnect = ref_time_ticks()
         last_heartbeat = ref_time_ticks()
         last_list = ref_time_ticks()
         send("\{\"op\":\"list\"\}")
@@ -429,6 +481,7 @@ class private WatcherRichClient : HvWebSocketClient {
         sent_columns = 0
         sent_rows = 0
         error = "watcher connection closed"
+        last_reconnect = ref_time_ticks()
     }
 
     def override onMessage(message : string#) {
@@ -490,11 +543,59 @@ class private WatcherRichClient : HvWebSocketClient {
                         g_selected_worktree_path = repositories[0].record.checkout_path
                     }
                 }
+                let review_identity = "{g_selected_repository_id}\n{g_selected_worktree_path}"
+                if (!empty(g_selected_repository_id)
+                        && !empty(g_selected_worktree_path)
+                        && review_identity != last_review_identity) {
+                    request_repository_review(
+                        g_selected_repository_id, g_selected_worktree_path)
+                    request_repository_history(
+                        g_selected_repository_id, g_selected_worktree_path)
+                    request_repository_refs(
+                        g_selected_repository_id, g_selected_worktree_path)
+                }
+                for (repository in repositories) {
+                    let id = repository.record.id
+                    let seen = key_exists(git_failure_revisions, id) ? git_failure_revisions[id] : 0l
+                    if (repository.failure_revision <= seen) continue
+                    git_failure_revisions[id] = repository.failure_revision
+                    if (git_failure_baseline_ready
+                            && !empty(repository.failure_session_id)) {
+                        attach_session(repository.failure_session_id)
+                        TERMINAL_WIN.open = true
+                        TERMINAL_WIN.pending_raise = true
+                        g_focus_terminal_pending = true
+                    }
+                    if (git_failure_baseline_ready) {
+                        error = repository.failure_message
+                    }
+                }
+                git_failure_baseline_ready = true
+            } else {
+                error = "invalid repository snapshot message"
             }
         } elif (envelope._type == "file_inspection") {
             var incoming : WatcherFileInspectionMessage
             if (sscan_json(body, incoming)) {
                 install_file_inspection(incoming)
+            }
+        } elif (envelope._type == "git_file_action") {
+            var incoming : WatcherGitFileActionMessage
+            if (sscan_json(body, incoming)
+                    && incoming.request_id == git_action_request_id) {
+                git_action_loading = incoming.loading
+                git_action_file_path = incoming.file_path
+                git_action_status = incoming.status
+                if (!empty(incoming.error)) {
+                    error = incoming.error
+                }
+                if (incoming.status == "failed"
+                        && !empty(incoming.task_session_id)) {
+                    attach_session(incoming.task_session_id)
+                    TERMINAL_WIN.open = true
+                    TERMINAL_WIN.pending_raise = true
+                    g_focus_terminal_pending = true
+                }
             }
         } elif (envelope._type == "attached") {
             var incoming : WatcherAttachedMessage
@@ -586,18 +687,74 @@ class private WatcherRichClient : HvWebSocketClient {
             "{sprint_json(repository_id, false)}\}")
     }
 
+    def request_repository_review(repository_id : string; worktree_path : string) {
+        if (!connected || empty(repository_id) || empty(worktree_path)) return
+        last_review_identity = "{repository_id}\n{worktree_path}"
+        send("\{\"op\":\"repository_review\"," +
+            "\"repository_id\":{sprint_json(repository_id, false)}," +
+            "\"worktree_path\":{sprint_json(worktree_path, false)}\}")
+    }
+
+    def request_repository_history(repository_id : string;
+                                   worktree_path : string;
+                                   ref_name : string = "") {
+        if (!connected || empty(repository_id) || empty(worktree_path)) return
+        last_history_identity = "{repository_id}\n{worktree_path}\n{ref_name}"
+        send("\{\"op\":\"repository_history\"," +
+            "\"repository_id\":{sprint_json(repository_id, false)}," +
+            "\"worktree_path\":{sprint_json(worktree_path, false)}," +
+            "\"revision\":{sprint_json(ref_name, false)}\}")
+    }
+
+    def request_repository_commit_files(repository_id : string;
+                                        worktree_path : string;
+                                        commit_hash : string) {
+        if (!connected || empty(repository_id) || empty(worktree_path)
+                || empty(commit_hash)) return
+        send("\{\"op\":\"repository_commit_files\"," +
+            "\"repository_id\":{sprint_json(repository_id, false)}," +
+            "\"worktree_path\":{sprint_json(worktree_path, false)}," +
+            "\"revision\":{sprint_json(commit_hash, false)}\}")
+    }
+
+    def request_repository_refs(repository_id : string; worktree_path : string) {
+        if (!connected || empty(repository_id) || empty(worktree_path)) return
+        last_refs_identity = "{repository_id}\n{worktree_path}"
+        send("\{\"op\":\"repository_refs\"," +
+            "\"repository_id\":{sprint_json(repository_id, false)}," +
+            "\"worktree_path\":{sprint_json(worktree_path, false)}\}")
+    }
+
+    def git_file_action(repository_id : string; worktree_path : string;
+                        file_path : string; action : string) {
+        if (!connected || git_action_loading || empty(repository_id)
+                || empty(worktree_path) || empty(file_path)) return
+        git_action_request_id++
+        git_action_loading = true
+        git_action_file_path = file_path
+        git_action_status = "running"
+        send("\{\"op\":\"git_file_action\"," +
+            "\"request_id\":{git_action_request_id}," +
+            "\"repository_id\":{sprint_json(repository_id, false)}," +
+            "\"worktree_path\":{sprint_json(worktree_path, false)}," +
+            "\"file_path\":{sprint_json(file_path, false)}," +
+            "\"action\":{sprint_json(action, false)}\}")
+    }
+
     def inspect_file(repository_id, worktree_path, file_path,
                      comparison : string;
-                     diff_context : string = "compact") {
+                     diff_context : string = "compact";
+                     git_revision : string = "") {
         if (!connected || empty(repository_id) || empty(worktree_path)
                 || empty(file_path)) return
         begin_file_inspection(repository_id, worktree_path, file_path,
-            comparison, diff_context)
+            comparison, diff_context, git_revision)
         send("\{\"op\":\"file_inspect\",\"request_id\":{g_inspector.request_id}," +
             "\"repository_id\":{sprint_json(repository_id, false)}," +
             "\"worktree_path\":{sprint_json(worktree_path, false)}," +
             "\"file_path\":{sprint_json(file_path, false)}," +
             "\"comparison\":{sprint_json(comparison, false)}," +
+            "\"revision\":{sprint_json(git_revision, false)}," +
             "\"diff_context\":{sprint_json(diff_context, false)}\}")
     }
 
@@ -632,7 +789,17 @@ class private WatcherRichClient : HvWebSocketClient {
 
     def pump() {
         process_event_que()
-        if (!connected) return
+        if (!connected) {
+            if (get_time_nsec(last_reconnect) / 1000000l >= 1000l) {
+                cleanup()
+                let result = init(g_url)
+                last_reconnect = ref_time_ticks()
+                if (result != 0) {
+                    error = "watcher reconnect failed ({result})"
+                }
+            }
+            return
+        }
         if (get_time_nsec(last_heartbeat) / 1000000l >= 1000l) {
             send("\{\"op\":\"heartbeat\"\}")
             last_heartbeat = ref_time_ticks()
@@ -846,6 +1013,8 @@ def private draw_repositories_window() {
                     g_selected_repository_id = repository.record.id
                     g_selected_worktree_path = worktree.path
                     g_client->refresh_repository(repository.record.id)
+                    g_client->request_repository_review(
+                        repository.record.id, worktree.path)
                     GIT_STATUS_WIN.open = true
                     GIT_STATUS_WIN.pending_raise = true
                 }
@@ -925,6 +1094,296 @@ def private draw_git_file_group(repository : RepositorySnapshot const;
     return count
 }
 
+def private git_status_file_code(repository : RepositorySnapshot const;
+                                 worktree_path : string;
+                                 file_path : string) : string {
+    for (file in repository.files) {
+        if (file.worktree_path == worktree_path && file.path == file_path) {
+            return file.code
+        }
+    }
+    return ""
+}
+
+def private draw_pr_included_files(repository : RepositorySnapshot const;
+                                   worktree : WorktreeState const;
+                                   var file_row : int&;
+                                   var action_row : int&) : int {
+    var count = 0
+    for (file in repository.review_files) {
+        if (file.worktree_path == worktree.path) count++
+    }
+    text(GIT_GROUP_TITLE[10], (text = "PR TOTAL  {count}"))
+    separator(GIT_GROUP_SEPARATOR[10])
+    for (file in repository.review_files) {
+        if (file.worktree_path != worktree.path) continue
+        let status_code = git_status_file_code(
+            repository, worktree.path, file.path)
+        let staged = (!empty(status_code) && status_code != "??"
+            && git_status_byte(status_code, 0) != ' ')
+        if (staged) {
+            let busy = g_client != null && g_client.git_action_loading
+            let action_label = ((busy && g_client.git_action_file_path == file.path)
+                ? "Unstaging..." : "Unstage")
+            if (busy) {
+                text_disabled(GIT_ACTION_DISABLED[action_row],
+                    (text = action_label))
+            } elif (small_button(GIT_ACTION_BUTTON[action_row],
+                    (text = "{action_label}##pr-unstage:{file.path}"))
+                    && g_client != null) {
+                g_client->git_file_action(repository.record.id,
+                    worktree.path, file.path, "unstage")
+            }
+            same_line(GIT_ACTION_SAME_LINE[action_row])
+        }
+        GIT_FILE_ROW[file_row].value = (g_inspector.repository_id == repository.record.id
+            && g_inspector.worktree_path == worktree.path
+            && g_inspector.file_path == file.path
+            && g_inspector.comparison == "pr")
+        let old_label = !empty(file.old_path) ? "  (from {file.old_path})" : ""
+        if (selectable(GIT_FILE_ROW[file_row],
+                (text = "{file.code}  {file.path}{old_label}##pr:{file.path}"))) {
+            if (g_client != null) {
+                g_client->inspect_file(repository.record.id, worktree.path,
+                    file.path, "pr")
+                FILE_INSPECTOR_WIN.open = true
+                FILE_INSPECTOR_WIN.pending_raise = true
+            }
+        }
+        file_row++
+        action_row++
+    }
+    return count
+}
+
+def private draw_pr_not_included_files(repository : RepositorySnapshot const;
+                                       worktree : WorktreeState const;
+                                       var file_row : int&;
+                                       var action_row : int&) : int {
+    var count = 0
+    for (file in repository.files) {
+        if (file.worktree_path != worktree.path) continue
+        if (file.code == "??" || git_status_byte(file.code, 1) != ' ') count++
+    }
+    text(GIT_GROUP_TITLE[11], (text = "NOT INCLUDED  {count}"))
+    separator(GIT_GROUP_SEPARATOR[11])
+    for (file in repository.files) {
+        if (file.worktree_path != worktree.path
+                || (file.code != "??" && git_status_byte(file.code, 1) == ' ')) continue
+        let busy = g_client != null && g_client.git_action_loading
+        let action_label = ((busy && g_client.git_action_file_path == file.path)
+            ? "Staging..." : "Stage")
+        if (busy) {
+            text_disabled(GIT_ACTION_DISABLED[action_row],
+                (text = action_label))
+        } elif (small_button(GIT_ACTION_BUTTON[action_row],
+                (text = "{action_label}##pr-stage:{file.path}"))
+                && g_client != null) {
+            g_client->git_file_action(repository.record.id,
+                worktree.path, file.path, "stage")
+        }
+        same_line(GIT_ACTION_SAME_LINE[action_row])
+        GIT_FILE_ROW[file_row].value = (g_inspector.repository_id == repository.record.id
+            && g_inspector.worktree_path == worktree.path
+            && g_inspector.file_path == file.path
+            && g_inspector.comparison == "working")
+        let old_label = !empty(file.old_path) ? "  (from {file.old_path})" : ""
+        var selected = false
+        with_style((ImGuiCol.Text, GetStyleColorVec4(ImGuiCol.TextDisabled))) {
+            selected = selectable(GIT_FILE_ROW[file_row],
+                (text = "{file.code}  {file.path}{old_label}##working:{file.path}"))
+        }
+        if (selected && g_client != null) {
+            g_client->inspect_file(repository.record.id, worktree.path,
+                file.path, "working")
+            FILE_INSPECTOR_WIN.open = true
+            FILE_INSPECTOR_WIN.pending_raise = true
+        }
+        file_row++
+        action_row++
+    }
+    return count
+}
+
+def private draw_pr_review(repository : RepositorySnapshot const;
+                           worktree : WorktreeState const) {
+    var commit_count = 0
+    for (commit in repository.review_commits) {
+        if (commit.worktree_path == worktree.path) commit_count++
+    }
+    let base = ((!empty(worktree.review_base_ref))
+        ? worktree.review_base_ref : "detecting base...")
+    text(GIT_GROUP_TITLE[12],
+        (text = "OUTGOING COMMITS  {commit_count}   -> {base}"))
+    separator(GIT_GROUP_SEPARATOR[12])
+    var commit_row = 0
+    for (commit in repository.review_commits) {
+        if (commit.worktree_path != worktree.path) continue
+        text(GIT_COMMIT_TEXT[commit_row],
+            (text = "{commit.short_hash}  {commit.subject}  - {commit.author}"))
+        commit_row++
+    }
+    if (commit_count == 0 && !worktree.review_loading
+            && empty(worktree.review_error)) {
+        text_disabled("No outgoing commits")
+    }
+    if (worktree.review_loading) {
+        text_disabled("Refreshing worktree PR...")
+    }
+    if (!empty(worktree.review_error)) {
+        text_colored(GIT_ERROR,
+            (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
+            text = worktree.review_error))
+    }
+    separator()
+    var file_row = 0
+    var action_row = 0
+    let included = draw_pr_included_files(
+        repository, worktree, file_row, action_row)
+    dummy(GIT_GROUP_SPACING[10], (size = float2(0.0f, GetStyle().ItemSpacing.y)))
+    let not_included = draw_pr_not_included_files(
+        repository, worktree, file_row, action_row)
+    if (included == 0 && not_included == 0 && !worktree.review_loading
+            && empty(worktree.review_error)) {
+        text_disabled("Nothing to send or stage")
+    }
+}
+
+def private ensure_history(repository : RepositorySnapshot const;
+                           worktree : WorktreeState const; ref_name : string) {
+    if (g_client == null || empty(ref_name)) return
+    let identity = "{repository.record.id}\n{worktree.path}\n{ref_name}"
+    if (g_client.last_history_identity != identity) {
+        g_client->request_repository_history(
+            repository.record.id, worktree.path, ref_name)
+    }
+}
+
+def private draw_commit_files(repository : RepositorySnapshot const;
+                              worktree : WorktreeState const) {
+    var count = 0
+    for (file in repository.commit_files) {
+        if (file.worktree_path == worktree.path
+                && file.commit_hash == worktree.history_commit) count++
+    }
+    text(GIT_GROUP_TITLE[21],
+        (text = "FILES IN {worktree.history_commit}  {count}"))
+    separator(GIT_GROUP_SEPARATOR[21])
+    var row = 0
+    for (file in repository.commit_files) {
+        if (file.worktree_path != worktree.path
+                || file.commit_hash != worktree.history_commit) continue
+        GIT_COMMIT_FILE_ROW[row].value = (g_inspector.repository_id == repository.record.id
+            && g_inspector.worktree_path == worktree.path
+            && g_inspector.file_path == file.path
+            && g_inspector.comparison == "commit"
+            && g_inspector.git_revision == file.commit_hash)
+        let old_label = !empty(file.old_path) ? "  (from {file.old_path})" : ""
+        if (selectable(GIT_COMMIT_FILE_ROW[row],
+                (text = "{file.code}  {file.path}{old_label}##commit:{file.commit_hash}:{file.path}"))
+                && g_client != null) {
+            g_client->inspect_file(repository.record.id, worktree.path,
+                file.path, "commit", "compact", file.commit_hash)
+            FILE_INSPECTOR_WIN.open = true
+            FILE_INSPECTOR_WIN.pending_raise = true
+        }
+        row++
+    }
+    if (count == 0 && !worktree.history_loading
+            && empty(worktree.history_error)) {
+        text_disabled("Select a commit to inspect its files")
+    }
+}
+
+def private draw_history_commits(repository : RepositorySnapshot const;
+                                 worktree : WorktreeState const) {
+    var count = 0
+    for (commit in repository.history_commits) {
+        if (commit.worktree_path == worktree.path) count++
+    }
+    text(GIT_GROUP_TITLE[20],
+        (text = "COMMITS ON {worktree.history_ref}  {count}"))
+    separator(GIT_GROUP_SEPARATOR[20])
+    var row = 0
+    for (commit in repository.history_commits) {
+        if (commit.worktree_path != worktree.path) continue
+        GIT_HISTORY_COMMIT_ROW[row].value = commit.hash == worktree.history_commit
+        if (selectable(GIT_HISTORY_COMMIT_ROW[row],
+                (text = "{commit.short_hash}  {commit.subject}  - {commit.author}##history:{commit.hash}"))
+                && g_client != null && commit.hash != worktree.history_commit) {
+            g_client->request_repository_commit_files(
+                repository.record.id, worktree.path, commit.hash)
+        }
+        row++
+    }
+    if (worktree.history_loading) text_disabled("Reading Git history...")
+    if (!empty(worktree.history_error)) {
+        text_colored(GIT_ERROR,
+            (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
+            text = worktree.history_error))
+    }
+    separator()
+    draw_commit_files(repository, worktree)
+}
+
+def private draw_history_review(repository : RepositorySnapshot const;
+                                worktree : WorktreeState const) {
+    ensure_history(repository, worktree, worktree.branch)
+    draw_history_commits(repository, worktree)
+}
+
+def private draw_ref_group(repository : RepositorySnapshot const;
+                           worktree : WorktreeState const; remote : bool;
+                           var row : int&) : int {
+    var count = 0
+    for (ref in repository.refs) {
+        if (ref.worktree_path == worktree.path && ref.remote == remote) count++
+    }
+    let group = remote ? 23 : 22
+    text(GIT_GROUP_TITLE[group],
+        (text = remote ? "REMOTE BRANCHES  {count}" : "LOCAL BRANCHES  {count}"))
+    separator(GIT_GROUP_SEPARATOR[group])
+    for (ref in repository.refs) {
+        if (ref.worktree_path != worktree.path || ref.remote != remote) continue
+        GIT_REF_ROW[row].value = ref.name == worktree.history_ref
+        let marker = ref.current ? "* " : "  "
+        if (selectable(GIT_REF_ROW[row],
+                (text = "{marker}{ref.name}##ref:{ref.full_name}"))
+                && g_client != null && ref.name != worktree.history_ref) {
+            g_client->request_repository_history(
+                repository.record.id, worktree.path, ref.name)
+        }
+        row++
+    }
+    return count
+}
+
+def private draw_tree_review(repository : RepositorySnapshot const;
+                             worktree : WorktreeState const) {
+    if (g_client != null) {
+        let identity = "{repository.record.id}\n{worktree.path}"
+        if (g_client.last_refs_identity != identity) {
+            g_client->request_repository_refs(repository.record.id, worktree.path)
+        }
+    }
+    var row = 0
+    let local_count = draw_ref_group(repository, worktree, false, row)
+    dummy(GIT_GROUP_SPACING[22], (size = float2(0.0f, GetStyle().ItemSpacing.y)))
+    let remote_count = draw_ref_group(repository, worktree, true, row)
+    if (worktree.refs_loading) text_disabled("Reading local and remote branches...")
+    if (!empty(worktree.refs_error)) {
+        text_colored(GIT_ERROR,
+            (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
+            text = worktree.refs_error))
+    }
+    if (local_count + remote_count == 0 && !worktree.refs_loading
+            && empty(worktree.refs_error)) {
+        text_disabled("No branches found")
+    }
+    separator()
+    draw_history_commits(repository, worktree)
+}
+
 def private draw_git_status_window() {
     var found = false
     if (g_client != null) {
@@ -939,6 +1398,12 @@ def private draw_git_status_window() {
                 if (small_button(REFRESH_GIT, (text = repository.refreshing ? "Refreshing..." : "Refresh",
                         enabled = !repository.refreshing))) {
                     g_client->refresh_repository(repository.record.id)
+                    g_client->request_repository_review(
+                        repository.record.id, worktree.path)
+                    g_client->request_repository_history(
+                        repository.record.id, worktree.path, worktree.branch)
+                    g_client->request_repository_refs(
+                        repository.record.id, worktree.path)
                 }
                 text_disabled(GIT_WORKTREE_PATH, (text = worktree.path))
                 let status_summary = "staged {worktree.staged}   unstaged {worktree.unstaged}   untracked {worktree.untracked}   conflicted {worktree.conflicted}"
@@ -952,13 +1417,20 @@ def private draw_git_status_window() {
                         text = repository.error))
                 }
                 separator()
-                var file_row = 0
-                let conflicts = draw_git_file_group(repository, worktree, 0, file_row)
-                let staged = draw_git_file_group(repository, worktree, 1, file_row)
-                let modified = draw_git_file_group(repository, worktree, 2, file_row)
-                let untracked = draw_git_file_group(repository, worktree, 3, file_row)
-                if (file_row == 0 && !repository.refreshing && empty(repository.error)) {
-                    text_disabled("Working tree clean")
+                tab_bar(GIT_PERSPECTIVE_TABS,
+                        (text = "Git perspectives", flags = ImGuiTabBarFlags.None)) {
+                    tab_item(GIT_PR_TAB, (text = "PR", closable = false,
+                            flags = ImGuiTabItemFlags.None)) {
+                        draw_pr_review(repository, worktree)
+                    }
+                    tab_item(GIT_HISTORY_TAB, (text = "History", closable = false,
+                            flags = ImGuiTabItemFlags.None)) {
+                        draw_history_review(repository, worktree)
+                    }
+                    tab_item(GIT_TREE_TAB, (text = "Tree", closable = false,
+                            flags = ImGuiTabItemFlags.None)) {
+                        draw_tree_review(repository, worktree)
+                    }
                 }
             }
         }
@@ -1050,7 +1522,8 @@ def private draw_side_by_side_diff() {
             && g_client != null && g_client.connected) {
         g_client->inspect_file(g_inspector.repository_id,
             g_inspector.worktree_path, g_inspector.file_path,
-            g_inspector.comparison, INSPECTOR_CONTEXT_VALUES[selected_context])
+            g_inspector.comparison, INSPECTOR_CONTEXT_VALUES[selected_context],
+            g_inspector.git_revision)
     }
     same_line()
     SetNextItemWidth(150.0f)
@@ -1196,6 +1669,181 @@ def private draw_file_view() {
     }
 }
 
+[live_command(description = "Inspect watcher connectivity and rich-client repository/session counts.")]
+def herder_client_state(_input : JsonValue?) : JsonValue? {
+    if (g_client == null) return JV((ok = false, error = "client is unavailable"))
+    return JV((ok = g_client.connected,
+        connected = g_client.connected,
+        error = g_client.error,
+        session_count = length(g_client.sessions),
+        repository_count = length(g_client.repositories),
+        selected_repository_id = g_selected_repository_id,
+        selected_worktree_path = g_selected_worktree_path))
+}
+
+[live_command(description = "Select a worktree for Git review. Args: repository_id, worktree_path.")]
+def herder_git_select_worktree(input : JsonValue?) : JsonValue? {
+    if (g_client == null || !g_client.connected) {
+        return JV((ok = false, error = "watcher is not connected"))
+    }
+    let args = from_JV(input, type<HerderGitWorktreeArgs>)
+    for (repository in g_client.repositories) {
+        if (repository.record.id != args.repository_id) continue
+        for (worktree in repository.worktrees) {
+            if (worktree.path != args.worktree_path) continue
+            g_selected_repository_id = args.repository_id
+            g_selected_worktree_path = args.worktree_path
+            g_client->refresh_repository(args.repository_id)
+            g_client->request_repository_review(
+                args.repository_id, args.worktree_path)
+            g_client->request_repository_history(
+                args.repository_id, args.worktree_path, worktree.branch)
+            g_client->request_repository_refs(
+                args.repository_id, args.worktree_path)
+            GIT_STATUS_WIN.open = true
+            GIT_STATUS_WIN.pending_raise = true
+            return JV((ok = true, repository_id = args.repository_id,
+                worktree_path = args.worktree_path))
+        }
+    }
+    return JV((ok = false, error = "unknown repository or worktree"))
+}
+
+[live_command(description = "Inspect the selected worktree PR model, including outgoing commits, included files, and not-included files.")]
+def herder_git_review_state(_input : JsonValue?) : JsonValue? {
+    var commits : array<JsonValue?>
+    var included : array<JsonValue?>
+    var not_included : array<JsonValue?>
+    if (g_client != null) {
+        for (repository in g_client.repositories) {
+            if (repository.record.id != g_selected_repository_id) continue
+            for (worktree in repository.worktrees) {
+                if (worktree.path != g_selected_worktree_path) continue
+                for (commit in repository.review_commits) {
+                    if (commit.worktree_path != worktree.path) continue
+                    commits |> push(JV((hash = commit.hash,
+                        short_hash = commit.short_hash,
+                        authored_at = commit.authored_at,
+                        author = commit.author, subject = commit.subject)))
+                }
+                for (file in repository.review_files) {
+                    if (file.worktree_path != worktree.path) continue
+                    let status_code = git_status_file_code(
+                        repository, worktree.path, file.path)
+                    included |> push(JV((code = file.code, path = file.path,
+                        old_path = file.old_path,
+                        staged = (!empty(status_code) && status_code != "??"
+                            && git_status_byte(status_code, 0) != ' '))))
+                }
+                for (file in repository.files) {
+                    if (file.worktree_path != worktree.path
+                            || (file.code != "??"
+                                && git_status_byte(file.code, 1) == ' ')) continue
+                    not_included |> push(JV((code = file.code,
+                        path = file.path, old_path = file.old_path)))
+                }
+                return JV((ok = empty(worktree.review_error),
+                    repository_id = repository.record.id,
+                    worktree_path = worktree.path,
+                    branch = worktree.branch,
+                    base_ref = worktree.review_base_ref,
+                    merge_base = worktree.review_merge_base,
+                    loading = worktree.review_loading,
+                    error = worktree.review_error,
+                    commits = commits, included = included,
+                    not_included = not_included,
+                    git_action_loading = g_client.git_action_loading,
+                    git_action_file_path = g_client.git_action_file_path,
+                    git_action_status = g_client.git_action_status))
+            }
+        }
+    }
+    return JV((ok = false, error = "selected worktree is unavailable"))
+}
+
+[live_command(description = "Inspect selected worktree History and Tree data, including refs, commits, and selected-commit files.")]
+def herder_git_history_state(_input : JsonValue?) : JsonValue? {
+    var refs : array<JsonValue?>
+    var commits : array<JsonValue?>
+    var files : array<JsonValue?>
+    if (g_client != null) {
+        for (repository in g_client.repositories) {
+            if (repository.record.id != g_selected_repository_id) continue
+            for (worktree in repository.worktrees) {
+                if (worktree.path != g_selected_worktree_path) continue
+                for (ref in repository.refs) {
+                    if (ref.worktree_path != worktree.path) continue
+                    refs |> push(JV((name = ref.name, full_name = ref.full_name,
+                        hash = ref.hash, current = ref.current, remote = ref.remote)))
+                }
+                for (commit in repository.history_commits) {
+                    if (commit.worktree_path != worktree.path) continue
+                    commits |> push(JV((hash = commit.hash,
+                        short_hash = commit.short_hash,
+                        authored_at = commit.authored_at,
+                        author = commit.author, subject = commit.subject)))
+                }
+                for (file in repository.commit_files) {
+                    if (file.worktree_path != worktree.path
+                            || file.commit_hash != worktree.history_commit) continue
+                    files |> push(JV((commit_hash = file.commit_hash,
+                        code = file.code, path = file.path,
+                        old_path = file.old_path)))
+                }
+                return JV((ok = empty(worktree.history_error)
+                        && empty(worktree.refs_error),
+                    repository_id = repository.record.id,
+                    worktree_path = worktree.path,
+                    branch = worktree.branch,
+                    history_ref = worktree.history_ref,
+                    history_commit = worktree.history_commit,
+                    history_loading = worktree.history_loading,
+                    history_error = worktree.history_error,
+                    refs_loading = worktree.refs_loading,
+                    refs_error = worktree.refs_error,
+                    refs = refs, commits = commits, files = files))
+            }
+        }
+    }
+    return JV((ok = false, error = "selected worktree is unavailable"))
+}
+
+[live_command(description = "Switch Git Status perspective. Args: perspective = pr | history | tree.")]
+def herder_git_perspective(input : JsonValue?) : JsonValue? {
+    let args = from_JV(input, type<HerderGitPerspectiveArgs>)
+    let perspective = to_lower(args.perspective)
+    if (perspective == "pr") {
+        GIT_PR_TAB.pending_select = true
+    } elif (perspective == "history") {
+        GIT_HISTORY_TAB.pending_select = true
+    } elif (perspective == "tree") {
+        GIT_TREE_TAB.pending_select = true
+    } else {
+        return JV((ok = false, error = "perspective must be pr, history, or tree"))
+    }
+    GIT_STATUS_WIN.open = true
+    GIT_STATUS_WIN.pending_raise = true
+    return JV((ok = true, perspective = perspective))
+}
+
+[live_command(description = "Stage or unstage one observed worktree file. Args: repository_id, worktree_path, file_path, action.")]
+def herder_git_file_action(input : JsonValue?) : JsonValue? {
+    if (g_client == null || !g_client.connected) {
+        return JV((ok = false, error = "watcher is not connected"))
+    }
+    let args = from_JV(input, type<HerderGitFileActionArgs>)
+    if (args.action != "stage" && args.action != "unstage") {
+        return JV((ok = false, error = "action must be stage or unstage"))
+    }
+    if (g_client.git_action_loading) {
+        return JV((ok = false, error = "another Git file action is running"))
+    }
+    g_client->git_file_action(args.repository_id, args.worktree_path,
+        args.file_path, args.action)
+    return JV((ok = true, request_id = g_client.git_action_request_id,
+        action = args.action, file_path = args.file_path))
+}
+
 [live_command(description = "Inspect the selected Git file, comparison, render mode, and changed-line telemetry.")]
 def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
     let view_selection = text_source_view_selection(g_inspector.view)
@@ -1206,6 +1854,7 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         worktree_path = g_inspector.worktree_path,
         file_path = g_inspector.file_path,
         comparison = g_inspector.comparison,
+        git_revision = g_inspector.git_revision,
         zoom_percent = g_zoom_percent,
         diff_context = g_inspector.diff_context,
         diff_context_choice = g_inspector.diff_context_choice,
@@ -1291,7 +1940,7 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         markdown_gutter_segments = g_inspector.markdown_gutter_segments))
 }
 
-[live_command(description = "Open a changed Git file immediately. Args: repository_id, worktree_path, file_path, comparison.")]
+[live_command(description = "Open a changed Git file immediately. Args: repository_id, worktree_path, file_path, comparison, optional revision for commit.")]
 def herder_file_inspector_open(input : JsonValue?) : JsonValue? {
     if (g_client == null || !g_client.connected) {
         return JV((ok = false, error = "watcher is not connected"))
@@ -1304,11 +1953,12 @@ def herder_file_inspector_open(input : JsonValue?) : JsonValue? {
     }
     let comparison = empty(args.comparison) ? "working" : args.comparison
     g_client->inspect_file(args.repository_id, args.worktree_path,
-        args.file_path, comparison, args.diff_context)
+        args.file_path, comparison, args.diff_context, args.revision)
     FILE_INSPECTOR_WIN.open = true
     FILE_INSPECTOR_WIN.pending_raise = true
     return JV((ok = true, request_id = g_inspector.request_id,
-        file_path = args.file_path, comparison = comparison))
+        file_path = args.file_path, comparison = comparison,
+        revision = args.revision))
 }
 
 [live_command(description = "Read exact inspector text. Args: side = before | after | view.")]
@@ -1514,6 +2164,7 @@ def shutdown() {
         g_client->cleanup()
         delete g_client.sessions
         delete g_client.repositories
+        delete g_client.git_failure_revisions
         unsafe { delete g_client }
         g_client = null
     }

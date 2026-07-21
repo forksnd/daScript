@@ -7,6 +7,7 @@ options indenting = 4
 module repository_core shared public
 
 require ./watcher_core.das public
+require daslib/command_line
 require daslib/fio public
 require daslib/json_boost public
 require daslib/strings_boost
@@ -15,7 +16,8 @@ require strings public
 let private REPOSITORY_CONFIG_VERSION = 1
 let private GIT_TIMEOUT_MS = 15000l
 let private GIT_CAPTURE_COLUMNS = 240
-let private GIT_CAPTURE_ROWS = 100
+let private GIT_CAPTURE_ROWS = 512
+let private GIT_FIELD_SEPARATOR = "<|dasHerd-field|>"
 
 struct public RepositoryRecord {
     id : string
@@ -27,6 +29,39 @@ struct public RepositoryRecord {
 
 struct public GitFileState {
     worktree_path : string
+    code : string
+    path : string
+    old_path : string
+}
+
+struct public GitCommitState {
+    worktree_path : string
+    hash : string
+    short_hash : string
+    authored_at : int64
+    author : string
+    subject : string
+}
+
+struct public GitReviewFileState {
+    worktree_path : string
+    code : string
+    path : string
+    old_path : string
+}
+
+struct public GitRefState {
+    worktree_path : string
+    full_name : string
+    name : string
+    hash : string
+    current : bool
+    remote : bool
+}
+
+struct public GitCommitFileState {
+    worktree_path : string
+    commit_hash : string
     code : string
     path : string
     old_path : string
@@ -48,17 +83,35 @@ struct public WorktreeState {
     untracked : int
     conflicted : int
     error : string
+    review_base_ref : string
+    review_merge_base : string
+    review_loading : bool
+    review_error : string
+    history_ref : string
+    history_commit : string
+    history_loading : bool
+    history_error : string
+    refs_loading : bool
+    refs_error : string
 }
 
 struct public RepositorySnapshot {
     record : RepositoryRecord = RepositoryRecord()
     worktrees : array<WorktreeState>
     files : array<GitFileState>
+    review_commits : array<GitCommitState>
+    review_files : array<GitReviewFileState>
+    history_commits : array<GitCommitState>
+    commit_files : array<GitCommitFileState>
+    refs : array<GitRefState>
     refreshing : bool
     error : string
     revision : int64
     last_success_ms : int64
     task_session_id : string
+    failure_session_id : string
+    failure_message : string
+    failure_revision : int64
 }
 
 struct public RepositoryAddRequest {
@@ -82,9 +135,37 @@ class private RepositoryRuntime {
     worktree_index : int
     refresh_pending : bool = true
     rerun_pending : bool
+    review_pending_path : string
+    review_worktree_index : int = -1
+    review_base_ref : string
+    review_merge_base : string
+    review_tried_origin_main : bool
+    pending_review_commits : array<GitCommitState>
+    pending_review_files : array<GitReviewFileState>
+    history_pending_path : string
+    history_pending_ref : string
+    commit_pending_path : string
+    commit_pending_hash : string
+    refs_pending_path : string
+    history_worktree_index : int = -1
+    history_ref : string
+    history_commit : string
+    pending_history_commits : array<GitCommitState>
+    pending_commit_files : array<GitCommitFileState>
+    pending_refs : array<GitRefState>
     def operator delete {
         delete snapshot.worktrees
         delete snapshot.files
+        delete snapshot.review_commits
+        delete snapshot.review_files
+        delete snapshot.history_commits
+        delete snapshot.commit_files
+        delete snapshot.refs
+        delete pending_review_commits
+        delete pending_review_files
+        delete pending_history_commits
+        delete pending_commit_files
+        delete pending_refs
     }
 }
 
@@ -274,13 +355,124 @@ def public repository_build_file_diff_argv(worktree_path : string;
     return ""
 }
 
+def private record_git_failure(var runtime : RepositoryRuntime?;
+                               message : string) {
+    runtime.snapshot.failure_session_id = runtime.snapshot.task_session_id
+    runtime.snapshot.failure_message = message
+    runtime.snapshot.failure_revision++
+}
+
+def public repository_build_review_file_diff_argv(worktree_path : string;
+                                                  merge_base : string;
+                                                  file_path : string;
+                                                  var argv : array<string>&;
+                                                  diff_context : string = "compact") : string {
+    delete argv
+    if (empty(merge_base)) return "worktree review has no merge base"
+    if (!repository_valid_relative_file_path(file_path)) {
+        return "invalid worktree-relative file path"
+    }
+    var context_lines = 3
+    if (diff_context == "expanded") {
+        context_lines = 20
+    } elif (diff_context == "full") {
+        context_lines = 1000000
+    } elif (diff_context != "compact") {
+        return "diff context is not implemented"
+    }
+    var inscope command <- ["git", "--literal-pathspecs", "-C", worktree_path,
+        "--no-pager", "-c", "color.ui=false", "diff", "--cached",
+        "--no-ext-diff", "--unified={context_lines}", merge_base, "--", file_path]
+    argv := command
+    return ""
+}
+
+def public repository_build_commit_file_diff_argv(worktree_path : string;
+                                                  commit_hash : string;
+                                                  file_path : string;
+                                                  var argv : array<string>&;
+                                                  diff_context : string = "compact") : string {
+    delete argv
+    if (empty(commit_hash)) return "commit hash is required"
+    if (!repository_valid_relative_file_path(file_path)) {
+        return "invalid worktree-relative file path"
+    }
+    var context_lines = 3
+    if (diff_context == "expanded") {
+        context_lines = 20
+    } elif (diff_context == "full") {
+        context_lines = 1000000
+    } elif (diff_context != "compact") {
+        return "diff context is not implemented"
+    }
+    var inscope command <- ["git", "--literal-pathspecs", "-C", worktree_path,
+        "--no-pager", "-c", "color.ui=false", "show", "--format=",
+        "--first-parent", "--find-renames", "--no-ext-diff", "--unified={context_lines}",
+        commit_hash, "--", file_path]
+    argv := command
+    return ""
+}
+
+def public repository_build_file_action_argv(worktree_path : string;
+                                             file_path : string;
+                                             action : string;
+                                             var argv : array<string>&) : string {
+    delete argv
+    if (!repository_valid_relative_file_path(file_path)) {
+        return "invalid worktree-relative file path"
+    }
+    if (action == "stage") {
+        var inscope command <- ["git", "--literal-pathspecs", "-C", worktree_path,
+            "add", "--", file_path]
+        argv := command
+    } elif (action == "unstage") {
+        var inscope command <- ["git", "--literal-pathspecs", "-C", worktree_path,
+            "reset", "--quiet", "HEAD", "--", file_path]
+        argv := command
+    } else {
+        return "file action is not implemented"
+    }
+    return ""
+}
+
+def public repository_file_action_argv(repository_id : string;
+                                       worktree_path : string;
+                                       file_path : string;
+                                       action : string;
+                                       var argv : array<string>&) : string {
+    delete argv
+    let repository_index = find_repository(repository_id)
+    if (repository_index < 0 || g_repositories[repository_index] == null) {
+        return "unknown repository"
+    }
+    let runtime = g_repositories[repository_index]
+    if (find_worktree(runtime, worktree_path) < 0) return "unknown worktree"
+    var file_index = -1
+    for (index in range(length(runtime.snapshot.files))) {
+        let file = runtime.snapshot.files[index]
+        if (file.worktree_path == worktree_path && file.path == file_path) {
+            file_index = index
+            break
+        }
+    }
+    if (file_index < 0) return "file is not present in the observed Git status"
+    let code = runtime.snapshot.files[file_index].code
+    let staged = code != "??" && byte_at(code, 0) != ' '
+    let working = code == "??" || byte_at(code, 1) != ' '
+    if (action == "stage" && !working) return "file has no working-tree change"
+    if (action == "unstage" && !staged) return "file has no staged change"
+    return repository_build_file_action_argv(
+        worktree_path, file_path, action, argv)
+}
+
 def public repository_file_diff_argv(repository_id : string;
                                      worktree_path : string;
                                      file_path : string;
                                      comparison : string;
                                      var argv : array<string>&;
                                      var expected_exit_code : int64&;
-                                     diff_context : string = "compact") : string {
+                                     diff_context : string = "compact";
+                                     revision : string = "") : string {
     delete argv
     expected_exit_code = 0l
     let repository_index = find_repository(repository_id)
@@ -288,14 +480,37 @@ def public repository_file_diff_argv(repository_id : string;
         return "unknown repository"
     }
     let runtime = g_repositories[repository_index]
-    var worktree_found = false
-    for (worktree in runtime.snapshot.worktrees) {
-        if (worktree.path == worktree_path) {
-            worktree_found = true
-            break
+    let worktree_index = find_worktree(runtime, worktree_path)
+    if (worktree_index < 0) return "unknown worktree"
+
+    if (comparison == "pr") {
+        var review_file_found = false
+        for (file in runtime.snapshot.review_files) {
+            if (file.worktree_path == worktree_path && file.path == file_path) {
+                review_file_found = true
+                break
+            }
         }
+        if (!review_file_found) return "file is not present in the worktree PR result"
+        return repository_build_review_file_diff_argv(
+            worktree_path,
+            runtime.snapshot.worktrees[worktree_index].review_merge_base,
+            file_path, argv, diff_context)
     }
-    if (!worktree_found) return "unknown worktree"
+
+    if (comparison == "commit") {
+        var commit_file_found = false
+        for (file in runtime.snapshot.commit_files) {
+            if (file.worktree_path == worktree_path
+                    && file.commit_hash == revision && file.path == file_path) {
+                commit_file_found = true
+                break
+            }
+        }
+        if (!commit_file_found) return "file is not present in the selected commit"
+        return repository_build_commit_file_diff_argv(
+            worktree_path, revision, file_path, argv, diff_context)
+    }
 
     var file_index = -1
     for (index in range(length(runtime.snapshot.files))) {
@@ -387,6 +602,87 @@ def public repository_working_preview_path(worktree_path : string;
     return ""
 }
 
+def private find_worktree(runtime : RepositoryRuntime?; path : string) : int {
+    for (index in range(length(runtime.snapshot.worktrees))) {
+        if (runtime.snapshot.worktrees[index].path == path) return index
+    }
+    return -1
+}
+
+def public repository_review(repository_id : string; worktree_path : string) : string {
+    let repository_index = find_repository(repository_id)
+    if (repository_index < 0 || g_repositories[repository_index] == null) {
+        return "unknown repository"
+    }
+    var runtime = g_repositories[repository_index]
+    if (find_worktree(runtime, worktree_path) < 0) return "unknown worktree"
+    runtime.review_pending_path = worktree_path
+    changed(runtime)
+    return ""
+}
+
+def public repository_history(repository_id : string; worktree_path : string;
+                              ref_name : string = "") : string {
+    let repository_index = find_repository(repository_id)
+    if (repository_index < 0 || g_repositories[repository_index] == null) {
+        return "unknown repository"
+    }
+    var runtime = g_repositories[repository_index]
+    let worktree_index = find_worktree(runtime, worktree_path)
+    if (worktree_index < 0) return "unknown worktree"
+    var resolved_ref = ref_name
+    if (empty(resolved_ref)) {
+        resolved_ref = runtime.snapshot.worktrees[worktree_index].branch
+    }
+    var allowed = resolved_ref == runtime.snapshot.worktrees[worktree_index].branch
+    for (ref in runtime.snapshot.refs) {
+        if (ref.worktree_path == worktree_path && ref.name == resolved_ref) {
+            allowed = true
+            break
+        }
+    }
+    if (empty(resolved_ref) || !allowed) return "unknown Git ref"
+    runtime.history_pending_path = worktree_path
+    runtime.history_pending_ref = resolved_ref
+    changed(runtime)
+    return ""
+}
+
+def public repository_commit_files(repository_id : string;
+                                   worktree_path : string;
+                                   commit_hash : string) : string {
+    let repository_index = find_repository(repository_id)
+    if (repository_index < 0 || g_repositories[repository_index] == null) {
+        return "unknown repository"
+    }
+    var runtime = g_repositories[repository_index]
+    if (find_worktree(runtime, worktree_path) < 0) return "unknown worktree"
+    var allowed = false
+    for (commit in runtime.snapshot.history_commits) {
+        if (commit.worktree_path == worktree_path && commit.hash == commit_hash) {
+            allowed = true
+            break
+        }
+    }
+    if (!allowed) return "commit is not present in the observed history"
+    runtime.commit_pending_path = worktree_path
+    runtime.commit_pending_hash = commit_hash
+    changed(runtime)
+    return ""
+}
+
+def public repository_refs(repository_id : string; worktree_path : string) : string {
+    let repository_index = find_repository(repository_id)
+    if (repository_index < 0 || g_repositories[repository_index] == null) {
+        return "unknown repository"
+    }
+    var runtime = g_repositories[repository_index]
+    if (find_worktree(runtime, worktree_path) < 0) return "unknown worktree"
+    runtime.refs_pending_path = worktree_path
+    changed(runtime)
+    return ""
+}
+
 def public repository_working_file_text(repository_id : string;
                                         worktree_path : string;
                                         file_path : string;
@@ -453,8 +749,31 @@ def public repository_staged_file_view_argv(worktree_path : string;
         return "invalid worktree-relative file path"
     }
     if (empty(output_path)) return "staged view output path is required"
-    var inscope command <- ["git", "-C", worktree_path, "--no-pager", "show",
-        "--format=", "--output={output_path}", ":0:{file_path}"]
+    let helper = path_join(get_das_root(),
+        "utils/dasHerd/watcher/git_blob_capture.das")
+    var inscope command <- [get_das_exe(), helper, "--",
+        "--worktree={worktree_path}", "--revision=:0",
+        "--file={file_path}", "--output={output_path}"]
+    argv := command
+    return ""
+}
+
+def public repository_commit_file_view_argv(worktree_path : string;
+                                            commit_hash : string;
+                                            file_path : string;
+                                            output_path : string;
+                                            var argv : array<string>&) : string {
+    delete argv
+    if (empty(commit_hash)) return "commit hash is required"
+    if (!repository_valid_relative_file_path(file_path)) {
+        return "invalid worktree-relative file path"
+    }
+    if (empty(output_path)) return "commit view output path is required"
+    let helper = path_join(get_das_root(),
+        "utils/dasHerd/watcher/git_blob_capture.das")
+    var inscope command <- [get_das_exe(), helper, "--",
+        "--worktree={worktree_path}", "--revision={commit_hash}",
+        "--file={file_path}", "--output={output_path}"]
     argv := command
     return ""
 }
@@ -474,10 +793,14 @@ def private launch_git(var runtime : RepositoryRuntime?; argv : array<string>;
     let result = watcher_launch(request)
     runtime.snapshot.task_session_id = result.session_id
     if (!result.ok) {
-        runtime.snapshot.error = result.error
-        runtime.snapshot.refreshing = false
-        runtime.phase = 0
-        changed(runtime)
+        if (runtime.phase >= 7) {
+            fail_history(runtime, result.error)
+        } elif (runtime.phase >= 3 && runtime.review_worktree_index >= 0
+                && runtime.review_worktree_index < length(runtime.snapshot.worktrees)) {
+            fail_review(runtime, result.error)
+        } else {
+            fail_refresh(runtime, result.error)
+        }
         return false
     }
     return true
@@ -612,6 +935,282 @@ def private launch_status(var runtime : RepositoryRuntime?) : bool {
         "git-status", path)
 }
 
+def private launch_review_upstream(var runtime : RepositoryRuntime?) {
+    let index = find_worktree(runtime, runtime.review_pending_path)
+    if (index < 0) {
+        runtime.review_pending_path = ""
+        return
+    }
+    runtime.review_worktree_index = index
+    runtime.review_pending_path = ""
+    runtime.review_base_ref = ""
+    runtime.review_merge_base = ""
+    runtime.review_tried_origin_main = false
+    runtime.pending_review_commits |> clear()
+    runtime.pending_review_files |> clear()
+    runtime.snapshot.worktrees[index].review_loading = true
+    runtime.snapshot.worktrees[index].review_error = ""
+    runtime.phase = 3
+    changed(runtime)
+    let path = runtime.snapshot.worktrees[index].path
+    let branch = runtime.snapshot.worktrees[index].branch
+    let ref = empty(branch) ? "refs/heads/__detached__" : "refs/heads/{branch}"
+    let _ = launch_git(runtime, ["git", "-C", path, "for-each-ref",
+        "--format=%(upstream:short)", ref], "git-review-base", path)
+}
+
+def private launch_review_merge_base(var runtime : RepositoryRuntime?) {
+    let path = runtime.snapshot.worktrees[runtime.review_worktree_index].path
+    runtime.phase = 4
+    let _ = launch_git(runtime, ["git", "-C", path, "merge-base",
+        runtime.review_base_ref, "HEAD"], "git-review-merge-base", path)
+}
+
+def private launch_review_commits(var runtime : RepositoryRuntime?) {
+    let path = runtime.snapshot.worktrees[runtime.review_worktree_index].path
+    runtime.phase = 5
+    let revision_range = "{runtime.review_merge_base}..HEAD"
+    let _ = launch_git(runtime, ["git", "-C", path, "--no-pager", "log",
+        "--max-count=200", "--format=%H{GIT_FIELD_SEPARATOR}%h{GIT_FIELD_SEPARATOR}%at{GIT_FIELD_SEPARATOR}%an{GIT_FIELD_SEPARATOR}%s", revision_range],
+        "git-review-commits", path)
+}
+
+def private launch_review_files(var runtime : RepositoryRuntime?) {
+    let path = runtime.snapshot.worktrees[runtime.review_worktree_index].path
+    runtime.phase = 6
+    let _ = launch_git(runtime, ["git", "--literal-pathspecs", "-C", path,
+        "--no-pager", "diff", "--cached", "--name-only", "--find-renames",
+        runtime.review_merge_base, "--"], "git-review-files", path)
+}
+
+def private launch_history(var runtime : RepositoryRuntime?) {
+    let index = find_worktree(runtime, runtime.history_pending_path)
+    if (index < 0) {
+        runtime.history_pending_path = ""
+        runtime.history_pending_ref = ""
+        return
+    }
+    runtime.history_worktree_index = index
+    runtime.history_ref = runtime.history_pending_ref
+    runtime.history_pending_path = ""
+    runtime.history_pending_ref = ""
+    runtime.pending_history_commits |> clear()
+    runtime.pending_commit_files |> clear()
+    runtime.snapshot.worktrees[index].history_loading = true
+    runtime.snapshot.worktrees[index].history_error = ""
+    runtime.phase = 7
+    changed(runtime)
+    let path = runtime.snapshot.worktrees[index].path
+    let _ = launch_git(runtime, ["git", "-C", path, "--no-pager", "log",
+        "--max-count=200", "--format=%H{GIT_FIELD_SEPARATOR}%h{GIT_FIELD_SEPARATOR}%at{GIT_FIELD_SEPARATOR}%an{GIT_FIELD_SEPARATOR}%s",
+        runtime.history_ref], "git-history", path)
+}
+
+def private launch_commit_files(var runtime : RepositoryRuntime?;
+                                path : string = ""; commit_hash : string = "") {
+    var requested_path = path
+    var requested_hash = commit_hash
+    if (empty(requested_path)) {
+        requested_path = runtime.commit_pending_path
+        requested_hash = runtime.commit_pending_hash
+        runtime.commit_pending_path = ""
+        runtime.commit_pending_hash = ""
+    }
+    let index = find_worktree(runtime, requested_path)
+    if (index < 0 || empty(requested_hash)) return
+    runtime.history_worktree_index = index
+    runtime.history_commit = requested_hash
+    runtime.pending_commit_files |> clear()
+    runtime.snapshot.worktrees[index].history_loading = true
+    runtime.snapshot.worktrees[index].history_error = ""
+    runtime.phase = 8
+    changed(runtime)
+    let _ = launch_git(runtime, ["git", "--literal-pathspecs", "-C", requested_path,
+        "--no-pager", "show", "--format=", "--name-only", "--find-renames",
+        "--first-parent", requested_hash, "--"], "git-commit-files", requested_path)
+}
+
+def private launch_refs(var runtime : RepositoryRuntime?) {
+    let index = find_worktree(runtime, runtime.refs_pending_path)
+    if (index < 0) {
+        runtime.refs_pending_path = ""
+        return
+    }
+    let path = runtime.refs_pending_path
+    runtime.refs_pending_path = ""
+    runtime.history_worktree_index = index
+    runtime.pending_refs |> clear()
+    runtime.snapshot.worktrees[index].refs_loading = true
+    runtime.snapshot.worktrees[index].refs_error = ""
+    runtime.phase = 9
+    changed(runtime)
+    let _ = launch_git(runtime, ["git", "-C", path, "for-each-ref",
+        "--format=%(refname){GIT_FIELD_SEPARATOR}%(refname:short){GIT_FIELD_SEPARATOR}%(objectname){GIT_FIELD_SEPARATOR}%(HEAD){GIT_FIELD_SEPARATOR}%(symref)",
+        "refs/heads", "refs/remotes"], "git-refs", path)
+}
+
+def private erase_history_content(var runtime : RepositoryRuntime?; path : string) {
+    var index = 0
+    while (index < length(runtime.snapshot.history_commits)) {
+        if (runtime.snapshot.history_commits[index].worktree_path == path) {
+            runtime.snapshot.history_commits |> erase(index)
+        } else {
+            index++
+        }
+    }
+    index = 0
+    while (index < length(runtime.snapshot.commit_files)) {
+        if (runtime.snapshot.commit_files[index].worktree_path == path) {
+            runtime.snapshot.commit_files |> erase(index)
+        } else {
+            index++
+        }
+    }
+}
+
+def private erase_refs(var runtime : RepositoryRuntime?; path : string) {
+    var index = 0
+    while (index < length(runtime.snapshot.refs)) {
+        if (runtime.snapshot.refs[index].worktree_path == path) {
+            runtime.snapshot.refs |> erase(index)
+        } else {
+            index++
+        }
+    }
+}
+
+def private finish_history_commits(var runtime : RepositoryRuntime?) {
+    let index = runtime.history_worktree_index
+    let path = runtime.snapshot.worktrees[index].path
+    erase_history_content(runtime, path)
+    runtime.snapshot.history_commits |> push_from(runtime.pending_history_commits)
+    runtime.pending_history_commits |> clear()
+    runtime.snapshot.worktrees[index].history_ref = runtime.history_ref
+    if (!empty(runtime.snapshot.history_commits)) {
+        var first_hash = ""
+        for (commit in runtime.snapshot.history_commits) {
+            if (commit.worktree_path == path) {
+                first_hash = commit.hash
+                break
+            }
+        }
+        if (!empty(first_hash)) {
+            launch_commit_files(runtime, path, first_hash)
+            return
+        }
+    }
+    runtime.snapshot.worktrees[index].history_commit = ""
+    runtime.snapshot.worktrees[index].history_loading = false
+    runtime.snapshot.worktrees[index].history_error = ""
+    runtime.snapshot.task_session_id = ""
+    runtime.phase = 0
+    changed(runtime)
+}
+
+def private finish_commit_files(var runtime : RepositoryRuntime?) {
+    let index = runtime.history_worktree_index
+    let path = runtime.snapshot.worktrees[index].path
+    var file_index = 0
+    while (file_index < length(runtime.snapshot.commit_files)) {
+        if (runtime.snapshot.commit_files[file_index].worktree_path == path) {
+            runtime.snapshot.commit_files |> erase(file_index)
+        } else {
+            file_index++
+        }
+    }
+    runtime.snapshot.commit_files |> push_from(runtime.pending_commit_files)
+    runtime.pending_commit_files |> clear()
+    runtime.snapshot.worktrees[index].history_commit = runtime.history_commit
+    runtime.snapshot.worktrees[index].history_loading = false
+    runtime.snapshot.worktrees[index].history_error = ""
+    runtime.snapshot.task_session_id = ""
+    runtime.phase = 0
+    changed(runtime)
+}
+
+def private finish_refs(var runtime : RepositoryRuntime?) {
+    let index = runtime.history_worktree_index
+    let path = runtime.snapshot.worktrees[index].path
+    erase_refs(runtime, path)
+    runtime.snapshot.refs |> push_from(runtime.pending_refs)
+    runtime.pending_refs |> clear()
+    runtime.snapshot.worktrees[index].refs_loading = false
+    runtime.snapshot.worktrees[index].refs_error = ""
+    runtime.snapshot.task_session_id = ""
+    runtime.phase = 0
+    changed(runtime)
+}
+
+def private erase_review_content(var runtime : RepositoryRuntime?; path : string) {
+    var index = 0
+    while (index < length(runtime.snapshot.review_commits)) {
+        if (runtime.snapshot.review_commits[index].worktree_path == path) {
+            runtime.snapshot.review_commits |> erase(index)
+        } else {
+            index++
+        }
+    }
+    index = 0
+    while (index < length(runtime.snapshot.review_files)) {
+        if (runtime.snapshot.review_files[index].worktree_path == path) {
+            runtime.snapshot.review_files |> erase(index)
+        } else {
+            index++
+        }
+    }
+}
+
+def private finish_review(var runtime : RepositoryRuntime?) {
+    let index = runtime.review_worktree_index
+    let path = runtime.snapshot.worktrees[index].path
+    erase_review_content(runtime, path)
+    runtime.snapshot.review_commits |> push_from(runtime.pending_review_commits)
+    runtime.snapshot.review_files |> push_from(runtime.pending_review_files)
+    runtime.pending_review_commits |> clear()
+    runtime.pending_review_files |> clear()
+    runtime.snapshot.worktrees[index].review_base_ref = runtime.review_base_ref
+    runtime.snapshot.worktrees[index].review_merge_base = runtime.review_merge_base
+    runtime.snapshot.worktrees[index].review_loading = false
+    runtime.snapshot.worktrees[index].review_error = ""
+    runtime.snapshot.task_session_id = ""
+    runtime.phase = 0
+    changed(runtime)
+}
+
+def private fail_review(var runtime : RepositoryRuntime?; message : string) {
+    record_git_failure(runtime, message)
+    let index = runtime.review_worktree_index
+    if (index >= 0 && index < length(runtime.snapshot.worktrees)) {
+        runtime.snapshot.worktrees[index].review_loading = false
+        runtime.snapshot.worktrees[index].review_error = message
+    }
+    runtime.pending_review_commits |> clear()
+    runtime.pending_review_files |> clear()
+    runtime.snapshot.task_session_id = ""
+    runtime.phase = 0
+    changed(runtime)
+}
+
+def private fail_history(var runtime : RepositoryRuntime?; message : string) {
+    record_git_failure(runtime, message)
+    let index = runtime.history_worktree_index
+    if (index >= 0 && index < length(runtime.snapshot.worktrees)) {
+        if (runtime.phase == 9) {
+            runtime.snapshot.worktrees[index].refs_loading = false
+            runtime.snapshot.worktrees[index].refs_error = message
+        } else {
+            runtime.snapshot.worktrees[index].history_loading = false
+            runtime.snapshot.worktrees[index].history_error = message
+        }
+    }
+    runtime.pending_history_commits |> clear()
+    runtime.pending_commit_files |> clear()
+    runtime.pending_refs |> clear()
+    runtime.snapshot.task_session_id = ""
+    runtime.phase = 0
+    changed(runtime)
+}
+
 def private finish_refresh(var runtime : RepositoryRuntime?) {
     runtime.phase = 0
     runtime.snapshot.refreshing = false
@@ -625,9 +1224,11 @@ def private finish_refresh(var runtime : RepositoryRuntime?) {
 }
 
 def private fail_refresh(var runtime : RepositoryRuntime?; message : string) {
+    record_git_failure(runtime, message)
     runtime.phase = 0
     runtime.snapshot.refreshing = false
     runtime.snapshot.error = message
+    runtime.snapshot.task_session_id = ""
     changed(runtime)
     if (runtime.rerun_pending) {
         runtime.rerun_pending = false
@@ -635,9 +1236,126 @@ def private fail_refresh(var runtime : RepositoryRuntime?; message : string) {
     }
 }
 
+def public repository_parse_review_commits(text : string; worktree_path : string;
+                                           var commits : array<GitCommitState>) {
+    for (raw_line in split(text, "\n")) {
+        let line = trim_cr(raw_line)
+        if (empty(line)) continue
+        let delimiter = find(line, GIT_FIELD_SEPARATOR) >= 0 ? GIT_FIELD_SEPARATOR : "\t"
+        let delimiter_length = length(delimiter)
+        let hash_end = find(line, delimiter)
+        if (hash_end < 0) continue
+        let short_end = find(line, delimiter, hash_end + delimiter_length)
+        if (short_end < 0) continue
+        let time_end = find(line, delimiter, short_end + delimiter_length)
+        if (time_end < 0) continue
+        let author_end = find(line, delimiter, time_end + delimiter_length)
+        if (author_end < 0) continue
+        commits |> push(GitCommitState(
+            worktree_path = worktree_path,
+            hash = slice(line, 0, hash_end),
+            short_hash = slice(line, hash_end + delimiter_length, short_end),
+            authored_at = to_int64(slice(line, short_end + delimiter_length, time_end)),
+            author = slice(line, time_end + delimiter_length, author_end),
+            subject = slice(line, author_end + delimiter_length)))
+    }
+}
+
+def public repository_parse_review_files(text : string; worktree_path : string;
+                                         var files : array<GitReviewFileState>) {
+    for (raw_line in split(text, "\n")) {
+        let line = trim_cr(raw_line)
+        if (empty(line)) continue
+        let delimiter = find(line, GIT_FIELD_SEPARATOR) >= 0 ? GIT_FIELD_SEPARATOR : "\t"
+        let fields = split(line, delimiter)
+        if (length(fields) < 2) continue
+        let code = fields[0]
+        var path = fields[1]
+        var old_path : string
+        if ((starts_with(code, "R") || starts_with(code, "C"))
+                && length(fields) >= 3) {
+            old_path = path
+            path = fields[2]
+        }
+        files |> push(GitReviewFileState(
+            worktree_path = worktree_path, code = code,
+            path = path, old_path = old_path))
+    }
+}
+
+def public repository_parse_commit_files(text : string; worktree_path : string;
+                                         commit_hash : string;
+                                         var files : array<GitCommitFileState>) {
+    for (raw_line in split(text, "\n")) {
+        let line = trim_cr(raw_line)
+        if (empty(line)) continue
+        let fields = split(line, "\t")
+        if (length(fields) < 2) continue
+        let code = fields[0]
+        var path = fields[1]
+        var old_path : string
+        if ((starts_with(code, "R") || starts_with(code, "C"))
+                && length(fields) >= 3) {
+            old_path = path
+            path = fields[2]
+        }
+        files |> push(GitCommitFileState(
+            worktree_path = worktree_path, commit_hash = commit_hash,
+            code = code, path = path, old_path = old_path))
+    }
+}
+
+def private repository_parse_review_file_names(text : string;
+                                               worktree_path : string;
+                                               var files : array<GitReviewFileState>) {
+    for (raw_line in split(text, "\n")) {
+        let path = trim_cr(raw_line)
+        if (empty(path)) continue
+        files |> push(GitReviewFileState(
+            worktree_path = worktree_path, code = "", path = path))
+    }
+}
+
+def private repository_parse_commit_file_names(text : string;
+                                               worktree_path : string;
+                                               commit_hash : string;
+                                               var files : array<GitCommitFileState>) {
+    for (raw_line in split(text, "\n")) {
+        let path = trim_cr(raw_line)
+        if (empty(path)) continue
+        files |> push(GitCommitFileState(
+            worktree_path = worktree_path, commit_hash = commit_hash,
+            code = "", path = path))
+    }
+}
+
+def public repository_parse_refs(text : string; worktree_path : string;
+                                 var refs : array<GitRefState>) {
+    for (raw_line in split(text, "\n")) {
+        let line = trim_cr(raw_line)
+        if (empty(line)) continue
+        let delimiter = find(line, GIT_FIELD_SEPARATOR) >= 0 ? GIT_FIELD_SEPARATOR : "\t"
+        let fields = split(line, delimiter)
+        if (length(fields) < 4
+                || (length(fields) >= 5 && !empty(fields[4]))) continue
+        let full_name = fields[0]
+        refs |> push(GitRefState(
+            worktree_path = worktree_path,
+            full_name = full_name,
+            name = fields[1],
+            hash = fields[2],
+            current = strip(fields[3]) == "*",
+            remote = starts_with(full_name, "refs/remotes/")))
+    }
+}
+
 def private advance_repository(var runtime : RepositoryRuntime?) {
     if (runtime.phase == 0) {
         if (runtime.refresh_pending) launch_inventory(runtime)
+        elif (!empty(runtime.review_pending_path)) launch_review_upstream(runtime)
+        elif (!empty(runtime.refs_pending_path)) launch_refs(runtime)
+        elif (!empty(runtime.history_pending_path)) launch_history(runtime)
+        elif (!empty(runtime.commit_pending_path)) launch_commit_files(runtime)
         return
     }
     var info = WatcherSessionInfo()
@@ -646,12 +1364,26 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
     let output = watcher_terminal_text(runtime.snapshot.task_session_id, scrollback_rows)
     if (scrollback_rows > 0) {
         let _compacted_overflow = watcher_compact_session(runtime.snapshot.task_session_id)
-        fail_refresh(runtime, "Git structured output exceeded the {GIT_CAPTURE_ROWS}-row capture window; inspect session {runtime.snapshot.task_session_id}")
+        let message = "Git structured output exceeded the {GIT_CAPTURE_ROWS}-row capture window; inspect session {runtime.snapshot.task_session_id}"
+        if (runtime.phase >= 7) fail_history(runtime, message)
+        elif (runtime.phase >= 3) fail_review(runtime, message)
+        else fail_refresh(runtime, message)
         return
     }
     let _compacted = watcher_compact_session(runtime.snapshot.task_session_id)
     if (info.exit_code != 0l) {
-        fail_refresh(runtime, "git exited with {info.exit_code}: {output}")
+        if (runtime.phase == 4 && runtime.review_base_ref == "origin/master"
+                && !runtime.review_tried_origin_main) {
+            runtime.review_base_ref = "origin/main"
+            runtime.review_tried_origin_main = true
+            launch_review_merge_base(runtime)
+        } elif (runtime.phase >= 7) {
+            fail_history(runtime, "git exited with {info.exit_code}: {output}")
+        } elif (runtime.phase >= 3) {
+            fail_review(runtime, "git exited with {info.exit_code}: {output}")
+        } else {
+            fail_refresh(runtime, "git exited with {info.exit_code}: {output}")
+        }
         return
     }
     if (runtime.phase == 1) {
@@ -669,6 +1401,22 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
             fail_refresh(runtime,
                 "main checkout is already registered: {main_path}")
             return
+        }
+        for (new_worktree in worktrees) {
+            for (old_worktree in runtime.snapshot.worktrees) {
+                if (old_worktree.path != new_worktree.path) continue
+                new_worktree.review_base_ref = old_worktree.review_base_ref
+                new_worktree.review_merge_base = old_worktree.review_merge_base
+                new_worktree.review_loading = old_worktree.review_loading
+                new_worktree.review_error = old_worktree.review_error
+                new_worktree.history_ref = old_worktree.history_ref
+                new_worktree.history_commit = old_worktree.history_commit
+                new_worktree.history_loading = old_worktree.history_loading
+                new_worktree.history_error = old_worktree.history_error
+                new_worktree.refs_loading = old_worktree.refs_loading
+                new_worktree.refs_error = old_worktree.refs_error
+                break
+            }
         }
         delete runtime.snapshot.worktrees
         runtime.snapshot.worktrees <- worktrees
@@ -688,13 +1436,57 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
         changed(runtime)
         return
     }
-    repository_parse_status(output, runtime.snapshot.worktrees[runtime.worktree_index], runtime.snapshot.files)
-    runtime.worktree_index++
-    if (runtime.worktree_index < length(runtime.snapshot.worktrees)) {
-        let _next_status_started = launch_status(runtime)
-        changed(runtime)
+    if (runtime.phase == 2) {
+        repository_parse_status(output, runtime.snapshot.worktrees[runtime.worktree_index], runtime.snapshot.files)
+        runtime.worktree_index++
+        if (runtime.worktree_index < length(runtime.snapshot.worktrees)) {
+            let _next_status_started = launch_status(runtime)
+            changed(runtime)
+        } else {
+            finish_refresh(runtime)
+        }
+        return
+    }
+    if (runtime.phase == 3) {
+        runtime.review_base_ref = strip(output)
+        if (empty(runtime.review_base_ref)) {
+            if (!empty(runtime.snapshot.record.base_ref)) {
+                runtime.review_base_ref = runtime.snapshot.record.base_ref
+            } else {
+                runtime.review_base_ref = "origin/master"
+            }
+        }
+        launch_review_merge_base(runtime)
+        return
+    }
+    if (runtime.phase == 4) {
+        runtime.review_merge_base = strip(output)
+        if (empty(runtime.review_merge_base)) {
+            fail_review(runtime, "git returned no merge base for {runtime.review_base_ref}")
+        } else {
+            launch_review_commits(runtime)
+        }
+        return
+    }
+    let active_index = runtime.phase >= 7 ? runtime.history_worktree_index : runtime.review_worktree_index
+    let path = runtime.snapshot.worktrees[active_index].path
+    if (runtime.phase == 5) {
+        repository_parse_review_commits(output, path, runtime.pending_review_commits)
+        launch_review_files(runtime)
+    } elif (runtime.phase == 6) {
+        repository_parse_review_file_names(
+            output, path, runtime.pending_review_files)
+        finish_review(runtime)
+    } elif (runtime.phase == 7) {
+        repository_parse_review_commits(output, path, runtime.pending_history_commits)
+        finish_history_commits(runtime)
+    } elif (runtime.phase == 8) {
+        repository_parse_commit_file_names(
+            output, path, runtime.history_commit, runtime.pending_commit_files)
+        finish_commit_files(runtime)
     } else {
-        finish_refresh(runtime)
+        repository_parse_refs(output, path, runtime.pending_refs)
+        finish_refs(runtime)
     }
 }
 

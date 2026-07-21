@@ -80,7 +80,7 @@ def test_watcher_process_lifecycle(t : T?) {
         let failed_metadata = fread(path_join(path_join(path_join(root, "sessions"),
             failed.session_id), "session.json"))
         t |> success(find(failed_metadata, "\"columns\":20") >= 0
-                && find(failed_metadata, "\"rows\":200") >= 0,
+                && find(failed_metadata, "\"rows\":512") >= 0,
             "session metadata retains the clamped launch dimensions")
         watcher_tick()
         t |> success(find(watcher_snapshot_json(failed.session_id), "\"state\":\"failed\"") >= 0,

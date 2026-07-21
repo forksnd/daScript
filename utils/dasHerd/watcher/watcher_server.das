@@ -50,6 +50,8 @@ struct private WatcherWsMessage {
     worktree_path : string
     file_path : string
     comparison : string
+    revision : string
+    action : string
     diff_context : string
     request_id : int
     text : string
@@ -68,6 +70,7 @@ struct public RepositoryFileInspectionMessage {
     worktree_path : string
     file_path : string
     comparison : string
+    revision : string
     diff_context : string
     task_session_id : string
     loading : bool
@@ -76,6 +79,20 @@ struct public RepositoryFileInspectionMessage {
     view_base64 : string
     view_byte_count : int
     view_available : bool
+    status : string
+    error : string
+}
+
+struct public RepositoryGitFileActionMessage {
+    @rename = "type"
+    _type : string = "git_file_action"
+    request_id : int
+    repository_id : string
+    worktree_path : string
+    file_path : string
+    action : string
+    task_session_id : string
+    loading : bool
     status : string
     error : string
 }
@@ -96,6 +113,7 @@ class private WatcherClient {
     inspection_worktree_path : string
     inspection_file_path : string
     inspection_comparison : string
+    inspection_revision : string
     inspection_diff_context : string
     inspection_session_id : string
     inspection_expected_exit_code : int64
@@ -103,6 +121,13 @@ class private WatcherClient {
     inspection_phase : string
     inspection_patch : string
     inspection_artifact_path : string
+    action_request_id : int
+    action_repository_id : string
+    action_worktree_path : string
+    action_file_path : string
+    action : string
+    action_session_id : string
+    action_delivered : bool = true
 }
 
 struct private WatcherOk {
@@ -354,6 +379,7 @@ class DasHerdWatcherServer : HvWebServer {
             worktree_path = client.inspection_worktree_path,
             file_path = client.inspection_file_path,
             comparison = client.inspection_comparison,
+            revision = client.inspection_revision,
             diff_context = client.inspection_diff_context,
             task_session_id = client.inspection_session_id,
             loading = loading, patch = patch, view_text = view_text,
@@ -391,14 +417,103 @@ class DasHerdWatcherServer : HvWebServer {
         client.inspection_artifact_path = ""
     }
 
-    def start_staged_file_view(var client : WatcherClient?; patch : string) {
+    def send_git_file_action(var client : WatcherClient?; loading : bool;
+                             status : string; error : string = "") {
+        if (client == null) return
+        let message = RepositoryGitFileActionMessage(
+            request_id = client.action_request_id,
+            repository_id = client.action_repository_id,
+            worktree_path = client.action_worktree_path,
+            file_path = client.action_file_path,
+            action = client.action,
+            task_session_id = client.action_session_id,
+            loading = loading, status = status, error = error)
+        send(client.channel, sprint_json(message, false),
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def start_git_file_action(var client : WatcherClient?;
+                              incoming : WatcherWsMessage const) {
+        if (client == null) return
+        if (!client.action_delivered) {
+            self.send_git_file_action(client, false, "failed",
+                "another Git file action is still running")
+            return
+        }
+        client.action_request_id = incoming.request_id
+        client.action_repository_id = incoming.repository_id
+        client.action_worktree_path = incoming.worktree_path
+        client.action_file_path = incoming.file_path
+        client.action = incoming.action
+        client.action_session_id = ""
+        var inscope argv : array<string>
+        let command_error = repository_file_action_argv(
+            incoming.repository_id, incoming.worktree_path,
+            incoming.file_path, incoming.action, argv)
+        if (!empty(command_error)) {
+            self.send_git_file_action(client, false, "failed", command_error)
+            return
+        }
+        let kind = incoming.action == "stage" ? "git-stage" : "git-unstage"
+        let _pruned = watcher_prune_completed_sessions(
+            kind, incoming.repository_id, incoming.worktree_path)
+        var inscope request = WatcherLaunchRequest(
+            cwd = incoming.worktree_path,
+            display_name = "Git {incoming.action}: {incoming.file_path}",
+            kind = kind, target_id = "local",
+            repository_id = incoming.repository_id,
+            worktree_path = incoming.worktree_path,
+            columns = 160, rows = 50, timeout_ms = 15000l)
+        request.argv := argv
+        let result = watcher_launch(request)
+        client.action_session_id = result.session_id
+        if (!result.ok) {
+            self.send_git_file_action(client, false, "failed", result.error)
+            return
+        }
+        client.action_delivered = false
+        self.send_git_file_action(client, true, "running")
+    }
+
+    def poll_git_file_action(var client : WatcherClient?) {
+        if (client == null || client.action_delivered
+                || empty(client.action_session_id)) return
+        var info = WatcherSessionInfo()
+        if (!watcher_get_session_info(client.action_session_id, info)
+                || !info.drained) return
+        client.action_delivered = true
+        let truncated = false
+        let output = watcher_machine_output_text(client.action_session_id, truncated)
+        let _compacted = watcher_compact_session(client.action_session_id, 160, 50)
+        if (truncated) {
+            self.send_git_file_action(client, false, "failed",
+                "Git action output exceeded the retained machine-output limit")
+        } elif (info.exit_code != 0l) {
+            self.send_git_file_action(client, false, "failed",
+                "git exited with {info.exit_code}: {output}")
+        } else {
+            self.send_git_file_action(client, false, "completed")
+            let _refresh_error = repository_refresh(client.action_repository_id)
+            let _review_error = repository_review(
+                client.action_repository_id, client.action_worktree_path)
+        }
+    }
+
+    def start_indexed_file_view(var client : WatcherClient?; patch : string) {
         if (client == null) return
         let artifact_path = watcher_session_artifact_path(
-            client.inspection_session_id, "staged-view.raw")
+            client.inspection_session_id, "git-view.raw")
         var inscope argv : array<string>
-        let command_error = repository_staged_file_view_argv(
-            client.inspection_worktree_path, client.inspection_file_path,
-            artifact_path, argv)
+        var command_error = ""
+        if (client.inspection_comparison == "commit") {
+            command_error = repository_commit_file_view_argv(
+                client.inspection_worktree_path, client.inspection_revision,
+                client.inspection_file_path, artifact_path, argv)
+        } else {
+            command_error = repository_staged_file_view_argv(
+                client.inspection_worktree_path, client.inspection_file_path,
+                artifact_path, argv)
+        }
         if (!empty(command_error)) {
             client.inspection_delivered = true
             self.send_file_inspection(client, false, patch, command_error)
@@ -409,14 +524,14 @@ class DasHerdWatcherServer : HvWebServer {
             client.inspection_worktree_path)
         var inscope request = WatcherLaunchRequest(
             cwd = client.inspection_worktree_path,
-            display_name = "Git staged view: {client.inspection_file_path}",
+            display_name = "Git file view: {client.inspection_file_path}",
             kind = "git-file-view", target_id = "local",
             repository_id = client.inspection_repository_id,
             worktree_path = client.inspection_worktree_path,
             columns = 80, rows = 25, timeout_ms = 15000l)
         request.argv := argv
         let result = watcher_launch(request)
-        client.inspection_phase = "staged-view"
+        client.inspection_phase = "indexed-view"
         client.inspection_patch = clone_string(patch)
         client.inspection_artifact_path = artifact_path
         client.inspection_session_id = result.session_id
@@ -430,7 +545,7 @@ class DasHerdWatcherServer : HvWebServer {
         }
         client.inspection_delivered = false
         self.send_file_inspection(client, true, "", "", "",
-            "Reading full staged file (15 second limit)...")
+            "Reading full Git file (15 second limit)...")
     }
 
     def start_file_inspection(var client : WatcherClient?;
@@ -446,6 +561,7 @@ class DasHerdWatcherServer : HvWebServer {
         client.inspection_worktree_path = incoming.worktree_path
         client.inspection_file_path = incoming.file_path
         client.inspection_comparison = incoming.comparison
+        client.inspection_revision = incoming.revision
         client.inspection_diff_context = incoming.diff_context
         if (empty(client.inspection_diff_context)) {
             client.inspection_diff_context = "compact"
@@ -460,7 +576,8 @@ class DasHerdWatcherServer : HvWebServer {
         let command_error = repository_file_diff_argv(
             incoming.repository_id, incoming.worktree_path,
             incoming.file_path, incoming.comparison,
-            argv, expected_exit_code, client.inspection_diff_context)
+            argv, expected_exit_code, client.inspection_diff_context,
+            client.inspection_revision)
         if (!empty(command_error)) {
             self.send_file_inspection(client, false, "", command_error)
             return
@@ -496,14 +613,14 @@ class DasHerdWatcherServer : HvWebServer {
         let truncated = false
         let output = watcher_machine_output_text(client.inspection_session_id, truncated)
         let _compacted = watcher_compact_session(client.inspection_session_id, 80, 25)
-        if (client.inspection_phase == "staged-view") {
+        if (client.inspection_phase == "indexed-view") {
             client.inspection_delivered = true
             if (truncated) {
                 self.cleanup_inspection_artifact(client)
                 let patch = client.inspection_patch
                 client.inspection_patch = ""
                 self.send_file_inspection(client, false, patch,
-                    "staged file command exceeded the retained machine-output limit")
+                    "Git file command exceeded the retained machine-output limit")
                 return
             }
             if (info.exit_code != client.inspection_expected_exit_code) {
@@ -550,13 +667,15 @@ class DasHerdWatcherServer : HvWebServer {
             self.send_file_inspection(client, false, "",
                 "git diff exited with {info.exit_code}: {output}")
         } else {
-            if (client.inspection_comparison == "staged") {
+            if (client.inspection_comparison == "staged"
+                    || client.inspection_comparison == "pr"
+                    || client.inspection_comparison == "commit") {
                 if (git_patch_result_is_deleted(output)) {
                     self.send_file_inspection(client, false, output, "",
                         "", "", "", 0, true)
                     return
                 }
-                self.start_staged_file_view(client, output)
+                self.start_indexed_file_view(client, output)
                 return
             }
             var view_text = ""
@@ -692,6 +811,30 @@ class DasHerdWatcherServer : HvWebServer {
             let error = repository_refresh(incoming.repository_id)
             if (!empty(error)) send_error(channel, error)
             send_repositories(client, true)
+        } elif (incoming.op == "repository_review") {
+            let error = repository_review(
+                incoming.repository_id, incoming.worktree_path)
+            if (!empty(error)) send_error(channel, error)
+            send_repositories(client, true)
+        } elif (incoming.op == "repository_history") {
+            let error = repository_history(
+                incoming.repository_id, incoming.worktree_path,
+                incoming.revision)
+            if (!empty(error)) send_error(channel, error)
+            send_repositories(client, true)
+        } elif (incoming.op == "repository_commit_files") {
+            let error = repository_commit_files(
+                incoming.repository_id, incoming.worktree_path,
+                incoming.revision)
+            if (!empty(error)) send_error(channel, error)
+            send_repositories(client, true)
+        } elif (incoming.op == "repository_refs") {
+            let error = repository_refs(
+                incoming.repository_id, incoming.worktree_path)
+            if (!empty(error)) send_error(channel, error)
+            send_repositories(client, true)
+        } elif (incoming.op == "git_file_action") {
+            self.start_git_file_action(client, incoming)
         } elif (incoming.op == "file_inspect") {
             self.start_file_inspection(client, incoming)
         } elif (incoming.op == "launch") {
@@ -774,6 +917,7 @@ class DasHerdWatcherServer : HvWebServer {
             send_snapshot(client)
             send_raw_output(client)
             send_repositories(client)
+            self.poll_git_file_action(client)
             self.poll_file_inspection(client)
         }
     }
