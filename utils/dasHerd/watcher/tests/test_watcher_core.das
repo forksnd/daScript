@@ -20,6 +20,7 @@ def private wait_for(session_id, state : string; timeout_ms : int64) : bool {
 
 [test]
 def test_watcher_process_lifecycle(t : T?) {
+    if (get_platform_name() != "windows") return
     t |> run("persistent core logs output, times out hangs, and arbitrates control") <| @(t : T?) {
         let temp = create_temp_directory_result("dasherd_watcher_test_")
         if (!(temp is value)) {
@@ -28,6 +29,15 @@ def test_watcher_process_lifecycle(t : T?) {
         }
         var root = temp as value
         t |> equal(watcher_init(path_join(root, "sessions")), "")
+
+        let missing_command = path_join(root, "missing-watcher-command.exe")
+        let failed = watcher_launch(WatcherLaunchRequest(
+            command_line = "\"{missing_command}\"", cwd = root,
+            columns = 80, rows = 20, timeout_ms = 5000l))
+        t |> success(!failed.ok, "failed PTY launch is reported to the caller")
+        t |> success(!empty(failed.session_id), "failed PTY launch retains its diagnostic session")
+        t |> success(find(watcher_snapshot_json(failed.session_id), "\"state\":\"failed\"") >= 0,
+            "failed PTY launch is retained in watcher state")
 
         let quick = watcher_launch(WatcherLaunchRequest(
             command_line = "powershell.exe -NoProfile -Command \"Write-Output watcher-core-ok\"",

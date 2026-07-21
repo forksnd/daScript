@@ -105,6 +105,23 @@ class TestWsClient : HvWebSocketClient {
     }
 }
 
+// Compatibility client intentionally implements only the original text callback.
+// HvWebSocketClient.onMessageFrame must continue forwarding text frames here.
+class LegacyTextWsClient : HvWebSocketClient {
+    received : array<string>
+    connected : bool
+    closed : bool
+
+    def override onOpen { connected = true }
+    def override onClose {
+        connected = false
+        closed = true
+    }
+    def override onMessage(msg : string#) {
+        received |> push_clone(string(msg))
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Helper: wait for a client to accumulate N messages
 // ──────────────────────────────────────────────────────────────────────────
@@ -193,6 +210,29 @@ def test_websockets(t : T?) {
             unsafe {
                 delete client
             }
+        }
+
+        t |> run("onMessage-only clients retain text compatibility") @(t : T?) {
+            var client = new LegacyTextWsClient()
+            client->init("{ws_url}/ws")
+            var elapsed = 0
+            while (length(client.received) < 1 && elapsed < 3000) {
+                client->process_event_que()
+                sleep(1u)
+                elapsed++
+            }
+            t |> success(client.connected, "legacy client is connected")
+            t |> equal(length(client.received), 1)
+            t |> success(starts_with(client.received[0], "welcome "),
+                "default frame callback forwards text")
+            client->close()
+            while (!client.closed && elapsed < 6000) {
+                client->process_event_que()
+                sleep(1u)
+                elapsed++
+            }
+            client->cleanup()
+            unsafe { delete client }
         }
 
         t |> run("binary frames preserve opcode, length, and embedded zero bytes") @(t : T?) {

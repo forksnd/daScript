@@ -46,9 +46,12 @@ class HvWebSocketClient {
         //! Called when the WebSocket connection is closed.
     def abstract onMessage(msg : string#) : void
         //! Called when a text message is received from the server.
-    def abstract onMessageFrame(msg : string#; byte_count : int; opcode : ws_opcode) : void
+    def onMessageFrame(msg : string#; byte_count : int; opcode : ws_opcode) {
         //! Called for every complete text or binary frame. ``byte_count`` is
-        //! authoritative and preserves embedded zero bytes.
+        //! authoritative and preserves embedded zero bytes. The default keeps
+        //! the original text-only contract by forwarding text frames.
+        if (opcode == ws_opcode.WS_OPCODE_TEXT) onMessage(msg)
+    }
     def is_connected : bool {
         //! Returns ``true`` if the WebSocket connection is currently open.
         return is_connected(client)

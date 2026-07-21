@@ -244,6 +244,7 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
     if (terminal_process_id(session.terminal) == 0) {
         session.state = "failed"
         session.reason = terminal_transport_error(session.terminal)
+        if (empty(session.reason)) { session.reason = "terminal launch failed" }
         session.drained = true
         session.status_revision++
         append_event(session, "launch_failed", session.reason)
@@ -253,6 +254,9 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
         append_event(session, "launched", "pid={terminal_process_id(session.terminal)}")
     }
     g_sessions |> push(session)
+    if (session.state == "failed") {
+        return WatcherLaunchResult(session_id = session_id, error = session.reason)
+    }
     return WatcherLaunchResult(ok = true, session_id = session_id)
 }
 
@@ -330,7 +334,7 @@ def public watcher_tick(maximum_bytes_per_session : int = 64 * 1024) {
 }
 
 def public watcher_output_since(session_id : string; requested_offset : int64;
-        maximum_bytes : int = 256 * 1024) : WatcherOutputChunk {
+                                maximum_bytes : int = 256 * 1024) : WatcherOutputChunk {
     var result = WatcherOutputChunk()
     let index = watcher_find_session(session_id)
     if (index < 0 || g_sessions[index] == null) return <- result

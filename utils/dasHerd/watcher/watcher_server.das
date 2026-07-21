@@ -72,6 +72,36 @@ def private json_error(message : string) : string {
     return sprint_json(WatcherError(error = message), false)
 }
 
+def private hex_nibble(value : int) : int {
+    if (value >= '0' && value <= '9') return value - '0'
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10
+    return -1
+}
+
+def private percent_decode(value : string) : string {
+    var decoded : array<uint8>
+    decoded |> reserve(length(value))
+    peek_data(value) $(data) {
+        var index = 0
+        while (index < length(value)) {
+            let byte = int(data[index])
+            if (byte == '%' && index + 2 < length(value)) {
+                let high = hex_nibble(int(data[index + 1]))
+                let low = hex_nibble(int(data[index + 2]))
+                if (high >= 0 && low >= 0) {
+                    decoded |> push(uint8((high << 4) | low))
+                    index += 3
+                    continue
+                }
+            }
+            decoded |> push(uint8(byte == '+' ? ' ' : byte))
+            index++
+        }
+    }
+    return string(decoded)
+}
+
 def private query_value(url, key : string) : string {
     let query = find(url, "?")
     if (query < 0) return ""
@@ -81,7 +111,7 @@ def private query_value(url, key : string) : string {
         let amp = find(url, "&", position)
         let end = amp < 0 ? length(url) : amp
         if (starts_with(slice(url, position, end), wanted)) {
-            return slice(url, position + length(wanted), end)
+            return percent_decode(slice(url, position + length(wanted), end))
         }
         if (amp < 0) break
         position = amp + 1

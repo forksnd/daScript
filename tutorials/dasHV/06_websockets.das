@@ -2,7 +2,8 @@
 //
 // This tutorial covers:
 //   - Creating a WebSocket server with HvWebServer (onWsOpen, onWsClose, onWsMessage)
-//   - Creating a WebSocket client with HvWebSocketClient (onOpen, onClose, onMessage)
+//   - Creating a WebSocket client with HvWebSocketClient
+//     (onOpen, onClose, onMessage, onMessageFrame)
 //   - Sending text messages (client → server, server → client)
 //   - Broadcasting messages to all connected clients
 //   - Tracking connected clients with a channel table
@@ -99,6 +100,7 @@ class ChatServer : HvWebServer {
 //   onOpen()        — connection established
 //   onClose()       — connection lost
 //   onMessage(msg)  — text message received
+//   onMessageFrame(msg, byte_count, opcode) — lossless text/binary frame received
 //
 // Call init(url) to connect, send(text) to send, process_event_que() to
 // pump the event queue, and is_connected() to check state.
