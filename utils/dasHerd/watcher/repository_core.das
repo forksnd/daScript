@@ -1572,7 +1572,6 @@ def public repository_apply_working_numstat(text : string; worktree_path : strin
     for (raw_line in split(text, "\n")) {
         var parsed = GitNumstatLine()
         if (!parse_numstat_line(trim_cr(raw_line), parsed)) continue
-        if (!key_exists(file_by_path, parsed.path)) continue
         let file_index = file_by_path?[parsed.path] ?? -1
         if (file_index < 0) continue
         files[file_index].added_lines = parsed.added_lines
