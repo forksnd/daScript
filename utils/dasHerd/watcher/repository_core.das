@@ -1165,8 +1165,8 @@ def private observed_worktree_path(worktrees : array<WorktreeState> const;
 }
 
 def public repository_prune_removed_worktree_data(
-        var snapshot : RepositorySnapshot;
-        worktrees : array<WorktreeState> const) {
+                                                  var snapshot : RepositorySnapshot;
+                                                  worktrees : array<WorktreeState> const) {
     var index = 0
     while (index < length(snapshot.files)) {
         if (!observed_worktree_path(worktrees,
