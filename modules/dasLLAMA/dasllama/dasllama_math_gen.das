@@ -344,7 +344,7 @@ def q40q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp 
 //! The K-quant TILE kernels (kq batch family): 4 tokens x mr rows per call — kqg is the group's
 //! QUANT panel (k4 the packed grp<mr> plane; k5/k6 a BYTE-EXPANDED scratch unpacked once per
 //! (group, token-block)). One call is bit-exact vs 4 per-token GEMVs over the same weights.
-[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8, nrsplit = 2),
+[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8), tune_perm(mr = 8, nrsplit = 2),
  tune_perm(dot = "maddubs", width = 256, mr = 8, requires = "avx2"), tune_perm(dot = "maddubs", width = 256, mr = 8, nrsplit = 2, requires = "avx2"),
  tune_perm(dot = "vpdpbusd", width = 256, mr = 8, requires = "avxvnni|avx512vnni"), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, nrsplit = 2, requires = "avxvnni|avx512vnni"),
  tune_perm(dot = "vpdpbusd", width = 512, mr = 16, requires = "avx512vnni,avx512bw"), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, nrsplit = 2, requires = "avx512vnni,avx512bw"),
@@ -364,7 +364,7 @@ def k4q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp :
     }
 }
 
-[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8, nrsplit = 2),
+[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8), tune_perm(mr = 8, nrsplit = 2),
  tune_perm(dot = "maddubs", width = 256, mr = 8, requires = "avx2"), tune_perm(dot = "maddubs", width = 256, mr = 8, nrsplit = 2, requires = "avx2"),
  tune_perm(dot = "vpdpbusd", width = 256, mr = 8, requires = "avxvnni|avx512vnni"), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, nrsplit = 2, requires = "avxvnni|avx512vnni"),
  tune_perm(dot = "vpdpbusd", width = 512, mr = 16, requires = "avx512vnni,avx512bw"), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, nrsplit = 2, requires = "avx512vnni,avx512bw"),
@@ -384,7 +384,7 @@ def k5q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp :
     }
 }
 
-[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8, nrsplit = 2),
+[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8), tune_perm(mr = 8, nrsplit = 2),
  tune_perm(dot = "maddubs", width = 256, mr = 8, requires = "avx2"), tune_perm(dot = "maddubs", width = 256, mr = 8, nrsplit = 2, requires = "avx2"),
  tune_perm(dot = "vpdpbusd", width = 256, mr = 8, requires = "avxvnni|avx512vnni"), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, nrsplit = 2, requires = "avxvnni|avx512vnni"),
  tune_perm(dot = "vpdpbusd", width = 512, mr = 16, requires = "avx512vnni,avx512bw"), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, nrsplit = 2, requires = "avx512vnni,avx512bw"),
@@ -404,7 +404,7 @@ def k6q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp :
     }
 }
 
-[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8, nrsplit = 2),
+[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8), tune_perm(mr = 8, nrsplit = 2),
  tune_perm(dot = "maddubs", width = 256, mr = 8, requires = "avx2"), tune_perm(dot = "maddubs", width = 256, mr = 8, nrsplit = 2, requires = "avx2"),
  tune_perm(dot = "vpdpbusd", width = 256, mr = 8, requires = "avxvnni|avx512vnni"), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, nrsplit = 2, requires = "avxvnni|avx512vnni"),
  tune_perm(dot = "vpdpbusd", width = 512, mr = 16, requires = "avx512vnni,avx512bw"), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, nrsplit = 2, requires = "avx512vnni,avx512bw"),
