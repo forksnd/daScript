@@ -2111,6 +2111,45 @@ def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int6
     return true
 }
 
+//! Resident prefill: embed all `npos` prompt tokens, build per-position rope rows, run the batched
+//! forward on device -> the LAST token's logits in s.logits, and the mirror filled for [0, npos).
+//! Returns false when the driver isn't armed (caller keeps the CPU prefill path).
+def resident_prefill(t : Model; var s : Session; tokens : array<int64>; npos : int64) : bool {
+    if (!g_rdec_active) {
+        return false
+    }
+    let c = t.config
+    let dim = c.dim
+    let hs = layer_head_size(c, 0l)
+    let half = hs / 2l
+    var xb : array<float>
+    xb |> resize(int(npos * dim))
+    var cb : array<float>
+    cb |> resize(int(npos * hs))
+    for (p in range64(npos)) {
+        unsafe {
+            embed_row(t, tokens[p], addr(xb[p * dim]))
+        }
+        if (c.embed_scale != 1.0) {
+            scale_inplace(unsafe(addr(xb[p * dim])), c.embed_scale, dim)
+        }
+        let theta = c.rope_freq_base
+        for (j in range64(half)) {
+            var freq = 1.0 / pow(theta, float(2l * j) / float(hs))
+            if (!empty(t.rope_freqs)) {
+                freq /= t.rope_freqs[j]
+            }
+            let ang = float(p) * freq * c.rope_freq_scale
+            cb[int(p * hs + j)] = cos(ang) * c.rope_mscale
+            cb[int(p * hs + half + j)] = sin(ang) * c.rope_mscale
+        }
+    }
+    rdec_prefill(xb, cb, npos, s.logits)
+    delete xb
+    delete cb
+    return true
+}
+
 [init]
 def resident_driver_register() {
     register_decode_override("vulkan", @@vulkan_resident_decode)
