@@ -189,14 +189,18 @@ def private bench_worker(daslang_bin, lcpp_bin, model_path : string; threads : i
         rc = run_and_capture(args, out, 3600.0)
     }
     delete args
+    if (rc != 0) {   // child died — check rc BEFORE parsing so js is never allocated (and leaked) on the failure path
+        bench_emit(events, 2, "bench failed (rc={rc}) — tail: {slice(out, max(0, length(out) - 300))}")
+        return
+    }
     var record_text = ""
     if (stat(record_path).is_valid) {
         record_text = fread(record_path)
     }
     var jerr = ""
     var js = read_json(record_text, jerr)
-    if (rc != 0 || js == null) {
-        bench_emit(events, 2, "bench failed (rc={rc}) — tail: {slice(out, max(0, length(out) - 300))}")
+    if (js == null) {   // rc==0 but the record didn't materialize or parse (see bench_worker's remove-before-launch)
+        bench_emit(events, 2, "bench failed (rc={rc}, no parseable record) — tail: {slice(out, max(0, length(out) - 300))}")
         return
     }
     var ours_pp = 0.0lf
