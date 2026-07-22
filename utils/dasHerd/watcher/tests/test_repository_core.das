@@ -77,6 +77,15 @@ def test_repository_untracked_diff_contract(t : T?) {
         t |> equal(argv[10], "--unified=3")
         t |> equal(argv[length(argv) - 1], "staged.das")
 
+        let clean_file = GitFileState(code = "  ", path = "clean.das")
+        let clean_error = repository_build_file_diff_argv(
+            "D:/Work/tree", clean_file, "working", argv,
+            expected_exit_code)
+        t |> equal(clean_error, "",
+            "working inspection permits files with an empty diff")
+        t |> equal(expected_exit_code, 0l)
+        t |> equal(argv[length(argv) - 1], "clean.das")
+
         let full_error = repository_build_file_diff_argv(
             "D:/Work/tree", staged_file, "staged", argv,
             expected_exit_code, "full")

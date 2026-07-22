@@ -358,11 +358,12 @@ def public repository_build_file_diff_argv(worktree_path : string;
     delete argv
     expected_exit_code = 0l
     let staged = file.code != "??" && byte_at(file.code, 0) != ' '
-    let working = file.code == "??" || byte_at(file.code, 1) != ' '
     if (comparison == "staged" && !staged) return "file has no staged change"
-    if (comparison == "working" && !working) return "file has no working-tree change"
     if (comparison != "staged" && comparison != "working") {
         return "comparison is not implemented"
+    }
+    if (!repository_valid_relative_file_path(file.path)) {
+        return "invalid worktree-relative file path"
     }
     var context_lines = 3
     if (diff_context == "expanded") {
@@ -570,7 +571,20 @@ def public repository_file_diff_argv(repository_id : string;
             break
         }
     }
-    if (file_index < 0) return "file is not present in the observed Git status"
+    if (file_index < 0) {
+        if (comparison != "working") {
+            return "file is not present in the observed Git status"
+        }
+        var absolute_path = ""
+        let path_error = repository_working_preview_path(
+            worktree_path, file_path, absolute_path)
+        if (!empty(path_error)) return path_error
+        var clean_file = GitFileState(
+            worktree_path = worktree_path, code = "  ", path = file_path)
+        return repository_build_file_diff_argv(
+            worktree_path, clean_file, comparison, argv, expected_exit_code,
+            diff_context)
+    }
     let file = runtime.snapshot.files[file_index]
     return repository_build_file_diff_argv(
         worktree_path, file, comparison, argv, expected_exit_code,
@@ -743,15 +757,7 @@ def public repository_working_file_text(repository_id : string;
         return "unknown repository"
     }
     let runtime = g_repositories[repository_index]
-    var file_found = false
-    for (file in runtime.snapshot.files) {
-        if (file.worktree_path == worktree_path && file.path == file_path
-                && (file.code == "??" || byte_at(file.code, 1) != ' ')) {
-            file_found = true
-            break
-        }
-    }
-    if (!file_found) return "file has no observed working-tree change"
+    if (find_worktree(runtime, worktree_path) < 0) return "unknown worktree"
     var absolute_path = ""
     let path_error = repository_working_preview_path(
         worktree_path, file_path, absolute_path)
@@ -772,15 +778,7 @@ def public repository_working_file_bytes(repository_id : string;
         return "unknown repository"
     }
     let runtime = g_repositories[repository_index]
-    var file_found = false
-    for (file in runtime.snapshot.files) {
-        if (file.worktree_path == worktree_path && file.path == file_path
-                && (file.code == "??" || byte_at(file.code, 1) != ' ')) {
-            file_found = true
-            break
-        }
-    }
-    if (!file_found) return "file has no observed working-tree change"
+    if (find_worktree(runtime, worktree_path) < 0) return "unknown worktree"
     var absolute_path = ""
     let path_error = repository_working_preview_path(
         worktree_path, file_path, absolute_path)

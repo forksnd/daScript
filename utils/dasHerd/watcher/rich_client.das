@@ -206,8 +206,6 @@ struct private GitInspectorState {
     old_document : TextSourceDocument = TextSourceDocument()
     new_document : TextSourceDocument = TextSourceDocument()
     view_document : TextSourceDocument = TextSourceDocument()
-    focus_new_document : TextSourceDocument = TextSourceDocument()
-    focus_view_document : TextSourceDocument = TextSourceDocument()
     focus_document_valid : bool
     focus_start_byte : int = -1
     old_view : TextSourceViewState = TextSourceViewState()
@@ -262,9 +260,11 @@ var private g_selected_repository_id : string
 var private g_focus_terminal_pending = false
 var private g_active_focus_message = ""
 var private g_active_focus_target = -1
+var private g_active_focus_range = -1
 var private g_focus_visible = true
 var private g_pending_focus_scroll = false
 var private g_focus_view_scroll_pending = false
+var private g_focus_view_scroll_y = 0.0f
 var private g_last_human_request = ""
 var private g_applied_focus_identity = ""
 var private g_requested_history_commit : string
@@ -301,12 +301,31 @@ var private WORKTREE_SEPARATOR : table<int; EmptyMarkerState>
 var private GIT_GROUP_SEPARATOR : table<int; EmptyMarkerState>
 var private GIT_GROUP_SPACING : table<int; EmptyMarkerState>
 var private GIT_HOVER_TOOLTIP : NarrativeState
+var private FOCUS_HINT_TOOLTIP : NarrativeState
 var private GIT_CHANGELIST_STATUS_TEXT : NarrativeState
 var private GIT_ACTIVITY_STATUS_TEXT : NarrativeState
 var private GIT_CHANGELIST_STATUS_SEPARATOR : EmptyMarkerState
 var private GIT_ACTIVITY_STATUS_SEPARATOR : EmptyMarkerState
 var private INSPECTOR_STATUS_TEXT : NarrativeState
 var private INSPECTOR_STATUS_SEPARATOR : EmptyMarkerState
+var private REPOSITORY_ERROR_POPUP : table<int; PopupContextItemState>
+var private REPOSITORY_ERROR_COPY : table<int; ToggleState>
+var private REPOSITORY_ERROR_SEND : table<int; ToggleState>
+var private CHANGELIST_ERROR_POPUP : PopupContextItemState
+var private CHANGELIST_ERROR_COPY : ToggleState
+var private CHANGELIST_ERROR_SEND : ToggleState
+var private ACTIVITY_ERROR_POPUP : PopupContextItemState
+var private ACTIVITY_ERROR_COPY : ToggleState
+var private ACTIVITY_ERROR_SEND : ToggleState
+var private INSPECTOR_ERROR_POPUP : PopupContextItemState
+var private INSPECTOR_ERROR_COPY : ToggleState
+var private INSPECTOR_ERROR_SEND : ToggleState
+var private CLIENT_ERROR_POPUP : PopupContextItemState
+var private CLIENT_ERROR_COPY : ToggleState
+var private CLIENT_ERROR_SEND : ToggleState
+var private PREVIEW_ERROR_POPUP : PopupContextItemState
+var private PREVIEW_ERROR_COPY : ToggleState
+var private PREVIEW_ERROR_SEND : ToggleState
 
 def private setup_default_layout(dock_id : uint) {
     DockBuilderRemoveNode(dock_id)
@@ -325,8 +344,12 @@ def private setup_default_layout(dock_id : uint) {
     var changelist_id : uint = 0u
     var activity_id : uint = 0u
     DockBuilderSplitNode(git_id, ImGuiDir.Up, 0.35f, changelist_id, activity_id)
-    DockBuilderDockWindow("Sessions & Activity", left_id)
-    DockBuilderDockWindow("Repositories & Worktrees", left_id)
+    var repositories_id : uint = 0u
+    var sessions_id : uint = 0u
+    DockBuilderSplitNode(left_id, ImGuiDir.Down, 0.42f,
+        sessions_id, repositories_id)
+    DockBuilderDockWindow("Sessions & Activity###SessionsActivity", sessions_id)
+    DockBuilderDockWindow("Repositories & Worktrees", repositories_id)
     DockBuilderDockWindow("Git Changelist", changelist_id)
     DockBuilderDockWindow("Git Activity", activity_id)
     DockBuilderDockWindow("File Inspector", inspector_id)
@@ -382,8 +405,6 @@ def private release_inspector_content() {
     text_source_document_dispose(g_inspector.old_document)
     text_source_document_dispose(g_inspector.new_document)
     text_source_document_dispose(g_inspector.view_document)
-    text_source_document_dispose(g_inspector.focus_new_document)
-    text_source_document_dispose(g_inspector.focus_view_document)
     g_inspector.focus_document_valid = false
     g_inspector.focus_start_byte = -1
     markdown_view_dispose(g_inspector.markdown_view)
@@ -397,6 +418,7 @@ def private release_inspector_content() {
     g_inspector.preview_byte_count = 0
     g_inspector.preview_error = ""
     g_inspector.diff_scroll_y = 0.0f
+    g_focus_view_scroll_y = 0.0f
     g_inspector.diff_scroll_jump_pending = false
     g_inspector.diff_current_hunk = 0
     g_inspector.diff_left_rect = float4()
@@ -948,6 +970,37 @@ class private WatcherRichClient : HvWebSocketClient {
         send(payload)
     }
 
+    def post_error_request(context, message : string) {
+        if (!connected || empty(selected_id) || empty(message)) return
+        let subject = "{context}: {message}"
+        var focus_json = ("\"focus\":\{\"summary\":" +
+            "{sprint_json(subject, false)},\"targets\":[]\}")
+        if (!empty(g_inspector.installed_repository_id)
+                && !empty(g_inspector.installed_worktree_path)
+                && !empty(g_inspector.installed_file_path)) {
+            focus_json = ("\"focus\":\{" +
+                "\"repository_id\":{sprint_json(g_inspector.installed_repository_id, false)}," +
+                "\"worktree_path\":{sprint_json(g_inspector.installed_worktree_path, false)}," +
+                "\"comparison\":{sprint_json(g_inspector.installed_comparison, false)}," +
+                "\"revision\":{sprint_json(g_inspector.installed_git_revision, false)}," +
+                "\"summary\":{sprint_json(subject, false)},\"targets\":[\{" +
+                "\"file_path\":{sprint_json(g_inspector.installed_file_path, false)}," +
+                "\"whole_file\":true,\"ranges\":[]\}]\}")
+        }
+        send(("\{\"op\":\"mailbox_post\",\"session_id\":" +
+            "{sprint_json(selected_id, false)},\"direction\":\"inbox\"," +
+            "\"sender\":\"human:local\",\"kind\":\"error\"," +
+            "\"subject\":{sprint_json(subject, false)},\"notify\":true," +
+            "{focus_json}\}"))
+    }
+
+    def acknowledge_mailbox(message_id : string) {
+        if (!connected || empty(selected_id) || empty(message_id)) return
+        send("\{\"op\":\"mailbox_state\",\"session_id\":" +
+            "{sprint_json(selected_id, false)},\"message_id\":" +
+            "{sprint_json(message_id, false)},\"status\":\"acknowledged\"\}")
+    }
+
     def send_input(text : string) {
         if (!controls || empty(text)) return
         send("\{\"op\":\"input\",\"text\":{sprint_json(text, false)}\}")
@@ -1018,6 +1071,80 @@ def private selected_session_label() : string {
     return g_client.selected_id
 }
 
+def private pending_attention_count() : int {
+    var count = 0
+    if (g_client != null) {
+        for (message in g_client.mailbox) {
+            if (message.direction == "outbox" && message.status == "new") count++
+        }
+    }
+    return count
+}
+
+def private first_focus_range(target : WatcherFocusTarget const) : int {
+    var result = -1
+    for (index in range(length(target.ranges))) {
+        if (result < 0 || target.ranges[index].start_byte
+                < target.ranges[result].start_byte) {
+            result = index
+        }
+    }
+    return result
+}
+
+def private activate_focus_target(message : WatcherMailboxMessage const;
+                                  target_index : int) {
+    if (g_client == null || target_index < 0
+            || target_index >= length(message.focus.targets)) return
+    let target & = unsafe(message.focus.targets[target_index])
+    g_active_focus_message = message.id
+    g_active_focus_target = target_index
+    g_active_focus_range = first_focus_range(target)
+    g_focus_visible = true
+    g_pending_focus_scroll = true
+    g_applied_focus_identity = ""
+    let selection_changed = (g_selected_repository_id
+            != message.focus.repository_id
+        || g_selected_worktree_path != message.focus.worktree_path)
+    g_selected_repository_id = message.focus.repository_id
+    g_selected_worktree_path = message.focus.worktree_path
+    if (message.status == "new") g_client->acknowledge_mailbox(message.id)
+    if (selection_changed) {
+        g_client->refresh_repository(message.focus.repository_id)
+        g_client->request_repository_review(message.focus.repository_id,
+            message.focus.worktree_path)
+        g_client->request_repository_history(message.focus.repository_id,
+            message.focus.worktree_path)
+        g_client->request_repository_refs(message.focus.repository_id,
+            message.focus.worktree_path)
+    }
+    g_client->inspect_file(message.focus.repository_id,
+        message.focus.worktree_path, target.file_path,
+        message.focus.comparison, "full", message.focus.revision)
+    FILE_INSPECTOR_WIN.open = true
+    FILE_INSPECTOR_WIN.pending_raise = true
+}
+
+def private draw_error_context(var popup_state : PopupContextItemState;
+                               var copy_state : ToggleState;
+                               var send_state : ToggleState;
+                               popup_id, context, message : string) {
+    popup_context_item(popup_state,
+            (str_id = popup_id, flags = ImGuiPopupFlags.MouseButtonRight)) {
+        if (menu_item(copy_state, (text = "Copy error"))) {
+            let copied = clipboard_set_text(message)
+            g_status = (copied == ClipboardStatus.ok
+                ? "Error copied" : "Clipboard unavailable")
+        }
+        if (menu_item(send_state, (text = "Send to session agent",
+                enabled = g_client != null && g_client.connected
+                    && !empty(g_client.selected_id)))) {
+            g_client->post_error_request(context, message)
+            g_status = "Error sent to session agent"
+        }
+    }
+}
+
 def private draw_session_list() {
     let connection = g_client != null && g_client.connected ? "connected" : "disconnected"
     text("Watcher: {connection}")
@@ -1054,12 +1181,7 @@ def private draw_session_list() {
     }
     text_disabled("Exited sessions are retained and hidden by default.")
     separator()
-    var attention_count = 0
-    if (g_client != null) {
-        for (message in g_client.mailbox) {
-            if (message.direction == "outbox") attention_count++
-        }
-    }
+    let attention_count = pending_attention_count()
     text("Attention ({attention_count})")
     text_disabled("Agent notes never navigate until you click them.")
     child(ATTENTION_CHILD, (text = "attention", size = float2(0.0f, 0.0f),
@@ -1069,37 +1191,21 @@ def private draw_session_list() {
             for (message_index in range(length(g_client.mailbox))) {
                 let message & = unsafe(g_client.mailbox[message_index])
                 if (message.direction != "outbox") continue
-                let selected_message = message.id == g_active_focus_message
-                ATTENTION_MESSAGE_ROW[message_index].value = selected_message
+                ATTENTION_MESSAGE_ROW[message_index].value = false
                 if (selectable(ATTENTION_MESSAGE_ROW[message_index],
                         (text = "{message.subject}##{message.id}"))
                         && !empty(message.focus.targets)) {
-                    g_active_focus_message = message.id
-                    g_active_focus_target = 0
-                    g_focus_visible = true
-                    g_pending_focus_scroll = true
-                    let target & = unsafe(message.focus.targets[0])
-                    g_client->inspect_file(message.focus.repository_id,
-                        message.focus.worktree_path, target.file_path,
-                        message.focus.comparison, "compact", message.focus.revision)
-                    FILE_INSPECTOR_WIN.open = true
-                    FILE_INSPECTOR_WIN.pending_raise = true
+                    activate_focus_target(message, 0)
                 }
+                ATTENTION_MESSAGE_ROW[message_index].value = false
+                let selected_message = message.id == g_active_focus_message
                 for (target_index in range(length(message.focus.targets))) {
                     let target & = unsafe(message.focus.targets[target_index])
                     ATTENTION_TARGET_ROW[target_row].value = (selected_message
                         && target_index == g_active_focus_target)
                     if (selectable(ATTENTION_TARGET_ROW[target_row],
                             (text = "  {target.file_path}##{message.id}:{target_index}"))) {
-                        g_active_focus_message = message.id
-                        g_active_focus_target = target_index
-                        g_focus_visible = true
-                        g_pending_focus_scroll = true
-                        g_client->inspect_file(message.focus.repository_id,
-                            message.focus.worktree_path, target.file_path,
-                            message.focus.comparison, "compact", message.focus.revision)
-                        FILE_INSPECTOR_WIN.open = true
-                        FILE_INSPECTOR_WIN.pending_raise = true
+                        activate_focus_target(message, target_index)
                     }
                     target_row++
                 }
@@ -1188,7 +1294,9 @@ def private draw_main_menu() {
                 open_dock_window(REPOSITORIES_WIN)
             }
             if (menu_label(VIEW_SESSIONS,
-                    (text = "Sessions & Activity", selected = SESSIONS_WIN.open))) {
+                    (text = pending_attention_count() > 0
+                        ? "Sessions & Activity  [{pending_attention_count()}]"
+                        : "Sessions & Activity", selected = SESSIONS_WIN.open))) {
                 open_dock_window(SESSIONS_WIN)
             }
             if (menu_label(VIEW_GIT_CHANGELIST,
@@ -1248,6 +1356,11 @@ def private draw_repositories_window() {
             if (!empty(repository.error)) {
                 text_colored(REPOSITORY_ERROR[repository_row], (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
                     text = repository.error))
+                draw_error_context(REPOSITORY_ERROR_POPUP[repository_row],
+                    REPOSITORY_ERROR_COPY[repository_row],
+                    REPOSITORY_ERROR_SEND[repository_row],
+                    "repository_error_{repository_row}", "Repository",
+                    repository.error)
             }
             for (worktree in repository.worktrees) {
                 var branch = worktree.branch
@@ -2150,6 +2263,11 @@ def private draw_git_changelist_window() {
     separator(GIT_CHANGELIST_STATUS_SEPARATOR)
     text_colored(GIT_CHANGELIST_STATUS_TEXT,
         (color = git_status_color(status), text = status.text))
+    if (status.error) {
+        draw_error_context(CHANGELIST_ERROR_POPUP, CHANGELIST_ERROR_COPY,
+            CHANGELIST_ERROR_SEND, "changelist_error", "Git Changelist",
+            status.text)
+    }
 }
 
 def private draw_git_activity_window() {
@@ -2189,6 +2307,11 @@ def private draw_git_activity_window() {
     separator(GIT_ACTIVITY_STATUS_SEPARATOR)
     text_colored(GIT_ACTIVITY_STATUS_TEXT,
         (color = git_status_color(status), text = status.text))
+    if (status.error) {
+        draw_error_context(ACTIVITY_ERROR_POPUP, ACTIVITY_ERROR_COPY,
+            ACTIVITY_ERROR_SEND, "activity_error", "Git Activity",
+            status.text)
+    }
 }
 
 def private source_view_style(diff_background : bool = false) : TextSourceViewStyle {
@@ -2238,6 +2361,11 @@ def private draw_binary_preview() {
             (text = empty(g_inspector.preview_error)
                 ? "Preview unavailable"
                 : "Preview unavailable: {g_inspector.preview_error}"))
+        if (!empty(g_inspector.preview_error)) {
+            draw_error_context(PREVIEW_ERROR_POPUP, PREVIEW_ERROR_COPY,
+                PREVIEW_ERROR_SEND, "preview_error", "File Preview",
+                g_inspector.preview_error)
+        }
         return
     }
     text_disabled(INSPECTOR_BINARY_DIMENSIONS,
@@ -2398,16 +2526,11 @@ def private draw_side_by_side_diff() {
         }
         text_disabled("AFTER")
         separator()
-        var result = TextSourceViewResult()
-        if (g_inspector.focus_document_valid) {
-            var style = focus_source_view_style(true)
-            result <- text_source_view("git diff after",
-                g_inspector.focus_new_document, g_inspector.new_view, style)
-        } else {
-            var style = source_view_style(true)
-            result <- text_source_view("git diff after", g_inspector.new_document,
-                g_inspector.new_view, style)
-        }
+        var style = source_view_style(true)
+        let result <- text_source_view("git diff after", g_inspector.new_document,
+            g_inspector.new_view, style)
+        draw_active_focus_overlay(g_inspector.new_view,
+            g_inspector.new_document, true)
         if (result.selection_context_requested) {
             open_popup(DIFF_SELECTION_POPUP)
         }
@@ -2418,8 +2541,11 @@ def private draw_side_by_side_diff() {
                     (text = "Look at that", enabled = g_client != null
                         && g_client.connected && !empty(g_client.selected_id)
                         && selection.end_byte > selection.start_byte))) {
-                g_client->post_selection_request(
-                    selection.start_byte, selection.end_byte)
+                let canonical_start = diff_byte_to_view_byte(
+                    selection.start_byte, false)
+                let canonical_end = diff_byte_to_view_byte(
+                    selection.end_byte, true)
+                g_client->post_selection_request(canonical_start, canonical_end)
                 close_current_popup(DIFF_SELECTION_POPUP)
             }
         }
@@ -2450,19 +2576,14 @@ def private draw_file_view() {
                 max(1.0f, 2.0f * float(g_zoom_percent) / 100.0f))
         } else {
             if (g_focus_view_scroll_pending) {
-                SetScrollY(max(0.0f, g_inspector.diff_scroll_y))
+                SetScrollY(max(0.0f, g_focus_view_scroll_y))
                 g_focus_view_scroll_pending = false
             }
-            var result = TextSourceViewResult()
-            if (g_inspector.focus_document_valid) {
-                var style = focus_source_view_style(false)
-                result <- text_source_view("git file view",
-                    g_inspector.focus_view_document, g_inspector.view, style)
-            } else {
-                var style = source_view_style(false)
-                result <- text_source_view("git file view",
-                    g_inspector.view_document, g_inspector.view, style)
-            }
+            var style = source_view_style(false)
+            let result <- text_source_view("git file view",
+                g_inspector.view_document, g_inspector.view, style)
+            draw_active_focus_overlay(g_inspector.view,
+                g_inspector.view_document, false)
             if (result.selection_context_requested) {
                 open_popup(INSPECTOR_SELECTION_POPUP)
             }
@@ -2857,8 +2978,8 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         new_line_number_count = length(g_inspector.new_document.line_numbers),
         view_line_mark_count = length(g_inspector.view_document.line_marks),
         focus_document_valid = g_inspector.focus_document_valid,
-        focus_new_marker_count = g_inspector.focus_new_document.marker_count,
-        focus_view_marker_count = g_inspector.focus_view_document.marker_count,
+        focus_new_marker_count = 0,
+        focus_view_marker_count = 0,
         focus_start_byte = g_inspector.focus_start_byte,
         changed_source_range_count = length(g_inspector.changed_source_ranges),
         old_syntax_span_count = length(g_inspector.old_document.spans),
@@ -2986,13 +3107,6 @@ def private file_inspector_status() : GitWindowStatus {
     return GitWindowStatus(text = "Select a changed file")
 }
 
-def private focus_source_view_style(diff_background : bool = false) : TextSourceViewStyle {
-    var style = source_view_style(diff_background)
-    style.text_color = float4(0.30f, 0.31f, 0.33f, 1.0f)
-    style.marker_color = float4(1.0f, 0.82f, 0.38f, 1.0f)
-    return style
-}
-
 [live_command(description = "Inspect persistent, non-modal agent Attention and active Focus Set state.")]
 def herder_attention_state(_input : JsonValue?) : JsonValue? {
     var messages : array<JsonValue?>
@@ -3015,6 +3129,7 @@ def herder_attention_state(_input : JsonValue?) : JsonValue? {
         mailbox_revision = g_client != null ? g_client.mailbox_revision : 0l,
         active_message_id = g_active_focus_message,
         active_target_index = g_active_focus_target,
+        active_range_index = g_active_focus_range,
         focus_visible = g_focus_visible,
         last_human_request_id = g_last_human_request,
         messages = messages))
@@ -3032,86 +3147,234 @@ def herder_attention_open(input : JsonValue?) : JsonValue? {
                 || args.target_index >= length(message.focus.targets)) {
             return JV((ok = false, error = "target_index is out of range"))
         }
-        g_active_focus_message = message.id
-        g_active_focus_target = args.target_index
-        g_focus_visible = true
-        g_pending_focus_scroll = true
-        g_applied_focus_identity = ""
         let target & = unsafe(message.focus.targets[args.target_index])
-        g_client->inspect_file(message.focus.repository_id,
-            message.focus.worktree_path, target.file_path,
-            message.focus.comparison, "compact", message.focus.revision)
-        FILE_INSPECTOR_WIN.open = true
-        FILE_INSPECTOR_WIN.pending_raise = true
+        activate_focus_target(message, args.target_index)
         return JV((ok = true, message_id = message.id,
             target_index = args.target_index, file_path = target.file_path))
     }
     return JV((ok = false, error = "unknown attention message"))
 }
 
-def private push_focus_span(var document : TextSourceDocument;
-                            start_byte, end_byte : int; marker : bool) {
-    if (end_byte <= start_byte) return
-    var styles : TextSourceStyles
-    styles.marker = marker
-    styles.bold = marker
-    document.spans |> push(TextSourceSpan(
-        source = TextSourceRange(start_byte = start_byte, end_byte = end_byte),
-        styles = styles))
-    if (marker) {
-        document.marker_count++
+def private append_line_starts(source : string;
+                               var starts : array<int>&) {
+    delete starts
+    starts |> push(0)
+    peek_data(source) $(bytes) {
+        for (index in range(length(bytes))) {
+            if (int(bytes[index]) == '\n') starts |> push(index + 1)
+        }
     }
 }
 
-def private make_focus_document(source : TextSourceDocument const;
-                                target : WatcherFocusTarget const;
-                                revision_bias : int) : TextSourceDocument {
-    var document = TextSourceDocument(
-        source = clone_string(source.source),
-        revision = source.revision + revision_bias)
-    document.line_marks := source.line_marks
-    document.line_numbers := source.line_numbers
-    let source_length = length(source.source)
-    if (target.whole_file || empty(target.ranges)) {
-        push_focus_span(document, 0, source_length, true)
-        return <- document
+def private diff_byte_to_view_byte(diff_byte : int;
+                                   end_bias : bool) : int {
+    var inscope diff_starts : array<int>
+    var inscope view_starts : array<int>
+    append_line_starts(g_inspector.new_document.source, diff_starts)
+    append_line_starts(g_inspector.view_document.source, view_starts)
+    let clamped_byte = clamp(diff_byte, 0,
+        length(g_inspector.new_document.source))
+    var display_line = 0
+    for (index in range(length(diff_starts))) {
+        if (diff_starts[index] > clamped_byte) break
+        display_line = index
     }
-    var cursor = 0
-    while (cursor < source_length) {
-        var best_start = source_length
-        var best_end = -1
-        for (focus_range in target.ranges) {
-            let range_start = clamp(focus_range.start_byte, 0, source_length)
-            let range_end = clamp(focus_range.end_byte, 0, source_length)
-            if (range_end <= cursor || range_end <= range_start) continue
-            if (range_start < best_start) {
-                best_start = range_start
-                best_end = range_end
-            } elif (range_start == best_start) {
-                best_end = max(best_end, range_end)
+    if (display_line < 0
+            || display_line >= length(g_inspector.new_document.line_numbers)) return -1
+    var source_line = g_inspector.new_document.line_numbers[display_line]
+    if (source_line <= 0 && end_bias) {
+        var scan = display_line - 1
+        while (scan >= 0) {
+            source_line = g_inspector.new_document.line_numbers[scan]
+            if (source_line > 0) break
+            scan--
+        }
+    }
+    if (source_line <= 0 || source_line > length(view_starts)) return -1
+    let column = max(0, clamped_byte - diff_starts[display_line])
+    let line_start = view_starts[source_line - 1]
+    let line_end = (source_line < length(view_starts)
+        ? max(line_start, view_starts[source_line] - 1)
+        : length(g_inspector.view_document.source))
+    return min(line_end, line_start + column)
+}
+
+def private focus_intersects(target : WatcherFocusTarget const;
+                             start_byte, end_byte : int) : bool {
+    if (target.whole_file || empty(target.ranges)) return true
+    for (focus_range in target.ranges) {
+        if (focus_range.end_byte > start_byte
+                && focus_range.start_byte < end_byte) return true
+    }
+    return false
+}
+
+def private focus_caption(target : WatcherFocusTarget const;
+                          start_byte, end_byte : int) : string {
+    for (focus_range in target.ranges) {
+        if (!empty(focus_range.caption)
+                && focus_range.end_byte > start_byte
+                && focus_range.start_byte < end_byte) {
+            return focus_range.caption
+        }
+    }
+    return ""
+}
+
+def private mouse_inside(p0, p1 : float2) : bool {
+    let mouse = GetMousePos()
+    return (mouse.x >= p0.x && mouse.x <= p1.x
+        && mouse.y >= p0.y && mouse.y <= p1.y)
+}
+
+def private draw_focus_target_overlay(target : WatcherFocusTarget const;
+                                      state : TextSourceViewState const;
+                                      document : TextSourceDocument const;
+                                      diff_mapping : bool) {
+    var inscope display_starts : array<int>
+    var inscope view_starts : array<int>
+    if (diff_mapping) {
+        append_line_starts(document.source, display_starts)
+        append_line_starts(g_inspector.view_document.source, view_starts)
+    }
+    let dim_color = GetColorU32(float4(0.015f, 0.018f, 0.024f, 0.48f))
+    let focus_fill = GetColorU32(float4(1.0f, 0.72f, 0.18f, 0.13f))
+    let focus_outline = GetColorU32(float4(1.0f, 0.76f, 0.24f, 0.92f))
+    let clip_min = GetWindowPos()
+    let clip_max = clip_min + GetWindowSize()
+    var hover_caption = ""
+    with_window_drawlist() $(var dl) {
+        dl |> with_drawlist_clip_rect(clip_min, clip_max, true) {
+            if (state.virtual_mode && !empty(state.virtual_line_starts)) {
+                let line_height = (state.screen_size.y
+                    / float(length(state.virtual_line_starts)))
+                for (line_index in range(length(state.virtual_line_starts))) {
+                    let display_start = state.virtual_line_starts[line_index]
+                    let display_end = (line_index + 1 < length(state.virtual_line_starts)
+                        ? max(display_start,
+                            state.virtual_line_starts[line_index + 1] - 1)
+                        : length(document.source))
+                    var source_start = display_start
+                    var source_end = display_end
+                    var mapped = !diff_mapping
+                    if (diff_mapping && line_index < length(document.line_numbers)) {
+                        let source_line = document.line_numbers[line_index]
+                        if (source_line > 0 && source_line <= length(view_starts)) {
+                            source_start = view_starts[source_line - 1]
+                            source_end = (source_line < length(view_starts)
+                                ? max(source_start, view_starts[source_line] - 1)
+                                : length(g_inspector.view_document.source))
+                            mapped = true
+                        }
+                    }
+                    let y0 = state.screen_origin.y + float(line_index) * line_height
+                    let p0 = float2(state.screen_origin.x, y0)
+                    let p1 = float2(state.screen_origin.x + state.screen_size.x,
+                        y0 + line_height)
+                    if (p1.y < clip_min.y || p0.y > clip_max.y) continue
+                    let focused = mapped && focus_intersects(target,
+                        source_start, max(source_start + 1, source_end))
+                    if (!focused) {
+                        dl |> add_rect_filled(p0, p1, dim_color)
+                    } else {
+                        dl |> add_rect_filled(p0, p1, focus_fill)
+                        let marker_right = state.screen_origin.x
+                            - max(2.0f, GetStyle().ItemSpacing.x * 0.35f)
+                        dl |> add_rect_filled(
+                            float2(marker_right - 3.0f, p0.y),
+                            float2(marker_right, p1.y), focus_outline)
+                        let caption = focus_caption(target,
+                            source_start, max(source_start + 1, source_end))
+                        if (empty(hover_caption) && !empty(caption)
+                                && mouse_inside(p0, p1)) {
+                            hover_caption = caption
+                        }
+                    }
+                }
+                return
+            }
+            var last_focused_line = -1
+            for (cell in state.cells) {
+                var source_start = cell.source.start_byte
+                var source_end = cell.source.end_byte
+                var mapped = !diff_mapping
+                if (diff_mapping && cell.line_index >= 0
+                        && cell.line_index < length(document.line_numbers)
+                        && cell.line_index < length(display_starts)) {
+                    let source_line = document.line_numbers[cell.line_index]
+                    if (source_line > 0 && source_line <= length(view_starts)) {
+                        let canonical_line_start = view_starts[source_line - 1]
+                        let canonical_line_end = (source_line < length(view_starts)
+                            ? max(canonical_line_start, view_starts[source_line] - 1)
+                            : length(g_inspector.view_document.source))
+                        source_start = min(canonical_line_end,
+                            canonical_line_start + max(0,
+                                cell.source.start_byte - display_starts[cell.line_index]))
+                        source_end = min(canonical_line_end,
+                            canonical_line_start + max(0,
+                                cell.source.end_byte - display_starts[cell.line_index]))
+                        mapped = true
+                    }
+                }
+                let p0 = state.screen_origin + float2(cell.rect.x, cell.rect.y)
+                let p1 = state.screen_origin + float2(cell.rect.z, cell.rect.w)
+                let focused = mapped && focus_intersects(target,
+                    source_start, max(source_start + 1, source_end))
+                if (!focused) {
+                    dl |> add_rect_filled(p0, p1, dim_color)
+                } else {
+                    dl |> add_rect_filled(p0, p1, focus_fill)
+                    if (cell.line_index != last_focused_line) {
+                        let marker_right = state.screen_origin.x
+                            - max(2.0f, GetStyle().ItemSpacing.x * 0.35f)
+                        dl |> add_rect_filled(
+                            float2(marker_right - 3.0f, p0.y),
+                            float2(marker_right, p1.y), focus_outline)
+                        last_focused_line = cell.line_index
+                    }
+                    let caption = focus_caption(target,
+                        source_start, max(source_start + 1, source_end))
+                    let hover_p0 = float2(state.screen_origin.x, p0.y)
+                    let hover_p1 = float2(state.screen_origin.x
+                        + state.screen_size.x, p1.y)
+                    if (empty(hover_caption) && !empty(caption)
+                            && mouse_inside(hover_p0, hover_p1)) {
+                        hover_caption = caption
+                    }
+                }
             }
         }
-        if (best_end < 0) {
-            push_focus_span(document, cursor, source_length, false)
-            break
-        }
-        push_focus_span(document, cursor, max(cursor, best_start), false)
-        let marked_start = max(cursor, best_start)
-        push_focus_span(document, marked_start, best_end, true)
-        cursor = best_end
     }
-    return <- document
+    if (!empty(hover_caption)) {
+        set_tooltip(FOCUS_HINT_TOOLTIP, hover_caption)
+    }
+}
+
+def private draw_active_focus_overlay(state : TextSourceViewState const;
+                                      document : TextSourceDocument const;
+                                      diff_mapping : bool) {
+    if (!g_inspector.focus_document_valid || g_client == null) return
+    for (message in g_client.mailbox) {
+        if (message.id != g_active_focus_message
+                || g_active_focus_target < 0
+                || g_active_focus_target >= length(message.focus.targets)) continue
+        let target & = unsafe(message.focus.targets[g_active_focus_target])
+        if (target.file_path == g_inspector.installed_file_path) {
+            draw_focus_target_overlay(target, state, document, diff_mapping)
+        }
+        return
+    }
 }
 
 def private apply_active_focus() {
     if (g_client == null) return
     let identity = ("{g_active_focus_message}:{g_active_focus_target}:" +
+        "{g_active_focus_range}:" +
         "{g_focus_visible}:{g_inspector.revision}:{g_inspector.installed_file_path}")
     if (identity == g_applied_focus_identity && !g_pending_focus_scroll) return
-    text_source_document_dispose(g_inspector.focus_view_document)
-    text_source_document_dispose(g_inspector.focus_new_document)
     g_inspector.focus_document_valid = false
     g_inspector.focus_start_byte = -1
+    var matched_target = false
     if (g_focus_visible && !empty(g_active_focus_message)) {
         for (message in g_client.mailbox) {
             if (message.id != g_active_focus_message
@@ -3119,13 +3382,15 @@ def private apply_active_focus() {
                     || g_active_focus_target >= length(message.focus.targets)) continue
             let target & = unsafe(message.focus.targets[g_active_focus_target])
             if (target.file_path != g_inspector.installed_file_path) continue
-            g_inspector.focus_view_document <- make_focus_document(
-                g_inspector.view_document, target, 1000001)
-            g_inspector.focus_new_document <- make_focus_document(
-                g_inspector.new_document, target, 1000002)
+            matched_target = true
             g_inspector.focus_document_valid = true
             if (!empty(target.ranges)) {
-                g_inspector.focus_start_byte = target.ranges[0].start_byte
+                if (g_active_focus_range < 0
+                        || g_active_focus_range >= length(target.ranges)) {
+                    g_active_focus_range = first_focus_range(target)
+                }
+                g_inspector.focus_start_byte = target.ranges[
+                    g_active_focus_range].start_byte
             } else {
                 g_inspector.focus_start_byte = 0
             }
@@ -3139,30 +3404,101 @@ def private apply_active_focus() {
                         }
                     }
                 }
-                g_inspector.diff_scroll_y = (float(line_index)
-                    * GetTextLineHeight())
+                var diff_row = line_index
+                for (row_index in range(length(g_inspector.parsed.rows))) {
+                    if (g_inspector.parsed.rows[row_index].new_line
+                            == line_index + 1) {
+                        diff_row = row_index
+                        break
+                    }
+                }
+                let diff_line_height = max(GetTextLineHeight(),
+                    g_inspector.new_view.key.line_height)
+                let view_line_height = max(GetTextLineHeight(),
+                    g_inspector.view.key.line_height)
+                g_inspector.diff_scroll_y = (float(max(0, diff_row - 1))
+                    * diff_line_height)
+                g_focus_view_scroll_y = (float(max(0, line_index - 1))
+                    * view_line_height)
                 g_inspector.diff_scroll_jump_pending = true
                 g_focus_view_scroll_pending = true
             }
             break
         }
     }
-    g_pending_focus_scroll = false
-    g_applied_focus_identity = identity
+    if (!g_pending_focus_scroll || matched_target) {
+        g_pending_focus_scroll = false
+        g_applied_focus_identity = identity
+    } else {
+        // Replacement inspection keeps the old document alive. Do not consume
+        // the one-shot navigation until the requested Focus target installs.
+        g_applied_focus_identity = ""
+    }
 }
 
 def private navigate_active_focus(delta : int) {
     if (g_client == null || empty(g_active_focus_message)) return
     for (message in g_client.mailbox) {
         if (message.id != g_active_focus_message || empty(message.focus.targets)) continue
-        g_active_focus_target = (g_active_focus_target + delta
+        let target_index = (g_active_focus_target + delta
             + length(message.focus.targets)) % length(message.focus.targets)
+        activate_focus_target(message, target_index)
+        return
+    }
+}
+
+def private active_focus_range_count() : int {
+    if (g_client == null || empty(g_active_focus_message)) return 0
+    for (message in g_client.mailbox) {
+        if (message.id == g_active_focus_message
+                && g_active_focus_target >= 0
+                && g_active_focus_target < length(message.focus.targets)) {
+            return length(message.focus.targets[g_active_focus_target].ranges)
+        }
+    }
+    return 0
+}
+
+def private navigate_active_focus_range(delta : int) {
+    if (g_client == null || empty(g_active_focus_message) || delta == 0) return
+    for (message in g_client.mailbox) {
+        if (message.id != g_active_focus_message
+                || g_active_focus_target < 0
+                || g_active_focus_target >= length(message.focus.targets)) continue
         let target & = unsafe(message.focus.targets[g_active_focus_target])
+        if (empty(target.ranges)) return
+        if (g_active_focus_range < 0
+                || g_active_focus_range >= length(target.ranges)) {
+            g_active_focus_range = first_focus_range(target)
+        }
+        let current_start = target.ranges[g_active_focus_range].start_byte
+        var candidate = -1
+        for (index in range(length(target.ranges))) {
+            let start_byte = target.ranges[index].start_byte
+            if (delta > 0 && start_byte > current_start
+                    && (candidate < 0 || start_byte
+                        < target.ranges[candidate].start_byte)) {
+                candidate = index
+            } elif (delta < 0 && start_byte < current_start
+                    && (candidate < 0 || start_byte
+                        > target.ranges[candidate].start_byte)) {
+                candidate = index
+            }
+        }
+        if (candidate < 0) {
+            candidate = first_focus_range(target)
+            if (delta < 0) {
+                for (index in range(length(target.ranges))) {
+                    if (target.ranges[index].start_byte
+                            > target.ranges[candidate].start_byte) {
+                        candidate = index
+                    }
+                }
+            }
+        }
+        g_active_focus_range = candidate
         g_pending_focus_scroll = true
         g_applied_focus_identity = ""
-        g_client->inspect_file(message.focus.repository_id,
-            message.focus.worktree_path, target.file_path,
-            message.focus.comparison, "compact", message.focus.revision)
         return
     }
 }
@@ -3186,16 +3522,39 @@ def private draw_file_inspector_content() {
         (text = to_upper(g_inspector.installed_comparison)))
     if (!empty(g_active_focus_message)) {
         same_line()
-        if (small_button(FOCUS_PREVIOUS, (text = "Previous"))) {
+        if (arrow_button(FOCUS_PREVIOUS,
+                (text = "##previous-focused-file", dir = ImGuiDir.Left))) {
             navigate_active_focus(-1)
         }
+        set_item_tooltip(FOCUS_PREVIOUS_TIP,
+            (text = "Previous focused file"))
         same_line()
-        if (small_button(FOCUS_NEXT, (text = "Next"))) {
+        if (arrow_button(FOCUS_NEXT,
+                (text = "##next-focused-file", dir = ImGuiDir.Right))) {
             navigate_active_focus(1)
         }
+        set_item_tooltip(FOCUS_NEXT_TIP, (text = "Next focused file"))
+        if (active_focus_range_count() > 1) {
+            same_line()
+            if (arrow_button(FOCUS_RANGE_PREVIOUS,
+                    (text = "##previous-highlight", dir = ImGuiDir.Up))) {
+                navigate_active_focus_range(-1)
+            }
+            set_item_tooltip(FOCUS_RANGE_PREVIOUS_TIP,
+                (text = "Previous highlight in file"))
+            same_line()
+            if (arrow_button(FOCUS_RANGE_NEXT,
+                    (text = "##next-highlight", dir = ImGuiDir.Down))) {
+                navigate_active_focus_range(1)
+            }
+            set_item_tooltip(FOCUS_RANGE_NEXT_TIP,
+                (text = "Next highlight in file"))
+        }
         same_line()
-        if (small_button(FOCUS_TOGGLE,
-                (text = g_focus_visible ? "Hide focus" : "Show focus"))) {
+        if (icon_button(FOCUS_TOGGLE,
+                (glyph = g_focus_visible ? "visible" : "hidden",
+                 tip = g_focus_visible ? "Hide focus" : "Show focus",
+                 size = 16.0f))) {
             g_focus_visible = !g_focus_visible
             g_applied_focus_identity = ""
         }
@@ -3226,6 +3585,11 @@ def private draw_file_inspector_window() {
     separator(INSPECTOR_STATUS_SEPARATOR)
     text_colored(INSPECTOR_STATUS_TEXT,
         (color = git_status_color(status), text = status.text))
+    if (status.error) {
+        draw_error_context(INSPECTOR_ERROR_POPUP, INSPECTOR_ERROR_COPY,
+            INSPECTOR_ERROR_SEND, "inspector_error", "File Inspector",
+            status.text)
+    }
 }
 
 def private draw_settings_window() {
@@ -3243,6 +3607,8 @@ def private draw_terminal_window() {
     if (g_client != null && !empty(g_client.error)) {
         text_colored(CLIENT_ERROR,
             (color = float4(1.0f, 0.35f, 0.30f, 1.0f), text = g_client.error))
+        draw_error_context(CLIENT_ERROR_POPUP, CLIENT_ERROR_COPY,
+            CLIENT_ERROR_SEND, "client_error", "Watcher", g_client.error)
     }
     separator()
     let terminal_style = ImGuiTerminalStyle(
@@ -3315,7 +3681,11 @@ def update() {
                 flags = ImGuiWindowFlags.None)) {
             draw_repositories_window()
         }
-        dock_window(SESSIONS_WIN, (text = "Sessions & Activity", closable = true,
+        let attention_count = pending_attention_count()
+        let sessions_title = (attention_count > 0
+            ? "Sessions & Activity  [! {attention_count}]###SessionsActivity"
+            : "Sessions & Activity###SessionsActivity")
+        dock_window(SESSIONS_WIN, (text = sessions_title, closable = true,
                 flags = ImGuiWindowFlags.None)) {
             draw_session_list()
         }

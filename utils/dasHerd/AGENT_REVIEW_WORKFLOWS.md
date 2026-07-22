@@ -247,8 +247,10 @@ Focus Set and navigates to its first important target. The Attention panel also
 lists every file/section for direct navigation. Focus mode keeps targeted files
 and ranges ordinary/brighter while subduing unrelated PR plumbing; a toggle
 restores the normal undimmed view without discarding the set. Previous/next
-navigation walks the set's targets. The entry remains inspectable and can be
-dismissed or resolved independently.
+file navigation walks the set's targets; previous/next highlight navigation
+walks the ranges in the current file. An optional range `caption` appears as a
+hover hint explaining why that section matters. The entry remains inspectable
+and can be dismissed or resolved independently.
 
 ### Human points agent at code
 

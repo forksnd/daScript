@@ -34,9 +34,11 @@ powershell.exe -NoProfile -File utils/dasHerd/dasherd.ps1 outbox send `
 A Focus Set contains `repository_id`, `worktree_path`, `comparison`, optional
 `revision` and `summary`, and one or more file targets. Each target has
 `file_path`, `whole_file`, and zero or more `{start_byte,end_byte,caption}`
-ranges. One message may target several files and several disjoint ranges per
-file. The human receives persistent, non-modal Attention; publishing must not
-assume that their current file, scroll position, mode, or keyboard focus changed.
+ranges. `caption` is an optional short hint shown when the human hovers that
+highlight, such as `main loop` or `bug was here`. One message may target several
+files and several disjoint ranges per file. The human receives persistent,
+non-modal Attention; publishing must not assume that their current file, scroll
+position, mode, or keyboard focus changed.
 
 Use `outbox reply <inbox-id> --subject ... --focus-json ...` to preserve the
 conversation link. Inbox means human/system to agent; Outbox means agent to
