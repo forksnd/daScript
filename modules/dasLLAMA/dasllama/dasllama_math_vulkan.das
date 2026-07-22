@@ -3602,7 +3602,7 @@ def vk_rdec_set_cls(cls_block : int64; cls_fmt : int) {
     let dim = g_rd.dim
     let vocab = g_rd.vocab
     unsafe {
-        
+
         g_rd.m_prologue = rd_meta()
         g_rd.m_quant_final = rd_meta()
         g_rd.cls_meta_dev = make_device_buf(CLS_META_BYTES)
