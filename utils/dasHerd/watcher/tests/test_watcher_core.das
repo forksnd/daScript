@@ -31,6 +31,8 @@ def test_watcher_machine_output(t : T?) {
         let expanded_tabs = "1{esc}[7C2{esc}[6Cutils/dasHerd/watcher_core.das"
         t |> equal(watcher_strip_terminal_controls(expanded_tabs),
             "1       2      utils/dasHerd/watcher_core.das")
+        t |> equal(watcher_strip_terminal_controls("abc\n{esc}[5Gx"),
+            "abc\n    x", "normalized lone LF resets the synthesized text column")
         let worktrees = "worktree D:/main\r\nHEAD A\r\nbranch refs/heads/main{esc}[5;1Hworktree D:/linked\r\nHEAD B\r\nbranch refs/heads/topic"
         t |> equal(watcher_strip_terminal_controls(worktrees),
             "worktree D:/main\r\nHEAD A\r\nbranch refs/heads/main\n\nworktree D:/linked\r\nHEAD B\r\nbranch refs/heads/topic")

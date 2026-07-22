@@ -470,6 +470,7 @@ def public watcher_strip_terminal_controls(value : string) : string {
                         utf8_remaining = 0
                     } elif (byte == '\n') {
                         cursor_row++
+                        cursor_column = 1
                         utf8_remaining = 0
                     } elif (byte < 0x80) {
                         cursor_column++
