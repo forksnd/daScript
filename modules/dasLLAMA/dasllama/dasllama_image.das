@@ -25,7 +25,7 @@ require dasllama/dasllama_math   // active_kernel_backend — half the image ide
 // fields ride the meta blob via serialize_strings — raw string pointers can't be planes.
 
 // bump on ANY layout/serialization change — a mismatched image regenerates from the gguf
-let IMAGE_VERSION = 4   // v4: Model meta grew mx4_repacked (Wave C stage 4)
+let IMAGE_VERSION = 5   // v5: Model grew the deltanet projection format tags (dn kq-native planes)
 
 //! The metal (blob-only) flavor's identity tag: q8 planes ride the 34B block_q8_0 blob and the
 //! kq scale planes their GPU forms (convert_model_to_metal_blob) — flavors are per-config and

@@ -578,6 +578,11 @@ struct Model {
     we1_fmt : array<KqFmt>
     we2_fmt : array<KqFmt>
     we3_fmt : array<KqFmt>
+    // deltanet projection tags (recurrent layers; empty = all q8). CPU rail only: detect keeps
+    // these q8 whenever Metal or the GPU dn/dense tier could claim the planes (both bind dn q8)
+    dnqkv_fmt : array<KqFmt>
+    dngate_fmt : array<KqFmt>
+    dnout_fmt : array<KqFmt>
     wcls_fmt : KqFmt = KqFmt.q8
     emb_fmt : KqFmt = KqFmt.q8
     // gemma4 E-series PLE token table (per_layer_token_embd) — gather-only (whole superblock-
@@ -1033,18 +1038,18 @@ def private layout_offsets(var t : Model) : LayoutSizes {
             t.wo_offs |> push(kq_take(cur, fmt_at(t.wo_fmt, l), layer_qd(c, l) * dim))
         }
     }
-    if (c.recr_mask != 0ul) {  // deltanet big weights (recurrent layers only; kind-major regions, q8 planes)
+    if (c.recr_mask != 0ul) {  // deltanet big weights (recurrent layers only; kind-major regions; beta/alpha stay q8)
         let cd = dn_conv_dim(c)
         t.dnqkv_offs |> clear(); t.dnqkv_offs |> reserve(layers)
-        for (l in range64(layers)) { t.dnqkv_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * cd) : -1l) }
+        for (l in range64(layers)) { t.dnqkv_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, fmt_at(t.dnqkv_fmt, l), dim * cd) : -1l) }
         t.dngate_offs |> clear(); t.dngate_offs |> reserve(layers)
-        for (l in range64(layers)) { t.dngate_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * c.ssm_d_inner) : -1l) }
+        for (l in range64(layers)) { t.dngate_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, fmt_at(t.dngate_fmt, l), dim * c.ssm_d_inner) : -1l) }
         t.dnbeta_offs |> clear(); t.dnbeta_offs |> reserve(layers)
         for (l in range64(layers)) { t.dnbeta_offs |> push(layer_is_recurrent(c, l) && !t.dn_ba_f32 ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
         t.dnalpha_offs |> clear(); t.dnalpha_offs |> reserve(layers)
         for (l in range64(layers)) { t.dnalpha_offs |> push(layer_is_recurrent(c, l) && !t.dn_ba_f32 ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
         t.dnout_offs |> clear(); t.dnout_offs |> reserve(layers)
-        for (l in range64(layers)) { t.dnout_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, c.ssm_d_inner * dim) : -1l) }
+        for (l in range64(layers)) { t.dnout_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, fmt_at(t.dnout_fmt, l), c.ssm_d_inner * dim) : -1l) }
     }
     var mx = 0l
     if (c.n_expert > 0l) {
@@ -1595,6 +1600,22 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
         t.mtp_ehproj_fmt = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{t.config.n_layers}.nextn.eh_proj.weight")), 2l * t.config.dim)
         any ||= t.mtp_ehproj_fmt != KqFmt.q8
     }
+    // deltanet dn tags: CPU rail only — Metal/GPU tiers bind dn q8; grouped files have no exact transcode
+    if (t.config.recr_mask != 0ul && !t.dn_grouped
+            && get_metal_mode() == MetalMode.off
+            && !(moe_gpu_tier_installed() && (gpu_want_dense() || gpu_want_dn() || gpu_want_dnd()))) {
+        t.dnqkv_fmt |> resize(layers)
+        t.dngate_fmt |> resize(layers)
+        t.dnout_fmt |> resize(layers)
+        for (l in range64(layers)) {
+            if (layer_is_recurrent(t.config, l)) {
+                t.dnqkv_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_qkv.weight")), t.config.dim)
+                t.dngate_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_gate.weight")), t.config.dim)
+                t.dnout_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ssm_out.weight")), t.config.ssm_d_inner)
+                any ||= t.dnqkv_fmt[l] != KqFmt.q8 || t.dngate_fmt[l] != KqFmt.q8 || t.dnout_fmt[l] != KqFmt.q8
+            }
+        }
+    }
     // E-series PLE token table: gather-only whole rows; row length must be superblock-aligned
     if (has_ple(t.config) && (t.config.n_layers * t.config.n_embd_per_layer) % 256l == 0l) {
         t.ple_emb_fmt = kq_fmt_of(gguf_tensor_type(m, "per_layer_token_embd.weight"))
@@ -1611,6 +1632,9 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
         delete t.we1_fmt
         delete t.we2_fmt
         delete t.we3_fmt
+        delete t.dnqkv_fmt
+        delete t.dngate_fmt
+        delete t.dnout_fmt
     }
     t.kquant_native = any
 }
@@ -1618,6 +1642,11 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
 // Any K-quant-tagged expert stack in layer `l`? (The MoE dispatch and prefill gates branch on this.)
 def private moe_layer_kq(t : Model; l : int64) : bool {
     return fmt_at(t.we1_fmt, l) != KqFmt.q8 || fmt_at(t.we2_fmt, l) != KqFmt.q8 || fmt_at(t.we3_fmt, l) != KqFmt.q8
+}
+
+// Are layer l's deltanet projection planes all q8? (Metal and the GPU tiers bind/upload dn q8 only.)
+def private dn_layer_q8(t : Model; l : int64) : bool {
+    return fmt_at(t.dnqkv_fmt, l) == KqFmt.q8 && fmt_at(t.dngate_fmt, l) == KqFmt.q8 && fmt_at(t.dnout_fmt, l) == KqFmt.q8
 }
 
 // Any expert stack on the SUPERBLOCK kq lattice? (q51 excluded — its grouped-prefill kernels are
@@ -2368,7 +2397,9 @@ def moe_gpu_upload_resident(var t : Model) {
         for (l in range64(layers)) {
             var uploads : array<tuple<f : KqFmt; woff : int64; n : int64; rows : int64>>
             if (layer_is_recurrent(t.config, l)) {
-                if (t.dnqkv_offs[l] >= 0l && t.dngate_offs[l] >= 0l && t.dnout_offs[l] >= 0l) {
+                // kq-tagged dn planes (CPU-rail loads) are not tier-servable — the dn chain reads q8
+                if (t.dnqkv_offs[l] >= 0l && t.dngate_offs[l] >= 0l && t.dnout_offs[l] >= 0l
+                        && dn_layer_q8(t, l)) {
                     uploads |> push((f = KqFmt.q8, woff = t.dnqkv_offs[l], n = dim, rows = dn_conv_dim(t.config)))
                     uploads |> push((f = KqFmt.q8, woff = t.dngate_offs[l], n = dim, rows = t.config.ssm_d_inner))
                     uploads |> push((f = KqFmt.q8, woff = t.dnout_offs[l], n = t.config.ssm_d_inner, rows = dim))
@@ -2448,7 +2479,8 @@ def moe_gpu_upload_resident(var t : Model) {
         var dn_stop = false
         for (l in range64(layers)) {
             if (!layer_is_recurrent(t.config, l)
-                    || t.dnqkv_offs[l] < 0l || t.dngate_offs[l] < 0l || t.dnout_offs[l] < 0l) {
+                    || t.dnqkv_offs[l] < 0l || t.dngate_offs[l] < 0l || t.dnout_offs[l] < 0l
+                    || !dn_layer_q8(t, l)) {   // kq-tagged dn planes stay on the CPU rail
                 continue
             }
             if (moe_gpu_dense_on_gpu(int(KqFmt.q8), t.dnqkv_offs[l])) {
@@ -2704,9 +2736,10 @@ def private metal_blob_layout_ok(t : Model) : bool {
         return false
     }
     for (l in range64(c.n_layers)) {
-        // recurrent layers (Wave D): no attention tensors (offs -1, off_ok true), q8 dn planes instead
+        // recurrent layers (Wave D): no attention tensors (offs -1, off_ok true); dn planes must be q8
         let dn_bad = (has_dn && layer_is_recurrent(c, l) &&
-            (!metal_blob_off_ok(t.dnqkv_offs[l], KqFmt.q8) ||
+            (!dn_layer_q8(t, l) ||
+             !metal_blob_off_ok(t.dnqkv_offs[l], KqFmt.q8) ||
              !metal_blob_off_ok(t.dngate_offs[l], KqFmt.q8) ||
              !metal_blob_off_ok(t.dnbeta_offs[l], KqFmt.q8) ||
              !metal_blob_off_ok(t.dnalpha_offs[l], KqFmt.q8) ||
@@ -2945,15 +2978,21 @@ def private repack_q8_weights(var t : Model) {
         if (t.wo_offs[l] >= 0l && fmt_at(t.wo_fmt, l) == KqFmt.q8) {
             push_repack(regs, 0, t.wo_offs[l], qd, dim)
         }
-        if (layer_is_recurrent(c, l)) {  // deltanet projections (all q8 in v1 — no kq tags)
+        if (layer_is_recurrent(c, l)) {  // deltanet projections (kq-tagged planes repack in the kq walk)
             let cd = dn_conv_dim(c)
-            push_repack(regs, 0, t.dnqkv_offs[l], dim, cd)
-            push_repack(regs, 0, t.dngate_offs[l], dim, c.ssm_d_inner)
+            if (fmt_at(t.dnqkv_fmt, l) == KqFmt.q8) {
+                push_repack(regs, 0, t.dnqkv_offs[l], dim, cd)
+            }
+            if (fmt_at(t.dngate_fmt, l) == KqFmt.q8) {
+                push_repack(regs, 0, t.dngate_offs[l], dim, c.ssm_d_inner)
+            }
             if (t.dnbeta_offs[l] >= 0l) {   // -1 when beta/alpha ship F32 (fblob, no repack)
                 push_repack(regs, 0, t.dnbeta_offs[l], dim, c.ssm_dt_rank)
                 push_repack(regs, 0, t.dnalpha_offs[l], dim, c.ssm_dt_rank)
             }
-            push_repack(regs, 0, t.dnout_offs[l], c.ssm_d_inner, dim)
+            if (fmt_at(t.dnout_fmt, l) == KqFmt.q8) {
+                push_repack(regs, 0, t.dnout_offs[l], c.ssm_d_inner, dim)
+            }
         }
         if (has_ple(c)) {  // gemma-4 E-series per-layer PLE gate/proj (the emb table stays linear, unpacked)
             let ple = c.n_embd_per_layer
@@ -3041,7 +3080,13 @@ def private repack_kq_weights(var t : Model) {
     for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the MTP/NextN block at index n_layers
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
-        // recurrent (deltanet) layers carry no attention projections; nothing kq to repack on them
+        // recurrent (deltanet) layers carry no attention projections — their kq planes are the dn triple
+        if (layer_is_recurrent(c, l)) {
+            let cd = dn_conv_dim(c)
+            push_repack_kq(regs, fmt_at(t.dnqkv_fmt, l), t.dnqkv_offs[l], dim, cd)
+            push_repack_kq(regs, fmt_at(t.dngate_fmt, l), t.dngate_offs[l], dim, c.ssm_d_inner)
+            push_repack_kq(regs, fmt_at(t.dnout_fmt, l), t.dnout_offs[l], c.ssm_d_inner, dim)
+        }
         if (t.wq_offs[l] >= 0l) {
             push_repack_kq(regs, fmt_at(t.wq_fmt, l), t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
         }
@@ -3603,11 +3648,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         // fp32 path (a requantized classifier would drift from the oracle for no parity gain).
         t.cls_q8 = (t.config.shared_weights && mode == QuantMode.q8
             && gguf_tensor_type(m, "token_embd.weight") == GGML_TYPE_Q8_0)
-        // per-tensor K-quant format tags (kquant_native rail; no-op when the knob is off or the
-        // file has no K-quant tensors) — must precede layout_offsets, which walks the tags
-        detect_kq_formats(t, m)
         // ssm_beta/ssm_alpha disk type routes their matmul (must precede layout_offsets): F32
-        // files keep them fp32 in fblob (llama.cpp matmuls f32); quantized files ride qblob
+        // files keep them fp32 in fblob (llama.cpp matmuls f32); quantized files ride qblob.
+        // Also before detect_kq_formats — the dn tags demote on grouped (qwen3next) files.
         if (t.config.recr_mask != 0ul) {
             var frl = 0l
             while (!layer_is_recurrent(t.config, frl)) {
@@ -3617,6 +3660,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             let ba0 = t.dn_grouped ? "blk.{frl}.ssm_ba.weight" : "blk.{frl}.ssm_beta.weight"
             t.dn_ba_f32 = gguf_tensor_type(m, ba0) == GGML_TYPE_F32
         }
+        // per-tensor K-quant format tags (kquant_native rail; no-op when the knob is off or the
+        // file has no K-quant tensors) — must precede layout_offsets, which walks the tags
+        detect_kq_formats(t, m)
         // logit soft-caps from metadata when present (gemma2: 50/30, gemma4: final 30 only);
         // configure()'s values stay as the fallback for files without the keys
         if (gguf_has(m, "{arch}.attn_logit_softcapping")) {
@@ -3820,13 +3866,13 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                     load_dn_grouped(m, bytes, t, l, dim, scratch)
                 } else {
                     let cd = dn_conv_dim(t.config)
-                    load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch)
-                    load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch)
+                    load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch, 0l, fmt_at(t.dnqkv_fmt, l))
+                    load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch, 0l, fmt_at(t.dngate_fmt, l))
                     if (!t.dn_ba_f32) {
                         load_big(m, bytes, "blk.{l}.ssm_beta.weight", t, t.dnbeta_offs[l], dim * t.config.ssm_dt_rank, scratch)
                         load_big(m, bytes, "blk.{l}.ssm_alpha.weight", t, t.dnalpha_offs[l], dim * t.config.ssm_dt_rank, scratch)
                     }
-                    load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch)
+                    load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch, 0l, fmt_at(t.dnout_fmt, l))
                 }
             } elif (t.config.fused_qkv) {
                 // Phi3: attn_qkv rows are [q (qd) ; k (kv) ; v (kv)], ffn_up rows are [gate ; up] (hidden each).
@@ -7237,8 +7283,8 @@ def private deltanet_decode(t : Model; var s : Session; l : int64) {
     rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
     prof_add("norm", ts_norm0)
     let ts_qkv = ref_time_ticks()
-    mm_f(s.dn_qkv, t, KqFmt.q8, t.dnqkv_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, cd)
-    mm_f(s.dn_z, t, KqFmt.q8, t.dngate_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, di)
+    mm_f(s.dn_qkv, t, fmt_at(t.dnqkv_fmt, l), t.dnqkv_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, cd)
+    mm_f(s.dn_z, t, fmt_at(t.dngate_fmt, l), t.dngate_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, di)
     if (t.dn_ba_f32) {   // F32-on-disk beta/alpha matmul fp32, like llama.cpp
         mm_fblob(s.dn_beta, t, t.dn_betaf_off + l * dim * nvh, s.xb, dim, nvh)
         mm_fblob(s.dn_g, t, t.dn_alphaf_off + l * dim * nvh, s.xb, dim, nvh)
@@ -7254,7 +7300,7 @@ def private deltanet_decode(t : Model; var s : Session; l : int64) {
     }
     prof_add("attn", ts_attn)
     let ts_wo = ref_time_ticks()
-    mm_f(s.xb2, t, KqFmt.q8, t.dnout_offs[l], s.dn_o, s.xq, s.xs, s.xbs, di, dim)
+    mm_f(s.xb2, t, fmt_at(t.dnout_fmt, l), t.dnout_offs[l], s.dn_o, s.xq, s.xs, s.xbs, di, dim)
     prof_add("mm_wo", ts_wo)
     let ts_resid = ref_time_ticks()
     add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb2[0])), dim)
@@ -10545,8 +10591,8 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
     rms_batch(s.xb_b, s.x_b, t, t.rms_att_off + l * dim, dim, npos)
     prof_add("dn_norm", ts_norm0)
     let ts_qkv = ref_time_ticks()
-    mm_b_f(s, s.dn_qkv_b, t, KqFmt.q8, t.dnqkv_offs[l], s.xb_b, dim, cd, npos)
-    mm_b_f(s, s.dn_z_b, t, KqFmt.q8, t.dngate_offs[l], s.xb_b, dim, di, npos)
+    mm_b_f(s, s.dn_qkv_b, t, fmt_at(t.dnqkv_fmt, l), t.dnqkv_offs[l], s.xb_b, dim, cd, npos)
+    mm_b_f(s, s.dn_z_b, t, fmt_at(t.dngate_fmt, l), t.dngate_offs[l], s.xb_b, dim, di, npos)
     if (t.dn_ba_f32) {   // F32-on-disk beta/alpha matmul fp32, like llama.cpp
         mm_fblob_b(s.dn_beta_b, t, t.dn_betaf_off + l * dim * nvh, s.xb_b, dim, nvh, npos)
         mm_fblob_b(s.dn_g_b, t, t.dn_alphaf_off + l * dim * nvh, s.xb_b, dim, nvh, npos)
@@ -10572,7 +10618,7 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
         prof_add("dn_core", ts_core)
     }
     let ts_wo = ref_time_ticks()
-    mm_b_f(s, s.xb2_b, t, KqFmt.q8, t.dnout_offs[l], s.dn_o_b, di, dim, npos)
+    mm_b_f(s, s.xb2_b, t, fmt_at(t.dnout_fmt, l), t.dnout_offs[l], s.dn_o_b, di, dim, npos)
     prof_add("dn_mm_out", ts_wo)
     let ts_resid = ref_time_ticks()
     add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)

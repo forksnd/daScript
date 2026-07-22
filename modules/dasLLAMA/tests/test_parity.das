@@ -409,6 +409,71 @@ def test_parity_qwen3_4b_q6k(t : T?) {
     }
 }
 
+// Qwen3.5-4B K-quant trio — the deltanet arm of the native-kq gate: recurrent-layer projections
+// (attn_qkv / attn_gate / ssm_out) ride kq-native planes on the CPU rail (Metal/GPU-tier loads
+// keep them q8). Trio spans k4/k5/k6 dn planes (qkv mixes Q6_K into the Q4/Q5 files). Oracle
+// simple_ids per-file; all three continue identically to QWEN3_GEN. The engaged assert is per
+// plane kind — a silently-demoted tag would otherwise pass green on the q8 fallback rail.
+def private dn_kq_engaged(fmts : array<KqFmt>) : int64 {
+    var n = 0l
+    for (f in fmts) {
+        if (f != KqFmt.q8) {
+            n++
+        }
+    }
+    return n
+}
+
+def private dn_kq_parity_ok(t : T?; file, tag : string) {
+    let path = path_join(models_dir(), file)
+    if (!model_available(t, path)) return
+    let prev_kq = get_kquant_native()
+    set_kquant_native(true)
+    var tr <- load_gguf(path, QuantMode.q8)
+    set_kquant_native(prev_kq)
+    if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+        tr.config.seq_len = 2048l
+    }
+    t |> success(dn_kq_engaged(tr.dnqkv_fmt) > 0l && dn_kq_engaged(tr.dngate_fmt) > 0l && dn_kq_engaged(tr.dnout_fmt) > 0l,
+        "{tag} dn planes kq-native (not demoted)")
+    t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "{tag} token-for-token")
+    t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN, [dn_chunked = true]), "{tag} chunked-prefill token-for-token")
+    delete tr
+}
+
+[test]
+def test_parity_qwen35_4b_q4k(t : T?) {
+    t |> run("qwen35 forward (Qwen3.5-4B Q4_K_M, native kq deltanet planes)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        dn_kq_parity_ok(t, "Qwen3.5-4B-Q4_K_M.gguf", "qwen3.5-4b Q4_K_M")
+    }
+}
+
+[test]
+def test_parity_qwen35_4b_q5k(t : T?) {
+    t |> run("qwen35 forward (Qwen3.5-4B Q5_K_M, native kq deltanet planes)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        dn_kq_parity_ok(t, "Qwen3.5-4B-Q5_K_M.gguf", "qwen3.5-4b Q5_K_M")
+    }
+}
+
+[test]
+def test_parity_qwen35_4b_q6k(t : T?) {
+    t |> run("qwen35 forward (Qwen3.5-4B Q6_K, native kq deltanet planes)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        dn_kq_parity_ok(t, "Qwen3.5-4B-Q6_K.gguf", "qwen3.5-4b Q6_K")
+    }
+}
+
 // Qwen1.5-MoE-A2.7B-Chat Q8 — the routed-experts arch (softmax router -> top-4 of 60 with
 // un-renormalized weights + a sigmoid-gated shared expert; QKV bias, NEOX rope). Same Qwen BPE
 // vocab and counting continuation as the dense Qwen fixtures, so the id arrays are shared.
