@@ -190,26 +190,36 @@ the same trusted agent could perform that operation directly through its shell.
 
 ## Next vertical slice: one scenario each way
 
-The next implementation slice is complete only when one real source-range
-handoff works in each direction against a running agent session.
+The next implementation slice is complete only when the real PR-ready focus
+scenario works agent-to-human and one corrective source-range handoff works
+human-to-agent against a running agent session.
 
 ### Agent points human at code
 
-The agent publishes one Outbox focus message containing a revision-aware source
-anchor and the human-facing instruction **Look at that**. dasHerd adds a durable
-entry to a non-modal **Attention** panel backed by the session Outbox. This may
-also add a badge to the affected file.
+The agent publishes one Outbox Focus Set with the summary:
+
+> Ready for PR. Check it out; I've highlighted the important bits.
+
+The set contains several revision-aware targets at once: whole files that are
+important as units and multiple source ranges/sections inside other files. A
+file target with no ranges means the whole file matters. A file target may
+contain several disjoint ranges. dasHerd adds one durable entry to a non-modal
+**Attention** panel backed by the session Outbox and marks every affected file
+in the Changelist.
 
 Arrival never steals the human's workflow. It does not select a repository or
 worktree, replace the inspected file, switch Diff/View, scroll, raise a window,
-or take keyboard focus. If the target document is already displayed, its range
-may be highlighted in place without moving the viewport. If it is not
-displayed, dasHerd stores the highlight but does not open the file.
+or take keyboard focus. If a targeted document is already displayed, all of its
+ranges may be highlighted in place without moving the viewport. Other targeted
+files receive Changelist/Attention markers but are not opened.
 
-At a time of the human's choosing, clicking the Attention entry navigates to
-the anchored repository/worktree/file/revision, prepares the appropriate
-Diff/View, scrolls the range into view, and applies the focus treatment. The
-entry remains inspectable and can be dismissed or resolved independently.
+At a time of the human's choosing, clicking the Attention entry activates that
+Focus Set and navigates to its first important target. The Attention panel also
+lists every file/section for direct navigation. Focus mode keeps targeted files
+and ranges ordinary/brighter while subduing unrelated PR plumbing; a toggle
+restores the normal undimmed view without discarding the set. Previous/next
+navigation walks the set's targets. The entry remains inspectable and can be
+dismissed or resolved independently.
 
 ### Human points agent at code
 
@@ -223,10 +233,12 @@ message, then can publish a reply or focus result through its Outbox.
 - Before/after live state proves agent-message arrival did not change selected
   worktree, installed file, mode, scroll position, active window/widget, or
   keyboard focus.
-- The Attention panel and mailbox expose the message, source anchor, sender,
-  lifecycle, and raw payload immediately.
-- Clicking the Attention entry is what changes navigation; the resulting exact
-  source range is visible and highlighted.
+- The test Focus Set contains multiple files and multiple disjoint ranges in at
+  least one file. The Attention panel and mailbox expose its summary, every
+  anchor, sender, lifecycle, and raw payload immediately.
+- Clicking the Attention entry is what changes navigation. All targeted files
+  are marked, all ranges for the opened file are highlighted, previous/next
+  walks the set, and the focus toggle restores the ordinary undimmed view.
 - The reverse request contains the human's exact selected source anchor; the
   Inbox records notification, fetch, and acknowledgement state.
 - The demonstration uses the real CLI, watcher, web UI mailbox, rich client,
@@ -383,6 +395,8 @@ for presentation, never the correctness oracle.
 - 2026-07-21: Herder has no agent permission or capability model. Session
   context supplies routing defaults, not authority; connection tokens are only
   transport hygiene against accidental local cross-talk.
-- 2026-07-21: Scope the next implementation slice to one source-range handoff
-  in each direction. Agent-to-human arrival is non-modal and never changes
-  navigation/focus; the human navigates only by clicking its Attention entry.
+- 2026-07-21: Scope the next implementation slice to the real PR-ready Focus
+  Set (several important files and several sections per file) agent-to-human,
+  plus one corrective source-range handoff human-to-agent. Arrival is non-modal
+  and never changes navigation/focus; the human navigates only by clicking its
+  Attention entry.
