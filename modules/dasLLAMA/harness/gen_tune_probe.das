@@ -1190,7 +1190,9 @@ def private confirm_and_write(winner : string) : bool {
 
 def tune_mode_run : bool {
     let tune_total_t0 = ref_time_ticks()
-    var fx <- build_fixture(2048l, 512l, 64l)      // batch shape (the kv projection)
+    // batch shape: fat STREAMING ffn like the kq fixture — the old 2048x512x64 kv-projection was
+    // L2-hot; divergent crowns still pass the e2e confirm gate before shipping
+    var fx <- build_fixture(2048l, 8192l, 256l)
     var gfx <- build_fixture(2048l, 8192l, 1l)     // streamed decode shape (DRAM-bound ffn GEMV)
     var hfx <- build_fixture(2048l, 512l, 1l)      // hot decode shape (cache-resident — the
                                                    // only regime where gemv knobs can show)
