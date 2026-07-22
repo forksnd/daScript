@@ -55,7 +55,7 @@ An agent-facing `dasherder.md` skill explains the available operations and how
 to discover the current session. The agent publishes structured focus sets,
 notes, acknowledgements, and results to dasHerd. The first supported agent
 surface is a small `dasherd` CLI. It speaks to the local watcher protocol, reads
-the current session capability automatically, and offers stable human-readable
+the current session context automatically, and offers stable human-readable
 and JSON output. MCP is explicitly deferred until the mailbox and focus
 contract have enough real use to justify its support cost. Raw localhost HTTP
 is an implementation/debugging substrate, not the initial agent-facing
@@ -135,34 +135,42 @@ dasherd outbox reply <message-id> --kind <kind> --payload <file>
 
 ### Sender identity and provenance
 
-Sender is assigned by dasHerd from the authenticated transport principal; it
-is never trusted from a message field supplied by the CLI or web client.
+Sender is a routing/provenance label, not an authenticated principal. It is
+assigned by dasHerd from the mailbox operation rather than copied from an
+arbitrary message-body field:
 
-- A session-scoped CLI capability stamps the sender as
-  `agent_session:<session-id>` and restricts the destination to that session's
-  Outbox, acknowledgements, and replies.
+- Posting to session `<id>`'s Outbox stamps the sender as
+  `agent_session:<id>`. The CLI defaults `<id>` from its launch context.
 - The local web UI stamps the sender as `human:local` in the single-user first
   slice and records its client/connection ID separately for diagnostics.
 - Watcher-generated lifecycle notices use `system:dasHerd`.
 
-A later multi-user or cross-agent design can add principals without changing
-message identity. Cross-session agent messaging is not part of the first
-slice: an agent can consume only its own Inbox and publish only to its own
-Outbox. Replies carry `reply_to`/correlation identity rather than copying or
-overwriting the original sender.
+A later multi-user or cross-agent design can add more provenance labels without
+changing message identity. Cross-session agent messaging is not exposed in the
+first CLI because it is outside the initial workflow, not because dasHerd
+claims to prevent it. Replies carry `reply_to`/correlation identity rather than
+copying or overwriting the original sender.
 
-### Session discovery and capability scope
+### No Herder permission model
 
-dasHerd supplies an agent session with one capability descriptor containing the
-protocol version, localhost endpoint, session ID, and session-scoped
-credential. The launch profile exposes only the descriptor location; the
-`dasherder.md` skill describes how the CLI consumes it. Credentials must not
-appear in generated prompts, terminal history, review briefs, CLI arguments,
-or the repository.
+dasHerd deliberately does not implement agent permissions, per-operation
+approval gates, or a capability sandbox. The local agent already has the
+machine/worktree authority to edit files, run Git and `gh`, and call localhost.
+Adding nominal Herder restrictions would not create a meaningful security
+boundary and would import support cost and permission theater from other agent
+clients.
 
-The capability may read and acknowledge only its own inbox and publish focus
-for its own session/worktree. It cannot impersonate a human-origin message or
-mutate Git/GitHub state through the focus protocol.
+dasHerd supplies launch context containing the protocol version, localhost
+endpoint, and default session ID so the CLI can route ordinary commands without
+extra arguments. A connection token may still exist to prevent accidental
+cross-talk with unrelated local pages/processes, as the watcher already does;
+it is transport hygiene, not authorization or a claim that the agent lacks
+authority.
+
+Sender labels, mailbox direction, and event history make behavior observable
+and debuggable. They are not security attestations. Likewise, a human clicking
+a proposed GitHub action is a product interaction, not a permission boundary:
+the same trusted agent could perform that operation directly through its shell.
 
 ### Delivery rules
 
@@ -177,8 +185,8 @@ mutate Git/GitHub state through the focus protocol.
 - Agent profiles may replace TTY notification with a stronger native wake
   transport, but every profile exposes the same message lifecycle.
 - A Markdown review brief remains the portable export. It can reference the
-  same message/focus IDs, but it contains no credentials and does not become
-  the authoritative mutable inbox record.
+  same message/focus IDs, but it does not become the authoritative mutable
+  inbox record.
 
 ## Track A: local PR preparation and review
 
@@ -279,9 +287,9 @@ focus.
 
 ## Suggested implementation sequence
 
-1. Define the generic message envelope, lifecycle/event history, authenticated
-   actor identities, and per-session Inbox/Outbox storage.
-2. Implement the session-scoped CLI capability and `dasherder.md` skill for
+1. Define the generic message envelope, lifecycle/event history, routing/
+   provenance labels, and per-session Inbox/Outbox storage.
+2. Implement the session-aware CLI context and `dasherder.md` skill for
    list/get/ack/complete/send/reply.
 3. Expose Inbox and Outbox in the web UI, including readable and raw payloads,
    lifecycle state, cancel, and retry-notification controls.
@@ -320,10 +328,13 @@ for presentation, never the correctness oracle.
 - 2026-07-21: Ship visible per-session Inbox/Outbox views in the web UI with the
   first protocol implementation, including raw payload inspection for manual
   debugging.
-- 2026-07-21: Assign sender identity from scoped transport credentials:
-  `agent_session:<id>`, `human:local`, or `system:dasHerd`; never accept sender
-  identity from an untrusted message payload.
+- 2026-07-21: Assign sender provenance from mailbox direction/session routing:
+  `agent_session:<id>`, `human:local`, or `system:dasHerd`. These are observable
+  workflow labels, not authenticated security principals.
 - 2026-07-21: Human contextual delivery is one-step: select code, invoke
   **Look at that**, and immediately create the Inbox message plus TTY nudge.
   The visible mailbox is an audit/debug surface, not a mandatory composer or
   confirmation step.
+- 2026-07-21: Herder has no agent permission or capability model. Session
+  context supplies routing defaults, not authority; connection tokens are only
+  transport hygiene against accidental local cross-talk.
