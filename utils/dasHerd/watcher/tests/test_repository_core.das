@@ -240,6 +240,11 @@ def test_repository_review_parsing(t : T?) {
     }
     t |> run("commit inspection uses one observed revision") <| @(t : T?) {
         var argv : array<string>
+        var expected_exit_code = 0l
+        t |> equal(repository_file_diff_argv(
+            "missing", "D:/Work/tree", "src/main.das", "commit",
+            argv, expected_exit_code, "compact", ""),
+            "commit revision is required")
         t |> equal(repository_build_commit_file_diff_argv(
             "D:/Work/tree", "abcdef0123456789", "src/main.das",
             argv, "expanded"), "")

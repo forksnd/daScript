@@ -522,6 +522,9 @@ def public repository_file_diff_argv(repository_id : string;
                                      revision : string = "") : string {
     delete argv
     expected_exit_code = 0l
+    if (comparison == "commit" && empty(revision)) {
+        return "commit revision is required"
+    }
     let repository_index = find_repository(repository_id)
     if (repository_index < 0 || g_repositories[repository_index] == null) {
         return "unknown repository"
