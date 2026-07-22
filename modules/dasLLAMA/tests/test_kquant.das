@@ -120,6 +120,35 @@ def private build_q40_block() : array<uint8> {
     return <- blkb
 }
 
+// q51 synthetic 32-block index `blk`: f16-exact d/m varied per block, elem k = q5_pat(k + blk)
+// (shifted per block so an inter-block offset bug can't cancel); disk layout [d][m][qh][qs].
+def private q51_d(blk : int) : float => float(blk % 7 + 1) * 0.0625
+def private q51_m(blk : int) : float => float(blk % 5) * 0.25 - 0.5
+
+def private build_q51_block(blk : int) : array<uint8> {
+    var b : array<uint8>
+    b |> resize(24)
+    let dbits = f32_to_f16(q51_d(blk))
+    let mbits = f32_to_f16(q51_m(blk))
+    b[0] = uint8(dbits & 0xFF)
+    b[1] = uint8(dbits >> 8u)
+    b[2] = uint8(mbits & 0xFF)
+    b[3] = uint8(mbits >> 8u)
+    var qh = 0u
+    for (k in range(32)) {   // qh bit k = the 5th bit of element k
+        if ((q5_pat(k + blk) & 16) != 0) {
+            qh |= 1u << uint(k)
+        }
+    }
+    for (i in range(4)) {
+        b[4 + i] = uint8(qh >> uint(i * 8))
+    }
+    for (j in range(16)) {   // byte j: element blk32+j low nibble, +16 high nibble
+        b[8 + j] = uint8((q5_pat(j + blk) & 15) | ((q5_pat(j + 16 + blk) & 15) << 4))
+    }
+    return <- b
+}
+
 [test]
 def test_q4k_synthetic(t : T?) {
     t |> run("Q4_K superblock unpacks the 6-bit scale/min packing") @(t : T?) {
@@ -226,6 +255,23 @@ def test_kq_transcode_planes(t : T?) {
             t |> success(dst[k] == expected, "q40 plane element must match hand-packed value exactly")
         }
     }
+    t |> run("q51 planes unpack the hand-packed Q5_1 blocks exactly") @(t : T?) {
+        for (blk in range(4)) {
+            let blkb <- build_q51_block(blk)
+            var kq : array<uint8>
+            var ks : array<uint8>
+            kq |> resize(20)
+            ks |> resize(4)
+            transcode_q51_block(blkb, 0l, kq, 0l, ks, 0l)
+            var dst : array<float>
+            dst |> resize(32)
+            dequant_q51_plane_block(kq, 0l, ks, 0l, dst, 0l)
+            for (k in range(32)) {
+                let expected = q51_d(blk) * float(q5_pat(k + blk)) + q51_m(blk)
+                t |> success(dst[k] == expected, "q51 plane element must match hand-packed value exactly")
+            }
+        }
+    }
 }
 
 // XOR the quant payload of a synthetic superblock with an LCG byte stream — every quant bit
@@ -236,6 +282,149 @@ def private perturb_quants(var blkb : array<uint8>; qoff, qlen : int) {
     for (i in range(qlen)) {
         st = st * 1664525u + 1013904223u
         blkb[qoff + i] = uint8(uint(blkb[qoff + i]) ^ (st >> 16u))
+    }
+}
+
+// ===== q51 kernel gates (per-32 planes, Q8_0-form activations — NOT the kq superblock lattice) =====
+
+// Fill `rows` q51 plane rows of n elements; row r block b packs build_q51_block(r*31 + b) so no
+// two blocks anywhere share data (offset bugs can't cancel).
+def private q51_fill_planes(var kq : array<uint8>; var ks : array<uint8>; rows, n : int64) {
+    let nb = n / 32l
+    kq |> resize(rows * nb * 20l)
+    ks |> resize(rows * nb * 4l)
+    for (r in range64(rows)) {
+        for (b in range64(nb)) {
+            let blkb <- build_q51_block(int(r * 31l + b))
+            transcode_q51_block(blkb, 0l, kq, (r * nb + b) * 20l, ks, (r * nb + b) * 4l)
+        }
+    }
+}
+
+// smooth per-row-shifted activation rows -> the Q8_0-form image (per-32 scales, no block sums)
+def private q51_fill_acts(var xq : array<int8>; var xs : array<float>; rows, n : int64) {
+    var src : array<float>
+    src |> resize(n)
+    xq |> resize(rows * n)
+    xs |> resize(rows * (n / 32l))
+    for (r in range64(rows)) {
+        for (i in range64(n)) {
+            src[i] = 1.7 * sin(float(i + r * 37l) * 0.23) + 0.3 * cos(float(i) * 0.071)
+        }
+        quantize_q8_0_into(src, n, xq, xs, r * n, r * (n / 32l))
+    }
+    delete src
+}
+
+def private q51_dot_gate(t : T?) {
+    let n = 704l   // the real 26B-A4B expert row: % 32, NOT % 256 — why the tier exists
+    let nb = n / 32l
+    var kq : array<uint8>
+    var ks : array<uint8>
+    q51_fill_planes(kq, ks, 1l, n)
+    var w : array<float>
+    w |> resize(n)
+    for (b in range64(nb)) {
+        dequant_q51_plane_block(kq, b * 20l, ks, b * 4l, w, b * 32l)
+    }
+    var xq : array<int8>
+    var xs : array<float>
+    q51_fill_acts(xq, xs, 1l, n)
+    var ref = 0.0lf
+    for (i in range64(n)) {
+        ref += double(w[i]) * double(xq[i]) * double(xs[i / 32l])
+    }
+    let got = dot_q51q8_scalar(unsafe(addr(kq[0])), unsafe(addr(ks[0])), unsafe(addr(xq[0])), unsafe(addr(xs[0])), n)
+    let denom = max(abs(float(ref)), 1.0e-6)
+    t |> success(abs(got - float(ref)) / denom < 1.0e-4, "dot_q51q8_scalar must match the fp64 plane-dequant reference")
+}
+
+def private q51_groupn_gate(t : T?) {
+    let n = 704l
+    let nb = n / 32l
+    let d = 8l
+    let nreg = 3l
+    var kq : array<uint8>
+    var ks : array<uint8>
+    q51_fill_planes(kq, ks, nreg * d, n)
+    var xq : array<int8>
+    var xs : array<float>
+    q51_fill_acts(xq, xs, nreg, n)
+    var offs : array<int64>
+    offs |> reserve(nreg * 2l)
+    for (r in range64(nreg)) {   // (weight element off, activation element off) pairs
+        offs |> push(r * d * n)
+        offs |> push(r * n)
+    }
+    var y : array<float>
+    y |> resize(nreg * d)
+    matmul_q51q8_groupn(y, kq, ks, offs, nreg, xq, xs, n, d)
+    unsafe {
+        for (r in range64(nreg)) {
+            for (row in range64(d)) {
+                let want = dot_q51q8_scalar(addr(kq[(r * d + row) * nb * 20l]), addr(ks[(r * d + row) * nb * 4l]),
+                    addr(xq[r * n]), addr(xs[r * (n / 32l)]), n)
+                t |> success(y[r * d + row] == want, "q51 groupn row must bit-match the scalar row dot")
+            }
+        }
+    }
+}
+
+def private q51_batch_gate(t : T?) {
+    let n = 704l
+    let nb = n / 32l
+    let d = 8l
+    let ntok = 5l
+    let nreg = 2l
+    var kq : array<uint8>
+    var ks : array<uint8>
+    q51_fill_planes(kq, ks, nreg * d, n)
+    var xq : array<int8>
+    var xs : array<float>
+    q51_fill_acts(xq, xs, ntok, n)
+    // batch off region 1's rows — the non-zero element woff pins the wrapper's /32*20 plane math
+    var y : array<float>
+    y |> resize(ntok * d)
+    matmul_q51q8_batch(y, kq, ks, d * n, xq, xs, n, d, ntok)
+    unsafe {
+        for (tk in range64(ntok)) {
+            for (row in range64(d)) {
+                let want = dot_q51q8_scalar(addr(kq[(d + row) * nb * 20l]), addr(ks[(d + row) * nb * 4l]),
+                    addr(xq[tk * n]), addr(xs[tk * (n / 32l)]), n)
+                t |> success(y[tk * d + row] == want, "q51 batch cell must bit-match the scalar row dot")
+            }
+        }
+    }
+    // batch groupn: (woff, row0, cnt) triples — tokens 0..2 hit region 0, 2..5 region 1
+    let offs <- [0l, 0l, 2l, d * n, 2l, 3l]
+    var yg : array<float>
+    yg |> resize(ntok * d)
+    matmul_q51q8_batch_groupn(yg, kq, ks, offs, nreg, xq, xs, n, d)
+    unsafe {
+        for (r in range64(nreg)) {
+            let row0 = offs[r * 3l + 1l]
+            let cnt = offs[r * 3l + 2l]
+            for (tk in range64(cnt)) {
+                for (row in range64(d)) {
+                    let want = dot_q51q8_scalar(addr(kq[(r * d + row) * nb * 20l]), addr(ks[(r * d + row) * nb * 4l]),
+                        addr(xq[(row0 + tk) * n]), addr(xs[(row0 + tk) * (n / 32l)]), n)
+                    t |> success(yg[(row0 + tk) * d + row] == want, "q51 batch-groupn cell must bit-match the scalar row dot")
+                }
+            }
+        }
+    }
+}
+
+[test]
+def test_q51_kernels(t : T?) {
+    t |> run("dot_q51q8_scalar matches the fp64 plane-dequant reference at n=704") @(t : T?) {
+        q51_dot_gate(t)
+    }
+    t |> run("q51 groupn bit-matches scalar row dots") @(t : T?) {
+        q51_groupn_gate(t)
+    }
+    t |> run("q51 batch + batch-groupn bit-match scalar row dots") @(t : T?) {
+        q51_batch_gate(t)
     }
 }
 

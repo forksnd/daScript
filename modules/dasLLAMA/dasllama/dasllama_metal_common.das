@@ -684,6 +684,20 @@ def kq_scales_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tupl
     }
 }
 
+//! One q51 tensor's plane pair bind: quant plane (20B/block, uint-viewable) at (off/32)*20 and
+//! the f16 d+m scale plane at (off/32)*4 — both verbatim disk splits, never rebaked (the blob
+//! transform leaves q51 planes untouched). off % 128 keeps both binds 16B-aligned.
+def q51_planes_of(dev : MetalDevice?; t : Model; off : int64) : tuple<qbuf : MetalBuffer?; qoff : uint64; sbuf : MetalBuffer?; soff : uint64> {
+    assert(t.metal_blob)
+    let b0 = off / 32l
+    unsafe {
+        return (qbuf = plane_buffer(dev, addr < void? >(t.q51q[0]), uint64(long_length(t.q51q)), t.image_map != null),
+                qoff = uint64(b0 * 20l),
+                sbuf = plane_buffer(dev, addr < void? >(t.q51s[0]), uint64(long_length(t.q51s)), t.image_map != null),
+                soff = uint64(b0 * 4l))
+    }
+}
+
 def uniform_u32(v : uint) : MetalBuffer? {
     var buf = pool_acquire_untracked(g_upool, g_dev, 4ul)
     var p = unsafe(reinterpret<uint?>(metal_buffer_contents(buf)))
@@ -720,6 +734,27 @@ def mirror_evict_to_cap(cap_bytes : uint64; keep : uint64) {
     }
 }
 
+//! Cross-layer KV sharing (gemma-4 E-series): does layer l either own its rows or share a
+//! byte-compatible source? A shared layer aliases its source's mirror slab / prefill panel via
+//! kv_row_prefix, so the source must own rows and match l's class geometry exactly.
+def kv_share_ok(t : Model; l : int64) : bool {
+    if (l >= int64(length(t.kv_src))) {   // the MTP draft slab owns its rows
+        return true
+    }
+    let src = t.kv_src[l]
+    if (src == l) {
+        return true
+    }
+    return (src >= 0l && src < l && t.kv_src[src] == src && !layer_is_recurrent(t.config, src) &&
+        layer_kv_dim(t.config, l) == layer_kv_dim(t.config, src) &&
+        layer_head_size(t.config, l) == layer_head_size(t.config, src))
+}
+
+//! true when layer l reads another layer's KV (no rows of its own — Q-only attention)
+def kv_shared_layer(t : Model; l : int64) : bool {
+    return l < int64(length(t.kv_src)) && t.kv_src[l] != l
+}
+
 // Hetero-safe per-layer mirror addressing (gemma4's two kv-head classes): every KV codec is
 // linear bytes-per-element for kvd % 32 == 0, so the layout_offsets element prefix scales
 // straight to bytes. Uniform models reduce to the old l * cap * rowb addresses exactly.
@@ -727,7 +762,9 @@ def mirror_row_total(t : Model) : int64 {
     let c = t.config
     var tot = 0l
     for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the MTP draft slab (trunk-shaped attention)
-        tot += layer_kv_dim(c, l)   // the GPU gate pins kv_src[l] == l, so every layer owns rows
+        if (!kv_shared_layer(t, l)) {   // shared layers (E-series) alias their source's slab
+            tot += layer_kv_dim(c, l)
+        }
     }
     return tot
 }
@@ -907,6 +944,7 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
             var kdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + koff
             var vdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + voff
             for (l in range64(c.n_layers + c.n_layer_nextn)) {   // draft slab rides the watermark contract
+                continue if (kv_shared_layer(t, l))   // aliases the source slab — its upload covers l
                 let kvd_l = layer_kv_dim(c, l)
                 let krow = kv_row_bytes(s.kv_dtype_k, kvd_l)
                 let vrow = kv_row_bytes(s.kv_dtype_v, kvd_l)
@@ -1076,6 +1114,9 @@ def moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
     if (fmt == KqFmt.k6) {
         return off >= 0l && (off % 512l) == 0l && (ege % 256l) == 0l
     }
+    if (fmt == KqFmt.q51) {   // per-32 planes: off % 128 keeps the 20B/4B binds 16B-aligned
+        return off >= 0l && (off % 128l) == 0l && (ege % 32l) == 0l
+    }
     return false
 }
 
@@ -1149,12 +1190,18 @@ def moe_metal_ok(t : Model) : bool {
         let f1 = moe_fmt_at(t.we1_fmt, l)
         let f2 = moe_fmt_at(t.we2_fmt, l)
         let f3 = moe_fmt_at(t.we3_fmt, l)
-        // per-site alignment + (kq kernels iterate whole superblock rows) reduction dims %256
+        // per-site alignment + reduction dims: superblock kq kernels iterate whole 256-rows,
+        // q51 whole 32-blocks (+ the mul_mm's 64-col output tiles)
+        let sb1 = f1 == KqFmt.k4 || f1 == KqFmt.k5 || f1 == KqFmt.k6
+        let sb3 = f3 == KqFmt.k4 || f3 == KqFmt.k5 || f3 == KqFmt.k6
+        let sb2 = f2 == KqFmt.k4 || f2 == KqFmt.k5 || f2 == KqFmt.k6
         if (!moe_site_ok(f1, t.we1_offs[l], ege) ||
                 !moe_site_ok(f2, t.we2_offs[l], ege) ||
                 !moe_site_ok(f3, t.we3_offs[l], ege) ||
-                ((f1 != KqFmt.q8 || f3 != KqFmt.q8) && (c.dim % 256l) != 0l) ||
-                (f2 != KqFmt.q8 && (nfe % 256l) != 0l)) {
+                ((sb1 || sb3) && (c.dim % 256l) != 0l) ||
+                (sb2 && (nfe % 256l) != 0l) ||
+                ((f1 == KqFmt.q51 || f3 == KqFmt.q51) && ((c.dim % 32l) != 0l || (nfe % 64l) != 0l)) ||
+                (f2 == KqFmt.q51 && ((nfe % 32l) != 0l || (c.dim % 64l) != 0l))) {
             return false
         }
     }

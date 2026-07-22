@@ -55,28 +55,13 @@ def llama_bench_bin(ngl : int) : string {
                      : "/Users/borisbatkin/Work/llama.cpp-clean/build/bin/llama-bench")
 }
 
-// The subset of llama-bench's `-o json` result object we consume. sscan_json ignores the rest.
-struct LlamaBenchRow {
-    n_prompt : int
-    n_gen : int
-    avg_ts : double
-    model_n_params : int64
-    build_commit : string
-}
-
-// Run llama-bench for one model and fold its two result rows (n_gen=0 prefill, n_prompt=0 decode) into
-// an LlmBaseline. prefill/emission stay -1 on a run or parse failure.
+// Run llama-bench for one model (via profile_common's shared runner) and fold its two result rows
+// (n_gen=0 prefill, n_prompt=0 decode) into an LlmBaseline. prefill/emission stay -1 on failure.
 def bench_one(display, path : string; threads, nprompt, ngen, ngl : int) : LlmBaseline {
     // affinity args pin the bench to distinct physical cores on the boxes that pin (see profile_common)
-    let cmd = "{llama_bench_bin(ngl)} -m {path} -ngl {ngl} -t {threads}{lcpp_affinity_args(threads)} -p {nprompt} -n {ngen} -o json"
-    var out = ""
-    unsafe {
-        popen(cmd) $(f) {
-            out = fread_to_eof(f)
-        }
-    }
+    let cmd = "\"{llama_bench_bin(ngl)}\" -m \"{path}\" -ngl {ngl} -t {threads}{lcpp_affinity_args(threads)} -p {nprompt} -n {ngen} -o json"
     var rows : array<LlamaBenchRow>
-    if (!sscan_json(out, rows)) {
+    if (!run_llama_bench(cmd, rows)) {
         return LlmBaseline(model = display, prefill_tok_s = -1.0lf, emission_tok_s = -1.0lf, lcpp_commit = "", n_params = 0l)
     }
     var prefill = -1.0lf

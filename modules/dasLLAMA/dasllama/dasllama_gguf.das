@@ -43,6 +43,7 @@ let GGML_TYPE_F32 = 0
 let GGML_TYPE_F16 = 1
 let GGML_TYPE_Q4_0 = 2
 let GGML_TYPE_Q5_0 = 6
+let GGML_TYPE_Q5_1 = 7
 let GGML_TYPE_Q8_0 = 8
 let GGML_TYPE_Q4_K = 12
 let GGML_TYPE_Q5_K = 13
@@ -1104,6 +1105,34 @@ def dequant_q40_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<
     }
 }
 
+//! Transcode one Q5_1 disk block (24 bytes at `bo`: d f16, m f16, qh u32, 16 nibble bytes) into
+//! the q51 planes — verbatim splits, exact. The per-block array form the tests drive; the bulk
+//! loader (gguf_transcode_q51) runs the same split pointerized and threaded.
+def transcode_q51_block(bytes : array<uint8> | #; bo : int64; var kq : array<uint8>; kqo : int64; var ks : array<uint8>; kso : int64) {
+    for (i in range64(4l)) {
+        ks[kso + i] = bytes[bo + i]
+        kq[kqo + 16l + i] = bytes[bo + 4l + i]
+    }
+    for (i in range64(16l)) {
+        kq[kqo + i] = bytes[bo + 8l + i]
+    }
+}
+
+//! Reference dequant of one q51-plane 32-block: w = d * q + m with q = nibble | qh_bit << 4
+//! (elem k reads qh bit k, elem k+16 bit k+16 — the llama.cpp Q5_1 bit map, kept verbatim).
+def dequant_q51_plane_block(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
+    let d = f16_to_f32(rd_u16(ks, kso))
+    let m = f16_to_f32(rd_u16(ks, kso + 2l))
+    let qh = rd_u32(kq, kqo + 16l)
+    for (k in range64(16l)) {
+        let b = int(kq[kqo + k])
+        let h0 = (int(qh >> uint(k)) & 1) << 4
+        let h1 = (int(qh >> uint(k + 16l)) & 1) << 4
+        dst[doff + k] = d * float((b & 15) | h0) + m
+        dst[doff + k + 16l] = d * float((b >> 4) | h1) + m
+    }
+}
+
 // K-quant plane strides (bytes per 256-weight superblock)
 let K4_QSB = 128l
 let K4_SSB = 20l   // kq v2: 16B verbatim disk scale block + 4B pad (repack decodes in place)
@@ -1113,6 +1142,10 @@ let K6_QSB = 192l
 let K6_SSB = 18l
 let Q40_QSB = 128l   // q40 tier: 8 x 16 nibble bytes (the k4 pairing, k / k+16 per 32-block)
 let Q40_SSB = 16l    // 8 x f16 d, verbatim disk halfwords
+// q51 tier strides are per 32-block, NOT per superblock: Q5_1 exists precisely for rows that are
+// % 32 but not % 256 (llama.cpp's quantizer fallback), so the planes carry no superblock structure
+let Q51_QB = 20l   // 16 nibble bytes (k / k+16 pairing) + 4 qh bytes, verbatim disk splits
+let Q51_SB = 4l    // d, m f16 halfwords, verbatim
 
 // Raw byte copy via unaligned u64 moves + byte tail — the workhorse of the pointerized transcode
 // loops (uint8 source and destination regions never overlap).
@@ -1284,6 +1317,40 @@ def gguf_transcode_q40(m : GGUFMeta; srcbytes : array<uint8> | #; name : string;
     }
 }
 
+//! Transcode a Q5_1 tensor into the q51 planes (per 32-BLOCK strides 20/4 — see Q51_QB): each
+//! 24B disk block splits into 2B d + 2B m (scale plane) and 16B nibbles + 4B qh (quant plane),
+//! all verbatim. Exact; `eloff`/`src_off`/`expect_n` are element offsets, % 32.
+def gguf_transcode_q51(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
+    let ti = kq_transcode_check(m, name, GGML_TYPE_Q5_1, "Q5_1", src_off, expect_n)
+    let nb = expect_n / 32l
+    if (nb <= 0l) {
+        return
+    }
+    if (eloff % 32l != 0l || src_off % 32l != 0l || expect_n % 32l != 0l) {
+        panic("gguf: tensor '{name}' Q5_1 slice [{src_off}, +{expect_n}) @ {eloff} is not block-aligned")
+    }
+    guard_dst(name, "q51 quant plane", (eloff / 32l) * Q51_QB, nb * Q51_QB, long_length(kq))
+    guard_dst(name, "q51 scale plane", (eloff / 32l) * Q51_SB, nb * Q51_SB, long_length(ks))
+    with_tensor_view(m, srcbytes, ti) $(bytes, tbase) {
+        let bo = tbase + (src_off / 32l) * 24l
+        unsafe {
+            let srcp = addr<uint8 const?>(bytes[bo])
+            var kqp = addr(kq[(eloff / 32l) * Q51_QB])
+            var ksp = addr(ks[(eloff / 32l) * Q51_SB])
+            maybe_parallel_for(0, int(nb), transcode_jobs(nb, 24l)) $(rb, re) {
+                unsafe {
+                    for (blk in range64(int64(rb), int64(re))) {
+                        let src = srcp + blk * 24l
+                        bcopy(ksp + blk * Q51_SB, src, 4l)               // f16 d, f16 m
+                        bcopy(kqp + blk * Q51_QB, src + 8l, 16l)         // nibbles
+                        bcopy(kqp + blk * Q51_QB + 16l, src + 4l, 4l)    // qh
+                    }
+                }
+            }
+        }
+    }
+}
+
 //! Decode tensor `name` (F32 or F16 on disk) into dst[dst_off ..] as fp32. Panics if the
 //! tensor is missing, has a different element count than expected, or uses a type we don't
 //! yet read (quantized types are wired in a later step).
@@ -1391,6 +1458,28 @@ def gguf_read_tensor_f32(m : GGUFMeta; srcbytes : array<uint8> | #; name : strin
             }
             bo += 16l
         }
+    } elif (gtype == GGML_TYPE_Q5_1) {
+        // block of 32: fp16 d + fp16 min m (4 bytes) + 4 bytes of high bits + 16 bytes (split-half
+        // nibbles); x = (nibble | high_bit << 4) * d + m — the min carries the offset, q is unsigned
+        if (src_off % 32l != 0l || expect_n % 32l != 0l) {
+            panic("gguf: tensor '{name}' Q5_1 slice [{src_off}, +{expect_n}) is not block-aligned")
+        }
+        let nb = expect_n / 32l
+        var bo = base + (src_off / 32l) * 24l
+        for (blk in range64(nb)) {
+            let d = f16_to_f32(rd_u16(bytes, bo))
+            let mn = f16_to_f32(rd_u16(bytes, bo + 2l))
+            let qh = rd_u32(bytes, bo + 4l)
+            bo += 8l
+            for (k in range64(16l)) {
+                let b = int(bytes[bo + k])
+                let h0 = (int(qh >> uint(k)) & 1) << 4
+                let h1 = (int(qh >> uint(k + 16l)) & 1) << 4
+                dst[dst_off + blk * 32l + k] = float((b & 15) | h0) * d + mn
+                dst[dst_off + blk * 32l + k + 16l] = float((b >> 4) | h1) * d + mn
+            }
+            bo += 16l
+        }
     } elif (gtype == GGML_TYPE_Q4_K || gtype == GGML_TYPE_Q5_K || gtype == GGML_TYPE_Q6_K) {
         if (src_off % 256l != 0l || expect_n % 256l != 0l) {
             panic("gguf: tensor '{name}' K-quant slice [{src_off}, +{expect_n}) is not superblock-aligned")
@@ -1434,7 +1523,7 @@ def gguf_read_tensor_f32(m : GGUFMeta; srcbytes : array<uint8> | #; name : strin
             bo += 16l
         }
     } else {
-        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/BF16/Q8_0/Q4_0/Q5_0/Q4_K/Q5_K/Q6_K/MXFP4)")
+        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/BF16/Q8_0/Q4_0/Q5_0/Q5_1/Q4_K/Q5_K/Q6_K/MXFP4)")
     }
     }
 }

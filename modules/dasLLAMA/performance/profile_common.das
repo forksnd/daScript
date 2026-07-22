@@ -16,6 +16,7 @@ require daslib/strings_boost public
 require daslib/logger public              // structured, ISO-8601-timestamped ndjson event log
 require daslib/json public                // JV(...) for logger field payloads
 require dasllama/dasllama_common public   // QuantMode
+require dasllama/dasllama_math            // active_kernel_backend — the exec_fmt layout receipt
 require llvm/daslib/llvm_tune             // tune_status — stamp provenance for the platform block
 
 // ===== Box + model roots =====
@@ -31,7 +32,12 @@ def public prof_log_name() : string {
 // Machine-local model root; override with DASLLAMA_MODELS_DIR (the x64/handoff boxes).
 def models_dir() : string {
     let env = get_env_variable("DASLLAMA_MODELS_DIR")
-    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+    if (empty(env)) {
+        return "/Users/borisbatkin/Work/llama.cpp/models/"
+    }
+    // callers concat "{models_dir()}{file}" — guarantee the separator so a slashless override
+    // (DASLLAMA_MODELS_DIR=/models) doesn't silently skip every catalog file
+    return ends_with(env, "/") || ends_with(env, "\\") ? env : "{env}/"
 }
 
 // Short box tag baked into the JSON/TSV filenames (profile_llm_<box>.json). Override with DASLLAMA_BOX.
@@ -192,6 +198,60 @@ def active_params_b(t : Model) : double {
     return double(p) / 1.0e9lf
 }
 
+def private exec_fmt_add(var seen : table<string>; a : array<KqFmt>) {
+    if (empty(a)) {
+        seen |> insert("q8")
+        return
+    }
+    for (f in a) {
+        seen |> insert("{f}")
+    }
+}
+
+//! What this loaded das Model EXECUTES — per-site weight formats, activation/scale treatment,
+//! and the weight layout — the bench record's apples-to-apples receipt (`BenchRun.exec_fmt`).
+//! A kq entry (k4/k5/k6/q40/q51) means the DISK format runs natively; q8 planes on a K-quant file
+//! are tensors the file itself ships as Q8_0 (norms/embeddings ride fblob, not listed).
+def model_exec_fmt(t : Model) : string {
+    if (t.quant != QuantMode.q8) {
+        return quant_str(t.quant)
+    }
+    var seen : table<string>
+    exec_fmt_add(seen, t.wq_fmt)
+    exec_fmt_add(seen, t.wk_fmt)
+    exec_fmt_add(seen, t.wv_fmt)
+    exec_fmt_add(seen, t.wo_fmt)
+    exec_fmt_add(seen, t.w1_fmt)
+    exec_fmt_add(seen, t.w2_fmt)
+    exec_fmt_add(seen, t.w3_fmt)
+    if (t.experts_mx4) {
+        seen |> insert("mxfp4")
+    } elif (t.config.moe) {
+        exec_fmt_add(seen, t.we1_fmt)
+        exec_fmt_add(seen, t.we2_fmt)
+        exec_fmt_add(seen, t.we3_fmt)
+    }
+    seen |> insert("{t.config.shared_weights ? t.emb_fmt : t.wcls_fmt}")
+    var names <- [for (k in keys(seen)); k]
+    sort(names)
+    let weights = join(names, "/")
+    let scales = t.wscale_f16 ? "f16 scales" : "f32 scales"
+    var layout = "planar {active_kernel_backend()}"
+    if (t.metal_blob) {
+        layout = "metal blob"
+    } elif (t.kq_repacked || t.mx4_repacked) {
+        layout = "planar {active_kernel_backend()} (repacked)"
+    }
+    return "weights {weights} native; q8 activations; {scales}; {layout}"
+}
+
+//! The llama.cpp sibling's execution receipt, derived from the build flavor: every gguf tensor
+//! runs in its disk format; the cpu backend additionally layout-repacks supported types at load
+//! (GGML_CPU_REPACK is ON in both pinned ref flavors).
+def lcpp_exec_fmt(backend : string) : string {
+    return backend == "cpu" ? "native gguf formats; cpu runtime layout repack" : "native gguf formats"
+}
+
 //! True when `m` is present on disk AND in the requested tier. `sz` receives the file size (0 if absent).
 def model_selected(m : LlmModel; tier : Tier; var sz : uint64&) : bool {
     let st = stat(model_path(m))
@@ -289,7 +349,9 @@ def private platform_os() : string {
     if (is_windows()) {
         return run_capture("ver", true)
     }
-    return "{run_capture("sw_vers -productName", true)} {run_capture("sw_vers -productVersion", true)}"
+    // sw_vers is macOS-only; on Linux both probes return "" and the join is a lone space —
+    // strip so empty()==true and the record stores "unknown" (or set DASLLAMA_OS on those boxes)
+    return strip("{run_capture("sw_vers -productName", true)} {run_capture("sw_vers -productVersion", true)}")
 }
 
 def private tune_row_str(r : TuneStatus) : string {
@@ -325,6 +387,138 @@ def gather_platform(threads : int; llama_cpp, date, box_profile : string; parsec
         box_profile = box_profile,
         parsec_off = parsec_off,
         tune = tune_summary())
+}
+
+// ===== Hardware block (public bench records — see modules/dasLLAMA/PUBLIC_BENCH_PLAN.md) =====
+
+//! Auto-gathered hardware identity for a public bench record. Always probed, never typed by the
+//! submitter — community records depend on this block being trustworthy. Probes are best-effort
+//! per OS; a field the box cannot answer is omitted (`@optional`). Env overrides for boxes with
+//! no clean probe: DASLLAMA_CPU, DASLLAMA_OS, DASLLAMA_GPU_NAME, DASLLAMA_RAM_GB.
+struct HardwareInfo {
+    cpu : string
+    arch : string
+    os : string
+    @optional perf_cores : int    // performance cores (Apple asymmetric SoCs); 0 elsewhere
+    @optional total_cores : int   // physical on macOS, logical on Windows/Linux (best-effort)
+    @optional ram_gb : int
+    @optional gpu : string
+}
+
+def private is_macos() : bool {
+    return !is_windows() && run_capture("uname -s", true) == "Darwin"
+}
+
+def private platform_arch() : string {
+    if (is_windows()) {
+        return get_env_variable("PROCESSOR_ARCHITECTURE")
+    }
+    return run_capture("uname -m", true)
+}
+
+def private win_env_int(name : string) : int {
+    return to_int(get_env_variable(name))
+}
+
+def private platform_ram_gb() : int {
+    let ov = get_env_variable("DASLLAMA_RAM_GB")
+    if (!empty(ov)) {
+        return to_int(ov)
+    }
+    let gib = 1024.0 * 1024.0 * 1024.0
+    if (is_windows()) {
+        // wmic emits "TotalPhysicalMemory=68632934400"
+        let raw = run_capture("wmic ComputerSystem get TotalPhysicalMemory /value", false)
+        for (ln in split(raw, "\n")) {
+            let i = find(ln, "=")
+            if (i >= 0 && find(ln, "TotalPhysicalMemory") >= 0) {
+                return int(to_float(strip(slice(ln, i + 1))) / gib + 0.5)
+            }
+        }
+        return 0
+    }
+    if (is_macos()) {
+        return int(to_float(run_capture("sysctl -n hw.memsize", true)) / gib + 0.5)
+    }
+    // linux /proc/meminfo: "MemTotal:       131842348 kB"
+    let ln = run_capture("grep MemTotal /proc/meminfo", true)
+    let i = find(ln, ":")
+    if (i < 0) {
+        return 0
+    }
+    let toks <- split(strip(slice(ln, i + 1)), " ")
+    return empty(toks) ? 0 : int(to_float(toks[0]) / (1024.0 * 1024.0) + 0.5)
+}
+
+// after-colon tail of the first line of `raw` containing `key`; "" when absent
+def private line_value(raw, key : string) : string {
+    for (ln in split(raw, "\n")) {
+        let k = find(ln, key)
+        if (k >= 0) {
+            let c = find(ln, ":", k)
+            if (c >= 0) {
+                return strip(slice(ln, c + 1))
+            }
+        }
+    }
+    return ""
+}
+
+def private platform_gpu() : string {
+    let ov = get_env_variable("DASLLAMA_GPU_NAME")
+    if (!empty(ov)) {
+        return ov
+    }
+    if (is_windows()) {
+        let raw = run_capture("wmic path win32_VideoController get name /value", false)
+        for (ln in split(raw, "\n")) {
+            let i = find(ln, "Name=")
+            if (i >= 0) {
+                return strip(slice(ln, i + length("Name=")))
+            }
+        }
+        return ""
+    }
+    if (is_macos()) {
+        let raw = run_capture("system_profiler SPDisplaysDataType", false)
+        let chip = line_value(raw, "Chipset Model")
+        let cores = line_value(raw, "Total Number of Cores")
+        if (empty(chip)) {
+            return ""
+        }
+        return empty(cores) ? chip : "{chip} ({cores}-core)"
+    }
+    let ln = run_capture("lspci | grep -iE \"vga|3d\"", true)
+    let i = find(ln, ": ")
+    return i >= 0 ? strip(slice(ln, i + 2)) : ""
+}
+
+def private platform_cores() : tuple<perf : int; total : int> {
+    if (is_windows()) {
+        return (perf = 0, total = win_env_int("NUMBER_OF_PROCESSORS"))
+    }
+    if (is_macos()) {
+        return (
+            perf = to_int(run_capture("sysctl -n hw.perflevel0.physicalcpu", true)),
+            total = to_int(run_capture("sysctl -n hw.physicalcpu", true)))
+    }
+    return (perf = 0, total = to_int(run_capture("nproc", true)))
+}
+
+//! Probe this box's hardware identity (see `HardwareInfo`). One-shot — a handful of child
+//! processes; call once per run, not per row.
+def gather_hardware : HardwareInfo {
+    let cpu = platform_cpu()
+    let os = platform_os()
+    let cores = platform_cores()
+    return HardwareInfo(
+        cpu = empty(cpu) ? "unknown" : cpu,
+        arch = platform_arch(),
+        os = empty(os) ? "unknown" : os,
+        perf_cores = cores.perf,
+        total_cores = cores.total,
+        ram_gb = platform_ram_gb(),
+        gpu = platform_gpu())
 }
 
 // ===== Baseline TSV I/O (reference tok/s the establisher writes, the generator reads) =====
@@ -661,4 +855,149 @@ def upsert_asr(var tests : array<AsrRec>; var rec : AsrRec) {
         }
     }
     tests |> emplace(rec)
+}
+
+// ===== Public bench records (modules/dasLLAMA/PUBLIC_BENCH_PLAN.md) =====
+
+//! One measured test row, keyed in `BenchRun.tests` by the llama-bench test name
+//! ("pp512", "tg128", ...): mean tok/s over the timed reps ± sample stdev.
+struct BenchTest {
+    tok_s : double
+    @optional stddev : double
+}
+
+//! One engine × backend × flavor run on one box — a first-class record. das and llama.cpp runs
+//! are siblings in the same store; pairing and ratios are derived at render time, never stored.
+//! `cmd` is the reproduction receipt: the exact invocation that produced the numbers.
+struct BenchRun {
+    engine : string          // "das" | "llama.cpp"
+    backend : string         // "cpu" | "metal" | "vulkan"
+    flavor : string          // das: "tuned"; llama.cpp build flavor: "stock" | "clean-cpu"
+    box : string
+    threads : int
+    date : string            // YYYY-MM-DD
+    cmd : string
+    hardware : HardwareInfo
+    tests : table<string; BenchTest>
+    @optional source : string   // "official" | "community" — stamped by the store driver, not the tool
+    @optional sha : string      // engine commit (das: git HEAD; llama.cpp: build_commit)
+    @optional version : string  // das release version
+    @optional tune : string     // das gen-kernel stamp provenance — required for reproducibility
+    @optional exec_fmt : string // what this engine EXECUTES for this file (weight formats per site
+                                // class + activation/scale treatment) — the apples-to-apples receipt;
+                                // das derives it from the loaded Model, llama.cpp rows from flavor
+}
+
+//! One GGUF's identity plus every run measured against it. `gguf` (the exact filename) is the
+//! store's primary key — it pins weights and quant.
+struct BenchModel {
+    gguf : string
+    runs : array<BenchRun>
+    @optional arch : string
+    @optional quant : string
+    @optional params_b : double    // total parameters, from llama-bench's model_n_params
+    @optional active_b : double    // per-token active parameters (MoE-aware), from Config geometry
+    @optional size_bytes : int64
+    @optional note : string        // board caveat for this model (quant substitution, capability gap)
+}
+
+//! True on a macOS box — the gate for Metal cells in the record driver.
+def is_apple_box : bool {
+    return !is_windows() && run_capture("uname -s", true) == "Darwin"
+}
+
+//! The official per-box record store the site build merges.
+def bench_records_path : string {
+    return "modules/dasLLAMA/performance/records/{box_name()}.json"
+}
+
+def read_bench_records(path : string; var models : array<BenchModel>) : bool {
+    if (!stat(path).is_valid) {
+        return false
+    }
+    return sscan_json(fread(path), models)
+}
+
+def write_bench_records(path : string; models : array<BenchModel>) {
+    let text = sprint_json(models, true)
+    var wrote = false
+    fopen(path, "wb") $(f) {
+        if (f != null) {
+            fwrite(f, text)
+            wrote = true
+        }
+    }
+    if (!wrote) {
+        to_log(LOG_ERROR, "dasLLAMA bench: could not open {path} for writing — records NOT persisted\n")
+    }
+}
+
+//! Update-or-insert one run; the identity is (box, engine, backend, flavor) — a re-measure
+//! replaces its row in place (fresh date/sha), never appends a superseded copy.
+def upsert_bench_run(var runs : array<BenchRun>; var r : BenchRun) {
+    for (c in runs) {
+        if (c.box == r.box && c.engine == r.engine && c.backend == r.backend && c.flavor == r.flavor) {
+            c <- r
+            return
+        }
+    }
+    runs |> emplace(r)
+}
+
+//! Merge one incoming model (e.g. a --json-path cell from lcpp_bench) into the store: identity
+//! fields refresh when the incoming side knows them, runs upsert per (box, engine, backend, flavor).
+def upsert_bench_model(var models : array<BenchModel>; var incoming : BenchModel) {
+    for (m in models) {
+        if (m.gguf == incoming.gguf) {
+            if (!empty(incoming.arch)) {
+                m.arch = incoming.arch
+            }
+            if (!empty(incoming.quant)) {
+                m.quant = incoming.quant
+            }
+            if (incoming.params_b > 0.0lf) {
+                m.params_b = incoming.params_b
+            }
+            if (incoming.active_b > 0.0lf) {
+                m.active_b = incoming.active_b
+            }
+            if (incoming.size_bytes > 0l) {
+                m.size_bytes = incoming.size_bytes
+            }
+            if (!empty(incoming.note)) {
+                m.note = incoming.note
+            }
+            for (i in range(length(incoming.runs))) {
+                upsert_bench_run(m.runs, incoming.runs[i])
+            }
+            return
+        }
+    }
+    models |> emplace(incoming)
+}
+
+// ===== llama-bench invocation (shared by lcpp_bench --ref and the establisher) =====
+
+//! One llama-bench `-o json` result row (prefill rows have n_gen=0, decode rows n_prompt=0).
+struct LlamaBenchRow {
+    n_prompt : int
+    n_gen : int
+    avg_ts : double
+    @optional stddev_ts : double
+    model_n_params : int64
+    build_commit : string
+}
+
+//! Run a llama-bench command line (must include `-o json`) and parse its rows. False on a run or
+//! parse failure. Stdout only — llama-bench keeps progress on stderr, so the pipe stays clean.
+def run_llama_bench(cmd : string; var rows : array<LlamaBenchRow>) : bool {
+    var out = ""
+    unsafe {
+        popen(cmd) $(f) {
+            if (f != null) {   // popen can hand a null handle on spawn failure (bad binary path)
+                out = fread_to_eof(f)
+            }
+        }
+    }
+    return sscan_json(out, rows)
 }

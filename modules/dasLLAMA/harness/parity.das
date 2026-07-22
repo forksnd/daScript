@@ -43,6 +43,9 @@ struct Args {
     @clarg_doc = "Native K-quant planes A/B: 1 = keep Q4_K/Q5_K/Q6_K packed at load, 0 = q8-requant fallback, -1 = keep default"
     kquant_native : int = -1
 
+    @clarg_doc = "GPU layers, llama-bench spelling: 0 = CPU, anything else = the whole graph on Metal, required (default: 0)"
+    ngl : int = 0
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -76,7 +79,13 @@ def main {
     if (cfg.kquant_native >= 0) {   // load-time layout decision, must precede load_gguf
         set_kquant_native(cfg.kquant_native != 0)
     }
+    if (cfg.ngl != 0) {   // before load_model — pins the portable backend, activates the metal overrides
+        set_metal_mode(MetalMode.required)
+    }
     var t <- load_gguf(cfg.model, cfg.quant)
+    if (cfg.ngl != 0 && !convert_model_to_metal_blob(t)) {   // the Metal drivers serve blob-form models only
+        panic("dasLLAMA parity: metal-blob transform declined — cannot serve --ngl on this load")
+    }
     // Cap the KV context: only ~(prompt + n_gen) positions are used, and native seq_len (Llama-3 /
     // Phi / gemma4: 131072) would waste multi-GB KV allocations. Same cap test_parity.das applies.
     if (t.config.seq_len > 2048l) {

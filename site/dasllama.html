@@ -103,6 +103,29 @@
   .dl-td-model { color: var(--fg); }
   .dl-plat { font-family: var(--font-mono); font-size: 11px; color: var(--fg-faint); margin-top: 14px; }
 
+  /* per-model benchmark leaderboard */
+  .dl-bench-model { border: 1px solid var(--rule); border-radius: 8px; background: var(--bg-2); margin-top: 18px; padding: 18px 20px; }
+  .dl-bench-model__head { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 6px 14px; }
+  .dl-bench-model__name { font-family: var(--font-mono); font-size: 14px; font-weight: 600; color: var(--fg); overflow-wrap: anywhere; }
+  .dl-bench-model__meta { font-family: var(--font-mono); font-size: 11px; color: var(--fg-faint); }
+  .dl-bench-model__note { font-family: var(--font-mono); font-size: 10.5px; color: var(--amber-dim); margin-top: 6px; }
+  .dl-bench-box { margin-top: 14px; }
+  .dl-bench-box__name { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); margin-bottom: 4px; }
+  .dl-bench-cols, .dl-bench-row { display: grid; grid-template-columns: 210px 1fr 84px 84px 72px; gap: 12px; align-items: center; padding: 4px 8px; }
+  .dl-bench-cols { font-family: var(--font-mono); font-size: 10px; color: var(--fg-faint); }
+  .dl-bench-cols span:nth-child(n+3) { text-align: right; }
+  .dl-bench-row { border-radius: 4px; cursor: pointer; }
+  .dl-bench-row:hover { background: rgba(232,161,58,0.05); }
+  .dl-bench-row__eng { font-family: var(--font-mono); font-size: 12px; color: var(--fg-dim); }
+  .dl-bench-row--das .dl-bench-row__eng { color: var(--amber); }
+  .dl-bench-row--win .dl-bench-row__eng { font-weight: 700; }
+  .dl-bench-row__tags { color: var(--fg-faint); font-size: 10px; }
+  .dl-bench-row__track { height: 13px; background: var(--bg-3); border-radius: 3px; overflow: hidden; }
+  .dl-bench-row__fill { height: 100%; border-radius: 3px; background: var(--fg-faint); }
+  .dl-bench-row--das .dl-bench-row__fill { background: var(--amber); }
+  .dl-bench-row__num, .dl-bench-row__ratio { font-family: var(--font-mono); font-size: 12px; text-align: right; color: var(--fg); }
+  .dl-bench-receipt { font-family: var(--font-mono); font-size: 10.5px; line-height: 1.6; color: var(--fg-dim); background: var(--bg-3); border-radius: 6px; padding: 10px 12px; margin: 4px 0 8px; overflow-x: auto; white-space: pre; }
+
   /* ASR */
   .dl-asr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
   .dl-asr-model { border: 1px solid var(--rule); border-radius: 8px; padding: 20px 22px; background: var(--bg-2); }
@@ -133,6 +156,7 @@
   @media (max-width: 900px) {
     .dl-asr-grid, .dl-blowouts, .dl-caveats { grid-template-columns: 1fr; }
     .dl-bar { grid-template-columns: 110px 1fr 52px; }
+    .dl-bench-cols, .dl-bench-row { grid-template-columns: 128px 1fr 60px 60px 48px; gap: 8px; }
     .dl-axis { padding: 0 52px 0 110px; }
   }
 </style>
@@ -290,10 +314,29 @@ def main() {
         </div>
     </section>
 
-    <!-- § 02 ASR -->
-    <section class="forge-section forge-section--alt">
+    <!-- § 02 per-model benchmarks (leaderboard from bench_records.json; hidden until records exist) -->
+    <section class="forge-section forge-section--alt" id="bench" hidden>
         <div class="forge-container">
-            <div class="forge-section-label"><span class="forge-section-label__num">§ 02</span><span class="forge-section-label__rule"></span><span>speech-to-text</span></div>
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 02</span><span class="forge-section-label__rule"></span><span>per-model benchmarks</span></div>
+            <h2 class="forge-h2">Every engine, every machine, one list.</h2>
+            <p class="forge-p">One group per model &times; machine, every configuration a row, sorted by measured speed. llama.cpp appears in both reference builds &mdash; <em>clean-cpu</em> (no Accelerate/BLAS, kernel-vs-kernel) and <em>stock</em> (as shipped: Accelerate on macOS, plus its Metal backend at <code>-ngl 99</code>). Click a row for its receipt: the exact command lines, commits, tune state, and auto-probed hardware. pp512 = 512-token prefill, tg128 = 128-token greedy decode, tok/s, higher is better. The ratio column compares each das row with the best llama.cpp row on the same backend.</p>
+
+            <div class="dl-toggles">
+                <span class="dl-seg__caption">sort by</span>
+                <div class="dl-seg">
+                    <button class="js-bench-sort is-active" data-sort="tg128" type="button">decode (tg128)</button>
+                    <button class="js-bench-sort" data-sort="pp512" type="button">prefill (pp512)</button>
+                </div>
+            </div>
+
+            <div id="bench-groups"></div>
+        </div>
+    </section>
+
+    <!-- § 03 ASR -->
+    <section class="forge-section">
+        <div class="forge-container">
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 03</span><span class="forge-section-label__rule"></span><span>speech-to-text</span></div>
             <h2 class="forge-h2">Competitive with the dedicated engines on CPU.</h2>
             <p class="forge-p">Transcription time, CPU only, greedy decode. Bars show speed relative to the reference CLI (longer = faster); the small figure is real-time factor — seconds of audio per second of compute. Note the macOS *-cli tools do get Apple's AMX matrix unit here, so this isn't scalar-only on their side.</p>
 
@@ -313,7 +356,7 @@ def main() {
     <!-- § 03 audio-chat blowout -->
     <section class="forge-section">
         <div class="forge-container">
-            <div class="forge-section-label"><span class="forge-section-label__num">§ 03</span><span class="forge-section-label__rule"></span><span>audio-chat models</span></div>
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 04</span><span class="forge-section-label__rule"></span><span>audio-chat models</span></div>
             <div class="forge-bench__grid">
                 <div>
                     <h2 class="forge-h2">Where the CPU-only gap is widest: audio chat.</h2>
@@ -328,7 +371,7 @@ def main() {
     <!-- § 04 supported model families -->
     <section class="forge-section" id="models">
         <div class="forge-container">
-            <div class="forge-section-label"><span class="forge-section-label__num">§ 04</span><span class="forge-section-label__rule"></span><span>supported model families</span></div>
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 05</span><span class="forge-section-label__rule"></span><span>supported model families</span></div>
             <h2 class="forge-h2">One engine, twelve architectures.</h2>
             <p class="forge-p">Everything below loads from stock GGUF (llama2.c <code>.bin</code> for the toy), auto-detected from metadata, and is verified token-for-token against its reference engine. Weights: F32 / F16 / Q8_0 / Q4_0 / MXFP4 read directly; K-quant files (Q4_K_M / Q5_K_M / Q6_K) run on native K-quant kernels; bf16 audio towers read exactly.</p>
             <div class="dl-caveats">
@@ -348,7 +391,7 @@ def main() {
     <!-- § 05 methodology -->
     <section class="forge-section forge-section--alt" id="method">
         <div class="forge-container">
-            <div class="forge-section-label"><span class="forge-section-label__num">§ 05</span><span class="forge-section-label__rule"></span><span>methodology &amp; honest caveats</span></div>
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 06</span><span class="forge-section-label__rule"></span><span>methodology &amp; honest caveats</span></div>
             <h2 class="forge-h2" style="margin-bottom:36px">The framing, in full.</h2>
             <div class="dl-caveats">
                 <div class="dl-caveat"><div class="dl-caveat__k">what das is</div><div class="dl-caveat__v">An LLM + ASR inference engine written entirely in daslang and JIT-compiled — no hand-written SIMD/assembly. The point is narrow but real: a scripting language keeping pace with hand-tuned C++ on the CPU path.</div></div>

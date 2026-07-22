@@ -5707,7 +5707,9 @@ var g_pso_g4rnorm : MetalComputePipeline?      // gemma4 MoE router-input norm (
 var g_pso_moe_wscale : MetalComputePipeline?   // gemma4 per-expert down-scale fold
 var g_pso_swiglu_oai : MetalComputePipeline?   // gpt-oss clamped swiglu (stage 4)
 var g_pso_moe_gemv_mx4 : MetalComputePipeline?  // gpt-oss MXFP4 expert GEMV
+var g_pso_moe_gemv_q51 : MetalComputePipeline?  // Q5_1 expert GEMV (per-32 planes)
 var g_e8m0_tab : MetalBuffer?                   // [256] exact e8m0_half scales
+var g_mx4_vtab : MetalBuffer?                   // [16] signed doubled-e2m1 values
 var g_pso_dn_conv : MetalComputePipeline?      // deltanet (Wave D): causal conv + SiLU
 var g_pso_dn_hist : MetalComputePipeline?      // conv-history advance
 var g_pso_dn_l2 : MetalComputePipeline?        // q/k per-head L2 norm + q pre-scale
@@ -5842,6 +5844,7 @@ def metal_decode_init : bool {
     g_pso_moe_wscale = compile_pso(metal_moe_wscale_msl, metal_moe_wscale_msl_entry, metal_moe_wscale_msl_fastmath, ok)
     g_pso_swiglu_oai = compile_pso(metal_swiglu_oai_msl, metal_swiglu_oai_msl_entry, metal_swiglu_oai_msl_fastmath, ok)
     g_pso_moe_gemv_mx4 = compile_pso(metal_moe_gemv_mx4_msl, metal_moe_gemv_mx4_msl_entry, metal_moe_gemv_mx4_msl_fastmath, ok)
+    g_pso_moe_gemv_q51 = compile_pso(metal_moe_gemv_q51_msl, metal_moe_gemv_q51_msl_entry, metal_moe_gemv_q51_msl_fastmath, ok)
     g_pso_dn_conv = compile_pso(metal_dn_conv_msl, metal_dn_conv_msl_entry, metal_dn_conv_msl_fastmath, ok)
     g_pso_dn_hist = compile_pso(metal_dn_conv_hist_msl, metal_dn_conv_hist_msl_entry, metal_dn_conv_hist_msl_fastmath, ok)
     g_pso_dn_l2 = compile_pso(metal_dn_l2norm_msl, metal_dn_l2norm_msl_entry, metal_dn_l2norm_msl_fastmath, ok)
@@ -5855,6 +5858,14 @@ def metal_decode_init : bool {
         var ep = reinterpret<uint?>(metal_buffer_contents(g_e8m0_tab))
         for (ei in range(256)) {
             ep[ei] = ei < 2 ? (0x00200000u << uint(ei)) : (uint(ei - 1) << 23u)
+        }
+    }
+    g_mx4_vtab = metal_new_buffer(g_dev, 64ul)
+    unsafe {
+        var vp = reinterpret<float?>(metal_buffer_contents(g_mx4_vtab))
+        let mags = fixed_array(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0)
+        for (vi in range(16)) {
+            vp[vi] = vi < 8 ? mags[vi] : -mags[vi - 8]
         }
     }
     g_pso_copy_row = compile_pso(metal_copy_row_msl, metal_copy_row_msl_entry, metal_copy_row_msl_fastmath, ok)
@@ -6319,6 +6330,22 @@ def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, 
         metal_set_buffer(enc, bbxs, 0ul, 10)
         metal_set_buffer(enc, bbys, 0ul, 11)
         metal_dispatch_threadgroups(enc, uint3(uint((rows + g_gemv_rows - 1l) / g_gemv_rows), uint(k), uint(nst)), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
+    } elif (fmt == KqFmt.q51) {
+        let qp = q51_planes_of(g_dev, t, stack_off)
+        metal_set_pipeline(enc, g_pso_moe_gemv_q51)
+        metal_set_buffer(enc, qp.qbuf, qp.qoff, 0)
+        metal_set_buffer(enc, qp.sbuf, qp.soff, 1)
+        metal_set_buffer(enc, bx, 0ul, 2)
+        metal_set_buffer(enc, by, yoff, 3)
+        metal_set_buffer(enc, bn, 0ul, 4)
+        metal_set_buffer(enc, bd, 0ul, 5)
+        metal_set_buffer(enc, bsel, 0ul, 6)
+        metal_set_buffer(enc, bes, 0ul, 7)
+        metal_set_buffer(enc, bxs, 0ul, 8)
+        metal_set_buffer(enc, bss, 0ul, 9)
+        metal_set_buffer(enc, bbxs, 0ul, 10)
+        metal_set_buffer(enc, bbys, 0ul, 11)
+        metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
     } else {
         let bq = kq_quants_of(g_dev, t, fmt, stack_off)
         let bs = kq_scales_of(g_dev, t, fmt, stack_off)
@@ -6389,7 +6416,8 @@ def enc_moe_gemv_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, rows, k, 
     metal_set_buffer(enc, bwb, 0ul, 12)
     metal_set_buffer(enc, bhasb, 0ul, 13)
     metal_set_buffer(enc, g_e8m0_tab, 0ul, 14)
-    metal_dispatch_threadgroups(enc, uint3(uint((rows + g_gemv_rows - 1l) / g_gemv_rows), uint(k), uint(nst)), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
+    metal_set_buffer(enc, g_mx4_vtab, 0ul, 15)
+    metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
 }
 
 // ===== deltanet (Wave D) — the recurrent-layer chain encoders =====
@@ -7284,6 +7312,7 @@ def metal_kernels_release {
     release_pso(g_pso_moe_wscale)
     release_pso(g_pso_swiglu_oai)
     release_pso(g_pso_moe_gemv_mx4)
+    release_pso(g_pso_moe_gemv_q51)
     release_pso(g_pso_dn_conv)
     release_pso(g_pso_dn_hist)
     release_pso(g_pso_dn_l2)
@@ -7292,6 +7321,10 @@ def metal_kernels_release {
     release_pso(g_pso_dn_deint)
     release_pso(g_pso_sigmul)
     release_pso(g_pso_axpy_sig)
+    if (g_mx4_vtab != null) {
+        metal_release(g_mx4_vtab)
+        g_mx4_vtab = null
+    }
     if (g_e8m0_tab != null) {
         metal_release(g_e8m0_tab)
         g_e8m0_tab = null

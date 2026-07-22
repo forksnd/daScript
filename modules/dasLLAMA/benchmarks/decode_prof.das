@@ -78,6 +78,9 @@ struct Args {
     @clarg_doc = "Q5_0 -> k5 re-encode A/B: 1 = re-quantize Q5_0 into the k5 plane at load (LOSSY, 9.0 -> 5.625 bits), 0 = bit-exact Q5_0 -> Q8, -1 = keep default"
     q50_native : int = -1
 
+    @clarg_doc = "Native Q5_1 plane tier A/B: 1 = per-32 q51 planes (expert stacks), 0 = q8-requant fallback (exact), -1 = keep default"
+    q51_native : int = -1
+
     @clarg_doc = "Noisy diagnostics: the loader reports backend, format tags and plane bytes (also DASLLAMA_NOISY=1)"
     noisy : bool
 
@@ -123,6 +126,9 @@ def private kq_wbytes(f : KqFmt; q8wb : double) : double {
     }
     if (f == KqFmt.q40) {
         return (128.0lf + 16.0lf) / 256.0lf   // nibbles + 8 x f16 d
+    }
+    if (f == KqFmt.q51) {
+        return (20.0lf + 4.0lf) / 32.0lf   // per 32-block: nibbles + qh, f16 d + m
     }
     return q8wb
 }
@@ -320,6 +326,10 @@ def main() {
     if (cfg.q50_native >= 0) {
         set_kq_q50_native(cfg.q50_native != 0)
         print("q50_native override: {cfg.q50_native != 0}\n")
+    }
+    if (cfg.q51_native >= 0) {
+        set_kq_q51_native(cfg.q51_native != 0)
+        print("q51_native override: {cfg.q51_native != 0}\n")
     }
     if (cfg.noisy) {
         set_dasllama_noisy(true)
