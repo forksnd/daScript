@@ -579,7 +579,7 @@ def public repository_file_diff_argv(repository_id : string;
         let path_error = repository_working_preview_path(
             worktree_path, file_path, absolute_path)
         if (!empty(path_error)) return path_error
-        var clean_file = GitFileState(
+        let clean_file = GitFileState(
             worktree_path = worktree_path, code = "  ", path = file_path)
         return repository_build_file_diff_argv(
             worktree_path, clean_file, comparison, argv, expected_exit_code,

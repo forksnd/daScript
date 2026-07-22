@@ -982,7 +982,7 @@ class DasHerdWatcherServer : HvWebServer {
         } elif (incoming.op == "file_inspect") {
             self.start_file_inspection(client, incoming)
         } elif (incoming.op == "mailbox_post") {
-            var request = WatcherMailboxPostRequest(
+            let request = WatcherMailboxPostRequest(
                 session_id = incoming.session_id,
                 direction = incoming.direction,
                 sender = incoming.sender,

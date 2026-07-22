@@ -953,18 +953,20 @@ def public watcher_mailbox_json(session_id : string; direction : string = "";
                                 message_id : string = "") : string {
     let index = watcher_find_session(session_id)
     if (index < 0 || g_sessions[index] == null) return "[]"
-    var result = "["
-    var first = true
-    for (message in g_sessions[index].mailbox) {
-        if (!empty(direction) && message.direction != direction) continue
-        if (!empty(message_id) && message.id != message_id) continue
-        if (!first) {
-            result += ","
+    return build_string() $(var writer) {
+        writer |> write("[")
+        var first = true
+        for (message in g_sessions[index].mailbox) {
+            if ((!empty(direction) && message.direction != direction)
+                    || (!empty(message_id) && message.id != message_id)) continue
+            if (!first) {
+                writer |> write(",")
+            }
+            writer |> write(sprint_json(message, false))
+            first = false
         }
-        result += sprint_json(message, false)
-        first = false
+        writer |> write("]")
     }
-    return result + "]"
 }
 
 def private resize_session(var session : WatcherSession?; columns, rows, client_id : int) : string {

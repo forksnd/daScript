@@ -3111,14 +3111,13 @@ def private file_inspector_status() : GitWindowStatus {
 def herder_attention_state(_input : JsonValue?) : JsonValue? {
     var messages : array<JsonValue?>
     if (g_client != null) {
+        messages |> reserve(length(g_client.mailbox))
         for (message in g_client.mailbox) {
             if (message.direction != "outbox") continue
-            var targets : array<JsonValue?>
-            for (target in message.focus.targets) {
-                targets |> push(JV((file_path = target.file_path,
+            var targets <- [for (target in message.focus.targets);
+                JV((file_path = target.file_path,
                     whole_file = target.whole_file,
-                    range_count = length(target.ranges))))
-            }
+                    range_count = length(target.ranges)))]
             messages |> push(JV((id = message.id, sender = message.sender,
                 subject = message.subject, status = message.status,
                 targets = targets)))
@@ -3278,8 +3277,8 @@ def private draw_focus_target_overlay(target : WatcherFocusTarget const;
                         dl |> add_rect_filled(p0, p1, dim_color)
                     } else {
                         dl |> add_rect_filled(p0, p1, focus_fill)
-                        let marker_right = state.screen_origin.x
-                            - max(2.0f, GetStyle().ItemSpacing.x * 0.35f)
+                        let marker_right = (state.screen_origin.x
+                            - max(2.0f, GetStyle().ItemSpacing.x * 0.35f))
                         dl |> add_rect_filled(
                             float2(marker_right - 3.0f, p0.y),
                             float2(marker_right, p1.y), focus_outline)
@@ -3325,8 +3324,8 @@ def private draw_focus_target_overlay(target : WatcherFocusTarget const;
                 } else {
                     dl |> add_rect_filled(p0, p1, focus_fill)
                     if (cell.line_index != last_focused_line) {
-                        let marker_right = state.screen_origin.x
-                            - max(2.0f, GetStyle().ItemSpacing.x * 0.35f)
+                        let marker_right = (state.screen_origin.x
+                            - max(2.0f, GetStyle().ItemSpacing.x * 0.35f))
                         dl |> add_rect_filled(
                             float2(marker_right - 3.0f, p0.y),
                             float2(marker_right, p1.y), focus_outline)
@@ -3397,8 +3396,8 @@ def private apply_active_focus() {
             if (g_pending_focus_scroll) {
                 var line_index = 0
                 peek_data(g_inspector.view_document.source) $(bytes) {
-                    for (index in range(min(length(bytes),
-                            max(0, g_inspector.focus_start_byte)))) {
+                    for (index in range(clamp(g_inspector.focus_start_byte,
+                            0, length(bytes)))) {
                         if (int(bytes[index]) == '\n') {
                             line_index++
                         }
