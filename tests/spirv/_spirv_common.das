@@ -2065,10 +2065,11 @@ def public sdot_emitter_opcodes : table<uint> {
     return <- s
 }
 
-// The coopmat GEMM-tile fixture adds the four KHR cooperative-matrix opcodes plus OpConstantNull (the
-// zero-initialized accumulator — no earlier fixture zero-inits a value type). The CooperativeMatrixKHR /
-// VulkanMemoryModel capabilities + SPV_KHR_cooperative_matrix extension ride the already-declared
-// Capability / Extension opcodes; the Vulkan memory model rides the already-declared MemoryModel opcode.
+// The coopmat GEMM-tile fixture adds the four KHR cooperative-matrix opcodes plus OpConstantNull (every
+// bare `var` coopmat local — A, B and the accumulator — zero-inits with one; no earlier fixture zero-inits
+// a value type). The CooperativeMatrixKHR / VulkanMemoryModel capabilities + SPV_KHR_cooperative_matrix
+// extension ride the already-declared Capability / Extension opcodes; the Vulkan memory model rides the
+// already-declared MemoryModel opcode.
 def public coopmat_emitter_opcodes : table<uint> {
     var s <- sdot_emitter_opcodes()
     for (op in [

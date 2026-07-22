@@ -386,14 +386,16 @@ def public rayQueryGetIntersectionBarycentricsEXT(var rq : rayQueryEXT; committe
 def public rayQueryGetIntersectionTEXT(var rq : rayQueryEXT; committed : bool) : float { return 0.0 }
 
 // ===== cooperative matrices (VK_KHR_cooperative_matrix — Tensor-Core MMA) =====
-// A coopmat is a subgroup-scoped opaque tile (OpTypeCooperativeMatrixKHR) held in a Function-storage
-// LOCAL, unlike a texture (a descriptor). Each marker struct names one concrete (component, use, tile)
-// combination the emitter recognizes by name (coopmat_info) -> OpTypeCooperativeMatrixKHR. v1 covers the
-// f16xf16 -> f32 GEMM tile at 16x16: A (MxK) and B (KxN) inputs, an f32 accumulator (MxN). `var acc :
-// coopmatAcc_f32_16x16` is zero-initialized (OpConstantNull); coopmatLoad fills A/B from an SSBO,
-// coopmatMulAdd accumulates, coopmatStore writes the result out. The stub bodies never run — only the
-// call AST is read (declare_local_var + the visitExprCall coopmat arms do the lowering). `layout` is a
-// compile-time constant: 0 = row-major, 1 = column-major (SpvCooperativeMatrixLayout).
+// A coopmat is a subgroup-scoped MMA tile (OpTypeCooperativeMatrixKHR) held in a Function-storage LOCAL,
+// unlike a texture (a descriptor). It is a whole-tile VALUE — loaded, accumulated and stored as a unit
+// (so declare_local_var treats it as a loadable local, not is_opaque like rayQueryEXT). Each marker
+// struct names one concrete (component, use, tile) combination the emitter recognizes by name
+// (coopmat_info) -> OpTypeCooperativeMatrixKHR. v1 covers the f16xf16 -> f32 GEMM tile at 16x16: A (MxK)
+// and B (KxN) inputs, an f32 accumulator (MxN). A bare `var` coopmat local is zero-initialized
+// (OpConstantNull); coopmatLoad fills A/B from an SSBO, coopmatMulAdd accumulates, coopmatStore writes
+// the result out. The stub bodies never run — only the call AST is read (declare_local_var + the
+// visitExprCall coopmat arms do the lowering). `layout` is a compile-time constant: 0 = row-major, 1 =
+// column-major (SpvCooperativeMatrixLayout).
 struct coopmatA_f16_16x16 {}
 struct coopmatB_f16_16x16 {}
 struct coopmatAcc_f32_16x16 {}
