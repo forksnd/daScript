@@ -109,4 +109,7 @@ def main {
     emit_golden(dir, "q8blk", q8blk_words())
     // packed integer dot product: sdot4 -> OpSDot + PackedVectorFormat4x8Bit literal
     emit_golden(dir, "sdot", sdot_words())
+    // cooperative matrix: OpTypeCooperativeMatrixKHR + Load/Store/MulAddKHR, VulkanMemoryModel + the
+    // Vulkan memory model, SPIR-V 1.6 header
+    emit_golden(dir, "coopmat", coopmat_words())
 }

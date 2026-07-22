@@ -186,6 +186,26 @@ def public ensure_storage_buffer_8(var m : SpirvModule) {
     m.type_pool |> insert("cap_sb8", 1u)
 }
 
+// Cooperative matrices (Tensor-Core MMA) need OpCapability CooperativeMatrixKHR + OpExtension
+// "SPV_KHR_cooperative_matrix", and — because coopmat ops carry implicit memory scope — the
+// VulkanMemoryModel capability (spirv-val rejects Shader + CooperativeMatrixKHR without it), which also
+// forces OpMemoryModel to Vulkan (generate_spirv picks that when this cap is present). The coopmat
+// opcodes are core only at SPIR-V 1.6, so the module version floors at 1.6 (glslang's KHR_coopmat blobs
+// are 1.6, where VulkanMemoryModel is core too — no OpExtension for it). Deduped through the type pool
+// like ensure_storage_buffer_8 so type_cooperative_matrix can pull it without an EmitCtx.
+def public ensure_cooperative_matrix(var m : SpirvModule) {
+    if (m.version < SPV_VERSION_1_6) {
+        m.version = SPV_VERSION_1_6
+    }
+    return if ((m.type_pool?["cap_coopmat"] ?? 0u) != 0u)
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.VulkanMemoryModel))
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.CooperativeMatrixKHR))
+    var nm <- string_words("SPV_KHR_cooperative_matrix")
+    emit_n(m, SEC_EXT, SpvOp.Extension, nm)
+    delete nm
+    m.type_pool |> insert("cap_coopmat", 1u)
+}
+
 def public type_int(var m : SpirvModule; width, signedness : uint) : uint {
     let key = "i{width}_{signedness}"
     let ex = m.type_pool?[key] ?? 0u
@@ -288,6 +308,28 @@ def public type_ray_query(var m : SpirvModule) : uint {
     return ex if (ex != 0u)
     let id = alloc_id(m)
     emit(m, SEC_TYPES, SpvOp.TypeRayQueryKHR, id)
+    m.type_pool |> insert(key, id)
+    return id
+}
+
+// OpTypeCooperativeMatrixKHR — a subgroup-scoped MxN (or MxK / KxN) tile of `comp_type`. The scope,
+// rows, cols and use are all <id> operands (OpConstant uints), NOT inline literals, so they are
+// materialized as constants first — define-before-use inside SEC_TYPES, exactly as type_array emits its
+// length const. `use` is SpvCooperativeMatrixUse (A/B/Accumulator); scope is SpvScope (Subgroup here).
+// Pulls the capability/extension + 1.6 floor via ensure_cooperative_matrix. Deduped on the full tuple.
+def public type_cooperative_matrix(var m : SpirvModule; comp_type, scope, rows, cols, use : uint) : uint {
+    ensure_cooperative_matrix(m)
+    let key = "coopmat{comp_type}_s{scope}_r{rows}_c{cols}_u{use}"
+    let ex = m.type_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let scope_id = const_uint(m, scope)
+    let rows_id = const_uint(m, rows)
+    let cols_id = const_uint(m, cols)
+    let use_id = const_uint(m, use)
+    let id = alloc_id(m)
+    var ops <- [id, comp_type, scope_id, rows_id, cols_id, use_id]
+    emit_n(m, SEC_TYPES, SpvOp.TypeCooperativeMatrixKHR, ops)
+    delete ops
     m.type_pool |> insert(key, id)
     return id
 }

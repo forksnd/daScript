@@ -115,6 +115,8 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_spec_axis_dup", "duplicates another SpecId")
         // gl_WorkGroupSize is the declared LocalSize: only the workgroup-dispatched stages have one
         check_rejects(t, "_fc_wgsize_stage", "builtin 'gl_WorkGroupSize' is not available in the fragment stage")
+        // cooperative matrices are subgroup-scoped -> compute-only; a coopmat op in a fragment shader is rejected
+        check_rejects(t, "_fc_coopmat_stage", "coopmatLoad is only valid in a compute shader")
         // a storage image's access qualifier is binding: no read of a @writeonly, no write to a @readonly
         check_rejects(t, "_fc_image_writeonly_load", "is @writeonly (NonReadable)")
         check_rejects(t, "_fc_image_readonly_store", "is @readonly (NonWritable)")

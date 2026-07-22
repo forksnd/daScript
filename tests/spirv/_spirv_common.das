@@ -2032,12 +2032,54 @@ def public q8blk_words : array<uint> {
     return clone_to_move(q8blk_spv)
 }
 
+// ===== cooperative matrix (SPV_KHR_cooperative_matrix): an f16 x f16 -> f32 GEMM tile. Loads a 16x16 A
+// (row-major) and B (column-major) from f16 SSBOs into subgroup tiles, one MulAdd into a zero-initialized
+// (OpConstantNull) f32 accumulator, stores the 16x16 result column-major. Exercises
+// OpTypeCooperativeMatrixKHR + CooperativeMatrix{Load,Store,MulAdd}KHR + the CooperativeMatrixKHR
+// capability + SPV_KHR_cooperative_matrix extension + the SPIR-V 1.6 version floor. =====
+var @ssbo @binding = 0 cm_a : array<float16>
+var @ssbo @binding = 1 cm_b : array<float16>
+var @ssbo @binding = 2 cm_c : array<float>
+
+[compute_shader(local_size_x=32, name="coopmat_spv"), marker(no_coverage)]
+def coopmat_kernel {
+    var a : coopmatA_f16_16x16
+    var b : coopmatB_f16_16x16
+    var acc : coopmatAcc_f32_16x16
+    coopmatLoad(a, cm_a, 0, 16, 0)   // A: 16x16 row-major, stride 16
+    coopmatLoad(b, cm_b, 0, 16, 1)   // B: 16x16 column-major, stride 16
+    acc = coopmatMulAdd(a, b, acc)
+    coopmatStore(acc, cm_c, 0, 16, 1)   // C: 16x16 column-major, stride 16
+}
+
+def public coopmat_words : array<uint> {
+    return clone_to_move(coopmat_spv)
+}
+
 // ===== packed integer dot product: sdot4 -> OpSDot with the PackedVectorFormat4x8Bit literal.
 // The DotProduct / DotProductInput4x8BitPacked caps + SPV_KHR_integer_dot_product ride the
 // declared Capability/Extension opcodes. =====
 def public sdot_emitter_opcodes : table<uint> {
     var s <- storage816_emitter_opcodes()
     s |> insert(uint(SpvOp.SDot))
+    return <- s
+}
+
+// The coopmat GEMM-tile fixture adds the four KHR cooperative-matrix opcodes plus OpConstantNull (the
+// zero-initialized accumulator — no earlier fixture zero-inits a value type). The CooperativeMatrixKHR /
+// VulkanMemoryModel capabilities + SPV_KHR_cooperative_matrix extension ride the already-declared
+// Capability / Extension opcodes; the Vulkan memory model rides the already-declared MemoryModel opcode.
+def public coopmat_emitter_opcodes : table<uint> {
+    var s <- sdot_emitter_opcodes()
+    for (op in [
+        SpvOp.ConstantNull,
+        SpvOp.TypeCooperativeMatrixKHR,
+        SpvOp.CooperativeMatrixLoadKHR,
+        SpvOp.CooperativeMatrixStoreKHR,
+        SpvOp.CooperativeMatrixMulAddKHR
+    ]) {
+        s |> insert(uint(op))
+    }
     return <- s
 }
 
