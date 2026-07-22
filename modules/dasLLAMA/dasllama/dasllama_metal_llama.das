@@ -61,7 +61,7 @@ let DECODE_NEEDS_OK = (MetalNeed.neox | MetalNeed.qkv_bias | MetalNeed.qk_norm |
     MetalNeed.ple)
 // q_gated/partial_rope only occur on hybrid models (attn_is_std false), which batch graph-declines;
 // ple (E-series) has no batch arm either — batched steps decline `feature` and fall back per-row
-let BATCH_NEEDS_OK = DECODE_NEEDS_OK ^ MetalNeed.ple
+let BATCH_NEEDS_OK = DECODE_NEEDS_OK & ~MetalNeed.ple   // clear ple explicitly (XOR would re-add it if DECODE ever drops it)
 
 def private decode_shape_decline(t : Model; needs_ok : MetalNeed; allow_moe : bool = false; allow_kv_share : bool = false) : MetalDecodeDecline {
     if (t.quant != QuantMode.q8) {
