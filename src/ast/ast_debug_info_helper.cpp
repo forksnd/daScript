@@ -234,8 +234,13 @@ namespace das {
         sti->init_mnh = 0;
         if ( st.module ) {
             sti->module_name = debugInfo->allocateCachedName(st.module->name);
-            if ( auto fn = st.module->findFunction(st.name) ) {
-                sti->init_mnh = fn->getMangledNameHash();
+            if ( auto it = st.module->functionsByName.find(hash64z(st.name.c_str())) ) {
+                for ( auto * fn : it->second ) {
+                    if ( fn->arguments.empty() && fn->result && fn->result->structType == &st ) {
+                        sti->init_mnh = fn->getMangledNameHash();
+                        break;
+                    }
+                }
             }
         }
         sti->annotations = makeAnnotationList(st.annotations, sti->annotation_count);
