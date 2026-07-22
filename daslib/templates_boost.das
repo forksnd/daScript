@@ -1366,18 +1366,24 @@ def public apply_qmacro_template_class(instance_name : string; var template_type
         if (func.classParent == template_structure) {
             // we rename methods
             let func_name = string(func.name)
-            var method_name_parts = split(func_name, "`")
-            if (method_name_parts[0] == template_name) {
-                method_name_parts[0] = instance_name
-            }
-            if (length(method_name_parts) == 2) {
-                if (method_name_parts[1] == template_name) { // ctor
-                    method_name_parts[1] = instance_name
-                } elif (method_name_parts[1] == "clone" || method_name_parts[1] == "finalize" || method_name_parts[1] == "each") {
-                    method_name_parts.erase(0)
+            var func_clone_name : string
+            if (func_name == "{template_name}'__finalize") {
+                // Keep each compiler-generated class finalizer distinct so substitution can retarget its field initializer.
+                func_clone_name = "{instance_name}'__finalize"
+            } else {
+                var method_name_parts = split(func_name, "`")
+                if (method_name_parts[0] == template_name) {
+                    method_name_parts[0] = instance_name
                 }
+                if (length(method_name_parts) == 2) {
+                    if (method_name_parts[1] == template_name) { // ctor
+                        method_name_parts[1] = instance_name
+                    } elif (method_name_parts[1] == "clone" || method_name_parts[1] == "finalize" || method_name_parts[1] == "each") {
+                        method_name_parts.erase(0)
+                    }
+                }
+                func_clone_name = join(method_name_parts, "`")
             }
-            let func_clone_name = join(method_name_parts, "`")
             method_renames.insert(func_name, func_clone_name)
         }
     })

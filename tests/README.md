@@ -1081,6 +1081,8 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 | File | Description | Expects errors |
 |---|---|---|
 | test_basic.das | All four grammar forms (`name(args)`, `$name(args)`, `name<types>(args)`, `$name<types>(args)`), const int/bool/string argument extraction, `typedecl(expr)` | |
+| test_template_structure_class.das | `[template_structure]` class specializations, inherited fields, virtual overrides, and distinct generated finalizers for multiple type arguments | |
+| _template_structure_class_mod.das | *(helper)* inherited `class template ProbeScalarCommand<T>` definition | |
 | _typemacro_mod.das | *(helper)* `tm_make` raw AstTypeMacro — resolves `tm_make(type<T>, N, wrap, tag)` to `T[N]` or `T` | |
 
 ## unsafe/
