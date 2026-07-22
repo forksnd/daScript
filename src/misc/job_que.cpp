@@ -80,14 +80,23 @@ namespace das {
     // slow E-core stalls every parallel_for on its straggler chunk (measured ~1.6x slower on an
     // M-series 8P+2E prefill vs P-only) — pre-main-steal that ruled out logical cores-1 here; now
     // that the main thread computes too, the -1 is what keeps every compute thread on a P-core.
-    // DAS_JOBQUE_THREADS is an explicit override that bypasses everything (0/unset = the default).
+    // DAS_JOBQUE_THREADS is an explicit override that bypasses everything (unset = the default).
     // The value is TOTAL cores, so it follows the same cores-1 rule as the default: N-1 workers +
     // the computing main == N lanes (matches llama.cpp -t N; the old "N workers + main" oversubscribed
-    // by one core and left a ragged final wave when the split didn't divide N+1). The max(1,...)
-    // floors at one worker: a 0-worker JobQue can't run, so N==1 gives 1 worker + main = 2 lanes.
+    // by one core and left a ragged final wave when the split didn't divide N+1). Values <= 1 are a
+    // FATAL ERROR: a 0-worker JobQue can't serve new_job, and the old floor-to-1-worker silently ran
+    // "t=1" as 2 lanes — every baseline built on it was inflated 2x.
     static int jobque_thread_count(int hw) {
-        static int forced = []{ const char * e = getenv("DAS_JOBQUE_THREADS"); return e ? atoi(e) : 0; }();
-        if ( forced > 0 ) return max(1, forced - 1);
+        static int forced = []{
+            const char * e = getenv("DAS_JOBQUE_THREADS");
+            if ( !e ) return 0;
+            int v = atoi(e);
+            if ( v <= 1 ) {
+                DAS_FATAL_ERROR("DAS_JOBQUE_THREADS='%s': value is TOTAL compute lanes (N-1 workers + the computing main) and must be >= 2; unset it for the default\n", e);
+            }
+            return v;
+        }();
+        if ( forced > 0 ) return forced - 1;
         int def = 0;
 #if defined(__APPLE__)
         if ( int good = apple_perf_core_count() ) def = max(1, good - 1);
