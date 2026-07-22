@@ -491,7 +491,7 @@ class DasHerdWatcherServer : HvWebServer {
         if (!watcher_get_session_info(client.action_session_id, info)
                 || !info.drained) return
         client.action_delivered = true
-        let truncated = false
+        var truncated = false
         let output = watcher_machine_output_text(client.action_session_id, truncated)
         let _compacted = watcher_compact_session(client.action_session_id, 160, 50)
         var failure = ""
@@ -545,7 +545,7 @@ class DasHerdWatcherServer : HvWebServer {
                 continue
             }
             if (!info.drained) continue
-            let truncated = false
+            var truncated = false
             let output = watcher_machine_output_text(action.session_id, truncated)
             let _compacted = watcher_compact_session(
                 action.session_id, 160, 50)
@@ -682,7 +682,7 @@ class DasHerdWatcherServer : HvWebServer {
         var info = WatcherSessionInfo()
         if (!watcher_get_session_info(client.inspection_session_id, info)
                 || !info.drained) return
-        let truncated = false
+        var truncated = false
         let output = watcher_machine_output_text(client.inspection_session_id, truncated)
         let _compacted = watcher_compact_session(client.inspection_session_id, 80, 25)
         if (client.inspection_phase == "indexed-view") {

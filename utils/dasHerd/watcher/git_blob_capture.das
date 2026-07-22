@@ -41,15 +41,17 @@ def main() : int {
                 while (true) {
                     let read_count = fread(input, chunk)
                     if (read_count <= 0) break
+                    if (capture_too_large || write_failed) continue
                     if (byte_count + read_count > MAX_CAPTURE_BYTES) {
                         capture_too_large = true
-                        break
+                        continue
                     }
                     if (read_count < length(chunk)) chunk |> resize(read_count)
                     let written = fwrite(output, chunk)
                     if (written != read_count) {
                         write_failed = true
-                        break
+                        if (read_count < 65536) chunk |> resize(65536)
+                        continue
                     }
                     byte_count += written
                     if (read_count < 65536) chunk |> resize(65536)

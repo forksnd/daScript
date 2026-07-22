@@ -583,7 +583,7 @@ def public watcher_strip_terminal_controls(value : string) : string {
 }
 
 def public watcher_machine_output_text(session_id : string;
-                                       var truncated : bool) : string {
+                                       var truncated : bool&) : string {
     truncated = false
     let index = watcher_find_session(session_id)
     if (index < 0 || g_sessions[index] == null) return ""

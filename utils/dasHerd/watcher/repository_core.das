@@ -1699,7 +1699,7 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
     }
     var info = WatcherSessionInfo()
     if (!watcher_get_session_info(runtime.snapshot.task_session_id, info) || !info.drained) return
-    let machine_output_truncated = false
+    var machine_output_truncated = false
     let output = watcher_machine_output_text(
         runtime.snapshot.task_session_id, machine_output_truncated)
     if (machine_output_truncated) {

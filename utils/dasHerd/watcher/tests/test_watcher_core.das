@@ -49,6 +49,11 @@ def test_watcher_machine_output(t : T?) {
         t |> equal(watcher_strip_terminal_controls("e" + combining_acute + esc + "[5Gx"),
             "e" + combining_acute + "   x", "combining codepoints do not consume a terminal column")
     }
+    t |> run("machine output reports truncation through its out parameter") <| @(t : T?) {
+        var truncated = true
+        t |> equal(watcher_machine_output_text("missing-session", truncated), "")
+        t |> success(!truncated)
+    }
 }
 
 def private wait_for(session_id, state : string; timeout_ms : int64) : bool {
