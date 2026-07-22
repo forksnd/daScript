@@ -706,7 +706,10 @@ def kq_test_family(fmt : int64; kfxs : array<KqFixture>) : bool {
 // suffix ("" = a gate failed). The kq gemv is nrsplit-independent — same-mr rows share the
 // plane and the gemv shape — so the tile bench decides the family entry.
 def kq_tune_family(fmt : int64) : string {
-    var kbfx <- build_kq_fixture(fmt, 2048l, 512l, 64l)      // batch shape (the kv projection)
+    // batch shape: fat STREAMING ffn (weights > the L2 budget, multi-token-block walk) — the shape
+    // class that carries ~90% of prefill time. The old 2048x512x64 kv-projection probe was L2-hot
+    // and crowned hot-shape winners that lose double-digit % at model scale (mr4 vs mr8, M1).
+    var kbfx <- build_kq_fixture(fmt, 2048l, 8192l, 256l)
     var kgfx <- build_kq_fixture(fmt, 2048l, 8192l, 1l)      // streamed decode shape (DRAM-bound ffn)
     var khfx <- build_kq_fixture(fmt, 2048l, 512l, 1l)       // hot decode shape (cache-resident)
     var tvs <- kq_tile_variants(fmt)
