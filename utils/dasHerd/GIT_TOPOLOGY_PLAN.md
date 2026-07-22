@@ -97,7 +97,9 @@ other branch; this is what we are bringing in," emphasize those paths, and
 subdue unrelated topology. The focus is inspectable user-visible state, not an
 implicit filter: the user can see the selected identities, clear the focus, or
 switch back to `Auto`/`All`. This is future direction, not part of the current
-view-only PR.
+view-only PR. The shared file/source/Tree/GitHub focus and two-way human-agent
+handoff are specified in
+[`AGENT_REVIEW_WORKFLOWS.md`](AGENT_REVIEW_WORKFLOWS.md).
 
 ## Deferred operational direction -- not this PR
 
