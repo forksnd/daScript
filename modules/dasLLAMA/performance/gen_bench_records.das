@@ -120,6 +120,10 @@ def main : int {
         return 0
     }
     let apple = is_apple_box()
+    if (cfg.backend == "metal" && !apple) {   // fail fast instead of running metal cells that all decline on non-Apple boxes
+        to_log(LOG_ERROR, "gen_bench_records: --backend metal requested on a non-Apple box — Metal is macOS-only\n")
+        return 1
+    }
     var backends : array<string>
     if (cfg.backend == "cpu" || cfg.backend == "all") {
         backends |> push("cpu")

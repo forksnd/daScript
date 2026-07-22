@@ -45,7 +45,9 @@ def private capture_out(cmd : string) : string {
     var out = ""
     unsafe {
         popen(cmd) $(f) {
-            out = fread_to_eof(f)
+            if (f != null) {   // popen returns null on spawn failure (missing git / bad PATH) — don't deref
+                out = fread_to_eof(f)
+            }
         }
     }
     return strip(out)
