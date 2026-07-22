@@ -3865,6 +3865,38 @@ def private pf_setup {
     g_rd.pf_ready = true
 }
 
+//! Batch-decode support: upload one layer's f32 KV history ([npos x kvd] each) into the shared
+//! mirror at layer `l`, positions [0, npos). Resyncs a session's cache before its decode step.
+def vk_rdec_sync_kv(l : int64; kp : float const?; vp : float const?; npos : int64) {
+    assert(g_rd != null, "vk_rdec_sync_kv before prepare")
+    let kvd = g_rd.kv_dim
+    let base = (l * g_rd.seq_cap) * kvd * 4l
+    unsafe {
+        upload_region_at(g_rd.k_mirror, base, reinterpret<uint8 const?>(kp), npos * kvd * 4l)
+        upload_region_at(g_rd.v_mirror, base, reinterpret<uint8 const?>(vp), npos * kvd * 4l)
+    }
+}
+
+//! Batch-decode writeback: read layer `l`'s new K/V row at `pos` from the mirror back into the
+//! caller's f32 cache row (kp/vp, kvd each). Keeps the CPU cache current after a GPU decode step.
+def vk_rdec_read_kv(l, pos : int64; kp : float?; vp : float?) {
+    assert(g_rd != null, "vk_rdec_read_kv before prepare")
+    let kvd = g_rd.kv_dim
+    let off = ((l * g_rd.seq_cap) + pos) * kvd * 4l
+    verify(vk_moe_init())
+    unsafe {
+        var raw = alloc_cmd()
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        cmd_copy_range(raw, g_rd.k_mirror, off, g_rd.kv_readback.buf, 0l, kvd * 4l)
+        cmd_copy_range(raw, g_rd.v_mirror, off, g_rd.kv_readback.buf, kvd * 4l, kvd * 4l)
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(raw)
+        memcpy(reinterpret<void?>(kp), g_rd.kv_readback.mapped, int(kvd * 4l))
+        memcpy(reinterpret<void?>(vp), reinterpret<float?>(g_rd.kv_readback.mapped) + kvd, int(kvd * 4l))
+    }
+}
+
 //! Resident-driver prefill: `npos` embedded rows (x_batch, [npos x dim]) + per-position rope rows
 //! (cos_batch, [npos x hs]) -> the last row's logits, filling the KV mirror at positions [0, npos).
 def vk_rdec_prefill(x_batch : array<float>; cos_batch : array<float>; npos : int64; var logits : array<float>) {
@@ -5980,7 +6012,8 @@ def dasllama_math_vulkan_register() {
     set_moe_gpu_device_report(@@vk_device_name)
     set_moe_gpu_budget_hooks(@@vk_weight_budget, @@vk_plane_bytes)
     install_moe_gpu_resident(@@vk_arena_reserve, @@vk_arena_place, @@vk_rdec_prepare,
-        @@vk_rdec_upload_norms, @@vk_rdec_set_layer, @@vk_rdec_set_cls, @@vk_rdec_token, @@vk_rdec_prefill)
+        @@vk_rdec_upload_norms, @@vk_rdec_set_layer, @@vk_rdec_set_cls, @@vk_rdec_token, @@vk_rdec_prefill,
+        @@vk_rdec_sync_kv, @@vk_rdec_read_kv)
     set_moe_gpu_dn_state_hooks(@@vk_dn_step_flush, @@vk_dn_step_invalidate)
     set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
     set_moe_gpu_qkv_hook(@@vk_moe_qkv)

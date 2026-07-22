@@ -2150,9 +2150,79 @@ def resident_prefill(t : Model; var s : Session; tokens : array<int64>; npos : i
     return true
 }
 
+//! Resident batch-decode override: processes each session SEQUENTIALLY through the single-session
+//! decode chain (resync its f32 KV into the mirror, decode, write K/V back, scatter logits).
+//! Correct multi-stream decode; declines to CPU for non-f32 KV or paged sessions.
+def private vulkan_resident_batch_decode(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; nrows : int64) : bool {
+    if (!g_rdec_active) {
+        return false
+    }
+    let c = t.config
+    let dim = c.dim
+    let hs = layer_head_size(c, 0l)
+    let half = hs / 2l
+    let kvd = layer_kv_dim(c, 0l)
+    // require the shape the mirror sync can handle: flat f32 cache
+    for (i in range64(nrows)) {
+        var s = sessions[i]
+        if (s.kv_dtype_k != KVDtype.f32 || s.kv_dtype_v != KVDtype.f32 || s.kv_pool != null) {
+            return false
+        }
+    }
+    if (dasllama_noisy()) {
+        to_log(LOG_INFO, "dasLLAMA: resident batch decode engaged ({nrows} streams)\n")
+    }
+    var x : array<float>
+    x |> resize(int(dim))
+    var cossin : array<float>
+    cossin |> resize(int(hs))
+    var tmp : array<float>
+    tmp |> resize(int(c.vocab_size))
+    for (i in range64(nrows)) {
+        var s & = unsafe(*sessions[i])
+        let pos = ws.positions[i]
+        // resync this session's KV history [0, pos) into the mirror
+        for (l in range64(c.n_layers)) {
+            unsafe {
+                rdec_sync_kv(l, reinterpret<float const?>(kv_layer_kbase(s, l, c.seq_len)),
+                    reinterpret<float const?>(kv_layer_vbase(s, l, c.seq_len)), pos)
+            }
+        }
+        // this row's embedded residual is already in ws.scr.x_b; its rope row for pos
+        for (k in range64(dim)) {
+            x[int(k)] = ws.scr.x_b[i * dim + k]
+        }
+        let theta = c.rope_freq_base
+        for (j in range64(half)) {
+            var freq = 1.0 / pow(theta, float(2l * j) / float(hs))
+            if (!empty(t.rope_freqs)) {
+                freq /= t.rope_freqs[j]
+            }
+            let ang = float(pos) * freq * c.rope_freq_scale
+            cossin[int(j)] = cos(ang) * c.rope_mscale
+            cossin[int(half + j)] = sin(ang) * c.rope_mscale
+        }
+        rdec_token(x, cossin, pos, pos + 1l, tmp)
+        // write the new token's K/V back to this session's cache at pos, then scatter logits
+        for (l in range64(c.n_layers)) {
+            unsafe {
+                rdec_read_kv(l, pos, reinterpret<float?>(kv_layer_kbase(s, l, c.seq_len)) + pos * kvd,
+                    reinterpret<float?>(kv_layer_vbase(s, l, c.seq_len)) + pos * kvd)
+            }
+        }
+        copy_floats(tmp, 0l, s.logits, 0l, c.vocab_size)
+    }
+    delete x
+    delete cossin
+    delete tmp
+    batch_decode_override_logits_done()
+    return true
+}
+
 [init]
 def resident_driver_register() {
     register_decode_override("vulkan", @@vulkan_resident_decode)
+    register_batch_decode_override("vulkan", @@vulkan_resident_batch_decode)
 }
 
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
