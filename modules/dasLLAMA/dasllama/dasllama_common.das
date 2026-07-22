@@ -7490,7 +7490,7 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
             quantize_q8_k_into(s.hb, hidden, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
         }
         mm_pre_f(s.xb, t, f2, t.w2_offs[l], s.xq, s.xs, s.kxq, s.kxs, s.kxbs, hidden, dim)
-        prof_add("mm_ffn", ts_down)
+        prof_add("mm_ffn_down", ts_down)
     } elif (t.quant == QuantMode.q8) {
         // gate+up share the activation: ONE quantize + ONE region-list dispatch into ffn_gu's halves
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
@@ -7509,7 +7509,7 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
         let ts_down = ref_time_ticks()
         quantize_q8_0_into(s.ffn_gu, hidden, s.xq, s.xs, 0l, 0l)
         mm_at_q8_pre(s.xb, t, t.w2_offs[l], s.xq, s.xs, hidden, dim)
-        prof_add("mm_ffn", ts_down)
+        prof_add("mm_ffn_down", ts_down)
     } else {
         mm(s.hb, t, t.w1_offs[l], s.xb, s.xq, s.xs, dim, hidden)
         mm(s.hb2, t, t.w3_offs[l], s.xb, s.xq, s.xs, dim, hidden)
@@ -7519,7 +7519,7 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
         prof_add("act", ts_act)
         let ts_ffn2 = ref_time_ticks()
         mm(s.xb, t, t.w2_offs[l], s.hb, s.xq, s.xs, hidden, dim)
-        prof_add("mm_ffn", ts_ffn2)
+        prof_add("mm_ffn_down", ts_ffn2)
     }
 }
 
@@ -10740,7 +10740,7 @@ def private ffn_dense_prefill(t : Model; var s : Session; l : int64; npos : int6
     // down projection (batched) + optional post-FFN norm + residual
     let ts_ffn2 = ref_time_ticks()
     mm_b_f(s, s.xb_b, t, fmt_at(t.w2_fmt, l), t.w2_offs[l], s.hb_b, hidden, dim, npos)
-    prof_add("mm_ffn", ts_ffn2)
+    prof_add("mm_ffn_down", ts_ffn2)   // own bucket: down is long-K + often a different format (Q4_K_M keeps it q6_K)
     let ts_resid1 = ref_time_ticks()
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm per position before residual
         rms_batch(s.xb_b, s.xb_b, t, t.rms_post_ffn_off + l * dim, dim, npos)
