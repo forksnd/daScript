@@ -1103,6 +1103,50 @@ def ar_add_rms {
     }
 }
 
+// batched add+rmsnorm: one workgroup per row (@workgroup arrays are per-wg, rows independent).
+// Same math as ar_add_rms; row = gl_WorkGroupID.x offsets x/a/y by row*dim. Norm weight is shared.
+[compute_shader(local_size_x=256, name="ar_add_rms_b_spv")]
+def ar_add_rms_b {
+    let dim = vk_meta[0u]
+    let add_on = vk_meta[1u]
+    let woff = vk_meta[2u]
+    let eps = vk_xs[0u]
+    let ascale = vk_xs[1u]
+    let row = gl_WorkGroupID.x
+    let base = row * dim
+    let tid = gl_LocalInvocationID.x
+    var ss = 0.0
+    var k = tid
+    while (k < dim) {
+        let vv = add_on != 0u ? (vk_upf[base + k] + vk_wsf[base + k]) * ascale : vk_upf[base + k]
+        vk_upf[base + k] = vv
+        ar_row[k] = vv
+        ss += vv * vv
+        k += 256u
+    }
+    ss = subgroupAdd(ss)
+    if (gl_SubgroupInvocationID == 0u) {
+        ar_part[gl_SubgroupID] = ss
+    }
+    barrier()
+    if (tid == 0u) {
+        var tot = 0.0
+        var sgi = 0u
+        while (sgi < gl_NumSubgroups) {
+            tot += ar_part[sgi]
+            sgi++
+        }
+        ar_inv[0u] = 1.0 / sqrt(tot / float(dim) + eps)
+    }
+    barrier()
+    let inv = ar_inv[0u]
+    k = tid
+    while (k < dim) {
+        vk_y[base + k] = vk_xqf[woff + k] * (ar_row[k] * inv)
+        k += 256u
+    }
+}
+
 // fused rope + KV-row store (decode, one token), f32 mirror. One thread per rotation pair; each
 // owns 2 distinct K + 2 V slots (no packing, no hazard). q roped in vk_y, k roped into vk_wsf, v raw
 // into vk_xqf at absolute pos. meta 0=qd 1=kvd 2=hs 3=half 4=neox 5=kpair0 6=npairs 7=krow_f 8=vrow_f.
