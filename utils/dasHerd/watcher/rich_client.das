@@ -434,7 +434,7 @@ def private drain_inspector_prepare_events() {
             g_inspector.markdown_view <- event.markdown_view
             g_inspector.changed_source_ranges <- event.changed_source_ranges
             g_inspector.view_source = clone_string(event.view_source)
-            g_inspector.view_prepared = !g_inspector.parsed.binary
+            g_inspector.view_prepared = event.view_text_ready
             g_inspector.installed_repository_id = g_inspector.repository_id
             g_inspector.installed_worktree_path = g_inspector.worktree_path
             g_inspector.installed_file_path = g_inspector.file_path
@@ -2257,7 +2257,7 @@ def private draw_side_by_side_diff() {
 }
 
 def private draw_file_view() {
-    if (g_inspector.parsed.binary) {
+    if (!g_inspector.view_prepared) {
         draw_binary_preview()
         return
     }

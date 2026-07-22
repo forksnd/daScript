@@ -390,6 +390,13 @@ def test_repository_text_read_contract(t : T?) {
         t |> equal(repository_working_preview_path(
             root, "bytes.bin", preview_path), "")
         t |> equal(preview_path, bytes_path)
+        let unicode_name = "unicode-Привет.txt"
+        let unicode_path = path_join(root, unicode_name)
+        t |> success(fwrite(unicode_path, "hello"),
+            "UTF-8 path fixture is written")
+        t |> equal(repository_working_preview_path(
+            root, unicode_name, preview_path), "")
+        t |> equal(preview_path, unicode_path)
         t |> equal(repository_read_text_file(bytes_path, 2, text),
             "file exceeds the raw-byte View limit")
         t |> equal(text, "", "oversized mapped text is never materialized")

@@ -257,4 +257,61 @@ def test_inspection_prepare_worker(t : T?) {
         tt |> equal(inspector_prepare_worker_shutdown(worker), true)
         destroy_job_que()
     }
+    t |> run("no-hunk patch still prepares the selected full View") <| @(tt : T?) {
+        let source = "int generated_value = 42;\n"
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 17,
+            "warning: diff emitted no file patch\n", source,
+            "cpp", "", 0, true), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.view_text_ready, true)
+                    tt |> equal(event.view_source, source)
+                    tt |> equal(event.view_document.source, source)
+                    tt |> equal(length(event.parsed.hunks), 0)
+                    tt |> success(length(event.view_document.spans) > 1,
+                        "zero-hunk View is syntax highlighted")
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("Git-binary UTF-8 bytes prepare as source View") <| @(tt : T?) {
+        let source = "// generated source\nint answer = 42;\n"
+        let encoded = base64_encode(source)
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 18,
+            "diff --git a/generated.cpp b/generated.cpp\nBinary files a/generated.cpp and b/generated.cpp differ\n",
+            "", "cpp", encoded, length(source), true), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.parsed.binary, true)
+                    tt |> equal(event.view_text_ready, true)
+                    tt |> equal(event.view_source, source)
+                    tt |> equal(event.view_document.source, source)
+                    tt |> equal(event.preview_error, "")
+                    tt |> equal(empty(event.preview_pixels), true)
+                    tt |> success(length(event.view_document.spans) > 1,
+                        "Git-binary source is syntax highlighted")
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
 }
