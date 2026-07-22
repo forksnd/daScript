@@ -91,7 +91,7 @@ struct public WatcherFocusSet {
 struct public WatcherMailboxPostRequest {
     session_id : string
     direction : string
-    sender : string
+    sender : string = ""
     kind : string = "note"
     subject : string
     reply_to : string
@@ -776,9 +776,11 @@ def private flush_pending_notifications(var session : WatcherSession?) {
         let pending & = unsafe(session.pending_notifications[delivered])
         if (!terminal_write(session.terminal, pending.text)) break
         session.input_bytes += int64(length(pending.text))
-        let _ = watcher_mailbox_set_notification(session.id, pending.message_id)
-        append_event(session, "mailbox_notified",
-            "id={pending.message_id}; queued=true")
+        if (!empty(pending.message_id)) {
+            let _ = watcher_mailbox_set_notification(session.id, pending.message_id)
+            append_event(session, "mailbox_notified",
+                "id={pending.message_id}; queued=true")
+        }
         delivered++
     }
     if (delivered > 0) {

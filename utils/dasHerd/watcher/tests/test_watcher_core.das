@@ -136,6 +136,14 @@ def test_watcher_process_lifecycle(t : T?) {
         t |> success(fexist(path_join(path_join(path_join(root, "sessions"), quick.session_id), "output.raw")),
             "raw output log exists")
 
+        var senderless_request = WatcherMailboxPostRequest()
+        t |> success(sscan_json("\{\"session_id\":{sprint_json(quick.session_id, false)}," +
+                "\"direction\":\"inbox\",\"subject\":\"No sender\"\}",
+                senderless_request),
+            "mailbox JSON accepts an omitted transport sender")
+        t |> equal(senderless_request.sender, "",
+            "omitted transport sender defaults to empty before server stamping")
+
         var focus_target = WatcherFocusTarget(
             file_path = "unicode-Привет.txt")
         focus_target.ranges |> push(WatcherFocusRange(
@@ -270,6 +278,13 @@ def test_watcher_process_lifecycle(t : T?) {
         t |> success(find(delivered_json, "\"notified\":true") >= 0
                 && find(delivered_json, "\"notification_error\":\"\"") >= 0,
             "submitting the partial line atomically flushes its queued notification")
+        t |> equal(watcher_input(controlled.session_id, "partial", 12), "")
+        t |> equal(watcher_notify(controlled.session_id, "plain nudge\r"), "queued")
+        t |> equal(watcher_input(controlled.session_id, "\r", 12), "")
+        let controlled_events = fread(path_join(path_join(path_join(root, "sessions"),
+            controlled.session_id), "events.jsonl"))
+        t |> success(find(controlled_events, "\"detail\":\"id=; queued=true\"") < 0,
+            "a queued non-mailbox nudge does not emit an empty mailbox event")
         t |> equal(watcher_terminate(controlled.session_id, "test_complete"), "")
         t |> success(wait_for(controlled.session_id, "exited", 4000l), "terminated command exits and drains")
         watcher_shutdown(true)

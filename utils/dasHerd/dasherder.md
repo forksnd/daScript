@@ -43,4 +43,6 @@ position, mode, or keyboard focus changed.
 Use `outbox reply <inbox-id> --subject ... --focus-json ...` to preserve the
 conversation link. Inbox means human/system to agent; Outbox means agent to
 human. Senders are provenance strings: `agent_session:<id>`, `human:local`, or
-`system:dasHerd`.
+`system:dasHerd`. Post payloads do not choose their provenance: the watcher
+stamps it from the session and direction, and reserves `system:dasHerd` for
+watcher-generated lifecycle notices.

@@ -61,7 +61,7 @@ struct private WatcherWsMessage {
     control : bool
     raw : bool
     direction : string
-    sender : string
+    sender : string = ""
     subject : string
     reply_to : string
     message_id : string
