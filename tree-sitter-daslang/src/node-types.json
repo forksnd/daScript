@@ -3150,7 +3150,7 @@
             "named": false
           },
           {
-            "type": "identifier",
+            "type": "require_module_name",
             "named": true
           }
         ]

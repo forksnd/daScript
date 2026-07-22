@@ -104,6 +104,10 @@ module.exports = grammar({
     [$.func_addr_expression, $.lambda_expression],
     [$.function_argument_list, $._variable_name],
     [$.type_expression, $.type_witness],
+    // `require ?guard target`: both halves are require_module_names and a name may START with
+    // `./` or `../`, so after `?a` a `.` could continue the guard or begin a relative target.
+    // GLR prefers the longer parse (`?a.b`), which is the form that actually occurs.
+    [$.require_module_name],
   ],
 
   rules: {
@@ -167,7 +171,10 @@ module.exports = grammar({
 
     require_declaration: $ => seq(
       'require',
-      optional(field('guard', seq('?', $.identifier))),  // optional require: `require ?guard target`
+      // optional require: `require ?guard target`. The guard is a full module name, not a bare
+      // identifier — ds2_parser.ypp:843 is `'?' require_module_name`, so `?llvm/daslib/llvm_tune`
+      // is legal and appears in dasllama_common.das.
+      optional(field('guard', seq('?', $.require_module_name))),
       field('module', $.require_module_name),
       optional(seq('as', field('alias', $.identifier))),
       optional('public'),

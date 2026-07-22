@@ -30,6 +30,8 @@ let WOFF1 = 1000000l   // gate / up / down stack base element offsets (arbitrary
 let WOFF3 = 2000000l   // the tier resolves regions by [base, base+elems) containment)
 let WOFF2 = 3000000l
 let REL_TOL = 1e-3
+// the q8 arena is process-global and shared by every arena arm — reserve once, generously
+let ARENA_BLOCKS = 4096l
 
 def private pow2_scale(i : int64) : float {
     let p = i % 5l
@@ -2279,6 +2281,543 @@ def test_vulkan_attention(t : T?) {
             delete rmsk
         } else {
             feint("dasVulkan not installed; vulkan attention chain untestable here\n")
+        }
+    }
+}
+
+// Fused rope + KV-row store, BOTH rope arms — llama's NORM (adjacent pairs) and qwen/gemma's NEOX
+// (half-offset). This is the family-ledger kernel: llama is non-NEOX, which the attention rail's
+// existing rope arm does not cover. Verifies roped q + the stored K row (roped) + V row (raw).
+[test]
+def test_vulkan_rope_kv_store(t : T?) {
+    t |> run("vulkan rope+kv-store == CPU reference (NORM + NEOX arms)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let HS = 64l        // llama-family head size (the closed-rail case)
+            let NH = 4l
+            let NKV = 2l
+            let QD = NH * HS
+            let KVD = NKV * HS
+            let half = HS / 2l
+            let POS = 7l
+            if (!vk_device_ready()) {
+                feint("no Vulkan device; rope_kv_store untestable here\n")
+                return
+            }
+            for (arm in range(2)) {
+                let neox = arm == 1
+                var qkv : array<float>
+                qkv |> resize(int(QD + 2l * KVD))
+                for (i in range(int(QD + 2l * KVD))) {
+                    qkv[i] = float((i % 23) - 11) * 0.1
+                }
+                var cossin : array<float>
+                cossin |> resize(int(HS))
+                for (j in range(int(half))) {
+                    let ang = float(POS) * (1.0 / pow(10000.0, float(2l * int64(j)) / float(HS)))
+                    cossin[j] = cos(ang)
+                    cossin[int(half) + j] = sin(ang)
+                }
+                var qout : array<float>
+                var krow : array<float>
+                var vrow : array<float>
+                qout |> resize(int(QD))
+                krow |> resize(int(KVD))
+                vrow |> resize(int(KVD))
+                vk_rope_kv_store(qkv, qout, krow, vrow, cossin, QD, KVD, HS, POS, neox)
+                // CPU reference
+                var rq : array<float>
+                var rk : array<float>
+                var rv : array<float>
+                rq |> resize(int(QD))
+                rk |> resize(int(KVD))
+                rv |> resize(int(KVD))
+                for (i in range(int(QD))) { rq[i] = qkv[i] }
+                for (i in range(int(KVD))) {
+                    rk[i] = qkv[int(QD) + i]
+                    rv[i] = qkv[int(QD + KVD) + i]
+                }
+                // rope rq (NH heads) and rk (NKV heads) in place; same pair rule as the kernel
+                for (hh in range(int(NH + NKV))) {
+                    let is_q = hh < int(NH)
+                    let h = is_q ? hh : hh - int(NH)
+                    for (j in range(int(half))) {
+                        let e0 = neox ? h * int(HS) + j : h * int(HS) + j * 2
+                        let e1 = neox ? h * int(HS) + j + int(half) : h * int(HS) + j * 2 + 1
+                        let a0 = is_q ? rq[e0] : rk[e0]
+                        let a1 = is_q ? rq[e1] : rk[e1]
+                        let r0 = a0 * cossin[j] - a1 * cossin[int(half) + j]
+                        let r1 = a0 * cossin[int(half) + j] + a1 * cossin[j]
+                        if (is_q) {
+                            rq[e0] = r0
+                            rq[e1] = r1
+                        } else {
+                            rk[e0] = r0
+                            rk[e1] = r1
+                        }
+                    }
+                }
+                let cq = compare_gout(qout, rq)
+                let ck = compare_gout(krow, rk)
+                let cv = compare_gout(vrow, rv)
+                let tag = neox ? "NEOX" : "NORM"
+                t |> success(cq.maxdiff <= float(REL_TOL) * cq.maxref + 1e-6,
+                    "rope_kv {tag} q roped (maxdiff {cq.maxdiff})")
+                t |> success(ck.maxdiff <= float(REL_TOL) * ck.maxref + 1e-6,
+                    "rope_kv {tag} K stored roped (maxdiff {ck.maxdiff})")
+                t |> success(cv.maxdiff <= 1e-6,
+                    "rope_kv {tag} V stored raw (maxdiff {cv.maxdiff})")
+                delete qkv
+                delete cossin
+                delete qout
+                delete krow
+                delete vrow
+                delete rq
+                delete rk
+                delete rv
+            }
+        } else {
+            feint("dasVulkan not installed; rope_kv_store untestable here\n")
+        }
+    }
+}
+
+// Decode attention over the device K/V mirror. Populates the mirror through vk_rope_kv_store (the
+// real producer), capturing each stored row for the CPU reference, then attends with a fresh query
+// and checks GQA + online softmax against a plain CPU attention over the captured cache.
+[test]
+def test_vulkan_decode_attn(t : T?) {
+    t |> run("vulkan decode attention == CPU reference (GQA over the device KV mirror)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let HS = 64l
+            let NH = 4l
+            let NKV = 2l
+            let QD = NH * HS
+            let KVD = NKV * HS
+            let CNT = 5l
+            let SCALE = 1.0 / sqrt(float(HS))
+            let kv_mul = NH / NKV
+            if (!vk_device_ready()) {
+                feint("no Vulkan device; decode_attn untestable here\n")
+                return
+            }
+            var cpuK : array<float>
+            var cpuV : array<float>
+            cpuK |> resize(int(CNT * KVD))
+            cpuV |> resize(int(CNT * KVD))
+            // build the cache one position at a time via the real rope_kv_store producer
+            for (p in range(int(CNT))) {
+                var qkv : array<float>
+                qkv |> resize(int(QD + 2l * KVD))
+                for (i in range(int(QD + 2l * KVD))) {
+                    qkv[i] = float(((i + p * 13) % 19) - 9) * 0.1
+                }
+                var cossin : array<float>
+                cossin |> resize(int(HS))
+                for (j in range(int(HS / 2l))) {
+                    let ang = float(p) * (1.0 / pow(10000.0, float(2 * j) / float(HS)))
+                    cossin[j] = cos(ang)
+                    cossin[int(HS / 2l) + j] = sin(ang)
+                }
+                var qout : array<float>
+                var krow : array<float>
+                var vrow : array<float>
+                qout |> resize(int(QD))
+                krow |> resize(int(KVD))
+                vrow |> resize(int(KVD))
+                vk_rope_kv_store(qkv, qout, krow, vrow, cossin, QD, KVD, HS, int64(p), false)
+                for (i in range(int(KVD))) {
+                    cpuK[p * int(KVD) + i] = krow[i]
+                    cpuV[p * int(KVD) + i] = vrow[i]
+                }
+                delete qkv
+                delete cossin
+                delete qout
+                delete krow
+                delete vrow
+            }
+            // a fresh query, then decode attention over the cnt cached rows
+            var q : array<float>
+            q |> resize(int(QD))
+            for (i in range(int(QD))) {
+                q[i] = float((i % 7) - 3) * 0.2
+            }
+            var out : array<float>
+            out |> resize(int(QD))
+            vk_decode_attn(q, out, CNT, QD, KVD, HS, kv_mul, SCALE)
+            // CPU reference: per head, softmax(q.k*scale) then weighted V
+            var refo : array<float>
+            refo |> resize(int(QD))
+            for (h in range(int(NH))) {
+                let kvh = h / int(kv_mul)
+                var sc : array<float>
+                sc |> resize(int(CNT))
+                var mx = -1.0e30
+                for (p in range(int(CNT))) {
+                    var s = 0.0
+                    for (d in range(int(HS))) {
+                        s += q[h * int(HS) + d] * cpuK[p * int(KVD) + kvh * int(HS) + d]
+                    }
+                    s *= SCALE
+                    sc[p] = s
+                    mx = max(mx, s)
+                }
+                var den = 0.0
+                for (p in range(int(CNT))) {
+                    sc[p] = exp(sc[p] - mx)
+                    den += sc[p]
+                }
+                for (d in range(int(HS))) {
+                    var acc = 0.0
+                    for (p in range(int(CNT))) {
+                        acc += sc[p] * cpuV[p * int(KVD) + kvh * int(HS) + d]
+                    }
+                    refo[h * int(HS) + d] = float(acc / den)
+                }
+                delete sc
+            }
+            let ca = compare_gout(out, refo)
+            t |> success(ca.maxdiff <= float(REL_TOL) * ca.maxref + 1e-5,
+                "decode attention within tolerance (maxdiff {ca.maxdiff} vs {float(REL_TOL) * ca.maxref} bar, maxref {ca.maxref})")
+            delete cpuK
+            delete cpuV
+            delete q
+            delete out
+            delete refo
+        } else {
+            feint("dasVulkan not installed; decode_attn untestable here\n")
+        }
+    }
+}
+
+// Arena batch GEMM (prefill twin of the arena GEMV): npos rows through q8_moe_batch against an
+// arena-resident plane, vs a CPU reference. Two tensors again so the block offset must be honored.
+[test]
+def test_vulkan_arena_gemm(t : T?) {
+    t |> run("vulkan arena batch GEMM == CPU reference (npos rows, distinct blocks)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let GROWS = 64l
+            let GNP = 40l    // npos, matches the existing batch arms (>= BATCH_TILE, unpadded)
+            if (!vk_arena_reserve(0, ARENA_BLOCKS)) {
+                feint("no Vulkan device; arena batch GEMM untestable here\n")
+                return
+            }
+            var wqa : array<int8>
+            var wsa : array<float>
+            var wqbv : array<int8>
+            var wsbv : array<float>
+            fill_stack(wqa, wsa, GROWS, N, 41l, false)
+            fill_stack(wqbv, wsbv, GROWS, N, 67l, false)
+            var pqa : array<uint8>
+            var psa : array<uint8>
+            var pqb : array<uint8>
+            var psb : array<uint8>
+            pack_upload(wqa, wsa, pqa, psa)
+            pack_upload(wqbv, wsbv, pqb, psb)
+            let gblk_a = vk_arena_place(pqa, psa, N, GROWS, 0)
+            let gblk_b = vk_arena_place(pqb, psb, N, GROWS, 0)
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, GNP)
+            let nb = int(N / 32l)
+            for (arm in range(2)) {
+                let blk = arm == 0 ? gblk_a : gblk_b
+                var y : array<float>
+                y |> resize(int(GNP * GROWS))
+                vk_arena_gemm(y, blk, N, GROWS, GNP, 0, xq, xs)
+                var refy : array<float>
+                refy |> resize(int(GNP * GROWS))
+                for (r in range(int(GNP))) {
+                    for (col in range(int(GROWS))) {
+                        var acc = 0.0lf
+                        for (b in range(nb)) {
+                            var id = 0
+                            for (k in range(32)) {
+                                let wi = col * int(N) + b * 32 + k
+                                id += int(xq[r * int(N) + b * 32 + k]) * int(arm == 0 ? wqa[wi] : wqbv[wi])
+                            }
+                            let si = col * nb + b
+                            acc += double(arm == 0 ? wsa[si] : wsbv[si]) * double(xs[r * nb + b]) * double(id)
+                        }
+                        refy[r * int(GROWS) + col] = float(acc)
+                    }
+                }
+                let cg = compare_gout(y, refy)
+                t |> success(cg.maxdiff <= float(REL_TOL) * cg.maxref,
+                    "arena GEMM arm {arm} within tolerance (maxdiff {cg.maxdiff} vs {float(REL_TOL) * cg.maxref} bar)")
+                delete y
+                delete refy
+            }
+            delete wqa
+            delete wsa
+            delete wqbv
+            delete wsbv
+            delete pqa
+            delete psa
+            delete pqb
+            delete psb
+            delete xq
+            delete xs
+        } else {
+            feint("dasVulkan not installed; arena batch GEMM untestable here\n")
+        }
+    }
+}
+
+// The whole dense FFN against arena-resident planes: gate GEMV -> up GEMV -> fused act+requant ->
+// down GEMV, ONE submit. No new kernels — q8_moe_actrq is already region-free, so this is the
+// per-op chain with the weight base coming from an arena block index instead of a stack.
+[test]
+def test_vulkan_arena_ffn(t : T?) {
+    t |> run("vulkan arena FFN chain == CPU reference (dense gate/up/down triple)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!vk_arena_reserve(0, ARENA_BLOCKS)) {
+                feint("no Vulkan device (or the arena reserve was refused); skipping\n")
+                return
+            }
+            var wq1 : array<int8>
+            var ws1 : array<float>
+            var wq3 : array<int8>
+            var ws3 : array<float>
+            var wq2 : array<int8>
+            var ws2 : array<float>
+            fill_stack(wq1, ws1, NFE, N, 11l, true)    // gate/up small scales — the sane silu regime
+            fill_stack(wq3, ws3, NFE, N, 23l, true)
+            fill_stack(wq2, ws2, N, NFE, 37l, false)
+            var p1 : array<uint8>
+            var s1 : array<uint8>
+            var p3 : array<uint8>
+            var s3 : array<uint8>
+            var p2 : array<uint8>
+            var s2 : array<uint8>
+            pack_upload(wq1, ws1, p1, s1)
+            pack_upload(wq3, ws3, p3, s3)
+            pack_upload(wq2, ws2, p2, s2)
+            let b1 = vk_arena_place(p1, s1, N, NFE, 0)
+            let b3 = vk_arena_place(p3, s3, N, NFE, 0)
+            let b2 = vk_arena_place(p2, s2, NFE, N, 0)
+            t |> success(b1 >= 0l && b3 >= 0l && b2 >= 0l, "arena admitted the FFN triple (blocks {b1}/{b3}/{b2})")
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, 1l)
+            var y : array<float>
+            y |> resize(int(N))
+            vk_arena_ffn(y, b1, b3, b2, N, NFE, 0, 0, 0, xq, xs, false)
+            // CPU mirror: gate/up GEMV -> silu(g)*u -> q8_0 requant -> down GEMV
+            let nb = int(N / 32l)
+            let nbh = int(NFE / 32l)
+            var h : array<float>
+            var hq : array<int>
+            var hs : array<float>
+            h |> resize(int(NFE))
+            hq |> resize(int(NFE))
+            hs |> resize(nbh)
+            for (i in range(int(NFE))) {
+                var ag = 0.0
+                var au = 0.0
+                for (b in range(nb)) {
+                    var dg = 0
+                    var du = 0
+                    for (j in range(32)) {
+                        let xv = int(xq[b * 32 + j])
+                        dg += int(wq1[i * int(N) + b * 32 + j]) * xv
+                        du += int(wq3[i * int(N) + b * 32 + j]) * xv
+                    }
+                    let xscl = xs[b]
+                    ag += float(dg) * ws1[i * nb + b] * xscl
+                    au += float(du) * ws3[i * nb + b] * xscl
+                }
+                h[i] = (ag / (1.0 + exp(-ag))) * au
+            }
+            for (b in range(nbh)) {
+                var amax = 0.0
+                for (j in range(32)) {
+                    amax = max(amax, abs(h[b * 32 + j]))
+                }
+                let d = amax / 127.0
+                let id = d != 0.0 ? 1.0 / d : 0.0
+                hs[b] = d
+                for (j in range(32)) {
+                    hq[b * 32 + j] = int(round(h[b * 32 + j] * id))
+                }
+            }
+            var refy : array<float>
+            refy |> resize(int(N))
+            for (o in range(int(N))) {
+                var acc = 0.0
+                for (b in range(nbh)) {
+                    var dd = 0
+                    for (j in range(32)) {
+                        dd += int(wq2[o * int(NFE) + b * 32 + j]) * hq[b * 32 + j]
+                    }
+                    acc += float(dd) * ws2[o * nbh + b] * hs[b]
+                }
+                refy[o] = acc
+            }
+            let cf = compare_gout(y, refy)
+            t |> success(cf.maxdiff <= float(REL_TOL) * cf.maxref,
+                "arena FFN within tolerance (maxdiff {cf.maxdiff} vs {float(REL_TOL) * cf.maxref} bar, maxref {cf.maxref})")
+            delete wq1
+            delete ws1
+            delete wq3
+            delete ws3
+            delete wq2
+            delete ws2
+            delete p1
+            delete s1
+            delete p3
+            delete s3
+            delete p2
+            delete s2
+            delete xq
+            delete xs
+            delete y
+            delete h
+            delete hq
+            delete hs
+            delete refy
+        } else {
+            feint("dasVulkan not installed; arena FFN untestable here\n")
+        }
+    }
+}
+
+// The resident driver's fused residual-add + RMSNorm — the kernel that collapses the layer
+// boundary to one dispatch. ascale != 1 and a non-zero addend on purpose: with ascale = 1 or a = 0
+// a dropped term would still land inside tolerance.
+// The in-place residual check is NOT redundant with the y check and must not be dropped: RMSNorm
+// is SCALE-INVARIANT, so a lost uniform factor (ascale) divides straight back out of y and is
+// invisible there — mutation-probed, y stayed in tolerance while x was off by 1.125 on a 0.003 bar.
+[test]
+def test_vulkan_add_rms(t : T?) {
+    t |> run("vulkan add+rms == CPU reference (fused arm + norm-only arm)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let AD = 512l
+            let EPS = 1e-5
+            let ASCALE = 0.75
+            for (arm in range(2)) {
+                let add_on = arm == 0
+                var x : array<float>
+                var a : array<float>
+                var w : array<float>
+                var y : array<float>
+                x |> resize(int(AD))
+                a |> resize(int(AD))
+                w |> resize(int(AD))
+                y |> resize(int(AD))
+                for (i in range(int(AD))) {
+                    x[i] = float((i % 17) - 8) * 0.25
+                    a[i] = float((i % 11) - 5) * 0.5
+                    w[i] = 1.0 + float(i % 7) * 0.125
+                }
+                // CPU reference over the pre-call x
+                var vv : array<float>
+                vv |> resize(int(AD))
+                var ss = 0.0lf
+                for (i in range(int(AD))) {
+                    vv[i] = add_on ? (x[i] + a[i]) * ASCALE : x[i]
+                    ss += double(vv[i]) * double(vv[i])
+                }
+                let inv = 1.0lf / sqrt(ss / double(AD) + double(EPS))
+                var refy : array<float>
+                refy |> resize(int(AD))
+                for (i in range(int(AD))) {
+                    refy[i] = float(double(w[i]) * double(vv[i]) * inv)
+                }
+                vk_add_rms(x, a, w, y, AD, EPS, ASCALE, add_on)
+                let cy = compare_gout(y, refy)
+                t |> success(cy.maxdiff <= float(REL_TOL) * cy.maxref,
+                    "add_rms arm {arm} y within tolerance (maxdiff {cy.maxdiff} vs {float(REL_TOL) * cy.maxref} bar)")
+                // x IS the residual stream — the kernel must have updated it in place
+                let cx = compare_gout(x, vv)
+                t |> success(cx.maxdiff <= float(REL_TOL) * cx.maxref,
+                    "add_rms arm {arm} residual updated in place (maxdiff {cx.maxdiff} vs {float(REL_TOL) * cx.maxref} bar)")
+                delete x
+                delete a
+                delete w
+                delete y
+                delete vv
+                delete refy
+            }
+        } else {
+            feint("dasVulkan not installed; add_rms untestable here\n")
+        }
+    }
+}
+
+// The resident driver's weight arena: many tensors in ONE buffer pair per format, addressed by
+// block index, so a whole dense model costs one descriptor set per format instead of one per plane
+// (the MAX_STACKS cap). TWO tensors on purpose — a single one lands at block 0 and would pass even
+// if the arena base were ignored entirely; the second only matches if its offset is honored.
+[test]
+def test_vulkan_arena(t : T?) {
+    t |> run("vulkan resident arena == CPU reference (two q8 tensors, distinct block offsets)") @(tt : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let AROWS = 64l
+            let ABLK = AROWS * (N / 32l)   // blocks one [AROWS x N] q8 tensor occupies
+            if (!vk_arena_reserve(0, ARENA_BLOCKS)) {
+                feint("no Vulkan device (or the arena reserve was refused); skipping\n")
+                return
+            }
+            var wqa : array<int8>
+            var wsa : array<float>
+            var wqbv : array<int8>
+            var wsbv : array<float>
+            fill_stack(wqa, wsa, AROWS, N, 31l, false)
+            fill_stack(wqbv, wsbv, AROWS, N, 57l, false)   // different seed => different content
+            var pqa : array<uint8>
+            var psa : array<uint8>
+            var pqb : array<uint8>
+            var psb : array<uint8>
+            pack_upload(wqa, wsa, pqa, psa)
+            pack_upload(wqbv, wsbv, pqb, psb)
+            let blk_a = vk_arena_place(pqa, psa, N, AROWS, 0)
+            let blk_b = vk_arena_place(pqb, psb, N, AROWS, 0)
+            // relative, not absolute: the arena is process-global, so another arm may have placed
+            // into it first. Back-to-back is the actual invariant.
+            tt |> success(blk_a >= 0l && blk_b == blk_a + ABLK,
+                "arena bump cursor packs tensors back to back (a={blk_a}, b={blk_b}, delta expected {ABLK})")
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, 1l)
+            let nb = int(N / 32l)
+            for (arm in range(2)) {
+                let blk = arm == 0 ? blk_a : blk_b
+                var y : array<float>
+                y |> resize(int(AROWS))
+                vk_arena_gemv(y, blk, N, AROWS, 0, xq, xs)
+                var refy : array<float>
+                refy |> resize(int(AROWS))
+                for (c in range(int(AROWS))) {
+                    var acc = 0.0lf
+                    for (b in range(nb)) {
+                        var id = 0
+                        for (k in range(32)) {
+                            let wi = c * int(N) + b * 32 + k
+                            id += int(xq[b * 32 + k]) * int(arm == 0 ? wqa[wi] : wqbv[wi])
+                        }
+                        let si = c * nb + b
+                        acc += double(arm == 0 ? wsa[si] : wsbv[si]) * double(xs[b]) * double(id)
+                    }
+                    refy[c] = float(acc)
+                }
+                let cc = compare_gout(y, refy)
+                tt |> success(cc.maxdiff <= float(REL_TOL) * cc.maxref,
+                    "arena tensor {arm} within tolerance (maxdiff {cc.maxdiff} vs {float(REL_TOL) * cc.maxref} bar, maxref {cc.maxref})")
+                delete y
+                delete refy
+            }
+            delete wqa
+            delete wsa
+            delete wqbv
+            delete wsbv
+            delete pqa
+            delete psa
+            delete pqb
+            delete psb
+            delete xq
+            delete xs
+        } else {
+            feint("dasVulkan not installed; resident arena untestable here\n")
         }
     }
 }

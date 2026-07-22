@@ -103,11 +103,10 @@
 ; Module name
 (module_declaration (identifier) @module)
 
-; Require (import)
+; Require (import). One pattern covers both halves: the guard is a require_module_name too
+; (`require ?llvm/daslib/llvm_tune target`), so it matches here as well.
 (require_declaration
   (require_module_name) @module)
-(require_declaration
-  guard: (identifier) @module)
 
 ; Struct/class names
 (structure_declaration
