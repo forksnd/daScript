@@ -136,6 +136,49 @@ def test_watcher_process_lifecycle(t : T?) {
         t |> success(fexist(path_join(path_join(path_join(root, "sessions"), quick.session_id), "output.raw")),
             "raw output log exists")
 
+        var focus_target = WatcherFocusTarget(
+            file_path = "unicode-Привет.txt")
+        focus_target.ranges |> push(WatcherFocusRange(
+            start_byte = 2, end_byte = 9, caption = "important"))
+        var mailbox_request = WatcherMailboxPostRequest(
+            session_id = quick.session_id, direction = "outbox",
+            sender = "agent_session:{quick.session_id}", kind = "focus_set",
+            subject = "Ready for PR")
+        mailbox_request.focus.repository_id = "repo"
+        mailbox_request.focus.worktree_path = root
+        mailbox_request.focus.targets |> emplace(focus_target)
+        let posted = watcher_mailbox_post(mailbox_request)
+        t |> success(posted.ok, posted.error)
+        t |> success(starts_with(posted.message_id, "hf_"),
+            "mailbox messages receive stable ids")
+        let outbox = watcher_mailbox_json(quick.session_id, "outbox")
+        t |> success(find(outbox, "unicode-Привет.txt") >= 0
+                && find(outbox, "Ready for PR") >= 0
+                && find(outbox, "agent_session:{quick.session_id}") >= 0,
+            "focus set and server-assigned provenance survive JSON serialization")
+        let notified = watcher_mailbox_set_notification(
+            quick.session_id, posted.message_id)
+        t |> success(notified.ok, notified.error)
+        let fetched = watcher_mailbox_mark_fetched(
+            quick.session_id, posted.message_id)
+        t |> success(fetched.ok, fetched.error)
+        let acknowledged = watcher_mailbox_set_state(WatcherMailboxStateRequest(
+            session_id = quick.session_id, message_id = posted.message_id,
+            status = "acknowledged"))
+        t |> success(acknowledged.ok, acknowledged.error)
+        t |> success(find(watcher_mailbox_json(quick.session_id, "", posted.message_id),
+            "\"status\":\"acknowledged\"") >= 0
+                && find(watcher_mailbox_json(quick.session_id, "", posted.message_id),
+                    "\"notified\":true") >= 0
+                && find(watcher_mailbox_json(quick.session_id, "", posted.message_id),
+                    "\"fetched\":true") >= 0,
+            "notification, fetch, and acknowledgement are observable")
+        let mailbox_log = path_join(path_join(path_join(root, "sessions"),
+            quick.session_id), "mailbox.jsonl")
+        t |> success(fexist(mailbox_log)
+                && find(fread(mailbox_log), "acknowledged") >= 0,
+            "mailbox create and state records are durable JSONL")
+
         let spaced_dir = path_join(root, "argv space")
         var mkdir_error : string
         t |> success(mkdir_rec(spaced_dir, mkdir_error), mkdir_error)
@@ -202,6 +245,25 @@ def test_watcher_process_lifecycle(t : T?) {
         t |> success(!watcher_claim_controller(controlled.session_id, 12), "second controller is rejected")
         watcher_release_controller(controlled.session_id, 11, "test_detach")
         t |> success(watcher_claim_controller(controlled.session_id, 12), "released lease can be reclaimed")
+        let queued_message = watcher_mailbox_post(WatcherMailboxPostRequest(
+            session_id = controlled.session_id, direction = "inbox",
+            sender = "untrusted-payload-sender", subject = "Look at that"))
+        t |> success(queued_message.ok, queued_message.error)
+        t |> equal(watcher_input(controlled.session_id, "partial", 12), "")
+        t |> equal(watcher_notify(controlled.session_id, "nudge\r",
+            queued_message.message_id), "queued",
+            "notification waits behind a partial terminal input line")
+        let queued_json = watcher_mailbox_json(
+            controlled.session_id, "inbox", queued_message.message_id)
+        t |> success(find(queued_json, "\"sender\":\"human:local\"") >= 0
+                && find(queued_json, "\"notification_error\":\"queued\"") >= 0,
+            "queued notification and server-assigned human provenance are visible")
+        t |> equal(watcher_input(controlled.session_id, "\r", 12), "")
+        let delivered_json = watcher_mailbox_json(
+            controlled.session_id, "inbox", queued_message.message_id)
+        t |> success(find(delivered_json, "\"notified\":true") >= 0
+                && find(delivered_json, "\"notification_error\":\"\"") >= 0,
+            "submitting the partial line atomically flushes its queued notification")
         t |> equal(watcher_terminate(controlled.session_id, "test_complete"), "")
         t |> success(wait_for(controlled.session_id, "exited", 4000l), "terminated command exits and drains")
         watcher_shutdown(true)

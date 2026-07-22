@@ -1,7 +1,7 @@
 # Agent-assisted review workflows
 
-Status: product direction; local Review Focus first; communication protocol
-under discussion
+Status: first bidirectional local Review Focus slice implemented; GitHub PR
+surface remains next
 
 This note records the two agreed product tracks that follow a usable local Git
 inspector. Both tracks will be implemented. The local Review Focus vertical
@@ -14,6 +14,36 @@ slice comes first, followed by the GitHub PR surface.
 
 They are not separate interaction models. Both should use one inspectable
 `Review Focus` contract.
+
+## Implemented first slice
+
+The watcher now owns an append-only `mailbox.jsonl` in every session artifact
+directory plus authenticated localhost HTTP and WebSocket projections. Inbox
+and Outbox are visible in the web control UI with sender, lifecycle, reply
+identity, delivery/fetch state, and raw JSON. The watcher assigns provenance
+from the routed direction/session instead of trusting a payload sender string.
+
+`utils/dasHerd/dasherd.ps1` implements `whoami`, Inbox list/get/ack/complete,
+and Outbox send/reply. URL, token, and session routing come from
+`DASHERD_URL`, `DASHERD_TOKEN`, and `DASHERD_SESSION_ID`, with explicit flags
+available for diagnostics. `utils/dasHerd/dasherder.md` is the agent-facing
+protocol note. Fetching a specific Inbox item records `fetched`; the one-step
+human action stores before sending an atomic TTY wake and records notification
+success or failure.
+
+The rich client consumes Outbox messages without changing repository,
+worktree, installed file, Diff/View mode, scroll, raised window, terminal, or
+keyboard focus. Its existing Sessions window contains persistent Attention;
+agent-targeted files carry an `[AGENT]` marker in changelists. Only clicking a
+message or file target navigates. Active source focus supports multiple
+disjoint UTF-8 byte ranges, dimmed surrounding text, direct file navigation,
+previous/next target navigation, and a show/hide toggle. A code selection's
+right-click **Look at that** action atomically posts the exact installed
+repository/worktree/comparison/path/range to the selected session Inbox.
+
+Live commands expose Attention state and explicit target opening for semantic
+verification. The next product track is the GitHub PR surface described below;
+MCP remains deliberately deferred.
 
 ## Shared contract: Review Focus
 
@@ -55,8 +85,8 @@ An agent-facing `dasherder.md` skill explains the available operations and how
 to discover the current session. The agent publishes structured focus sets,
 notes, acknowledgements, and results to dasHerd. The first supported agent
 surface is a small `dasherd` CLI. It speaks to the local watcher protocol, reads
-the current session context automatically, and offers stable human-readable
-and JSON output. MCP is explicitly deferred until the mailbox and focus
+the current session context from its environment or explicit flags, and offers
+stable human-readable and JSON output. MCP is explicitly deferred until the mailbox and focus
 contract have enough real use to justify its support cost. Raw localhost HTTP
 is an implementation/debugging substrate, not the initial agent-facing
 contract.
@@ -82,8 +112,9 @@ notification from payload:
 3. The notification tells the agent to use the dasHerd skill and fetch that
    exact message ID.
 4. The agent fetches the payload through the CLI and acknowledges it.
-5. dasHerd shows pending, notified, fetched, acknowledged, completed, failed,
-   canceled, and stale state rather than assuming that pasted text was read.
+5. dasHerd shows new, notification success/failure, fetched, acknowledged, and
+   completed state rather than assuming that pasted text was read. Cancel and
+   stale transitions remain extensions of the same record.
 
 For example, the visible TTY message can be:
 
@@ -109,10 +140,8 @@ Inbox and Outbox are named relative to the agent session:
 The first implementation includes both views in the web UI for every session.
 This is not deferred until rich focus rendering. At minimum each mailbox shows
 message ID, time, sender, kind/subject, lifecycle state, reply/correlation ID,
-notification state, and a readable payload. A raw structured-payload view is
-available from the start so protocol mistakes can be diagnosed by eye. The UI
-also exposes cancel, retry-notification, and acknowledgement transitions as
-applicable.
+notification/fetch state, and a readable payload. A raw structured-payload
+view is available from the start so protocol mistakes can be diagnosed by eye.
 
 There is no required compose, preview, or confirmation stage for a contextual
 request. The baseline interaction is: select code in Diff/View, right-click,
@@ -140,7 +169,7 @@ assigned by dasHerd from the mailbox operation rather than copied from an
 arbitrary message-body field:
 
 - Posting to session `<id>`'s Outbox stamps the sender as
-  `agent_session:<id>`. The CLI defaults `<id>` from its launch context.
+  `agent_session:<id>`. The CLI defaults `<id>` from `DASHERD_SESSION_ID`.
 - The local web UI stamps the sender as `human:local` in the single-user first
   slice and records its client/connection ID separately for diagnostics.
 - Watcher-generated lifecycle notices use `system:dasHerd`.
@@ -160,10 +189,10 @@ Adding nominal Herder restrictions would not create a meaningful security
 boundary and would import support cost and permission theater from other agent
 clients.
 
-dasHerd supplies launch context containing the protocol version, localhost
-endpoint, and default session ID so the CLI can route ordinary commands without
-extra arguments. A connection token may still exist to prevent accidental
-cross-talk with unrelated local pages/processes, as the watcher already does;
+The CLI accepts launch context containing the localhost endpoint and default
+session ID through environment variables; tighter launcher injection can be
+added without changing the protocol. A connection token may still exist to
+prevent accidental cross-talk with unrelated local pages/processes, as the watcher already does;
 it is transport hygiene, not authorization or a claim that the agent lacks
 authority.
 
@@ -178,8 +207,8 @@ the same trusted agent could perform that operation directly through its shell.
   is the send action; there is no mandatory composer or second confirmation.
 - The TTY nudge uses the same serialized input ownership as ordinary terminal
   input; it must not interleave with a human's partial line or paste.
-- Message IDs make retries idempotent. Re-sending a nudge does not duplicate
-  the inbox payload or lose acknowledgement state.
+- Message IDs keep notification retries tied to the existing Inbox payload so
+  acknowledgement state is not lost when retry UI is added.
 - The inbox is authoritative. TTY text is only a wake signal and never proof
   that the agent received, understood, or completed the request.
 - Agent profiles may replace TTY notification with a stronger native wake

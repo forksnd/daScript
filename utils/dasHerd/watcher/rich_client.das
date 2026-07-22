@@ -66,6 +66,19 @@ struct private WatcherRepositoriesMessage {
     data : array<RepositorySnapshot>
 }
 
+struct private WatcherMailboxMessageEnvelope {
+    @rename = "type" _type : string
+    session_id : string
+    revision : int64
+    data : array<WatcherMailboxMessage>
+}
+
+struct private WatcherMailboxPostedMessage {
+    @rename = "type" _type : string
+    message_id : string
+    revision : int64
+}
+
 struct private WatcherFileInspectionMessage {
     @rename = "type" _type : string
     request_id : int
@@ -141,6 +154,11 @@ struct private HerderGitShaArgs {
     sha : string
 }
 
+struct private HerderAttentionOpenArgs {
+    message_id : string
+    target_index : int
+}
+
 enum private GitInspectorMode {
     diff
     view
@@ -188,6 +206,10 @@ struct private GitInspectorState {
     old_document : TextSourceDocument = TextSourceDocument()
     new_document : TextSourceDocument = TextSourceDocument()
     view_document : TextSourceDocument = TextSourceDocument()
+    focus_new_document : TextSourceDocument = TextSourceDocument()
+    focus_view_document : TextSourceDocument = TextSourceDocument()
+    focus_document_valid : bool
+    focus_start_byte : int = -1
     old_view : TextSourceViewState = TextSourceViewState()
     new_view : TextSourceViewState = TextSourceViewState()
     view : TextSourceViewState = TextSourceViewState()
@@ -238,6 +260,13 @@ var private g_token : string
 var private g_selected_worktree_path : string
 var private g_selected_repository_id : string
 var private g_focus_terminal_pending = false
+var private g_active_focus_message = ""
+var private g_active_focus_target = -1
+var private g_focus_visible = true
+var private g_pending_focus_scroll = false
+var private g_focus_view_scroll_pending = false
+var private g_last_human_request = ""
+var private g_applied_focus_identity = ""
 var private g_requested_history_commit : string
 var private g_pending_clipboard_sha : string
 var private g_last_copied_sha : string
@@ -251,6 +280,8 @@ var private g_inspector = GitInspectorState()
 var private g_prepare_worker = InspectorPrepareWorker()
 var private g_jobque_owned = false
 var private SESSION_ROW : table<int; ToggleState>
+var private ATTENTION_MESSAGE_ROW : table<int; ToggleState>
+var private ATTENTION_TARGET_ROW : table<int; ToggleState>
 var private WORKTREE_ROW : table<int; ToggleState>
 var private GIT_FILE_ROW : table<int; ToggleState>
 var private GIT_COMMIT_TITLE_TEXT : table<int; NarrativeState>
@@ -351,6 +382,10 @@ def private release_inspector_content() {
     text_source_document_dispose(g_inspector.old_document)
     text_source_document_dispose(g_inspector.new_document)
     text_source_document_dispose(g_inspector.view_document)
+    text_source_document_dispose(g_inspector.focus_new_document)
+    text_source_document_dispose(g_inspector.focus_view_document)
+    g_inspector.focus_document_valid = false
+    g_inspector.focus_start_byte = -1
     markdown_view_dispose(g_inspector.markdown_view)
     rich_document_dispose(g_inspector.markdown_document)
     delete g_inspector.changed_source_ranges
@@ -505,6 +540,8 @@ class private WatcherRichClient : HvWebSocketClient {
     attached_id : string
     sessions : array<WatcherSessionInfo>
     repositories : array<RepositorySnapshot>
+    mailbox : array<WatcherMailboxMessage>
+    mailbox_revision : int64
     error : string
     last_heartbeat : int64
     last_list : int64
@@ -687,6 +724,20 @@ class private WatcherRichClient : HvWebSocketClient {
                 git_failure_baseline_ready = true
             } else {
                 error = "invalid repository snapshot message"
+            }
+        } elif (envelope._type == "mailbox") {
+            var incoming = WatcherMailboxMessageEnvelope()
+            if (sscan_json(body, incoming)) {
+                delete mailbox
+                mailbox <- incoming.data
+                mailbox_revision = incoming.revision
+            } else {
+                error = "invalid mailbox message"
+            }
+        } elif (envelope._type == "mailbox_posted") {
+            var incoming : WatcherMailboxPostedMessage
+            if (sscan_json(body, incoming)) {
+                g_last_human_request = incoming.message_id
             }
         } elif (envelope._type == "file_inspection") {
             var incoming : WatcherFileInspectionMessage
@@ -878,6 +929,25 @@ class private WatcherRichClient : HvWebSocketClient {
             "\"diff_context\":{sprint_json(diff_context, false)}\}")
     }
 
+    def post_selection_request(start_byte, end_byte : int) {
+        if (!connected || empty(selected_id) || start_byte < 0
+                || end_byte <= start_byte
+                || empty(g_inspector.installed_file_path)) return
+        let payload = ("\{\"op\":\"mailbox_post\",\"session_id\":" +
+            "{sprint_json(selected_id, false)},\"direction\":\"inbox\"," +
+            "\"sender\":\"human:local\",\"kind\":\"focus_set\"," +
+            "\"subject\":\"Look at that\",\"notify\":true,\"focus\":\{" +
+            "\"repository_id\":{sprint_json(g_inspector.installed_repository_id, false)}," +
+            "\"worktree_path\":{sprint_json(g_inspector.installed_worktree_path, false)}," +
+            "\"comparison\":{sprint_json(g_inspector.installed_comparison, false)}," +
+            "\"revision\":{sprint_json(g_inspector.installed_git_revision, false)}," +
+            "\"summary\":\"Human-selected code\",\"targets\":[\{" +
+            "\"file_path\":{sprint_json(g_inspector.installed_file_path, false)}," +
+            "\"whole_file\":false,\"ranges\":[\{\"start_byte\":{start_byte}," +
+            "\"end_byte\":{end_byte},\"caption\":\"Look at that\"\}]\}]\}\}")
+        send(payload)
+    }
+
     def send_input(text : string) {
         if (!controls || empty(text)) return
         send("\{\"op\":\"input\",\"text\":{sprint_json(text, false)}\}")
@@ -959,7 +1029,7 @@ def private draw_session_list() {
         g_client->terminate_selected()
     }
     separator()
-    child(SESSIONS_CHILD, (text = "sessions", size = float2(0.0f, -150.0f),
+    child(SESSIONS_CHILD, (text = "sessions", size = float2(0.0f, -260.0f),
             child_flags = ImGuiChildFlags.Borders, window_flags = ImGuiWindowFlags.None)) {
         var visible_sessions = 0
         if (g_client != null) {
@@ -983,6 +1053,59 @@ def private draw_session_list() {
         }
     }
     text_disabled("Exited sessions are retained and hidden by default.")
+    separator()
+    var attention_count = 0
+    if (g_client != null) {
+        for (message in g_client.mailbox) {
+            if (message.direction == "outbox") attention_count++
+        }
+    }
+    text("Attention ({attention_count})")
+    text_disabled("Agent notes never navigate until you click them.")
+    child(ATTENTION_CHILD, (text = "attention", size = float2(0.0f, 0.0f),
+            child_flags = ImGuiChildFlags.Borders, window_flags = ImGuiWindowFlags.None)) {
+        if (g_client != null) {
+            var target_row = 0
+            for (message_index in range(length(g_client.mailbox))) {
+                let message & = unsafe(g_client.mailbox[message_index])
+                if (message.direction != "outbox") continue
+                let selected_message = message.id == g_active_focus_message
+                ATTENTION_MESSAGE_ROW[message_index].value = selected_message
+                if (selectable(ATTENTION_MESSAGE_ROW[message_index],
+                        (text = "{message.subject}##{message.id}"))
+                        && !empty(message.focus.targets)) {
+                    g_active_focus_message = message.id
+                    g_active_focus_target = 0
+                    g_focus_visible = true
+                    g_pending_focus_scroll = true
+                    let target & = unsafe(message.focus.targets[0])
+                    g_client->inspect_file(message.focus.repository_id,
+                        message.focus.worktree_path, target.file_path,
+                        message.focus.comparison, "compact", message.focus.revision)
+                    FILE_INSPECTOR_WIN.open = true
+                    FILE_INSPECTOR_WIN.pending_raise = true
+                }
+                for (target_index in range(length(message.focus.targets))) {
+                    let target & = unsafe(message.focus.targets[target_index])
+                    ATTENTION_TARGET_ROW[target_row].value = (selected_message
+                        && target_index == g_active_focus_target)
+                    if (selectable(ATTENTION_TARGET_ROW[target_row],
+                            (text = "  {target.file_path}##{message.id}:{target_index}"))) {
+                        g_active_focus_message = message.id
+                        g_active_focus_target = target_index
+                        g_focus_visible = true
+                        g_pending_focus_scroll = true
+                        g_client->inspect_file(message.focus.repository_id,
+                            message.focus.worktree_path, target.file_path,
+                            message.focus.comparison, "compact", message.focus.revision)
+                        FILE_INSPECTOR_WIN.open = true
+                        FILE_INSPECTOR_WIN.pending_raise = true
+                    }
+                    target_row++
+                }
+            }
+        }
+    }
 }
 
 def private draw_terminal_footer() {
@@ -1186,6 +1309,26 @@ def private git_group_scope(group : int) : string {
     return group == 1 ? "staged" : "working"
 }
 
+def private agent_marks_file(repository_id, worktree_path,
+                             file_path : string) : bool {
+    if (g_client == null) return false
+    for (message in g_client.mailbox) {
+        if (message.direction != "outbox"
+                || message.focus.repository_id != repository_id
+                || message.focus.worktree_path != worktree_path) continue
+        for (target in message.focus.targets) {
+            if (target.file_path == file_path) return true
+        }
+    }
+    return false
+}
+
+def private focused_file_label(repository_id, worktree_path,
+                               file_path : string) : string {
+    return (agent_marks_file(repository_id, worktree_path, file_path)
+        ? "[AGENT] {file_path}" : file_path)
+}
+
 def private draw_git_file_group(repository : RepositorySnapshot const;
                                 worktree : WorktreeState const;
                                 group : int; var file_row : int&) : int {
@@ -1206,8 +1349,10 @@ def private draw_git_file_group(repository : RepositorySnapshot const;
             && g_inspector.file_path == file.path
             && g_inspector.comparison == comparison)
         let old_label = !empty(file.old_path) ? "  (from {file.old_path})" : ""
+        let display_path = focused_file_label(
+            repository.record.id, worktree.path, file.path)
         if (selectable(GIT_FILE_ROW[file_row],
-                (text = "{file.code}  {file.path}{old_label}##{comparison}:{file.path}"))) {
+                (text = "{file.code}  {display_path}{old_label}##{comparison}:{file.path}"))) {
             if (g_client != null) {
                 g_client->inspect_file(repository.record.id, worktree.path,
                     file.path, comparison)
@@ -1375,7 +1520,9 @@ def private draw_pr_included_files(repository : RepositorySnapshot const;
                     (text = "{file.path}  {stats}##pr:{file.path}"))
             }
         }
-        decorate_git_file_row("pr:{file.path}", file.path, file.added_lines,
+        let display_path = focused_file_label(
+            repository.record.id, worktree.path, file.path)
+        decorate_git_file_row("pr:{file.path}", display_path, file.added_lines,
             file.deleted_lines, file.stats_known, file.binary, false,
             staged && !busy ? "minus" : "",
             "Remove from the staged PR result", action_clicked)
@@ -1421,7 +1568,9 @@ def private draw_pr_not_included_files(repository : RepositorySnapshot const;
                     (text = "{file.path}  {stats}##working:{file.path}"))
             }
         }
-        decorate_git_file_row("working:{file.path}", file.path, file.added_lines,
+        let display_path = focused_file_label(
+            repository.record.id, worktree.path, file.path)
+        decorate_git_file_row("working:{file.path}", display_path, file.added_lines,
             file.deleted_lines, file.stats_known, file.binary, true,
             busy ? "" : "check", "Add to the staged PR result",
             action_clicked)
@@ -2249,9 +2398,31 @@ def private draw_side_by_side_diff() {
         }
         text_disabled("AFTER")
         separator()
-        var style = source_view_style(true)
-        let _ = text_source_view("git diff after", g_inspector.new_document,
-            g_inspector.new_view, style)
+        var result = TextSourceViewResult()
+        if (g_inspector.focus_document_valid) {
+            var style = focus_source_view_style(true)
+            result <- text_source_view("git diff after",
+                g_inspector.focus_new_document, g_inspector.new_view, style)
+        } else {
+            var style = source_view_style(true)
+            result <- text_source_view("git diff after", g_inspector.new_document,
+                g_inspector.new_view, style)
+        }
+        if (result.selection_context_requested) {
+            open_popup(DIFF_SELECTION_POPUP)
+        }
+        popup(DIFF_SELECTION_POPUP,
+                (text = "DiffSelection", flags = ImGuiWindowFlags.None)) {
+            let selection = text_source_view_selection(g_inspector.new_view)
+            if (menu_item(DIFF_LOOK_AT_THAT,
+                    (text = "Look at that", enabled = g_client != null
+                        && g_client.connected && !empty(g_client.selected_id)
+                        && selection.end_byte > selection.start_byte))) {
+                g_client->post_selection_request(
+                    selection.start_byte, selection.end_byte)
+                close_current_popup(DIFF_SELECTION_POPUP)
+            }
+        }
     }
     g_inspector.diff_scroll_jump_pending = false
 }
@@ -2264,7 +2435,8 @@ def private draw_file_view() {
     child(FILE_VIEW_PANE, (text = "file view", size = float2(0.0f, 0.0f),
             child_flags = ImGuiChildFlags.None,
             window_flags = ImGuiWindowFlags.HorizontalScrollbar)) {
-        if (g_inspector.resolved_language == "markdown") {
+        if (g_inspector.resolved_language == "markdown"
+                && !g_inspector.focus_document_valid) {
             var style = MarkdownViewStyle(
                 fonts = g_fonts,
                 typography = MarkdownTypography(
@@ -2277,9 +2449,35 @@ def private draw_file_view() {
                 g_inspector.markdown_gutter_segments,
                 max(1.0f, 2.0f * float(g_zoom_percent) / 100.0f))
         } else {
-            var style = source_view_style(false)
-            let _ = text_source_view("git file view", g_inspector.view_document,
-                g_inspector.view, style)
+            if (g_focus_view_scroll_pending) {
+                SetScrollY(max(0.0f, g_inspector.diff_scroll_y))
+                g_focus_view_scroll_pending = false
+            }
+            var result = TextSourceViewResult()
+            if (g_inspector.focus_document_valid) {
+                var style = focus_source_view_style(false)
+                result <- text_source_view("git file view",
+                    g_inspector.focus_view_document, g_inspector.view, style)
+            } else {
+                var style = source_view_style(false)
+                result <- text_source_view("git file view",
+                    g_inspector.view_document, g_inspector.view, style)
+            }
+            if (result.selection_context_requested) {
+                open_popup(INSPECTOR_SELECTION_POPUP)
+            }
+            popup(INSPECTOR_SELECTION_POPUP,
+                    (text = "InspectorSelection", flags = ImGuiWindowFlags.None)) {
+                let selection = text_source_view_selection(g_inspector.view)
+                if (menu_item(INSPECTOR_LOOK_AT_THAT,
+                        (text = "Look at that", enabled = g_client != null
+                            && g_client.connected && !empty(g_client.selected_id)
+                            && selection.end_byte > selection.start_byte))) {
+                    g_client->post_selection_request(
+                        selection.start_byte, selection.end_byte)
+                    close_current_popup(INSPECTOR_SELECTION_POPUP)
+                }
+            }
         }
     }
 }
@@ -2658,6 +2856,10 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         old_line_number_count = length(g_inspector.old_document.line_numbers),
         new_line_number_count = length(g_inspector.new_document.line_numbers),
         view_line_mark_count = length(g_inspector.view_document.line_marks),
+        focus_document_valid = g_inspector.focus_document_valid,
+        focus_new_marker_count = g_inspector.focus_new_document.marker_count,
+        focus_view_marker_count = g_inspector.focus_view_document.marker_count,
+        focus_start_byte = g_inspector.focus_start_byte,
         changed_source_range_count = length(g_inspector.changed_source_ranges),
         old_syntax_span_count = length(g_inspector.old_document.spans),
         new_syntax_span_count = length(g_inspector.new_document.spans),
@@ -2784,6 +2986,187 @@ def private file_inspector_status() : GitWindowStatus {
     return GitWindowStatus(text = "Select a changed file")
 }
 
+def private focus_source_view_style(diff_background : bool = false) : TextSourceViewStyle {
+    var style = source_view_style(diff_background)
+    style.text_color = float4(0.30f, 0.31f, 0.33f, 1.0f)
+    style.marker_color = float4(1.0f, 0.82f, 0.38f, 1.0f)
+    return style
+}
+
+[live_command(description = "Inspect persistent, non-modal agent Attention and active Focus Set state.")]
+def herder_attention_state(_input : JsonValue?) : JsonValue? {
+    var messages : array<JsonValue?>
+    if (g_client != null) {
+        for (message in g_client.mailbox) {
+            if (message.direction != "outbox") continue
+            var targets : array<JsonValue?>
+            for (target in message.focus.targets) {
+                targets |> push(JV((file_path = target.file_path,
+                    whole_file = target.whole_file,
+                    range_count = length(target.ranges))))
+            }
+            messages |> push(JV((id = message.id, sender = message.sender,
+                subject = message.subject, status = message.status,
+                targets = targets)))
+        }
+    }
+    return JV((ok = g_client != null,
+        session_id = g_client != null ? g_client.selected_id : "",
+        mailbox_revision = g_client != null ? g_client.mailbox_revision : 0l,
+        active_message_id = g_active_focus_message,
+        active_target_index = g_active_focus_target,
+        focus_visible = g_focus_visible,
+        last_human_request_id = g_last_human_request,
+        messages = messages))
+}
+
+[live_command(description = "Open one agent Focus Set target at the user's chosen time. Args: message_id, target_index.")]
+def herder_attention_open(input : JsonValue?) : JsonValue? {
+    if (g_client == null || !g_client.connected) {
+        return JV((ok = false, error = "watcher is not connected"))
+    }
+    let args = from_JV(input, type<HerderAttentionOpenArgs>)
+    for (message in g_client.mailbox) {
+        if (message.id != args.message_id) continue
+        if (args.target_index < 0
+                || args.target_index >= length(message.focus.targets)) {
+            return JV((ok = false, error = "target_index is out of range"))
+        }
+        g_active_focus_message = message.id
+        g_active_focus_target = args.target_index
+        g_focus_visible = true
+        g_pending_focus_scroll = true
+        g_applied_focus_identity = ""
+        let target & = unsafe(message.focus.targets[args.target_index])
+        g_client->inspect_file(message.focus.repository_id,
+            message.focus.worktree_path, target.file_path,
+            message.focus.comparison, "compact", message.focus.revision)
+        FILE_INSPECTOR_WIN.open = true
+        FILE_INSPECTOR_WIN.pending_raise = true
+        return JV((ok = true, message_id = message.id,
+            target_index = args.target_index, file_path = target.file_path))
+    }
+    return JV((ok = false, error = "unknown attention message"))
+}
+
+def private push_focus_span(var document : TextSourceDocument;
+                            start_byte, end_byte : int; marker : bool) {
+    if (end_byte <= start_byte) return
+    var styles : TextSourceStyles
+    styles.marker = marker
+    styles.bold = marker
+    document.spans |> push(TextSourceSpan(
+        source = TextSourceRange(start_byte = start_byte, end_byte = end_byte),
+        styles = styles))
+    if (marker) {
+        document.marker_count++
+    }
+}
+
+def private make_focus_document(source : TextSourceDocument const;
+                                target : WatcherFocusTarget const;
+                                revision_bias : int) : TextSourceDocument {
+    var document = TextSourceDocument(
+        source = clone_string(source.source),
+        revision = source.revision + revision_bias)
+    document.line_marks := source.line_marks
+    document.line_numbers := source.line_numbers
+    let source_length = length(source.source)
+    if (target.whole_file || empty(target.ranges)) {
+        push_focus_span(document, 0, source_length, true)
+        return <- document
+    }
+    var cursor = 0
+    while (cursor < source_length) {
+        var best_start = source_length
+        var best_end = -1
+        for (focus_range in target.ranges) {
+            let range_start = clamp(focus_range.start_byte, 0, source_length)
+            let range_end = clamp(focus_range.end_byte, 0, source_length)
+            if (range_end <= cursor || range_end <= range_start) continue
+            if (range_start < best_start) {
+                best_start = range_start
+                best_end = range_end
+            } elif (range_start == best_start) {
+                best_end = max(best_end, range_end)
+            }
+        }
+        if (best_end < 0) {
+            push_focus_span(document, cursor, source_length, false)
+            break
+        }
+        push_focus_span(document, cursor, max(cursor, best_start), false)
+        let marked_start = max(cursor, best_start)
+        push_focus_span(document, marked_start, best_end, true)
+        cursor = best_end
+    }
+    return <- document
+}
+
+def private apply_active_focus() {
+    if (g_client == null) return
+    let identity = ("{g_active_focus_message}:{g_active_focus_target}:" +
+        "{g_focus_visible}:{g_inspector.revision}:{g_inspector.installed_file_path}")
+    if (identity == g_applied_focus_identity && !g_pending_focus_scroll) return
+    text_source_document_dispose(g_inspector.focus_view_document)
+    text_source_document_dispose(g_inspector.focus_new_document)
+    g_inspector.focus_document_valid = false
+    g_inspector.focus_start_byte = -1
+    if (g_focus_visible && !empty(g_active_focus_message)) {
+        for (message in g_client.mailbox) {
+            if (message.id != g_active_focus_message
+                    || g_active_focus_target < 0
+                    || g_active_focus_target >= length(message.focus.targets)) continue
+            let target & = unsafe(message.focus.targets[g_active_focus_target])
+            if (target.file_path != g_inspector.installed_file_path) continue
+            g_inspector.focus_view_document <- make_focus_document(
+                g_inspector.view_document, target, 1000001)
+            g_inspector.focus_new_document <- make_focus_document(
+                g_inspector.new_document, target, 1000002)
+            g_inspector.focus_document_valid = true
+            if (!empty(target.ranges)) {
+                g_inspector.focus_start_byte = target.ranges[0].start_byte
+            } else {
+                g_inspector.focus_start_byte = 0
+            }
+            if (g_pending_focus_scroll) {
+                var line_index = 0
+                peek_data(g_inspector.view_document.source) $(bytes) {
+                    for (index in range(min(length(bytes),
+                            max(0, g_inspector.focus_start_byte)))) {
+                        if (int(bytes[index]) == '\n') {
+                            line_index++
+                        }
+                    }
+                }
+                g_inspector.diff_scroll_y = (float(line_index)
+                    * GetTextLineHeight())
+                g_inspector.diff_scroll_jump_pending = true
+                g_focus_view_scroll_pending = true
+            }
+            break
+        }
+    }
+    g_pending_focus_scroll = false
+    g_applied_focus_identity = identity
+}
+
+def private navigate_active_focus(delta : int) {
+    if (g_client == null || empty(g_active_focus_message)) return
+    for (message in g_client.mailbox) {
+        if (message.id != g_active_focus_message || empty(message.focus.targets)) continue
+        g_active_focus_target = (g_active_focus_target + delta
+            + length(message.focus.targets)) % length(message.focus.targets)
+        let target & = unsafe(message.focus.targets[g_active_focus_target])
+        g_pending_focus_scroll = true
+        g_applied_focus_identity = ""
+        g_client->inspect_file(message.focus.repository_id,
+            message.focus.worktree_path, target.file_path,
+            message.focus.comparison, "compact", message.focus.revision)
+        return
+    }
+}
+
 def private draw_file_inspector_content() {
     let io & = unsafe(GetIO())
     if (IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows) && io.KeyCtrl) {
@@ -2796,10 +3179,27 @@ def private draw_file_inspector_content() {
         }
         return
     }
+    apply_active_focus()
     text(INSPECTOR_PATH, (text = g_inspector.installed_file_path))
     same_line()
     text_disabled(INSPECTOR_SCOPE,
         (text = to_upper(g_inspector.installed_comparison)))
+    if (!empty(g_active_focus_message)) {
+        same_line()
+        if (small_button(FOCUS_PREVIOUS, (text = "Previous"))) {
+            navigate_active_focus(-1)
+        }
+        same_line()
+        if (small_button(FOCUS_NEXT, (text = "Next"))) {
+            navigate_active_focus(1)
+        }
+        same_line()
+        if (small_button(FOCUS_TOGGLE,
+                (text = g_focus_visible ? "Hide focus" : "Show focus"))) {
+            g_focus_visible = !g_focus_visible
+            g_applied_focus_identity = ""
+        }
+    }
     tab_bar(INSPECTOR_MODE_TABS,
             (text = "InspectorModes", flags = ImGuiTabBarFlags.None)) {
         tab_item(INSPECTOR_DIFF_TAB, (text = "Diff", closable = false,
@@ -2951,6 +3351,7 @@ def shutdown() {
         g_client->cleanup()
         delete g_client.sessions
         delete g_client.repositories
+        delete g_client.mailbox
         delete g_client.git_failure_revisions
         unsafe { delete g_client }
         g_client = null
