@@ -471,6 +471,27 @@ def private is_subpass_input_type(t : TypeDecl?) : bool {
     return "{t.structType.name}" == "subpassInput"
 }
 
+// A cooperative-matrix local is recognized by its marker struct name (coopmatA_f16_16x16, ...). Returns
+// the OpTypeCooperativeMatrixKHR parameters declare_local_var + the coopmat call arms need: the component
+// float width and the tile's rows/cols/use (SpvCooperativeMatrixUse). Scope is always Subgroup; every v1
+// component is a float (f16 input / f32 accumulator), so no signedness/int-kind flag is carried yet.
+def private coopmat_info(t : TypeDecl?) : tuple<ok : bool; comp_width : uint; rows : uint; cols : uint; use : uint> {
+    if (t == null || t.baseType != Type.tStructure || t.structType == null) return (ok = false, comp_width = 0u, rows = 0u, cols = 0u, use = 0u)
+    let n = "{t.structType.name}"
+    if (n == "coopmatA_f16_16x16") return (ok = true, comp_width = 16u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixAKHR))
+    if (n == "coopmatB_f16_16x16") return (ok = true, comp_width = 16u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixBKHR))
+    if (n == "coopmatAcc_f32_16x16") return (ok = true, comp_width = 32u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixAccumulatorKHR))
+    return (ok = false, comp_width = 0u, rows = 0u, cols = 0u, use = 0u)
+}
+
+// Materialize the OpTypeCooperativeMatrixKHR for a coopmat marker type (0 if `t` is not a coopmat).
+def private coopmat_type_of(var m : SpirvModule; t : TypeDecl?) : uint {
+    let ci = coopmat_info(t)
+    if (!ci.ok) return 0u
+    let comp = type_float(m, ci.comp_width)
+    return type_cooperative_matrix(m, comp, uint(SpvScope.Subgroup), ci.rows, ci.cols, ci.use)
+}
+
 // Exactly the type set emit_type lowers without panicking: a scalar/vector (scalar_class >= 0), bool,
 // a matrix, or a fixed array of those. Lets the @workgroup path reject an unsupported shared type with
 // a clean diagnostic instead of crashing in emit_type (struct/handle/dynamic-array shared vars).
@@ -2580,6 +2601,18 @@ def private declare_local_var(var m : SpirvModule; var ctx : EmitCtx; v : Variab
         ctx.local_vars |> insert(intptr(v), LocalVar(ptr_id = rqid, value_type = rqt, is_opaque = true))
         return
     }
+    // A cooperative-matrix OBJECT (coopmatA_f16_16x16, ...): a subgroup tile in a Function-storage local,
+    // recognized by its marker name. Unlike rayQueryEXT it holds a LOADABLE value (coopmatLoad fills it,
+    // coopmatMulAdd reads it and produces one), so it is NOT is_opaque -- the normal value rail applies and
+    // OpConstantNull zero-init of a bare `var acc : coopmatAcc_f32_16x16` accumulator is legal for a coopmat.
+    if (bt == Type.tStructure && v._type.structType != null && coopmat_info(v._type).ok) {
+        let cmt = coopmat_type_of(m, v._type)
+        let cmpt = type_pointer(m, SpvStorageClass.Function, cmt)
+        let cmid = alloc_id(m)
+        emit(m, SEC_FUNCS, SpvOp.Variable, cmpt, cmid, uint(SpvStorageClass.Function))
+        ctx.local_vars |> insert(intptr(v), LocalVar(ptr_id = cmid, value_type = cmt))
+        return
+    }
     // a matrix is a tHandle, so numeric_info does not see it -- emit_type lowers it to OpTypeMatrix,
     // which is a perfectly good Function-storage pointee (glslang gives a local `mat4` an OpVariable too)
     if (!is_emittable_value_type(v._type) && bt != Type.tFixedArray && bt != Type.tStructure &&
@@ -2932,6 +2965,37 @@ class SpirvEmit : AstVisitor {
         let r2v = arg ?as ExprRef2Value
         let lv = r2v != null ? r2v.subexpr : arg
         return ptr_of(lv).id
+    }
+
+    // A coopmat local argument: peel a defensive ExprRef2Value, then take its Function pointer + coopmat
+    // pointee type (coopmatLoad's dst) or load its value (coopmatMulAdd's a/b/c, coopmatStore's mat).
+    def coop_local_ptr(arg : ExpressionPtr) : tuple<id : uint; pty : uint> {
+        let r2v = arg ?as ExprRef2Value
+        let lv = r2v != null ? r2v.subexpr : arg
+        return ptr_of(lv)
+    }
+    def coop_local_val(arg : ExpressionPtr) : uint {
+        let r2v = arg ?as ExprRef2Value
+        let lv = r2v != null ? r2v.subexpr : arg
+        return value_of(lv)
+    }
+    // Resolve a coopmat Load/Store buffer operand (an @ssbo array global) + an element index to the
+    // OpAccessChain pointer at buf[idx] -- the Pointer operand coopMat Load/Store wants. Mirrors the SSBO
+    // branch of emit_index_read (Block member 0, then the dynamic element index).
+    def coop_buf_ptr(buf_arg : ExpressionPtr; idx : uint; who : string) : uint {
+        var bm & = unsafe(*m)
+        let g = global_var_of(buf_arg)
+        let gi = g != null ? (ctx.globals?[intptr(g)] ?? GlobalInfo()) : GlobalInfo()
+        if (g == null || !gi.is_ssbo) {
+            errs |> push("{who}: the buffer argument must be an @ssbo array")
+            return 0u
+        }
+        let ptr_t = type_pointer(bm, gi.storage, gi.elem_type)
+        let res = alloc_id(bm)
+        var ops <- [ptr_t, res, gi.var_id, const_uint(bm, 0u), idx]
+        emit_n(bm, SEC_FUNCS, SpvOp.AccessChain, ops)
+        delete ops
+        return res
     }
 
     // The `committed` flag of a ray-query accessor: GLSL's bool literal (true = the committed hit).
@@ -4062,6 +4126,85 @@ class SpirvEmit : AstVisitor {
             let rt = emit_type(bm, expr._type)
             let res = alloc_id(bm)
             emit(bm, SEC_FUNCS, op, rt, res, rqp, committed_id)
+            e2id[k] = res
+            return expr
+        }
+        // Cooperative matrices (SPV_KHR_cooperative_matrix). All compute-only (the tile scope is the
+        // subgroup). coopmatLoad(dst, src, idx, stride, layout): OpCooperativeMatrixLoadKHR from an @ssbo
+        // element pointer into the dst tile local (result-type = dst's coopmat type), then OpStore.
+        // coopmatStore(mat, dst, idx, stride, layout): OpCooperativeMatrixStoreKHR of the loaded tile.
+        // coopmatMulAdd(a, b, c): OpCooperativeMatrixMulAddKHR (float accumulate -> no operands mask).
+        // `layout` is a compile-time-constant 0 (row-major) / 1 (column-major); `stride` is an id operand.
+        if (name == "coopmatLoad" || name == "coopmatStore") {
+            if (ctx.stage != ShaderStage.Compute) {
+                errs |> push("{name} is only valid in a compute shader")
+                return expr
+            }
+            if (length(expr.arguments) != 5) {
+                errs |> push("{name} expects ({name == "coopmatLoad" ? "dst, src" : "mat, dst"}, idx, stride, layout)")
+                return expr
+            }
+            let idx = value_of(expr.arguments[2])
+            let stride_id = value_of(expr.arguments[3])
+            let lay = const_uint_value(expr.arguments[4])
+            if (idx == 0u || stride_id == 0u) return expr
+            if (!lay.ok || lay.value > 1u) {
+                errs |> push("{name}: layout must be a constant 0 (row-major) or 1 (column-major)")
+                return expr
+            }
+            let layout_id = const_uint(bm, lay.value)
+            if (name == "coopmatLoad") {
+                let dst = coop_local_ptr(expr.arguments[0])
+                if (dst.id == 0u || dst.pty == 0u) {
+                    errs |> push("coopmatLoad: the first argument must be a coopmat local")
+                    return expr
+                }
+                let sptr = coop_buf_ptr(expr.arguments[1], idx, "coopmatLoad")
+                if (sptr == 0u) return expr
+                let res = alloc_id(bm)
+                var ld <- [dst.pty, res, sptr, layout_id, stride_id]
+                emit_n(bm, SEC_FUNCS, SpvOp.CooperativeMatrixLoadKHR, ld)
+                delete ld
+                emit(bm, SEC_FUNCS, SpvOp.Store, dst.id, res)
+            } else {
+                let obj = coop_local_val(expr.arguments[0])
+                if (obj == 0u) {
+                    errs |> push("coopmatStore: the first argument must be a coopmat value")
+                    return expr
+                }
+                let dptr = coop_buf_ptr(expr.arguments[1], idx, "coopmatStore")
+                if (dptr == 0u) return expr
+                var st <- [dptr, obj, layout_id, stride_id]
+                emit_n(bm, SEC_FUNCS, SpvOp.CooperativeMatrixStoreKHR, st)
+                delete st
+            }
+            return expr
+        }
+        if (name == "coopmatMulAdd") {
+            if (ctx.stage != ShaderStage.Compute) {
+                errs |> push("coopmatMulAdd is only valid in a compute shader")
+                return expr
+            }
+            if (length(expr.arguments) != 3) {
+                errs |> push("coopmatMulAdd expects (a, b, c)")
+                return expr
+            }
+            let va = coop_local_val(expr.arguments[0])
+            let vb = coop_local_val(expr.arguments[1])
+            let vc = coop_local_val(expr.arguments[2])
+            if (va == 0u || vb == 0u || vc == 0u) {
+                errs |> push("coopmatMulAdd: could not evaluate an operand")
+                return expr
+            }
+            let rt = coopmat_type_of(bm, expr._type)
+            if (rt == 0u) {
+                errs |> push("coopmatMulAdd: result must be a coopmat accumulator type")
+                return expr
+            }
+            let res = alloc_id(bm)
+            var ops <- [rt, res, va, vb, vc]
+            emit_n(bm, SEC_FUNCS, SpvOp.CooperativeMatrixMulAddKHR, ops)
+            delete ops
             e2id[k] = res
             return expr
         }
@@ -5751,7 +5894,9 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
     if (!is_rt_stage(stage)) {
         emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Shader))
     }
-    emit(m, SEC_MEMMODEL, SpvOp.MemoryModel, uint(SpvAddressingModel.Logical), uint(SpvMemoryModel.GLSL450))
+    // OpMemoryModel is emitted LATE (just before the entry point), not here: a cooperative-matrix body
+    // pulls the VulkanMemoryModel capability, which forces the Vulkan memory model, and that is only
+    // known once the body has been walked. Every other shader stays Logical GLSL450.
     // Mesh / task stages pull in the mesh-shading capability + the SPV_EXT_mesh_shader extension.
     // Do this BEFORE the entry point so the capabilities section is closed and the extension is
     // visible by the time spirv-val checks the entry point's execution model. SPV_EXT_mesh_shader
@@ -5920,6 +6065,12 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
         delete extra
         delete listed
     }
+
+    // The memory model, now that the body is walked: a cooperative-matrix module pulled
+    // VulkanMemoryModel (spirv-val requires it once CooperativeMatrixKHR is declared), which mandates the
+    // Vulkan memory model; every other shader keeps Logical GLSL450.
+    let mem_model = (m.type_pool?["cap_coopmat"] ?? 0u) != 0u ? SpvMemoryModel.Vulkan : SpvMemoryModel.GLSL450
+    emit(m, SEC_MEMMODEL, SpvOp.MemoryModel, uint(SpvAddressingModel.Logical), uint(mem_model))
 
     var ep <- [uint(execution_model(stage)), id_main]
     var nm <- string_words("main")

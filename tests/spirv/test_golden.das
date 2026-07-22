@@ -208,5 +208,8 @@ def test_golden_disassembly(t : T?) {
         check(t, "q8blk", q8blk_words())
         // packed integer dot product: OpSDot + the PackedVectorFormat4x8Bit literal
         check(t, "sdot", sdot_words())
+        // cooperative matrix: the four KHR coopmat opcodes + the Vulkan memory model + 1.6 header.
+        // byte-identical check() — visitor baseline, deterministic ids.
+        check(t, "coopmat", coopmat_words())
     }
 }

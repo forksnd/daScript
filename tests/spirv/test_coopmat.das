@@ -1,0 +1,48 @@
+options gen2
+options indenting = 4
+
+// Cooperative-matrix gate (SPV_KHR_cooperative_matrix — Tensor-Core MMA). The coopmat_kernel fixture is
+// an f16 x f16 -> f32 GEMM tile: it loads a 16x16 A (row-major) and B (column-major) from f16 SSBOs into
+// subgroup tiles, does one OpCooperativeMatrixMulAddKHR into a zero-initialized (OpConstantNull) f32
+// accumulator, and stores the 16x16 result column-major. This pins the four KHR coopmat opcodes, the
+// CooperativeMatrixKHR capability + SPV_KHR_cooperative_matrix extension, and the SPIR-V 1.6 version
+// floor; spirv-val (vulkan1.3) is the independent witness that the whole shape is valid.
+
+require dastest/testing_boost public
+require _spirv_common               // validate_spirv, coopmat_words
+require spirv/spirv_dis             // count_op, op_has_operand
+require spirv/spirv_grammar         // SpvOp, SpvCapability, SPV_VERSION_1_6
+
+[test]
+def test_coopmat(t : T?) {
+    t |> run("cooperative matrix f16xf16->f32 GEMM tile: KHR coopmat opcodes + capability + 1.6 floor") <| @(t : T?) {
+        var words <- coopmat_words()
+        // capability + extension + the SPIR-V 1.6 version floor coopmat forces
+        t |> success(op_has_operand(words, SpvOp.Capability, uint(SpvCapability.CooperativeMatrixKHR)),
+            "OpCapability CooperativeMatrixKHR (6022)")
+        t |> success(count_op(words, SpvOp.Extension) >= 1,
+            "an OpExtension is declared (SPV_KHR_cooperative_matrix)")
+        t |> success(length(words) >= 2 && words[1] == SPV_VERSION_1_6,
+            "SPIR-V header version floored to 1.6")
+        // three distinct tile types (A f16/use0, B f16/use1, accumulator f32/use2), two loads, one
+        // multiply-accumulate, one store
+        t |> success(count_op(words, SpvOp.TypeCooperativeMatrixKHR) == 3,
+            "three OpTypeCooperativeMatrixKHR (A, B, accumulator)")
+        t |> success(count_op(words, SpvOp.CooperativeMatrixLoadKHR) == 2,
+            "two OpCooperativeMatrixLoadKHR (A, B tiles)")
+        t |> success(count_op(words, SpvOp.CooperativeMatrixMulAddKHR) == 1,
+            "one OpCooperativeMatrixMulAddKHR")
+        t |> success(count_op(words, SpvOp.CooperativeMatrixStoreKHR) == 1,
+            "one OpCooperativeMatrixStoreKHR")
+        // the accumulator is zero-initialized (a bare `var acc : coopmatAcc...`) -> OpConstantNull
+        t |> success(count_op(words, SpvOp.ConstantNull) >= 1,
+            "OpConstantNull zero-inits the accumulator tile")
+        let r = validate_spirv(words, "vulkan1.3")
+        if (r.ran) {
+            t |> success(r.ok, "spirv-val (vulkan1.3): {r.msg}")
+        } else {
+            feint("spirv-val not found locally; skipping (CI enforces)\n")
+        }
+        delete words
+    }
+}
