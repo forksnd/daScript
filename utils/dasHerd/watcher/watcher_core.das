@@ -814,9 +814,12 @@ def public watcher_notify(session_id : string; text : string;
         if (!empty(message_id)) {
             let _ = watcher_mailbox_set_notification(
                 session_id, message_id, "queued")
+            append_event(g_sessions[index], "mailbox_notification_queued",
+                "id={message_id}; partial_input_bytes={g_sessions[index].input_line_bytes}")
+        } else {
+            append_event(g_sessions[index], "terminal_notification_queued",
+                "partial_input_bytes={g_sessions[index].input_line_bytes}")
         }
-        append_event(g_sessions[index], "mailbox_notification_queued",
-            "id={message_id}; partial_input_bytes={g_sessions[index].input_line_bytes}")
         return "queued"
     }
     let controller_id = g_sessions[index].controller_id

@@ -294,6 +294,11 @@ def test_watcher_process_lifecycle(t : T?) {
             controlled.session_id), "events.jsonl"))
         t |> success(find(controlled_events, "delivery=deferred") >= 0,
             "a deferred mailbox nudge records its eventual delivery")
+        t |> success(find(controlled_events, "terminal_notification_queued") >= 0,
+            "a deferred non-mailbox nudge uses a terminal-specific queue event")
+        t |> success(find(controlled_events,
+                "\"event\":\"mailbox_notification_queued\",\"detail\":\"id=;") < 0,
+            "a deferred non-mailbox nudge does not emit an empty mailbox queue event")
         t |> success(find(controlled_events, "\"detail\":\"id=; delivery=deferred\"") < 0,
             "a deferred non-mailbox nudge does not emit an empty mailbox event")
         t |> equal(watcher_terminate(controlled.session_id, "test_complete"), "")
