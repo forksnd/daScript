@@ -189,10 +189,11 @@ def private perm_declines(var gc : LlvmCodeCtx; p : TilePerm) : bool {
         return LLVMGetIntrinsicDeclaration(mod, tblId, tblTypes) == null
     }
     if (p.dotPrim == "sdot") {
-        // the NEON leg (M2 shape): 128-bit q-regs, 4-row sdot lane structure, q-reg budget checked below
+        // the NEON leg (M2 shape): 128-bit q-regs, 4-row sdot lanes; mr>=8 budgets the FUSED-acc shape (kq shares one lo+hi acc there — half the mr4 formula's int-acc bank)
         if ((!g_target_is_aarch64) || (p.width != 128)
             || (p.mr % 4 != 0)
-            || (2 * p.mr + p.nrsplit * p.mr / 4 + 2 * p.nrsplit + 2 > 32)) return true
+            || (p.mr >= 8 ? (p.mr + p.nrsplit * p.mr / 4 + 2 * p.nrsplit + 2 > 32)
+                          : (2 * p.mr + p.nrsplit * p.mr / 4 + 2 * p.nrsplit + 2 > 32))) return true
         let mod = LLVMGetGlobalParent(gc.impl)
         var v16i8 = LLVMVectorType(gc.jit.types.t_int8, 16u)
         let id = LLVMLookupIntrinsicID("llvm.aarch64.neon.sdot")
@@ -796,6 +797,23 @@ def private load_f16_vec_at(var te : TileEmit; var base, off : LLVMOpaqueValue?;
     return LLVMBuildFPExt(b, LLVMBuildBitCast(b, hv, te.vnf16, ""), te.vnf32, name)
 }
 
+// pairwise i32 fold of two bsum quads into one v4 of per-32 sums (even+odd shuffle + add —
+// the backend lowers the pair to a single addp)
+def private pairwise_add_i32(var te : TileEmit; var av, bv : LLVMOpaqueValue?; name : string) : LLVMOpaqueValue? {
+    let b = te.builder
+    let evens <- [0, 2, 4, 6]
+    let odds <- [1, 3, 5, 7]
+    var e = LLVMBuildShuffleVector(b, te.types, av, bv, evens, "")
+    var o = LLVMBuildShuffleVector(b, te.types, av, bv, odds, "")
+    return LLVMBuildAdd(b, e, o, name)
+}
+
+// splat one lane of a v4i32 across the accumulator width (dup .4s[lane] after lowering)
+def private splat_lane_i32(var te : TileEmit; var v : LLVMOpaqueValue?; lane : int; name : string) : LLVMOpaqueValue? {
+    let mask <- [for (_i in range(te.rv)); lane]
+    return LLVMBuildShuffleVector(te.builder, te.types, v, v, mask, name)
+}
+
 // or-in of a masked bit test as the nibble's 0x10: w |= (bytes & mask) != 0 ? 0x10 : 0
 // (pcmpeqb+pand shape after lowering — the k5 high-bit deposit)
 def private or_bit_x10(te : TileEmit; var w, bytes, maskv : LLVMOpaqueValue?; name : string) : LLVMOpaqueValue? {
@@ -848,6 +866,24 @@ def private emit_block_kqv2(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f
         iacc[i] = LLVMConstNull(te.vni32)
         bacc[i] = LLVMConstNull(te.vni32)
         facc[i] = LLVMConstNull(te.vnf32)
+    }
+    // vector bsums: sdot leg only (x64's vpbroadcastd makes scalars free; k6 needs bs0/bs1 unsummed)
+    let vecBsums = !memBcast && !k6
+    // mr>=8 fuses lo+hi into ONE acc (i32-exact — the fold adds them anyway); mr4 keeps split accs for ILP
+    let fuseAcc = !memBcast && mr >= 8 && !k6
+    var a32v8 : LLVMOpaqueValue? [8]   // [tok * 2 + blk / 4], lane blk % 4
+    if (vecBsums) {
+        var xb16 = LLVMBuildShl(b, sbi, te.types->ConstI64(4ul), "xb16")
+        for (i in range(tokCount)) {
+            let tk = tokBase + i
+            var q : LLVMOpaqueValue? [4]
+            for (q4 in range(4)) {
+                var bp = LLVMBuildGEP2(b, te.types.t_int32, te.xbs[tk], LLVMBuildAdd(b, xb16, te.types->ConstI64(uint64(q4 * 4)), ""), "bsp{tk}_{q4}")
+                q[q4] = LLVMBuildLoad2Aligned(b, te.vni32, bp, 4u, "bsv{tk}_{q4}")
+            }
+            a32v8[i * 2] = pairwise_add_i32(te, q[0], q[1], "a32lo{tk}")
+            a32v8[i * 2 + 1] = pairwise_add_i32(te, q[2], q[3], "a32hi{tk}")
+        }
     }
     for (blk in range(8)) {
         var xoff0 = LLVMBuildAdd(b, xb, te.types->ConstI64(uint64(blk * 32)), "")
@@ -926,8 +962,12 @@ def private emit_block_kqv2(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f
                     }
                 } else {
                     for (i in range(tokCount)) {
-                        a0[i * rq + qd] = kq_dot_lane(te, a0[i * rq + qd], wlo, xv0[i], j)
-                        a1[i * rq + qd] = kq_dot_lane(te, a1[i * rq + qd], whi, xv1[i], j)
+                        if (fuseAcc) {
+                            a0[i * rq + qd] = kq_dot_lane(te, kq_dot_lane(te, a0[i * rq + qd], wlo, xv0[i], j), whi, xv1[i], j)
+                        } else {
+                            a0[i * rq + qd] = kq_dot_lane(te, a0[i * rq + qd], wlo, xv0[i], j)
+                            a1[i * rq + qd] = kq_dot_lane(te, a1[i * rq + qd], whi, xv1[i], j)
+                        }
                     }
                 }
             }
@@ -963,9 +1003,11 @@ def private emit_block_kqv2(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f
                 mnv[qd] = LLVMBuildSExt(b, LLVMBuildLoad2Aligned(b, vri8, sc1p, 1u, ""), te.vni32, "sc{blk}_{qd}b")
             } else {
                 var scp = LLVMBuildGEP2(b, te.types.t_int8, te.sg, LLVMBuildAdd(b, sb, te.types->ConstI64(uint64(4 * mr + blk * mr + qd * te.rv)), ""), "scp{blk}_{qd}")
-                var mnp = LLVMBuildGEP2(b, te.types.t_int8, te.sg, LLVMBuildAdd(b, sb, te.types->ConstI64(uint64(12 * mr + blk * mr + qd * te.rv)), ""), "mnp{blk}_{qd}")
                 scv[qd] = LLVMBuildZExt(b, LLVMBuildLoad2Aligned(b, vri8, scp, 1u, ""), te.vni32, "sc{blk}_{qd}")
-                mnv[qd] = LLVMBuildZExt(b, LLVMBuildLoad2Aligned(b, vri8, mnp, 1u, ""), te.vni32, "mn{blk}_{qd}")
+                if (!vecBsums) {   // mins feed the inline bacc fold; the vector-bsum leg folds them in the epilogue instead
+                    var mnp = LLVMBuildGEP2(b, te.types.t_int8, te.sg, LLVMBuildAdd(b, sb, te.types->ConstI64(uint64(12 * mr + blk * mr + qd * te.rv)), ""), "mnp{blk}_{qd}")
+                    mnv[qd] = LLVMBuildZExt(b, LLVMBuildLoad2Aligned(b, vri8, mnp, 1u, ""), te.vni32, "mn{blk}_{qd}")
+                }
             }
         }
         var bIdx = LLVMBuildAdd(b, gb, te.types->ConstI64(uint64(blk)), "b{blk}")
@@ -973,15 +1015,23 @@ def private emit_block_kqv2(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f
         var bi2b = LLVMBuildAdd(b, bi2, te.types->ConstI64(1ul), "")
         for (i in range(tokCount)) {
             let tk = tokBase + i
-            var bp0 = LLVMBuildGEP2(b, te.types.t_int32, te.xbs[tk], bi2, "bp{tk}_{blk}a")
-            var bs0 = LLVMBuildLoad2Aligned(b, te.types.t_int32, bp0, 4u, "bs{tk}_{blk}a")
-            var bp1 = LLVMBuildGEP2(b, te.types.t_int32, te.xbs[tk], bi2b, "bp{tk}_{blk}b")
-            var bs1 = LLVMBuildLoad2Aligned(b, te.types.t_int32, bp1, 4u, "bs{tk}_{blk}b")
+            var bs0 : LLVMOpaqueValue?
+            var bs1 : LLVMOpaqueValue?
+            var a32v : LLVMOpaqueValue?
+            if (vecBsums) {
+                a32v = splat_lane_i32(te, a32v8[i * 2 + blk / 4], blk % 4, "a32v{tk}_{blk}")
+            } else {
+                var bp0 = LLVMBuildGEP2(b, te.types.t_int32, te.xbs[tk], bi2, "bp{tk}_{blk}a")
+                bs0 = LLVMBuildLoad2Aligned(b, te.types.t_int32, bp0, 4u, "bs{tk}_{blk}a")
+                var bp1 = LLVMBuildGEP2(b, te.types.t_int32, te.xbs[tk], bi2b, "bp{tk}_{blk}b")
+                bs1 = LLVMBuildLoad2Aligned(b, te.types.t_int32, bp1, 4u, "bs{tk}_{blk}b")
+                if (!k6) {
+                    a32v = splat_i32(te, LLVMBuildAdd(b, bs0, bs1, "a32{tk}_{blk}"), "a32v{tk}_{blk}")
+                }
+            }
             if (q40) {
-                var a32 = LLVMBuildAdd(b, bs0, bs1, "a32{tk}_{blk}")
-                var a32v = splat_i32(te, a32, "a32v{tk}_{blk}")
                 for (qd in range(rq)) {
-                    var acc = LLVMBuildAdd(b, a0[i * rq + qd], a1[i * rq + qd], "acc{tk}_{blk}_{qd}")
+                    var acc = fuseAcc ? a0[i * rq + qd] : LLVMBuildAdd(b, a0[i * rq + qd], a1[i * rq + qd], "acc{tk}_{blk}_{qd}")
                     var isub = LLVMBuildSub(b, acc, LLVMBuildMul(b, a32v, splat_i32n(te, 8), ""), "is{tk}_{blk}_{qd}")
                     facc[i * rq + qd] = fold_fma(te, LLVMBuildSIToFP(b, isub, te.vnf32, ""), dvb[qd], facc[i * rq + qd], "fa{tk}_{blk}_{qd}")
                 }
@@ -995,12 +1045,25 @@ def private emit_block_kqv2(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f
                     bacc[i * rq + qd] = LLVMBuildAdd(b, bacc[i * rq + qd], ba, "ba{tk}_{blk}_{qd}")
                 }
             } else {
-                var a32 = LLVMBuildAdd(b, bs0, bs1, "a32{tk}_{blk}")
-                var a32v = splat_i32(te, a32, "a32v{tk}_{blk}")
                 for (qd in range(rq)) {
-                    var acc = LLVMBuildAdd(b, a0[i * rq + qd], a1[i * rq + qd], "acc{tk}_{blk}_{qd}")
+                    var acc = fuseAcc ? a0[i * rq + qd] : LLVMBuildAdd(b, a0[i * rq + qd], a1[i * rq + qd], "acc{tk}_{blk}_{qd}")
                     iacc[i * rq + qd] = LLVMBuildAdd(b, iacc[i * rq + qd], LLVMBuildMul(b, scv[qd], acc, ""), "ia{tk}_{blk}_{qd}")
-                    bacc[i * rq + qd] = LLVMBuildAdd(b, bacc[i * rq + qd], LLVMBuildMul(b, mnv[qd], a32v, ""), "ba{tk}_{blk}_{qd}")
+                    if (!vecBsums) {
+                        bacc[i * rq + qd] = LLVMBuildAdd(b, bacc[i * rq + qd], LLVMBuildMul(b, mnv[qd], a32v, ""), "ba{tk}_{blk}_{qd}")
+                    }
+                }
+            }
+        }
+    }
+    // epilogue min-bias fold (k4/k5 vector-bsum leg): bit-exact i32, keeps bacc out of the block loop's register set
+    if (vecBsums && !q40) {
+        for (blk in range(8)) {
+            for (qd in range(rq)) {
+                var mnp = LLVMBuildGEP2(b, te.types.t_int8, te.sg, LLVMBuildAdd(b, sb, te.types->ConstI64(uint64(12 * mr + blk * mr + qd * te.rv)), ""), "emnp{blk}_{qd}")
+                var mnq = LLVMBuildZExt(b, LLVMBuildLoad2Aligned(b, vri8, mnp, 1u, ""), te.vni32, "emn{blk}_{qd}")
+                for (i in range(tokCount)) {
+                    var a32v = splat_lane_i32(te, a32v8[i * 2 + blk / 4], blk % 4, "ea32{tokBase + i}_{blk}")
+                    bacc[i * rq + qd] = LLVMBuildAdd(b, bacc[i * rq + qd], LLVMBuildMul(b, mnq, a32v, ""), "eba{tokBase + i}_{blk}_{qd}")
                 }
             }
         }
