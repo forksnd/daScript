@@ -206,6 +206,8 @@ struct private GitInspectorState {
     old_document : TextSourceDocument = TextSourceDocument()
     new_document : TextSourceDocument = TextSourceDocument()
     view_document : TextSourceDocument = TextSourceDocument()
+    new_line_starts : array<int>
+    view_line_starts : array<int>
     focus_document_valid : bool
     focus_start_byte : int = -1
     old_view : TextSourceViewState = TextSourceViewState()
@@ -405,6 +407,8 @@ def private release_inspector_content() {
     text_source_document_dispose(g_inspector.old_document)
     text_source_document_dispose(g_inspector.new_document)
     text_source_document_dispose(g_inspector.view_document)
+    delete g_inspector.new_line_starts
+    delete g_inspector.view_line_starts
     g_inspector.focus_document_valid = false
     g_inspector.focus_start_byte = -1
     markdown_view_dispose(g_inspector.markdown_view)
@@ -487,6 +491,10 @@ def private drain_inspector_prepare_events() {
             g_inspector.old_document <- event.old_document
             g_inspector.new_document <- event.new_document
             g_inspector.view_document <- event.view_document
+            append_line_starts(g_inspector.new_document.source,
+                g_inspector.new_line_starts)
+            append_line_starts(g_inspector.view_document.source,
+                g_inspector.view_line_starts)
             g_inspector.markdown_document <- event.markdown_document
             g_inspector.markdown_view <- event.markdown_view
             g_inspector.changed_source_ranges <- event.changed_source_ranges
@@ -3189,15 +3197,11 @@ def private append_line_starts(source : string;
 
 def private diff_byte_to_view_byte(diff_byte : int;
                                    end_bias : bool) : int {
-    var inscope diff_starts : array<int>
-    var inscope view_starts : array<int>
-    append_line_starts(g_inspector.new_document.source, diff_starts)
-    append_line_starts(g_inspector.view_document.source, view_starts)
     let clamped_byte = clamp(diff_byte, 0,
         length(g_inspector.new_document.source))
     var display_line = 0
-    for (index in range(length(diff_starts))) {
-        if (diff_starts[index] > clamped_byte) break
+    for (index in range(length(g_inspector.new_line_starts))) {
+        if (g_inspector.new_line_starts[index] > clamped_byte) break
         display_line = index
     }
     if (display_line < 0
@@ -3211,11 +3215,13 @@ def private diff_byte_to_view_byte(diff_byte : int;
             scan--
         }
     }
-    if (source_line <= 0 || source_line > length(view_starts)) return -1
-    let column = max(0, clamped_byte - diff_starts[display_line])
-    let line_start = view_starts[source_line - 1]
-    let line_end = (source_line < length(view_starts)
-        ? max(line_start, view_starts[source_line] - 1)
+    if (source_line <= 0
+            || source_line > length(g_inspector.view_line_starts)) return -1
+    let column = max(0,
+        clamped_byte - g_inspector.new_line_starts[display_line])
+    let line_start = g_inspector.view_line_starts[source_line - 1]
+    let line_end = (source_line < length(g_inspector.view_line_starts)
+        ? max(line_start, g_inspector.view_line_starts[source_line] - 1)
         : length(g_inspector.view_document.source))
     return min(line_end, line_start + column)
 }
@@ -3252,12 +3258,6 @@ def private draw_focus_target_overlay(target : WatcherFocusTarget const;
                                       state : TextSourceViewState const;
                                       document : TextSourceDocument const;
                                       diff_mapping : bool) {
-    var inscope display_starts : array<int>
-    var inscope view_starts : array<int>
-    if (diff_mapping) {
-        append_line_starts(document.source, display_starts)
-        append_line_starts(g_inspector.view_document.source, view_starts)
-    }
     let dim_color = GetColorU32(float4(0.015f, 0.018f, 0.024f, 0.48f))
     let focus_fill = GetColorU32(float4(1.0f, 0.72f, 0.18f, 0.13f))
     let focus_outline = GetColorU32(float4(1.0f, 0.76f, 0.24f, 0.92f))
@@ -3280,10 +3280,12 @@ def private draw_focus_target_overlay(target : WatcherFocusTarget const;
                     var mapped = !diff_mapping
                     if (diff_mapping && line_index < length(document.line_numbers)) {
                         let source_line = document.line_numbers[line_index]
-                        if (source_line > 0 && source_line <= length(view_starts)) {
-                            source_start = view_starts[source_line - 1]
-                            source_end = (source_line < length(view_starts)
-                                ? max(source_start, view_starts[source_line] - 1)
+                        if (source_line > 0
+                                && source_line <= length(g_inspector.view_line_starts)) {
+                            source_start = g_inspector.view_line_starts[source_line - 1]
+                            source_end = (source_line < length(g_inspector.view_line_starts)
+                                ? max(source_start,
+                                    g_inspector.view_line_starts[source_line] - 1)
                                 : length(g_inspector.view_document.source))
                             mapped = true
                         }
@@ -3321,19 +3323,24 @@ def private draw_focus_target_overlay(target : WatcherFocusTarget const;
                 var mapped = !diff_mapping
                 if (diff_mapping && cell.line_index >= 0
                         && cell.line_index < length(document.line_numbers)
-                        && cell.line_index < length(display_starts)) {
+                        && cell.line_index < length(g_inspector.new_line_starts)) {
                     let source_line = document.line_numbers[cell.line_index]
-                    if (source_line > 0 && source_line <= length(view_starts)) {
-                        let canonical_line_start = view_starts[source_line - 1]
-                        let canonical_line_end = (source_line < length(view_starts)
-                            ? max(canonical_line_start, view_starts[source_line] - 1)
+                    if (source_line > 0
+                            && source_line <= length(g_inspector.view_line_starts)) {
+                        let canonical_line_start = g_inspector.view_line_starts[source_line - 1]
+                        let canonical_line_end = (source_line
+                                < length(g_inspector.view_line_starts)
+                            ? max(canonical_line_start,
+                                g_inspector.view_line_starts[source_line] - 1)
                             : length(g_inspector.view_document.source))
                         source_start = min(canonical_line_end,
                             canonical_line_start + max(0,
-                                cell.source.start_byte - display_starts[cell.line_index]))
+                                cell.source.start_byte
+                                    - g_inspector.new_line_starts[cell.line_index]))
                         source_end = min(canonical_line_end,
                             canonical_line_start + max(0,
-                                cell.source.end_byte - display_starts[cell.line_index]))
+                                cell.source.end_byte
+                                    - g_inspector.new_line_starts[cell.line_index]))
                         mapped = true
                     }
                 }
