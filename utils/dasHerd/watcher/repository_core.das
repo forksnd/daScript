@@ -1467,6 +1467,7 @@ def public repository_parse_graph_history(text : string; worktree_path : string;
 
 struct private GitNumstatLine {
     path : string
+    old_path : string
     added_lines : int
     deleted_lines : int
     known : bool
@@ -1507,13 +1508,27 @@ def private expanded_numstat_path(path : string) : string {
     if (arrow < 0) {
         return path
     }
-    let brace_start = find(path, "{")
+    let brace_start = find(path, "\{")
     tail_text = slice(path, arrow + 4)
-    end_pos = find(tail_text, "}")
+    end_pos = find(tail_text, "\}")
     if (brace_start >= 0 && end_pos >= 0) {
         return "{slice(path, 0, brace_start)}{slice(tail_text, 0, end_pos)}{slice(tail_text, end_pos + 1)}"
     }
     return slice(path, arrow + 4)
+}
+
+def private original_numstat_path(path : string) : string {
+    let arrow = find(path, " => ")
+    var tail_text : string // nolint:LINT003 daScript loses let lifetime after the early-return guard
+    var end_pos : int // nolint:LINT003 daScript loses let lifetime after the early-return guard
+    if (arrow < 0) return ""
+    let brace_start = find(path, "\{")
+    tail_text = slice(path, arrow + 4)
+    end_pos = find(tail_text, "\}")
+    if (brace_start >= 0 && end_pos >= 0) {
+        return "{slice(path, 0, brace_start)}{slice(path, brace_start + 1, arrow)}{slice(tail_text, end_pos + 1)}"
+    }
+    return slice(path, 0, arrow)
 }
 
 def private parse_numstat_line(line : string; var result : GitNumstatLine&) : bool {
@@ -1525,7 +1540,9 @@ def private parse_numstat_line(line : string; var result : GitNumstatLine&) : bo
     let added = slice(line, 0, added_end)
     let deleted = slice(line, deleted_start, deleted_end)
     if (!numstat_count_token(added) || !numstat_count_token(deleted)) return false
-    result.path = expanded_numstat_path(slice(line, path_start))
+    let raw_path = slice(line, path_start)
+    result.path = expanded_numstat_path(raw_path)
+    result.old_path = original_numstat_path(raw_path)
     result.binary = added == "-" || deleted == "-"
     result.known = !result.binary
     result.added_lines = result.known ? to_int(added) : 0
@@ -1595,6 +1612,7 @@ def public repository_parse_review_files(text : string; worktree_path : string;
         if (parse_numstat_line(line, numstat)) {
             files |> push(GitReviewFileState(
                 worktree_path = worktree_path, path = numstat.path,
+                old_path = numstat.old_path,
                 added_lines = numstat.added_lines,
                 deleted_lines = numstat.deleted_lines,
                 stats_known = numstat.known, binary = numstat.binary))
@@ -1627,7 +1645,8 @@ def public repository_parse_commit_files(text : string; worktree_path : string;
         if (parse_numstat_line(line, numstat)) {
             files |> push(GitCommitFileState(
                 worktree_path = worktree_path, commit_hash = commit_hash,
-                path = numstat.path, added_lines = numstat.added_lines,
+                path = numstat.path, old_path = numstat.old_path,
+                added_lines = numstat.added_lines,
                 deleted_lines = numstat.deleted_lines,
                 stats_known = numstat.known, binary = numstat.binary))
             continue

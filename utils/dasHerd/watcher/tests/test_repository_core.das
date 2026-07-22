@@ -180,9 +180,16 @@ def test_repository_review_parsing(t : T?) {
         t |> equal(stats[0].added_lines, 12)
         t |> equal(stats[0].deleted_lines, 3)
         t |> success(stats[0].stats_known)
+        t |> equal(stats[1].old_path, "old.cpp")
         t |> equal(stats[1].path, "src/new.cpp")
         t |> success(stats[2].binary)
         t |> success(!stats[2].stats_known)
+        stats |> clear()
+        repository_parse_review_files(
+            "0  0  src/\{old => new\}.cpp\n",
+            "D:/Work/tree", stats)
+        t |> equal(stats[0].old_path, "src/old.cpp")
+        t |> equal(stats[0].path, "src/new.cpp")
     }
     t |> run("aggregate PR diffs compare the merge base with the index") <| @(t : T?) {
         var argv : array<string>
@@ -213,6 +220,12 @@ def test_repository_review_parsing(t : T?) {
         t |> equal(files[0].added_lines, 1)
         t |> equal(files[0].deleted_lines, 2)
         t |> equal(files[0].path, "src/main.das")
+        files |> clear()
+        repository_parse_commit_files(
+            "0  0  docs/\{before => after\}.md\n",
+            "D:/Work/tree", "abcdef0123456789", files)
+        t |> equal(files[0].old_path, "docs/before.md")
+        t |> equal(files[0].path, "docs/after.md")
         var refs : array<GitRefState>
         repository_parse_refs(
             "refs/heads/main\tmain\tabcdef\t*\t\torigin/main\n" +
