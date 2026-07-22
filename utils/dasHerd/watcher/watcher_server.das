@@ -296,10 +296,20 @@ class DasHerdWatcherServer : HvWebServer {
             if (empty(session_id)) {
                 return self.respond_error(resp, http_status.BAD_REQUEST, "session_id is required")
             }
+            if (watcher_find_session(session_id) < 0) {
+                return self.respond_error(resp, http_status.NOT_FOUND, "unknown session")
+            }
             let direction = query_value(url, "direction")
+            if (!empty(direction) && direction != "inbox" && direction != "outbox") {
+                return self.respond_error(resp, http_status.BAD_REQUEST,
+                    "direction must be inbox or outbox")
+            }
             let message_id = query_value(url, "message_id")
             if (direction == "inbox" && !empty(message_id)) {
-                let _ = watcher_mailbox_mark_fetched(session_id, message_id)
+                let fetched = watcher_mailbox_mark_fetched(session_id, message_id)
+                if (!fetched.ok) {
+                    return self.respond_error(resp, http_status.NOT_FOUND, fetched.error)
+                }
             }
             return resp |> JSON(watcher_mailbox_json(session_id,
                 direction, message_id), http_status.OK)
@@ -397,10 +407,11 @@ class DasHerdWatcherServer : HvWebServer {
             if (!sscan_json(string(req.body), request)) {
                 return self.respond_error(resp, http_status.BAD_REQUEST, "invalid mailbox JSON")
             }
-            let result = watcher_mailbox_post(request)
+            var result = watcher_mailbox_post(request)
             if (!result.ok) return self.respond_error(resp, http_status.BAD_REQUEST, result.error)
             self.maybe_notify_inbox_message(request.session_id,
                 request.direction, result.message_id, request.notify)
+            result.revision = watcher_mailbox_session_revision(request.session_id)
             return resp |> JSON(sprint_json(result, false), http_status.CREATED)
         }
         POST("/api/v1/mailbox/state") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
@@ -447,6 +458,10 @@ class DasHerdWatcherServer : HvWebServer {
     def send_mailbox(var client : WatcherClient?; force : bool = false) {
         if (client == null || empty(client.session_id)) return
         let revision = watcher_mailbox_session_revision(client.session_id)
+        if (revision < 0l) {
+            send_error(client.channel, "unknown session")
+            return
+        }
         if (!force && client.mailbox_revision == revision) return
         client.mailbox_revision = revision
         send(client.channel, "\{\"type\":\"mailbox\",\"session_id\":" +
@@ -996,13 +1011,14 @@ class DasHerdWatcherServer : HvWebServer {
                 reply_to = incoming.reply_to,
                 notify = incoming.notify,
                 focus := incoming.focus)
-            let result = watcher_mailbox_post(request)
+            var result = watcher_mailbox_post(request)
             if (!result.ok) {
                 send_error(channel, result.error)
                 return
             }
             self.maybe_notify_inbox_message(request.session_id,
                 request.direction, result.message_id, request.notify)
+            result.revision = watcher_mailbox_session_revision(request.session_id)
             send(channel, "\{\"type\":\"mailbox_posted\",\"message_id\":" +
                 "{sprint_json(result.message_id, false)},\"revision\":{result.revision}\}",
                 ws_opcode.WS_OPCODE_TEXT, true)

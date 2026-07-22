@@ -123,6 +123,8 @@ def test_watcher_process_lifecycle(t : T?) {
             command_line = "powershell.exe -NoProfile -Command \"Write-Output watcher-core-ok\"",
             cwd = root, columns = 80, rows = 20, timeout_ms = 5000l))
         t |> success(quick.ok, quick.error)
+        t |> equal(watcher_mailbox_session_revision("missing-session"), -1l,
+            "unknown sessions do not expose a normal mailbox revision")
         t |> success(watcher_accepts_input(quick.session_id), "running session accepts input")
         t |> success(wait_for(quick.session_id, "exited", 5000l), "quick command exits and drains")
         t |> success(!watcher_accepts_input(quick.session_id), "exited session is replay-only")
@@ -267,6 +269,13 @@ def test_watcher_process_lifecycle(t : T?) {
         t |> equal(watcher_notify(controlled.session_id, "nudge\r",
             queued_message.message_id), "queued",
             "notification waits behind a partial terminal input line")
+        t |> success(watcher_mailbox_session_revision(controlled.session_id)
+                > queued_message.revision,
+            "recording queued delivery advances the session mailbox revision")
+        let missing_fetch = watcher_mailbox_mark_fetched(
+            controlled.session_id, "missing-message")
+        t |> success(!missing_fetch.ok && missing_fetch.error == "unknown mailbox message",
+            "fetching an unknown mailbox message reports a routing error")
         let queued_json = watcher_mailbox_json(
             controlled.session_id, "inbox", queued_message.message_id)
         t |> success(find(queued_json, "\"sender\":\"human:local\"") >= 0

@@ -564,6 +564,8 @@ class private WatcherRichClient : HvWebSocketClient {
     repositories : array<RepositorySnapshot>
     mailbox : array<WatcherMailboxMessage>
     mailbox_revision : int64
+    agent_mark_revision : int64 = -1l
+    agent_mark_files : table<string; bool>
     error : string
     last_heartbeat : int64
     last_list : int64
@@ -592,6 +594,8 @@ class private WatcherRichClient : HvWebSocketClient {
         connected = true
         connect_count++
         delete git_failure_revisions
+        delete agent_mark_files
+        agent_mark_revision = -1l
         git_failure_baseline_ready = false
         error = ""
         last_reconnect = ref_time_ticks()
@@ -753,6 +757,7 @@ class private WatcherRichClient : HvWebSocketClient {
                 delete mailbox
                 mailbox <- incoming.data
                 mailbox_revision = incoming.revision
+                agent_mark_revision = -1l
             } else {
                 error = "invalid mailbox message"
             }
@@ -999,6 +1004,31 @@ class private WatcherRichClient : HvWebSocketClient {
         send("\{\"op\":\"mailbox_state\",\"session_id\":" +
             "{sprint_json(selected_id, false)},\"message_id\":" +
             "{sprint_json(message_id, false)},\"status\":\"acknowledged\"\}")
+    }
+
+    def agent_mark_key(repository_id, worktree_path, file_path : string) : string {
+        return ("{length(repository_id)}:{repository_id}" +
+            "{length(worktree_path)}:{worktree_path}{file_path}")
+    }
+
+    def refresh_agent_marks() {
+        if (agent_mark_revision == mailbox_revision) return
+        delete agent_mark_files
+        for (message in mailbox) {
+            if (message.direction != "outbox") continue
+            for (target in message.focus.targets) {
+                agent_mark_files[agent_mark_key(message.focus.repository_id,
+                    message.focus.worktree_path, target.file_path)] = true
+            }
+        }
+        agent_mark_revision = mailbox_revision
+    }
+
+    def marks_file_for_agent(repository_id, worktree_path,
+                             file_path : string) : bool {
+        refresh_agent_marks()
+        return key_exists(agent_mark_files,
+            agent_mark_key(repository_id, worktree_path, file_path))
     }
 
     def send_input(text : string) {
@@ -1424,16 +1454,8 @@ def private git_group_scope(group : int) : string {
 
 def private agent_marks_file(repository_id, worktree_path,
                              file_path : string) : bool {
-    if (g_client == null) return false
-    for (message in g_client.mailbox) {
-        if (message.direction != "outbox"
-                || message.focus.repository_id != repository_id
-                || message.focus.worktree_path != worktree_path) continue
-        for (target in message.focus.targets) {
-            if (target.file_path == file_path) return true
-        }
-    }
-    return false
+    return (g_client != null
+        && g_client->marks_file_for_agent(repository_id, worktree_path, file_path))
 }
 
 def private focused_file_label(repository_id, worktree_path,
@@ -3722,6 +3744,7 @@ def shutdown() {
         delete g_client.repositories
         delete g_client.mailbox
         delete g_client.git_failure_revisions
+        delete g_client.agent_mark_files
         unsafe { delete g_client }
         g_client = null
     }
