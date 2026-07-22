@@ -343,16 +343,30 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
-- **Small-model q8 single-stream GEMV: restore the vector quant load on the blob layout
-  (2026-07-18, the blob rewiring's one regression — TOP of the perf queue).** The planar
-  kernels loaded 4 quants as ONE byte4 vector; the 34B blob's +2 quant phase forced 4
-  scalar loads across the single-stream family (MetalQ8Gemv, the QkvRs twins, W13Sw).
-  Issue-bound models pay ~7-8% at B=1 (4B Q8 64.5 -> 59.5 = 0.88x, g3-1b 204.7 -> 190.3);
-  DRAM-bound 12B is flat; batch forms amortize over columns and IMPROVED (+5..24%).
-  Fix A: a third uint16 buffer view (the blob is 2-byte aligned everywhere) — 2 aligned
-  ushort loads + sign-extend unpack per chunk. Fix B (zero kernel changes, A/B-able at the
-  encoder): dispatch MetalQ8MvB2 at nrows=1 with ys=0/xs4=0 (the double-store is benign —
-  both columns compute and store the same value). Measure both at the 4B shapes.
+- **Q6-greedy spec-chain inversion on big pure-k6 files (2026-07-22 re-pair).** `spec_cls_capable`
+  (dasllama_metal_llama.das:164) is a pure CAPABILITY test — it engages the greedy spec chain for
+  any tied-k6 classifier with no BENEFICIAL condition, so a big pure-k6 file eats the spec-chain
+  work where it is a net loss. Cost today: gemma4-12B Q6_K B=1 greedy runs 26.81 t/s with spec on
+  vs 27.11 spec-off (~+1%; `DASLLAMA_METAL_SPEC=0` recovers). This was the board's "0.81x" cell —
+  RE-PAIRED to 0.977 on / 0.988 off in a clean quiet window (the 0.81 was window-skew; spec-on had
+  drifted 22.4→26.8). Fix: a size/format beneficial-gate (decline spec on pure-k6 above a
+  param/layer threshold, picked at the 4B-wins / 12B-loses crossover) in spec_cls_capable or the
+  :1888 engagement gate. Small inch (~+1%); deferred (Boris, 2026-07-22).
+
+- **Small-model q8 single-stream GEMV vector-load: TESTED + REFUTED (2026-07-22), do not
+  re-chase.** The hypothesis (the blob's +2 quant phase forces 4 scalar int8 loads instead of
+  one byte4 vector load, costing ~7-8% at B=1) was IMPLEMENTED as Fix A (a uint16 blob view +
+  2 aligned ushort loads + sign-extend unpack in MetalQ8Gemv), proven bit-exact on GPU, and
+  measured in a clean A/B (distinct dll hashes): PERF-NEUTRAL-to-slightly-NEGATIVE. gemma3-1b
+  B=1 master 192.1 vs Fix A 188.7 (the unpack ADDS ALU where the GEMV is not load-issue-bound);
+  qwen3-4B B=1 63.40 vs 63.45 (noise). Root cause of the original "regression": the ledgered
+  64.5→59.5 was WINDOW-SKEW, not a real issue-bound cost — the q8 B=1 GEMV is
+  bandwidth-bound at the M1 ceiling (qwen3-4B 349 GB/s, gemma4-12B 327 GB/s, both near peak),
+  so cutting weight-load issues does nothing. Contrast the gpt-oss expert-GEMV win, which cut
+  X-RELOAD issues (a different axis). Reverted. The real q8 B=1 lever is the non-GEMV overhead
+  (elementwise dispatch fusion + attention), not the weight-load path — see the ew-fusion
+  ledger items below. Kept a byproduct: the gemv kernel-unit now covers the main vectorized
+  loop (n=1120), which it never did before (committed).
 
 - **Per-config .dlim: map-only load, BLOB-ONLY metal flavor — SHIPPED (2026-07-18).** The
   contract "no processing on load FOR THE CONFIG IT WAS BUILT FOR" holds: image v3 +
