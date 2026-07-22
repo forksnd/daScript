@@ -183,6 +183,11 @@ def test_is_symlink(t : T?) {
         var error : string
         t |> success(!is_symlink("/no/such/path", error))
     }
+    t |> run("empty path") @(t : T?) {
+        var error : string
+        t |> success(!is_symlink("", error))
+        t |> equal(error, "empty path")
+    }
 }
 
 [test]

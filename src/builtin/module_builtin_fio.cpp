@@ -1912,7 +1912,7 @@ namespace das {
 
     bool builtin_fs_is_symlink ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) {
         error = nullptr;
-        if ( !path ) { error = empty_path_error(ctx, at); return false; }
+        if ( !path || !path[0] ) { error = empty_path_error(ctx, at); return false; }
         std::error_code ec;
 #if defined(_WIN32)
         auto widePath = utf8_file_path_to_wide(path);
