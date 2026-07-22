@@ -53,32 +53,35 @@ contract.
 
 An agent-facing `dasherder.md` skill explains the available operations and how
 to discover the current session. The agent publishes structured focus sets,
-notes, acknowledgements, and results to dasHerd. MCP is the preferred ergonomic
-surface when installed; a small CLI is the portable surface; localhost HTTP is
-the underlying fallback. All three map to the same versioned protocol and
-identities.
+notes, acknowledgements, and results to dasHerd. The first supported agent
+surface is a small `dasherd` CLI. It speaks to the local watcher protocol, reads
+the current session capability automatically, and offers stable human-readable
+and JSON output. MCP is explicitly deferred until the mailbox and focus
+contract have enough real use to justify its support cost. Raw localhost HTTP
+is an implementation/debugging substrate, not the initial agent-facing
+contract.
 
 The agent should not have to synthesize UI input or emit terminal prose for
 dasHerd to scrape. A typical operation is semantically:
 
 ```text
-publish_focus(session, focus_items, summary)
+dasherd outbox send --kind focus --payload focus.json
 ```
 
 ### dasHerd to agent: durable payload plus wake-up
 
-Local HTTP/MCP state cannot wake a passive agent model. Conversely, pasting the
+Local mailbox state cannot wake a passive agent model. Conversely, pasting the
 complete request into a TTY is fragile, noisy, difficult to acknowledge, and
 unsafe for large source selections. The proposed transport therefore splits
 notification from payload:
 
 1. dasHerd stores the complete structured request in a durable per-session
    inbox and assigns a stable message ID.
-2. After the human previews and sends it, dasHerd injects one short natural-
-   language notification through the agent's normal TTY input path.
+2. The same explicit UI action immediately injects one short natural-language
+   notification through the agent's normal TTY input path.
 3. The notification tells the agent to use the dasHerd skill and fetch that
    exact message ID.
-4. The agent fetches the payload through MCP/CLI/HTTP and acknowledges it.
+4. The agent fetches the payload through the CLI and acknowledges it.
 5. dasHerd shows pending, notified, fetched, acknowledged, completed, failed,
    canceled, and stale state rather than assuming that pasted text was read.
 
@@ -90,20 +93,72 @@ For example, the visible TTY message can be:
 The nudge is intentionally sufficient for the model to choose the skill but
 does not duplicate the source payload in terminal scrollback or context.
 
-MCP resource-change notifications or a future direct agent callback may remove
-the TTY wake-up for agents that support true push. They are optimizations of
-the wake transport, not replacements for the durable inbox and acknowledgement
-model. Pure polling is not the default because an idle agent has no reason to
-take another turn.
+A future direct agent callback may remove the TTY wake-up for agents that
+support true push. It is an optimization of the wake transport, not a
+replacement for the durable inbox and acknowledgement model. Pure polling is
+not the default because an idle agent has no reason to take another turn.
+
+### Per-session Inbox and Outbox
+
+Inbox and Outbox are named relative to the agent session:
+
+- **Inbox** contains human or dasHerd-system requests addressed to that agent.
+- **Outbox** contains focus sets, replies, notes, and results published by that
+  agent for the human/dasHerd.
+
+The first implementation includes both views in the web UI for every session.
+This is not deferred until rich focus rendering. At minimum each mailbox shows
+message ID, time, sender, kind/subject, lifecycle state, reply/correlation ID,
+notification state, and a readable payload. A raw structured-payload view is
+available from the start so protocol mistakes can be diagnosed by eye. The UI
+also exposes cancel, retry-notification, and acknowledgement transitions as
+applicable.
+
+There is no required compose, preview, or confirmation stage for a contextual
+request. The baseline interaction is: select code in Diff/View, right-click,
+choose **Look at that**, and return to work. That menu action immediately
+creates the Inbox message from the selected revision/path/range and queues the
+TTY notification. Selection alone sends nothing. If notification fails, the
+durable message remains visible and retryable in the mailbox.
+
+The CLI begins with operations equivalent to:
+
+```text
+dasherd whoami
+dasherd inbox list
+dasherd inbox get <message-id>
+dasherd inbox ack <message-id>
+dasherd inbox complete <message-id> [--message <text>]
+dasherd outbox send --kind <kind> --payload <file>
+dasherd outbox reply <message-id> --kind <kind> --payload <file>
+```
+
+### Sender identity and provenance
+
+Sender is assigned by dasHerd from the authenticated transport principal; it
+is never trusted from a message field supplied by the CLI or web client.
+
+- A session-scoped CLI capability stamps the sender as
+  `agent_session:<session-id>` and restricts the destination to that session's
+  Outbox, acknowledgements, and replies.
+- The local web UI stamps the sender as `human:local` in the single-user first
+  slice and records its client/connection ID separately for diagnostics.
+- Watcher-generated lifecycle notices use `system:dasHerd`.
+
+A later multi-user or cross-agent design can add principals without changing
+message identity. Cross-session agent messaging is not part of the first
+slice: an agent can consume only its own Inbox and publish only to its own
+Outbox. Replies carry `reply_to`/correlation identity rather than copying or
+overwriting the original sender.
 
 ### Session discovery and capability scope
 
 dasHerd supplies an agent session with one capability descriptor containing the
 protocol version, localhost endpoint, session ID, and session-scoped
 credential. The launch profile exposes only the descriptor location; the
-`dasherder.md` skill describes how MCP, CLI, or HTTP consumes it. Credentials
-must not appear in generated prompts, terminal history, review briefs, or the
-repository.
+`dasherder.md` skill describes how the CLI consumes it. Credentials must not
+appear in generated prompts, terminal history, review briefs, CLI arguments,
+or the repository.
 
 The capability may read and acknowledge only its own inbox and publish focus
 for its own session/worktree. It cannot impersonate a human-origin message or
@@ -111,8 +166,8 @@ mutate Git/GitHub state through the focus protocol.
 
 ### Delivery rules
 
-- Human-to-agent delivery is explicit. The human previews the generated nudge
-  and request before sending it.
+- Human-to-agent delivery is explicit but one-step. Invoking **Look at that**
+  is the send action; there is no mandatory composer or second confirmation.
 - The TTY nudge uses the same serialized input ownership as ordinary terminal
   input; it must not interleave with a human's partial line or paste.
 - Message IDs make retries idempotent. Re-sending a nudge does not duplicate
@@ -152,8 +207,8 @@ This supports:
 A human can select files, functions, source ranges, commits, or Tree paths and
 turn that selection into either:
 
-- a generated chat prompt inserted through the normal, visible agent input
-  path; or
+- an immediate **Look at that** Inbox request plus the short visible TTY nudge;
+  or
 - an exported Markdown review brief that the human can ask the agent to read.
 
 The Markdown artifact is the portable human-readable projection of the same
@@ -162,8 +217,10 @@ and the human's notes/questions. A machine-readable representation may travel
 beside or inside it, but the `.md` must remain sufficient to inspect, edit, and
 discuss without dasHerd.
 
-No prompt is sent silently. The human sees and may edit the generated request
-before sending it.
+Selecting text never sends by itself. Invoking the named context-menu action is
+the deliberate send; the resulting request and delivery state are immediately
+visible in the session mailbox. Markdown export remains the editable path for a
+larger curated brief.
 
 ## Track B: GitHub PR observation and supervised operation
 
@@ -222,17 +279,21 @@ focus.
 
 ## Suggested implementation sequence
 
-1. Define and persist the headless Review Focus/item schema, revision/staleness
-   rules, and live inspection surface.
-2. Render agent-to-human file, source, and Tree focus with visible provenance,
-   reasons, and clear/Auto/All controls.
-3. Capture human selections and generate an editable prompt plus Markdown
-   review brief.
-4. Add agent tools/skill flow to publish and consume focus sets during local PR
-   preparation and review.
-5. Add read-only GitHub PR association, body, checks, comments, and logs.
-6. Extend focus targets to GitHub checks, threads, and log ranges.
-7. Add supervised ghost actions and integrate the babysit/merge policy.
+1. Define the generic message envelope, lifecycle/event history, authenticated
+   actor identities, and per-session Inbox/Outbox storage.
+2. Implement the session-scoped CLI capability and `dasherder.md` skill for
+   list/get/ack/complete/send/reply.
+3. Expose Inbox and Outbox in the web UI, including readable and raw payloads,
+   lifecycle state, cancel, and retry-notification controls.
+4. Add the short serialized TTY wake-up and prove store-before-notify,
+   idempotent retry, acknowledgement, and failure behavior.
+5. Define the Review Focus payload, revision/staleness rules, and live
+   inspection surface on top of the mailbox.
+6. Render agent-to-human file, source, and Tree focus, then capture human
+   selections as editable requests and Markdown review briefs.
+7. Add read-only GitHub PR association, body, checks, comments, and logs;
+   extend focus targets to GitHub state; then add supervised ghost actions and
+   babysit/merge policy.
 
 Each stage must expose semantic state to live commands. Screenshots are useful
 for presentation, never the correctness oracle.
@@ -252,5 +313,17 @@ for presentation, never the correctness oracle.
 - 2026-07-21: Adopt local Review Focus first and begin protocol design before
   UI implementation.
 - 2026-07-21: Proposed human-to-agent transport is a durable per-session inbox
-  fetched through MCP/CLI/HTTP, paired with a short visible TTY wake-up and an
+  fetched through the CLI, paired with a short visible TTY wake-up and an
   explicit acknowledgement lifecycle.
+- 2026-07-21: Make the CLI the first and only supported agent transport; defer
+  MCP until real mailbox usage justifies its support cost.
+- 2026-07-21: Ship visible per-session Inbox/Outbox views in the web UI with the
+  first protocol implementation, including raw payload inspection for manual
+  debugging.
+- 2026-07-21: Assign sender identity from scoped transport credentials:
+  `agent_session:<id>`, `human:local`, or `system:dasHerd`; never accept sender
+  identity from an untrusted message payload.
+- 2026-07-21: Human contextual delivery is one-step: select code, invoke
+  **Look at that**, and immediately create the Inbox message plus TTY nudge.
+  The visible mailbox is an audit/debug surface, not a mandatory composer or
+  confirmation step.
