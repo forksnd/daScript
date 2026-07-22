@@ -116,7 +116,7 @@ def main : int {
         return 1
     }
     let want = empty(cfg.sha) ? DEFAULT_REF_SHA : cfg.sha
-    let full = capture_out("git -C \"{src}\" rev-parse --verify --quiet {want}^\{commit\}")
+    let full = capture_out("git -C \"{src}\" rev-parse --verify --quiet \"{want}^\{commit\}\"")
     if (empty(full)) {
         print("error: `{want}` is not a commit in {src} — fetch it first (git -C \"{src}\" fetch origin)\n")
         return 1

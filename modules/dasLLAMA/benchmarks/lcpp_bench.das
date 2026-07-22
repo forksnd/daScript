@@ -362,12 +362,18 @@ def main() {
     models |> emplace(m)
     let text = sprint_json(models, true)
     if (!empty(cfg.json_path)) {
+        var wrote = false
         fopen(cfg.json_path, "wb") $(f) {
             if (f != null) {
                 fwrite(f, text)
+                wrote = true
             }
         }
-        say(fmt, "records written to {cfg.json_path}\n")
+        if (wrote) {
+            say(fmt, "records written to {cfg.json_path}\n")
+        } else {
+            say(fmt, "warning: could not open {cfg.json_path} for writing — no records file\n")
+        }
     }
     print("{text}\n")
 }
