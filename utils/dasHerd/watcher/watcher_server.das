@@ -766,6 +766,7 @@ class DasHerdWatcherServer : HvWebServer {
         next_client_id++
         clients |> push(new WatcherClient(channel = channel, id = next_client_id,
             last_heartbeat = ref_time_ticks()))
+        print("dasHerd watcher: client {next_client_id} connected\n")
         send(channel, "\{\"type\":\"connected\",\"client_id\":{next_client_id}\}",
             ws_opcode.WS_OPCODE_TEXT, true)
         send_sessions(channel)
@@ -776,10 +777,12 @@ class DasHerdWatcherServer : HvWebServer {
         let index = find_client(channel)
         if (index < 0) return
         var client = clients[index]
+        let client_id = client.id
         detach(client, "client_closed")
         self.cleanup_inspection_artifact(client)
         clients |> erase(index)
         unsafe { delete client }
+        print("dasHerd watcher: client {client_id} disconnected\n")
     }
 
     def override onWsMessage(channel : WebSocketChannel; message : string#) {
@@ -797,7 +800,6 @@ class DasHerdWatcherServer : HvWebServer {
             send(channel, "\{\"type\":\"heartbeat\"\}", ws_opcode.WS_OPCODE_TEXT, true)
         } elif (incoming.op == "list") {
             send_sessions(channel)
-            send_repositories(client, true)
         } elif (incoming.op == "repository_add") {
             let error = repository_add(RepositoryAddRequest(path = incoming.repository_path,
                 display_name = incoming.display_name,
@@ -806,33 +808,27 @@ class DasHerdWatcherServer : HvWebServer {
                 send_error(channel, error)
                 return
             }
-            send_repositories(client, true)
         } elif (incoming.op == "repository_refresh") {
             let error = repository_refresh(incoming.repository_id)
             if (!empty(error)) send_error(channel, error)
-            send_repositories(client, true)
         } elif (incoming.op == "repository_review") {
             let error = repository_review(
                 incoming.repository_id, incoming.worktree_path)
             if (!empty(error)) send_error(channel, error)
-            send_repositories(client, true)
         } elif (incoming.op == "repository_history") {
             let error = repository_history(
                 incoming.repository_id, incoming.worktree_path,
                 incoming.revision)
             if (!empty(error)) send_error(channel, error)
-            send_repositories(client, true)
         } elif (incoming.op == "repository_commit_files") {
             let error = repository_commit_files(
                 incoming.repository_id, incoming.worktree_path,
                 incoming.revision)
             if (!empty(error)) send_error(channel, error)
-            send_repositories(client, true)
         } elif (incoming.op == "repository_refs") {
             let error = repository_refs(
                 incoming.repository_id, incoming.worktree_path)
             if (!empty(error)) send_error(channel, error)
-            send_repositories(client, true)
         } elif (incoming.op == "git_file_action") {
             self.start_git_file_action(client, incoming)
         } elif (incoming.op == "file_inspect") {

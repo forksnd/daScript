@@ -12,6 +12,17 @@ def test_watcher_machine_output(t : T?) {
         t |> equal(watcher_target_id_or_local(""), "local")
         t |> equal(watcher_target_id_or_local("ssh-build"), "ssh-build")
     }
+    t |> run("watcher GC reacts to allocation pressure as well as fragmentation") <| @(t : T?) {
+        t |> equal(watcher_gc_reason(64ul * 1024ul * 1024ul,
+            65ul * 1024ul * 1024ul, 1ul, 1ul), "string_pressure")
+        t |> equal(watcher_gc_reason(1ul, 1ul,
+            128ul * 1024ul * 1024ul, 129ul * 1024ul * 1024ul), "heap_pressure")
+        t |> equal(watcher_gc_reason(10ul, 100ul, 10ul, 10ul),
+            "string_fragmentation")
+        t |> equal(watcher_gc_reason(10ul, 10ul, 10ul, 100ul),
+            "heap_fragmentation")
+        t |> equal(watcher_gc_reason(10ul, 10ul, 10ul, 10ul), "")
+    }
     t |> run("ConPTY wrapper controls are removed without changing task text") <| @(t : T?) {
         let esc = to_char(27)
         let bel = to_char(7)

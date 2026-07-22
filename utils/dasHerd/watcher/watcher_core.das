@@ -18,6 +18,21 @@ let private MAX_COMMAND_BYTES = 32 * 1024
 let private MAX_INPUT_BYTES = 1024 * 1024
 let private MAX_RAW_HISTORY_BYTES = 8 * 1024 * 1024
 let private RAW_HISTORY_TRIM_SLACK = 1024 * 1024
+let private WATCHER_GC_STRING_PRESSURE_BYTES = 64ul * 1024ul * 1024ul
+let private WATCHER_GC_HEAP_PRESSURE_BYTES = 128ul * 1024ul * 1024ul
+
+def public watcher_gc_reason(string_used, string_total,
+                             heap_used, heap_total : uint64) : string {
+    if (string_used >= WATCHER_GC_STRING_PRESSURE_BYTES) return "string_pressure"
+    if (heap_used >= WATCHER_GC_HEAP_PRESSURE_BYTES) return "heap_pressure"
+    if (string_total > 0ul && string_used * 3ul < string_total * 2ul) {
+        return "string_fragmentation"
+    }
+    if (heap_total > 0ul && heap_used * 3ul < heap_total) {
+        return "heap_fragmentation"
+    }
+    return ""
+}
 
 struct public WatcherLaunchRequest {
     command_line : string

@@ -262,6 +262,7 @@ var private GIT_CHANGELIST_STATUS_TEXT : NarrativeState
 var private GIT_ACTIVITY_STATUS_TEXT : NarrativeState
 var private GIT_CHANGELIST_STATUS_SEPARATOR : EmptyMarkerState
 var private GIT_ACTIVITY_STATUS_SEPARATOR : EmptyMarkerState
+var private INSPECTOR_CONNECTION_ERROR : NarrativeState
 
 def private setup_default_layout(dock_id : uint) {
     DockBuilderRemoveNode(dock_id)
@@ -499,27 +500,40 @@ class private WatcherRichClient : HvWebSocketClient {
     git_action_status : string
     git_failure_revisions : table<string; int64>
     git_failure_baseline_ready : bool
+    connect_count : int64
+    disconnect_count : int64
+    reconnect_attempt_count : int64
+    message_count : int64
+    repository_message_count : int64
 
     def override onOpen {
         connected = true
+        connect_count++
         error = ""
         last_reconnect = ref_time_ticks()
         last_heartbeat = ref_time_ticks()
         last_list = ref_time_ticks()
+        print("dasHerd client: watcher connected (generation {connect_count})\n")
         send("\{\"op\":\"list\"\}")
     }
 
     def override onClose {
+        let was_connected = connected
         connected = false
+        disconnect_count++
         attached = false
         controls = false
         sent_columns = 0
         sent_rows = 0
         error = "watcher connection closed"
         last_reconnect = ref_time_ticks()
+        if (was_connected) {
+            print("dasHerd client: watcher connection closed; reconnecting\n")
+        }
     }
 
     def override onMessage(message : string#) {
+        message_count++
         var envelope : WatcherEnvelope
         let body = string(message)
         if (!sscan_json(body, envelope)) {
@@ -554,6 +568,7 @@ class private WatcherRichClient : HvWebSocketClient {
                 g_focus_terminal_pending = true
             }
         } elif (envelope._type == "repositories") {
+            repository_message_count++
             var incoming : WatcherRepositoriesMessage
             if (sscan_json(body, incoming)) {
                 delete repositories
@@ -780,7 +795,13 @@ class private WatcherRichClient : HvWebSocketClient {
                      comparison : string;
                      diff_context : string = "compact";
                      git_revision : string = "") {
-        if (!connected || empty(repository_id) || empty(worktree_path)
+        if (!connected) {
+            error = "watcher is not connected"
+            g_inspector.loading = false
+            g_inspector.error = error
+            return
+        }
+        if (empty(repository_id) || empty(worktree_path)
                 || empty(file_path)) return
         begin_file_inspection(repository_id, worktree_path, file_path,
             comparison, diff_context, git_revision)
@@ -827,6 +848,7 @@ class private WatcherRichClient : HvWebSocketClient {
         if (!connected) {
             if (get_time_nsec(last_reconnect) / 1000000l >= 1000l) {
                 cleanup()
+                reconnect_attempt_count++
                 let result = init(g_url)
                 last_reconnect = ref_time_ticks()
                 if (result != 0) {
@@ -1441,7 +1463,7 @@ def private ensure_history(repository : RepositorySnapshot const;
 def private request_commit_files(repository : RepositorySnapshot const;
                                  worktree : WorktreeState const;
                                  commit_hash : string) {
-    if (g_client == null || empty(commit_hash)) return
+    if (g_client == null || !g_client.connected || empty(commit_hash)) return
     g_requested_history_commit = commit_hash
     g_client->request_repository_commit_files(
         repository.record.id, worktree.path, commit_hash)
@@ -1782,6 +1804,9 @@ def private git_selected_commit_file_count(repository : RepositorySnapshot const
 
 def private git_activity_status(repository : RepositorySnapshot const;
                                 worktree : WorktreeState const) : GitWindowStatus {
+    if (g_client == null || !g_client.connected) {
+        return GitWindowStatus(text = "WATCHER DISCONNECTED - reconnecting...", error = true)
+    }
     if (GIT_TREE_TAB.selected) {
         if (!empty(worktree.refs_error)) {
             return GitWindowStatus(text = worktree.refs_error, error = true)
@@ -1823,6 +1848,9 @@ def private git_activity_status(repository : RepositorySnapshot const;
 
 def private git_changelist_status(repository : RepositorySnapshot const;
                                   worktree : WorktreeState const) : GitWindowStatus {
+    if (g_client == null || !g_client.connected) {
+        return GitWindowStatus(text = "WATCHER DISCONNECTED - reconnecting...", error = true)
+    }
     if (!empty(repository.error)) {
         return GitWindowStatus(text = repository.error, error = true)
     }
@@ -2187,6 +2215,15 @@ def herder_client_state(_input : JsonValue?) : JsonValue? {
     return JV((ok = g_client.connected,
         connected = g_client.connected,
         error = g_client.error,
+        connect_count = g_client.connect_count,
+        disconnect_count = g_client.disconnect_count,
+        reconnect_attempt_count = g_client.reconnect_attempt_count,
+        message_count = g_client.message_count,
+        repository_message_count = g_client.repository_message_count,
+        heap_bytes = int64(heap_bytes_allocated()),
+        heap_total_bytes = int64(heap_total_allocated()),
+        string_heap_bytes = int64(string_heap_bytes_allocated()),
+        string_heap_total_bytes = int64(string_heap_total_allocated()),
         session_count = length(g_client.sessions),
         repository_count = length(g_client.repositories),
         selected_repository_id = g_selected_repository_id,
@@ -2640,6 +2677,11 @@ def private draw_file_inspector_window() {
     if (IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows) && io.KeyCtrl) {
         if (io.MouseWheel > 0.0f) zoom_by(5)
         elif (io.MouseWheel < 0.0f) zoom_by(-5)
+    }
+    if (g_client == null || !g_client.connected) {
+        text_colored(INSPECTOR_CONNECTION_ERROR,
+            (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
+            text = "WATCHER DISCONNECTED - reconnecting..."))
     }
     if (empty(g_inspector.file_path)) {
         text_disabled("Select a changed file")
