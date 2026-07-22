@@ -532,6 +532,8 @@ class private WatcherRichClient : HvWebSocketClient {
     def override onOpen {
         connected = true
         connect_count++
+        delete git_failure_revisions
+        git_failure_baseline_ready = false
         error = ""
         last_reconnect = ref_time_ticks()
         last_heartbeat = ref_time_ticks()
@@ -546,8 +548,24 @@ class private WatcherRichClient : HvWebSocketClient {
         disconnect_count++
         attached = false
         controls = false
+        attached_id = ""
         sent_columns = 0
         sent_rows = 0
+        last_review_identity = ""
+        last_history_identity = ""
+        last_refs_identity = ""
+        if (git_action_loading) {
+            git_action_loading = false
+            git_action_status = "interrupted"
+        }
+        if (g_inspector.loading) {
+            let disconnect_error = "watcher connection closed during file inspection"
+            g_inspector.loading = false
+            g_inspector.status = ""
+            g_inspector.error = disconnect_error
+            let _ = inspector_load_fail(g_inspector.prepare,
+                g_inspector.prepare.generation, disconnect_error)
+        }
         error = "watcher connection closed"
         last_reconnect = ref_time_ticks()
         if (was_connected) {
@@ -573,7 +591,24 @@ class private WatcherRichClient : HvWebSocketClient {
             if (sscan_json(body, incoming)) {
                 delete sessions
                 sessions <- incoming.data
-                if (empty(selected_id)) {
+                var selected_found = empty(selected_id)
+                if (!empty(selected_id)) {
+                    for (session in sessions) {
+                        if (session.id == selected_id) {
+                            selected_found = true
+                            break
+                        }
+                    }
+                }
+                if (!selected_found) {
+                    selected_id = ""
+                    attached_id = ""
+                    attached = false
+                    controls = false
+                }
+                if (!attached && !empty(selected_id)) {
+                    attach_session(selected_id)
+                } elif (empty(selected_id)) {
                     for (session in sessions) {
                         if (session.state == "running") {
                             attach_session(session.id)
@@ -597,6 +632,7 @@ class private WatcherRichClient : HvWebSocketClient {
                 delete repositories
                 repositories <- incoming.data
                 var selection_found = false
+                var selected_worktree_observed = false
                 for (repository in repositories) {
                     if (repository.record.id != g_selected_repository_id) continue
                     if (empty(repository.worktrees)) {
@@ -605,6 +641,7 @@ class private WatcherRichClient : HvWebSocketClient {
                     for (worktree in repository.worktrees) {
                         if (worktree.path == g_selected_worktree_path) {
                             selection_found = true
+                            selected_worktree_observed = true
                         }
                     }
                 }
@@ -612,12 +649,14 @@ class private WatcherRichClient : HvWebSocketClient {
                     g_selected_repository_id = repositories[0].record.id
                     if (!empty(repositories[0].worktrees)) {
                         g_selected_worktree_path = repositories[0].worktrees[0].path
+                        selected_worktree_observed = true
                     } else {
                         g_selected_worktree_path = repositories[0].record.checkout_path
                     }
                 }
                 let review_identity = "{g_selected_repository_id}\n{g_selected_worktree_path}"
-                if (!empty(g_selected_repository_id)
+                if (selected_worktree_observed
+                        && !empty(g_selected_repository_id)
                         && !empty(g_selected_worktree_path)
                         && review_identity != last_review_identity) {
                     request_repository_review(
@@ -633,7 +672,9 @@ class private WatcherRichClient : HvWebSocketClient {
                     if (repository.failure_revision <= seen) continue
                     git_failure_revisions[id] = repository.failure_revision
                     if (git_failure_baseline_ready
-                            && !empty(repository.failure_session_id)) {
+                            && !empty(repository.failure_session_id)
+                            && repository.failure_session_id != selected_id
+                            && repository.failure_session_id != attached_id) {
                         attach_session(repository.failure_session_id)
                         TERMINAL_WIN.open = true
                         TERMINAL_WIN.pending_raise = true

@@ -3,6 +3,8 @@ options gen2
 require daslib/fio
 require strings
 
+let private MAX_CAPTURE_BYTES = 8 * 1024 * 1024
+
 def private option_value(prefix : string) : string {
     for (argument in get_command_line_arguments()) {
         if (starts_with(argument, prefix)) return slice(argument, length(prefix))
@@ -25,6 +27,8 @@ def main() : int {
     var exit_code = -1
     var byte_count = 0
     var output_opened = false
+    var write_failed = false
+    var capture_too_large = false
     fopen(output_path, "wb") $(output) {
         if (output != null) {
             output_opened = true
@@ -37,10 +41,14 @@ def main() : int {
                 while (true) {
                     let read_count = fread(input, chunk)
                     if (read_count <= 0) break
+                    if (byte_count + read_count > MAX_CAPTURE_BYTES) {
+                        capture_too_large = true
+                        break
+                    }
                     if (read_count < length(chunk)) chunk |> resize(read_count)
                     let written = fwrite(output, chunk)
                     if (written != read_count) {
-                        exit_code = 3
+                        write_failed = true
                         break
                     }
                     byte_count += written
@@ -52,6 +60,16 @@ def main() : int {
     }
     if (!output_opened) {
         print("could not open captured Git blob\n")
+        return 3
+    }
+    if (capture_too_large) {
+        let _removed = remove(output_path)
+        print("Git blob exceeds the 8 MiB preview limit\n")
+        return 4
+    }
+    if (write_failed) {
+        let _removed = remove(output_path)
+        print("could not write captured Git blob\n")
         return 3
     }
     if (exit_code != 0) {

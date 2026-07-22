@@ -343,6 +343,12 @@ def public repository_refresh(id : string) : string {
     return ""
 }
 
+def public repository_phase_family(phase : int) : string {
+    if (phase == 10 || phase < 3) return "refresh"
+    if (phase >= 7) return "history"
+    return "review"
+}
+
 def public repository_build_file_diff_argv(worktree_path : string;
                                            file : GitFileState const;
                                            comparison : string;
@@ -389,6 +395,18 @@ def private record_git_failure(var runtime : RepositoryRuntime?;
     runtime.snapshot.failure_session_id = runtime.snapshot.task_session_id
     runtime.snapshot.failure_message = message
     runtime.snapshot.failure_revision++
+}
+
+def public repository_record_task_failure(repository_id, session_id,
+                                          message : string) : string {
+    let index = find_repository(repository_id)
+    if (index < 0 || g_repositories[index] == null) return "unknown repository"
+    var runtime = g_repositories[index]
+    runtime.snapshot.failure_session_id = session_id
+    runtime.snapshot.failure_message = message
+    runtime.snapshot.failure_revision++
+    changed(runtime)
+    return ""
 }
 
 def public repository_build_review_file_diff_argv(worktree_path : string;
@@ -822,10 +840,10 @@ def private launch_git(var runtime : RepositoryRuntime?; argv : array<string>;
     let result = watcher_launch(request)
     runtime.snapshot.task_session_id = result.session_id
     if (!result.ok) {
-        if (runtime.phase >= 7) {
+        let family = repository_phase_family(runtime.phase)
+        if (family == "history") {
             fail_history(runtime, result.error)
-        } elif (runtime.phase >= 3 && runtime.review_worktree_index >= 0
-                && runtime.review_worktree_index < length(runtime.snapshot.worktrees)) {
+        } elif (family == "review") {
             fail_review(runtime, result.error)
         } else {
             fail_refresh(runtime, result.error)
@@ -1135,6 +1153,88 @@ def private erase_refs(var runtime : RepositoryRuntime?; path : string) {
     }
 }
 
+def private observed_worktree_path(worktrees : array<WorktreeState> const;
+                                   path : string) : bool {
+    for (worktree in worktrees) {
+        if (worktree.path == path) return true
+    }
+    return false
+}
+
+def public repository_prune_removed_worktree_data(
+        var snapshot : RepositorySnapshot;
+        worktrees : array<WorktreeState> const) {
+    var index = 0
+    while (index < length(snapshot.files)) {
+        if (!observed_worktree_path(worktrees,
+                snapshot.files[index].worktree_path)) {
+            snapshot.files |> erase(index)
+        } else {
+            index++
+        }
+    }
+    index = 0
+    while (index < length(snapshot.review_commits)) {
+        if (!observed_worktree_path(worktrees,
+                snapshot.review_commits[index].worktree_path)) {
+            snapshot.review_commits |> erase(index)
+        } else {
+            index++
+        }
+    }
+    index = 0
+    while (index < length(snapshot.review_files)) {
+        if (!observed_worktree_path(worktrees,
+                snapshot.review_files[index].worktree_path)) {
+            snapshot.review_files |> erase(index)
+        } else {
+            index++
+        }
+    }
+    index = 0
+    while (index < length(snapshot.history_commits)) {
+        if (!observed_worktree_path(worktrees,
+                snapshot.history_commits[index].worktree_path)) {
+            snapshot.history_commits |> erase(index)
+        } else {
+            index++
+        }
+    }
+    index = 0
+    while (index < length(snapshot.graph_rows)) {
+        if (!observed_worktree_path(worktrees,
+                snapshot.graph_rows[index].worktree_path)) {
+            snapshot.graph_rows |> erase(index)
+        } else {
+            index++
+        }
+    }
+    index = 0
+    while (index < length(snapshot.commit_files)) {
+        if (!observed_worktree_path(worktrees,
+                snapshot.commit_files[index].worktree_path)) {
+            snapshot.commit_files |> erase(index)
+        } else {
+            index++
+        }
+    }
+    index = 0
+    while (index < length(snapshot.refs)) {
+        if (!observed_worktree_path(worktrees,
+                snapshot.refs[index].worktree_path)) {
+            snapshot.refs |> erase(index)
+        } else {
+            index++
+        }
+    }
+}
+
+def private promote_pending_refresh(var runtime : RepositoryRuntime?) {
+    if (!runtime.rerun_pending) return
+    runtime.rerun_pending = false
+    runtime.refresh_pending = true
+}
+
 def private finish_history_commits(var runtime : RepositoryRuntime?) {
     let index = runtime.history_worktree_index
     let path = runtime.snapshot.worktrees[index].path
@@ -1162,6 +1262,7 @@ def private finish_history_commits(var runtime : RepositoryRuntime?) {
     runtime.snapshot.worktrees[index].history_error = ""
     runtime.snapshot.task_session_id = ""
     runtime.phase = 0
+    promote_pending_refresh(runtime)
     changed(runtime)
 }
 
@@ -1183,6 +1284,7 @@ def private finish_commit_files(var runtime : RepositoryRuntime?) {
     runtime.snapshot.worktrees[index].history_error = ""
     runtime.snapshot.task_session_id = ""
     runtime.phase = 0
+    promote_pending_refresh(runtime)
     changed(runtime)
 }
 
@@ -1196,6 +1298,7 @@ def private finish_refs(var runtime : RepositoryRuntime?) {
     runtime.snapshot.worktrees[index].refs_error = ""
     runtime.snapshot.task_session_id = ""
     runtime.phase = 0
+    promote_pending_refresh(runtime)
     changed(runtime)
 }
 
@@ -1232,6 +1335,7 @@ def private finish_review(var runtime : RepositoryRuntime?) {
     runtime.snapshot.worktrees[index].review_error = ""
     runtime.snapshot.task_session_id = ""
     runtime.phase = 0
+    promote_pending_refresh(runtime)
     changed(runtime)
 }
 
@@ -1246,6 +1350,7 @@ def private fail_review(var runtime : RepositoryRuntime?; message : string) {
     runtime.pending_review_files |> clear()
     runtime.snapshot.task_session_id = ""
     runtime.phase = 0
+    promote_pending_refresh(runtime)
     changed(runtime)
 }
 
@@ -1267,6 +1372,7 @@ def private fail_history(var runtime : RepositoryRuntime?; message : string) {
     runtime.pending_refs |> clear()
     runtime.snapshot.task_session_id = ""
     runtime.phase = 0
+    promote_pending_refresh(runtime)
     changed(runtime)
 }
 
@@ -1276,10 +1382,7 @@ def private finish_refresh(var runtime : RepositoryRuntime?) {
     runtime.snapshot.last_success_ms = int64(get_clock()) * 1000l
     runtime.snapshot.task_session_id = ""
     changed(runtime)
-    if (runtime.rerun_pending) {
-        runtime.rerun_pending = false
-        runtime.refresh_pending = true
-    }
+    promote_pending_refresh(runtime)
 }
 
 def private fail_refresh(var runtime : RepositoryRuntime?; message : string) {
@@ -1289,10 +1392,7 @@ def private fail_refresh(var runtime : RepositoryRuntime?; message : string) {
     runtime.snapshot.error = message
     runtime.snapshot.task_session_id = ""
     changed(runtime)
-    if (runtime.rerun_pending) {
-        runtime.rerun_pending = false
-        runtime.refresh_pending = true
-    }
+    promote_pending_refresh(runtime)
 }
 
 def private repository_parse_commit_line(line, worktree_path : string;
@@ -1636,6 +1736,7 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
                 break
             }
         }
+        repository_prune_removed_worktree_data(runtime.snapshot, worktrees)
         delete runtime.snapshot.worktrees
         runtime.snapshot.worktrees <- worktrees
         runtime.snapshot.files |> clear()

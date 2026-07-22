@@ -36,12 +36,13 @@ def test_git_graph_model(t : T?) {
             graph_commit("B", "A", 40l),
             graph_commit("A", "", 30l)]
         repository.refs <- [
-            graph_ref("feature", "F2", false, true, "origin/feature"),
             graph_ref("origin/feature", "F1", true),
-            graph_ref("parallel", "P1", false, false, "origin/parallel"),
+            graph_ref("feature", "F2", false, true, "origin/feature"),
             graph_ref("origin/parallel", "P1", true),
+            graph_ref("parallel", "P1", false, false, "origin/parallel"),
             graph_ref("origin/master", "B", true),
-            graph_ref("merged-label", "B")]
+            graph_ref("merged-label", "B"),
+            graph_ref("origin/unrelated", "F2", true)]
         let worktree = WorktreeState(path = "D:/Work/tree", head = "F2",
             branch = "feature", review_base_ref = "origin/master")
         var model = GitTreeModel()
@@ -66,8 +67,16 @@ def test_git_graph_model(t : T?) {
         t |> success(!model.nodes[b].focused,
             "selected outgoing range stops at base ancestry")
         t |> success(model.nodes[p1].head && model.nodes[p1].pushed)
+        t |> equal(model.nodes[p1].primary_ref, "parallel",
+            "a local branch remains the primary badge even when its remote sorts first")
         t |> success(model.max_lane > 0,
             "parallel history occupies a separate semantic lane")
+
+        git_tree_build_model(repository, worktree,
+            GitTreeFilter.all, "feature", model)
+        let all_f2 = graph_node(model, "F2")
+        t |> success(all_f2 >= 0 && !model.nodes[all_f2].pushed,
+            "a commit on an unrelated remote is not pushed for the owning branch")
         delete model
         delete repository.history_commits
         delete repository.refs

@@ -289,6 +289,66 @@ def test_repository_relative_file_path_contract(t : T?) {
 }
 
 [test]
+def test_repository_async_lifecycle_contract(t : T?) {
+    t |> run("working-numstat launch failures remain refresh failures") <| @(t : T?) {
+        t |> equal(repository_phase_family(1), "refresh")
+        t |> equal(repository_phase_family(2), "refresh")
+        t |> equal(repository_phase_family(10), "refresh")
+        t |> equal(repository_phase_family(3), "review")
+        t |> equal(repository_phase_family(6), "review")
+        t |> equal(repository_phase_family(7), "history")
+        t |> equal(repository_phase_family(9), "history")
+    }
+    t |> run("inventory replacement releases removed-worktree payloads") <| @(t : T?) {
+        let kept = "D:/Work/main"
+        let removed = "D:/Work/removed"
+        var snapshot = RepositorySnapshot()
+        snapshot.files <- [
+            GitFileState(worktree_path = kept, path = "keep.txt"),
+            GitFileState(worktree_path = removed, path = "drop.txt")]
+        snapshot.review_commits <- [
+            GitCommitState(worktree_path = kept, hash = "keep"),
+            GitCommitState(worktree_path = removed, hash = "drop")]
+        snapshot.review_files <- [
+            GitReviewFileState(worktree_path = kept, path = "keep.txt"),
+            GitReviewFileState(worktree_path = removed, path = "drop.txt")]
+        snapshot.history_commits <- [
+            GitCommitState(worktree_path = kept, hash = "keep"),
+            GitCommitState(worktree_path = removed, hash = "drop")]
+        snapshot.graph_rows <- [
+            GitGraphRowState(worktree_path = kept, commit_hash = "keep"),
+            GitGraphRowState(worktree_path = removed, commit_hash = "drop")]
+        snapshot.commit_files <- [
+            GitCommitFileState(worktree_path = kept, path = "keep.txt"),
+            GitCommitFileState(worktree_path = removed, path = "drop.txt")]
+        snapshot.refs <- [
+            GitRefState(worktree_path = kept, name = "main"),
+            GitRefState(worktree_path = removed, name = "old")]
+        let observed : array<WorktreeState> <- [WorktreeState(path = kept)]
+
+        repository_prune_removed_worktree_data(snapshot, observed)
+
+        t |> equal(length(snapshot.files), 1)
+        t |> equal(length(snapshot.review_commits), 1)
+        t |> equal(length(snapshot.review_files), 1)
+        t |> equal(length(snapshot.history_commits), 1)
+        t |> equal(length(snapshot.graph_rows), 1)
+        t |> equal(length(snapshot.commit_files), 1)
+        t |> equal(length(snapshot.refs), 1)
+        t |> equal(snapshot.files[0].worktree_path, kept)
+        t |> equal(snapshot.refs[0].worktree_path, kept)
+
+        delete snapshot.files
+        delete snapshot.review_commits
+        delete snapshot.review_files
+        delete snapshot.history_commits
+        delete snapshot.graph_rows
+        delete snapshot.commit_files
+        delete snapshot.refs
+    }
+}
+
+[test]
 def test_repository_text_read_contract(t : T?) {
     t |> run("empty files remain distinct from read failures") <| @(t : T?) {
         let temp = create_temp_directory_result("dasherd_repository_text_")

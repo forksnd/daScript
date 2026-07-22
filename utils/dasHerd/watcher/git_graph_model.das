@@ -118,6 +118,51 @@ def private graph_mark_ancestors(head : string;
     }
 }
 
+def private graph_owned_commit_key(owner, hash : string) : string {
+    return "{owner}\n{hash}"
+}
+
+def private graph_mark_owned_ancestors(owner, head : string;
+                                       commits : array<GitCommitState> const;
+                                       commit_by_hash : table<string; int> const;
+                                       var marked : table<string; bool>) {
+    if (empty(owner) || empty(head) || !key_exists(commit_by_hash, head)) return
+    var inscope pending : array<string>
+    pending |> push(head)
+    while (!empty(pending)) {
+        let hash = pending[length(pending) - 1]
+        pending |> pop()
+        let key = graph_owned_commit_key(owner, hash)
+        if (key_exists(marked, key) || !key_exists(commit_by_hash, hash)) continue
+        marked[key] = true
+        let commit = commits[commit_by_hash?[hash] ?? -1]
+        for (parent in split(commit.parents, " ")) {
+            if (!empty(parent) && key_exists(commit_by_hash, parent)) {
+                pending |> push(parent)
+            }
+        }
+    }
+}
+
+def private graph_mark_ref_pushed(identity : string; ref_index : int;
+                                  repository : RepositorySnapshot const;
+                                  worktree_path : string;
+                                  commit_by_hash : table<string; int> const;
+                                  var marked : table<string; bool>) {
+    if (ref_index < 0 || ref_index >= length(repository.refs)) return
+    let ref = repository.refs[ref_index]
+    var remote_head = ref.remote ? ref.hash : ""
+    if (!ref.remote && !empty(ref.upstream)) {
+        let upstream_index = graph_ref_index(
+            repository, worktree_path, ref.upstream)
+        if (upstream_index >= 0 && repository.refs[upstream_index].remote) {
+            remote_head = repository.refs[upstream_index].hash
+        }
+    }
+    graph_mark_owned_ancestors(identity, remote_head,
+        repository.history_commits, commit_by_hash, marked)
+}
+
 def private graph_assign_first_parent(head, identity : string;
                                       commits : array<GitCommitState> const;
                                       commit_by_hash : table<string; int> const;
@@ -205,22 +250,14 @@ def public git_tree_build_model(repository : RepositorySnapshot const;
     model.included_ref_count = length(included_refs)
 
     var inscope visible : table<string; bool>
-    for (index in keys(included_refs)) {
+    for (index in range(length(repository.refs))) {
+        if (!key_exists(included_refs, index)) continue
         graph_mark_ancestors(repository.refs[index].hash,
             repository.history_commits, commit_by_hash, visible)
     }
     if (empty(visible) && key_exists(commit_by_hash, worktree.head)) {
         graph_mark_ancestors(worktree.head, repository.history_commits,
             commit_by_hash, visible)
-    }
-
-    var inscope pushed : table<string; bool>
-    for (index in keys(included_refs)) {
-        let ref = repository.refs[index]
-        if (ref.remote) {
-            graph_mark_ancestors(ref.hash, repository.history_commits,
-                commit_by_hash, pushed)
-        }
     }
 
     model.focus_ref = (empty(requested_focus_ref)
@@ -261,11 +298,23 @@ def public git_tree_build_model(repository : RepositorySnapshot const;
             repository.history_commits, commit_by_hash, visible,
             owner_slot, owner_name)
     }
-    for (index in keys(included_refs)) {
+    for (index in range(length(repository.refs))) {
+        if (!key_exists(included_refs, index)) continue
         let ref = repository.refs[index]
         graph_assign_first_parent(ref.hash, ref.name,
             repository.history_commits, commit_by_hash, visible,
             owner_slot, owner_name)
+    }
+
+    var inscope pushed_by_owner : table<string; bool>
+    graph_mark_ref_pushed(model.base_ref, base_ref_index,
+        repository, worktree.path, commit_by_hash, pushed_by_owner)
+    graph_mark_ref_pushed(model.focus_ref, focus_ref_index,
+        repository, worktree.path, commit_by_hash, pushed_by_owner)
+    for (index in range(length(repository.refs))) {
+        if (!key_exists(included_refs, index)) continue
+        graph_mark_ref_pushed(repository.refs[index].name, index,
+            repository, worktree.path, commit_by_hash, pushed_by_owner)
     }
 
     var inscope node_by_hash : table<string; int>
@@ -276,15 +325,18 @@ def public git_tree_build_model(repository : RepositorySnapshot const;
         var refs_text : string
         var refs_count = 0
         var primary_ref : string
+        var primary_remote = true
         var head = false
-        for (ref_index in keys(included_refs)) {
+        for (ref_index in range(length(repository.refs))) {
+            if (!key_exists(included_refs, ref_index)) continue
             let ref = repository.refs[ref_index]
             if (ref.hash != commit.hash) continue
             head = true
             graph_append_ref_label(refs_text, ref.name, refs_count)
             if (empty(primary_ref) || ref.current
-                    || (!ref.remote && starts_with(primary_ref, "origin/"))) {
+                    || (!ref.remote && primary_remote)) {
                 primary_ref = ref.name
+                primary_remote = ref.remote
             }
         }
         let color_slot = (key_exists(owner_slot, commit.hash)
@@ -292,10 +344,12 @@ def public git_tree_build_model(repository : RepositorySnapshot const;
             : git_tree_color_slot(commit.hash))
         let node_index = length(model.nodes)
         node_by_hash[commit.hash] = node_index
+        let owner = key_exists(owner_name, commit.hash) ? (owner_name?[commit.hash] ?? "") : ""
         model.nodes |> push(GitTreeNode(
             commit_index = commit_index, hash = commit.hash,
             row = node_index, color_slot = color_slot,
-            head = head, pushed = key_exists(pushed, commit.hash),
+            head = head, pushed = key_exists(pushed_by_owner,
+                graph_owned_commit_key(owner, commit.hash)),
             focused = key_exists(focus_range, commit.hash),
             focus_head = commit.hash == focus_hash,
             refs_text = refs_text, primary_ref = primary_ref))

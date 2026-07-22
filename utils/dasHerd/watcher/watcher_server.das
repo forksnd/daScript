@@ -97,6 +97,14 @@ struct public RepositoryGitFileActionMessage {
     error : string
 }
 
+struct private OrphanedGitFileAction {
+    session_id : string
+    repository_id : string
+    worktree_path : string
+    file_path : string
+    action : string
+}
+
 class private WatcherClient {
     @safe_when_uninitialized
     channel : WebSocketChannel = default<WebSocketChannel>
@@ -201,6 +209,7 @@ class DasHerdWatcherServer : HvWebServer {
     xterm_web_links_js : string
     clients : array<WatcherClient?>
     pending_inspection_artifacts : array<string>
+    orphaned_git_actions : array<OrphanedGitFileAction>
     next_client_id : int
 
     def authorized(url : string) : bool {
@@ -485,17 +494,80 @@ class DasHerdWatcherServer : HvWebServer {
         let truncated = false
         let output = watcher_machine_output_text(client.action_session_id, truncated)
         let _compacted = watcher_compact_session(client.action_session_id, 160, 50)
+        var failure = ""
         if (truncated) {
-            self.send_git_file_action(client, false, "failed",
-                "Git action output exceeded the retained machine-output limit")
+            failure = "Git action output exceeded the retained machine-output limit"
         } elif (info.exit_code != 0l) {
-            self.send_git_file_action(client, false, "failed",
-                "git exited with {info.exit_code}: {output}")
+            failure = "git exited with {info.exit_code}: {output}"
+        }
+        if (!empty(failure)) {
+            let _failure_error = repository_record_task_failure(
+                client.action_repository_id, client.action_session_id, failure)
+            self.send_git_file_action(client, false, "failed", failure)
         } else {
             self.send_git_file_action(client, false, "completed")
-            let _refresh_error = repository_refresh(client.action_repository_id)
+        }
+        let _refresh_error = repository_refresh(client.action_repository_id)
+        let _review_error = repository_review(
+            client.action_repository_id, client.action_worktree_path)
+    }
+
+    def remember_orphaned_git_action(var client : WatcherClient?) {
+        if (client == null || client.action_delivered
+                || empty(client.action_session_id)) return
+        orphaned_git_actions |> push(OrphanedGitFileAction(
+            session_id = client.action_session_id,
+            repository_id = client.action_repository_id,
+            worktree_path = client.action_worktree_path,
+            file_path = client.action_file_path,
+            action = client.action))
+        print("dasHerd watcher: retaining Git {client.action} task " +
+            "{client.action_session_id} for {client.action_file_path} " +
+            "after client disconnect\n")
+    }
+
+    def poll_orphaned_git_actions() {
+        var index = length(orphaned_git_actions)
+        while (index > 0) {
+            index--
+            let action = orphaned_git_actions[index]
+            var info = WatcherSessionInfo()
+            if (!watcher_get_session_info(action.session_id, info)) {
+                let failure = "orphaned Git action session disappeared before observation"
+                let _failure_error = repository_record_task_failure(
+                    action.repository_id, action.session_id, failure)
+                let _refresh_error = repository_refresh(action.repository_id)
+                let _review_error = repository_review(
+                    action.repository_id, action.worktree_path)
+                print("dasHerd watcher: Git {action.action} task " +
+                    "{action.session_id} for {action.file_path} disappeared\n")
+                orphaned_git_actions |> erase(index)
+                continue
+            }
+            if (!info.drained) continue
+            let truncated = false
+            let output = watcher_machine_output_text(action.session_id, truncated)
+            let _compacted = watcher_compact_session(
+                action.session_id, 160, 50)
+            var failure = ""
+            if (truncated) {
+                failure = "Git action output exceeded the retained machine-output limit"
+            } elif (info.exit_code != 0l) {
+                failure = "git exited with {info.exit_code}: {output}"
+            }
+            if (!empty(failure)) {
+                let _failure_error = repository_record_task_failure(
+                    action.repository_id, action.session_id, failure)
+                print("dasHerd watcher: orphaned Git {action.action} task " +
+                    "{action.session_id} for {action.file_path} failed: {failure}\n")
+            } else {
+                print("dasHerd watcher: orphaned Git {action.action} task " +
+                    "{action.session_id} for {action.file_path} completed\n")
+            }
+            let _refresh_error = repository_refresh(action.repository_id)
             let _review_error = repository_review(
-                client.action_repository_id, client.action_worktree_path)
+                action.repository_id, action.worktree_path)
+            orphaned_git_actions |> erase(index)
         }
     }
 
@@ -780,6 +852,7 @@ class DasHerdWatcherServer : HvWebServer {
         let client_id = client.id
         detach(client, "client_closed")
         self.cleanup_inspection_artifact(client)
+        self.remember_orphaned_git_action(client)
         clients |> erase(index)
         unsafe { delete client }
         print("dasHerd watcher: client {client_id} disconnected\n")
@@ -902,6 +975,7 @@ class DasHerdWatcherServer : HvWebServer {
         watcher_tick()
         repository_tick()
         self.retry_inspection_artifact_cleanup()
+        self.poll_orphaned_git_actions()
         for (index in range(length(clients))) {
             var client = clients[index]
             if (client == null) continue
@@ -934,5 +1008,6 @@ class DasHerdWatcherServer : HvWebServer {
     def cleanup_inspection_artifacts {
         self.retry_inspection_artifact_cleanup()
         delete pending_inspection_artifacts
+        delete orphaned_git_actions
     }
 }
