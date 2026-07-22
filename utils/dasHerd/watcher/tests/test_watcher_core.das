@@ -283,8 +283,10 @@ def test_watcher_process_lifecycle(t : T?) {
         t |> equal(watcher_input(controlled.session_id, "\r", 12), "")
         let controlled_events = fread(path_join(path_join(path_join(root, "sessions"),
             controlled.session_id), "events.jsonl"))
-        t |> success(find(controlled_events, "\"detail\":\"id=; queued=true\"") < 0,
-            "a queued non-mailbox nudge does not emit an empty mailbox event")
+        t |> success(find(controlled_events, "delivery=deferred") >= 0,
+            "a deferred mailbox nudge records its eventual delivery")
+        t |> success(find(controlled_events, "\"detail\":\"id=; delivery=deferred\"") < 0,
+            "a deferred non-mailbox nudge does not emit an empty mailbox event")
         t |> equal(watcher_terminate(controlled.session_id, "test_complete"), "")
         t |> success(wait_for(controlled.session_id, "exited", 4000l), "terminated command exits and drains")
         watcher_shutdown(true)

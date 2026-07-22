@@ -779,7 +779,7 @@ def private flush_pending_notifications(var session : WatcherSession?) {
         if (!empty(pending.message_id)) {
             let _ = watcher_mailbox_set_notification(session.id, pending.message_id)
             append_event(session, "mailbox_notified",
-                "id={pending.message_id}; queued=true")
+                "id={pending.message_id}; delivery=deferred")
         }
         delivered++
     }
