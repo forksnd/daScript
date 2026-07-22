@@ -99,9 +99,195 @@ def test_repository_untracked_diff_contract(t : T?) {
         let staged_view_error = repository_staged_file_view_argv(
             "D:/Work/tree", "staged.das", "D:/Temp/staged-view.raw", argv)
         t |> equal(staged_view_error, "")
-        t |> equal(argv[length(argv) - 2],
+        t |> success(ends_with(to_lower(argv[0]),
+            get_platform_name() == "windows" ? "daslang.exe" : "daslang"))
+        t |> success(ends_with(replace(argv[1], "\\", "/"),
+            "utils/dasHerd/watcher/git_blob_capture.das"))
+        t |> equal(argv[length(argv) - 3], "--revision=:0")
+        t |> equal(argv[length(argv) - 2], "--file=staged.das")
+        t |> equal(argv[length(argv) - 1],
             "--output=D:/Temp/staged-view.raw")
-        t |> equal(argv[length(argv) - 1], ":0:staged.das")
+    }
+}
+
+[test]
+def test_repository_review_parsing(t : T?) {
+    t |> run("worktree PR commits retain descriptions and identity") <| @(t : T?) {
+        var commits : array<GitCommitState>
+        repository_parse_review_commits(
+            "0123456789abcdef\t01234567\t1721577600\tAgent One\tFirst change\r\n" +
+            "abcdef0123456789\tabcdef01\t1721577700\tAgent Two\tSubject\twith tab\n",
+            "D:/Work/tree", commits)
+        t |> equal(length(commits), 2)
+        t |> equal(commits[0].worktree_path, "D:/Work/tree")
+        t |> equal(commits[0].short_hash, "01234567")
+        t |> equal(commits[0].authored_at, 1721577600l)
+        t |> equal(commits[1].subject, "Subject\twith tab")
+        var graph_commits : array<GitCommitState>
+        repository_parse_review_commits(
+            "feedface<|dasHerd-field|>feedface<|dasHerd-field|>1721577800<|dasHerd-field|>Agent<|dasHerd-field|>Merge work<|dasHerd-field|>parent-one parent-two\n",
+            "D:/Work/tree", graph_commits)
+        t |> equal(length(graph_commits), 1)
+        t |> equal(graph_commits[0].subject, "Merge work")
+        t |> equal(graph_commits[0].parents, "parent-one parent-two")
+        var collision_commits : array<GitCommitState>
+        repository_parse_review_commits(
+            "deadbeef<|dasHerd-field|>deadbeef<|dasHerd-field|>1721577900<|dasHerd-field|>Agent<|dasHerd-field|>Mention <|dasHerd-field|> literally<|dasHerd-field|>parent-one\n",
+            "D:/Work/tree", collision_commits)
+        t |> equal(length(collision_commits), 1)
+        t |> equal(collision_commits[0].subject,
+            "Mention <|dasHerd-field|> literally")
+        t |> equal(collision_commits[0].parents, "parent-one")
+    }
+    t |> run("Git graph history preserves commit and transition rows") <| @(t : T?) {
+        var commits : array<GitCommitState>
+        var rows : array<GitGraphRowState>
+        repository_parse_graph_history(
+            "* <|dasHerd-commit|>mergehash<|dasHerd-field|>merge<|dasHerd-field|>1721578000<|dasHerd-field|>Agent One<|dasHerd-field|>Merge topic<|dasHerd-field|>mainhash sidehash\r\n" +
+            "|\\  \r\n" +
+            "| * <|dasHerd-commit|>sidehash<|dasHerd-field|>side<|dasHerd-field|>1721577900<|dasHerd-field|>Agent Two<|dasHerd-field|>Mention <|dasHerd-field|> literally<|dasHerd-field|>mainhash\n" +
+            "|/  \n" +
+            "* <|dasHerd-commit|>mainhash<|dasHerd-field|>main<|dasHerd-field|>1721577800<|dasHerd-field|>Agent One<|dasHerd-field|>Main line<|dasHerd-field|>\n",
+            "D:/Work/tree", commits, rows)
+        t |> equal(length(commits), 3)
+        t |> equal(length(rows), 5)
+        t |> equal(rows[0].topology, "* ")
+        t |> equal(rows[0].commit_hash, "mergehash")
+        t |> equal(rows[1].topology, "|\\  ")
+        t |> equal(rows[1].commit_hash, "")
+        t |> equal(rows[2].topology, "| * ")
+        t |> equal(rows[3].topology, "|/  ")
+        t |> equal(rows[4].commit_hash, "mainhash")
+        t |> equal(commits[1].subject,
+            "Mention <|dasHerd-field|> literally")
+        t |> equal(commits[0].parents, "mainhash sidehash")
+    }
+    t |> run("aggregate PR files retain rename provenance") <| @(t : T?) {
+        var files : array<GitReviewFileState>
+        repository_parse_review_files(
+            "M\tsrc/main.das\r\nA\tdocs/new.md\nR095\told name.cpp\tnew name.cpp\n",
+            "D:/Work/tree", files)
+        t |> equal(length(files), 3)
+        t |> equal(files[0].code, "M")
+        t |> equal(files[1].path, "docs/new.md")
+        t |> equal(files[2].old_path, "old name.cpp")
+        t |> equal(files[2].path, "new name.cpp")
+        var stats : array<GitReviewFileState>
+        repository_parse_review_files(
+            "12  3  src/main.das\n0  0  old.cpp => src/new.cpp\n-  -  assets/image.png\n",
+            "D:/Work/tree", stats)
+        t |> equal(length(stats), 3)
+        t |> equal(stats[0].added_lines, 12)
+        t |> equal(stats[0].deleted_lines, 3)
+        t |> success(stats[0].stats_known)
+        t |> equal(stats[1].old_path, "old.cpp")
+        t |> equal(stats[1].path, "src/new.cpp")
+        t |> success(stats[2].binary)
+        t |> success(!stats[2].stats_known)
+        stats |> clear()
+        repository_parse_review_files(
+            "0  0  src/\{old => new\}.cpp\n",
+            "D:/Work/tree", stats)
+        t |> equal(stats[0].old_path, "src/old.cpp")
+        t |> equal(stats[0].path, "src/new.cpp")
+    }
+    t |> run("aggregate PR diffs compare the merge base with the index") <| @(t : T?) {
+        var argv : array<string>
+        let error = repository_build_review_file_diff_argv(
+            "D:/Work/tree", "0123456789abcdef", "src/main.das", argv, "expanded")
+        t |> equal(error, "")
+        t |> equal(argv[1], "--literal-pathspecs")
+        t |> equal(argv[8], "--cached")
+        t |> equal(argv[10], "--unified=20")
+        t |> equal(argv[11], "0123456789abcdef")
+        t |> equal(argv[length(argv) - 1], "src/main.das")
+    }
+    t |> run("commit files and refs retain review identity") <| @(t : T?) {
+        var files : array<GitCommitFileState>
+        repository_parse_commit_files(
+            "M\tsrc/main.das\r\nR090\told.md\tnew.md\n",
+            "D:/Work/tree", "abcdef0123456789", files)
+        t |> equal(length(files), 2)
+        t |> equal(files[0].commit_hash, "abcdef0123456789")
+        t |> equal(files[1].old_path, "old.md")
+        t |> equal(files[1].path, "new.md")
+        files |> clear()
+        let esc = to_char(27)
+        repository_parse_commit_files(watcher_strip_terminal_controls(
+            "1{esc}[7C2{esc}[6Csrc/main.das\r\n"),
+            "D:/Work/tree", "abcdef0123456789", files)
+        t |> equal(length(files), 1)
+        t |> equal(files[0].added_lines, 1)
+        t |> equal(files[0].deleted_lines, 2)
+        t |> equal(files[0].path, "src/main.das")
+        files |> clear()
+        repository_parse_commit_files(
+            "0  0  docs/\{before => after\}.md\n",
+            "D:/Work/tree", "abcdef0123456789", files)
+        t |> equal(files[0].old_path, "docs/before.md")
+        t |> equal(files[0].path, "docs/after.md")
+        var refs : array<GitRefState>
+        repository_parse_refs(
+            "refs/heads/main\tmain\tabcdef\t*\t\torigin/main\n" +
+            "refs/remotes/origin/main\torigin/main\tabcdef\t \t\t\n" +
+            "refs/remotes/origin/HEAD\torigin/HEAD\tabcdef\t \trefs/remotes/origin/main\n",
+            "D:/Work/tree", refs)
+        t |> equal(length(refs), 2)
+        t |> success(refs[0].current)
+        t |> success(!refs[0].remote)
+        t |> equal(refs[0].upstream, "origin/main")
+        t |> success(refs[1].remote)
+    }
+    t |> run("working numstat updates only matching worktree files") <| @(t : T?) {
+        var files : array<GitFileState> <- [
+            GitFileState(worktree_path = "D:/Work/tree", code = " M",
+                path = "src/main.das"),
+            GitFileState(worktree_path = "D:/Work/other", code = " M",
+                path = "src/main.das")]
+        repository_apply_working_numstat(
+            "9  4  src/main.das\n", "D:/Work/tree", files)
+        t |> equal(files[0].added_lines, 9)
+        t |> equal(files[0].deleted_lines, 4)
+        t |> success(files[0].stats_known)
+        t |> success(!files[1].stats_known)
+    }
+    t |> run("commit inspection uses one observed revision") <| @(t : T?) {
+        var argv : array<string>
+        var expected_exit_code = 0l
+        t |> equal(repository_file_diff_argv(
+            "missing", "D:/Work/tree", "src/main.das", "commit",
+            argv, expected_exit_code, "compact", ""),
+            "commit revision is required")
+        t |> equal(repository_build_commit_file_diff_argv(
+            "D:/Work/tree", "abcdef0123456789", "src/main.das",
+            argv, "expanded"), "")
+        t |> equal(argv[1], "--literal-pathspecs")
+        t |> equal(argv[7], "show")
+        t |> equal(argv[12], "--unified=20")
+        t |> equal(argv[13], "abcdef0123456789")
+        t |> equal(argv[length(argv) - 1], "src/main.das")
+        t |> equal(repository_commit_file_view_argv(
+            "D:/Work/tree", "abcdef0123456789", "src/main.das",
+            "D:/Temp/view.raw", argv), "")
+        t |> equal(argv[length(argv) - 3],
+            "--revision=abcdef0123456789")
+        t |> equal(argv[length(argv) - 2], "--file=src/main.das")
+        t |> equal(argv[length(argv) - 1], "--output=D:/Temp/view.raw")
+    }
+    t |> run("file staging actions use literal Git paths") <| @(t : T?) {
+        var argv : array<string>
+        t |> equal(repository_build_file_action_argv(
+            "D:/Work/tree", ":(glob)**.das", "stage", argv), "")
+        t |> equal(argv[1], "--literal-pathspecs")
+        t |> equal(argv[4], "add")
+        t |> equal(argv[length(argv) - 1], ":(glob)**.das")
+        t |> equal(repository_build_file_action_argv(
+            "D:/Work/tree", "src/main.das", "unstage", argv), "")
+        t |> equal(argv[4], "reset")
+        t |> equal(argv[5], "--quiet")
+        t |> equal(argv[6], "HEAD")
+        t |> success(!empty(repository_build_file_action_argv(
+            "D:/Work/tree", "../outside.txt", "stage", argv)))
     }
 }
 
@@ -117,6 +303,66 @@ def test_repository_relative_file_path_contract(t : T?) {
             t |> success(!repository_valid_relative_file_path("C:\\Windows\\win.ini"))
             t |> success(!repository_valid_relative_file_path("C:drive-relative.txt"))
         }
+    }
+}
+
+[test]
+def test_repository_async_lifecycle_contract(t : T?) {
+    t |> run("working-numstat launch failures remain refresh failures") <| @(t : T?) {
+        t |> equal(repository_phase_family(1), "refresh")
+        t |> equal(repository_phase_family(2), "refresh")
+        t |> equal(repository_phase_family(10), "refresh")
+        t |> equal(repository_phase_family(3), "review")
+        t |> equal(repository_phase_family(6), "review")
+        t |> equal(repository_phase_family(7), "history")
+        t |> equal(repository_phase_family(9), "history")
+    }
+    t |> run("inventory replacement releases removed-worktree payloads") <| @(t : T?) {
+        let kept = "D:/Work/main"
+        let removed = "D:/Work/removed"
+        var snapshot = RepositorySnapshot()
+        snapshot.files <- [
+            GitFileState(worktree_path = kept, path = "keep.txt"),
+            GitFileState(worktree_path = removed, path = "drop.txt")]
+        snapshot.review_commits <- [
+            GitCommitState(worktree_path = kept, hash = "keep"),
+            GitCommitState(worktree_path = removed, hash = "drop")]
+        snapshot.review_files <- [
+            GitReviewFileState(worktree_path = kept, path = "keep.txt"),
+            GitReviewFileState(worktree_path = removed, path = "drop.txt")]
+        snapshot.history_commits <- [
+            GitCommitState(worktree_path = kept, hash = "keep"),
+            GitCommitState(worktree_path = removed, hash = "drop")]
+        snapshot.graph_rows <- [
+            GitGraphRowState(worktree_path = kept, commit_hash = "keep"),
+            GitGraphRowState(worktree_path = removed, commit_hash = "drop")]
+        snapshot.commit_files <- [
+            GitCommitFileState(worktree_path = kept, path = "keep.txt"),
+            GitCommitFileState(worktree_path = removed, path = "drop.txt")]
+        snapshot.refs <- [
+            GitRefState(worktree_path = kept, name = "main"),
+            GitRefState(worktree_path = removed, name = "old")]
+        let observed : array<WorktreeState> <- [WorktreeState(path = kept)]
+
+        repository_prune_removed_worktree_data(snapshot, observed)
+
+        t |> equal(length(snapshot.files), 1)
+        t |> equal(length(snapshot.review_commits), 1)
+        t |> equal(length(snapshot.review_files), 1)
+        t |> equal(length(snapshot.history_commits), 1)
+        t |> equal(length(snapshot.graph_rows), 1)
+        t |> equal(length(snapshot.commit_files), 1)
+        t |> equal(length(snapshot.refs), 1)
+        t |> equal(snapshot.files[0].worktree_path, kept)
+        t |> equal(snapshot.refs[0].worktree_path, kept)
+
+        delete snapshot.files
+        delete snapshot.review_commits
+        delete snapshot.review_files
+        delete snapshot.history_commits
+        delete snapshot.graph_rows
+        delete snapshot.commit_files
+        delete snapshot.refs
     }
 }
 

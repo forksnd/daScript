@@ -12,14 +12,47 @@ def test_watcher_machine_output(t : T?) {
         t |> equal(watcher_target_id_or_local(""), "local")
         t |> equal(watcher_target_id_or_local("ssh-build"), "ssh-build")
     }
+    t |> run("watcher GC reacts to allocation pressure as well as fragmentation") <| @(t : T?) {
+        t |> equal(watcher_gc_reason(64ul * 1024ul * 1024ul,
+            65ul * 1024ul * 1024ul, 1ul, 1ul), "string_pressure")
+        t |> equal(watcher_gc_reason(1ul, 1ul,
+            128ul * 1024ul * 1024ul, 129ul * 1024ul * 1024ul), "heap_pressure")
+        t |> equal(watcher_gc_reason(10ul, 100ul, 10ul, 10ul),
+            "string_fragmentation")
+        t |> equal(watcher_gc_reason(10ul, 10ul, 10ul, 100ul),
+            "heap_fragmentation")
+        t |> equal(watcher_gc_reason(10ul, 10ul, 10ul, 10ul), "")
+    }
     t |> run("ConPTY wrapper controls are removed without changing task text") <| @(t : T?) {
         let esc = to_char(27)
         let bel = to_char(7)
         let wrapped = "{esc}[?9001h{esc}[2J{esc}[Hfirst\r\nsecond\tvalue{esc}]0;git.exe{bel}{esc}[?25h"
         t |> equal(watcher_strip_terminal_controls(wrapped), "first\r\nsecond\tvalue")
+        let expanded_tabs = "1{esc}[7C2{esc}[6Cutils/dasHerd/watcher_core.das"
+        t |> equal(watcher_strip_terminal_controls(expanded_tabs),
+            "1       2      utils/dasHerd/watcher_core.das")
+        t |> equal(watcher_strip_terminal_controls("abc\n{esc}[5Gx"),
+            "abc\n    x", "normalized lone LF resets the synthesized text column")
+        let worktrees = "worktree D:/main\r\nHEAD A\r\nbranch refs/heads/main{esc}[5;1Hworktree D:/linked\r\nHEAD B\r\nbranch refs/heads/topic"
+        t |> equal(watcher_strip_terminal_controls(worktrees),
+            "worktree D:/main\r\nHEAD A\r\nbranch refs/heads/main\n\nworktree D:/linked\r\nHEAD B\r\nbranch refs/heads/topic")
         let unicode_wrapped = "{esc}[31mΚαλημέρα, мир, こんにちは, 🐑{esc}[0m"
         t |> equal(watcher_strip_terminal_controls(unicode_wrapped),
             "Καλημέρα, мир, こんにちは, 🐑")
+        let e_acute : string = to_char(int(0xc3)) + to_char(int(0xa9))
+        t |> equal(watcher_strip_terminal_controls(e_acute + esc + "[5Gx"),
+            e_acute + "   x", "UTF-8 continuation bytes do not consume terminal columns")
+        let wide_cjk : string = to_char(int(0xe7)) + to_char(int(0x95)) + to_char(int(0x8c))
+        t |> equal(watcher_strip_terminal_controls(wide_cjk + esc + "[5Gx"),
+            wide_cjk + "  x", "wide Unicode codepoints consume two terminal columns")
+        let combining_acute : string = to_char(int(0xcc)) + to_char(int(0x81))
+        t |> equal(watcher_strip_terminal_controls("e" + combining_acute + esc + "[5Gx"),
+            "e" + combining_acute + "   x", "combining codepoints do not consume a terminal column")
+    }
+    t |> run("machine output reports truncation through its out parameter") <| @(t : T?) {
+        var truncated = true
+        t |> equal(watcher_machine_output_text("missing-session", truncated), "")
+        t |> success(!truncated)
     }
 }
 
@@ -80,7 +113,7 @@ def test_watcher_process_lifecycle(t : T?) {
         let failed_metadata = fread(path_join(path_join(path_join(root, "sessions"),
             failed.session_id), "session.json"))
         t |> success(find(failed_metadata, "\"columns\":20") >= 0
-                && find(failed_metadata, "\"rows\":200") >= 0,
+                && find(failed_metadata, "\"rows\":512") >= 0,
             "session metadata retains the clamped launch dimensions")
         watcher_tick()
         t |> success(find(watcher_snapshot_json(failed.session_id), "\"state\":\"failed\"") >= 0,

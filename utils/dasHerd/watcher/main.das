@@ -27,7 +27,8 @@ var private g_log_root : string
 var private g_config_path : string
 var private g_last_memory_log_at = 0l
 var private g_last_gc_at = 0l
-let GC_MIN_INTERVAL_SECONDS = 60l
+let GC_PRESSURE_MIN_INTERVAL_SECONDS = 10l
+let GC_COMPACT_MIN_INTERVAL_SECONDS = 60l
 
 def private option_value(prefix : string; fallback : string = "") : string {
     for (argument in get_command_line_arguments()) {
@@ -76,7 +77,6 @@ def private maybe_collect_gc() {
     let forced = watcher_take_gc_request()
     return if (is_live_mode() && !forced)
     let now = int64(get_clock())
-    if (!forced && g_last_gc_at != 0l && now - g_last_gc_at < GC_MIN_INTERVAL_SECONDS) return
     if (forced) {
         g_last_gc_at = now
         let gc_started = ref_time_ticks()
@@ -90,35 +90,26 @@ def private maybe_collect_gc() {
             "string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
         return
     }
-    let string_used = string_heap_bytes_allocated()
-    let string_total = string_heap_total_allocated()
-    if (string_total > 0ul && string_used * 3ul < string_total * 2ul) {
-        g_last_gc_at = now
-        let gc_started = ref_time_ticks()
-        print("dasHerd watcher: GC begin reason=string_fragmentation validate=true " +
-            "das_heap={heap_bytes_allocated()}/{heap_total_allocated()} " +
-            "string_heap={string_used}/{string_total}\n")
-        unsafe(heap_collect(true, true))
-        print("dasHerd watcher: GC end reason=string_fragmentation " +
-            "elapsed_ms={int64(get_time_usec(gc_started)) / 1000l} " +
-            "das_heap={heap_bytes_allocated()}/{heap_total_allocated()} " +
-            "string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
-        return
-    }
     let heap_used = heap_bytes_allocated()
     let heap_total = heap_total_allocated()
-    if (heap_total > 0ul && heap_used * 3ul < heap_total) {
-        g_last_gc_at = now
-        let gc_started = ref_time_ticks()
-        print("dasHerd watcher: GC begin reason=heap_fragmentation validate=true " +
-            "das_heap={heap_used}/{heap_total} " +
-            "string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
-        unsafe(heap_collect(true, true))
-        print("dasHerd watcher: GC end reason=heap_fragmentation " +
-            "elapsed_ms={int64(get_time_usec(gc_started)) / 1000l} " +
-            "das_heap={heap_bytes_allocated()}/{heap_total_allocated()} " +
-            "string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
-    }
+    let string_used = string_heap_bytes_allocated()
+    let string_total = string_heap_total_allocated()
+    let reason = watcher_gc_reason(string_used, string_total,
+        heap_used, heap_total)
+    if (empty(reason)) return
+    let minimum_interval = ((reason == "string_pressure" || reason == "heap_pressure")
+        ? GC_PRESSURE_MIN_INTERVAL_SECONDS : GC_COMPACT_MIN_INTERVAL_SECONDS)
+    if (g_last_gc_at != 0l && now - g_last_gc_at < minimum_interval) return
+    g_last_gc_at = now
+    let gc_started = ref_time_ticks()
+    print("dasHerd watcher: GC begin reason={reason} validate=true " +
+        "das_heap={heap_used}/{heap_total} " +
+        "string_heap={string_used}/{string_total}\n")
+    unsafe(heap_collect(true, true))
+    print("dasHerd watcher: GC end reason={reason} " +
+        "elapsed_ms={int64(get_time_usec(gc_started)) / 1000l} " +
+        "das_heap={heap_bytes_allocated()}/{heap_total_allocated()} " +
+        "string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
 }
 
 [export]

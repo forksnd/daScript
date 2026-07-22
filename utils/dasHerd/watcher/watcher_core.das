@@ -18,6 +18,21 @@ let private MAX_COMMAND_BYTES = 32 * 1024
 let private MAX_INPUT_BYTES = 1024 * 1024
 let private MAX_RAW_HISTORY_BYTES = 8 * 1024 * 1024
 let private RAW_HISTORY_TRIM_SLACK = 1024 * 1024
+let private WATCHER_GC_STRING_PRESSURE_BYTES = 64ul * 1024ul * 1024ul
+let private WATCHER_GC_HEAP_PRESSURE_BYTES = 128ul * 1024ul * 1024ul
+
+def public watcher_gc_reason(string_used, string_total,
+                             heap_used, heap_total : uint64) : string {
+    if (string_used >= WATCHER_GC_STRING_PRESSURE_BYTES) return "string_pressure"
+    if (heap_used >= WATCHER_GC_HEAP_PRESSURE_BYTES) return "heap_pressure"
+    if (string_total > 0ul && string_used * 3ul < string_total * 2ul) {
+        return "string_fragmentation"
+    }
+    if (heap_total > 0ul && heap_used * 3ul < heap_total) {
+        return "heap_fragmentation"
+    }
+    return ""
+}
 
 struct public WatcherLaunchRequest {
     command_line : string
@@ -275,7 +290,7 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
         return WatcherLaunchResult(error = "could not open session logs")
     }
     let columns = clamp(request.columns, 20, 400)
-    let rows = clamp(request.rows, 5, 200)
+    let rows = clamp(request.rows, 5, 512)
     var inscope persisted_request := request
     persisted_request.columns = columns
     persisted_request.rows = rows
@@ -425,11 +440,22 @@ def public watcher_output_text(session_id : string) : string {
 def public watcher_strip_terminal_controls(value : string) : string {
     // Task processes launched through ConPTY are wrapped in cursor, screen,
     // title, and mode sequences even when the child itself emits plain text.
-    // Machine consumers need the original printable byte stream, not a
-    // bounded reconstructed screen.
+    // Machine consumers need the printable byte stream, not a bounded screen;
+    // cursor moves are intentionally normalized into spaces/newlines so
+    // ConPTY-expanded field and record separators remain machine-parseable.
     var inscope output : array<uint8>
     output |> reserve(length(value))
     var state = 0 // 0=text, 1=ESC, 2=CSI, 3=OSC, 4=OSC ESC, 5=ST string, 6=ST ESC
+    var csi_first = 0
+    var csi_second = 0
+    var csi_field = 0
+    var csi_has_first = false
+    var csi_has_second = false
+    var cursor_row = 1
+    var cursor_column = 1
+    var utf8_codepoint = 0u
+    var utf8_minimum = 0u
+    var utf8_remaining = 0
     peek_data(value) $(bytes) {
         for (index in range(length(value))) {
             let byte = int(bytes[index])
@@ -439,10 +465,54 @@ def public watcher_strip_terminal_controls(value : string) : string {
                 }
                 elif (byte == '\t' || byte == '\r' || byte == '\n' || byte >= 0x20) {
                     output |> push(uint8(byte))
+                    if (byte == '\r') {
+                        cursor_column = 1
+                        utf8_remaining = 0
+                    } elif (byte == '\n') {
+                        cursor_row++
+                        cursor_column = 1
+                        utf8_remaining = 0
+                    } elif (byte < 0x80) {
+                        cursor_column++
+                        utf8_remaining = 0
+                    } elif (utf8_remaining > 0 && (byte & 0xc0) == 0x80) {
+                        utf8_codepoint = (utf8_codepoint << 6u) | uint(byte & 0x3f)
+                        utf8_remaining--
+                        if (utf8_remaining == 0) {
+                            let valid = (utf8_codepoint >= utf8_minimum &&
+                                utf8_codepoint <= 0x10ffffu &&
+                                !(utf8_codepoint >= 0xd800u && utf8_codepoint <= 0xdfffu))
+                            cursor_column += terminal_codepoint_width(
+                                valid ? utf8_codepoint : 0xfffdu)
+                        }
+                    } else {
+                        if (utf8_remaining > 0) cursor_column++
+                        if ((byte & 0xe0) == 0xc0) {
+                            utf8_codepoint = uint(byte & 0x1f)
+                            utf8_minimum = 0x80u
+                            utf8_remaining = 1
+                        } elif ((byte & 0xf0) == 0xe0) {
+                            utf8_codepoint = uint(byte & 0x0f)
+                            utf8_minimum = 0x800u
+                            utf8_remaining = 2
+                        } elif ((byte & 0xf8) == 0xf0) {
+                            utf8_codepoint = uint(byte & 0x07)
+                            utf8_minimum = 0x10000u
+                            utf8_remaining = 3
+                        } else {
+                            cursor_column++
+                            utf8_remaining = 0
+                        }
+                    }
                 }
             } elif (state == 1) {
                 if (byte == '[') {
                     state = 2
+                    csi_first = 0
+                    csi_second = 0
+                    csi_field = 0
+                    csi_has_first = false
+                    csi_has_second = false
                 } elif (byte == ']') {
                     state = 3
                 } elif (byte == 'P' || byte == '^' || byte == '_' || byte == 'X') {
@@ -451,7 +521,45 @@ def public watcher_strip_terminal_controls(value : string) : string {
                     state = 0
                 }
             } elif (state == 2) {
-                if (byte >= 0x40 && byte <= 0x7e) {
+                if (is_number(byte)) {
+                    if (csi_field == 0) {
+                        csi_first = min(4096, csi_first * 10 + byte - '0')
+                        csi_has_first = true
+                    } else {
+                        csi_second = min(4096, csi_second * 10 + byte - '0')
+                        csi_has_second = true
+                    }
+                } elif (byte == ';') {
+                    csi_field = 1
+                } elif (byte >= 0x40 && byte <= 0x7e) {
+                    // ConPTY expands horizontal tabs emitted by console
+                    // applications into CSI cursor commands. Preserve their
+                    // field and record-separating effect for machine consumers.
+                    if (byte == 'C') {
+                        let spaces = csi_has_first ? max(1, csi_first) : 1
+                        for (_ in range(spaces)) {
+                            output |> push(uint8(' '))
+                        }
+                        cursor_column += spaces
+                    } elif (byte == 'G') {
+                        let target_column = csi_has_first ? max(1, csi_first) : 1
+                        while (cursor_column < target_column) {
+                            output |> push(uint8(' '))
+                            cursor_column++
+                        }
+                    } elif (byte == 'H' || byte == 'f') {
+                        let target_row = csi_has_first ? max(1, csi_first) : 1
+                        let target_column = csi_has_second ? max(1, csi_second) : 1
+                        while (cursor_row < target_row) {
+                            output |> push(uint8('\n'))
+                            cursor_row++
+                            cursor_column = 1
+                        }
+                        while (cursor_column < target_column) {
+                            output |> push(uint8(' '))
+                            cursor_column++
+                        }
+                    }
                     state = 0
                 }
             } elif (state == 3) {
@@ -475,7 +583,7 @@ def public watcher_strip_terminal_controls(value : string) : string {
 }
 
 def public watcher_machine_output_text(session_id : string;
-                                       var truncated : bool) : string {
+                                       var truncated : bool&) : string {
     truncated = false
     let index = watcher_find_session(session_id)
     if (index < 0 || g_sessions[index] == null) return ""
@@ -503,7 +611,7 @@ def public watcher_compact_session(session_id : string;
     var session = g_sessions[index]
     if (!session.drained || session.state == "running" || session.state == "terminating") return false
     let compact_columns = clamp(columns, 20, 400)
-    let compact_rows = clamp(rows, 5, 200)
+    let compact_rows = clamp(rows, 5, 512)
     if (session.terminal.transport == null && session.terminal.columns == compact_columns
             && session.terminal.rows == compact_rows) return true
     var inscope compact <- terminal_create(compact_columns, compact_rows)
@@ -559,7 +667,7 @@ def public watcher_input(session_id : string; text : string; client_id : int = 0
 
 def private resize_session(var session : WatcherSession?; columns, rows, client_id : int) : string {
     if (session.controller_id != 0 && session.controller_id != client_id) return "controller lease is held by another client"
-    terminal_resize(session.terminal, clamp(columns, 20, 400), clamp(rows, 5, 200))
+    terminal_resize(session.terminal, clamp(columns, 20, 400), clamp(rows, 5, 512))
     append_event(session, "resized", "{session.terminal.columns}x{session.terminal.rows}")
     return ""
 }
