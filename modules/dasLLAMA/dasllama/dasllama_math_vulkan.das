@@ -1067,6 +1067,7 @@ var @workgroup ar_inv : float[1]
 def ar_add_rms {
     let dim = vk_meta[0u]
     let add_on = vk_meta[1u]
+    let woff = vk_meta[2u]   // norm-weight row base (resident driver shares one norms buffer)
     let eps = vk_xs[0u]
     let ascale = vk_xs[1u]
     let tid = gl_LocalInvocationID.x
@@ -1097,7 +1098,7 @@ def ar_add_rms {
     let inv = ar_inv[0u]
     k = tid
     while (k < dim) {
-        vk_y[k] = vk_xqf[k] * (ar_row[k] * inv)
+        vk_y[k] = vk_xqf[woff + k] * (ar_row[k] * inv)
         k += 256u
     }
 }
@@ -1158,6 +1159,8 @@ def da_attn {
     let kvd = vk_meta[2u]
     let hs = vk_meta[3u]
     let kv_mul = vk_meta[4u]
+    let kbase = vk_meta[5u]   // layer base into the shared KV mirror (0 for the standalone seam)
+    let vbase = vk_meta[6u]
     let scale = vk_xs[0u]
     let h = gl_WorkGroupID.x
     let kvh = h / kv_mul
@@ -1175,7 +1178,7 @@ def da_attn {
         var s = 0.0
         var d = 0u
         while (d < hs) {
-            s += da_q[d] * vk_wsf[j * kvd + kvh * hs + d]
+            s += da_q[d] * vk_wsf[kbase + j * kvd + kvh * hs + d]
             d++
         }
         s *= scale
@@ -1229,7 +1232,7 @@ def da_attn {
         var acc = 0.0
         var jj = 0u
         while (jj < cnt) {
-            acc += da_sc[jj] * vk_xqf[jj * kvd + kvh * hs + tid]
+            acc += da_sc[jj] * vk_xqf[vbase + jj * kvd + kvh * hs + tid]
             jj++
         }
         vk_y[h * hs + tid] = acc * linv
@@ -2944,6 +2947,7 @@ def vk_add_rms(var x : array<float>; a : array<float>; w : array<float>; var y :
         var mp = reinterpret<uint?>(g_gpu.ar_meta.mapped)
         mp[0] = uint(dim)
         mp[1] = add ? 1u : 0u
+        mp[2] = 0u   // standalone seam: norm weight starts at 0
         var sp = reinterpret<float?>(g_gpu.ar_scal.mapped)
         sp[0] = eps
         sp[1] = ascale
@@ -3113,6 +3117,8 @@ def vk_decode_attn(var q : array<float>; var out : array<float>; cnt, qd, kv_dim
         mp[2] = uint(kv_dim)
         mp[3] = uint(head_size)
         mp[4] = uint(kv_mul)
+        mp[5] = 0u   // standalone seam: mirror base 0
+        mp[6] = 0u
         var sp = reinterpret<float?>(g_gpu.da_scal.mapped)
         sp[0] = scale
         upload_region_at(g_gpu.da_q_dev, 0l, addr<uint8 const?>(q[0]), qd * 4l)
@@ -3169,6 +3175,383 @@ def vk_rope_kv_store(var qkv : array<float>; var qout : array<float>; var krow :
         memcpy(addr<void?>(qout[0]), g_gpu.rks_q_host.mapped, int(qd * 4l))
         memcpy(addr<void?>(krow[0]), g_gpu.rks_kv_host.mapped, int(kv_dim * 4l))
         memcpy(addr<void?>(vrow[0]), reinterpret<float?>(g_gpu.rks_kv_host.mapped) + kv_dim, int(kv_dim * 4l))
+    }
+}
+
+// ===== the resident whole-stack decode driver =====
+// One cb/token: residual + KV mirror stay device-side, host only uploads x + rope row, reads logits.
+// v1 re-records per token (still 1 submit). Activations quantized on-device before each GEMV.
+
+struct private RLayer {
+    // arena block indices + formats for this layer's 7 planes
+    bq, bk, bv, bo, b1, b3, b2 : int64
+    fq, fk, fv, fo, f1, f3, f2 : int
+    // the layer's descriptor sets (built once, referenced every token)
+    s_quant_xb : VkDescriptorSet    // dn_requant of the attn-norm activation
+    s_q, s_k, s_v : VkDescriptorSet  // q/k/v GEMV
+    s_rope : VkDescriptorSet
+    s_attn : VkDescriptorSet
+    s_quant_at : VkDescriptorSet
+    s_wo : VkDescriptorSet
+    s_addr_ffn : VkDescriptorSet
+    s_quant_xb2 : VkDescriptorSet
+    s_gate, s_up : VkDescriptorSet
+    s_actrq : VkDescriptorSet
+    s_down : VkDescriptorSet
+    s_addr_next : VkDescriptorSet
+    // per-dispatch metas (host-visible; contents rewritten per token)
+    m_quant_xb, m_q, m_k, m_v, m_rope, m_attn, m_quant_at, m_wo, m_addr_ffn : HostBuf
+    m_quant_xb2, m_gate, m_up, m_actrq, m_down, m_addr_next : HostBuf
+    next_norm_off : int64   // rms_ffn is w_off for addr_ffn; addr_next uses rms_att[l+1] or final
+    made : bool
+}
+
+struct private RDec {
+    ready : bool
+    n_layers, dim, qd, kv_dim, head_size, n_heads, kv_mul, hidden, vocab, seq_cap : int64
+    neox : bool
+    eps, scale : float
+    // per-token device buffers
+    x_dev, xb_dev : uint64        // residual, normed activation
+    xq_dev, xs_dev : uint64       // quantized activation (shared across the layer's GEMVs)
+    q_dev, kv_dev : uint64        // roped q; the k/v projection buffer rope reads (k@qd, v@qd+kvd)
+    attn_dev : uint64             // attention output
+    aq_dev, as_dev : uint64       // quantized attn (wo input)
+    gate_dev, up_dev : uint64
+    ffnout_dev : uint64
+    xb2_dev : uint64              // wo output
+    k_mirror, v_mirror : uint64   // [n_layers x seq_cap x kv_dim] f32
+    norms_dev : uint64            // rms_att[l]/rms_ffn[l] interleaved + final, uploaded once
+    cos_dev : uint64              // this token's rope row (cos[half] + sin[half])
+    scal_dev : uint64             // da_attn scalars: [0] = attn scale
+    ar_scal_dev : uint64          // add_rms scalars: [0] = eps, [1] = ascale (1.0 for the residual add)
+    logits_dev : uint64
+    x_host, logits_host : HostBuf
+    kv_readback : HostBuf         // per-layer K/V row -> CPU cache writeback
+    cls_meta_dev : uint64
+    cls_set : VkDescriptorSet
+    s_prologue : VkDescriptorSet  // xb = rms_att[0](x)
+    m_prologue : HostBuf
+    s_quant_final : VkDescriptorSet
+    m_quant_final : HostBuf
+    dummy : uint64                // filler for unused bindings
+    cls_fmt_marker : int
+    layers : array<RLayer>
+    cmd : VkCommandBuffer
+}
+
+var private g_rd : RDec?
+
+def private rd_set6(b0, b1, b2, b3, b4, b5 : uint64; s0, s1, s2, s3, s4, s5 : int64) : VkDescriptorSet {
+    var set = alloc_desc_set()
+    var writes : array<WriteDescriptorSet>
+    write_buf_desc(writes, set, 0u, b0, s0)
+    write_buf_desc(writes, set, 1u, b1, s1)
+    write_buf_desc(writes, set, 2u, b2, s2)
+    write_buf_desc(writes, set, 3u, b3, s3)
+    write_buf_desc(writes, set, 4u, b4, s4)
+    write_buf_desc(writes, set, 5u, b5, s5)
+    let no_copies : array<CopyDescriptorSet>
+    update_descriptor_sets(g_gpu.device, writes, no_copies)
+    return set
+}
+
+// a small host-visible meta buffer (uint words), contents filled per token during recording
+def private rd_meta() : HostBuf => make_host_buf(META_BYTES, true)
+
+// one arena's plane handles + sizes in ONE table lookup (das rejects two lookups in one expr)
+def private arena_planes(fmt : int) : tuple<wq : uint64; ws : uint64; wqb : int64; wsb : int64> {
+    unsafe {
+        var a & = g_gpu.arenas[fmt]
+        return (wq = a.wqbuf, ws = a.wsbuf, wqb = a.wqbytes, wsb = a.wsbytes)
+    }
+}
+
+//! Resident-driver prepare: allocate all per-token + session buffers for a model's geometry. One
+//! resident model at a time (the arbiter guarantees it). Call before set_layer / token.
+def vk_rdec_prepare(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64;
+                    neox : bool; eps, scale : float) : bool {
+    if (!vk_moe_init()) {
+        return false
+    }
+    g_rd = new RDec(ready = false, n_layers = n_layers, dim = dim, qd = qd, kv_dim = kv_dim,
+                 head_size = head_size, n_heads = n_heads, kv_mul = n_heads / (kv_dim / head_size),
+                 hidden = hidden, vocab = vocab, seq_cap = seq_cap, neox = neox, eps = eps, scale = scale)
+    var r & = unsafe(*g_rd)
+    let wide = max(max(qd, hidden), dim)
+    r.x_dev = make_device_buf(dim * 4l)
+    r.xb_dev = make_device_buf(dim * 4l)
+    r.xq_dev = make_device_buf(wide)              // int8 quants, 1 byte/elem
+    r.xs_dev = make_device_buf((wide / 32l) * 4l)
+    r.q_dev = make_device_buf(qd * 4l)
+    r.kv_dev = make_device_buf((qd + 2l * kv_dim) * 4l)
+    r.attn_dev = make_device_buf(qd * 4l)
+    r.aq_dev = make_device_buf(qd)
+    r.as_dev = make_device_buf((qd / 32l) * 4l)
+    r.gate_dev = make_device_buf(hidden * 4l)
+    r.up_dev = make_device_buf(hidden * 4l)
+    r.ffnout_dev = make_device_buf(dim * 4l)
+    r.xb2_dev = make_device_buf(dim * 4l)
+    r.k_mirror = make_device_buf(n_layers * seq_cap * kv_dim * 4l)
+    r.v_mirror = make_device_buf(n_layers * seq_cap * kv_dim * 4l)
+    r.norms_dev = make_device_buf((n_layers * 2l * dim + dim) * 4l)
+    r.cos_dev = make_device_buf(head_size * 4l)
+    r.scal_dev = make_device_buf(64l)
+    r.ar_scal_dev = make_device_buf(64l)
+    r.logits_dev = make_device_buf(vocab * 4l)
+    r.dummy = make_device_buf(256l)
+    r.x_host = make_host_buf(dim * 4l, false, [cached = true])
+    r.logits_host = make_host_buf(vocab * 4l, false, [cached = true])
+    r.kv_readback = make_host_buf(2l * kv_dim * 4l, false, [cached = true])
+    ensure_ffn_state()   // hq_dev/hs_dev for the FFN act+requant
+    r.cmd = alloc_cmd()
+    return true
+}
+
+//! Upload the norm-weight rows once: [rms_att[0], rms_ffn[0], ..., rms_att[L-1], rms_ffn[L-1],
+//! rms_final], dim floats each, exactly the layout the layer w_offs index.
+def vk_rdec_upload_norms(norms : array<float>) {
+    assert(g_rd != null, "vk_rdec_upload_norms before prepare")
+    upload_region_at(g_rd.norms_dev, 0l, unsafe(addr<uint8 const?>(norms[0])), int64(length(norms)) * 4l)
+}
+
+//! Register a dense layer's arena block indices + formats and build its descriptor sets. Called
+//! once per layer after prepare. `w_ffn_off`/`w_next_off` are the rms_ffn[l] and rms_att[l+1]
+//! (or rms_final for the last layer) offsets in the norms buffer (dim-element units).
+def vk_rdec_set_layer(l : int64; bq, bk, bv, bo, b1, b3, b2 : int64; fq, fk, fv, fo, f1, f3, f2 : int) {
+    assert(g_rd != null, "vk_rdec_set_layer before prepare")
+    while (int64(length(g_rd.layers)) <= l) {
+        g_rd.layers |> emplace(RLayer())
+    }
+    unsafe {
+        var L & = g_rd.layers[l]
+        L.bq = bq; L.bk = bk; L.bv = bv; L.bo = bo; L.b1 = b1; L.b3 = b3; L.b2 = b2
+        L.fq = fq; L.fk = fk; L.fv = fv; L.fo = fo; L.f1 = f1; L.f3 = f3; L.f2 = f2
+        let dim = g_rd.dim
+        let qd = g_rd.qd
+        let kvd = g_rd.kv_dim
+        let hid = g_rd.hidden
+        let pq = arena_planes(fq)
+        let pk = arena_planes(fk)
+        let pv = arena_planes(fv)
+        let po = arena_planes(fo)
+        let p1 = arena_planes(f1)
+        let p3 = arena_planes(f3)
+        let p2 = arena_planes(f2)
+        // metas
+        L.m_quant_xb = rd_meta(); L.m_q = rd_meta(); L.m_k = rd_meta(); L.m_v = rd_meta()
+        L.m_rope = rd_meta(); L.m_attn = rd_meta(); L.m_quant_at = rd_meta(); L.m_wo = rd_meta()
+        L.m_addr_ffn = rd_meta(); L.m_quant_xb2 = rd_meta(); L.m_gate = rd_meta(); L.m_up = rd_meta()
+        L.m_actrq = rd_meta(); L.m_down = rd_meta(); L.m_addr_next = rd_meta()
+        // quantize xb -> xq/xs (dn_requant: in vk_upf@0, meta@2, xq@3, xs@4)
+        L.s_quant_xb = rd_set6(g_rd.xb_dev, g_rd.dummy, L.m_quant_xb.buf, g_rd.xq_dev, g_rd.xs_dev, g_rd.dummy,
+            dim * 4l, 256l, META_BYTES, dim, (dim / 32l) * 4l, 256l)
+        // q/k/v GEMV: arena[f] planes @0/1, meta@2, xq@3, xs@4, out@5
+        L.s_q = rd_set6(pq.wq, pq.ws, L.m_q.buf, g_rd.xq_dev, g_rd.xs_dev, g_rd.q_dev,
+            pq.wqb, pq.wsb, META_BYTES, dim, (dim / 32l) * 4l, qd * 4l)
+        L.s_k = rd_set6(pk.wq, pk.ws, L.m_k.buf, g_rd.xq_dev, g_rd.xs_dev, g_rd.kv_dev,
+            pk.wqb, pk.wsb, META_BYTES, dim, (dim / 32l) * 4l, (qd + 2l * kvd) * 4l)
+        L.s_v = rd_set6(pv.wq, pv.ws, L.m_v.buf, g_rd.xq_dev, g_rd.xs_dev, g_rd.kv_dev,
+            pv.wqb, pv.wsb, META_BYTES, dim, (dim / 32l) * 4l, (qd + 2l * kvd) * 4l)
+        // rope+store: kv@0, Kmirror@1, meta@2, Vmirror@3, cossin@4, q@5
+        let mirbytes = g_rd.n_layers * g_rd.seq_cap * kvd * 4l
+        L.s_rope = rd_set6(g_rd.kv_dev, g_rd.k_mirror, L.m_rope.buf, g_rd.v_mirror, g_rd.cos_dev, g_rd.q_dev,
+            (qd + 2l * kvd) * 4l, mirbytes, META_BYTES, mirbytes, g_rd.head_size * 4l, qd * 4l)
+        // attn: q@0, Kmirror@1, meta@2, Vmirror@3, scale@4, out@5
+        L.s_attn = rd_set6(g_rd.q_dev, g_rd.k_mirror, L.m_attn.buf, g_rd.v_mirror, g_rd.scal_dev, g_rd.attn_dev,
+            qd * 4l, mirbytes, META_BYTES, mirbytes, 64l, qd * 4l)
+        // quantize attn -> aq/as
+        L.s_quant_at = rd_set6(g_rd.attn_dev, g_rd.dummy, L.m_quant_at.buf, g_rd.aq_dev, g_rd.as_dev, g_rd.dummy,
+            qd * 4l, 256l, META_BYTES, qd, (qd / 32l) * 4l, 256l)
+        // wo GEMV -> xb2
+        L.s_wo = rd_set6(po.wq, po.ws, L.m_wo.buf, g_rd.aq_dev, g_rd.as_dev, g_rd.xb2_dev,
+            po.wqb, po.wsb, META_BYTES, qd, (qd / 32l) * 4l, dim * 4l)
+        // addrms: x@0 += xb2@1, meta@2, norms@3, scalars@4, xb@5
+        L.s_addr_ffn = rd_set6(g_rd.x_dev, g_rd.xb2_dev, L.m_addr_ffn.buf, g_rd.norms_dev, g_rd.ar_scal_dev, g_rd.xb_dev,
+            dim * 4l, dim * 4l, META_BYTES, (g_rd.n_layers * 2l * dim + dim) * 4l, 64l, dim * 4l)
+        // quantize xb (post-ffn-norm) -> xq/xs
+        L.s_quant_xb2 = rd_set6(g_rd.xb_dev, g_rd.dummy, L.m_quant_xb2.buf, g_rd.xq_dev, g_rd.xs_dev, g_rd.dummy,
+            dim * 4l, 256l, META_BYTES, dim, (dim / 32l) * 4l, 256l)
+        // gate/up GEMV
+        L.s_gate = rd_set6(p1.wq, p1.ws, L.m_gate.buf, g_rd.xq_dev, g_rd.xs_dev, g_rd.gate_dev,
+            p1.wqb, p1.wsb, META_BYTES, dim, (dim / 32l) * 4l, hid * 4l)
+        L.s_up = rd_set6(p3.wq, p3.ws, L.m_up.buf, g_rd.xq_dev, g_rd.xs_dev, g_rd.up_dev,
+            p3.wqb, p3.wsb, META_BYTES, dim, (dim / 32l) * 4l, hid * 4l)
+        // act+requant: up@0, filler@1, ffn_meta@2, hq@3, hs@4, gate@5
+        L.s_actrq = rd_set6(g_rd.up_dev, g_rd.dummy, g_gpu.ffn_meta_dev, g_gpu.hq_dev, g_gpu.hs_dev, g_rd.gate_dev,
+            hid * 4l, 256l, FFN_META_BYTES, BATCH_HQ_BYTES, BATCH_HS_BYTES, hid * 4l)
+        // down GEMV -> ffnout
+        L.s_down = rd_set6(p2.wq, p2.ws, L.m_down.buf, g_gpu.hq_dev, g_gpu.hs_dev, g_rd.ffnout_dev,
+            p2.wqb, p2.wsb, META_BYTES, hid, (hid / 32l) * 4l, dim * 4l)
+        // addrms next: x@0 += ffnout@1, norms@3, xb@5
+        L.s_addr_next = rd_set6(g_rd.x_dev, g_rd.ffnout_dev, L.m_addr_next.buf, g_rd.norms_dev, g_rd.ar_scal_dev, g_rd.xb_dev,
+            dim * 4l, dim * 4l, META_BYTES, (g_rd.n_layers * 2l * dim + dim) * 4l, 64l, dim * 4l)
+        L.made = true
+    }
+}
+
+//! Register the classifier plane (arena block + format) and build the prologue / final-norm / cls
+//! sets. Call after all layers are set.
+def vk_rdec_set_cls(cls_block : int64; cls_fmt : int) {
+    assert(g_rd != null, "vk_rdec_set_cls before prepare")
+    let dim = g_rd.dim
+    let vocab = g_rd.vocab
+    unsafe {
+        
+        g_rd.m_prologue = rd_meta()
+        g_rd.m_quant_final = rd_meta()
+        g_rd.cls_meta_dev = make_device_buf(CLS_META_BYTES)
+        // prologue: xb = rms_att[0](x), add off
+        g_rd.s_prologue = rd_set6(g_rd.x_dev, g_rd.dummy, g_rd.m_prologue.buf, g_rd.norms_dev, g_rd.ar_scal_dev, g_rd.xb_dev,
+            dim * 4l, 256l, META_BYTES, (g_rd.n_layers * 2l * dim + dim) * 4l, 64l, dim * 4l)
+        // quantize final xb
+        g_rd.s_quant_final = rd_set6(g_rd.xb_dev, g_rd.dummy, g_rd.m_quant_final.buf, g_rd.xq_dev, g_rd.xs_dev, g_rd.dummy,
+            dim * 4l, 256l, META_BYTES, dim, (dim / 32l) * 4l, 256l)
+        // cls GEMV: arena[fmt]@0/1, device meta@2, xq@3, xs@4, logits@5
+        let pc = arena_planes(cls_fmt)
+        g_rd.cls_set = rd_set6(pc.wq, pc.ws, g_rd.cls_meta_dev, g_rd.xq_dev, g_rd.xs_dev, g_rd.logits_dev,
+            pc.wqb, pc.wsb, CLS_META_BYTES, dim, (dim / 32l) * 4l, vocab * 4l)
+        // cls meta is constant (block base, n=dim, d=vocab) — device-filled once
+        var mp = reinterpret<uint?>(g_gpu.staging.mapped)
+        mp[0] = uint(dim)
+        mp[1] = uint(vocab)
+        mp[2] = 1u
+        mp[3] = 0u
+        mp[4] = uint(cls_block)
+        mp[5] = 0u
+        staged_upload(g_rd.cls_meta_dev, 0l, CLS_META_BYTES)
+        g_rd.cls_fmt_marker = cls_fmt
+        g_rd.ready = true
+    }
+}
+
+// gemv meta: [0]=n [1]=d [2]=nregions=1 [3]=ybase(row) [4]=weight block [5]=xblock base
+def private fill_gemv_meta(hb : HostBuf; n, d, ybase, blk : int64) {
+    unsafe {
+        var mp = reinterpret<uint?>(hb.mapped)
+        mp[0] = uint(n)
+        mp[1] = uint(d)
+        mp[2] = 1u
+        mp[3] = uint(ybase)
+        mp[4] = uint(blk)
+        mp[5] = 0u
+    }
+}
+
+// dn_requant meta: [10]=input base (0) [18]=block count
+def private fill_quant_meta(hb : HostBuf; nblocks : int64) {
+    unsafe {
+        var mp = reinterpret<uint?>(hb.mapped)
+        mp[10] = 0u
+        mp[18] = uint(nblocks)
+    }
+}
+
+def private fill_addrms_meta(hb : HostBuf; dim, woff : int64; add : bool) {
+    unsafe {
+        var mp = reinterpret<uint?>(hb.mapped)
+        mp[0] = uint(dim)
+        mp[1] = add ? 1u : 0u
+        mp[2] = uint(woff)
+    }
+}
+
+def private rd_gemv_wg(rows : int64) : uint => uint((rows + g_gpu.rows_per_wg - 1l) / g_gpu.rows_per_wg)
+
+def private rd_dispatch(raw : VkCommandBuffer; pipe : Pipeline; var set : VkDescriptorSet; groups : uint) {
+    cmd_bind_pipeline(vk_value_to_boost(raw), pipe, VkPipelineBindPoint.COMPUTE)
+    cmd_bind_dispatch(raw, set, groups)
+    comp_barrier(raw)
+}
+
+// GEMV dispatch — the per-format kernel selected off the plane format
+def private rd_dispatch_gemv(raw : VkCommandBuffer; fmt : int; var set : VkDescriptorSet; groups : uint) {
+    bind_gemv_pipe(raw, fmt)
+    cmd_bind_dispatch(raw, set, groups)
+    comp_barrier(raw)
+}
+
+//! Resident-driver token: run the whole stack on device from the embedded residual `x` and this
+//! position's rope row (cos[half]+sin[half]) -> logits. `cnt` = cached positions incl. this one;
+//! K/V for `pos` get stored into the mirror as a side effect.
+def vk_rdec_token(x : array<float>; cossin : array<float>; pos, cnt : int64; var logits : array<float>) {
+    assert(g_rd != null && g_rd.ready, "vk_rdec_token before prepare/set_cls")
+    let dim = g_rd.dim
+    let qd = g_rd.qd
+    let kvd = g_rd.kv_dim
+    let hid = g_rd.hidden
+    let nlfin = g_rd.n_layers * 2l * dim   // rms_final offset in the norms buffer (dim units later)
+    unsafe {
+        // per-token host state — attn scalars ([0]=scale) and add_rms scalars ([0]=eps, [1]=ascale)
+        var sp = reinterpret<float?>(g_gpu.staging.mapped)
+        sp[0] = g_rd.scale
+        staged_upload(g_rd.scal_dev, 0l, 64l)
+        sp[0] = g_rd.eps
+        sp[1] = 1.0
+        staged_upload(g_rd.ar_scal_dev, 0l, 64l)
+        upload_region_at(g_rd.x_dev, 0l, addr<uint8 const?>(x[0]), dim * 4l)
+        upload_region_at(g_rd.cos_dev, 0l, addr<uint8 const?>(cossin[0]), g_rd.head_size * 4l)
+        // fill the FFN act+requant meta once (gelu off; nfe blocks = hidden/32)
+        fill_ffn_meta(hid, hid / 32l, false)
+        // fill all metas
+        fill_addrms_meta(g_rd.m_prologue, dim, 0l, false)   // rms_att[0] at offset 0
+        for (l in range64(g_rd.n_layers)) {
+            var L & = g_rd.layers[l]
+            fill_quant_meta(L.m_quant_xb, dim / 32l)
+            fill_gemv_meta(L.m_q, dim, qd, 0l, L.bq)
+            fill_gemv_meta(L.m_k, dim, kvd, qd, L.bk)             // k at ybase qd in kv_dev
+            fill_gemv_meta(L.m_v, dim, kvd, qd + kvd, L.bv)       // v at ybase qd+kvd
+            var mr = reinterpret<uint?>(L.m_rope.mapped)
+            mr[0] = uint(qd); mr[1] = uint(kvd); mr[2] = uint(g_rd.head_size); mr[3] = uint(g_rd.head_size / 2l)
+            mr[4] = g_rd.neox ? 1u : 0u; mr[5] = uint(qd / 2l); mr[6] = uint(qd / 2l + kvd / 2l)
+            mr[7] = uint(l * g_rd.seq_cap * kvd + pos * kvd); mr[8] = uint(l * g_rd.seq_cap * kvd + pos * kvd)
+            var ma = reinterpret<uint?>(L.m_attn.mapped)
+            ma[0] = uint(cnt); ma[2] = uint(kvd); ma[3] = uint(g_rd.head_size); ma[4] = uint(g_rd.kv_mul)
+            ma[5] = uint(l * g_rd.seq_cap * kvd); ma[6] = uint(l * g_rd.seq_cap * kvd)
+            fill_quant_meta(L.m_quant_at, qd / 32l)
+            fill_gemv_meta(L.m_wo, qd, dim, 0l, L.bo)
+            fill_addrms_meta(L.m_addr_ffn, dim, (l * 2l + 1l) * dim, true)   // rms_ffn[l]
+            fill_quant_meta(L.m_quant_xb2, dim / 32l)
+            fill_gemv_meta(L.m_gate, dim, hid, 0l, L.b1)
+            fill_gemv_meta(L.m_up, dim, hid, 0l, L.b3)
+            fill_gemv_meta(L.m_down, hid, dim, 0l, L.b2)
+            let nxt = l + 1l < g_rd.n_layers ? (l + 1l) * 2l * dim : nlfin   // rms_att[l+1] or final
+            fill_addrms_meta(L.m_addr_next, dim, nxt, true)
+        }
+        fill_quant_meta(g_rd.m_quant_final, dim / 32l)
+        // record the whole token
+        var raw = g_rd.cmd
+        let rf : VkCommandBufferResetFlags
+        vk_check(vkResetCommandBuffer(raw, rf), null)
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
+        comp_barrier(raw)
+        rd_dispatch(raw, g_gpu.ar_pipeline, g_rd.s_prologue, 1u)   // xb = rms_att[0](x)
+        for (l in range64(g_rd.n_layers)) {
+            var L & = g_rd.layers[l]
+            rd_dispatch(raw, g_gpu.dn_rq_pipeline, L.s_quant_xb, uint((dim / 32l + 255l) / 256l))
+            rd_dispatch_gemv(raw, L.fq, L.s_q, rd_gemv_wg(qd))
+            rd_dispatch_gemv(raw, L.fk, L.s_k, rd_gemv_wg(kvd))
+            rd_dispatch_gemv(raw, L.fv, L.s_v, rd_gemv_wg(kvd))
+            rd_dispatch(raw, g_gpu.rks_pipeline, L.s_rope, uint((qd / 2l + kvd / 2l + int64(WG_X) - 1l) / int64(WG_X)))
+            rd_dispatch(raw, g_gpu.da_pipeline, L.s_attn, uint(g_rd.n_heads))
+            rd_dispatch(raw, g_gpu.dn_rq_pipeline, L.s_quant_at, uint((qd / 32l + 255l) / 256l))
+            rd_dispatch_gemv(raw, L.fo, L.s_wo, rd_gemv_wg(dim))
+            rd_dispatch(raw, g_gpu.ar_pipeline, L.s_addr_ffn, 1u)
+            rd_dispatch(raw, g_gpu.dn_rq_pipeline, L.s_quant_xb2, uint((dim / 32l + 255l) / 256l))
+            rd_dispatch_gemv(raw, L.f1, L.s_gate, rd_gemv_wg(hid))
+            rd_dispatch_gemv(raw, L.f3, L.s_up, rd_gemv_wg(hid))
+            rd_dispatch(raw, g_gpu.actrq_pipeline, L.s_actrq, uint((hid / 32l + 255l) / 256l))
+            rd_dispatch_gemv(raw, L.f2, L.s_down, rd_gemv_wg(dim))
+            rd_dispatch(raw, g_gpu.ar_pipeline, L.s_addr_next, 1u)
+        }
+        rd_dispatch(raw, g_gpu.dn_rq_pipeline, g_rd.s_quant_final, uint((dim / 32l + 255l) / 256l))
+        rd_dispatch_gemv(raw, g_rd.cls_fmt_marker, g_rd.cls_set, rd_gemv_wg(g_rd.vocab))
+        cmd_copy_whole(raw, g_rd.logits_dev, g_rd.logits_host.buf, g_rd.vocab * 4l)
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(raw)
+        memcpy(addr<void?>(logits[0]), g_rd.logits_host.mapped, int(g_rd.vocab * 4l))
     }
 }
 
@@ -5119,6 +5502,8 @@ def dasllama_math_vulkan_register() {
     set_moe_gpu_vram_report(@@vk_resident_bytes)
     set_moe_gpu_device_report(@@vk_device_name)
     set_moe_gpu_budget_hooks(@@vk_weight_budget, @@vk_plane_bytes)
+    install_moe_gpu_resident(@@vk_arena_reserve, @@vk_arena_place, @@vk_rdec_prepare,
+        @@vk_rdec_upload_norms, @@vk_rdec_set_layer, @@vk_rdec_set_cls, @@vk_rdec_token)
     set_moe_gpu_dn_state_hooks(@@vk_dn_step_flush, @@vk_dn_step_invalidate)
     set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
     set_moe_gpu_qkv_hook(@@vk_moe_qkv)

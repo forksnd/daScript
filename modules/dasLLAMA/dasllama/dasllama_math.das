@@ -1413,6 +1413,65 @@ var g_moe_gpu_dn_route = true          // runtime routing gate over the deltanet
 var g_moe_gpu_attn_layers : table<int64>  // full-attention layers whose q/k/v/o quad is tier-resident
 var g_moe_gpu_attn_route = true        // runtime routing gate over the attention marks (--attn-ab lever)
 
+// ===== the resident whole-stack decode driver hooks =====
+// The tier registers these; common reaches the driver through them, so the engine never names a GPU
+// symbol. reserve/place fill the arenas; prepare/norms/set_layer/set_cls build it; token runs one forward.
+typedef RdecReserveFn = function<(fmt : int; cap_blocks : int64) : bool>
+typedef RdecPlaceFn = function<(wq : array<uint8>; ws : array<uint8>; n : int64; rows : int64; fmt : int) : int64>
+typedef RdecPrepareFn = function<(n_layers : int64; dim : int64; qd : int64; kv_dim : int64; head_size : int64; n_heads : int64; hidden : int64; vocab : int64; seq_cap : int64; neox : bool; eps : float; scale : float) : bool>
+typedef RdecNormsFn = function<(norms : array<float>) : void>
+typedef RdecSetLayerFn = function<(l : int64; bq : int64; bk : int64; bv : int64; bo : int64; b1 : int64; b3 : int64; b2 : int64; fq : int; fk : int; fv : int; fo : int; f1 : int; f3 : int; f2 : int) : void>
+typedef RdecSetClsFn = function<(cls_block : int64; cls_fmt : int) : void>
+typedef RdecTokenFn = function<(x : array<float>; cossin : array<float>; pos : int64; cnt : int64; var logits : array<float>) : void>
+
+[unused_argument(fmt, cap_blocks)]
+def private rdec_unset_reserve(fmt : int; cap_blocks : int64) : bool => false
+[unused_argument(wq, ws, n, rows, fmt)]
+def private rdec_unset_place(wq : array<uint8>; ws : array<uint8>; n, rows : int64; fmt : int) : int64 => -1l
+[unused_argument(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap, neox, eps, scale)]
+def private rdec_unset_prepare(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64; neox : bool; eps, scale : float) : bool => false
+[unused_argument(norms)]
+def private rdec_unset_norms(norms : array<float>) {}
+[unused_argument(l, bq, bk, bv, bo, b1, b3, b2, fq, fk, fv, fo, f1, f3, f2)]
+def private rdec_unset_set_layer(l, bq, bk, bv, bo, b1, b3, b2 : int64; fq, fk, fv, fo, f1, f3, f2 : int) {}
+[unused_argument(cls_block, cls_fmt)]
+def private rdec_unset_set_cls(cls_block : int64; cls_fmt : int) {}
+[unused_argument(x, cossin, pos, cnt, logits)]
+def private rdec_unset_token(x : array<float>; cossin : array<float>; pos, cnt : int64; var logits : array<float>) {
+    panic("dasLLAMA: resident decode token hit without an installed GPU driver")
+}
+
+var g_rdec_reserve = @@rdec_unset_reserve
+var g_rdec_place = @@rdec_unset_place
+var g_rdec_prepare = @@rdec_unset_prepare
+var g_rdec_norms = @@rdec_unset_norms
+var g_rdec_set_layer = @@rdec_unset_set_layer
+var g_rdec_set_cls = @@rdec_unset_set_cls
+var g_rdec_token = @@rdec_unset_token
+var g_rdec_installed = false
+
+//! Install the resident whole-stack decode driver (a GPU backend calls this at [init]).
+def public install_moe_gpu_resident(reserve : RdecReserveFn; place : RdecPlaceFn; prepare : RdecPrepareFn;
+                                    norms : RdecNormsFn; set_layer : RdecSetLayerFn; set_cls : RdecSetClsFn; token : RdecTokenFn) {
+    g_rdec_reserve = reserve
+    g_rdec_place = place
+    g_rdec_prepare = prepare
+    g_rdec_norms = norms
+    g_rdec_set_layer = set_layer
+    g_rdec_set_cls = set_cls
+    g_rdec_token = token
+    g_rdec_installed = true
+}
+
+def public moe_gpu_resident_installed() : bool => g_rdec_installed
+def public rdec_reserve(fmt : int; cap_blocks : int64) : bool => invoke(g_rdec_reserve, fmt, cap_blocks)
+def public rdec_place(wq : array<uint8>; ws : array<uint8>; n, rows : int64; fmt : int) : int64 => invoke(g_rdec_place, wq, ws, n, rows, fmt)
+def public rdec_prepare(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64; neox : bool; eps, scale : float) : bool => invoke(g_rdec_prepare, n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap, neox, eps, scale)
+def public rdec_upload_norms(norms : array<float>) { invoke(g_rdec_norms, norms) }
+def public rdec_set_layer(l, bq, bk, bv, bo, b1, b3, b2 : int64; fq, fk, fv, fo, f1, f3, f2 : int) { invoke(g_rdec_set_layer, l, bq, bk, bv, bo, b1, b3, b2, fq, fk, fv, fo, f1, f3, f2) }
+def public rdec_set_cls(cls_block : int64; cls_fmt : int) { invoke(g_rdec_set_cls, cls_block, cls_fmt) }
+def public rdec_token(x : array<float>; cossin : array<float>; pos, cnt : int64; var logits : array<float>) { invoke(g_rdec_token, x, cossin, pos, cnt, logits) }
+
 //! Install the GPU MoE tier (a GPU backend calls this at [init] when its device probe passes).
 def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn; dense : MoeGpuDenseFn; drop : MoeGpuDropFn; dn : MoeGpuDnFn; attn : MoeGpuAttnFn) {
     g_moe_gpu_ffn = ffn

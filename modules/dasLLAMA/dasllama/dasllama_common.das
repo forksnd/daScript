@@ -1943,6 +1943,176 @@ def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype) : ResidentPlan
     return p
 }
 
+// ===== the resident whole-stack decode driver (dense models that fully fit) =====
+
+var private g_rdec_active = false       // this loaded model runs the resident decode driver
+var private g_rdec_cnt = 0l             // cached positions in the device KV mirror (built as we decode)
+
+// gather one prepared plane into device-layout bytes and place it in its format's arena; returns
+// the arena block index. Same gather the per-op tier uses (moe_gpu_gather_stack / _kq), then place
+// instead of upload_stack.
+def private resident_place(t : Model; f : KqFmt; woff : int64; n, rows : int64;
+                           mr, kgroup, wbias : int64) : int64 {
+    var wq : array<uint8>
+    var ws : array<uint8>
+    if (f == KqFmt.q8) {
+        moe_gpu_gather_stack(t, woff, n, rows, rows, mr, kgroup, wbias, wq, ws)
+    } else {
+        let kmr = t.kq_repacked ? (f == KqFmt.k4 ? t.kq_repack_mr4
+            : (f == KqFmt.k5 ? t.kq_repack_mr5
+            : (f == KqFmt.k6 ? t.kq_repack_mr6 : t.kq_repack_mr40))) : 1l
+        moe_gpu_gather_stack_kq(t, f, woff, n, rows, rows, t.kq_repacked, kmr, wq, ws)
+    }
+    let blk = rdec_place(wq, ws, n, rows, int(f))
+    delete wq
+    delete ws
+    return blk
+}
+
+def private rdec_blocks_for(n, rows : int64; f : KqFmt) : int64 => rows * (n / (f == KqFmt.q8 ? 32l : 256l))
+
+//! Reserve arenas + place every dense plane + wire the resident decode driver. Returns false (and
+//! leaves the driver unarmed) if the model is not a servable dense shape or does not fit at seq_cap.
+def resident_upload(var t : Model; seq_cap : int64) : bool {
+    g_rdec_active = false
+    if (!moe_gpu_resident_installed() || t.quant != QuantMode.q8 || t.config.n_expert > 0l) {
+        return false
+    }
+    let c = t.config
+    // only the plain llama/qwen std shape for now — no bias, no sinks, no shared-KV, uniform geometry
+    if (c.attn_qkv_bias || c.attn_out_bias || c.v_norm || c.attn_sinks || c.moe_dense_shexp
+            || c.n_layer_nextn > 0l) {
+        return false
+    }
+    let dim = c.dim
+    let hid0 = layer_hidden(t, 0l)
+    let hs = layer_head_size(c, 0l)
+    let qd = layer_qd(c, 0l)
+    let kvd = layer_kv_dim(c, 0l)
+    let neox = c.rope_neox
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    // reject non-uniform per-layer geometry (the recorder assumes fixed dims across layers)
+    for (l in range64(c.n_layers)) {
+        if (layer_hidden(t, l) != hid0 || layer_head_size(c, l) != hs || layer_kv_dim(c, l) != kvd
+                || t.kv_src[l] != l || t.wq_offs[l] < 0l || t.wk_offs[l] < 0l || t.wv_offs[l] < 0l
+                || layer_is_recurrent(c, l) || layer_is_sliding(c, l)) {
+            return false
+        }
+    }
+    // tally arena blocks per format
+    var need : table<int; int64>
+    var planes : array<tuple<n : int64; rows : int64; f : KqFmt>>
+    planes |> reserve(int(c.n_layers * 7l + 1l))
+    for (l in range64(c.n_layers)) {
+        planes |> push((n = dim, rows = qd, f = fmt_at(t.wq_fmt, l)))
+        planes |> push((n = dim, rows = kvd, f = fmt_at(t.wk_fmt, l)))
+        planes |> push((n = dim, rows = kvd, f = fmt_at(t.wv_fmt, l)))
+        planes |> push((n = qd, rows = dim, f = fmt_at(t.wo_fmt, l)))
+        planes |> push((n = dim, rows = hid0, f = fmt_at(t.w1_fmt, l)))
+        planes |> push((n = dim, rows = hid0, f = fmt_at(t.w3_fmt, l)))
+        planes |> push((n = hid0, rows = dim, f = fmt_at(t.w2_fmt, l)))
+    }
+    planes |> push((n = dim, rows = c.vocab_size, f = cls_fmt))
+    for (pl in planes) {
+        let fi = int(pl.f)
+        need[fi] = (need?[fi] ?? 0l) + rdec_blocks_for(pl.n, pl.rows, pl.f)
+    }
+    delete planes
+    for (fmt, blocks in keys(need), values(need)) {
+        if (!rdec_reserve(fmt, blocks)) {
+            to_log(LOG_WARNING, "dasLLAMA: resident driver — arena reserve failed (fmt {fmt}, {blocks} blocks)\n")
+            return false
+        }
+    }
+    let repacked = kernel_backend_needs_repack(active_kernel_backend())
+    let mr = repacked ? active_q8_layout_mr() : 1l
+    let kg = repacked ? active_q8_kgroup() : 4l
+    let wb = repacked ? active_q8_wbias() : 0l
+    if (!rdec_prepare(c.n_layers, dim, qd, kvd, hs, c.n_heads, hid0, c.vocab_size, seq_cap, neox,
+                      c.norm_eps, c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(hs)))) {
+        return false
+    }
+    // place every plane, wire each layer
+    for (l in range64(c.n_layers)) {
+        let bq = resident_place(t, fmt_at(t.wq_fmt, l), t.wq_offs[l], dim, qd, mr, kg, wb)
+        let bk = resident_place(t, fmt_at(t.wk_fmt, l), t.wk_offs[l], dim, kvd, mr, kg, wb)
+        let bv = resident_place(t, fmt_at(t.wv_fmt, l), t.wv_offs[l], dim, kvd, mr, kg, wb)
+        let bo = resident_place(t, fmt_at(t.wo_fmt, l), t.wo_offs[l], qd, dim, mr, kg, wb)
+        let b1 = resident_place(t, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, hid0, mr, kg, wb)
+        let b3 = resident_place(t, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, hid0, mr, kg, wb)
+        let b2 = resident_place(t, fmt_at(t.w2_fmt, l), t.w2_offs[l], hid0, dim, mr, kg, wb)
+        rdec_set_layer(l, bq, bk, bv, bo, b1, b3, b2,
+            int(fmt_at(t.wq_fmt, l)), int(fmt_at(t.wk_fmt, l)), int(fmt_at(t.wv_fmt, l)), int(fmt_at(t.wo_fmt, l)),
+            int(fmt_at(t.w1_fmt, l)), int(fmt_at(t.w3_fmt, l)), int(fmt_at(t.w2_fmt, l)))
+    }
+    let bcls = resident_place(t, cls_fmt, t.wcls_off, dim, c.vocab_size, mr, kg, wb)
+    rdec_set_cls(bcls, int(cls_fmt))
+    // upload the norm rows: [rms_att[l], rms_ffn[l]] x L, then rms_final
+    var norms : array<float>
+    norms |> resize(int(c.n_layers * 2l * dim + dim))
+    for (l in range64(c.n_layers)) {
+        for (i in range64(dim)) {
+            norms[int(l * 2l * dim + i)] = t.fblob[t.rms_att_off + l * dim + i]
+            norms[int((l * 2l + 1l) * dim + i)] = t.fblob[t.rms_ffn_off + l * dim + i]
+        }
+    }
+    for (i in range64(dim)) {
+        norms[int(c.n_layers * 2l * dim + i)] = t.fblob[t.rms_final_off + i]
+    }
+    rdec_upload_norms(norms)
+    delete norms
+    g_rdec_active = true
+    g_rdec_cnt = 0l
+    select_decode_override("vulkan")
+    to_log(LOG_INFO, "dasLLAMA: resident decode driver armed ({c.n_layers} layers, dim {dim}, ctx {seq_cap})\n")
+    return true
+}
+
+//! The resident whole-stack decode override (registered as "vulkan"): embeds the token, builds this
+//! position's rope row, runs the whole forward on device, produces s.logits. Decode-from-scratch
+//! for now — the mirror builds as positions arrive (prefix-KV sync is a follow-up).
+def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int64) : bool {
+    if (!g_rdec_active) {
+        return false
+    }
+    let c = t.config
+    let dim = c.dim
+    let hs = layer_head_size(c, 0l)
+    var x : array<float>
+    x |> resize(int(dim))
+    unsafe {
+        embed_row(t, token, addr(x[0]))
+    }
+    if (c.embed_scale != 1.0) {
+        scale_inplace(unsafe(addr(x[0])), c.embed_scale, dim)
+    }
+    // this position's rope row: cos[half] then sin[half]
+    let half = hs / 2l
+    var cossin : array<float>
+    cossin |> resize(int(hs))
+    let theta = c.rope_freq_base
+    for (j in range64(half)) {
+        var freq = 1.0 / pow(theta, float(2l * j) / float(hs))
+        if (!empty(t.rope_freqs)) {
+            freq /= t.rope_freqs[j]
+        }
+        let ang = float(pos) * freq * c.rope_freq_scale
+        cossin[int(j)] = cos(ang) * c.rope_mscale
+        cossin[int(half + j)] = sin(ang) * c.rope_mscale
+    }
+    let cnt = pos + 1l
+    rdec_token(x, cossin, pos, cnt, s.logits)
+    delete x
+    delete cossin
+    decode_override_logits_done()   // logits produced on device
+    return true
+}
+
+[init]
+def resident_driver_register() {
+    register_decode_override("vulkan", @@vulkan_resident_decode)
+}
+
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
 // the end of every load rail so DASLLAMA_GPU_MOE_LAYERS behaves identically however the model
 // arrived. Layers go resident from the end while the tier's VRAM budget holds.
