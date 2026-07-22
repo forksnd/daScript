@@ -1912,9 +1912,19 @@ namespace das {
 
     bool builtin_fs_is_symlink ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) {
         error = nullptr;
-        if ( !path ) { error = empty_path_error(ctx, at); return false; }
+        if ( !path || !path[0] ) { error = empty_path_error(ctx, at); return false; }
         std::error_code ec;
+#if defined(_WIN32)
+        auto widePath = utf8_file_path_to_wide(path);
+        if ( widePath.empty() ) {
+            static constexpr char invalidUtf8[] = "invalid UTF-8 file path";
+            error = ctx->allocateString(invalidUtf8, uint32_t(sizeof(invalidUtf8) - 1), at);
+            return false;
+        }
+        bool result = std::filesystem::is_symlink(std::filesystem::path(widePath), ec);
+#else
         bool result = std::filesystem::is_symlink(path, ec);
+#endif
         if ( ec ) { error = ec_to_string(ec, ctx, at); return false; }
         return result;
     }

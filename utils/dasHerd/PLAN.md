@@ -11,6 +11,10 @@ The name is intentional: this is an agent herder, not a general-purpose IDE.
 The initial implementation may force a narrow workflow when that makes state
 unambiguous and reliable.
 
+The proposed ordering and shared interaction contract for agent-assisted local
+review and the later GitHub PR surface are recorded in
+[`AGENT_REVIEW_WORKFLOWS.md`](AGENT_REVIEW_WORKFLOWS.md).
+
 ## Product contract
 
 - One writable agent session owns one worktree.

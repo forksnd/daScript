@@ -10,6 +10,7 @@ require daslib/rtti
 require daslib/base64
 require daslib/safe_addr
 require daslib/strings_boost
+require daslib/utf8_utils
 require imgui/imgui_text_tree_sitter
 require imgui/imgui_markdown_tree_sitter
 require stbimage/stbimage_boost
@@ -49,6 +50,7 @@ struct public InspectorPrepareEvent {
     markdown_view : MarkdownViewState = MarkdownViewState()
     changed_source_ranges : array<TextSourceRange>
     view_source : string
+    view_text_ready : bool
     preview_pixels : array<uint8>
     preview_width : int
     preview_height : int
@@ -289,16 +291,56 @@ def private prepare_worker_main(var jobs : Channel?&;
             var markdown_view = MarkdownViewState()
             var changed_ranges : array<TextSourceRange>
             var view_source = ""
+            var view_text_ready = false
+            var inscope decoded_view_bytes : array<uint8>
             var preview_pixels : array<uint8>
             var preview_width = 0
             var preview_height = 0
             var preview_error = ""
             let failed = catch_prepare_panic(failure) {
                 var prepared_patch <- git_parse_unified_patch(job.patch)
+                if (prepared_patch.error == "diff contains no text hunks"
+                        && job.view_available) {
+                    prepared_patch.error = ""
+                }
                 if (!empty(prepared_patch.error)) {
                     failure = prepared_patch.error
                 } else {
-                    view_source = (job.view_available || !empty(job.view_text)) ? job.view_text : prepared_patch.new_text
+                    if (!prepared_patch.binary) {
+                        if (job.view_available || !empty(job.view_text)) {
+                            view_source = job.view_text
+                        } else {
+                            view_source = prepared_patch.new_text
+                        }
+                        view_text_ready = true
+                    } elif (job.view_byte_count > MAX_FILE_PREVIEW_RAW_BYTES) {
+                        preview_error = "Binary preview exceeds the 8 MiB raw-byte limit"
+                    } elif (job.view_byte_count == 0) {
+                        preview_error = "Binary preview is empty"
+                    } elif (job.view_byte_count < 0) {
+                        preview_error = "Binary transport reported an invalid byte count"
+                    } elif (empty(job.view_base64)) {
+                        preview_error = "Binary preview bytes are unavailable for this comparison"
+                    } else {
+                        let decoded = base64_decode(job.view_base64,
+                            decoded_view_bytes)
+                        if (decoded < 0 || decoded != job.view_byte_count) {
+                            preview_error = "Binary transport failed exact-byte validation"
+                        } else {
+                            var has_nul = false
+                            for (byte in decoded_view_bytes) {
+                                if (byte == uint8(0)) {
+                                    has_nul = true
+                                    break
+                                }
+                            }
+                            if (!has_nul
+                                    && is_utf8_string_valid(decoded_view_bytes)) {
+                                view_source = string(decoded_view_bytes)
+                                view_text_ready = true
+                            }
+                        }
+                    }
                     let old_source = inspector_reconstruct_old_source(
                         view_source, prepared_patch)
                     var full_old <- tree_sitter_source_document(
@@ -332,7 +374,7 @@ def private prepare_worker_main(var jobs : Channel?&;
                                 kind = TextSourceLineMarkKind.added))
                         }
                     }
-                    if (!prepared_patch.binary) {
+                    if (view_text_ready) {
                         full_new.line_marks |> reserve(
                             length(prepared_patch.new_changed_lines))
                         for (line in prepared_patch.new_changed_lines) {
@@ -359,43 +401,29 @@ def private prepare_worker_main(var jobs : Channel?&;
                     } else {
                         text_source_document_dispose(full_new)
                     }
-                    if (prepared_patch.binary) {
-                        if (job.view_byte_count > MAX_FILE_PREVIEW_RAW_BYTES) {
-                            preview_error = "Binary preview exceeds the 8 MiB raw-byte limit"
-                        } elif (job.view_byte_count == 0) {
-                            preview_error = "Binary preview is empty"
-                        } elif (job.view_byte_count < 0) {
-                            preview_error = "Binary transport reported an invalid byte count"
-                        } elif (empty(job.view_base64)) {
-                            preview_error = "Binary preview bytes are unavailable for this comparison"
+                    if (prepared_patch.binary && !view_text_ready
+                            && empty(preview_error)) {
+                        var width, height, channels : int
+                        let image_info = stbi_info_from_memory(
+                            unsafe(addr<uint8 const?>(decoded_view_bytes[0])),
+                            length(decoded_view_bytes), safe_addr(width),
+                            safe_addr(height), safe_addr(channels))
+                        if (image_info == 0) {
+                            preview_error = stbi_failure_reason()
+                        } elif (width <= 0 || height <= 0 ||
+                                int64(width) * int64(height)
+                                    > MAX_BINARY_PREVIEW_PIXELS) {
+                            preview_error = "Image dimensions exceed the 64 megapixel preview limit"
                         } else {
-                            var inscope encoded : array<uint8>
-                            let decoded = base64_decode(job.view_base64, encoded)
-                            if (decoded < 0 || decoded != job.view_byte_count) {
-                                preview_error = "Binary transport failed exact-byte validation"
+                            var image : Image
+                            let (image_ok, image_error) = image->load_from_memory(
+                                decoded_view_bytes, 4)
+                            if (image_ok) {
+                                preview_width = image.width
+                                preview_height = image.height
+                                preview_pixels <- image.bytes
                             } else {
-                                var width, height, channels : int
-                                let image_info = stbi_info_from_memory(
-                                    unsafe(addr<uint8 const?>(encoded[0])),
-                                    length(encoded), safe_addr(width),
-                                    safe_addr(height), safe_addr(channels))
-                                if (image_info == 0) {
-                                    preview_error = stbi_failure_reason()
-                                } elif (width <= 0 || height <= 0 ||
-                                        int64(width) * int64(height)
-                                            > MAX_BINARY_PREVIEW_PIXELS) {
-                                    preview_error = "Image dimensions exceed the 64 megapixel preview limit"
-                                } else {
-                                    var image : Image
-                                    let (image_ok, image_error) = image->load_from_memory(encoded, 4)
-                                    if (image_ok) {
-                                        preview_width = image.width
-                                        preview_height = image.height
-                                        preview_pixels <- image.bytes
-                                    } else {
-                                        preview_error = image_error
-                                    }
-                                }
+                                preview_error = image_error
                             }
                         }
                     }
@@ -416,6 +444,7 @@ def private prepare_worker_main(var jobs : Channel?&;
                     kind = InspectorPrepareEventKind.completed,
                     generation = job.generation,
                     view_source = view_source,
+                    view_text_ready = view_text_ready,
                     preview_width = preview_width,
                     preview_height = preview_height,
                     preview_byte_count = job.view_byte_count,

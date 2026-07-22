@@ -60,6 +60,14 @@ struct private WatcherWsMessage {
     timeout_ms : int64
     control : bool
     raw : bool
+    direction : string
+    sender : string = ""
+    subject : string
+    reply_to : string
+    message_id : string
+    status : string
+    notify : bool = true
+    focus : WatcherFocusSet = WatcherFocusSet()
 }
 
 struct public RepositoryFileInspectionMessage {
@@ -116,6 +124,7 @@ class private WatcherClient {
     raw : bool
     raw_offset : int64
     repository_revision : int64 = -1l
+    mailbox_revision : int64 = -1l
     inspection_request_id : int
     inspection_repository_id : string
     inspection_worktree_path : string
@@ -226,6 +235,23 @@ class DasHerdWatcherServer : HvWebServer {
         return false
     }
 
+    def maybe_notify_inbox_message(session_id, direction, message_id : string;
+                                   notify : bool) {
+        if (direction != "inbox" || !notify) return
+        let nudge_error = watcher_notify(session_id,
+            "dasHerd review request {message_id} is ready. " +
+            "Use the dasHerd skill to fetch and acknowledge it.\r",
+            message_id)
+        if (!empty(nudge_error) && nudge_error != "queued") {
+            print("dasHerd watcher: mailbox {message_id} persisted; " +
+                "TTY nudge failed: {nudge_error}\n")
+        }
+        if (nudge_error != "queued") {
+            let _ = watcher_mailbox_set_notification(
+                session_id, message_id, nudge_error)
+        }
+    }
+
     def override onInit {
         GET("/") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
@@ -262,6 +288,31 @@ class DasHerdWatcherServer : HvWebServer {
         GET("/api/v1/repositories") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
             return resp |> JSON(repository_list_json(), http_status.OK)
+        }
+        GET("/api/v1/mailbox") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            let url = req != null ? string(req.url) : ""
+            let session_id = query_value(url, "session_id")
+            if (empty(session_id)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "session_id is required")
+            }
+            if (watcher_find_session(session_id) < 0) {
+                return self.respond_error(resp, http_status.NOT_FOUND, "unknown session")
+            }
+            let direction = query_value(url, "direction")
+            if (!empty(direction) && direction != "inbox" && direction != "outbox") {
+                return self.respond_error(resp, http_status.BAD_REQUEST,
+                    "direction must be inbox or outbox")
+            }
+            let message_id = query_value(url, "message_id")
+            if (direction == "inbox" && !empty(message_id)) {
+                let fetched = watcher_mailbox_mark_fetched(session_id, message_id)
+                if (!fetched.ok) {
+                    return self.respond_error(resp, http_status.NOT_FOUND, fetched.error)
+                }
+            }
+            return resp |> JSON(watcher_mailbox_json(session_id,
+                direction, message_id), http_status.OK)
         }
         POST("/api/v1/gc") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
@@ -347,6 +398,35 @@ class DasHerdWatcherServer : HvWebServer {
             if (!empty(error)) return self.respond_error(resp, http_status.CONFLICT, error)
             return resp |> JSON(sprint_json(WatcherOk(), false), http_status.OK)
         }
+        POST("/api/v1/mailbox") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var request = WatcherMailboxPostRequest()
+            if (!sscan_json(string(req.body), request)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid mailbox JSON")
+            }
+            var result = watcher_mailbox_post(request)
+            if (!result.ok) return self.respond_error(resp, http_status.BAD_REQUEST, result.error)
+            self.maybe_notify_inbox_message(request.session_id,
+                request.direction, result.message_id, request.notify)
+            result.revision = watcher_mailbox_session_revision(request.session_id)
+            return resp |> JSON(sprint_json(result, false), http_status.CREATED)
+        }
+        POST("/api/v1/mailbox/state") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var request = WatcherMailboxStateRequest()
+            if (!sscan_json(string(req.body), request)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid mailbox state JSON")
+            }
+            let result = watcher_mailbox_set_state(request)
+            if (!result.ok) return self.respond_error(resp, http_status.BAD_REQUEST, result.error)
+            return resp |> JSON(sprint_json(result, false), http_status.OK)
+        }
     }
 
     def find_client(channel : WebSocketChannel) : int {
@@ -372,6 +452,21 @@ class DasHerdWatcherServer : HvWebServer {
         if (!force && client.repository_revision == revision) return
         client.repository_revision = revision
         send(client.channel, "\{\"type\":\"repositories\",\"data\":{repository_list_json()}\}",
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def send_mailbox(var client : WatcherClient?; force : bool = false) {
+        if (client == null || empty(client.session_id)) return
+        let revision = watcher_mailbox_session_revision(client.session_id)
+        if (revision < 0l) {
+            send_error(client.channel, "unknown session")
+            return
+        }
+        if (!force && client.mailbox_revision == revision) return
+        client.mailbox_revision = revision
+        send(client.channel, "\{\"type\":\"mailbox\",\"session_id\":" +
+            "{sprint_json(client.session_id, false)},\"revision\":{revision},\"data\":" +
+            "{watcher_mailbox_json(client.session_id)}\}",
             ws_opcode.WS_OPCODE_TEXT, true)
     }
 
@@ -861,7 +956,7 @@ class DasHerdWatcherServer : HvWebServer {
     def override onWsMessage(channel : WebSocketChannel; message : string#) {
         let index = find_client(channel)
         if (index < 0) return
-        var inscope incoming : WatcherWsMessage
+        var inscope incoming = WatcherWsMessage()
         if (length(message) > MAX_REQUEST_BODY_BYTES || !sscan_json(string(message), incoming)) {
             send_error(channel, "invalid WebSocket message")
             return
@@ -906,6 +1001,37 @@ class DasHerdWatcherServer : HvWebServer {
             self.start_git_file_action(client, incoming)
         } elif (incoming.op == "file_inspect") {
             self.start_file_inspection(client, incoming)
+        } elif (incoming.op == "mailbox_post") {
+            let request = WatcherMailboxPostRequest(
+                session_id = incoming.session_id,
+                direction = incoming.direction,
+                sender = incoming.sender,
+                kind = incoming.kind,
+                subject = incoming.subject,
+                reply_to = incoming.reply_to,
+                notify = incoming.notify,
+                focus := incoming.focus)
+            var result = watcher_mailbox_post(request)
+            if (!result.ok) {
+                send_error(channel, result.error)
+                return
+            }
+            self.maybe_notify_inbox_message(request.session_id,
+                request.direction, result.message_id, request.notify)
+            result.revision = watcher_mailbox_session_revision(request.session_id)
+            send(channel, "\{\"type\":\"mailbox_posted\",\"message_id\":" +
+                "{sprint_json(result.message_id, false)},\"revision\":{result.revision}\}",
+                ws_opcode.WS_OPCODE_TEXT, true)
+            self.send_mailbox(client, true)
+        } elif (incoming.op == "mailbox_state") {
+            let result = watcher_mailbox_set_state(WatcherMailboxStateRequest(
+                session_id = incoming.session_id,
+                message_id = incoming.message_id, status = incoming.status))
+            if (!result.ok) {
+                send_error(channel, result.error)
+                return
+            }
+            self.send_mailbox(client, true)
         } elif (incoming.op == "launch") {
             var inscope launch = WatcherLaunchRequest(
                 command_line = incoming.command_line, cwd = incoming.cwd,
@@ -944,6 +1070,7 @@ class DasHerdWatcherServer : HvWebServer {
                 ws_opcode.WS_OPCODE_TEXT, true)
             send_snapshot(client, true)
             send_raw_output(client)
+            self.send_mailbox(client, true)
         } elif (incoming.op == "detach") {
             detach(client, "client_detached")
             send(channel, "\{\"type\":\"detached\"\}", ws_opcode.WS_OPCODE_TEXT, true)
@@ -987,6 +1114,7 @@ class DasHerdWatcherServer : HvWebServer {
             send_snapshot(client)
             send_raw_output(client)
             send_repositories(client)
+            send_mailbox(client)
             self.poll_git_file_action(client)
             self.poll_file_inspection(client)
         }
