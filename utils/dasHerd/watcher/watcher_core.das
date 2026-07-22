@@ -440,8 +440,9 @@ def public watcher_output_text(session_id : string) : string {
 def public watcher_strip_terminal_controls(value : string) : string {
     // Task processes launched through ConPTY are wrapped in cursor, screen,
     // title, and mode sequences even when the child itself emits plain text.
-    // Machine consumers need the original printable byte stream, not a
-    // bounded reconstructed screen.
+    // Machine consumers need the printable byte stream, not a bounded screen;
+    // cursor moves are intentionally normalized into spaces/newlines so
+    // ConPTY-expanded field and record separators remain machine-parseable.
     var inscope output : array<uint8>
     output |> reserve(length(value))
     var state = 0 // 0=text, 1=ESC, 2=CSI, 3=OSC, 4=OSC ESC, 5=ST string, 6=ST ESC
@@ -452,6 +453,9 @@ def public watcher_strip_terminal_controls(value : string) : string {
     var csi_has_second = false
     var cursor_row = 1
     var cursor_column = 1
+    var utf8_codepoint = 0u
+    var utf8_minimum = 0u
+    var utf8_remaining = 0
     peek_data(value) $(bytes) {
         for (index in range(length(value))) {
             let byte = int(bytes[index])
@@ -463,10 +467,41 @@ def public watcher_strip_terminal_controls(value : string) : string {
                     output |> push(uint8(byte))
                     if (byte == '\r') {
                         cursor_column = 1
+                        utf8_remaining = 0
                     } elif (byte == '\n') {
                         cursor_row++
-                    } else {
+                        utf8_remaining = 0
+                    } elif (byte < 0x80) {
                         cursor_column++
+                        utf8_remaining = 0
+                    } elif (utf8_remaining > 0 && (byte & 0xc0) == 0x80) {
+                        utf8_codepoint = (utf8_codepoint << 6u) | uint(byte & 0x3f)
+                        utf8_remaining--
+                        if (utf8_remaining == 0) {
+                            let valid = (utf8_codepoint >= utf8_minimum &&
+                                utf8_codepoint <= 0x10ffffu &&
+                                !(utf8_codepoint >= 0xd800u && utf8_codepoint <= 0xdfffu))
+                            cursor_column += terminal_codepoint_width(
+                                valid ? utf8_codepoint : 0xfffdu)
+                        }
+                    } else {
+                        if (utf8_remaining > 0) cursor_column++
+                        if ((byte & 0xe0) == 0xc0) {
+                            utf8_codepoint = uint(byte & 0x1f)
+                            utf8_minimum = 0x80u
+                            utf8_remaining = 1
+                        } elif ((byte & 0xf0) == 0xe0) {
+                            utf8_codepoint = uint(byte & 0x0f)
+                            utf8_minimum = 0x800u
+                            utf8_remaining = 2
+                        } elif ((byte & 0xf8) == 0xf0) {
+                            utf8_codepoint = uint(byte & 0x07)
+                            utf8_minimum = 0x10000u
+                            utf8_remaining = 3
+                        } else {
+                            cursor_column++
+                            utf8_remaining = 0
+                        }
                     }
                 }
             } elif (state == 1) {

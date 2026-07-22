@@ -50,20 +50,12 @@ struct GitTreeModel {
     }
 }
 
-def private graph_byte(value : string; index : int) : int {
-    var result = 0
-    peek_data(value) $(bytes) {
-        if (index >= 0 && index < length(value)) {
-            result = int(bytes[index])
-        }
-    }
-    return result
-}
-
 def public git_tree_color_slot(identity : string) : int {
     var value = 2166136261u
-    for (index in range(length(identity))) {
-        value = (value ^ uint(graph_byte(identity, index))) * 16777619u
+    peek_data(identity) $(bytes) {
+        for (index in range(length(identity))) {
+            value = (value ^ uint(bytes[index])) * 16777619u
+        }
     }
     return int(value % 12u)
 }

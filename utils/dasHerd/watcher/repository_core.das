@@ -1563,18 +1563,22 @@ def private count_untracked_lines(worktree_path, relative_path : string;
 
 def public repository_apply_working_numstat(text : string; worktree_path : string;
                                             var files : array<GitFileState>) {
+    var inscope file_by_path : table<string; int>
+    for (index in range(length(files))) {
+        if (files[index].worktree_path == worktree_path) {
+            file_by_path[files[index].path] = index
+        }
+    }
     for (raw_line in split(text, "\n")) {
         var parsed = GitNumstatLine()
         if (!parse_numstat_line(trim_cr(raw_line), parsed)) continue
-        for (file in files) {
-            if (file.worktree_path == worktree_path && file.path == parsed.path) {
-                file.added_lines = parsed.added_lines
-                file.deleted_lines = parsed.deleted_lines
-                file.stats_known = parsed.known
-                file.binary = parsed.binary
-                break
-            }
-        }
+        if (!key_exists(file_by_path, parsed.path)) continue
+        let file_index = file_by_path?[parsed.path] ?? -1
+        if (file_index < 0) continue
+        files[file_index].added_lines = parsed.added_lines
+        files[file_index].deleted_lines = parsed.deleted_lines
+        files[file_index].stats_known = parsed.known
+        files[file_index].binary = parsed.binary
     }
     for (file in files) {
         if (file.worktree_path != worktree_path || file.code != "??") continue

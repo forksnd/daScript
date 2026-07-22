@@ -334,6 +334,10 @@ def private is_wide(value : uint) : bool {
         in_range(value, 0x20000u, 0x3fffdu))
 }
 
+def public terminal_codepoint_width(value : uint) : int {
+    return is_combining(value) ? 0 : (is_wide(value) ? 2 : 1)
+}
+
 def private indexed_color(index : int) : TerminalColor {
     return TerminalColor(kind = TerminalColorKind.indexed, index = clamp(index, 0, 255))
 }
@@ -594,9 +598,10 @@ def private put_grapheme(var terminal : Terminal; grapheme : string;
 }
 
 def private process_codepoint(var terminal : Terminal; codepoint : uint) {
-    let combining = is_combining(codepoint)
+    let width = terminal_codepoint_width(codepoint)
+    let combining = width == 0
     put_grapheme(terminal, codepoint_utf8(codepoint),
-        combining ? 0 : (is_wide(codepoint) ? 2 : 1), combining)
+        width, combining)
 }
 
 def private finish_utf8(var terminal : Terminal; valid_ : bool) {

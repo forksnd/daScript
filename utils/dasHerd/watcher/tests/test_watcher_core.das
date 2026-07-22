@@ -37,6 +37,15 @@ def test_watcher_machine_output(t : T?) {
         let unicode_wrapped = "{esc}[31mΚαλημέρα, мир, こんにちは, 🐑{esc}[0m"
         t |> equal(watcher_strip_terminal_controls(unicode_wrapped),
             "Καλημέρα, мир, こんにちは, 🐑")
+        let e_acute : string = to_char(int(0xc3)) + to_char(int(0xa9))
+        t |> equal(watcher_strip_terminal_controls(e_acute + esc + "[5Gx"),
+            e_acute + "   x", "UTF-8 continuation bytes do not consume terminal columns")
+        let wide_cjk : string = to_char(int(0xe7)) + to_char(int(0x95)) + to_char(int(0x8c))
+        t |> equal(watcher_strip_terminal_controls(wide_cjk + esc + "[5Gx"),
+            wide_cjk + "  x", "wide Unicode codepoints consume two terminal columns")
+        let combining_acute : string = to_char(int(0xcc)) + to_char(int(0x81))
+        t |> equal(watcher_strip_terminal_controls("e" + combining_acute + esc + "[5Gx"),
+            "e" + combining_acute + "   x", "combining codepoints do not consume a terminal column")
     }
 }
 
