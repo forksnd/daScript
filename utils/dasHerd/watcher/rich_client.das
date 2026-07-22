@@ -157,6 +157,8 @@ let INSPECTOR_CONTEXT_VALUES : array<string> <- [
 let TREE_FILTER_LABELS : array<string> <- ["Auto", "All"]
 
 struct private GitInspectorState {
+    // Request identity changes immediately when the user picks a file. The
+    // installed identity changes only when its prepared document is ready.
     request_id : int
     repository_id : string
     worktree_path : string
@@ -164,6 +166,16 @@ struct private GitInspectorState {
     comparison : string
     git_revision : string
     diff_context : string = "compact"
+    installed_repository_id : string
+    installed_worktree_path : string
+    installed_file_path : string
+    installed_comparison : string
+    installed_git_revision : string
+    installed_diff_context : string = "compact"
+    installed_diff_context_choice : int
+    installed_syntax_choice : int
+    prepare_language : string
+    pending_select_diff : bool
     task_session_id : string
     loading : bool
     status : string
@@ -262,7 +274,8 @@ var private GIT_CHANGELIST_STATUS_TEXT : NarrativeState
 var private GIT_ACTIVITY_STATUS_TEXT : NarrativeState
 var private GIT_CHANGELIST_STATUS_SEPARATOR : EmptyMarkerState
 var private GIT_ACTIVITY_STATUS_SEPARATOR : EmptyMarkerState
-var private INSPECTOR_CONNECTION_ERROR : NarrativeState
+var private INSPECTOR_STATUS_TEXT : NarrativeState
+var private INSPECTOR_STATUS_SEPARATOR : EmptyMarkerState
 
 def private setup_default_layout(dock_id : uint) {
     DockBuilderRemoveNode(dock_id)
@@ -359,13 +372,13 @@ def private release_inspector_content() {
 def private queue_inspector_prepare(status : string) {
     let choice = clamp(g_inspector.syntax_choice, 0,
         length(INSPECTOR_SYNTAX_VALUES) - 1)
-    g_inspector.resolved_language = inspector_language_for_path(
+    g_inspector.prepare_language = inspector_language_for_path(
         g_inspector.file_path, INSPECTOR_SYNTAX_VALUES[choice])
     let generation = inspector_load_queue(g_inspector.prepare, status)
     g_inspector.error = ""
     if (!inspector_prepare_worker_queue(g_prepare_worker, generation,
             g_inspector.source_patch, g_inspector.source_view_text,
-            g_inspector.resolved_language, g_inspector.source_view_base64,
+            g_inspector.prepare_language, g_inspector.source_view_base64,
             g_inspector.source_view_byte_count,
             g_inspector.source_view_available)) {
         let failure = "File inspection preparation worker is unavailable"
@@ -422,6 +435,22 @@ def private drain_inspector_prepare_events() {
             g_inspector.changed_source_ranges <- event.changed_source_ranges
             g_inspector.view_source = clone_string(event.view_source)
             g_inspector.view_prepared = !g_inspector.parsed.binary
+            g_inspector.installed_repository_id = g_inspector.repository_id
+            g_inspector.installed_worktree_path = g_inspector.worktree_path
+            g_inspector.installed_file_path = g_inspector.file_path
+            g_inspector.installed_comparison = g_inspector.comparison
+            g_inspector.installed_git_revision = g_inspector.git_revision
+            g_inspector.installed_diff_context = g_inspector.diff_context
+            g_inspector.installed_diff_context_choice = g_inspector.diff_context_choice
+            g_inspector.installed_syntax_choice = g_inspector.syntax_choice
+            g_inspector.resolved_language = g_inspector.prepare_language
+            DIFF_CONTEXT.value = g_inspector.installed_diff_context_choice
+            DIFF_SYNTAX.value = g_inspector.installed_syntax_choice
+            if (g_inspector.pending_select_diff) {
+                g_inspector.mode = GitInspectorMode.diff
+                INSPECTOR_DIFF_TAB.pending_select = true
+            }
+            g_inspector.pending_select_diff = false
             upload_inspector_preview(
                 unsafe(reinterpret<InspectorPrepareEvent const#>(event)))
             g_inspector.error = ""
@@ -434,7 +463,7 @@ def private begin_file_inspection(repository_id, worktree_path, file_path,
                                   comparison, diff_context : string;
                                   git_revision : string = "") {
     let same_identity = g_inspector.repository_id == repository_id && g_inspector.worktree_path == worktree_path && g_inspector.file_path == file_path && g_inspector.comparison == comparison && g_inspector.git_revision == git_revision
-    let same_content = g_inspector.prepare.has_retained_content && same_identity
+    let retained_content = g_inspector.prepare.has_retained_content
     g_inspector.request_id++
     g_inspector.repository_id = repository_id
     g_inspector.worktree_path = worktree_path
@@ -448,29 +477,23 @@ def private begin_file_inspection(repository_id, worktree_path, file_path,
     } elif (diff_context == "full") {
         g_inspector.diff_context_choice = 2
     }
-    DIFF_CONTEXT.value = g_inspector.diff_context_choice
     g_inspector.task_session_id = ""
     g_inspector.loading = true
     g_inspector.status = "Requesting diff..."
     g_inspector.error = ""
     if (!same_identity) {
-        g_inspector.source_patch = ""
-        g_inspector.source_view_text = ""
-        g_inspector.source_view_base64 = ""
-        g_inspector.source_view_byte_count = 0
-        g_inspector.source_view_available = false
         g_inspector.syntax_choice = 0
-        g_inspector.resolved_language = inspector_language_for_path(file_path)
-        DIFF_SYNTAX.value = 0
+        g_inspector.prepare_language = inspector_language_for_path(file_path)
     }
-    if (same_content) {
+    g_inspector.pending_select_diff = !same_identity
+    if (retained_content) {
         inspector_load_supersede(g_inspector.prepare, "Requesting diff...")
     } else {
         release_inspector_content()
         inspector_load_reset(g_inspector.prepare)
+        g_inspector.mode = GitInspectorMode.diff
+        INSPECTOR_DIFF_TAB.pending_select = true
     }
-    g_inspector.mode = GitInspectorMode.diff
-    INSPECTOR_DIFF_TAB.pending_select = true
 }
 
 class private WatcherRichClient : HvWebSocketClient {
@@ -2053,28 +2076,39 @@ def private draw_side_by_side_diff() {
     }
     let hunk_count = length(g_inspector.parsed.hunks)
     g_inspector.diff_current_hunk = hunk_count > 0 ? clamp(g_inspector.diff_current_hunk, 0, hunk_count - 1) : 0
-    SetNextItemWidth(150.0f)
-    combo(DIFF_CONTEXT,
-        (text = "Context", items <- INSPECTOR_CONTEXT_LABELS))
+    let replacement_busy = (g_inspector.loading
+        || g_inspector.prepare.request != InspectorRequestState.idle)
+    with_disabled(replacement_busy) {
+        SetNextItemWidth(150.0f)
+        combo(DIFF_CONTEXT,
+            (text = "Context", items <- INSPECTOR_CONTEXT_LABELS))
+        same_line()
+        SetNextItemWidth(150.0f)
+        combo(DIFF_SYNTAX, (text = "Syntax", items <- INSPECTOR_SYNTAX_LABELS))
+    }
     let selected_context = clamp(DIFF_CONTEXT.value, 0,
         length(INSPECTOR_CONTEXT_VALUES) - 1)
-    if (selected_context != g_inspector.diff_context_choice
+    if (!replacement_busy
+            && selected_context != g_inspector.installed_diff_context_choice
             && g_client != null && g_client.connected) {
-        g_client->inspect_file(g_inspector.repository_id,
-            g_inspector.worktree_path, g_inspector.file_path,
-            g_inspector.comparison, INSPECTOR_CONTEXT_VALUES[selected_context],
-            g_inspector.git_revision)
+        g_client->inspect_file(g_inspector.installed_repository_id,
+            g_inspector.installed_worktree_path, g_inspector.installed_file_path,
+            g_inspector.installed_comparison, INSPECTOR_CONTEXT_VALUES[selected_context],
+            g_inspector.installed_git_revision)
     }
-    same_line()
-    SetNextItemWidth(150.0f)
-    combo(DIFF_SYNTAX, (text = "Syntax", items <- INSPECTOR_SYNTAX_LABELS))
     let selected_syntax = clamp(DIFF_SYNTAX.value, 0,
         length(INSPECTOR_SYNTAX_VALUES) - 1)
-    if (selected_syntax != g_inspector.syntax_choice) {
+    if (!replacement_busy
+            && selected_syntax != g_inspector.installed_syntax_choice) {
+        g_inspector.repository_id = g_inspector.installed_repository_id
+        g_inspector.worktree_path = g_inspector.installed_worktree_path
+        g_inspector.file_path = g_inspector.installed_file_path
+        g_inspector.comparison = g_inspector.installed_comparison
+        g_inspector.git_revision = g_inspector.installed_git_revision
+        g_inspector.diff_context = g_inspector.installed_diff_context
+        g_inspector.diff_context_choice = g_inspector.installed_diff_context_choice
         g_inspector.syntax_choice = selected_syntax
-        g_inspector.resolved_language = inspector_language_for_path(
-            g_inspector.file_path,
-            INSPECTOR_SYNTAX_VALUES[g_inspector.syntax_choice])
+        g_inspector.pending_select_diff = false
         if (!empty(g_inspector.source_patch)) {
             queue_inspector_prepare("Applying syntax...")
         }
@@ -2520,13 +2554,20 @@ def herder_git_file_action(input : JsonValue?) : JsonValue? {
 def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
     let view_selection = text_source_view_selection(g_inspector.view)
     return JV((
-        ok = !empty(g_inspector.file_path) && !g_inspector.loading
-            && empty(g_inspector.error),
+        ok = g_inspector.prepare.has_retained_content,
         repository_id = g_inspector.repository_id,
         worktree_path = g_inspector.worktree_path,
         file_path = g_inspector.file_path,
         comparison = g_inspector.comparison,
         git_revision = g_inspector.git_revision,
+        installed_repository_id = g_inspector.installed_repository_id,
+        installed_worktree_path = g_inspector.installed_worktree_path,
+        installed_file_path = g_inspector.installed_file_path,
+        installed_comparison = g_inspector.installed_comparison,
+        installed_git_revision = g_inspector.installed_git_revision,
+        installed_diff_context = g_inspector.installed_diff_context,
+        replacement_busy = (g_inspector.loading
+            || g_inspector.prepare.request != InspectorRequestState.idle),
         zoom_percent = g_zoom_percent,
         diff_context = g_inspector.diff_context,
         diff_context_choice = g_inspector.diff_context_choice,
@@ -2554,6 +2595,7 @@ def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
         diff_right_rect = g_inspector.diff_right_rect,
         diff_scrollbar_rect = g_inspector.diff_scrollbar_rect,
         syntax_choice = g_inspector.syntax_choice,
+        installed_syntax_choice = g_inspector.installed_syntax_choice,
         resolved_language = g_inspector.resolved_language,
         binary = g_inspector.parsed.binary,
         preview_texture_ready = g_inspector.preview_texture != 0u,
@@ -2672,43 +2714,51 @@ def herder_file_inspector_mode(input : JsonValue?) : JsonValue? {
     return JV((ok = true, mode = mode))
 }
 
-def private draw_file_inspector_window() {
+def private file_inspector_status() : GitWindowStatus {
+    if (g_client == null || !g_client.connected) {
+        return GitWindowStatus(text = "WATCHER DISCONNECTED - reconnecting...", error = true)
+    }
+    let retained = g_inspector.prepare.has_retained_content
+    let showing = retained ? " - showing {g_inspector.installed_file_path}" : ""
+    if (g_inspector.loading) {
+        let phase = empty(g_inspector.status) ? "Reading Git diff..." : g_inspector.status
+        return GitWindowStatus(
+            text = "LOADING {g_inspector.file_path} - {phase}{showing}", busy = true)
+    }
+    if (g_inspector.prepare.request != InspectorRequestState.idle) {
+        let phase = (empty(g_inspector.prepare.status)
+            ? "Preparing view..." : g_inspector.prepare.status)
+        return GitWindowStatus(
+            text = "PREPARING {g_inspector.file_path} - {phase}{showing}", busy = true)
+    }
+    if (!empty(g_inspector.error)) {
+        let task = (empty(g_inspector.task_session_id)
+            ? "" : "   TASK {g_inspector.task_session_id}")
+        return GitWindowStatus(
+            text = "FAILED {g_inspector.file_path} - {g_inspector.error}{showing}{task}", error = true)
+    }
+    if (retained) {
+        return GitWindowStatus(text = "{to_upper(g_inspector.installed_comparison)}  {g_inspector.installed_file_path}   HUNKS {length(g_inspector.parsed.hunks)}   PREP {g_inspector.prepare_elapsed_usec / 1000l} ms")
+    }
+    return GitWindowStatus(text = "Select a changed file")
+}
+
+def private draw_file_inspector_content() {
     let io & = unsafe(GetIO())
     if (IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows) && io.KeyCtrl) {
         if (io.MouseWheel > 0.0f) zoom_by(5)
         elif (io.MouseWheel < 0.0f) zoom_by(-5)
     }
-    if (g_client == null || !g_client.connected) {
-        text_colored(INSPECTOR_CONNECTION_ERROR,
-            (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
-            text = "WATCHER DISCONNECTED - reconnecting..."))
-    }
-    if (empty(g_inspector.file_path)) {
-        text_disabled("Select a changed file")
+    if (!g_inspector.prepare.has_retained_content) {
+        if (empty(g_inspector.file_path)) {
+            text_disabled("Select a changed file")
+        }
         return
     }
-    text(INSPECTOR_PATH, (text = g_inspector.file_path))
+    text(INSPECTOR_PATH, (text = g_inspector.installed_file_path))
     same_line()
-    text_disabled(INSPECTOR_SCOPE, (text = to_upper(g_inspector.comparison)))
-    if (g_inspector.loading) {
-        text_disabled(INSPECTOR_LOADING,
-            (text = empty(g_inspector.status) ? "Loading diff..." : g_inspector.status))
-        if (!g_inspector.prepare.has_retained_content) return
-    }
-    if (!empty(g_inspector.error)) {
-        text_colored(INSPECTOR_ERROR,
-            (color = float4(1.0f, 0.35f, 0.30f, 1.0f), text = g_inspector.error))
-        if (!empty(g_inspector.task_session_id)) {
-            text_disabled("Task: {g_inspector.task_session_id}")
-        }
-        if (!g_inspector.prepare.has_retained_content) return
-    }
-    if (g_inspector.prepare.request != InspectorRequestState.idle) {
-        text_disabled(INSPECTOR_LOADING,
-            (text = empty(g_inspector.prepare.status)
-                ? "Preparing diff..." : g_inspector.prepare.status))
-        if (!g_inspector.prepare.has_retained_content) return
-    }
+    text_disabled(INSPECTOR_SCOPE,
+        (text = to_upper(g_inspector.installed_comparison)))
     tab_bar(INSPECTOR_MODE_TABS,
             (text = "InspectorModes", flags = ImGuiTabBarFlags.None)) {
         tab_item(INSPECTOR_DIFF_TAB, (text = "Diff", closable = false,
@@ -2722,6 +2772,19 @@ def private draw_file_inspector_window() {
             draw_file_view()
         }
     }
+}
+
+def private draw_file_inspector_window() {
+    child(FILE_INSPECTOR_CONTENT, (text = "inspector content",
+            size = float2(0.0f, -GetFrameHeightWithSpacing()),
+            child_flags = ImGuiChildFlags.None,
+            window_flags = ImGuiWindowFlags.None)) {
+        draw_file_inspector_content()
+    }
+    let status = file_inspector_status()
+    separator(INSPECTOR_STATUS_SEPARATOR)
+    text_colored(INSPECTOR_STATUS_TEXT,
+        (color = git_status_color(status), text = status.text))
 }
 
 def private draw_settings_window() {
