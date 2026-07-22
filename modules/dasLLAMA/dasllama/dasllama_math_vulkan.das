@@ -2895,6 +2895,10 @@ struct private ArenaFmt {
     y : HostBuf              // host-cached readback (the same-submit DMA lands here)
     y_dev : uint64
     ready : bool
+    // batch-GEMM scratch (prefill): shares g_gpu.batch_xq_dev/xs_dev/y1_dev; one set + meta per fmt
+    batch_set : VkDescriptorSet
+    batch_meta : HostBuf
+    batch_ready : bool
 }
 
 // per-block plane strides — the block is 32 weights for q8 and a 256-weight superblock for kq.
@@ -3688,6 +3692,76 @@ def vk_arena_ffn(var y : array<float>; blk1, blk3, blk2 : int64; n, nfe : int64;
         vk_check(vkEndCommandBuffer(raw), null)
         submit_wait(raw)
         memcpy(addr<void?>(y[0]), g_gpu.af_yo_host.mapped, int(n * 4l))
+    }
+}
+
+// single-region batch-GEMM meta over an arena block: all tiles map to region 0. Returns the
+// dispatch workgroup count. Mirrors fill_batch_meta for one region [0, npos).
+[unused_argument(fmt)]
+def private fill_arena_batch_meta(hb : HostBuf; n, d, blk, npos : int64; fmt : int) : uint {
+    let wtiles = (d + BATCH_TILE - 1l) / BATCH_TILE
+    let rtiles = (npos + BATCH_TILE - 1l) / BATCH_TILE
+    let total = rtiles * wtiles
+    unsafe {
+        var mp = reinterpret<uint?>(hb.mapped)
+        mp[0] = uint(n)
+        mp[1] = uint(d)
+        mp[2] = 1u          // one region
+        mp[3] = 8u          // map_off = 4 + nrc*4
+        mp[4] = uint(blk)   // arena block base (already in fmt units)
+        mp[5] = 0u          // rb0 - r0
+        mp[6] = uint(npos)  // cnt
+        mp[7] = 0u          // wg base
+        for (g in range64(total)) {
+            mp[8l + g] = 0u
+        }
+    }
+    return uint(total)
+}
+
+def private arena_ensure_batch(fmt : int) {
+    unsafe {
+        var a & = g_gpu.arenas[fmt]
+        if (a.batch_ready) {
+            return
+        }
+        ensure_batch_state()
+        a.batch_meta = make_host_buf(BATCH_META_BYTES, true)
+        a.batch_set = alloc_desc_set()
+        var writes : array<WriteDescriptorSet>
+        write_buf_desc(writes, a.batch_set, 0u, a.wqbuf, a.wqbytes)
+        write_buf_desc(writes, a.batch_set, 1u, a.wsbuf, a.wsbytes)
+        write_buf_desc(writes, a.batch_set, 2u, a.batch_meta.buf, BATCH_META_BYTES)
+        write_buf_desc(writes, a.batch_set, 3u, g_gpu.batch_xq_dev, BATCH_XQ_BYTES)
+        write_buf_desc(writes, a.batch_set, 4u, g_gpu.batch_xs_dev, BATCH_XS_BYTES)
+        write_buf_desc(writes, a.batch_set, 5u, g_gpu.batch_y1_dev, BATCH_Y_BYTES)
+        let no_copies : array<CopyDescriptorSet>
+        update_descriptor_sets(g_gpu.device, writes, no_copies)
+        a.batch_ready = true
+    }
+}
+
+//! Arena seam: batch GEMM of the [d x n] tensor at block `blk` against `npos` quantized activation
+//! rows (xq/xs, [npos x n]) into y[0..npos*d). The prefill twin of vk_arena_gemv (q8 only for now).
+def vk_arena_gemm(var y : array<float>; blk : int64; n, d, npos : int64; fmt : int; xq : array<int8>; xs : array<float>) {
+    verify(vk_moe_init())
+    assert(fmt == 0, "dasLLAMA vulkan arena_gemm: q8 only")
+    assert(npos * n <= BATCH_XQ_BYTES && npos * d * 4l <= BATCH_Y_BYTES, "arena_gemm: batch exceeds scratch")
+    arena_ensure_batch(fmt)
+    let groups = fill_arena_batch_meta(g_gpu.arenas[fmt].batch_meta, n, d, blk, npos, fmt)
+    unsafe {
+        upload_region_at(g_gpu.batch_xq_dev, 0l, addr<uint8 const?>(xq[0]), npos * n)
+        upload_region_at(g_gpu.batch_xs_dev, 0l, addr<uint8 const?>(xs[0]), npos * (n / 32l) * 4l)
+        var raw = alloc_cmd()
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw, begin), null)
+        cmd_bind_pipeline(vk_value_to_boost(raw), g_gpu.batch_pipeline, VkPipelineBindPoint.COMPUTE)
+        cmd_bind_dispatch(raw, g_gpu.arenas[fmt].batch_set, groups)
+        batch_barrier(raw, false)
+        cmd_copy_whole(raw, g_gpu.batch_y1_dev, g_gpu.batch_y1.buf, npos * d * 4l)
+        vk_check(vkEndCommandBuffer(raw), null)
+        submit_wait(raw)
+        memcpy(addr<void?>(y[0]), g_gpu.batch_y1.mapped, int(npos * d * 4l))
     }
 }
 

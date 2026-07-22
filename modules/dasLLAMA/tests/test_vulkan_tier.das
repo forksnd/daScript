@@ -2489,6 +2489,80 @@ def test_vulkan_decode_attn(t : T?) {
     }
 }
 
+// Arena batch GEMM (prefill twin of the arena GEMV): npos rows through q8_moe_batch against an
+// arena-resident plane, vs a CPU reference. Two tensors again so the block offset must be honored.
+[test]
+def test_vulkan_arena_gemm(t : T?) {
+    t |> run("vulkan arena batch GEMM == CPU reference (npos rows, distinct blocks)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let GROWS = 64l
+            let GNP = 40l    // npos, matches the existing batch arms (>= BATCH_TILE, unpadded)
+            if (!vk_arena_reserve(0, ARENA_BLOCKS)) {
+                feint("no Vulkan device; arena batch GEMM untestable here\n")
+                return
+            }
+            var wqa : array<int8>
+            var wsa : array<float>
+            var wqbv : array<int8>
+            var wsbv : array<float>
+            fill_stack(wqa, wsa, GROWS, N, 41l, false)
+            fill_stack(wqbv, wsbv, GROWS, N, 67l, false)
+            var pqa : array<uint8>
+            var psa : array<uint8>
+            var pqb : array<uint8>
+            var psb : array<uint8>
+            pack_upload(wqa, wsa, pqa, psa)
+            pack_upload(wqbv, wsbv, pqb, psb)
+            let gblk_a = vk_arena_place(pqa, psa, N, GROWS, 0)
+            let gblk_b = vk_arena_place(pqb, psb, N, GROWS, 0)
+            var xq : array<int8>
+            var xs : array<float>
+            fill_acts(xq, xs, GNP)
+            let nb = int(N / 32l)
+            for (arm in range(2)) {
+                let blk = arm == 0 ? gblk_a : gblk_b
+                var y : array<float>
+                y |> resize(int(GNP * GROWS))
+                vk_arena_gemm(y, blk, N, GROWS, GNP, 0, xq, xs)
+                var refy : array<float>
+                refy |> resize(int(GNP * GROWS))
+                for (r in range(int(GNP))) {
+                    for (col in range(int(GROWS))) {
+                        var acc = 0.0lf
+                        for (b in range(nb)) {
+                            var id = 0
+                            for (k in range(32)) {
+                                let wi = col * int(N) + b * 32 + k
+                                id += int(xq[r * int(N) + b * 32 + k]) * int(arm == 0 ? wqa[wi] : wqbv[wi])
+                            }
+                            let si = col * nb + b
+                            acc += double(arm == 0 ? wsa[si] : wsbv[si]) * double(xs[r * nb + b]) * double(id)
+                        }
+                        refy[r * int(GROWS) + col] = float(acc)
+                    }
+                }
+                let cg = compare_gout(y, refy)
+                t |> success(cg.maxdiff <= float(REL_TOL) * cg.maxref,
+                    "arena GEMM arm {arm} within tolerance (maxdiff {cg.maxdiff} vs {float(REL_TOL) * cg.maxref} bar)")
+                delete y
+                delete refy
+            }
+            delete wqa
+            delete wsa
+            delete wqbv
+            delete wsbv
+            delete pqa
+            delete psa
+            delete pqb
+            delete psb
+            delete xq
+            delete xs
+        } else {
+            feint("dasVulkan not installed; arena batch GEMM untestable here\n")
+        }
+    }
+}
+
 // The whole dense FFN against arena-resident planes: gate GEMV -> up GEMV -> fused act+requant ->
 // down GEMV, ONE submit. No new kernels — q8_moe_actrq is already region-free, so this is the
 // per-op chain with the weight base coming from an arena block index instead of a stack.
