@@ -211,5 +211,9 @@ def test_golden_disassembly(t : T?) {
         // cooperative matrix: the four KHR coopmat opcodes + the Vulkan memory model + 1.6 header.
         // byte-identical check() — visitor baseline, deterministic ids.
         check(t, "coopmat", coopmat_words())
+        // coopmat int8: s8xs8->s32 tile + the signed-components MulAdd operands mask
+        check(t, "coopmat_i8", coopmat_i8_words())
+        // coopmat load from @workgroup shared memory (Workgroup-storage access chain)
+        check(t, "coopmat_sm", coopmat_sm_words())
     }
 }
