@@ -32,7 +32,12 @@ def public prof_log_name() : string {
 // Machine-local model root; override with DASLLAMA_MODELS_DIR (the x64/handoff boxes).
 def models_dir() : string {
     let env = get_env_variable("DASLLAMA_MODELS_DIR")
-    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+    if (empty(env)) {
+        return "/Users/borisbatkin/Work/llama.cpp/models/"
+    }
+    // callers concat "{models_dir()}{file}" — guarantee the separator so a slashless override
+    // (DASLLAMA_MODELS_DIR=/models) doesn't silently skip every catalog file
+    return ends_with(env, "/") || ends_with(env, "\\") ? env : "{env}/"
 }
 
 // Short box tag baked into the JSON/TSV filenames (profile_llm_<box>.json). Override with DASLLAMA_BOX.
@@ -344,7 +349,9 @@ def private platform_os() : string {
     if (is_windows()) {
         return run_capture("ver", true)
     }
-    return "{run_capture("sw_vers -productName", true)} {run_capture("sw_vers -productVersion", true)}"
+    // sw_vers is macOS-only; on Linux both probes return "" and the join is a lone space —
+    // strip so empty()==true and the record stores "unknown" (or set DASLLAMA_OS on those boxes)
+    return strip("{run_capture("sw_vers -productName", true)} {run_capture("sw_vers -productVersion", true)}")
 }
 
 def private tune_row_str(r : TuneStatus) : string {

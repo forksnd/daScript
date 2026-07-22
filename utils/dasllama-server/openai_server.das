@@ -173,6 +173,7 @@ def private bench_worker(daslang_bin, lcpp_bin, model_path : string; threads : i
     let logs_dir = path_join(get_das_root(), "logs")
     mkdir_rec(logs_dir)   // the child writes its --json-path record here; a fresh checkout has no logs/
     let record_path = path_join(logs_dir, "server_bench_record.json")
+    remove(record_path)   // drop any prior run's record — a rc=0 child that wrote nothing must not read stale
     bench_emit(events, 0, "lcpp_bench A/B: das + llama-bench, pp512/tg128 x 3 reps (llama-bench methodology) — minutes-class, hold on")
     var out = ""
     var args <- [daslang_bin, "-jit", path_join(get_das_root(), "modules/dasLLAMA/benchmarks/lcpp_bench.das"), "--",
