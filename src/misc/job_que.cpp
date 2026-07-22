@@ -89,7 +89,7 @@ namespace das {
     static int jobque_thread_count(int hw) {
         static int forced = []{
             const char * e = getenv("DAS_JOBQUE_THREADS");
-            if ( !e ) return 0;
+            if ( !e || !*e ) return 0;   // exported-but-empty behaves like unset (CI environments do this)
             int v = atoi(e);
             if ( v <= 1 ) {
                 DAS_FATAL_ERROR("DAS_JOBQUE_THREADS='%s': value is TOTAL compute lanes (N-1 workers + the computing main) and must be >= 2; unset it for the default\n", e);

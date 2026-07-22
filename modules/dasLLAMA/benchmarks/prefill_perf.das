@@ -111,7 +111,7 @@ def main {
         if (has_env_variable("DASLLAMA_TOKEN_BLOCK")) {   // A/B the batch-GEMM token block (weights re-stream ntok/TB times)
             let tb = to_int(get_env_variable("DASLLAMA_TOKEN_BLOCK"))
             set_q8_token_block(int64(tb))
-            print("q8_token_block override: {tb}\n")
+            print("q8_token_block override: {get_q8_token_block()}\n")   // the EFFECTIVE value (setter clamps to >= 1)
         }
         if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV")) {
             let mgv = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV"))
