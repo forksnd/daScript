@@ -2021,11 +2021,16 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
         need[fi] = (need?[fi] ?? 0l) + rdec_blocks_for(pl.n, pl.rows, pl.f)
     }
     delete planes
+    var reserve_ok = true
     for (fmt, blocks in keys(need), values(need)) {
         if (!rdec_reserve(fmt, blocks)) {
             to_log(LOG_WARNING, "dasLLAMA: resident driver — arena reserve failed (fmt {fmt}, {blocks} blocks)\n")
-            return false
+            reserve_ok = false
         }
+    }
+    delete need
+    if (!reserve_ok) {
+        return false
     }
     let repacked = kernel_backend_needs_repack(active_kernel_backend())
     let mr = repacked ? active_q8_layout_mr() : 1l
@@ -2044,11 +2049,20 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
         let b1 = resident_place(t, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, hid0, mr, kg, wb)
         let b3 = resident_place(t, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, hid0, mr, kg, wb)
         let b2 = resident_place(t, fmt_at(t.w2_fmt, l), t.w2_offs[l], hid0, dim, mr, kg, wb)
+        // a placement can fail (arena exhausted); fail closed to the CPU loop rather than wire a -1 block
+        if (bq < 0l || bk < 0l || bv < 0l || bo < 0l || b1 < 0l || b3 < 0l || b2 < 0l) {
+            to_log(LOG_WARNING, "dasLLAMA: resident driver — arena placement failed at layer {l}, declining\n")
+            return false
+        }
         rdec_set_layer(l, bq, bk, bv, bo, b1, b3, b2,
             int(fmt_at(t.wq_fmt, l)), int(fmt_at(t.wk_fmt, l)), int(fmt_at(t.wv_fmt, l)), int(fmt_at(t.wo_fmt, l)),
             int(fmt_at(t.w1_fmt, l)), int(fmt_at(t.w3_fmt, l)), int(fmt_at(t.w2_fmt, l)))
     }
     let bcls = resident_place(t, cls_fmt, t.wcls_off, dim, c.vocab_size, mr, kg, wb)
+    if (bcls < 0l) {
+        to_log(LOG_WARNING, "dasLLAMA: resident driver — classifier placement failed, declining\n")
+        return false
+    }
     rdec_set_cls(bcls, int(cls_fmt))
     // upload the norm rows: [rms_att[l], rms_ffn[l]] x L, then rms_final
     var norms : array<float>

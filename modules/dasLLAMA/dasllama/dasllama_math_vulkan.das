@@ -1060,7 +1060,7 @@ def at_attn {
 
 var @workgroup ar_row : float[4096]   // AR_MAX_DIM — staged so the reread after the reduce needs
                                       // no device-memory barrier (barrier() is a workgroup fence)
-var @workgroup ar_part : float[32]    // one partial per subgroup (32 covers subgroup size >= 8)
+var @workgroup ar_part : float[64]    // one partial per subgroup — 64 covers subgroupSize >= 4 (256/4), the Vulkan floor
 var @workgroup ar_inv : float[1]
 
 [compute_shader(local_size_x=256, name="ar_add_rms_spv")]
@@ -1194,7 +1194,7 @@ def rope_kv_store {
 // barrier. Low-occupancy — split-K next. meta 0=cnt 2=kvd 3=hs 4=kv_mul; scale vk_xs[0].
 var @workgroup da_q : float[256]      // this head's query row (hs <= 256)
 var @workgroup da_sc : float[4096]    // per-position scores (DA_MAX_CNT)
-var @workgroup da_part : float[8]     // per-subgroup reduction partials
+var @workgroup da_part : float[64]    // per-subgroup partials — 64 covers subgroupSize >= 4 (was [8], OOB on subgroupSize < 32, e.g. Intel 16)
 var @workgroup da_ml : float[2]       // [0] = row max, [1] = softmax denom
 
 [compute_shader(local_size_x=256, name="da_attn_spv")]
@@ -3018,6 +3018,10 @@ def private arena_blocks_for(n, rows : int64; fmt : int) : int64 {
 // every tensor's shape from Model metadata before a byte moves, so it either fits or declines.
 def private arena_reserve(fmt : int; cap_blocks : int64) : bool {
     if (key_exists(g_gpu.arenas, fmt)) {
+        // model reload: reset the bump cursor so it overwrites; an oversized reload then trips arena_place's -1 (decline to CPU) rather than overflowing
+        unsafe {
+            g_gpu.arenas[fmt].blocks = 0l
+        }
         return true
     }
     let bb = arena_block_bytes(fmt)
@@ -3477,6 +3481,12 @@ def private arena_planes(fmt : int) : tuple<wq : uint64; ws : uint64; wqb : int6
 def vk_rdec_prepare(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64;
                     neox : bool; eps, scale : float) : bool {
     if (!vk_moe_init()) {
+        return false
+    }
+    // the shaders index the KV mirror with 32-bit uint meta offsets and the buffer must fit a 2GiB
+    // shard — a huge seq_cap would overflow both. The budget gate should decline first; guard anyway.
+    if (n_layers * seq_cap * kv_dim > 2_000_000_000l) {
+        to_log(LOG_WARNING, "dasLLAMA vulkan resident: KV mirror ({n_layers} x {seq_cap} x {kv_dim}) exceeds 32-bit index / 2GiB shard\n")
         return false
     }
     g_rd = new RDec(ready = false, n_layers = n_layers, dim = dim, qd = qd, kv_dim = kv_dim,
