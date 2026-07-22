@@ -292,7 +292,7 @@ def private prepare_worker_main(var jobs : Channel?&;
             var changed_ranges : array<TextSourceRange>
             var view_source = ""
             var view_text_ready = false
-            var decoded_view_bytes : array<uint8>
+            var inscope decoded_view_bytes : array<uint8>
             var preview_pixels : array<uint8>
             var preview_width = 0
             var preview_height = 0
