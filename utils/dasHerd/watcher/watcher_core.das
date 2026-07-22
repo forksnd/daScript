@@ -841,8 +841,10 @@ def private append_mailbox_record(var session : WatcherSession?;
     fflush(session.mailbox_file)
 }
 
-def public watcher_mailbox_revision : int64 {
-    return g_mailbox_revision
+def public watcher_mailbox_session_revision(session_id : string) : int64 {
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return -1l
+    return g_sessions[index].mailbox_revision
 }
 
 def public watcher_mailbox_post(request : WatcherMailboxPostRequest) : WatcherMailboxResult {
@@ -858,7 +860,7 @@ def public watcher_mailbox_post(request : WatcherMailboxPostRequest) : WatcherMa
     if (!empty(focus_error)) return WatcherMailboxResult(error = focus_error)
     let sender = (request.direction == "outbox"
         ? "agent_session:{request.session_id}"
-        : (request.sender == "system:dasHerd" ? request.sender : "human:local"))
+        : "human:local")
     g_next_mailbox_id++
     g_mailbox_revision++
     var message = WatcherMailboxMessage(

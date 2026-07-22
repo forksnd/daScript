@@ -241,14 +241,20 @@ def test_watcher_process_lifecycle(t : T?) {
             command_line = "powershell.exe -NoProfile -Command \"Start-Sleep -Seconds 5\"",
             cwd = root, columns = 80, rows = 20, timeout_ms = 10000l))
         t |> success(controlled.ok, controlled.error)
+        let quick_mailbox_revision = watcher_mailbox_session_revision(quick.session_id)
+        t |> equal(watcher_mailbox_session_revision(controlled.session_id), 0l,
+            "a new session starts with an independent mailbox revision")
         t |> success(watcher_claim_controller(controlled.session_id, 11), "first controller claims lease")
         t |> success(!watcher_claim_controller(controlled.session_id, 12), "second controller is rejected")
         watcher_release_controller(controlled.session_id, 11, "test_detach")
         t |> success(watcher_claim_controller(controlled.session_id, 12), "released lease can be reclaimed")
         let queued_message = watcher_mailbox_post(WatcherMailboxPostRequest(
             session_id = controlled.session_id, direction = "inbox",
-            sender = "untrusted-payload-sender", subject = "Look at that"))
+            sender = "system:dasHerd", subject = "Look at that"))
         t |> success(queued_message.ok, queued_message.error)
+        t |> equal(watcher_mailbox_session_revision(quick.session_id),
+            quick_mailbox_revision,
+            "mailbox activity does not change another session's revision")
         t |> equal(watcher_input(controlled.session_id, "partial", 12), "")
         t |> equal(watcher_notify(controlled.session_id, "nudge\r",
             queued_message.message_id), "queued",
@@ -257,7 +263,7 @@ def test_watcher_process_lifecycle(t : T?) {
             controlled.session_id, "inbox", queued_message.message_id)
         t |> success(find(queued_json, "\"sender\":\"human:local\"") >= 0
                 && find(queued_json, "\"notification_error\":\"queued\"") >= 0,
-            "queued notification and server-assigned human provenance are visible")
+            "queued notification and reserved system provenance cannot be spoofed")
         t |> equal(watcher_input(controlled.session_id, "\r", 12), "")
         let delivered_json = watcher_mailbox_json(
             controlled.session_id, "inbox", queued_message.message_id)

@@ -235,6 +235,23 @@ class DasHerdWatcherServer : HvWebServer {
         return false
     }
 
+    def maybe_notify_inbox_message(session_id, direction, message_id : string;
+                                   notify : bool) {
+        if (direction != "inbox" || !notify) return
+        let nudge_error = watcher_notify(session_id,
+            "dasHerd review request {message_id} is ready. " +
+            "Use the dasHerd skill to fetch and acknowledge it.\r",
+            message_id)
+        if (!empty(nudge_error) && nudge_error != "queued") {
+            print("dasHerd watcher: mailbox {message_id} persisted; " +
+                "TTY nudge failed: {nudge_error}\n")
+        }
+        if (nudge_error != "queued") {
+            let _ = watcher_mailbox_set_notification(
+                session_id, message_id, nudge_error)
+        }
+    }
+
     def override onInit {
         GET("/") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
@@ -382,20 +399,8 @@ class DasHerdWatcherServer : HvWebServer {
             }
             let result = watcher_mailbox_post(request)
             if (!result.ok) return self.respond_error(resp, http_status.BAD_REQUEST, result.error)
-            if (request.direction == "inbox" && request.notify) {
-                let nudge_error = watcher_notify(request.session_id,
-                    "dasHerd review request {result.message_id} is ready. " +
-                    "Use the dasHerd skill to fetch and acknowledge it.\r",
-                    result.message_id)
-                if (!empty(nudge_error) && nudge_error != "queued") {
-                    print("dasHerd watcher: mailbox {result.message_id} persisted; " +
-                        "TTY nudge failed: {nudge_error}\n")
-                }
-                if (nudge_error != "queued") {
-                    let _ = watcher_mailbox_set_notification(
-                        request.session_id, result.message_id, nudge_error)
-                }
-            }
+            self.maybe_notify_inbox_message(request.session_id,
+                request.direction, result.message_id, request.notify)
             return resp |> JSON(sprint_json(result, false), http_status.CREATED)
         }
         POST("/api/v1/mailbox/state") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
@@ -441,7 +446,7 @@ class DasHerdWatcherServer : HvWebServer {
 
     def send_mailbox(var client : WatcherClient?; force : bool = false) {
         if (client == null || empty(client.session_id)) return
-        let revision = watcher_mailbox_revision()
+        let revision = watcher_mailbox_session_revision(client.session_id)
         if (!force && client.mailbox_revision == revision) return
         client.mailbox_revision = revision
         send(client.channel, "\{\"type\":\"mailbox\",\"session_id\":" +
@@ -996,20 +1001,8 @@ class DasHerdWatcherServer : HvWebServer {
                 send_error(channel, result.error)
                 return
             }
-            if (request.direction == "inbox" && request.notify) {
-                let nudge_error = watcher_notify(request.session_id,
-                    "dasHerd review request {result.message_id} is ready. " +
-                    "Use the dasHerd skill to fetch and acknowledge it.\r",
-                    result.message_id)
-                if (!empty(nudge_error) && nudge_error != "queued") {
-                    print("dasHerd watcher: mailbox {result.message_id} persisted; " +
-                        "TTY nudge failed: {nudge_error}\n")
-                }
-                if (nudge_error != "queued") {
-                    let _ = watcher_mailbox_set_notification(
-                        request.session_id, result.message_id, nudge_error)
-                }
-            }
+            self.maybe_notify_inbox_message(request.session_id,
+                request.direction, result.message_id, request.notify)
             send(channel, "\{\"type\":\"mailbox_posted\",\"message_id\":" +
                 "{sprint_json(result.message_id, false)},\"revision\":{result.revision}\}",
                 ws_opcode.WS_OPCODE_TEXT, true)
