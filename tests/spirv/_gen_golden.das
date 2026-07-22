@@ -112,4 +112,6 @@ def main {
     // cooperative matrix: OpTypeCooperativeMatrixKHR + Load/Store/MulAddKHR, the Vulkan memory model,
     // SPIR-V 1.6 header
     emit_golden(dir, "coopmat", coopmat_words())
+    // coopmat int8: the s8 x s8 -> s32 tile + the signed-components MulAdd operands mask
+    emit_golden(dir, "coopmat_i8", coopmat_i8_words())
 }

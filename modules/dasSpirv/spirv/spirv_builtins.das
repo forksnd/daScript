@@ -408,3 +408,19 @@ def public coopmatLoad(var dst : coopmatB_f16_16x16; src : array<float16>; idx, 
 def public coopmatStore(mat : coopmatAcc_f32_16x16; var dst : array<float>; idx, stride, layout : int) : void {}
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatA_f16_16x16; b : coopmatB_f16_16x16; c : coopmatAcc_f32_16x16) : coopmatAcc_f32_16x16 { return c }
+
+// The native INT8 path (s8 x s8 -> s32), the Q8-weight tile: K=32 (double the f16 tile), A is 16x32 and
+// B is 32x16, s32 accumulator (16x16). Loading Q8_0 weights as s8 coopmat tiles feeds the tensor cores
+// directly, no dequant. The integer MulAdd carries a signed-components operands mask (added by the emitter).
+struct coopmatA_s8_16x32 {}
+struct coopmatB_s8_32x16 {}
+struct coopmatAcc_s32_16x16 {}
+
+[unused_argument(dst, src, idx, stride, layout), sideeffects]
+def public coopmatLoad(var dst : coopmatA_s8_16x32; src : array<int8>; idx, stride, layout : int) : void {}
+[unused_argument(dst, src, idx, stride, layout), sideeffects]
+def public coopmatLoad(var dst : coopmatB_s8_32x16; src : array<int8>; idx, stride, layout : int) : void {}
+[unused_argument(mat, dst, idx, stride, layout), sideeffects]
+def public coopmatStore(mat : coopmatAcc_s32_16x16; var dst : array<int>; idx, stride, layout : int) : void {}
+[unused_argument(a, b), sideeffects]
+def public coopmatMulAdd(a : coopmatA_s8_16x32; b : coopmatB_s8_32x16; c : coopmatAcc_s32_16x16) : coopmatAcc_s32_16x16 { return c }

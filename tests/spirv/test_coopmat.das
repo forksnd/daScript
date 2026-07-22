@@ -45,4 +45,27 @@ def test_coopmat(t : T?) {
         }
         delete words
     }
+    t |> run("cooperative matrix INT8 tile: s8xs8->s32 (16x16x32) + the signed-components MulAdd mask") <| @(t : T?) {
+        var words <- coopmat_i8_words()
+        t |> success(op_has_operand(words, SpvOp.Capability, uint(SpvCapability.CooperativeMatrixKHR)),
+            "OpCapability CooperativeMatrixKHR (6022)")
+        t |> success(op_has_operand(words, SpvOp.Capability, uint(SpvCapability.StorageBuffer8BitAccess)),
+            "OpCapability StorageBuffer8BitAccess (the int8 SSBO tiles)")
+        t |> success(count_op(words, SpvOp.TypeCooperativeMatrixKHR) == 3,
+            "three OpTypeCooperativeMatrixKHR (A s8 16x32, B s8 32x16, accumulator s32 16x16)")
+        t |> success(count_op(words, SpvOp.CooperativeMatrixLoadKHR) == 2, "two loads")
+        t |> success(count_op(words, SpvOp.CooperativeMatrixMulAddKHR) == 1, "one MulAdd")
+        t |> success(count_op(words, SpvOp.CooperativeMatrixStoreKHR) == 1, "one store")
+        // the integer MulAdd carries the CooperativeMatrixOperands mask at operand index 5:
+        // A|B|C|Result signed = 0x1|0x2|0x4|0x8 = 0xF (float MulAdd omits it)
+        t |> success(count_op_operand_at(words, SpvOp.CooperativeMatrixMulAddKHR, 5, 0xFu) == 1,
+            "the MulAdd declares all operands signed (mask 0xF)")
+        let r = validate_spirv(words, "vulkan1.3")
+        if (r.ran) {
+            t |> success(r.ok, "spirv-val (vulkan1.3): {r.msg}")
+        } else {
+            feint("spirv-val not found locally; skipping (CI enforces)\n")
+        }
+        delete words
+    }
 }

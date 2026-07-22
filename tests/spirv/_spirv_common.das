@@ -2056,6 +2056,30 @@ def public coopmat_words : array<uint> {
     return clone_to_move(coopmat_spv)
 }
 
+// ===== cooperative matrix INT8 path (SPV_KHR_cooperative_matrix): the native s8 x s8 -> s32 tile
+// (16x16x32 — the Q8-weight path, no dequant). A is 16x32 (row-major) and B is 32x16 (column-major),
+// both int8 SSBOs; an s32 accumulator (16x16). The integer MulAdd carries a CooperativeMatrixOperands
+// mask declaring A/B/C/Result signed (0xF). Reuses the four coopmat opcodes + the StorageBuffer8BitAccess
+// capability (from the 8/16-bit storage wave) — no NEW opcodes over the f16 coopmat fixture. =====
+var @ssbo @binding = 0 cmi_a : array<int8>
+var @ssbo @binding = 1 cmi_b : array<int8>
+var @ssbo @binding = 2 cmi_c : array<int>
+
+[compute_shader(local_size_x=32, name="coopmat_i8_spv"), marker(no_coverage)]
+def coopmat_i8_kernel {
+    var a : coopmatA_s8_16x32
+    var b : coopmatB_s8_32x16
+    var acc : coopmatAcc_s32_16x16
+    coopmatLoad(a, cmi_a, 0, 32, 0)   // A: 16x32 row-major, stride 32
+    coopmatLoad(b, cmi_b, 0, 32, 1)   // B: 32x16 column-major, stride 32
+    acc = coopmatMulAdd(a, b, acc)
+    coopmatStore(acc, cmi_c, 0, 16, 1)   // C: 16x16 column-major, stride 16
+}
+
+def public coopmat_i8_words : array<uint> {
+    return clone_to_move(coopmat_i8_spv)
+}
+
 // ===== packed integer dot product: sdot4 -> OpSDot with the PackedVectorFormat4x8Bit literal.
 // The DotProduct / DotProductInput4x8BitPacked caps + SPV_KHR_integer_dot_product ride the
 // declared Capability/Extension opcodes. =====

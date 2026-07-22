@@ -473,22 +473,26 @@ def private is_subpass_input_type(t : TypeDecl?) : bool {
 
 // A cooperative-matrix local is recognized by its marker struct name (coopmatA_f16_16x16, ...). Returns
 // the OpTypeCooperativeMatrixKHR parameters declare_local_var + the coopmat call arms need: the component
-// float width and the tile's rows/cols/use (SpvCooperativeMatrixUse). Scope is always Subgroup; every v1
-// component is a float (f16 input / f32 accumulator), so no signedness/int-kind flag is carried yet.
-def private coopmat_info(t : TypeDecl?) : tuple<ok : bool; comp_width : uint; rows : uint; cols : uint; use : uint> {
-    if (t == null || t.baseType != Type.tStructure || t.structType == null) return (ok = false, comp_width = 0u, rows = 0u, cols = 0u, use = 0u)
+// type (float vs signed int + width) and the tile's rows/cols/use (SpvCooperativeMatrixUse). Scope is
+// always Subgroup. v1 tiles: f16xf16->f32 (16x16x16) and the native s8xs8->s32 int path (16x16x32, where
+// A is 16x32 / B is 32x16 / accumulator 16x16 — the Q8-weight path, no dequant).
+def private coopmat_info(t : TypeDecl?) : tuple<ok : bool; is_float : bool; signed : bool; comp_width : uint; rows : uint; cols : uint; use : uint> {
+    if (t == null || t.baseType != Type.tStructure || t.structType == null) return (ok = false, is_float = false, signed = false, comp_width = 0u, rows = 0u, cols = 0u, use = 0u)
     let n = "{t.structType.name}"
-    if (n == "coopmatA_f16_16x16") return (ok = true, comp_width = 16u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixAKHR))
-    if (n == "coopmatB_f16_16x16") return (ok = true, comp_width = 16u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixBKHR))
-    if (n == "coopmatAcc_f32_16x16") return (ok = true, comp_width = 32u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixAccumulatorKHR))
-    return (ok = false, comp_width = 0u, rows = 0u, cols = 0u, use = 0u)
+    if (n == "coopmatA_f16_16x16") return (ok = true, is_float = true, signed = false, comp_width = 16u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixAKHR))
+    if (n == "coopmatB_f16_16x16") return (ok = true, is_float = true, signed = false, comp_width = 16u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixBKHR))
+    if (n == "coopmatAcc_f32_16x16") return (ok = true, is_float = true, signed = false, comp_width = 32u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixAccumulatorKHR))
+    if (n == "coopmatA_s8_16x32") return (ok = true, is_float = false, signed = true, comp_width = 8u, rows = 16u, cols = 32u, use = uint(SpvCooperativeMatrixUse.MatrixAKHR))
+    if (n == "coopmatB_s8_32x16") return (ok = true, is_float = false, signed = true, comp_width = 8u, rows = 32u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixBKHR))
+    if (n == "coopmatAcc_s32_16x16") return (ok = true, is_float = false, signed = true, comp_width = 32u, rows = 16u, cols = 16u, use = uint(SpvCooperativeMatrixUse.MatrixAccumulatorKHR))
+    return (ok = false, is_float = false, signed = false, comp_width = 0u, rows = 0u, cols = 0u, use = 0u)
 }
 
 // Materialize the OpTypeCooperativeMatrixKHR for a coopmat marker type (0 if `t` is not a coopmat).
 def private coopmat_type_of(var m : SpirvModule; t : TypeDecl?) : uint {
     let ci = coopmat_info(t)
     if (!ci.ok) return 0u
-    let comp = type_float(m, ci.comp_width)
+    let comp = ci.is_float ? type_float(m, ci.comp_width) : type_int(m, ci.comp_width, ci.signed ? 1u : 0u)
     return type_cooperative_matrix(m, comp, uint(SpvScope.Subgroup), ci.rows, ci.cols, ci.use)
 }
 
@@ -4196,13 +4200,22 @@ class SpirvEmit : AstVisitor {
                 errs |> push("coopmatMulAdd: could not evaluate an operand")
                 return expr
             }
+            let ci = coopmat_info(expr._type)
             let rt = coopmat_type_of(bm, expr._type)
             if (rt == 0u) {
                 errs |> push("coopmatMulAdd: result must be a coopmat accumulator type")
                 return expr
             }
             let res = alloc_id(bm)
+            // integer MulAdd carries a CooperativeMatrixOperands mask declaring operand signedness (A/B/C/
+            // Result signed); float accumulate takes no mask. The mask is an inline bitmask LITERAL.
             var ops <- [rt, res, va, vb, vc]
+            if (!ci.is_float && ci.signed) {
+                ops |> push(uint(SpvCooperativeMatrixOperands.MatrixASignedComponentsKHR)
+                    | uint(SpvCooperativeMatrixOperands.MatrixBSignedComponentsKHR)
+                    | uint(SpvCooperativeMatrixOperands.MatrixCSignedComponentsKHR)
+                    | uint(SpvCooperativeMatrixOperands.MatrixResultSignedComponentsKHR))
+            }
             emit_n(bm, SEC_FUNCS, SpvOp.CooperativeMatrixMulAddKHR, ops)
             delete ops
             e2id[k] = res
