@@ -1,9 +1,11 @@
 # Agent-assisted review workflows
 
-Status: product direction; ordering proposed for discussion
+Status: product direction; local Review Focus first; communication protocol
+under discussion
 
 This note records the two agreed product tracks that follow a usable local Git
-inspector. Both tracks will be implemented. The open decision is their order.
+inspector. Both tracks will be implemented. The local Review Focus vertical
+slice comes first, followed by the GitHub PR surface.
 
 1. Make local Git review useful for preparing and reviewing a PR through
    explicit human-agent attention handoff.
@@ -39,6 +41,89 @@ identities without weakening the local source anchor.
 The UI may subdue unrelated material, but it always shows who supplied the
 focus, why each item is present, and how to clear it or return to the ordinary
 Auto/All view. Focus never changes Git state by itself.
+
+## Human-agent communication protocol
+
+The rendering is deliberately simple: focused files/ranges keep their ordinary
+or brighter treatment, unrelated material is darkened, and a toggle restores
+the unfiltered view. The protocol that delivers focus state is the harder
+contract.
+
+### Agent to dasHerd
+
+An agent-facing `dasherder.md` skill explains the available operations and how
+to discover the current session. The agent publishes structured focus sets,
+notes, acknowledgements, and results to dasHerd. MCP is the preferred ergonomic
+surface when installed; a small CLI is the portable surface; localhost HTTP is
+the underlying fallback. All three map to the same versioned protocol and
+identities.
+
+The agent should not have to synthesize UI input or emit terminal prose for
+dasHerd to scrape. A typical operation is semantically:
+
+```text
+publish_focus(session, focus_items, summary)
+```
+
+### dasHerd to agent: durable payload plus wake-up
+
+Local HTTP/MCP state cannot wake a passive agent model. Conversely, pasting the
+complete request into a TTY is fragile, noisy, difficult to acknowledge, and
+unsafe for large source selections. The proposed transport therefore splits
+notification from payload:
+
+1. dasHerd stores the complete structured request in a durable per-session
+   inbox and assigns a stable message ID.
+2. After the human previews and sends it, dasHerd injects one short natural-
+   language notification through the agent's normal TTY input path.
+3. The notification tells the agent to use the dasHerd skill and fetch that
+   exact message ID.
+4. The agent fetches the payload through MCP/CLI/HTTP and acknowledges it.
+5. dasHerd shows pending, notified, fetched, acknowledged, completed, failed,
+   canceled, and stale state rather than assuming that pasted text was read.
+
+For example, the visible TTY message can be:
+
+> dasHerd review request `hf_42` is ready (3 source anchors). Use the dasHerd
+> skill to fetch and acknowledge it.
+
+The nudge is intentionally sufficient for the model to choose the skill but
+does not duplicate the source payload in terminal scrollback or context.
+
+MCP resource-change notifications or a future direct agent callback may remove
+the TTY wake-up for agents that support true push. They are optimizations of
+the wake transport, not replacements for the durable inbox and acknowledgement
+model. Pure polling is not the default because an idle agent has no reason to
+take another turn.
+
+### Session discovery and capability scope
+
+dasHerd supplies an agent session with one capability descriptor containing the
+protocol version, localhost endpoint, session ID, and session-scoped
+credential. The launch profile exposes only the descriptor location; the
+`dasherder.md` skill describes how MCP, CLI, or HTTP consumes it. Credentials
+must not appear in generated prompts, terminal history, review briefs, or the
+repository.
+
+The capability may read and acknowledge only its own inbox and publish focus
+for its own session/worktree. It cannot impersonate a human-origin message or
+mutate Git/GitHub state through the focus protocol.
+
+### Delivery rules
+
+- Human-to-agent delivery is explicit. The human previews the generated nudge
+  and request before sending it.
+- The TTY nudge uses the same serialized input ownership as ordinary terminal
+  input; it must not interleave with a human's partial line or paste.
+- Message IDs make retries idempotent. Re-sending a nudge does not duplicate
+  the inbox payload or lose acknowledgement state.
+- The inbox is authoritative. TTY text is only a wake signal and never proof
+  that the agent received, understood, or completed the request.
+- Agent profiles may replace TTY notification with a stronger native wake
+  transport, but every profile exposes the same message lifecycle.
+- A Markdown review brief remains the portable export. It can reference the
+  same message/focus IDs, but it contains no credentials and does not become
+  the authoritative mutable inbox record.
 
 ## Track A: local PR preparation and review
 
@@ -164,3 +249,8 @@ for presentation, never the correctness oracle.
   babysit-to-merge operation.
 - 2026-07-21: Proposed preference is local Review Focus first, GitHub second,
   because Review Focus is the shared interaction foundation.
+- 2026-07-21: Adopt local Review Focus first and begin protocol design before
+  UI implementation.
+- 2026-07-21: Proposed human-to-agent transport is a durable per-session inbox
+  fetched through MCP/CLI/HTTP, paired with a short visible TTY wake-up and an
+  explicit acknowledgement lifecycle.
