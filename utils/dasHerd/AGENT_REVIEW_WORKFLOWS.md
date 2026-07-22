@@ -188,6 +188,50 @@ the same trusted agent could perform that operation directly through its shell.
   same message/focus IDs, but it does not become the authoritative mutable
   inbox record.
 
+## Next vertical slice: one scenario each way
+
+The next implementation slice is complete only when one real source-range
+handoff works in each direction against a running agent session.
+
+### Agent points human at code
+
+The agent publishes one Outbox focus message containing a revision-aware source
+anchor and the human-facing instruction **Look at that**. dasHerd adds a durable
+entry to a non-modal **Attention** panel backed by the session Outbox. This may
+also add a badge to the affected file.
+
+Arrival never steals the human's workflow. It does not select a repository or
+worktree, replace the inspected file, switch Diff/View, scroll, raise a window,
+or take keyboard focus. If the target document is already displayed, its range
+may be highlighted in place without moving the viewport. If it is not
+displayed, dasHerd stores the highlight but does not open the file.
+
+At a time of the human's choosing, clicking the Attention entry navigates to
+the anchored repository/worktree/file/revision, prepares the appropriate
+Diff/View, scrolls the range into view, and applies the focus treatment. The
+entry remains inspectable and can be dismissed or resolved independently.
+
+### Human points agent at code
+
+The human selects one source range, right-clicks, and invokes **Look at that**.
+That one action stores the exact revision/path/range in the session Inbox and
+sends the short TTY nudge. The agent uses the CLI to fetch and acknowledge the
+message, then can publish a reply or focus result through its Outbox.
+
+### Acceptance evidence
+
+- Before/after live state proves agent-message arrival did not change selected
+  worktree, installed file, mode, scroll position, active window/widget, or
+  keyboard focus.
+- The Attention panel and mailbox expose the message, source anchor, sender,
+  lifecycle, and raw payload immediately.
+- Clicking the Attention entry is what changes navigation; the resulting exact
+  source range is visible and highlighted.
+- The reverse request contains the human's exact selected source anchor; the
+  Inbox records notification, fetch, and acknowledgement state.
+- The demonstration uses the real CLI, watcher, web UI mailbox, rich client,
+  and agent TTY rather than a test-only shortcut.
+
 ## Track A: local PR preparation and review
 
 ### Agent to human
@@ -298,7 +342,8 @@ focus.
 5. Define the Review Focus payload, revision/staleness rules, and live
    inspection surface on top of the mailbox.
 6. Render agent-to-human file, source, and Tree focus, then capture human
-   selections as editable requests and Markdown review briefs.
+   selections as immediate contextual requests and optional Markdown review
+   briefs.
 7. Add read-only GitHub PR association, body, checks, comments, and logs;
    extend focus targets to GitHub state; then add supervised ghost actions and
    babysit/merge policy.
@@ -338,3 +383,6 @@ for presentation, never the correctness oracle.
 - 2026-07-21: Herder has no agent permission or capability model. Session
   context supplies routing defaults, not authority; connection tokens are only
   transport hygiene against accidental local cross-talk.
+- 2026-07-21: Scope the next implementation slice to one source-range handoff
+  in each direction. Agent-to-human arrival is non-modal and never changes
+  navigation/focus; the human navigates only by clicking its Attention entry.
