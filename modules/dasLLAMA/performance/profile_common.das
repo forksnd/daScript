@@ -913,10 +913,15 @@ def read_bench_records(path : string; var models : array<BenchModel>) : bool {
 
 def write_bench_records(path : string; models : array<BenchModel>) {
     let text = sprint_json(models, true)
+    var wrote = false
     fopen(path, "wb") $(f) {
         if (f != null) {
             fwrite(f, text)
+            wrote = true
         }
+    }
+    if (!wrote) {
+        to_log(LOG_ERROR, "dasLLAMA bench: could not open {path} for writing — records NOT persisted\n")
     }
 }
 
