@@ -1979,9 +1979,12 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
         return false
     }
     let c = t.config
-    // only the plain llama/qwen std shape for now — no bias, no sinks, no shared-KV, uniform geometry
+    // only the plain llama std shape for now — no bias, no sinks, no qk-norm (qwen3), no shared-KV,
+    // no softcap (gemma), no partial rotary. These decline cleanly and fall back to the CPU loop.
     if (c.attn_qkv_bias || c.attn_out_bias || c.v_norm || c.attn_sinks || c.moe_dense_shexp
-            || c.n_layer_nextn > 0l) {
+            || c.n_layer_nextn > 0l || c.qk_norm || c.attn_logit_softcap != 0.0
+            || c.final_logit_softcap != 0.0 || c.pre_post_norm
+            || (c.rope_dim > 0l && c.rope_dim != c.head_size)) {
         return false
     }
     let dim = c.dim
