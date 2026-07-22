@@ -68,4 +68,18 @@ def test_coopmat(t : T?) {
         }
         delete words
     }
+    t |> run("cooperative matrix from @workgroup shared memory (the tiled-GEMM staging path)") <| @(t : T?) {
+        var words <- coopmat_sm_words()
+        t |> success(count_op(words, SpvOp.CooperativeMatrixLoadKHR) == 2, "two coopmat loads (from shared)")
+        // the shared tiles are Workgroup-storage OpVariables; the loads chain a Workgroup pointer
+        t |> success(op_has_operand(words, SpvOp.Variable, uint(SpvStorageClass.Workgroup)),
+            "a @workgroup (Workgroup-storage) OpVariable is declared")
+        let r = validate_spirv(words, "vulkan1.3")
+        if (r.ran) {
+            t |> success(r.ok, "spirv-val (vulkan1.3): {r.msg}")
+        } else {
+            feint("spirv-val not found locally; skipping (CI enforces)\n")
+        }
+        delete words
+    }
 }

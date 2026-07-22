@@ -2983,23 +2983,32 @@ class SpirvEmit : AstVisitor {
         let lv = r2v != null ? r2v.subexpr : arg
         return value_of(lv)
     }
-    // Resolve a coopmat Load/Store buffer operand (an @ssbo array global) + an element index to the
-    // OpAccessChain pointer at buf[idx] -- the Pointer operand coopMat Load/Store wants. Mirrors the SSBO
-    // branch of emit_index_read (Block member 0, then the dynamic element index).
+    // Resolve a coopmat Load/Store buffer operand (an @ssbo OR @workgroup array global) + an element index
+    // to the OpAccessChain pointer at buf[idx] -- the Pointer operand coopMat Load/Store wants. An @ssbo is
+    // a Block struct wrapping a runtime array (member 0, then the element index); a @workgroup shared array
+    // is a bare fixed array (a single element index). A real tiled GEMM stages into @workgroup and loads
+    // the tiles from SHARED -- loading straight from @ssbo global is memory-bound (no reuse).
     def coop_buf_ptr(buf_arg : ExpressionPtr; idx : uint; who : string) : uint {
         var bm & = unsafe(*m)
         let g = global_var_of(buf_arg)
         let gi = g != null ? (ctx.globals?[intptr(g)] ?? GlobalInfo()) : GlobalInfo()
-        if (g == null || !gi.is_ssbo) {
-            errs |> push("{who}: the buffer argument must be an @ssbo array")
-            return 0u
+        if (g != null && gi.is_ssbo) {
+            let ptr_t = type_pointer(bm, gi.storage, gi.elem_type)
+            let res = alloc_id(bm)
+            var ops <- [ptr_t, res, gi.var_id, const_uint(bm, 0u), idx]
+            emit_n(bm, SEC_FUNCS, SpvOp.AccessChain, ops)
+            delete ops
+            return res
         }
-        let ptr_t = type_pointer(bm, gi.storage, gi.elem_type)
-        let res = alloc_id(bm)
-        var ops <- [ptr_t, res, gi.var_id, const_uint(bm, 0u), idx]
-        emit_n(bm, SEC_FUNCS, SpvOp.AccessChain, ops)
-        delete ops
-        return res
+        if (g != null && gi.storage == SpvStorageClass.Workgroup && g._type != null && g._type.firstType != null) {
+            let pointee = emit_type(bm, g._type.firstType)   // the shared array's element type
+            let ptr_t = type_pointer(bm, gi.storage, pointee)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, gi.var_id, idx)
+            return res
+        }
+        errs |> push("{who}: the buffer argument must be an @ssbo or @workgroup array")
+        return 0u
     }
 
     // The `committed` flag of a ray-query accessor: GLSL's bool literal (true = the committed hit).
@@ -4139,13 +4148,15 @@ class SpirvEmit : AstVisitor {
         // coopmatStore(mat, dst, idx, stride, layout): OpCooperativeMatrixStoreKHR of the loaded tile.
         // coopmatMulAdd(a, b, c): OpCooperativeMatrixMulAddKHR (float accumulate -> no operands mask).
         // `layout` is a compile-time-constant 0 (row-major) / 1 (column-major); `stride` is an id operand.
-        if (name == "coopmatLoad" || name == "coopmatStore") {
+        // coopmatLoad/coopmatStore have an untyped buffer param, so they are GENERIC — match the origin
+        // name (name is the mangled instance name), like the coopmat markers this file also matches.
+        if (origin_name == "coopmatLoad" || origin_name == "coopmatStore") {
             if (ctx.stage != ShaderStage.Compute) {
-                errs |> push("{name} is only valid in a compute shader")
+                errs |> push("{origin_name} is only valid in a compute shader")
                 return expr
             }
             if (length(expr.arguments) != 5) {
-                errs |> push("{name} expects ({name == "coopmatLoad" ? "dst, src" : "mat, dst"}, idx, stride, layout)")
+                errs |> push("{origin_name} expects ({origin_name == "coopmatLoad" ? "dst, src" : "mat, dst"}, idx, stride, layout)")
                 return expr
             }
             let idx = value_of(expr.arguments[2])
@@ -4153,11 +4164,11 @@ class SpirvEmit : AstVisitor {
             let lay = const_uint_value(expr.arguments[4])
             if (idx == 0u || stride_id == 0u) return expr
             if (!lay.ok || lay.value > 1u) {
-                errs |> push("{name}: layout must be a constant 0 (row-major) or 1 (column-major)")
+                errs |> push("{origin_name}: layout must be a constant 0 (row-major) or 1 (column-major)")
                 return expr
             }
             let layout_id = const_uint(bm, lay.value)
-            if (name == "coopmatLoad") {
+            if (origin_name == "coopmatLoad") {
                 let dst = coop_local_ptr(expr.arguments[0])
                 if (dst.id == 0u || dst.pty == 0u) {
                     errs |> push("coopmatLoad: the first argument must be a coopmat local")

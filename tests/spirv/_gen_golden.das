@@ -114,4 +114,6 @@ def main {
     emit_golden(dir, "coopmat", coopmat_words())
     // coopmat int8: the s8 x s8 -> s32 tile + the signed-components MulAdd operands mask
     emit_golden(dir, "coopmat_i8", coopmat_i8_words())
+    // coopmat from @workgroup shared memory (the tiled-GEMM staging path)
+    emit_golden(dir, "coopmat_sm", coopmat_sm_words())
 }

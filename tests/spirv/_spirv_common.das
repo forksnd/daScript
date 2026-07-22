@@ -2080,6 +2080,37 @@ def public coopmat_i8_words : array<uint> {
     return clone_to_move(coopmat_i8_spv)
 }
 
+// ===== coopmat from @workgroup SHARED memory: the real-GEMM prerequisite. A tiled GEMM stages a block of
+// A/B into shared, then coopMatLoads the tiles from SHARED (coalesced, reused) rather than straight from
+// the @ssbo global (memory-bound). This fixture stages an f16 tile into @workgroup and coopMatLoads it
+// from there — exercising the Workgroup-storage OpAccessChain path in coop_buf_ptr. No new opcodes. =====
+var @ssbo @binding = 0 sm_a : array<float16>
+var @ssbo @binding = 1 sm_c : array<float>
+var @workgroup sm_tile_a : float16[256]
+var @workgroup sm_tile_b : float16[256]
+
+[compute_shader(local_size_x=32, name="coopmat_sm_spv"), marker(no_coverage)]
+def coopmat_sm_kernel {
+    var i = int(gl_LocalInvocationID.x)
+    while (i < 256) {
+        sm_tile_a[i] = sm_a[i]
+        sm_tile_b[i] = sm_a[i]
+        i += 32
+    }
+    barrier()
+    var a : coopmatA_f16_16x16
+    var b : coopmatB_f16_16x16
+    var acc : coopmatAcc_f32_16x16
+    coopmatLoad(a, sm_tile_a, 0, 16, 0)   // load the tile from SHARED memory (not the @ssbo)
+    coopmatLoad(b, sm_tile_b, 0, 16, 1)
+    acc = coopmatMulAdd(a, b, acc)
+    coopmatStore(acc, sm_c, 0, 16, 1)
+}
+
+def public coopmat_sm_words : array<uint> {
+    return clone_to_move(coopmat_sm_spv)
+}
+
 // ===== packed integer dot product: sdot4 -> OpSDot with the PackedVectorFormat4x8Bit literal.
 // The DotProduct / DotProductInput4x8BitPacked caps + SPV_KHR_integer_dot_product ride the
 // declared Capability/Extension opcodes. =====

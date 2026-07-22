@@ -400,12 +400,16 @@ struct coopmatA_f16_16x16 {}
 struct coopmatB_f16_16x16 {}
 struct coopmatAcc_f32_16x16 {}
 
+// `src` / `dst` are untyped: the emitter reads the buffer operand STRUCTURALLY (its @ssbo or @workgroup
+// global + the element index), so the param type is irrelevant to lowering and this one signature accepts
+// both a dynamic @ssbo array<T> and a fixed @workgroup T[N] (shared-memory staging). dst (the coopmat
+// tile) and a/b/c stay strongly typed — that is what selects the tile shape.
 [unused_argument(dst, src, idx, stride, layout), sideeffects]
-def public coopmatLoad(var dst : coopmatA_f16_16x16; src : array<float16>; idx, stride, layout : int) : void {}
+def public coopmatLoad(var dst : coopmatA_f16_16x16; src; idx, stride, layout : int) : void {}
 [unused_argument(dst, src, idx, stride, layout), sideeffects]
-def public coopmatLoad(var dst : coopmatB_f16_16x16; src : array<float16>; idx, stride, layout : int) : void {}
+def public coopmatLoad(var dst : coopmatB_f16_16x16; src; idx, stride, layout : int) : void {}
 [unused_argument(mat, dst, idx, stride, layout), sideeffects]
-def public coopmatStore(mat : coopmatAcc_f32_16x16; var dst : array<float>; idx, stride, layout : int) : void {}
+def public coopmatStore(mat : coopmatAcc_f32_16x16; dst; idx, stride, layout : int) : void {}
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatA_f16_16x16; b : coopmatB_f16_16x16; c : coopmatAcc_f32_16x16) : coopmatAcc_f32_16x16 { return c }
 
@@ -417,10 +421,10 @@ struct coopmatB_s8_32x16 {}
 struct coopmatAcc_s32_16x16 {}
 
 [unused_argument(dst, src, idx, stride, layout), sideeffects]
-def public coopmatLoad(var dst : coopmatA_s8_16x32; src : array<int8>; idx, stride, layout : int) : void {}
+def public coopmatLoad(var dst : coopmatA_s8_16x32; src; idx, stride, layout : int) : void {}
 [unused_argument(dst, src, idx, stride, layout), sideeffects]
-def public coopmatLoad(var dst : coopmatB_s8_32x16; src : array<int8>; idx, stride, layout : int) : void {}
+def public coopmatLoad(var dst : coopmatB_s8_32x16; src; idx, stride, layout : int) : void {}
 [unused_argument(mat, dst, idx, stride, layout), sideeffects]
-def public coopmatStore(mat : coopmatAcc_s32_16x16; var dst : array<int>; idx, stride, layout : int) : void {}
+def public coopmatStore(mat : coopmatAcc_s32_16x16; dst; idx, stride, layout : int) : void {}
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatA_s8_16x32; b : coopmatB_s8_32x16; c : coopmatAcc_s32_16x16) : coopmatAcc_s32_16x16 { return c }
