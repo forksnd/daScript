@@ -1283,6 +1283,53 @@ def da_attn {
     }
 }
 
+// batched rope + KV-store (prefill, npos positions). q roped in place (vk_upf); k/v ride vk_y (k at
+// 0, v at voff); roped k -> vk_wsf, raw v -> vk_xqf at absolute pos. cos/sin per pos in vk_xs.
+// meta 0=qd 1=kvd 2=hs 3=half 4=neox 5=kpair0 6=pairs/pos 7=layerbase 9=npos 10=pos0 11=voff
+[compute_shader(local_size_x=256, name="rope_kv_store_b_spv")]
+def rope_kv_store_b {
+    let gid = gl_GlobalInvocationID.x
+    let ppp = vk_meta[6u]
+    let npos = vk_meta[9u]
+    if (gid < npos * ppp) {
+        let qd = vk_meta[0u]
+        let kvd = vk_meta[1u]
+        let hs = vk_meta[2u]
+        let half = vk_meta[3u]
+        let neox = vk_meta[4u]
+        let kpair0 = vk_meta[5u]
+        let p = gid / ppp
+        let lp = gid % ppp
+        let is_k = lp >= kpair0
+        let pr = is_k ? lp - kpair0 : lp
+        let h = pr / half
+        let j = pr % half
+        let cb = p * hs           // this position's cos/sin row
+        let fcr = vk_xs[cb + j]
+        let fci = vk_xs[cb + half + j]
+        let e0 = neox != 0u ? j : j * 2u
+        let e1 = neox != 0u ? j + half : j * 2u + 1u
+        let apos = vk_meta[10u] + p
+        if (is_k) {
+            let kb = p * kvd + h * hs
+            let a0 = vk_y[kb + e0]
+            let a1 = vk_y[kb + e1]
+            let mo = vk_meta[7u] + apos * kvd + h * hs
+            vk_wsf[mo + e0] = a0 * fcr - a1 * fci
+            vk_wsf[mo + e1] = a0 * fci + a1 * fcr
+            let vb = vk_meta[11u] + p * kvd + h * hs
+            vk_xqf[mo + e0] = vk_y[vb + e0]
+            vk_xqf[mo + e1] = vk_y[vb + e1]
+        } else {
+            let qb = p * qd + h * hs
+            let a0 = vk_upf[qb + e0]
+            let a1 = vk_upf[qb + e1]
+            vk_upf[qb + e0] = a0 * fcr - a1 * fci
+            vk_upf[qb + e1] = a0 * fci + a1 * fcr
+        }
+    }
+}
+
 // plain Q8_K requant (no act) — the kq wo GEMM's activation image; input floats at vk_upf base
 // vk_meta[10], one thread per 256-weight superblock ([18] = superblock count). Mirrors
 // quantize_q8_k_into_ptr like q8k_moe_actrq does, minus the act.
