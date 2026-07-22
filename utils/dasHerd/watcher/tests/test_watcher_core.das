@@ -17,6 +17,12 @@ def test_watcher_machine_output(t : T?) {
         let bel = to_char(7)
         let wrapped = "{esc}[?9001h{esc}[2J{esc}[Hfirst\r\nsecond\tvalue{esc}]0;git.exe{bel}{esc}[?25h"
         t |> equal(watcher_strip_terminal_controls(wrapped), "first\r\nsecond\tvalue")
+        let expanded_tabs = "1{esc}[7C2{esc}[6Cutils/dasHerd/watcher_core.das"
+        t |> equal(watcher_strip_terminal_controls(expanded_tabs),
+            "1       2      utils/dasHerd/watcher_core.das")
+        let worktrees = "worktree D:/main\r\nHEAD A\r\nbranch refs/heads/main{esc}[5;1Hworktree D:/linked\r\nHEAD B\r\nbranch refs/heads/topic"
+        t |> equal(watcher_strip_terminal_controls(worktrees),
+            "worktree D:/main\r\nHEAD A\r\nbranch refs/heads/main\n\nworktree D:/linked\r\nHEAD B\r\nbranch refs/heads/topic")
         let unicode_wrapped = "{esc}[31mΚαλημέρα, мир, こんにちは, 🐑{esc}[0m"
         t |> equal(watcher_strip_terminal_controls(unicode_wrapped),
             "Καλημέρα, мир, こんにちは, 🐑")

@@ -139,6 +139,29 @@ def test_repository_review_parsing(t : T?) {
             "Mention <|dasHerd-field|> literally")
         t |> equal(collision_commits[0].parents, "parent-one")
     }
+    t |> run("Git graph history preserves commit and transition rows") <| @(t : T?) {
+        var commits : array<GitCommitState>
+        var rows : array<GitGraphRowState>
+        repository_parse_graph_history(
+            "* <|dasHerd-commit|>mergehash<|dasHerd-field|>merge<|dasHerd-field|>1721578000<|dasHerd-field|>Agent One<|dasHerd-field|>Merge topic<|dasHerd-field|>mainhash sidehash\r\n" +
+            "|\\  \r\n" +
+            "| * <|dasHerd-commit|>sidehash<|dasHerd-field|>side<|dasHerd-field|>1721577900<|dasHerd-field|>Agent Two<|dasHerd-field|>Mention <|dasHerd-field|> literally<|dasHerd-field|>mainhash\n" +
+            "|/  \n" +
+            "* <|dasHerd-commit|>mainhash<|dasHerd-field|>main<|dasHerd-field|>1721577800<|dasHerd-field|>Agent One<|dasHerd-field|>Main line<|dasHerd-field|>\n",
+            "D:/Work/tree", commits, rows)
+        t |> equal(length(commits), 3)
+        t |> equal(length(rows), 5)
+        t |> equal(rows[0].topology, "* ")
+        t |> equal(rows[0].commit_hash, "mergehash")
+        t |> equal(rows[1].topology, "|\\  ")
+        t |> equal(rows[1].commit_hash, "")
+        t |> equal(rows[2].topology, "| * ")
+        t |> equal(rows[3].topology, "|/  ")
+        t |> equal(rows[4].commit_hash, "mainhash")
+        t |> equal(commits[1].subject,
+            "Mention <|dasHerd-field|> literally")
+        t |> equal(commits[0].parents, "mainhash sidehash")
+    }
     t |> run("aggregate PR files retain rename provenance") <| @(t : T?) {
         var files : array<GitReviewFileState>
         repository_parse_review_files(
@@ -181,15 +204,25 @@ def test_repository_review_parsing(t : T?) {
         t |> equal(files[0].commit_hash, "abcdef0123456789")
         t |> equal(files[1].old_path, "old.md")
         t |> equal(files[1].path, "new.md")
+        files |> clear()
+        let esc = to_char(27)
+        repository_parse_commit_files(watcher_strip_terminal_controls(
+            "1{esc}[7C2{esc}[6Csrc/main.das\r\n"),
+            "D:/Work/tree", "abcdef0123456789", files)
+        t |> equal(length(files), 1)
+        t |> equal(files[0].added_lines, 1)
+        t |> equal(files[0].deleted_lines, 2)
+        t |> equal(files[0].path, "src/main.das")
         var refs : array<GitRefState>
         repository_parse_refs(
-            "refs/heads/main\tmain\tabcdef\t*\t\n" +
-            "refs/remotes/origin/main\torigin/main\tabcdef\t \t\n" +
+            "refs/heads/main\tmain\tabcdef\t*\t\torigin/main\n" +
+            "refs/remotes/origin/main\torigin/main\tabcdef\t \t\t\n" +
             "refs/remotes/origin/HEAD\torigin/HEAD\tabcdef\t \trefs/remotes/origin/main\n",
             "D:/Work/tree", refs)
         t |> equal(length(refs), 2)
         t |> success(refs[0].current)
         t |> success(!refs[0].remote)
+        t |> equal(refs[0].upstream, "origin/main")
         t |> success(refs[1].remote)
     }
     t |> run("working numstat updates only matching worktree files") <| @(t : T?) {

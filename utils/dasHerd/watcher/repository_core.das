@@ -15,9 +15,13 @@ require strings public
 
 let private REPOSITORY_CONFIG_VERSION = 1
 let private GIT_TIMEOUT_MS = 15000l
-let private GIT_CAPTURE_COLUMNS = 240
+// Keep structured records on one ConPTY row. The current wire format carries
+// full hashes, author, subject, and parents; 240 columns wrapped ordinary
+// commit metadata into cursor-positioned screen fragments.
+let private GIT_CAPTURE_COLUMNS = 400
 let private GIT_CAPTURE_ROWS = 512
 let private GIT_FIELD_SEPARATOR = "<|dasHerd-field|>"
+let private GIT_COMMIT_MARKER = "<|dasHerd-commit|>"
 let private UNTRACKED_NUMSTAT_MAX_BYTES = 32 * 1024 * 1024
 
 struct public RepositoryRecord {
@@ -49,6 +53,12 @@ struct public GitCommitState {
     parents : string
 }
 
+struct public GitGraphRowState {
+    worktree_path : string
+    topology : string
+    commit_hash : string
+}
+
 struct public GitReviewFileState {
     worktree_path : string
     code : string
@@ -67,6 +77,7 @@ struct public GitRefState {
     hash : string
     current : bool
     remote : bool
+    upstream : string
 }
 
 struct public GitCommitFileState {
@@ -116,6 +127,7 @@ struct public RepositorySnapshot {
     review_commits : array<GitCommitState>
     review_files : array<GitReviewFileState>
     history_commits : array<GitCommitState>
+    graph_rows : array<GitGraphRowState>
     commit_files : array<GitCommitFileState>
     refs : array<GitRefState>
     refreshing : bool
@@ -165,6 +177,7 @@ class private RepositoryRuntime {
     history_ref : string
     history_commit : string
     pending_history_commits : array<GitCommitState>
+    pending_graph_rows : array<GitGraphRowState>
     pending_commit_files : array<GitCommitFileState>
     pending_refs : array<GitRefState>
     def operator delete {
@@ -173,11 +186,13 @@ class private RepositoryRuntime {
         delete snapshot.review_commits
         delete snapshot.review_files
         delete snapshot.history_commits
+        delete snapshot.graph_rows
         delete snapshot.commit_files
         delete snapshot.refs
         delete pending_review_commits
         delete pending_review_files
         delete pending_history_commits
+        delete pending_graph_rows
         delete pending_commit_files
         delete pending_refs
     }
@@ -1018,6 +1033,7 @@ def private launch_history(var runtime : RepositoryRuntime?) {
     runtime.history_pending_path = ""
     runtime.history_pending_ref = ""
     runtime.pending_history_commits |> clear()
+    runtime.pending_graph_rows |> clear()
     runtime.pending_commit_files |> clear()
     runtime.snapshot.worktrees[index].history_loading = true
     runtime.snapshot.worktrees[index].history_error = ""
@@ -1025,7 +1041,15 @@ def private launch_history(var runtime : RepositoryRuntime?) {
     changed(runtime)
     let path = runtime.snapshot.worktrees[index].path
     var inscope argv <- ["git", "-C", path, "--no-pager", "log",
-        "--max-count=200", "--format=%H{GIT_FIELD_SEPARATOR}%h{GIT_FIELD_SEPARATOR}%at{GIT_FIELD_SEPARATOR}%an{GIT_FIELD_SEPARATOR}%s{GIT_FIELD_SEPARATOR}%P"]
+        "--max-count=200"]
+    if (runtime.history_ref == "__all__") {
+        argv |> push("--graph")
+        argv |> push("--topo-order")
+        argv |> push("--full-history")
+        argv |> push("--format={GIT_COMMIT_MARKER}%H{GIT_FIELD_SEPARATOR}%h{GIT_FIELD_SEPARATOR}%at{GIT_FIELD_SEPARATOR}%an{GIT_FIELD_SEPARATOR}%s{GIT_FIELD_SEPARATOR}%P")
+    } else {
+        argv |> push("--format=%H{GIT_FIELD_SEPARATOR}%h{GIT_FIELD_SEPARATOR}%at{GIT_FIELD_SEPARATOR}%an{GIT_FIELD_SEPARATOR}%s{GIT_FIELD_SEPARATOR}%P")
+    }
     argv |> push(runtime.history_ref == "__all__" ? "--all" : runtime.history_ref)
     let _ = launch_git(runtime, argv, "git-history", path)
 }
@@ -1069,7 +1093,7 @@ def private launch_refs(var runtime : RepositoryRuntime?) {
     runtime.phase = 9
     changed(runtime)
     let _ = launch_git(runtime, ["git", "-C", path, "for-each-ref",
-        "--format=%(refname){GIT_FIELD_SEPARATOR}%(refname:short){GIT_FIELD_SEPARATOR}%(objectname){GIT_FIELD_SEPARATOR}%(HEAD){GIT_FIELD_SEPARATOR}%(symref)",
+        "--format=%(refname){GIT_FIELD_SEPARATOR}%(refname:short){GIT_FIELD_SEPARATOR}%(objectname){GIT_FIELD_SEPARATOR}%(HEAD){GIT_FIELD_SEPARATOR}%(symref){GIT_FIELD_SEPARATOR}%(upstream:short)",
         "refs/heads", "refs/remotes"], "git-refs", path)
 }
 
@@ -1086,6 +1110,14 @@ def private erase_history_content(var runtime : RepositoryRuntime?; path : strin
     while (index < length(runtime.snapshot.commit_files)) {
         if (runtime.snapshot.commit_files[index].worktree_path == path) {
             runtime.snapshot.commit_files |> erase(index)
+        } else {
+            index++
+        }
+    }
+    index = 0
+    while (index < length(runtime.snapshot.graph_rows)) {
+        if (runtime.snapshot.graph_rows[index].worktree_path == path) {
+            runtime.snapshot.graph_rows |> erase(index)
         } else {
             index++
         }
@@ -1109,6 +1141,8 @@ def private finish_history_commits(var runtime : RepositoryRuntime?) {
     erase_history_content(runtime, path)
     runtime.snapshot.history_commits |> push_from(runtime.pending_history_commits)
     runtime.pending_history_commits |> clear()
+    runtime.snapshot.graph_rows |> push_from(runtime.pending_graph_rows)
+    runtime.pending_graph_rows |> clear()
     runtime.snapshot.worktrees[index].history_ref = runtime.history_ref
     if (!empty(runtime.snapshot.history_commits)) {
         var first_hash = ""
@@ -1228,6 +1262,7 @@ def private fail_history(var runtime : RepositoryRuntime?; message : string) {
         }
     }
     runtime.pending_history_commits |> clear()
+    runtime.pending_graph_rows |> clear()
     runtime.pending_commit_files |> clear()
     runtime.pending_refs |> clear()
     runtime.snapshot.task_session_id = ""
@@ -1260,36 +1295,70 @@ def private fail_refresh(var runtime : RepositoryRuntime?; message : string) {
     }
 }
 
+def private repository_parse_commit_line(line, worktree_path : string;
+                                         var commit : GitCommitState&) : bool {
+    let delimiter = find(line, GIT_FIELD_SEPARATOR) >= 0 ? GIT_FIELD_SEPARATOR : "\t"
+    let delimiter_length = length(delimiter)
+    let hash_end = find(line, delimiter)
+    if (hash_end < 0) return false
+    let short_end = find(line, delimiter, hash_end + delimiter_length)
+    if (short_end < 0) return false
+    let time_end = find(line, delimiter, short_end + delimiter_length)
+    if (time_end < 0) return false
+    let author_end = find(line, delimiter, time_end + delimiter_length)
+    if (author_end < 0) return false
+    let subject_end = delimiter == GIT_FIELD_SEPARATOR ? rfind(line, delimiter) : -1
+    var subject = slice(line, author_end + delimiter_length)
+    var parents : string
+    if (subject_end >= 0) {
+        subject = slice(line, author_end + delimiter_length, subject_end)
+        parents = slice(line, subject_end + delimiter_length)
+    }
+    commit = GitCommitState(
+        worktree_path = worktree_path,
+        hash = slice(line, 0, hash_end),
+        short_hash = slice(line, hash_end + delimiter_length, short_end),
+        authored_at = to_int64(slice(line, short_end + delimiter_length, time_end)),
+        author = slice(line, time_end + delimiter_length, author_end),
+        subject = subject,
+        parents = parents)
+    return true
+}
+
 def public repository_parse_review_commits(text : string; worktree_path : string;
                                            var commits : array<GitCommitState>) {
     for (raw_line in split(text, "\n")) {
         let line = trim_cr(raw_line)
         if (empty(line)) continue
-        let delimiter = find(line, GIT_FIELD_SEPARATOR) >= 0 ? GIT_FIELD_SEPARATOR : "\t"
-        let delimiter_length = length(delimiter)
-        let hash_end = find(line, delimiter)
-        if (hash_end < 0) continue
-        let short_end = find(line, delimiter, hash_end + delimiter_length)
-        if (short_end < 0) continue
-        let time_end = find(line, delimiter, short_end + delimiter_length)
-        if (time_end < 0) continue
-        let author_end = find(line, delimiter, time_end + delimiter_length)
-        if (author_end < 0) continue
-        let subject_end = delimiter == GIT_FIELD_SEPARATOR ? rfind(line, delimiter) : -1
-        var subject = slice(line, author_end + delimiter_length)
-        var parents : string
-        if (subject_end >= 0) {
-            subject = slice(line, author_end + delimiter_length, subject_end)
-            parents = slice(line, subject_end + delimiter_length)
+        var commit = GitCommitState()
+        if (repository_parse_commit_line(line, worktree_path, commit)) {
+            commits |> push(commit)
         }
-        commits |> push(GitCommitState(
+    }
+}
+
+def public repository_parse_graph_history(text : string; worktree_path : string;
+                                          var commits : array<GitCommitState>;
+                                          var rows : array<GitGraphRowState>) {
+    for (raw_line in split(text, "\n")) {
+        let line = trim_cr(raw_line)
+        if (empty(line)) continue
+        let marker = find(line, GIT_COMMIT_MARKER)
+        var commit_hash : string
+        var topology = line
+        if (marker >= 0) {
+            topology = slice(line, 0, marker)
+            var commit = GitCommitState()
+            if (!repository_parse_commit_line(
+                    slice(line, marker + length(GIT_COMMIT_MARKER)),
+                    worktree_path, commit)) continue
+            commit_hash = commit.hash
+            commits |> push(commit)
+        }
+        rows |> push(GitGraphRowState(
             worktree_path = worktree_path,
-            hash = slice(line, 0, hash_end),
-            short_hash = slice(line, hash_end + delimiter_length, short_end),
-            authored_at = to_int64(slice(line, short_end + delimiter_length, time_end)),
-            author = slice(line, time_end + delimiter_length, author_end),
-            subject = subject,
-            parents = parents))
+            topology = topology,
+            commit_hash = commit_hash))
     }
 }
 
@@ -1489,7 +1558,8 @@ def public repository_parse_refs(text : string; worktree_path : string;
             name = fields[1],
             hash = fields[2],
             current = strip(fields[3]) == "*",
-            remote = starts_with(full_name, "refs/remotes/")))
+            remote = starts_with(full_name, "refs/remotes/"),
+            upstream = length(fields) >= 6 ? fields[5] : ""))
     }
 }
 
@@ -1504,11 +1574,12 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
     }
     var info = WatcherSessionInfo()
     if (!watcher_get_session_info(runtime.snapshot.task_session_id, info) || !info.drained) return
-    let scrollback_rows = 0
-    let output = watcher_terminal_text(runtime.snapshot.task_session_id, scrollback_rows)
-    if (scrollback_rows > 0) {
+    let machine_output_truncated = false
+    let output = watcher_machine_output_text(
+        runtime.snapshot.task_session_id, machine_output_truncated)
+    if (machine_output_truncated) {
         let _compacted_overflow = watcher_compact_session(runtime.snapshot.task_session_id)
-        let message = "Git structured output exceeded the {GIT_CAPTURE_ROWS}-row capture window; inspect session {runtime.snapshot.task_session_id}"
+        let message = "Git structured output exceeded the watcher raw-history limit; inspect session {runtime.snapshot.task_session_id}"
         if (runtime.phase == 10) fail_refresh(runtime, message)
         elif (runtime.phase >= 7) fail_history(runtime, message)
         elif (runtime.phase >= 3) fail_review(runtime, message)
@@ -1631,7 +1702,13 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
             output, path, runtime.pending_review_files)
         finish_review(runtime)
     } elif (runtime.phase == 7) {
-        repository_parse_review_commits(output, path, runtime.pending_history_commits)
+        if (runtime.history_ref == "__all__") {
+            repository_parse_graph_history(output, path,
+                runtime.pending_history_commits, runtime.pending_graph_rows)
+        } else {
+            repository_parse_review_commits(
+                output, path, runtime.pending_history_commits)
+        }
         finish_history_commits(runtime)
     } elif (runtime.phase == 8) {
         repository_parse_commit_files(

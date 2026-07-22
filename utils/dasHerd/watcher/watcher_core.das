@@ -430,6 +430,13 @@ def public watcher_strip_terminal_controls(value : string) : string {
     var inscope output : array<uint8>
     output |> reserve(length(value))
     var state = 0 // 0=text, 1=ESC, 2=CSI, 3=OSC, 4=OSC ESC, 5=ST string, 6=ST ESC
+    var csi_first = 0
+    var csi_second = 0
+    var csi_field = 0
+    var csi_has_first = false
+    var csi_has_second = false
+    var cursor_row = 1
+    var cursor_column = 1
     peek_data(value) $(bytes) {
         for (index in range(length(value))) {
             let byte = int(bytes[index])
@@ -439,10 +446,22 @@ def public watcher_strip_terminal_controls(value : string) : string {
                 }
                 elif (byte == '\t' || byte == '\r' || byte == '\n' || byte >= 0x20) {
                     output |> push(uint8(byte))
+                    if (byte == '\r') {
+                        cursor_column = 1
+                    } elif (byte == '\n') {
+                        cursor_row++
+                    } else {
+                        cursor_column++
+                    }
                 }
             } elif (state == 1) {
                 if (byte == '[') {
                     state = 2
+                    csi_first = 0
+                    csi_second = 0
+                    csi_field = 0
+                    csi_has_first = false
+                    csi_has_second = false
                 } elif (byte == ']') {
                     state = 3
                 } elif (byte == 'P' || byte == '^' || byte == '_' || byte == 'X') {
@@ -451,7 +470,45 @@ def public watcher_strip_terminal_controls(value : string) : string {
                     state = 0
                 }
             } elif (state == 2) {
-                if (byte >= 0x40 && byte <= 0x7e) {
+                if (is_number(byte)) {
+                    if (csi_field == 0) {
+                        csi_first = min(4096, csi_first * 10 + byte - '0')
+                        csi_has_first = true
+                    } else {
+                        csi_second = min(4096, csi_second * 10 + byte - '0')
+                        csi_has_second = true
+                    }
+                } elif (byte == ';') {
+                    csi_field = 1
+                } elif (byte >= 0x40 && byte <= 0x7e) {
+                    // ConPTY expands horizontal tabs emitted by console
+                    // applications into CSI cursor commands. Preserve their
+                    // field and record-separating effect for machine consumers.
+                    if (byte == 'C') {
+                        let spaces = csi_has_first ? max(1, csi_first) : 1
+                        for (_ in range(spaces)) {
+                            output |> push(uint8(' '))
+                        }
+                        cursor_column += spaces
+                    } elif (byte == 'G') {
+                        let target_column = csi_has_first ? max(1, csi_first) : 1
+                        while (cursor_column < target_column) {
+                            output |> push(uint8(' '))
+                            cursor_column++
+                        }
+                    } elif (byte == 'H' || byte == 'f') {
+                        let target_row = csi_has_first ? max(1, csi_first) : 1
+                        let target_column = csi_has_second ? max(1, csi_second) : 1
+                        while (cursor_row < target_row) {
+                            output |> push(uint8('\n'))
+                            cursor_row++
+                            cursor_column = 1
+                        }
+                        while (cursor_column < target_column) {
+                            output |> push(uint8(' '))
+                            cursor_column++
+                        }
+                    }
                     state = 0
                 }
             } elif (state == 3) {
