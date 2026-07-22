@@ -261,7 +261,8 @@ C tutorials
    cmake -DCMAKE_PREFIX_PATH=/path/to/daslang /path/to/daslang/tutorials/integration/c
    cmake --build . --config Release
 
-This builds all 10 C integration tutorials.  On Windows:
+This builds the 14 standard C integration tutorials, plus tutorial 15 when the
+SDK was installed with the StbImage module. On Windows:
 
 .. code-block:: powershell
 

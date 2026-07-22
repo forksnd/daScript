@@ -101,6 +101,26 @@ DAS_C_TUTORIAL(integration_c_10 "${TUT_DIR}/10_threading.c")
 DAS_C_TUTORIAL(integration_c_11 "${TUT_DIR}/11_type_introspection.c")
 DAS_C_TUTORIAL(integration_c_12 "${TUT_DIR}/12_ecs.c")
 DAS_C_TUTORIAL(integration_c_13 "${TUT_DIR}/13_shared_module.c")
+DAS_C_TUTORIAL(integration_c_14 "${TUT_DIR}/14_passing_arrays.c")
+
+# The StbImage example uses the static compiler and module targets to
+# demonstrate registration between das_initialize_modules() and
+# das_initialize_finalize(). It is available when the SDK was installed with
+# the StbImage module enabled.
+if(TARGET DAS::libDasModuleStbImage)
+    add_executable(integration_c_15 "${TUT_DIR}/15_static_stbimage.c")
+    target_link_libraries(integration_c_15 PRIVATE
+        DAS::libDasModuleStbImage DAS::libDaScript Threads::Threads)
+    set_target_properties(integration_c_15 PROPERTIES
+        LINKER_LANGUAGE CXX
+        CXX_STANDARD 17
+    )
+    if(MSVC)
+        target_compile_options(integration_c_15 PRIVATE /wd4005)
+    elseif(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(integration_c_15 PRIVATE -Werror=strict-prototypes)
+    endif()
+endif()
 
 ###########################################################
 # Tutorial 09 — AOT (C)

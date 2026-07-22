@@ -38,6 +38,29 @@ but does not expose every C++ feature (e.g. class adapters, custom
 annotations).
 
 
+Explicit-length strings
+=======================
+
+Every C API input that consumes text has an explicit-length counterpart with
+an ``_n`` suffix.  These functions take a ``const char *`` and a ``size_t``
+byte count, do not call ``strlen``, and do not require a trailing null byte.
+They map directly to slice types in languages such as D.  A null pointer is
+accepted for an empty range; a null pointer with a non-zero length is an error.
+
+The original null-terminated entry points remain available for source and ABI
+compatibility.  They delegate to the explicit-length implementation.  Where an
+internal daslang type has a narrower count, an out-of-range value produces a
+fatal error instead of being silently truncated.
+
+For example:
+
+.. code-block:: c
+
+   const char function_name[] = {'m', 'a', 'i', 'n'};
+   das_function * fn = das_context_find_function_n(
+       ctx, function_name, sizeof(function_name));
+
+
 Initialization and shutdown
 ===========================
 
@@ -53,8 +76,26 @@ Initialization and shutdown
    }
 
 ``das_initialize()``
-   Must be called once before any other C API call.  Registers all
-   built-in modules.
+   One-call initialization for hosts which do not add statically linked
+   modules.  Equivalent to calling ``das_initialize_modules()`` followed by
+   ``das_initialize_finalize()``.
+
+``das_initialize_modules()``
+   Registers daslang's built-in modules without finalizing dependencies.
+
+``das_initialize_finalize()``
+   Finalizes every module registered in the current environment.  A host with
+   additional statically linked modules calls their unmangled C
+   ``register_Module_*`` entry points between these two functions:
+
+   .. code-block:: c
+
+      das_initialize_modules();
+      register_Module_Raster();
+      register_Module_StbImage();
+      das_initialize_finalize();
+
+   See :ref:`tutorial_integration_c_static_stbimage` for a complete example.
 
 ``das_shutdown()``
    Frees all internal structures.  Call once when done.
@@ -80,6 +121,22 @@ Text output
 ``das_text_release(writer)``
    Frees a text writer.
 
+``das_text_output(writer, text)`` / ``das_text_output_n(writer, text, length)``
+   Writes a null-terminated string or an explicit byte range, respectively.
+
+
+Dynamic modules
+===============
+
+``das_register_dynamic_modules(access, project_root, paths, count, tout)``
+   Scans the project's ``modules`` directory and any explicitly supplied
+   module folders.  Paths are null-terminated strings and ``count`` is
+   ``uint32_t``.
+
+``das_register_dynamic_modules_n(access, project_root, project_root_length, paths, path_lengths, count, tout)``
+   Explicit-length form.  ``path_lengths`` contains one ``size_t`` byte count
+   for each entry in ``paths``, and ``count`` is ``size_t``.
+
 
 File access
 ===========
@@ -97,12 +154,23 @@ File access
    Creates a file access backed by a ``.das_project`` file for
    sandboxing.  See :ref:`tutorial_integration_c_sandbox`.
 
+``das_fileaccess_make_project_n(project_file, project_file_length)``
+   Explicit-length form of ``das_fileaccess_make_project``.
+
 ``das_fileaccess_introduce_file(access, name, content, owns)``
    Registers a virtual file from a C string.  If ``owns`` is non-zero,
    the content is copied; otherwise the caller must keep it alive.
 
+``das_fileaccess_introduce_file_n(access, name, name_length, content, content_length, owns)``
+   Registers an explicit file-name and content range.  When ``owns`` is zero,
+   the caller must keep all ``content_length`` bytes alive for the lifetime of
+   the file access.
+
 ``das_fileaccess_introduce_file_from_disk(access, name, disk_path)``
    Reads a file from disk and caches it under a virtual path.
+
+``das_fileaccess_introduce_file_from_disk_n(...)``
+   Explicit-length form for both ``name`` and ``disk_path``.
 
 ``das_fileaccess_introduce_daslib(access)``
    Pre-loads all standard library modules into the cache.
@@ -110,12 +178,18 @@ File access
 ``das_fileaccess_introduce_native_modules(access)``
    Pre-loads all native plugin modules listed in ``external_resolve.inc``.
 
+``das_fileaccess_introduce_native_module(access, req)`` / ``das_fileaccess_introduce_native_module_n(access, req, req_length)``
+   Pre-loads one native module by its require-style path.
+
 ``das_fileaccess_lock(access)`` / ``das_fileaccess_unlock(access)``
    While locked, only pre-introduced files can be accessed — filesystem
    reads are blocked.  Essential for sandboxing.
 
 ``das_get_root(buf, maxbuf)``
    Copies the daslang root path into ``buf``.
+
+``das_get_root_n(buf, maxbuf)``
+   ``size_t``-sized counterpart.  Passing ``NULL, 0`` is valid.
 
 
 Compilation
@@ -138,8 +212,14 @@ Compilation
    Compiles a ``.das`` file.  Always returns non-NULL; check
    ``das_program_err_count()`` for errors.
 
+``das_program_compile_n(file, file_length, access, tout, libgroup)``
+   Compiles using an explicit-length file name.
+
 ``das_program_compile_policies(file, access, tout, libgroup, policies)``
    Same as above but applies custom ``CodeOfPolicies``.
+
+``das_program_compile_policies_n(file, file_length, access, tout, libgroup, policies)``
+   Explicit-length form with custom policies.
 
 ``das_program_release(program)``
    Frees a compiled program.
@@ -152,6 +232,10 @@ Compilation
 
 ``das_program_get_error(program, index)``
    Returns the i-th error object.
+
+``das_error_report(error, text, max_length)`` / ``das_error_report_n(error, text, max_length)``
+   Copies an error description to a caller-provided buffer.  The ``_n`` form
+   takes a ``size_t`` capacity.
 
 See :ref:`tutorial_integration_c_hello_world`.
 
@@ -247,6 +331,9 @@ Simulation and context
 
 ``das_context_find_function(ctx, name)``
    Finds an exported function by name.
+
+``das_context_find_function_n(ctx, name, name_length)``
+   Finds an exported function using an explicit-length name.
 
 ``das_context_release(ctx)``
    Frees a context.
@@ -376,6 +463,12 @@ For unaligned calling convention:
 
 See :ref:`tutorial_integration_c_binding_types`.
 
+Every text-bearing binding function also has an explicit-length form:
+``das_module_create_n``, ``das_module_bind_interop_function_n``,
+``das_module_bind_interop_function_unaligned_n``, and
+``das_module_bind_alias_n``.  The ``_n`` forms take a ``size_t`` length
+immediately after each string pointer.
+
 
 Binding types
 =============
@@ -396,6 +489,11 @@ Structures
 Field types use mangled-name format (``"f"`` = float, ``"i"`` = int,
 ``"s"`` = string, etc.).
 
+``das_structure_make_n`` and ``das_structure_add_field_n`` accept explicit
+lengths for all names and mangled type strings.  Their sizes, alignments, and
+field offsets use ``size_t``; they fail rather than truncate when the internal
+representation cannot hold a value.
+
 Enumerations
 ------------
 
@@ -407,6 +505,12 @@ Enumerations
    das_enumeration_add_value(en, "green", "Color::green", 1);
    das_enumeration_add_value(en, "blue",  "Color::blue",  2);
    das_module_bind_enumeration(mod, en);
+
+``das_enumeration_make_n`` and ``das_enumeration_add_value_n`` accept
+explicit-length names.  The latter stores an ``int64_t`` value.
+``das_enumeration_add_value_i64`` is the null-terminated-name counterpart for
+64-bit enumeration values; the original ``das_enumeration_add_value`` remains
+the ``int`` compatibility interface.
 
 Type aliases
 ------------
@@ -425,6 +529,9 @@ String allocation
 
 Allocates a copy on the context's string heap.  The returned pointer
 is managed by the context — do not free it manually.
+
+``das_allocate_string_n(ctx, text, length)`` copies an explicit byte range and
+adds the terminating null byte managed by the context.
 
 
 Context variables
@@ -446,6 +553,9 @@ After simulation, global variables are accessible by name or index:
            das_context_get_variable_name(ctx, i),
            das_context_get_variable_size(ctx, i));
    }
+
+``das_context_find_variable_n(ctx, name, name_length)`` performs the lookup
+without requiring a null-terminated name.
 
 See :ref:`tutorial_integration_c_context_variables`.
 
@@ -643,17 +753,22 @@ Serialization
 
    // Serialize
    const void * data;
-   int64_t size;
-   das_serialized_data * blob = das_program_serialize(
+   size_t size;
+   das_serialized_data * blob = das_program_serialize_n(
        program, &data, &size);
 
    // Save data/size to file...
 
    // Deserialize (skips parsing and type inference)
-   das_program * restored = das_program_deserialize(data, size);
+   das_program * restored = das_program_deserialize_n(data, size);
 
    // Clean up
    das_serialized_data_release(blob);
+
+The ``_n`` serialization API uses ``size_t`` for native buffer sizes.  The
+legacy ``das_program_serialize`` and ``das_program_deserialize`` entry points
+remain available with ``int64_t`` sizes; negative or unrepresentable values
+produce a fatal error instead of being converted silently.
 
 See :ref:`tutorial_integration_c_serialization`.
 

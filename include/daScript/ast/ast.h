@@ -1290,7 +1290,7 @@ namespace das
     };
 
     #define REGISTER_MODULE(ClassName) \
-        DAS_EXPORT_DLL das::Module * register_##ClassName () { \
+        extern "C" DAS_EXPORT_DLL das::Module * register_##ClassName () { \
             das::daScriptEnvironment::ensure(); \
             ClassName * module_##ClassName = new ClassName(); \
             module_##ClassName->cppClassName = #ClassName; \
@@ -1320,7 +1320,7 @@ namespace das
     }
 
     #define REGISTER_MODULE_IN_NAMESPACE(ClassName,Namespace) \
-        DAS_EXPORT_DLL das::Module * register_##ClassName () { \
+        extern "C" DAS_EXPORT_DLL das::Module * register_##ClassName () { \
             das::daScriptEnvironment::ensure(); \
             Namespace::ClassName * module_##ClassName = new Namespace::ClassName(); \
             module_##ClassName->cppClassName = #ClassName; \

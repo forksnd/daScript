@@ -1,5 +1,7 @@
 #include "daScript/daScript.h"
 
+#include "modules/external_declare.inc"
+
 using namespace das;
 
 #define PATHTRACER_NAME   "/examples/pathTracer/toy_path_tracer_profile.das"
@@ -61,7 +63,7 @@ int main( int, char * [] ) {
     // request all da-script built in modules
     NEED_ALL_DEFAULT_MODULES;
     // request external modules
-    #include "modules/external_need.inc"
+    #include "modules/external_pull.inc"
     // add job-que
     if (!Module::require("jobque")) {
         NEED_MODULE(Module_JobQue);

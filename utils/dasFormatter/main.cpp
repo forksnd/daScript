@@ -6,6 +6,10 @@
 #include "daScript/misc/sysos.h"
 #include "fmt.h"
 
+#if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
+#include "modules/external_declare.inc"
+#endif
+
 using namespace das;
 
 das::FileAccessPtr get_file_access( char * pak );
@@ -14,7 +18,7 @@ void InitModules() {
     // register modules
     register_builtin_modules();
 #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
-#include "modules/external_need.inc"
+#include "modules/external_pull.inc"
 #endif
 #ifdef DAS_ENABLE_DYN_INCLUDES
     daScriptEnvironment::ensure();

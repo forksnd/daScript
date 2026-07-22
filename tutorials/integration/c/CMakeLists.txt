@@ -131,6 +131,28 @@ DAS_C_INTEGRATION_TUTORIAL(integration_c_14
     ${CMAKE_CURRENT_SOURCE_DIR}/integration/c/14_passing_arrays.c
 )
 
+#################################
+# Tutorial 15 - Static StbImage Module
+#################################
+# This example deliberately links the static compiler and module library so it
+# can demonstrate the split initialization sequence and C registration ABI.
+if(TARGET libDasModuleStbImage)
+    add_executable(integration_c_15
+        ${CMAKE_CURRENT_SOURCE_DIR}/integration/c/15_static_stbimage.c
+    )
+    target_link_libraries(integration_c_15 PRIVATE
+        libDasModuleStbImage libDaScript ${SRC_LIBRARIES})
+    target_include_directories(integration_c_15 PRIVATE ${NEED_MODULES_PATH})
+    SETUP_CPP11(integration_c_15)
+    set_target_properties(integration_c_15 PROPERTIES
+        LINKER_LANGUAGE CXX
+        CXX_STANDARD 17
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(integration_c_15 PRIVATE -Werror=strict-prototypes)
+    endif()
+endif()
+
 # Install C integration tutorial source files
 file(GLOB C_INTEGRATION_TUTORIAL_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/integration/c/*.c

@@ -41,16 +41,17 @@ Derive from ``Module``, register bindings in the constructor, and use
    REGISTER_MODULE(Module_MyMod);
 
 The host uses ``NEED_MODULE(Module_MyMod)`` before ``Module::Initialize()``.
-Scripts access it with ``require my_module_name``.
+If the registration definition is in another translation unit, place
+``DECLARE_MODULE(Module_MyMod)`` at file scope first.  Scripts access it with
+``require my_module_name``.
 
 .. note::
 
-   ``NEED_MODULE`` contains an ``extern`` declaration that binds to the
-   enclosing namespace.  If your initialization code lives inside a C++
-   namespace, use the namespace-safe pair ``DECLARE_MODULE`` (file scope)
-   and ``PULL_MODULE`` (inside the namespace) instead.  For external
-   modules, CMake also generates ``external_declare.inc`` and
-   ``external_pull.inc`` alongside the traditional ``external_need.inc``.
+   Module registration functions have global C linkage.  ``NEED_MODULE`` and
+   ``PULL_MODULE`` call that global entry point and are safe inside a C++
+   namespace, provided its declaration is visible.  For external modules,
+   CMake generates ``external_declare.inc`` for file scope and
+   ``external_pull.inc`` for the initialization function.
    See :ref:`tutorial_integration_cpp_namespace_integration`.
 
 See :ref:`tutorial_integration_cpp_custom_modules` for a complete example.

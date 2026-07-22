@@ -13,6 +13,10 @@
 #include <crtdbg.h>
 #endif
 
+#if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
+#include "modules/external_declare.inc"
+#endif
+
 using namespace das;
 
 void use_utf8();
@@ -227,7 +231,7 @@ int das_aot_main ( int argc, char * argv[] ) {
     require_project_specific_modules();
     #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
     // Otherwises search for static modules.
-    #include "modules/external_need.inc"
+    #include "modules/external_pull.inc"
     #endif
     #ifdef DAS_ENABLE_DYN_INCLUDES
     if ( !noDynamicModules ) {
@@ -907,7 +911,7 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
     require_project_specific_modules();
     #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
     // Otherwises search for static modules.
-    #include "modules/external_need.inc"
+    #include "modules/external_pull.inc"
     #endif
     #ifdef DAS_ENABLE_DYN_INCLUDES
     if ( !noDynamicModules ) {

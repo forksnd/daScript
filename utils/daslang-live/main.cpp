@@ -37,6 +37,10 @@
 #include <cstdio>
 #include <cstring>
 
+#if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
+#include "modules/external_declare.inc"
+#endif
+
 using namespace das;
 
 void require_project_specific_modules();
@@ -913,7 +917,7 @@ int main(int argc, char * argv[]) {
     require_project_specific_modules();
 
 #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
-    #include "modules/external_need.inc"
+    #include "modules/external_pull.inc"
 #endif
 
 #ifdef DAS_ENABLE_DYN_INCLUDES
