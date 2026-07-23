@@ -357,15 +357,22 @@ what it costs today and what the fix would change.
   **321 wGB/s (2.25x)**; W13-pair fusion ties it (327) so NO driver surgery; 4-rows/sg partial
   (202). FIX SHIPPED in MetalMoeGemvK4 (kernel-only; dispatch/driver/blob unchanged): in-graph
   full 53.06 → **57.65 t/s (+8.7%)**, gpu 18.80 → 17.31ms/step; kernel units + fam tolerance
-  cells green. Remaining quantified levers, by size: (1) "other gemv" 5.30ms is ~3x QKV/WO byte
-  cost — probe the dense q8/k4 GEMVs at gemma shapes in the same lab (suspect: same scalar-x or
-  shape-dependent under-run); (2) the q51 w2 MoE kernel sits at 224 wGB/s in-lab (~0.5ms/step
-  if closed — its dot is ALU-heavier: per-element qh bit-select); (3) serial-encoder barrier tax
-  became first-order post-fix (lab chain: serial 3838 vs pipe 3292us/pass = 14%) — the
-  concurrent-encoder + explicit-hazards port from the batch rail is now worth ~0.4-0.55ms/step;
-  (4) MetalMoeGemvK5 carries the same scalar-x block (identical structure, offsets stay
-  16B-aligned) — same mechanical fix when a k5-expert model is on the board, prove via a lab arm
-  first. Lab kept as the standing rig: variants stay as arms/negative controls.
+  cells green. Chapter 3, the "other gemv" anomaly RESOLVED as a phantom (finer noqkv/nowo
+  knockout arms, post-fix @512, full 17.27ms): QKV 2.56ms is AT ceiling — the 26B is HETERO
+  (global heads 512-wide: wq 8192x2816 on global layers), so real QKV bytes are ~857MB/step,
+  ideal 2.60ms; the old "3x" was a byte-estimate error. WO 1.52ms vs 1.30 ideal (~85%, ~0.2ms
+  slack). The residual gemv-class remainder 1.23ms = router (~0.15) + the greedy spec chain's
+  classifier dispatches (~1.1ms, gemv-gated, useful work). Routed experts post-fix: 3.84ms.
+  Remaining quantified levers, by size: (1) **serial-encoder barrier tax — now the biggest**:
+  the single-decode driver encodes ~330 dispatches on a SERIAL encoder (implicit barrier each);
+  the lab chain priced barriers at ~4.5us each at these shapes (serial 3838 vs pipe 3292us/pass
+  on 120 barriers) → whole-graph ~1-1.5ms/step; the batch rail's concurrent-encoder +
+  explicit-hazards form (dasllama_metal_llama.das:2511) is the template, g_skip runs must stay
+  serial (the knockout-unbarriered caveat there); (2) the q51 w2 MoE kernel at 224 wGB/s in-lab,
+  ALU-bound on the per-element qh select — integer-compose of the 5th bit (q | hbit<<4 pre-cvt,
+  bit-exact) saves ~15% ALU ≈ +0.3ms; (3) WO ~0.2ms slack; (4) MetalMoeGemvK5 carries the same
+  scalar-x block — mechanical sibling of the shipped fix, prove via a lab arm first. Lab kept as
+  the standing rig: variants stay as arms/negative controls.
 
 - **.dlim mint abort past ~11GB: root-caused as DISK-FULL, writer fixed, red cleared (2026-07-23).**
   Not an int-width bug — the write rail is 64-bit clean end-to-end (ftello, long_fwrite → size_t

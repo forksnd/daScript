@@ -23,6 +23,8 @@ require daslib/strings_boost   // nolint:STYLE030 — used only inside the Apple
 //   nogemv    minus every layer GEMV — attention + elementwise only
 //   nomoert   minus the ROUTED expert GEMVs only (router/select/combine + dense-shared stay live)
 //   nomoesh   minus the dense-shared branch GEMVs only (g4 shared FFN / qwen35moe shexp)
+//   noqkv     minus the attention input GEMVs only (wq/wk/wv or the fused QKV dispatch)
+//   nowo      minus the attention output projection GEMV only
 // Knockout arms compute GARBAGE tokens by design; timing is shape-bound, not data-bound. Each
 // window is preceded by one unclocked step that absorbs the mirror's rewind re-upload (windows
 // restart at the same depth, so pos < watermark fires every time) and the first-touch region
@@ -91,7 +93,8 @@ def private greedy_top(s : Session; vocab : int64) : int64 {
 
 def private apply_arm(arm) {   // untyped param = generic — non-Apple builds never compile the Metal-typed body
     set_metal_decode_skip(arm == "noattn" ? "attn" : (arm == "noew" ? "ew" : (arm == "nogemv" ? "gemv" :
-        (arm == "nomoert" ? "moe_rt" : (arm == "nomoesh" ? "moe_sh" : "")))))
+        (arm == "nomoert" ? "moe_rt" : (arm == "nomoesh" ? "moe_sh" : (arm == "noqkv" ? "qkv" :
+        (arm == "nowo" ? "wo" : "")))))))
     set_metal_decode_logits_cpu(arm == "nologits")
 }
 
