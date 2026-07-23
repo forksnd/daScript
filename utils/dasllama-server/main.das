@@ -421,6 +421,8 @@ def apply_config(var cfg : ServerArgs) : bool {
                 }
             }
             g_cfg_sources["models"] = "toml"
+        } else {
+            to_log(LOG_WARNING, "dasllama-server: 'models' in the config is not a [[models]] array-of-tables — roster ignored\n")
         }
     }
     unsafe {
