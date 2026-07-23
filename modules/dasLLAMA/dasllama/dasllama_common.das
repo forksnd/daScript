@@ -2419,6 +2419,88 @@ def resident_driver_register() {
     register_prefill_override("vulkan", @@vulkan_resident_prefill)
 }
 
+// ===== multi-model GPU slot switch (marks swap + whole-model drop/re-arm) =====
+
+//! One model's complete per-model tier state for a multi-model host: the loader-contract marks
+//! plus the resident driver's activation. Save after the model's load (or arm), restore before
+//! stepping that model — two models' offset-keyed marks must never be installed together.
+struct GpuModelMarks {
+    marks : MoeGpuMarks <- MoeGpuMarks()
+    rdec_active : bool
+    rdec_cnt : int64
+    rdec_cap : int64
+}
+
+//! Move the INSTALLED per-model tier state out into `st`; the globals read as no-model after.
+def moe_gpu_model_marks_save(var st : GpuModelMarks) {
+    moe_gpu_marks_save(st.marks)
+    st.rdec_active = g_rdec_active
+    st.rdec_cnt = g_rdec_cnt
+    st.rdec_cap = g_rdec_cap
+    g_rdec_active = false
+    g_rdec_cnt = 0l
+    g_rdec_cap = 0l
+}
+
+//! Install `st` as the per-model tier state (the save's inverse; `st` reads as no-model after).
+def moe_gpu_model_marks_restore(var st : GpuModelMarks) {
+    moe_gpu_marks_restore(st.marks)
+    g_rdec_active = st.rdec_active
+    g_rdec_cnt = st.rdec_cnt
+    g_rdec_cap = st.rdec_cap
+    st.rdec_active = false
+    st.rdec_cnt = 0l
+    st.rdec_cap = 0l
+}
+
+//! Is the resident whole-stack decode driver active for the INSTALLED model? (The arm-outcome
+//! discriminator status surfaces read: resident beats rails beats cpu.)
+def moe_gpu_resident_active() : bool => g_rdec_active
+
+//! Hydrate `s`'s host KV from the device mirror when `s` owns live mirror rows (no-op
+//! otherwise). Call over every live session of the outgoing model before ``moe_gpu_drop_model``
+//! — the drop destroys the mirror, and an unhydrated owner's rows exist nowhere else.
+def moe_gpu_hydrate_session(t : Model; var s : Session) {
+    if (g_rdec_active && g_rdec_cnt > 0l && s.rdec_gen == g_rdec_gen && !s.rdec_hydrated) {
+        rdec_hydrate_host(t, s)
+    }
+}
+
+//! Drop the INSTALLED model's whole GPU state (every model-owned device object + the routing
+//! marks); the model keeps serving on the CPU rails, and re-arm = the same three calls a load
+//! runs. Caller guarantees quiescence: no step in flight, sessions hydrated first.
+def moe_gpu_drop_model() {
+    if (!moe_gpu_tier_installed()) {
+        return
+    }
+    moe_gpu_dn_invalidate()
+    g_rdec_active = false
+    g_rdec_cnt = 0l
+    g_rdec_cap = 0l
+    // resident_upload selected the "vulkan" overrides; deselect so (a) a later re-arm's
+    // resident_upload passes its no-active-override gate (the warm re-arm decline), and (b) a
+    // dropped model's prefill/decode take the plain CPU path without consulting dead state
+    if (active_prefill_override() == "vulkan") {
+        select_prefill_override("")
+    }
+    if (active_decode_override() == "vulkan") {
+        select_decode_override("")
+    }
+    moe_gpu_drop_model_state()
+    // loader-contract reset — the same clean slate moe_gpu_upload_resident starts from
+    set_moe_gpu_layer_count(0l)
+    set_moe_gpu_from_layer(1000000l)
+    set_moe_gpu_stream_from(1000000l)
+    set_moe_gpu_total_layers(0l)
+    set_moe_gpu_cls_off(-1l)
+    reset_moe_gpu_dense_offs()
+    reset_moe_gpu_dn_layers()
+    reset_moe_gpu_attn_layers()
+    reset_moe_gpu_shexp_layers()
+    reset_moe_gpu_qkv_layers()
+    set_moe_gpu_model_support("")
+}
+
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
 // the end of every load rail so DASLLAMA_GPU_MOE_LAYERS behaves identically however the model
 // arrived. Layers go resident from the end while the tier's VRAM budget holds.

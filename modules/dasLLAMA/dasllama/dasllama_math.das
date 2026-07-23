@@ -1810,6 +1810,96 @@ def public set_moe_gpu_qkv_route(on : bool) {
     g_moe_gpu_qkv_route = on
 }
 
+// ===== per-model mark sets + whole-model drop (multi-model hosts) =====
+// The loader-contract marks are keyed by WEIGHT ELEMENT OFFSETS and two models' offset spaces
+// overlap — a multi-model host must swap the whole set per switch or funnels read wrong planes.
+
+//! One loaded model's tier routing marks — everything the loader contract sets per load.
+//! A multi-model host saves these after each load and restores them before stepping that model.
+struct MoeGpuMarks {
+    layer_count : int64
+    from_layer : int64 = 1000000l
+    stream_from : int64 = 1000000l
+    total_layers : int64
+    cls_off : int64 = -1l
+    dense_offs : table<int64>
+    dn_layers : table<int64; int64>
+    attn_layers : table<int64>
+    shexp_layers : table<int64>
+    qkv_layers : table<int64>
+    unsupported : string
+}
+
+//! Move the installed marks out into `m`; the globals read as no-marks after (routing gates —
+//! the process-wide A/B levers — stay put).
+def public moe_gpu_marks_save(var m : MoeGpuMarks) {
+    m.layer_count = g_moe_gpu_layer_count
+    m.from_layer = g_moe_gpu_from_layer
+    m.stream_from = g_moe_gpu_stream_from
+    m.total_layers = g_moe_gpu_total_layers
+    m.cls_off = g_moe_gpu_cls_off
+    m.dense_offs <- g_moe_gpu_dense_offs
+    m.dn_layers <- g_moe_gpu_dn_layers
+    m.attn_layers <- g_moe_gpu_attn_layers
+    m.shexp_layers <- g_moe_gpu_shexp_layers
+    m.qkv_layers <- g_moe_gpu_qkv_layers
+    m.unsupported = g_moe_gpu_unsupported
+    g_moe_gpu_layer_count = 0l
+    g_moe_gpu_from_layer = 1000000l
+    g_moe_gpu_stream_from = 1000000l
+    g_moe_gpu_total_layers = 0l
+    g_moe_gpu_cls_off = -1l
+    g_moe_gpu_unsupported = ""
+}
+
+//! Does a saved mark set carry any armed state? A multi-model host uses this to attribute a
+//! load's arm outcome to the slot that captured it — the process-global VRAM counter cannot
+//! tell WHOSE planes are resident.
+def public moe_gpu_marks_armed(m : MoeGpuMarks) : bool {
+    return (!empty(m.dense_offs) || !empty(m.dn_layers) || !empty(m.attn_layers)
+        || !empty(m.shexp_layers) || !empty(m.qkv_layers) || m.cls_off >= 0l
+        || (m.total_layers > 0l && (m.from_layer < m.total_layers || m.stream_from < m.total_layers)))
+}
+
+//! Install `m` as the global marks (moves the tables in; `m` reads as no-marks after).
+def public moe_gpu_marks_restore(var m : MoeGpuMarks) {
+    g_moe_gpu_layer_count = m.layer_count
+    g_moe_gpu_from_layer = m.from_layer
+    g_moe_gpu_stream_from = m.stream_from
+    g_moe_gpu_total_layers = m.total_layers
+    g_moe_gpu_cls_off = m.cls_off
+    g_moe_gpu_dense_offs <- m.dense_offs
+    g_moe_gpu_dn_layers <- m.dn_layers
+    g_moe_gpu_attn_layers <- m.attn_layers
+    g_moe_gpu_shexp_layers <- m.shexp_layers
+    g_moe_gpu_qkv_layers <- m.qkv_layers
+    g_moe_gpu_unsupported = m.unsupported
+    m.layer_count = 0l
+    m.from_layer = 1000000l
+    m.stream_from = 1000000l
+    m.total_layers = 0l
+    m.cls_off = -1l
+    m.unsupported = ""
+}
+
+typedef MoeGpuDropModelFn = function<() : void>
+
+def private moe_gpu_noop_drop_model() {}
+
+var g_moe_gpu_drop_model = @@moe_gpu_noop_drop_model
+
+//! Tier registration of the whole-model VRAM drop (beside install_moe_gpu_tier).
+def public set_moe_gpu_drop_model_hook(f : MoeGpuDropModelFn) {
+    g_moe_gpu_drop_model = f
+}
+
+//! Destroy every model-owned device object the tier holds (stacks, arenas, the resident
+//! driver, all lazy dispatch state); device-lifetime state survives and rebuilds lazily.
+//! Callers use dasllama_common's ``moe_gpu_drop_model``, which also resets the marks.
+def public moe_gpu_drop_model_state() {
+    invoke(g_moe_gpu_drop_model)
+}
+
 //! One attention layer's q/k/v decode projections on the tier — one submit, one shared
 //! activation image (the three planes must share a quant class), results copied back per plane.
 def public matmul_gpu_qkv(var yq : array<float>; var yk : array<float>; var yv : array<float>;

@@ -2864,6 +2864,10 @@ struct private GpuState {
     ffn_pend_bytes : int64
     qkv_cmds : table<int64; QkvCmd>   // q plane offset -> the layer's decode q/k/v group
     dev_mem : table<uint64; uint64>   // device buffer -> its VkDeviceMemory (rollback destroy needs it)
+    host_mem : table<uint64; uint64>  // host-visible buffer -> memory: every make_host_buf result except
+                                      // the process-lifetime pair (staging, profiler readback) — the
+                                      // whole-model drop sweeps this
+    model_cmds : array<VkCommandBuffer>   // every alloc_cmd result — freed together at model drop
     // FFN mid-chain state (lazy — first FFN dispatch creates it)
     hq_dev : uint64          // device requantized-hidden quants (the down GEMM's activation image)
     hs_dev : uint64          // ... its scales
@@ -2994,6 +2998,7 @@ def private make_host_buf(bytes : int64; storage : bool; cached : bool = false) 
     unsafe {
         vk_check(vkMapMemory(dev_raw(), boost_value_to_vk(m), 0ul, uint64(bytes), mf, addr(mapped)), null)
     }
+    g_gpu.host_mem |> insert(b._vk, m._vk)
     return HostBuf(buf = b._vk, mem = m._vk, mapped = mapped, bytes = bytes)
 }
 
@@ -3030,6 +3035,7 @@ def private destroy_host_buf(hb : HostBuf) {   // vkFreeMemory implicitly unmaps
         vkDestroyBuffer(dev_raw(), reinterpret<VkBuffer>(hb.buf), null)
         vkFreeMemory(dev_raw(), reinterpret<VkDeviceMemory>(hb.mem), null)
     }
+    g_gpu.host_mem |> erase(hb.buf)
 }
 
 def private nonowning_buf(h : uint64) : Buffer {
@@ -3206,6 +3212,7 @@ def private vk_moe_init : bool {
     var fence <- create_fence(g_gpu.device, FenceCreateInfo())   // never finalized (process-lifetime)
     g_gpu.fence = boost_value_to_vk(fence)
     g_gpu.staging = make_host_buf(STAGING_BYTES, false)
+    g_gpu.host_mem |> erase(g_gpu.staging.buf)   // process-lifetime — exempt from the model-drop sweep
     g_init_failed = false
     to_log(LOG_INFO, "dasLLAMA vulkan tier: device ready (subgroup {int(sg)}, {g_gpu.rows_per_wg} rows/wg)\n")
     if (dasllama_noisy()) {
@@ -3377,6 +3384,79 @@ def vk_moe_drop_stacks(n : int; stream : bool) {
         destroy_device_buf(g_gpu.stacks[k].wsbuf)
         g_gpu.stacks |> resize(k)
     }
+}
+
+//! MoeGpuDropModelFn: destroy every model-owned device object — stacks, arenas, the resident
+//! driver, all lazy dispatch state, their descriptor sets and command buffers. Device-lifetime
+//! state (instance/device/pipelines/staging/fence/profiler) survives and rebuilds lazily.
+def vk_drop_model_state {
+    if (g_gpu == null) {
+        return
+    }
+    vk_check(vkQueueWaitIdle(g_gpu.queue), null)
+    assert(g_gpu.ffn_pend_s2 == -1, "dasLLAMA vulkan tier: model drop with an async FFN in flight")
+    // the resident driver's das-side shell first (its VK objects die in the sweeps below)
+    if (g_rd != null) {
+        unsafe {
+            delete g_rd
+        }
+        g_rd = null
+    }
+    // every alloc_cmd result is model-owned — one bulk free
+    if (!empty(g_gpu.model_cmds)) {
+        unsafe {
+            vkFreeCommandBuffers(dev_raw(), boost_value_to_vk(g_gpu.pool), uint(length(g_gpu.model_cmds)), addr(g_gpu.model_cmds[0]))
+        }
+        g_gpu.model_cmds |> clear()
+    }
+    // every descriptor set came from the one pool and every one is model-owned
+    let rdpf : VkDescriptorPoolResetFlags
+    vk_check(vkResetDescriptorPool(dev_raw(), boost_value_to_vk(g_gpu.desc_pool), rdpf), null)
+    // device buffers: dev_mem tracks every make_device_buf result — all model-owned
+    for (buf, mem in keys(g_gpu.dev_mem), values(g_gpu.dev_mem)) {
+        unsafe {
+            vkDestroyBuffer(dev_raw(), reinterpret<VkBuffer>(buf), null)
+            vkFreeMemory(dev_raw(), reinterpret<VkDeviceMemory>(mem), null)
+        }
+    }
+    g_gpu.dev_mem |> clear()
+    // host-visible buffers: host_mem tracks every make_host_buf result minus the exempt pair
+    for (buf, mem in keys(g_gpu.host_mem), values(g_gpu.host_mem)) {
+        unsafe {
+            vkDestroyBuffer(dev_raw(), reinterpret<VkBuffer>(buf), null)
+            vkFreeMemory(dev_raw(), reinterpret<VkDeviceMemory>(mem), null)
+        }
+    }
+    g_gpu.host_mem |> clear()
+    // das-side shells + the lazy-family latches (the ensure_* paths rebuild on next use).
+    // clear(), not delete, where values carry VK handles — nothing das-heap-owned lives inside
+    // those structs, and delete would try to finalize the handle fields
+    g_gpu.stacks |> clear()
+    delete g_gpu.stream_stacks
+    delete g_gpu.stream_slots
+    g_gpu.arenas |> clear()
+    g_gpu.ffn_cmds |> clear()
+    g_gpu.qkv_cmds |> clear()
+    g_gpu.dnd_steps |> clear()
+    delete g_gpu.heat_pools
+    g_gpu.stream_max_gu_wq = 0l
+    g_gpu.stream_max_gu_ws = 0l
+    g_gpu.stream_max_dn_wq = 0l
+    g_gpu.stream_max_dn_ws = 0l
+    g_gpu.ar_ready = false
+    g_gpu.af_ready = false
+    g_gpu.rks_ready = false
+    g_gpu.da_ready = false
+    g_gpu.ffn_ready = false
+    g_gpu.batch_ready = false
+    g_gpu.comb_ready = false
+    g_gpu.stream_ready = false
+    g_gpu.dn_ready = false
+    g_gpu.dnd_ready = false
+    g_gpu.at_ready = false
+    g_gpu.ffn_pend_s2 = -1
+    g_gpu.ffn_pend_bytes = 0l
+    g_gpu.resident_bytes = 0l
 }
 
 // ===== dispatch plumbing =====
@@ -4122,6 +4202,7 @@ def private ensure_pfq {
     g_pfq_period = lp.limits.timestampPeriod
     g_pfq_pool <- create_query_pool(g_gpu.device, QueryPoolCreateInfo(queryType = VkQueryType.TIMESTAMP, queryCount = PFQ_CAP))
     g_pfq_buf = make_host_buf(int64(PFQ_CAP) * 8l, true, [cached = true])
+    g_gpu.host_mem |> erase(g_pfq_buf.buf)   // process-lifetime — exempt from the model-drop sweep
     g_pfq_ready = true
 }
 
@@ -4723,6 +4804,7 @@ def private alloc_cmd : VkCommandBuffer {
     unsafe {
         vk_check(vkAllocateCommandBuffers(dev_raw(), ai, addr(raw)), null)
     }
+    g_gpu.model_cmds |> push(raw)   // all persistent cmds are model-owned; freed by the model drop
     return raw
 }
 
@@ -6620,5 +6702,6 @@ def dasllama_math_vulkan_register() {
     set_moe_gpu_dn_state_hooks(@@vk_dn_step_flush, @@vk_dn_step_invalidate)
     set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
     set_moe_gpu_qkv_hook(@@vk_moe_qkv)
+    set_moe_gpu_drop_model_hook(@@vk_drop_model_state)
     vulkan_moe_gpu_arm()
 }
