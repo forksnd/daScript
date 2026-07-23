@@ -1900,7 +1900,13 @@ def private age_seconds(t : int64) : float {
 }
 
 def private handle_streams(var resp : HttpResponse?) : http_status {
-    var out = OaiStreamsResponse(max_streams = g_slots[g_active].sched.max_streams)
+    // the stream list below aggregates every slot, so the lane capacity the page sizes its
+    // swimlane from must be the cross-slot total, not the active slot's own cap
+    var total_cap = 0l
+    for (slot in g_slots) {
+        total_cap += slot.sched.max_streams
+    }
+    var out = OaiStreamsResponse(max_streams = total_cap)
     for (slot in g_slots) {
         var sch & = unsafe(slot.sched)
         let mname = slot.name
