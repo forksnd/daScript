@@ -58,6 +58,27 @@ team_dispatch = "hybrid" # LLM team dispatch + independent inline ASR caller thr
 asr_workers = 2    # two independent transcription requests; each worker owns an ASR model
 ```
 
+Several models serve LIVE from one process via a `[[models]]` roster instead of the flat `model`
+key — requests route on their `"model"` field (absent → the default entry). Execution is
+serialized (one scheduler steps at a time), switches are fast, and every cache level survives a
+switch: host weights stay mmap'd, each slot keeps its own KV pool + prefix cache, and ONE model's
+GPU state lives in VRAM at a time (the tier drops + re-arms on switch; `backend = "cpu"` slots
+never evict the GPU owner, so gpu↔cpu alternation is free). Blank keys inherit the flat defaults;
+`backend` is `auto | cpu | gpu` (auto = the engine's decline ladder), and per-entry `ctx`, `quant`,
+`kv_dtype`, `streams`, `chunk`, `page_rows`, `prefix`, `mtp` override per model:
+
+```toml
+[[models]]
+name = "qwen"      # route id (default: the file's basename)
+path = "D:/models/Qwen3.6-35B-A3B-Q8_0.gguf"
+default = true
+
+[[models]]
+name = "smol"
+path = "D:/models/SmolLM2-135M-Instruct-Q8_0.gguf"
+backend = "cpu"    # never touches the device — alternating with the GPU slot costs nothing
+```
+
 Chat and completion requests **batch continuously** (`llm_scheduler.das`): up to `--streams`
 generations run concurrently through one `eval_batch` decode step per tick, with long prompts
 prefilled in `--chunk`-token slices so a new arrival never stalls running streams for more than
@@ -125,17 +146,18 @@ Windows locks the DLLs.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/` | Control page: live stats + charts, stream swimlane + live text cards, prefix-cache table, a chat panel (all sampling knobs, `<think>` inline, mic input under `--asr`), config editor with save/restart, GC + drain buttons. Serves `control.html` from beside the server sources — polls `/v1/stats` + `/v1/streams` at 1 Hz |
-| `GET`  | `/v1/models` | Lists the served model (and `--asr` if loaded) |
+| `GET`  | `/` | Control page: live stats + charts, models panel (per-slot cards with state/GPU badges, prefix hit rate, switch telemetry, activate buttons; VRAM bar + switch strip), stream swimlane + live text cards, prefix-cache table, a chat panel (all sampling knobs, `<think>` inline, mic input under `--asr`), config editor with the `[[models]]` roster table + save/restart, GC + drain buttons. Serves `control.html` from beside the server sources — polls `/v1/stats` + `/v1/streams` at 1 Hz |
+| `GET`  | `/v1/models` | Lists every served slot (and `--asr` if loaded) — requests route on these ids via their `"model"` field |
+| `POST` | `/v1/models/activate` | `{"model": name}` admin warm-switch: make `name` the stepped slot and move the GPU tier to it now (instead of waiting for the owner to drain). `409` while any work is live, `404` on an unknown name; `200` reports `switch_ms` + `backend_effective` |
 | `POST` | `/v1/chat/completions` | Chat; `stream: true` → SSE, else buffered; OpenAI function calling (`tools`) |
 | `POST` | `/v1/completions` | Raw completion; `stream: true` → SSE, else buffered |
 | `POST` | `/v1/embeddings` | Mean-pooled, L2-normalized sentence embeddings |
 | `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`). `response_format=verbose_json` adds timed segments |
 | `POST` | `/v1/audio/translations` | Speech→English text (needs `--asr`) |
 | `POST` | `/vad` | Silero speech spans over an uploaded clip (the control page's waveform overlay; in-handler, ≤120 s, needs the in-repo `silero_vad.bin`) |
-| `GET`  | `/v1/stats` | Scheduler counters (`gen_tokens`, `prefill_tokens`, TTFT last/avg, …) plus `model`/`ctx`/`uptime_s`/`draining` identity fields, memory footprint (`weights_bytes`, `kv_bytes`, das heaps), a `hardware` line (CPU · lanes · GPU), and `asr_workers`, `asr_ready`, `asr_active`, `asr_pending` |
-| `GET`  | `/v1/streams` | Per-stream poll surface: state (`queued`/`prefilling`/`decoding`/`finished`), token counts, TTFT, and capped text tails (prompt head + generated tail); finished streams linger ~10 s flagged `finished`. Plus `cache`: the prefix-cache donation chains (tokens, live pages, hits, age, preview) and `asr`: recent ASR jobs (state, audio s, wall ms, RTF) |
-| `GET`  | `/config` | Effective config with per-key source (`default`/`cli`/`toml`), model files beside the served one, active rail (gguf vs prepared `.dlim`), GPU tier status (`supported` + `reason` when the loaded model can't ride it) |
+| `GET`  | `/v1/stats` | Scheduler counters (`gen_tokens`, `prefill_tokens`, TTFT last/avg, …) plus `model`/`active_model`/`ctx`/`uptime_s`/`draining` identity fields, memory footprint (`weights_bytes`, `kv_bytes`, das heaps, `gpu_vram_bytes`/`gpu_budget_bytes`), a `hardware` line (CPU · lanes · GPU), `asr_workers`, `asr_ready`, `asr_active`, `asr_pending`, and `models[]` — one entry per slot: `is_active`, `holds_gpu`, requested `backend` vs `backend_effective` (`cpu`/`gpu:rails`/`gpu:resident`), per-slot cache counters, `last_used_s`, switch count/avg ms |
+| `GET`  | `/v1/streams` | Per-stream poll surface: `model` (the slot it runs on), state (`queued`/`prefilling`/`decoding`/`finished`), token counts, TTFT, and capped text tails (prompt head + generated tail); finished streams linger ~10 s flagged `finished`. Plus `cache`: the prefix-cache donation chains (tokens, live pages, hits, age, preview) and `asr`: recent ASR jobs (state, audio s, wall ms, RTF) |
+| `GET`  | `/config` | Effective config with per-key source (`default`/`cli`/`toml`), the `[[models]]` roster, model files beside the served one, active rail (gguf vs prepared `.dlim`), GPU tier status (`supported` + `reason` when the loaded model can't ride it) |
 | `POST` | `/config` | Validate a `{key: value}` JSON body and write it as an **authoritative** TOML (`authoritative = true`) to the config path (or `dasllama-server.toml` beside the program on a config-less start). Applies on the next restart |
 | `POST` | `/restart` | Drain like `/shutdown`, then exit with code **4** — the watchdog relaunches, picking up the saved config (3 stays the tune-restart code) |
 | `POST` | `/gc` | Schedule a validated collection at the next lifecycle safe point; concurrent requests coalesce |

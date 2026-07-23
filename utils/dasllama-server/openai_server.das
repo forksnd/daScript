@@ -1777,12 +1777,16 @@ struct private OaiStatsResponse {
     kv_bytes : int64
     heap_bytes : int64
     string_heap_bytes : int64
+    gpu_vram_bytes : int64    // resident weight bytes on the device (0 = no tier / nothing resident)
+    gpu_budget_bytes : int64  // the tier's weight cap — the page's VRAM bar denominator
     hardware : string
     asr_done_jobs : int64
     asr_audio_s : float
 }
 
 def private handle_stats(var resp : HttpResponse?) : http_status {
+    // budget only when the tier is already live: the budget hook inits the device on first call
+    let tier = gpu_tier_status()
     var out = OaiStatsResponse(
         model = g_slots[g_active].name, active_model = g_slots[g_active].name,
         ctx = g_slots[g_active].model.config.seq_len,
@@ -1808,6 +1812,8 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         kv_bytes = kv_pool_bytes(g_slots[g_active].sched.pool),
         heap_bytes = int64(heap_bytes_allocated()),
         string_heap_bytes = int64(string_heap_bytes_allocated()),
+        gpu_vram_bytes = tier.vram_bytes,
+        gpu_budget_bytes = (tier.supported || tier.vram_bytes > 0l) ? moe_gpu_weight_budget() : 0l,
         hardware = g_hardware_line,
         asr_done_jobs = g_asr_done_jobs, asr_audio_s = g_asr_audio_s)
     out.models |> reserve(length(g_slots))
