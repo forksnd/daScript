@@ -343,16 +343,24 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
-- **gemma-4-26B-A4B tg 0.84x — the real lever is the routed expert-GEMV dispatch (2026-07-23).**
-  Knockout attribution (decode_metal_chase @512): the MoE GEMV is 67% of the step running
-  ~181 GB/s — HALF the M1 bandwidth ceiling the dense gemma4-12B hit (340), so genuine ~2x
-  headroom, NOT a bandwidth wall. Byte breakdown: routed k4/q51 experts 40%, dense-shared q8
-  24%, classifier (262k vocab) 21%, attention 16%. The dense-shared 24% got the w13-gelu fusion
-  (+1%, shipped f7337d92f). The remaining gap is the routed k4/q51 expert-GEMV dispatch/streaming
-  (the 40% chunk) — "already 2-row" yet the aggregate is sub-ceiling, so the expert-indexed
-  dispatch (per-slot scatter, x-reload) is the suspect. Deep AGX kernel-lab: finer per-component
-  knockout (routed vs shared vs cls) then disasm-grade reshape. lcpp does the token in 16.7ms vs
-  our 19.9 — closing the routed GEMV to ~280 GB/s closes the whole gap.
+- **gemma-4-26B-A4B tg 0.84x — routed expert GEMV convicted by moe-granular knockout (2026-07-23).**
+  The new moe_rt/moe_sh knockout arms (decode_metal_chase nomoert/nomoesh) attribute the Q4_K_M
+  file @512, per-step gpu, best-of-3 (reps <0.5% apart; clean Parsec-off window): full 18.80ms;
+  routed k4/q51 expert GEMVs **5.48ms (29%) at ~163 GB/s** (892MB/step at nfe=704 — half the 340
+  ceiling, ~2x headroom confirmed at the component level); dense-shared q8 GEMVs 1.89ms (10%);
+  other GEMVs (QKV/WO/router + their inter-dispatch bubbles) 5.30ms (28%); attention 1.93ms;
+  elementwise 1.96ms; non-gemv floor 6.13ms. Two surprises vs the old byte-split framing:
+  (1) the classifier's 21% byte share costs ~ZERO time on this file — nologits gpu == full gpu
+  because the greedy spec chain covers it (1342 hits / 3 misses in the window); (2) "other gemv"
+  at 5.30ms is ~3x what QKV/WO bytes predict at q8 rates (~1.7ms) — either the q8 attn-side GEMVs
+  run slow at these shapes or the gemv class carries heavy inter-dispatch bubbles; the kernel-lab
+  should timestamp per-site before touching kernels. The routed lever alone: 163→~300 GB/s saves
+  ~2.7ms/step = +17% tg ≈ 0.84→0.98, nearly the whole red. Kernel-lab candidates, in order:
+  per-site GPU timestamps (attribute bubbles vs occupancy), k4 W1+W3 pairing (one dispatch, x
+  loaded once — mirrors the shipped q8 w13sw fusion; also -30 dispatches/step), x-load
+  vectorization in MetalMoeGemvK4/K5 (32 scalar loads/block/row-pair → float4), rows-per-simdgroup.
+  Routed x-reload BYTES are trivial at B=1 (~164KB/layer) — it's issue/latency structure, not
+  bytes. Depth-independence check passed (routed delta 5.52ms @8 vs 5.48ms @512).
 
 - **.dlim mint abort past ~11GB: root-caused as DISK-FULL, writer fixed, red cleared (2026-07-23).**
   Not an int-width bug — the write rail is 64-bit clean end-to-end (ftello, long_fwrite → size_t
