@@ -1597,14 +1597,14 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
     return false
 }
 
-// DASLLAMA_METAL_DECODE_CONCURRENT: concurrent encoder for the single-stream step, barriers
-// only at tracker-detected hazards (hz_gate in every decode-path enc_* helper); g_skip
+// DASLLAMA_METAL_DECODE_CONCURRENT (default ON): concurrent encoder for the single-stream step,
+// barriers only at tracker-detected hazards (hz_gate in every decode-path enc_* helper); g_skip
 // knockouts force serial — skipped dispatches break the declared graph
 var private g_dconc = -1
 
 def private decode_concurrent : bool {
     if (g_dconc < 0) {
-        g_dconc = env_int("DASLLAMA_METAL_DECODE_CONCURRENT", 0)
+        g_dconc = env_int("DASLLAMA_METAL_DECODE_CONCURRENT", 1)
     }
     return g_dconc != 0
 }

@@ -378,7 +378,20 @@ what it costs today and what the fix would change.
   live set — plus ew-chain fusion and a graph-reorder pass that grows concurrent sets. Our shape:
   an enc_dispatch wrapper in dasllama_metal_common taking declared read/write (buffer, off, len)
   ranges per dispatch (every enc_* helper already knows its buffers), auto-barriering on conflict;
-  g_skip runs must stay serial (the knockout-unbarriered caveat at dasllama_metal_llama.das:2511); (2) the q51 w2 MoE kernel at 224 wGB/s in-lab —
+  g_skip runs must stay serial (the knockout-unbarriered caveat at dasllama_metal_llama.das:2511).
+  **SESSION 1 SHIPPED (2026-07-23): the hazard-tracked concurrent encoder is in** — range tracker
+  in dasllama_metal_common (exact (buffer, off, len) ranges, mutable frame buffers only; weights/
+  uniforms untracked), hz_gate in every decode-path enc_* helper, undeclared dispatches take a
+  conservative barrier (or PANIC under DASLLAMA_METAL_HAZARD_STRICT — the parity suite's arm13
+  runs strict, so declaration coverage is test-enforced), a dispatch-counter check makes a gate
+  bypass loud, DASLLAMA_METAL_HAZARD_PARANOID isolates the encoder flip. Measured on the 26B
+  Q4_K_M chase (full arm, best of 3): @8 63.08 -> 65.78 t/s (+4.3%), gpu 15.81 -> 15.11ms; @512
+  58.42 -> 60.84 t/s (+4.1%), gpu 17.07 -> 16.40ms; barriers 780/811 implicit -> 634/665 real.
+  The barrier floor is the PROGRAM-ORDER chain depth (~19 genuine links/layer on the g4 graph:
+  qkv triple, we1||we3, pre_ffn2||router_norm, post_ffn2||shared-w13sw group — everything else
+  chains); the original -1.5ms/<150-barrier bars need Session 2's load-time reorder + separate
+  scratch for the routed/shared branch interleave (the batch rail already validated that split);
+  (2) the q51 w2 MoE kernel at 224 wGB/s in-lab —
   the integer-compose form (q | hbit<<4 pre-convert, replacing the select chain) TESTED + REFUTED
   2026-07-23: 226 vs 224 wGB/s (+1%), bit-exact but the dot stays issue-bound in the shift/mask
   decode regardless of compose shape; kept as the lab's w2_ic negative control, do not re-chase —
