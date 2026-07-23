@@ -151,7 +151,7 @@ var private g_started_at = 0l   // ref_time_ticks at init_server; /v1/stats deri
 
 //! Append a loaded model as a serving slot (call once per model, before ``run_server``). ``name``
 //! is the id ``/v1/models`` reports and requests route on via their ``"model"`` field. The first
-//! slot added is the default until an entry with ``opts.backend``/``default`` says otherwise.
+//! slot added is the default until ``set_default_model`` says otherwise.
 def add_model(var m : Model; name : string; opts : SlotOpts = SlotOpts()) {
     var slot <- ModelSlot(name = name, is_default = empty(g_slots))
     slot.model <- m
@@ -270,13 +270,18 @@ def set_slot_backend_effective(name : string; eff : string) {
 //! Mark the default slot (the one serving requests with no ``"model"`` field). No-op on an
 //! unknown name.
 def set_default_model(name : string) {
+    var ni = -1
     for (i in range(length(g_slots))) {
         if (g_slots[i].name == name) {
-            g_default_slot = i
-            g_slots[i].is_default = true
-        } elif (g_slots[i].is_default) {
-            g_slots[i].is_default = false
+            ni = i
         }
+    }
+    if (ni < 0) {
+        return
+    }
+    g_default_slot = ni
+    for (i in range(length(g_slots))) {
+        g_slots[i].is_default = i == ni
     }
 }
 
