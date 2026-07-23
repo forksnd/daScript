@@ -6042,21 +6042,6 @@ def enc_kq_gemm_mm_b(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?;
     kn_dispatch(enc, uint3(uint(mp / 32l), uint(rows / 64l), 1u), uint3(128u, 1u, 1u))
 }
 
-def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?) {
-    kn_pipeline(enc, g_pso_rms)
-    kn_tgmem(enc, metal_rmsnorm_msl_tgmem, 0)
-    kn_buffer(enc, bx, 0ul, 0)
-    kn_buffer(enc, bw, 0ul, 1)
-    kn_buffer(enc, by, 0ul, 2)
-    kn_buffer(enc, bdim, 0ul, 3)
-    kn_buffer(enc, beps, 0ul, 4)
-    hz_read(bx)
-    hz_write(by)
-    hz_gate(enc)
-    // one row, latency-bound — the widest tg shortens the strided-load rounds (1024 max on M1)
-    kn_dispatch(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
-}
-
 // fused rope + KV-row store: the v source binds the SAME QKV buffer at its v byte offset
 def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; vsoff : uint64;
                    kmb, vmb : MetalBuffer?; koff, voff : uint64;
@@ -6351,20 +6336,6 @@ def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, 
     }
 }
 
-// gemma4 router-input norm: one tg per stream row (weightless rms * 1/sqrt(dim) * rscale)
-// gemma4 per-expert down-scale fold: selw[row][j] *= ds[seli[row][j]]
-def enc_moe_wscale(enc : MetalComputeEncoder?; bsel, bds, bnk : MetalBuffer?; nst : int64) {
-    kn_pipeline(enc, g_pso_moe_wscale)
-    kn_buffer(enc, bsel, 0ul, 0)
-    kn_buffer(enc, bsel, 0ul, 1)
-    kn_buffer(enc, bds, 0ul, 2)
-    kn_buffer(enc, bnk, 0ul, 3)
-    hz_read(bsel)
-    hz_write(bsel)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
-}
-
 // the MXFP4 expert site (gpt-oss): the mx4 planes bind at the layer stack's byte offsets;
 // bwb/bhasb = the layer's per-expert bias slab (identity g_one + g_zero when absent)
 def enc_moe_gemv_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, rows, k, nst : int64;
@@ -6392,115 +6363,6 @@ def enc_moe_gemv_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, rows, k, 
     hz_write(by, yoff, uint64(rows * k * nst * 4l))
     hz_gate(enc)
     kn_dispatch(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
-}
-
-// ===== deltanet (Wave D) — the recurrent-layer chain encoders =====
-// hist/state bind the per-session arena at the layer's byte offset; the rest are step scratch.
-
-def enc_dn_conv_hist(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uint64;
-                     bcd, bdconv, bnp : MetalBuffer?; cd : int64; hmoff : uint64; bmid : MetalBuffer?) {
-    kn_pipeline(enc, g_pso_dn_hist)
-    kn_buffer(enc, bx, 0ul, 0)
-    kn_buffer(enc, bhist, hoff, 1)
-    kn_buffer(enc, bcd, 0ul, 2)
-    kn_buffer(enc, bdconv, 0ul, 3)
-    kn_buffer(enc, bnp, 0ul, 4)
-    kn_buffer(enc, bhist, hmoff, 5)
-    kn_buffer(enc, bmid, 0ul, 6)
-    hz_read(bx)
-    hz_read(bhist)
-    hz_write(bhist)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((cd + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_dn_l2norm(enc : MetalComputeEncoder?; by, bcd, bkd, bds, beps, bqscale : MetalBuffer?; nblk, npos : int64) {
-    kn_pipeline(enc, g_pso_dn_l2)
-    kn_buffer(enc, by, 0ul, 0)
-    kn_buffer(enc, bcd, 0ul, 1)
-    kn_buffer(enc, bkd, 0ul, 2)
-    kn_buffer(enc, bds, 0ul, 3)
-    kn_buffer(enc, beps, 0ul, 4)
-    kn_buffer(enc, bqscale, 0ul, 5)
-    hz_read(by)
-    hz_write(by)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((nblk + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_dn_scan(enc : MetalComputeEncoder?; bcv, bst : MetalBuffer?; stoff : uint64;
-                bbraw, bgraw, baa, bdtb, bo, bcd, bkd, bds, bnvh, bnkh, bdi, bnp : MetalBuffer?; ds, nvh : int64;
-                stmoff : uint64; bmid : MetalBuffer?) {
-    kn_pipeline(enc, g_pso_dn_scan)
-    kn_buffer(enc, bcv, 0ul, 0)
-    kn_buffer(enc, bst, stoff, 1)
-    kn_buffer(enc, bbraw, 0ul, 2)
-    kn_buffer(enc, bgraw, 0ul, 3)
-    kn_buffer(enc, baa, 0ul, 4)
-    kn_buffer(enc, bdtb, 0ul, 5)
-    kn_buffer(enc, bo, 0ul, 6)
-    kn_buffer(enc, bcd, 0ul, 7)
-    kn_buffer(enc, bkd, 0ul, 8)
-    kn_buffer(enc, bds, 0ul, 9)
-    kn_buffer(enc, bnvh, 0ul, 10)
-    kn_buffer(enc, bnkh, 0ul, 11)
-    kn_buffer(enc, bdi, 0ul, 12)
-    kn_buffer(enc, bnp, 0ul, 13)
-    kn_buffer(enc, bst, stmoff, 14)
-    kn_buffer(enc, bmid, 0ul, 15)
-    hz_read(bcv)
-    hz_read(bbraw)
-    hz_read(bgraw)
-    hz_read(bst)
-    hz_write(bst)
-    hz_write(bo)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint(ds / 4l), uint(nvh), 1u), uint3(128u, 1u, 1u))
-}
-
-def enc_dn_gate(enc : MetalComputeEncoder?; bo, bz, bwn, bds, bdi, beps : MetalBuffer?; nvh, npos : int64) {
-    kn_pipeline(enc, g_pso_dn_gate)
-    kn_buffer(enc, bo, 0ul, 0)
-    kn_buffer(enc, bz, 0ul, 1)
-    kn_buffer(enc, bwn, 0ul, 2)
-    kn_buffer(enc, bds, 0ul, 3)
-    kn_buffer(enc, bdi, 0ul, 4)
-    kn_buffer(enc, beps, 0ul, 5)
-    hz_read(bo)
-    hz_read(bz)
-    hz_write(bo)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((nvh + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_dn_deint(enc : MetalComputeEncoder?; bqg, bq, bgt, bhs, bqd, bqs : MetalBuffer?; qd, npos : int64) {
-    kn_pipeline(enc, g_pso_dn_deint)
-    kn_buffer(enc, bqg, 0ul, 0)
-    kn_buffer(enc, bq, 0ul, 1)
-    kn_buffer(enc, bgt, 0ul, 2)
-    kn_buffer(enc, bhs, 0ul, 3)
-    kn_buffer(enc, bqd, 0ul, 4)
-    kn_buffer(enc, bqs, 0ul, 5)
-    hz_read(bqg)
-    hz_write(bq)
-    hz_write(bgt)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((qd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_axpy_sig(enc : MetalComputeEncoder?; by, bx, bg, btot, bdim : MetalBuffer?; total : int64) {
-    kn_pipeline(enc, g_pso_axpy_sig)
-    kn_buffer(enc, by, 0ul, 0)
-    kn_buffer(enc, bx, 0ul, 1)
-    kn_buffer(enc, bg, 0ul, 2)
-    kn_buffer(enc, btot, 0ul, 3)
-    kn_buffer(enc, bdim, 0ul, 4)
-    hz_read(by)
-    hz_read(bx)
-    hz_read(bg)
-    hz_write(by)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((total + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
 // fused add + rms when dim fits the kernel's row slab, the unfused pair otherwise
@@ -6729,30 +6591,6 @@ def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs, bchlo :
     hz_write(by)
     hz_gate(enc)
     kn_dispatch(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
-}
-
-// suppress-token pinning over a logits row in place (gemma4) — ids as a u32 buffer
-def enc_suppress_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64; bids, bn : MetalBuffer?; n : int64) {
-    kn_pipeline(enc, g_pso_suppress)
-    kn_buffer(enc, bx, xoff, 0)
-    kn_buffer(enc, bids, 0ul, 1)
-    kn_buffer(enc, bn, 0ul, 2)
-    hz_read(bx)
-    hz_write(bx)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((n + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
-}
-
-// logit soft-cap over a row in place (gemma2/gemma4 final_logit_softcap on the GPU classifier)
-def enc_softcap_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64; btot, bcap : MetalBuffer?; total : int64) {
-    kn_pipeline(enc, g_pso_softcap)
-    kn_buffer(enc, bx, xoff, 0)
-    kn_buffer(enc, btot, 0ul, 1)
-    kn_buffer(enc, bcap, 0ul, 2)
-    hz_read(bx, xoff, uint64(total * 4l))
-    hz_write(bx, xoff, uint64(total * 4l))
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // swiglu and add share the (a, b, total) elementwise shape; offsets serve the fused-buffer binds

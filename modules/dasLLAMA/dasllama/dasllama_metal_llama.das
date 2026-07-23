@@ -677,12 +677,12 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                 let hoff = r.dn_conv_base + uint64(dnli * (c.ssm_d_conv - 1l) * cd * 4l)
                 var bw_cv = upload_region(addr < void? >(t.fblob[t.dn_conv_off + l * c.ssm_d_conv * cd]), uint64(c.ssm_d_conv * cd * 4l))
                 enc_dn_conv(enc, r.bdn_qkv, r.bdn_state, hoff, bw_cv, r.bdn_cv, r.u_cd, r.u_dconv, r.u_one32, cd, 1l)
-                enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_one32, cd, hoff, r.u_zero32)
+                enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_one32, r.bdn_state, hoff, r.u_zero32, cd)
                 enc_dn_l2norm(enc, r.bdn_cv, r.u_cd, r.u_dn_kd, r.u_ds, r.u_eps, r.u_qscale, 2l * c.ssm_n_group, 1l)
                 var baa = upload_region(addr < void? >(t.fblob[t.dn_a_off + l * nvh]), uint64(nvh * 4l))
                 var bdt = upload_region(addr < void? >(t.fblob[t.dn_dt_off + l * nvh]), uint64(nvh * 4l))
                 enc_dn_scan(enc, r.bdn_cv, r.bdn_state, soff, r.bdn_b, r.bdn_g, baa, bdt, r.bdn_o,
-                    r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_one32, c.ssm_d_state, nvh, soff, r.u_zero32)
+                    r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_one32, r.bdn_state, soff, r.u_zero32, c.ssm_d_state, nvh)
                 var bwn = upload_region(addr < void? >(t.fblob[t.dn_norm_off + l * c.ssm_d_state]), uint64(c.ssm_d_state * 4l))
                 enc_dn_gate(enc, r.bdn_o, r.bdn_z, bwn, r.u_ds, r.u_di, r.u_eps, nvh, 1l)
             }
@@ -871,7 +871,7 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                 enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_moe_gmode, 1l)
                 if (g4) {
                     var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
-                    enc_moe_wscale(enc, r.bmoe_sel, bw_ds, r.u_moe_k, 1l)
+                    enc_moe_wscale(enc, r.bmoe_sel, r.bmoe_sel, bw_ds, r.u_moe_k, 1l)
                 }
                 if (r.u_moe_nsh != null) {
                     // shexp raw gate dot (σ in the combine) — bmoe_lg[0] is free once select consumed it
@@ -1239,13 +1239,13 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
             let hoff = r.dn_conv_base + hslice
             var bw_cv = upload_region(addr < void? >(t.fblob[t.dn_conv_off + l * c.ssm_d_conv * cd]), uint64(c.ssm_d_conv * cd * 4l))
             enc_dn_conv(enc, r.bdn_qkv, r.bdn_state, hoff, bw_cv, r.bdn_cv, r.u_cd, r.u_dconv, r.u_two32, cd, 2l)
-            enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_two32, cd, r.dn_conv_alt + hslice, r.u_one32)
+            enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.u_cd, r.u_dconv, r.u_two32, r.bdn_state, r.dn_conv_alt + hslice, r.u_one32, cd)
             enc_dn_l2norm(enc, r.bdn_cv, r.u_cd, r.u_dn_kd, r.u_ds, r.u_eps, r.u_qscale, 2l * c.ssm_n_group, 2l)
             var baa = upload_region(addr < void? >(t.fblob[t.dn_a_off + l * nvh]), uint64(nvh * 4l))
             var bdt = upload_region(addr < void? >(t.fblob[t.dn_dt_off + l * nvh]), uint64(nvh * 4l))
             enc_dn_scan(enc, r.bdn_cv, r.bdn_state, soff, r.bdn_b, r.bdn_g, baa, bdt, r.bdn_o,
-                r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_two32, c.ssm_d_state, nvh,
-                r.dn_state_alt + sslice, r.u_one32)
+                r.u_cd, r.u_dn_kd, r.u_ds, r.u_nvh, r.u_nkh, r.u_di, r.u_two32, r.bdn_state,
+                r.dn_state_alt + sslice, r.u_one32, c.ssm_d_state, nvh)
             var bwn = upload_region(addr < void? >(t.fblob[t.dn_norm_off + l * c.ssm_d_state]), uint64(c.ssm_d_state * 4l))
             enc_dn_gate(enc, r.bdn_o, r.bdn_z, bwn, r.u_ds, r.u_di, r.u_eps, nvh, 2l)
             let bdno = blob_of(g_dev, t, t.dnout_offs[l])
@@ -2876,7 +2876,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 if (g4moe) {
                     var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
                     bar_dep(enc, haz, HZ_BMSEL, HZ_BMSEL)
-                    enc_moe_wscale(enc, bmsel, bw_ds, u_moe_k, nrows)
+                    enc_moe_wscale(enc, bmsel, bmsel, bw_ds, u_moe_k, nrows)
                 }
                 bar_dep(enc, haz, hz_ex | HZ_BMSEL, hz_gh | hz_gh2)
                 if (t.experts_mx4) {
