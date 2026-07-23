@@ -271,3 +271,58 @@ def array_view(
         }
     }
 }
+
+[unused_argument(witness)]
+def private pod_view_impl(bytes : array<uint8>#; byte_offset : int | int64; witness : auto(TT)) : TT {
+    concept_assert(typeinfo is_pod(type<TT>), "pod_view requires a POD element type")
+    concept_assert(typeinfo is_raw(type<TT>), "pod_view requires a raw POD element type (no pointers)")
+    concept_assert(typeinfo sizeof(type<TT>) > 0, "pod_view requires a non-empty element type")
+    let element_size = typeinfo sizeof(type<TT>)
+    var result : TT
+    unsafe {
+        var view : array<uint8>#
+        _builtin_make_temp_array(view, addr<uint8?>(result), element_size)
+        static_if (typeinfo is_int(byte_offset)) {
+            if (byte_offset < 0 || byte_offset > _::length(bytes) - element_size) {
+                panic("pod_view: out of range")
+            }
+            for (i in range(element_size)) {
+                view[i] = bytes[byte_offset + i]
+            }
+        } else {
+            if (byte_offset < 0_l || byte_offset > _::long_length(bytes) - int64(element_size)) {
+                panic("pod_view: out of range")
+            }
+            for (i in range(element_size)) {
+                view[i] = bytes[byte_offset + int64(i)]
+            }
+        }
+    }
+    return result
+}
+
+[template(t), unused_argument(t)]
+def pod_view(bytes : array<uint8>#; byte_offset : int | int64; t : type<auto(TT)>) : TT {
+    //! reads one raw POD value from borrowed bytes at an arbitrary, possibly unaligned, byte offset;
+    //! bounds-checked byte copy — the alignment-free complement of the typed `array_view`
+    concept_assert(typeinfo is_pod(type<TT>) && typeinfo is_raw(type<TT>), "pod_view requires a raw POD element type (no pointers)")
+    let result : TT
+    return pod_view_impl(bytes, byte_offset, result)
+}
+
+[template(t), unused_argument(t)]
+def pod_view(bytes : array<uint8> ==const; byte_offset : int | int64; t : type<auto(TT)>) : TT {
+    //! reads one raw POD value from an owner byte array at an arbitrary, possibly unaligned, byte offset
+    concept_assert(typeinfo is_pod(type<TT>) && typeinfo is_raw(type<TT>), "pod_view requires a raw POD element type (no pointers)")
+    var result : TT
+    static_if (typeinfo is_int(byte_offset)) {
+        array_view(bytes, 0, _::length(bytes)) $(view : array<uint8>#) {
+            result = pod_view_impl(view, byte_offset, result)
+        }
+    } else {
+        array_view(bytes, 0_l, _::long_length(bytes)) $(view : array<uint8>#) {
+            result = pod_view_impl(view, byte_offset, result)
+        }
+    }
+    return result
+}

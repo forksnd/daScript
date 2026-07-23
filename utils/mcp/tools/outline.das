@@ -231,6 +231,7 @@ def do_outline(file, glob_filter : string) : string {
             }
         }
     }
+    raw_json = strip_ast_grep_banner(raw_json)
     if (empty(raw_json) || raw_json == "[]") return make_tool_result("No declarations found")
     var err : string
     var parsed = read_json(raw_json, err)

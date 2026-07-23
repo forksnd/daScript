@@ -827,7 +827,7 @@ def document_module_array_boost(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Temporary arrays", mod, %regex~(temp_array)$%%),
         group_by_regex("Empty check", mod, %regex~(empty)$%%),
-        group_by_regex("Sub-array view", mod, %regex~(array_view)$%%)
+        group_by_regex("Sub-array view", mod, %regex~(array_view|pod_view)$%%)
     )
     document("Boost package for array manipulation", mod, "array_boost.rst", groups)
 }

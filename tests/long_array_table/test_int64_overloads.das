@@ -202,3 +202,43 @@ def test_array_view_typed_bytes(t : T?) {
     }
     t |> success(out_of_range_panicked, "typed array_view rejects out-of-range data")
 }
+
+[test]
+def test_pod_view(t : T?) {
+    // 0x04030201 at offset 1, 0x08070605 at offset 5, fp32 3.5 at offset 9 — all unaligned
+    let bytes <- [
+        uint8(0xAA),
+        uint8(0x01), uint8(0x02), uint8(0x03), uint8(0x04),
+        uint8(0x05), uint8(0x06), uint8(0x07), uint8(0x08),
+        uint8(0x00), uint8(0x00), uint8(0x60), uint8(0x40)
+    ]
+    t |> equal(pod_view(bytes, 1, type<int>), int(0x04030201))
+    t |> equal(pod_view(bytes, 5, type<int>), int(0x08070605))
+    t |> equal(pod_view(bytes, 9, type<float>), 3.5)
+    t |> equal(pod_view(bytes, 1_l, type<int>), int(0x04030201))
+    let pair = pod_view(bytes, 1, type<int2>)
+    t |> equal(pair.x, int(0x04030201))
+    t |> equal(pair.y, int(0x08070605))
+    array_view(bytes, 0, length(bytes)) $(borrowed : array<uint8>#) {
+        t |> equal(pod_view(borrowed, 5, type<int>), int(0x08070605))
+    }
+
+    var sink = 0
+    var out_of_range_panicked = false
+    try {
+        sink = pod_view(bytes, 10, type<int>)
+    } recover {
+        out_of_range_panicked = true
+    }
+    t |> success(out_of_range_panicked, "pod_view rejects out-of-range reads")
+    t |> equal(sink, 0)
+
+    var negative_panicked = false
+    try {
+        sink = pod_view(bytes, -1, type<int>)
+    } recover {
+        negative_panicked = true
+    }
+    t |> success(negative_panicked, "pod_view rejects negative offsets")
+    t |> equal(sink, 0)
+}
