@@ -17,11 +17,11 @@ require daslib/json_boost
 def private parse_uint(data : array<uint8> const#; var pos : int&) : uint64 {
     var v = 0ul
     while (pos < length(data)) {
-        let c = uint(data[pos])
-        if (c < uint('0') || c > uint('9')) {
+        let c = int(data[pos])
+        if (!is_number(c)) {
             break
         }
-        v = v * 10ul + uint64(c - uint('0'))
+        v = v * 10ul + uint64(c - '0')
         pos++
     }
     return v
@@ -103,14 +103,14 @@ def private parse_x_line(data : array<uint8> const#; pos, line_end : int; var e 
     e.dur = parse_us3(data, at)
     at = seek_past(data, at, line_end, "\"name\":\"")
     if (at < 0) return false
-    let c = data[at]
-    if (c == uint8('p')) {
+    let c = int(data[at])
+    if (c == 'p') {
         e.kind = EV_PUBLISH
-    } elif (c == uint8('c')) {
+    } elif (c == 'c') {
         e.kind = EV_CHUNK
-    } elif (c == uint8('s')) {
+    } elif (c == 's') {
         e.kind = EV_STAGE_WAIT
-    } elif (c == uint8('w')) {
+    } elif (c == 'w') {
         e.kind = EV_WAKE
     } else {
         e.kind = EV_FIFO
@@ -174,15 +174,15 @@ def public load_trace(path : string; var doc : TraceDoc) : bool {
                 line_end++
             }
             if (pos + 8 < n && data[pos] == uint8('{') && data[pos + 2] == uint8('p') && data[pos + 4] == uint8('"')) {
-                let ph = data[pos + 7]
-                if (ph == uint8('X') || ph == uint8('i')) {
+                let ph = int(data[pos + 7])
+                if (ph == 'X' || ph == 'i') {
                     var at = seek_past(data, pos, line_end, "\"tid\":")
                     if (at >= 0) {
                         let tid = int(parse_uint(data, at))
                         while (length(counts) <= tid) {
                             counts |> push(0)
                         }
-                        if (ph == uint8('X')) {
+                        if (ph == 'X') {
                             counts[tid]++
                         }
                     }
@@ -233,8 +233,8 @@ def public load_trace(path : string; var doc : TraceDoc) : bool {
                 line_end++
             }
             if (pos + 8 < n && data[pos] == uint8('{') && data[pos + 2] == uint8('p') && data[pos + 4] == uint8('"')) {
-                let ph = data[pos + 7]
-                if (ph == uint8('X')) {
+                let ph = int(data[pos + 7])
+                if (ph == 'X') {
                     var le : LineEv
                     if (parse_x_line(data, pos, line_end, le) && le.tid < length(doc.lanes)) {
                         var stage = le.stage
@@ -252,7 +252,7 @@ def public load_trace(path : string; var doc : TraceDoc) : bool {
                             doc.span = tend
                         }
                     }
-                } elif (ph == uint8('i')) {
+                } elif (ph == 'i') {
                     var at = seek_past(data, pos, line_end, "\"tid\":")
                     if (at >= 0) {
                         let tid = int(parse_uint(data, at))
@@ -274,7 +274,7 @@ def public load_trace(path : string; var doc : TraceDoc) : bool {
                             }
                         }
                     }
-                } elif (ph == uint8('M')) {
+                } elif (ph == 'M') {
                     var at = seek_past(data, pos, line_end, "\"tid\":")
                     if (at >= 0) {
                         let tid = int(parse_uint(data, at))

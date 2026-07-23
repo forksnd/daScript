@@ -39,10 +39,10 @@ def public split_args(s : string) : array<string> {
     var in_quote = false
     peek_data(s) $(data) {
         for (i in range(length(data))) {
-            let c = data[i]
-            if (c == uint8('"')) {
+            let c = int(data[i])
+            if (c == '"') {
                 in_quote = !in_quote
-            } elif (!in_quote && (c == uint8(' ') || c == uint8('\t') || c == uint8('\n') || c == uint8('\r'))) {
+            } elif (!in_quote && (c == ' ' || c == '\t' || c == '\n' || c == '\r')) {
                 if (!empty(cur)) {
                     unsafe {
                         out |> push(string(cur))
@@ -50,7 +50,7 @@ def public split_args(s : string) : array<string> {
                     cur |> clear()
                 }
             } else {
-                cur |> push(c)
+                cur |> push(uint8(c))
             }
         }
     }
@@ -70,7 +70,7 @@ def public extract_json_path(line : string) : string {
     var toks <- split_args(line)
     for (tk in toks) {
         if (ends_with(tk, ".json")) {
-            found := tk
+            found = tk
             break
         }
     }
@@ -104,9 +104,9 @@ def public launch_start(var L : LaunchRail) : bool {
     }
     L.ch = unsafe(channel_create())
     var ch = L.ch
-    let app := L.app
-    let args := L.args
-    let das_exe := get_das_exe()   // .das apps run as `daslang -jit <script> -- <args>`
+    let app = clone_string(L.app)          // cloned: the job below runs in another context
+    let args = clone_string(L.args)
+    let das_exe = clone_string(get_das_exe())   // .das apps run as `daslang -jit <script> -- <args>`
     new_job <| @ {
         var outp = ""
         var argv <- split_args(args)
