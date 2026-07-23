@@ -660,6 +660,27 @@ def test_openai_server_multimodel(t : T?) {
                 t |> equal(int(resp.status_code), int(http_status.NOT_FOUND))
                 t |> success(find(string(resp.body), "model_not_found") >= 0, "404 carries model_not_found")
             }
+            // POST /v1/models/activate: admin warm-switch — 200 flips the active slot; 404 on an
+            // unknown id. The GPU rebind inside is a no-op on this rig (no tier armed).
+            POST("{base_url}/v1/models/activate", "\{\"model\":\"smol\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                t |> success(find(string(resp.body), "\"model\":\"smol\"") >= 0, "activate echoes the slot")
+            }
+            GET("{base_url}/v1/stats") $(resp) {
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "post-activate stats JSON parses")
+                if (js != null) {
+                    t |> equal(string(js?["active_model"] ?? ""), "smol")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            POST("{base_url}/v1/models/activate", "\{\"model\":\"nope\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.NOT_FOUND))
+                t |> success(find(string(resp.body), "model_not_found") >= 0, "activate 404 carries model_not_found")
+            }
             // THE directive test: slot caches survive interleaved traffic on another slot.
             // Same >1-page prompt on tiny twice, a smol request between them — the re-send must
             // hit tiny's prefix cache even though smol served in between.
@@ -698,6 +719,7 @@ def test_openai_server_multimodel(t : T?) {
                                 t |> equal(string(e?["backend"] ?? ""), "cpu")
                                 t |> equal(string(e?["backend_effective"] ?? ""), "cpu")
                                 t |> equal(e?["cached_tokens"] ?? -1l, 0l)
+                                t |> equal(e?["holds_gpu"] ?? true, false)
                             }
                         }
                     }

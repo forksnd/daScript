@@ -577,8 +577,8 @@ def parse_args() {
         request_exit()
         return
     }
-    if (empty(g_cfg.model)) {
-        print("error: no model — pass --model or set model = in --config\n\n")
+    if (empty(g_cfg.model) && empty(g_models)) {   // a [[models]] roster needs no flat model key
+        print("error: no model — pass --model, or set model = / a [[models]] roster in --config\n\n")
         print_help(get_command_info(type<ServerArgs>), "dasllama-server")
         g_exit_code = 1
         request_exit()
@@ -743,11 +743,17 @@ def init() {
             break
         }
     }
-    // P1: exactly ONE slot owns the GPU tier — the default slot unless its backend pins cpu,
-    // else the first gpu/auto entry. Everything else serves on the CPU rails until the P2
-    // switch-on-demand lands. The want is toggled per load (the tier arms at each load tail).
+    // At load time exactly ONE slot arms the GPU tier — the default slot unless its backend pins
+    // cpu, else the first gpu/auto entry. The want is toggled per load (the tier arms at each
+    // load tail); every non-cpu slot RECORDS the want so the switch-on-demand path (P2b) can
+    // re-arm it when the tick loop or POST /v1/models/activate moves the tier.
     var gpu_idx = -1
+    var slot_want = GpuTierWant()
     if (gpu == "vulkan") {
+        slot_want = GpuTierWant(
+            moe_layers = gpu_detail_layers(g_cfg), moe_stream = gpu_detail_stream(g_cfg),
+            vram_mb = int64(g_cfg.gpu_vram_mb), dn = gpu_detail_dn(g_cfg),
+            attn = gpu_detail_attn(g_cfg), dense = g_cfg.gpu_dense, shexp = true)
         if (g_models[def_idx].backend != "cpu") {
             gpu_idx = def_idx
         } else {
@@ -768,14 +774,7 @@ def init() {
             ent.name = base_name(ent.path)
         }
         if (gpu == "vulkan") {
-            if (i == gpu_idx) {
-                set_gpu_tier_want(GpuTierWant(
-                    moe_layers = gpu_detail_layers(g_cfg), moe_stream = gpu_detail_stream(g_cfg),
-                    vram_mb = int64(g_cfg.gpu_vram_mb), dn = gpu_detail_dn(g_cfg),
-                    attn = gpu_detail_attn(g_cfg), dense = g_cfg.gpu_dense, shexp = true))
-            } else {
-                set_gpu_tier_want(GpuTierWant())   // zero want: this slot loads CPU-only
-            }
+            set_gpu_tier_want(i == gpu_idx ? slot_want : GpuTierWant())   // zero want: loads CPU-only
         }
         print("loading {ent.path} ...\n")
         var m <- load_model(ent.path, pick_quant(!empty(ent.quant) ? ent.quant : g_cfg.quant))
@@ -803,9 +802,9 @@ def init() {
             opts.kv_dtype_set = true
         }
         opts.mtp = ent.mtp
-        add_model(m, ent.name, opts)
-        if (i == gpu_idx) {
-            set_slot_backend_effective(ent.name, "gpu")   // coarse P1 badge; P2's arm path refines
+        add_model(m, ent.name, opts)   // captures this load's arm outcome + marks onto the slot
+        if (gpu == "vulkan" && ent.backend != "cpu") {
+            set_slot_gpu_want(ent.name, slot_want)   // the want switch-in re-arms with
         }
     }
     set_default_model(g_models[def_idx].name)
@@ -818,7 +817,9 @@ def init() {
     // the /config surface: a config-less start saves beside the program (the same spot the
     // auto-discovery in parse_args looks)
     let save_path = !empty(g_cfg.config) ? g_cfg.config : path_join(get_this_module_dir(), "dasllama-server.toml")
-    set_config_surface(build_config_surface(g_cfg, save_path), save_path, g_cfg.model)
+    // the served-model anchor for the page's model_files picker: the flat key, else the roster default
+    let picker_model = !empty(g_cfg.model) ? g_cfg.model : g_models[def_idx].path
+    set_config_surface(build_config_surface(g_cfg, save_path), save_path, picker_model)
     // the bench button runs OUR bench as a child daslang process (lcpp_bench.das) — a
     // standalone-exe deployment has no script runner, so the button stays disabled there
     var daslang_bin = ""
