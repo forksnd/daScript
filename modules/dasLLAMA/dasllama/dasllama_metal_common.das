@@ -218,6 +218,115 @@ var g_arena : MetalBuffer?
 var g_arena_bytes = 0ul
 var g_arena_epoch = 0l   // bumps on every grow-rebuild — pre-encoded steps referencing the old buffer are stale
 var g_arena_free : array<tuple<off : uint64; size : uint64>>   // sorted by off, coalesced
+
+// ===== decode PSO + resource globals (declared here, not kernels.das, so [metal_dispatch]-generated
+// builders — co-located with their kernel class, some in prefill.das — see the pipeline they
+// dispatch; compile_pso() assignments + shutdown releases stay in kernels' metal_decode_init) =====
+var g_pso_gemv : MetalComputePipeline?
+var g_gemv_rows = 4l                       // rows (simdgroups) per GEMV threadgroup
+var g_pso_rms : MetalComputePipeline?
+var g_pso_add : MetalComputePipeline?
+var g_pso_addrms : MetalComputePipeline?
+var g_pso_preaddrms : MetalComputePipeline?
+var g_pso_swiglu : MetalComputePipeline?
+var g_pso_geglu : MetalComputePipeline?
+var g_pso_softcap : MetalComputePipeline?
+var g_pso_suppress : MetalComputePipeline?
+var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind
+var g_zero : MetalBuffer?                   // persistent 0u — the sink/hass identity bind
+var g_pso_attn16 : MetalComputePipeline?
+var g_pso_attn32 : MetalComputePipeline?
+var g_pso_attn_q8 : MetalComputePipeline?   // q8_0-mirror twin (dual-view block reads)
+var g_pso_attn_tq4 : MetalComputePipeline?  // tq4-mirror twin (rotated-basis nibble reads)
+var g_pso_attnp16 : MetalComputePipeline?
+var g_pso_attnp32 : MetalComputePipeline?
+var g_pso_attnp_q8 : MetalComputePipeline?
+var g_pso_attnp_tq4 : MetalComputePipeline?
+var g_pso_attncomb : MetalComputePipeline?
+var g_pso_rpst16 : MetalComputePipeline?
+var g_pso_rpst_h16 : MetalComputePipeline?  // head-cooperative fused bias+norm+rope+store (QK-norm models)
+var g_pso_rpst32 : MetalComputePipeline?
+var g_pso_rpst_q8 : MetalComputePipeline?   // per-32-block quantizing store
+var g_pso_rpst_tq4 : MetalComputePipeline?  // threadgroup-per-head FWHT + quantizing store
+var g_pso_unsign : MetalComputePipeline?    // the tq4 attention-output un-rotate
+var g_pso_qknorm : MetalComputePipeline?    // per-head QK RMSNorm prepass (MSL owned by prefill)
+
+var g_pso_argmax : MetalComputePipeline?
+var g_pso_copy_row : MetalComputePipeline?   // zero-copy logits: staging row -> wrapped session storage
+var g_pso_emb : MetalComputePipeline?
+var g_pso_emb_k6 : MetalComputePipeline?     // tied-k6 spec chain's embed gather
+var g_pso_moe_router : MetalComputePipeline?   // MoE (Wave C): router GEMV over the fp32 slab
+var g_pso_moe_select : MetalComputePipeline?   // softmax + top-k + renorm (one simdgroup)
+var g_pso_moe_gemv_q8 : MetalComputePipeline?  // expert-indexed GEMV twins (grid.y = slot)
+var g_pso_moe_kq_k4 : MetalComputePipeline?
+var g_pso_moe_kq_k5 : MetalComputePipeline?
+var g_pso_moe_kq_k6 : MetalComputePipeline?
+var g_pso_moe_combine : MetalComputePipeline?  // weighted top-k reduce into the w2 write shape
+var g_pso_g4rnorm : MetalComputePipeline?      // gemma4 MoE router-input norm (stage 3)
+var g_pso_moe_wscale : MetalComputePipeline?   // gemma4 per-expert down-scale fold
+var g_pso_swiglu_oai : MetalComputePipeline?   // gpt-oss clamped swiglu (stage 4)
+var g_pso_moe_gemv_mx4 : MetalComputePipeline?  // gpt-oss MXFP4 expert GEMV
+var g_pso_moe_gemv_q51 : MetalComputePipeline?  // Q5_1 expert GEMV (per-32 planes)
+var g_e8m0_tab : MetalBuffer?                   // [256] exact e8m0_half scales
+var g_mx4_vtab : MetalBuffer?                   // [16] signed doubled-e2m1 values
+var g_pso_dn_conv : MetalComputePipeline?      // deltanet (Wave D): causal conv + SiLU
+var g_pso_dn_hist : MetalComputePipeline?      // conv-history advance
+var g_pso_dn_l2 : MetalComputePipeline?        // q/k per-head L2 norm + q pre-scale
+var g_pso_dn_scan : MetalComputePipeline?      // the fused sequential delta rule
+var g_pso_dn_gate : MetalComputePipeline?      // z-gated out-norm
+var g_pso_dn_deint : MetalComputePipeline?     // 2x-wide [q|gate] deinterleave
+var g_pso_sigmul : MetalComputePipeline?       // x ⊙ σ(g) — the gated-attention out-gate
+var g_pso_axpy_sig : MetalComputePipeline?     // y += x ⊙ σ(g[row]) — the shexp combine (stage 3)
+var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
+var g_pso_qkvrs32 : MetalComputePipeline?
+var g_pso_w13sw : MetalComputePipeline?
+var g_pso_kq_k4 : MetalComputePipeline?
+var g_pso_kq_k5 : MetalComputePipeline?
+var g_pso_kq_k5c : MetalComputePipeline?   // the select-form nr0=1 twin — n < 3072 / small-d sites
+var g_pso_kq_k6 : MetalComputePipeline?
+var g_pso_kq_mvb2_k4 : MetalComputePipeline?   // batch B=2..8: the kq ext small-batch mv twins
+var g_pso_kq_mvb4_k4 : MetalComputePipeline?
+var g_pso_kq_mvb2_k5 : MetalComputePipeline?
+var g_pso_kq_mvb4_k5 : MetalComputePipeline?
+var g_pso_kq_mvb2_k6 : MetalComputePipeline?
+var g_pso_kq_mvb4_k6 : MetalComputePipeline?
+var g_pso_kq_mvb8_k4 : MetalComputePipeline?   // B=5..8 single-pass twins (in-graph A/B vs 2 x B4 groups)
+var g_pso_kq_mvb8_k5 : MetalComputePipeline?
+var g_pso_kq_mvb8_k6 : MetalComputePipeline?
+var g_pso_kq_mm_b4 : MetalComputePipeline?   // batch B>=9: the prefill-owned kq mul_mm twins
+var g_pso_kq_mm_b5 : MetalComputePipeline?
+var g_pso_kq_mm_b6 : MetalComputePipeline?     // fused W1|W3+swiglu (s16 path)
+// the batched-step set (P4): fixed-B GEMVs + the M-pad-32 GEMM twin (f32 X) + row-table kernels
+var g_pso_gemv_b2 : MetalComputePipeline?
+var g_pso_gemv_b4 : MetalComputePipeline?
+var g_pso_mv_b2 : MetalComputePipeline?
+var g_pso_mv_b4 : MetalComputePipeline?
+var g_pso_w13sw_b2 : MetalComputePipeline?
+var g_pso_w13sw_b4 : MetalComputePipeline?
+var g_pso_gemm_b : MetalComputePipeline?
+var g_pso_gemm_b_sk : MetalComputePipeline? // split-K twin (per-site policy)
+var g_pso_skred : MetalComputePipeline?     // the split-K plane reduce
+var g_pso_gemm64_b : MetalComputePipeline?  // 64-wide N tile (classifier site)
+var g_pso_mm : MetalComputePipeline?        // the prefill module's MetalQ8MulMm (34B blob)
+var g_pso_attnb16 : MetalComputePipeline?
+var g_pso_attnb32 : MetalComputePipeline?
+var g_pso_attnb_q8 : MetalComputePipeline?
+var g_pso_attnb_tq4 : MetalComputePipeline?
+var g_pso_attnpb16 : MetalComputePipeline?
+var g_pso_attnpb32 : MetalComputePipeline?
+var g_pso_attnpb_q8 : MetalComputePipeline?
+var g_pso_attnpb_tq4 : MetalComputePipeline?
+var g_pso_attncombb : MetalComputePipeline?
+var g_pso_attnd16 : MetalComputePipeline?   // fused single-pass batch attention (hs 128)
+var g_pso_attnd32 : MetalComputePipeline?
+var g_pso_attnd_q8 : MetalComputePipeline?
+var g_pso_attnd_tq4 : MetalComputePipeline?
+var g_pso_attncombd : MetalComputePipeline?
+var g_pso_rpstb16 : MetalComputePipeline?
+var g_pso_rpstb32 : MetalComputePipeline?
+var g_pso_rpstb_q8 : MetalComputePipeline?
+var g_pso_rpstb_tq4 : MetalComputePipeline?
+var g_pso_addrmsb : MetalComputePipeline?
 // uids a batch step is actively encoding against — eviction must never free a batch row's slice
 // out from under the step being assembled (the single path's `keep` protects only one uid)
 var g_pin : table<uint64>

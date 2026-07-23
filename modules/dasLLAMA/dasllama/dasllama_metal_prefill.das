@@ -4261,7 +4261,7 @@ var private g_pso_gemm64 : MetalComputePipeline?
 var private g_pf_pso_rms : MetalComputePipeline?
 var private g_pso_rope : MetalComputePipeline?
 var private g_pso_addbias : MetalComputePipeline?
-var private g_pso_qknorm : MetalComputePipeline?
+var private g_pf_pso_qknorm : MetalComputePipeline?
 var private g_pso_qk : MetalComputePipeline?
 var private g_pso_softmax : MetalComputePipeline?
 var private g_pso_av : MetalComputePipeline?
@@ -4426,9 +4426,9 @@ def public metal_prefill_shutdown {
         metal_release(g_pso_addbias)
         g_pso_addbias = null
     }
-    if (g_pso_qknorm != null) {
-        metal_release(g_pso_qknorm)
-        g_pso_qknorm = null
+    if (g_pf_pso_qknorm != null) {
+        metal_release(g_pf_pso_qknorm)
+        g_pf_pso_qknorm = null
     }
     if (g_pso_qk != null) {
         metal_release(g_pso_qk)
@@ -4575,7 +4575,7 @@ def private metal_prefill_init : bool {
     g_pf_pso_rms = pf_compile_pso(metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, ok)
     g_pso_rope = pf_compile_pso(metal_rope_msl, metal_rope_msl_entry, metal_rope_msl_fastmath, ok)
     g_pso_addbias = pf_compile_pso(metal_add_bias_rows_msl, metal_add_bias_rows_msl_entry, metal_add_bias_rows_msl_fastmath, ok)
-    g_pso_qknorm = pf_compile_pso(metal_qk_norm_msl, metal_qk_norm_msl_entry, metal_qk_norm_msl_fastmath, ok)
+    g_pf_pso_qknorm = pf_compile_pso(metal_qk_norm_msl, metal_qk_norm_msl_entry, metal_qk_norm_msl_fastmath, ok)
     g_pso_qk = pf_compile_pso(metal_attn_qk_msl, metal_attn_qk_msl_entry, metal_attn_qk_msl_fastmath, ok)
     g_pso_softmax = pf_compile_pso(metal_attn_softmax_msl, metal_attn_softmax_msl_entry, metal_attn_softmax_msl_fastmath, ok)
     g_pso_av = pf_compile_pso(metal_attn_av_msl, metal_attn_av_msl_entry, metal_attn_av_msl_fastmath, ok)
@@ -5073,7 +5073,7 @@ def private enc_add_bias_rows(enc : MetalComputeEncoder?; bx, bb, bn, btotal : M
 }
 
 def private enc_qk_norm_pf(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps, bsoffe : MetalBuffer?; ntg, nrows, hs : int64; off : uint64 = 0ul) {
-    metal_set_pipeline(enc, g_pso_qknorm)
+    metal_set_pipeline(enc, g_pf_pso_qknorm)
     metal_set_threadgroup_memory_length(enc, metal_qk_norm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, off, 0)
     metal_set_buffer(enc, bw, 0ul, 1)
