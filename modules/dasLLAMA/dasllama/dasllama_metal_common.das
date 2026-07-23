@@ -1251,6 +1251,135 @@ def bar_dep(enc : MetalComputeEncoder?; var h : HazTrack; rmask, wmask : uint) {
     h.w |= wmask
 }
 
+// ===== the single-decode range tracker (the dispatch port) =====
+// lcpp ggml_mem_ranges-shaped, finer: exact (buffer, off, len) ranges over mutable FRAME buffers
+// only; armed only while the single-stream concurrent encoder builds (others no-op the staging)
+
+struct MemRange {
+    buf : uint64    // intptr of the MetalBuffer handle (arena/pool handles are load-stable)
+    p0 : uint64
+    p1 : uint64
+    dst : bool
+}
+
+let HZ_WHOLE = 0xFFFFFFFFFFFFFFFFul   // whole-buffer p1 — for binds whose span lives in a uniform
+
+var g_hz_on = false                 // gating armed for the encoder being built
+var g_hz_paranoid = false           // DASLLAMA_METAL_HAZARD_PARANOID: barrier every dispatch
+var g_hz_strict = false             // DASLLAMA_METAL_HAZARD_STRICT: undeclared dispatch panics
+var g_hz_dirty = false              // an undeclared dispatch ran — the next gate must barrier
+var g_hz_stage : array<MemRange>    // the next dispatch's declared ranges
+var g_hz_pend : array<MemRange>     // unbarriered ranges live on the encoder
+var g_hz_barriers = 0l              // lifetime barrier count (chase prints the per-step delta)
+var g_hz_gated = 0l                 // lifetime gated dispatches — the coverage check's twin
+var g_hz_undeclared = 0l            // conservative fallbacks taken (0 once migration completes)
+var g_hz_cover_warned = false
+
+def hz_read(b : MetalBuffer?; off, len : uint64) {
+    if (g_hz_on && b != null) {
+        g_hz_stage |> push(MemRange(buf = intptr(b), p0 = off, p1 = off + len, dst = false))
+    }
+}
+
+def hz_read(b : MetalBuffer?) {
+    if (g_hz_on && b != null) {
+        g_hz_stage |> push(MemRange(buf = intptr(b), p0 = 0ul, p1 = HZ_WHOLE, dst = false))
+    }
+}
+
+def hz_write(b : MetalBuffer?; off, len : uint64) {
+    if (g_hz_on && b != null) {
+        g_hz_stage |> push(MemRange(buf = intptr(b), p0 = off, p1 = off + len, dst = true))
+    }
+}
+
+def hz_write(b : MetalBuffer?) {
+    if (g_hz_on && b != null) {
+        g_hz_stage |> push(MemRange(buf = intptr(b), p0 = 0ul, p1 = HZ_WHOLE, dst = true))
+    }
+}
+
+// the per-dispatch gate: barrier + reset only when this dispatch's staged ranges conflict with
+// the live set (any overlap involving a write) — then the staged set joins the live set
+def hz_gate(enc : MetalComputeEncoder?) {
+    if (!g_hz_on) {
+        return
+    }
+    g_hz_gated++
+    if (empty(g_hz_stage)) {
+        // undeclared dispatch: serial semantics — barrier before it, and dirty forces one after
+        if (g_hz_strict) {
+            panic("dasLLAMA metal decode: undeclared dispatch under DASLLAMA_METAL_HAZARD_STRICT")
+        }
+        g_hz_undeclared++
+        if (g_hz_dirty || !empty(g_hz_pend)) {
+            metal_memory_barrier(enc)
+            g_hz_barriers++
+            g_hz_pend |> clear()
+        }
+        g_hz_dirty = true
+        return
+    }
+    var bar = g_hz_dirty || (g_hz_paranoid && !empty(g_hz_pend))
+    if (!bar) {
+        for (s in g_hz_stage) {
+            for (p in g_hz_pend) {
+                if ((p.dst || s.dst) && s.buf == p.buf && s.p0 < p.p1 && p.p0 < s.p1) {
+                    bar = true
+                    break
+                }
+            }
+            break if (bar)
+        }
+    }
+    if (bar) {
+        metal_memory_barrier(enc)
+        g_hz_barriers++
+        g_hz_pend |> clear()
+    }
+    g_hz_dirty = false
+    g_hz_pend |> push_from(g_hz_stage)
+    g_hz_stage |> clear()
+}
+
+// arm/disarm around one encoder's build; lifetime counters survive
+def hz_arm(on : bool) {
+    g_hz_on = on
+    g_hz_stage |> clear()
+    g_hz_pend |> clear()
+    g_hz_dirty = false
+}
+
+// the coverage check: every dispatch on a gated encoder must have passed hz_gate — a raw
+// metal_dispatch_* in a decode-path helper would run UNBARRIERED (silent race), so a count
+// mismatch is loud: strict panics, otherwise one LOG_ERROR per process
+def hz_coverage_check(ndisp, ngated : int64) {
+    if (ndisp == ngated) {
+        return
+    }
+    if (g_hz_strict) {
+        panic("dasLLAMA metal decode: {ndisp - ngated} dispatch(es) bypassed hz_gate on a gated encoder")
+    }
+    if (!g_hz_cover_warned) {
+        g_hz_cover_warned = true
+        to_log(LOG_ERROR, "dasLLAMA metal decode: {ndisp - ngated} dispatch(es) bypassed hz_gate on a gated encoder — ungated dispatches are unbarriered\n")
+    }
+}
+
+//! (barriers issued, gated dispatches, conservative undeclared fallbacks) since load — read
+//! deltas around a window; the chase prints barriers/step next to disp/step.
+def public metal_hazard_stats() : tuple<barriers : int64; gated : int64; undeclared : int64> {
+    return (barriers = g_hz_barriers, gated = g_hz_gated, undeclared = g_hz_undeclared)
+}
+
+//! Hazard-mode rails: `paranoid` barriers every dispatch on the concurrent encoder (isolates
+//! encoder-flip bugs from barrier-elision bugs); `strict` panics on an undeclared dispatch
+//! (the migration-coverage gate). Env twins: `DASLLAMA_METAL_HAZARD_PARANOID` / `_STRICT`.
+def public set_metal_decode_hazard(paranoid, strict : bool) {
+    g_hz_paranoid = paranoid
+    g_hz_strict = strict
+}
+
 
 // ===== the pending-step (encode-ahead) machinery =====
 
@@ -1407,6 +1536,8 @@ def metal_common_init : bool {
     }
     g_queue = metal_new_command_queue(g_dev)
     g_attn_single_max = clamp(int64(env_int("DASLLAMA_METAL_ATTN_SINGLE", 64)), ATTN_CHUNK_ROWS, 128l)
+    g_hz_paranoid = env_int("DASLLAMA_METAL_HAZARD_PARANOID", 0) != 0
+    g_hz_strict = env_int("DASLLAMA_METAL_HAZARD_STRICT", 0) != 0
     return true
 }
 

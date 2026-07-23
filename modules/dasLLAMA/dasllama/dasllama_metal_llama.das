@@ -1597,6 +1597,24 @@ def metal_mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : 
     return false
 }
 
+// DASLLAMA_METAL_DECODE_CONCURRENT: concurrent encoder for the single-stream step, barriers
+// only at tracker-detected hazards (hz_gate in every decode-path enc_* helper); g_skip
+// knockouts force serial — skipped dispatches break the declared graph
+var private g_dconc = -1
+
+def private decode_concurrent : bool {
+    if (g_dconc < 0) {
+        g_dconc = env_int("DASLLAMA_METAL_DECODE_CONCURRENT", 0)
+    }
+    return g_dconc != 0
+}
+
+//! Concurrent-encoder rail for the single-stream decode: 1 forces on, 0 forces serial,
+//! negative restores the env default (`DASLLAMA_METAL_DECODE_CONCURRENT`).
+def public set_metal_decode_concurrent(v : int) {
+    g_dconc = v < 0 ? -1 : (v != 0 ? 1 : 0)
+}
+
 // encode the whole step (prologue rms, n_layers fused blocks, optional GPU classifier) into a
 // fresh command buffer; commit_now submits it, otherwise the caller commits after poking the
 // inputs (the encode-ahead rail). A spec step OPENS with argmax + embed gather — no CPU poke.
@@ -1605,7 +1623,11 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     let dim = c.dim
     // UNRETAINED: skips per-dispatch retain/release of ~2000 resource refs — everything referenced outlives the cb here
     var cb = metal_new_command_buffer_unretained(g_queue)
-    var enc = metal_new_compute_encoder(cb)
+    let conc = decode_concurrent() && empty(g_skip)
+    var enc = conc ? metal_new_compute_encoder_concurrent(cb) : metal_new_compute_encoder(cb)
+    hz_arm(conc)
+    let hz_d0 = conc ? metal_dispatch_calls() : 0l
+    let hz_g0 = g_hz_gated
     if (r.spec) {
         // speculative head: argmax the previous step's logits, gather the winner's embedding row into r.bx (cls_q8 or tied-k6 planes); the escale slot applies embed_scale in the gather
         unsafe {
@@ -1634,6 +1656,10 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     if (r.gpu_logits) {
         encode_cls_tail(t, r, enc, t.rms_final_off)
     }
+    if (conc) {
+        hz_coverage_check(metal_dispatch_calls() - hz_d0, g_hz_gated - hz_g0)
+    }
+    hz_arm(false)
     metal_end_encoding(enc)
     metal_release(enc)
     if (commit_now) {

@@ -5953,6 +5953,9 @@ def enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64; bx, b
     metal_set_buffer(enc, by, yoff, 3)
     metal_set_buffer(enc, bn, 0ul, 4)
     metal_set_buffer(enc, bd, 0ul, 5)
+    hz_read(bx)
+    hz_write(by, yoff, uint64(d * 4l))
+    hz_gate(enc)
     // the kernel is width-agnostic (one row per simdgroup) — rows/tg via DASLLAMA_METAL_GEMV_TG
     metal_dispatch_threadgroups(enc, uint3(uint((d + g_gemv_rows - 1l) / g_gemv_rows), 1u, 1u), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
 }
@@ -5983,6 +5986,9 @@ def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff
     metal_set_buffer(enc, by, yoff, 4)
     metal_set_buffer(enc, bn, 0ul, 5)
     metal_set_buffer(enc, bd, 0ul, 6)
+    hz_read(bx, xoff, uint64(n * 4l))
+    hz_write(by, yoff, uint64(rows * 4l))
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(groups), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6065,6 +6071,9 @@ def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?) {
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
+    hz_read(bx)
+    hz_write(by)
+    hz_gate(enc)
     // one row, latency-bound — the widest tg shortens the strided-load rounds (1024 max on M1)
     metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
 }
@@ -6089,6 +6098,11 @@ def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; 
     metal_set_buffer(enc, bbias, 0ul, 11)
     metal_set_buffer(enc, bhasb, 0ul, 12)
     metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 13)   // rot defaults to head_size (full rope)
+    hz_read(bqkv)
+    hz_write(bqkv)
+    hz_write(kmb)
+    hz_write(vmb)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6117,6 +6131,11 @@ def enc_rope_store_h16(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
     metal_set_buffer(enc, bhasn, 0ul, 14)
     metal_set_buffer(enc, beps, 0ul, 15)
     metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 16)   // rot defaults to head_size (full rope)
+    hz_read(bqkv)
+    hz_write(bqkv)
+    hz_write(kmb)
+    hz_write(vmb)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6144,6 +6163,11 @@ def enc_rope_store_tq4(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
     metal_set_buffer(enc, bneox, 0ul, 13)
     metal_set_buffer(enc, bbias, 0ul, 14)
     metal_set_buffer(enc, bhasb, 0ul, 15)
+    hz_read(bqkv)
+    hz_write(bqkv)
+    hz_write(kmb)
+    hz_write(vmb)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6161,6 +6185,9 @@ def enc_qk_norm(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, 
     metal_set_buffer(enc, bwoffe, 0ul, 6)
     metal_set_buffer(enc, beps, 0ul, 7)
     metal_set_buffer(enc, bsoffe, 0ul, 8)
+    hz_read(bx)
+    hz_write(bx)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6172,6 +6199,9 @@ def enc_fwht_unsign(enc : MetalComputeEncoder?; byo, bhs, bqs : MetalBuffer?; nh
     metal_set_buffer(enc, signs_buffer(), 0ul, 1)
     metal_set_buffer(enc, bhs, 0ul, 2)
     metal_set_buffer(enc, bqs, 0ul, 3)
+    hz_read(byo)
+    hz_write(byo)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6196,6 +6226,11 @@ def enc_rope_store_q8(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : u
     metal_set_buffer(enc, bneox, 0ul, 12)
     metal_set_buffer(enc, bbias, 0ul, 13)
     metal_set_buffer(enc, bhasb, 0ul, 14)
+    hz_read(bqkv)
+    hz_write(bqkv)
+    hz_write(kmb)
+    hz_write(vmb)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((nthreads + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6224,6 +6259,11 @@ def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bw : MetalBuffer?; w
     metal_set_buffer(enc, bneox, 0ul, 13)
     metal_set_buffer(enc, bbias, 0ul, 14)
     metal_set_buffer(enc, bhasb, 0ul, 15)
+    hz_read(bx)
+    hz_write(bq)
+    hz_write(kmb)
+    hz_write(vmb)
+    hz_gate(enc)
     let pairs = d / 2l
     metal_dispatch_threadgroups(enc, uint3(uint((pairs + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
@@ -6240,6 +6280,9 @@ def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off :
     metal_set_buffer(enc, bn, 0ul, 4)
     metal_set_buffer(enc, bhid, 0ul, 5)
     metal_set_buffer(enc, bact, 0ul, 8)   // 0 = silu, 1 = gelu
+    hz_read(bx)
+    hz_write(bh, 0ul, uint64(hidden * 4l))
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
@@ -6249,6 +6292,9 @@ def enc_argmax(enc : MetalComputeEncoder?; blg, btok, bn : MetalBuffer?) {
     metal_set_buffer(enc, blg, 0ul, 0)
     metal_set_buffer(enc, btok, 0ul, 1)
     metal_set_buffer(enc, bn, 0ul, 2)
+    hz_read(blg)
+    hz_write(btok)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
 }
 
@@ -6259,6 +6305,9 @@ def enc_copy_row(enc : MetalComputeEncoder?; bsrc : MetalBuffer?; soff : uint64;
     metal_set_buffer(enc, bsrc, soff, 0)
     metal_set_buffer(enc, bdst, doff, 1)
     metal_set_buffer(enc, bn, 0ul, 2)
+    hz_read(bsrc, soff, uint64(n * 4l))
+    hz_write(bdst, doff, uint64(n * 4l))
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((n + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6270,6 +6319,9 @@ def enc_embed(enc : MetalComputeEncoder?; bw : MetalBuffer?; eoff : uint64; btok
     metal_set_buffer(enc, bx, 0ul, 3)
     metal_set_buffer(enc, bdim, 0ul, 4)
     metal_set_buffer(enc, bescale != null ? bescale : g_one, 0ul, 5)   // embed_scale (identity 1.0)
+    hz_read(btok)
+    hz_write(bx)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6284,6 +6336,9 @@ def enc_embed_k6(enc : MetalComputeEncoder?; bq : MetalBuffer?; qoff : uint64; b
     metal_set_buffer(enc, bx, 0ul, 4)
     metal_set_buffer(enc, bdim, 0ul, 5)
     metal_set_buffer(enc, bescale != null ? bescale : g_one, 0ul, 6)   // embed_scale (identity 1.0)
+    hz_read(btok)
+    hz_write(bx)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6301,6 +6356,9 @@ def enc_moe_router(enc : MetalComputeEncoder?; bw, bx, by, bn, bd, bxs, brb, bha
     metal_set_buffer(enc, bxs, 0ul, 5)
     metal_set_buffer(enc, brb, 0ul, 6)
     metal_set_buffer(enc, bhasb, 0ul, 7)
+    hz_read(bx)
+    hz_write(by, 0ul, uint64(ne * nst * 4l))
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((ne + g_gemv_rows - 1l) / g_gemv_rows), uint(nst), 1u), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
 }
 
@@ -6314,6 +6372,9 @@ def enc_moe_select(enc : MetalComputeEncoder?; blg, bsel, bne, bnk, bgm : MetalB
     metal_set_buffer(enc, bne, 0ul, 3)
     metal_set_buffer(enc, bnk, 0ul, 4)
     metal_set_buffer(enc, bgm, 0ul, 5)
+    hz_read(blg)
+    hz_write(bsel)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
 }
 
@@ -6322,6 +6383,9 @@ def enc_moe_select(enc : MetalComputeEncoder?; blg, bsel, bne, bnk, bgm : MetalB
 // per-slot x stride, bss/bbxs/bbys = per-stream sel/x/y strides (single decode binds zeros)
 def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, rows, k, nst : int64;
                  bx, by, bn, bd, bsel, bes, bxs, bss, bbxs, bbys : MetalBuffer?; yoff : uint64 = 0ul) {
+    hz_read(bx)
+    hz_read(bsel)
+    hz_write(by, yoff, uint64(rows * k * nst * 4l))
     if (fmt == KqFmt.q8) {
         let bw = blob_of(g_dev, t, stack_off)
         metal_set_pipeline(enc, g_pso_moe_gemv_q8)
@@ -6337,6 +6401,7 @@ def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, 
         metal_set_buffer(enc, bss, 0ul, 9)
         metal_set_buffer(enc, bbxs, 0ul, 10)
         metal_set_buffer(enc, bbys, 0ul, 11)
+        hz_gate(enc)
         metal_dispatch_threadgroups(enc, uint3(uint((rows + g_gemv_rows - 1l) / g_gemv_rows), uint(k), uint(nst)), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
     } elif (fmt == KqFmt.q51) {
         let qp = q51_planes_of(g_dev, t, stack_off)
@@ -6353,6 +6418,7 @@ def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, 
         metal_set_buffer(enc, bss, 0ul, 9)
         metal_set_buffer(enc, bbxs, 0ul, 10)
         metal_set_buffer(enc, bbys, 0ul, 11)
+        hz_gate(enc)
         metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
     } else {
         let bq = kq_quants_of(g_dev, t, fmt, stack_off)
@@ -6376,6 +6442,7 @@ def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, 
         metal_set_buffer(enc, bss, 0ul, 10)
         metal_set_buffer(enc, bbxs, 0ul, 11)
         metal_set_buffer(enc, bbys, 0ul, 12)
+        hz_gate(enc)
         metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
     }
 }
@@ -6390,6 +6457,9 @@ def enc_g4_router_norm(enc : MetalComputeEncoder?; bx, brs, by, bdim, beps, binv
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
     metal_set_buffer(enc, binvd, 0ul, 5)
+    hz_read(bx)
+    hz_write(by)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6400,6 +6470,9 @@ def enc_moe_wscale(enc : MetalComputeEncoder?; bsel, bds, bnk : MetalBuffer?; ns
     metal_set_buffer(enc, bsel, 0ul, 1)
     metal_set_buffer(enc, bds, 0ul, 2)
     metal_set_buffer(enc, bnk, 0ul, 3)
+    hz_read(bsel)
+    hz_write(bsel)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
 }
 
@@ -6425,6 +6498,10 @@ def enc_moe_gemv_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, rows, k, 
     metal_set_buffer(enc, bhasb, 0ul, 13)
     metal_set_buffer(enc, g_e8m0_tab, 0ul, 14)
     metal_set_buffer(enc, g_mx4_vtab, 0ul, 15)
+    hz_read(bx)
+    hz_read(bsel)
+    hz_write(by, yoff, uint64(rows * k * nst * 4l))
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
 }
 
@@ -6441,6 +6518,10 @@ def enc_dn_conv(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uin
     metal_set_buffer(enc, bcd, 0ul, 4)
     metal_set_buffer(enc, bdconv, 0ul, 5)
     metal_set_buffer(enc, bnp, 0ul, 6)
+    hz_read(bx)
+    hz_read(bhist)
+    hz_write(by)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((cd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6454,6 +6535,10 @@ def enc_dn_conv_hist(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff 
     metal_set_buffer(enc, bnp, 0ul, 4)
     metal_set_buffer(enc, bhist, hmoff, 5)
     metal_set_buffer(enc, bmid, 0ul, 6)
+    hz_read(bx)
+    hz_read(bhist)
+    hz_write(bhist)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((cd + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6465,6 +6550,9 @@ def enc_dn_l2norm(enc : MetalComputeEncoder?; by, bcd, bkd, bds, beps, bqscale :
     metal_set_buffer(enc, bds, 0ul, 3)
     metal_set_buffer(enc, beps, 0ul, 4)
     metal_set_buffer(enc, bqscale, 0ul, 5)
+    hz_read(by)
+    hz_write(by)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((nblk + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6488,6 +6576,13 @@ def enc_dn_scan(enc : MetalComputeEncoder?; bcv, bst : MetalBuffer?; stoff : uin
     metal_set_buffer(enc, bnp, 0ul, 13)
     metal_set_buffer(enc, bst, stmoff, 14)
     metal_set_buffer(enc, bmid, 0ul, 15)
+    hz_read(bcv)
+    hz_read(bbraw)
+    hz_read(bgraw)
+    hz_read(bst)
+    hz_write(bst)
+    hz_write(bo)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(ds / 4l), uint(nvh), 1u), uint3(128u, 1u, 1u))
 }
 
@@ -6499,6 +6594,10 @@ def enc_dn_gate(enc : MetalComputeEncoder?; bo, bz, bwn, bds, bdi, beps : MetalB
     metal_set_buffer(enc, bds, 0ul, 3)
     metal_set_buffer(enc, bdi, 0ul, 4)
     metal_set_buffer(enc, beps, 0ul, 5)
+    hz_read(bo)
+    hz_read(bz)
+    hz_write(bo)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((nvh + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6510,6 +6609,10 @@ def enc_dn_deint(enc : MetalComputeEncoder?; bqg, bq, bgt, bhs, bqd, bqs : Metal
     metal_set_buffer(enc, bhs, 0ul, 3)
     metal_set_buffer(enc, bqd, 0ul, 4)
     metal_set_buffer(enc, bqs, 0ul, 5)
+    hz_read(bqg)
+    hz_write(bq)
+    hz_write(bgt)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((qd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6520,6 +6623,10 @@ def enc_moe_combine(enc : MetalComputeEncoder?; bdn, bsel, by, bdim, bnk : Metal
     metal_set_buffer(enc, by, 0ul, 2)
     metal_set_buffer(enc, bdim, 0ul, 3)
     metal_set_buffer(enc, bnk, 0ul, 4)
+    hz_read(bdn)
+    hz_read(bsel)
+    hz_write(by)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((dim + 255l) / 256l), uint(nst), 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6530,6 +6637,11 @@ def enc_axpy_sig(enc : MetalComputeEncoder?; by, bx, bg, btot, bdim : MetalBuffe
     metal_set_buffer(enc, bg, 0ul, 2)
     metal_set_buffer(enc, btot, 0ul, 3)
     metal_set_buffer(enc, bdim, 0ul, 4)
+    hz_read(by)
+    hz_read(bx)
+    hz_read(bg)
+    hz_write(by)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((total + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
@@ -6545,6 +6657,11 @@ def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Me
         metal_set_buffer(enc, bdim, 0ul, 4)
         metal_set_buffer(enc, beps, 0ul, 5)
         metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 6)
+        hz_read(bx)
+        hz_read(ba)
+        hz_write(bx)   // the residual add persists (x += a), then y = rms(x)
+        hz_write(by)
+        hz_gate(enc)
         metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
     } else {
         enc_ew2(enc, g_pso_add, bx, 0ul, ba, 0ul, bdim, dim, bascale)
@@ -6569,6 +6686,11 @@ def enc_attn(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; ko
     metal_set_buffer(enc, bcap, 0ul, 10)
     metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
     metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
+    hz_read(kmb)
+    hz_read(vmb)
+    hz_read(bq)
+    hz_write(by)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6589,6 +6711,11 @@ def enc_attn_part(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer
     metal_set_buffer(enc, bnch, 0ul, 10)
     metal_set_buffer(enc, bcap, 0ul, 11)
     metal_set_buffer(enc, bwin, 0ul, 12)
+    hz_read(kmb)
+    hz_read(vmb)
+    hz_read(bq)
+    hz_write(bpart)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6612,6 +6739,11 @@ def enc_attn_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff
     metal_set_buffer(enc, bcap, 0ul, 12)
     metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
     metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
+    hz_read(kmb)
+    hz_read(vmb)
+    hz_read(bq)
+    hz_write(by)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6634,6 +6766,11 @@ def enc_attn_part_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff,
     metal_set_buffer(enc, bnch, 0ul, 12)
     metal_set_buffer(enc, bcap, 0ul, 13)
     metal_set_buffer(enc, bwin, 0ul, 14)
+    hz_read(kmb)
+    hz_read(vmb)
+    hz_read(bq)
+    hz_write(bpart)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6658,6 +6795,11 @@ def enc_attn_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff 
     metal_set_buffer(enc, bcap, 0ul, 12)
     metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
     metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
+    hz_read(kmb)
+    hz_read(vmb)
+    hz_read(bq)
+    hz_write(by)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6680,6 +6822,11 @@ def enc_attn_part_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, 
     metal_set_buffer(enc, bnch, 0ul, 12)
     metal_set_buffer(enc, bcap, 0ul, 13)
     metal_set_buffer(enc, bwin, 0ul, 14)
+    hz_read(kmb)
+    hz_read(vmb)
+    hz_read(bq)
+    hz_write(bpart)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6693,6 +6840,9 @@ def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs, bchlo :
     metal_set_buffer(enc, bchlo, 0ul, 5)
     metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
     metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
+    hz_read(bpart)
+    hz_write(by)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
@@ -6702,6 +6852,9 @@ def enc_suppress_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint6
     metal_set_buffer(enc, bx, xoff, 0)
     metal_set_buffer(enc, bids, 0ul, 1)
     metal_set_buffer(enc, bn, 0ul, 2)
+    hz_read(bx)
+    hz_write(bx)
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((n + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6711,6 +6864,9 @@ def enc_softcap_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64
     metal_set_buffer(enc, bx, xoff, 0)
     metal_set_buffer(enc, btot, 0ul, 1)
     metal_set_buffer(enc, bcap, 0ul, 2)
+    hz_read(bx, xoff, uint64(total * 4l))
+    hz_write(bx, xoff, uint64(total * 4l))
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
@@ -6721,6 +6877,10 @@ def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalB
     metal_set_buffer(enc, bb, boff, 1)
     metal_set_buffer(enc, btot, 0ul, 2)
     metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 3)   // the add's ascale slot (unused by swiglu/geglu)
+    hz_read(ba, aoff, uint64(total * 4l))
+    hz_read(bb, boff, uint64(total * 4l))
+    hz_write(ba, aoff, uint64(total * 4l))
+    hz_gate(enc)
     metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
