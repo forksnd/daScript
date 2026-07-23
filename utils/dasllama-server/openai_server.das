@@ -1248,7 +1248,7 @@ def private handle_activate(var req : HttpRequest?; var resp : HttpResponse?) : 
     g_slots[mi].last_used = ref_time_ticks()
     let sw_ms = int64(get_time_usec(t0)) / 1000l
     return resp |> JSON(
-        "\{\"ok\":true,\"model\":\"{g_slots[mi].name}\",\"backend_effective\":\"{g_slots[mi].backend_effective}\",\"switch_ms\":{sw_ms}}",
+        "\{\"ok\":true,\"model\":{json_str(g_slots[mi].name)},\"backend_effective\":{json_str(g_slots[mi].backend_effective)},\"switch_ms\":{sw_ms}}",
         http_status.OK)
 }
 
