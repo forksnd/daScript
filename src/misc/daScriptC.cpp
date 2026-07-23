@@ -282,8 +282,8 @@ int das_register_dynamic_modules_n ( das_file_access *file_access,
             }
         }
     }
-    bool res = require_dynamic_modules((FileAccess *)file_access, project_root_string.c_str(),
-                    project_root_string.c_str(), load_modules, *writer);
+    bool res = require_dynamic_modules((FileAccess *)file_access, project_root_string,
+                    project_root_string, load_modules, *writer);
     return !res;
 }
 
@@ -345,7 +345,7 @@ void das_fileaccess_introduce_file_from_disk_n ( das_file_access * access,
                                                  const char * disk_path, size_t disk_path_length ) {
     auto name_string = string_from_range(name, name_length, "name");
     auto disk_path_string = string_from_range(disk_path, disk_path_length, "disk_path");
-    ((FsFileAccess *) access)->introduceFileFromDisk(name_string.c_str(), disk_path_string.c_str());
+    ((FsFileAccess *) access)->introduceFileFromDisk(name_string, disk_path_string);
 }
 
 void das_fileaccess_introduce_daslib ( das_file_access * access ) {
@@ -362,7 +362,7 @@ int das_fileaccess_introduce_native_module ( das_file_access * access, const cha
 
 int das_fileaccess_introduce_native_module_n ( das_file_access * access, const char * req, size_t req_length ) {
     auto req_string = string_from_range(req, req_length, "req");
-    return ((FsFileAccess *) access)->introduceNativeModule(req_string.c_str()) ? 1 : 0;
+    return ((FsFileAccess *) access)->introduceNativeModule(req_string) ? 1 : 0;
 }
 
 void das_fileaccess_lock ( das_file_access * access ) {
@@ -647,7 +647,7 @@ das_module * das_module_find ( const char * name ) {
 
 das_module * das_module_find_n ( const char * name, size_t name_length ) {
     auto name_string = string_from_range(name, name_length, "name");
-    return (das_module *) Module::require(name_string.c_str());
+    return (das_module *) Module::require(name_string);
 }
 
 void das_module_bind_interop_function ( das_module * mod, das_module_group * lib, das_interop_function * fun, char * name, char * cppName, uint32_t sideffects, char* args ) {

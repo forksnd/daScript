@@ -60,6 +60,8 @@ TEST_CASE("C API explicit-length strings accept non-null-terminated ranges") {
 
     const char builtin_name[] = {'$'};
     CHECK(das_module_find_n(builtin_name, sizeof(builtin_name)) != nullptr);
+    const char builtin_name_with_suffix[] = {'$','\0','x'};
+    CHECK(das_module_find_n(builtin_name_with_suffix, sizeof(builtin_name_with_suffix)) == nullptr);
 
     char one_byte_root[1] = {'x'};
     das_get_root_n(one_byte_root, sizeof(one_byte_root));
