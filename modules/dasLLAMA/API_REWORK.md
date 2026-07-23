@@ -392,8 +392,19 @@ what it costs today and what the fix would change.
   pair confirms: @8 35.05 -> 36.31 t/s (+3.6%, gpu -0.83ms), @512 32.37 -> 33.34 (+3.0%, -0.88ms).
   The barrier floor is the PROGRAM-ORDER chain depth (~19 genuine links/layer on the g4 graph:
   qkv triple, we1||we3, pre_ffn2||router_norm, post_ffn2||shared-w13sw group — everything else
-  chains); the original -1.5ms/<150-barrier bars need Session 2's load-time reorder + separate
-  scratch for the routed/shared branch interleave (the batch rail already validated that split);
+  chains). **SESSION 2 PHASES A-C SHIPPED (2026-07-23 night): step-graph capture (kn_* twins
+  record KNodes; graph_flush replays with the hz oracle deriving barriers, so a schedule can
+  only change speed) + a shape-class schedule cache (FNV over the pso sequence, compiled once)
+  with ASAP leveling over the conflict DAG + the g4 dense-shared/qwen35moe-shexp scratch split
+  (own bh12s panel).** Measured 26B: @8 69.23 t/s gpu 14.40ms, @512 62.90 gpu 15.87 — cumulative
+  vs serial @8 +9.7%/-1.41ms (das now well ahead of lcpp stock 58.50 same-window); barriers
+  634->574 (the split's 2 levels/layer; leveling found nothing else — depth 574 IS the true
+  chain). 12B (dense, no branch): unchanged, as expected. 26B/qwen35moe tolerance cells
+  byte-identical maxd under STRICT; llama arm1/7/13 token-exact. Remaining depth is FUSION
+  territory (lcpp prices it +1.46ms): wo+post_attn+add_rms and the g4 rms tails as fused
+  kernels would cut 2-4 levels/layer — new-MSL, ledger-class. Still open from the plan: the
+  [metal_dispatch] macro lens (generated builders + compile-time completeness), [tune]
+  schedule axes (thin until fusion adds real choices), batch-rail unification;
   (2) the q51 w2 MoE kernel at 224 wGB/s in-lab —
   the integer-compose form (q | hbit<<4 pre-convert, replacing the select chain) TESTED + REFUTED
   2026-07-23: 226 vs 224 wGB/s (+1%), bit-exact but the dot stays issue-bound in the shift/mask
