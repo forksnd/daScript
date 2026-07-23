@@ -1778,7 +1778,7 @@ class MetalQ8GemvQkvRsF32 {
 
 // The W1|W3 twin of the same shape: one simdgroup dots BOTH ffn rows of an output element (gate
 // off the w1 blob views, up off the w3 views — kind-major layout keeps them apart) and writes
-// silu(g)·u directly. Deletes the swiglu dispatch AND its serialization level.
+// act(g)·u directly (act = silu or gelu per the uniform). Deletes the swiglu/geglu dispatch AND its serialization level.
 class MetalQ8GemvW13Sw {
     @ssbo @binding = 0 wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
     @ssbo @binding = 1 wsh1 : array<float16>   // ... half-scale view
@@ -1788,6 +1788,7 @@ class MetalQ8GemvW13Sw {
     @uniform @binding = 5 hidden : uint
     @ssbo @binding = 6 wqb3 : array<int8>   // w3 blob views
     @ssbo @binding = 7 wsh3 : array<float16>
+    @uniform @binding = 8 act : uint        // gate activation: 0 = silu (swiglu), 1 = gelu (geglu, gemma line)
 
     [metal_kernel(name="metal_q8_gemv_w13sw16_msl")]
     def metal_q8_gemv_w13sw16 {
@@ -1814,7 +1815,13 @@ class MetalQ8GemvW13Sw {
         acc0 = simd_sum(acc0)
         acc1 = simd_sum(acc1)
         if (lane == 0u) {
-            ho[r] = (acc0 / (1.0 + exp(-acc0))) * acc1
+            if (act == 0u) {
+                ho[r] = (acc0 / (1.0 + exp(-acc0))) * acc1
+            } else {
+                // geglu: gelu(gate)·up — the CPU geglu4 / MetalGeglu tanh-via-exp identity (exp saturates, no NaN)
+                let ga = 0.7978845608028654 * (acc0 + 0.044715 * acc0 * acc0 * acc0)
+                ho[r] = 0.5 * acc0 * (2.0 - 2.0 / (1.0 + exp(2.0 * ga))) * acc1
+            }
         }
     }
 }
@@ -6221,8 +6228,8 @@ def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bw : MetalBuffer?; w
     metal_dispatch_threadgroups(enc, uint3(uint((pairs + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
-// the fused W1|W3+swiglu dispatch (2 rows per simdgroup — gate + up of one output element)
-def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off : uint64; bx, bh : MetalBuffer?; bn, bhid : MetalBuffer?; hidden : int64) {
+// the fused W1|W3 + silu/gelu dispatch (2 rows per simdgroup — gate + up of one output element; bact picks the activation)
+def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off : uint64; bx, bh : MetalBuffer?; bn, bhid : MetalBuffer?; hidden : int64; bact : MetalBuffer?) {
     metal_set_pipeline(enc, g_pso_w13sw)
     metal_set_buffer(enc, bw, w1off, 0)   // w1: byte + half views
     metal_set_buffer(enc, bw, w1off, 1)
@@ -6232,6 +6239,7 @@ def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off :
     metal_set_buffer(enc, bh, 0ul, 3)
     metal_set_buffer(enc, bn, 0ul, 4)
     metal_set_buffer(enc, bhid, 0ul, 5)
+    metal_set_buffer(enc, bact, 0ul, 8)   // 0 = silu, 1 = gelu
     metal_dispatch_threadgroups(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 

@@ -7,7 +7,8 @@
     "llama_cpp":"ebd048f",
     "date":"2026-07-22",
     "box_profile":"gen_profile.tune.json",
-    "parsec_off":true
+    "parsec_off":true,
+    "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q8q8_tile_gen=mr8_budget (manifest)"
   },
   "tests":[
     {

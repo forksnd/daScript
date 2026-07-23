@@ -49,23 +49,24 @@ chase candidate.
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 1863.8 | 1896.9 | 0.98x |
-| tg128 B=1 | 92.5 | 99.2 | 0.93x |
+| tg128 B=1 | 94.9 | 99.2 | 0.96x |
 | tg128 B=2 | 161.3 | 153.0 | **1.05x** |
 | tg128 B=4 | 263.3 | 254.0 | **1.04x** |
 | tg128 B=8 | 286.2 | 293.6 | 0.97x |
 | tg128 B=16 | 422.4 | 394.4 | **1.07x** |
 
-B=1 0.93x (re-paired 2026-07-22, was 0.89x) = the Q8 dispatch-tail class (gemma3-4b 0.92,
-gemma4-12B 0.85, qwen3-4B 0.92 — same signature: the q8 GEMV is bandwidth-bound at the M1
-ceiling, the gap is the per-step elementwise dispatch overhead lcpp's norm-chain fusion
-avoids). Batch rows green on the same forward. Fusion lever ledgered (post_add_rms, w13 gelu).
+B=1 0.96x (was 0.89x board / 0.93x re-pair) = the Q8 dispatch-tail class. The q8 GEMV is
+bandwidth-bound at the M1 ceiling; the gap is the per-step elementwise dispatch overhead
+lcpp fuses into its norm chain. The w13-gelu ew fusion shipped this pass (gemma's geglu
+now rides the fused w1|w3 kernel's act uniform, -2 dispatches/layer): +2.6% here (gemma4-12B
++6.3%). Batch rows green on the same forward. post_add_rms fusion still ledgered.
 
 ### gemma3-1b Q8_0
 
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 4777.5 | 4974.6 | 0.96x |
-| tg128 B=1 | 188.7 | 155.1 | **1.22x** |
+| tg128 B=1 | 191.4 | 155.1 | **1.24x** |
 | tg128 B=2 | 336.7 | 314.5 | **1.07x** |
 | tg128 B=4 | 485.5 | 494.3 | 0.98x |
 | tg128 B=8 | 675.8 | 664.1 | **1.02x** |
@@ -80,15 +81,16 @@ the serving path.
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 1194.7 | 1217.9 | 0.98x |
-| tg128 B=1 | 63.2 | 68.5 | 0.92x |
+| tg128 B=1 | 64.8 | 68.5 | 0.95x |
 | tg128 B=2 | 95.0 | 99.5 | 0.95x |
 | tg128 B=4 | 157.2 | 164.3 | 0.96x |
 | tg128 B=8 | 179.2 | 175.3 | **1.02x** |
 | tg128 B=16 | 276.1 | 290.1 | 0.95x |
 
-B=1 0.92x (re-paired 2026-07-22, was 0.91x) = the Q8 dispatch-tail class — the q8 GEMV is
+B=1 0.95x (was 0.91x board / 0.92x re-pair) = the Q8 dispatch-tail class — the q8 GEMV is
 at the M1 bandwidth ceiling, the gap is the per-step elementwise dispatch overhead lcpp
-fuses into its norm chain (fusion lever ledgered). The mild B=2/4/16 red (-4..-5%) rides
+fuses into its norm chain (the w13-gelu ew fusion shipped this pass, +2.6%; post_add_rms
+still ledgered). The mild B=2/4/16 red (-4..-5%) rides
 the same per-step tail at small B.
 
 ### gemma4-12B Q4_K_M (native kq planes)
@@ -142,7 +144,7 @@ not the ~14% the skewed board implied. `DASLLAMA_METAL_SPEC=0` recovers the last
 | shape | das tok/s | lcpp tok/s | das/lcpp |
 | :--- | ---: | ---: | ---: |
 | pp512 | 359.4 | 356.0 | **1.01x** |
-| tg128 B=1 | 21.1 | 24.8 | **0.85x RED** |
+| tg128 B=1 | 22.3 | 24.8 | 0.90x |
 | tg128 B=2 | 36.9 | 38.0 | 0.97x |
 | tg128 B=4 | 59.9 | 63.8 | 0.94x |
 | tg128 B=8 | 59.8 | 62.0 | 0.96x |
@@ -151,9 +153,11 @@ not the ~14% the skewed board implied. `DASLLAMA_METAL_SPEC=0` recovers the last
 B=2/4 were 0.90/0.59 before the hetero mul_mv un-gate (the fixed-B forms streamed the
 12.2GB blob once PER TOKEN under hetero); B=4/8/16 gained +2/+6.5/+6% from scope C (the
 V-copy→ones-RMS fusion + split-K un-gated under hetero via the per-class twins). The
-remaining column tail is structural and named: B=1 = the Q8 sequential class (the q8 GEMV
-itself measures ~352 GB/s — lcpp bandwidth class; the gap is the ~4.6 ms/step elementwise
-dispatch tail lcpp's norm-chain fusion avoids), and the same dispatch-tail class plus
+remaining column tail is structural and named: B=1 0.90x (was 0.83x — the w13-gelu ew
+fusion this pass gained +6.3%, fusing gemma's geglu into the w1|w3 kernel: -2 dispatches
+/layer) = the Q8 dispatch-tail class (the q8 GEMV is at the M1 bandwidth ceiling; the
+residual gap is the per-step elementwise dispatch tail lcpp's norm-chain fusion avoids —
+post_add_rms still ledgered), and the same dispatch-tail class plus
 GEMM-tier scheduling noise holds the B=8/16 residue (the K-quant ladders' B=8/16 are
 rep-stable to 0.1%; Q8's wobble 8-11% between reps — a scope D datapoint). lcpp's Q8 is
 its strongest Metal suite (ext kernels from B=2, highest bytes/weight), so this column's
@@ -167,11 +171,12 @@ K-quants (the single-pass kq b8 twins — ONE weight stream instead of two colum
 passes; the kernel lab could not see this win at SLC-resident shapes, only the in-graph
 A/B could). **The B=1 column was re-paired 2026-07-22 in a clean quiet window (das + fresh
 interleaved lcpp); the batch/pp cells stay at the 2026-07-17/18 date** — several old B=1
-"reds" were window-skew (gemma4-12B Q6 0.81→0.98, Q8 0.83→0.85, gemma2-q8 0.89→0.93,
-gemma3-4b 0.91→0.92). The remaining reds are structural and each has a named owner: the Q8
-dispatch-tail class (gemma2-q8 0.93, gemma3-4b 0.92, gemma4-q8 0.85 — the q8 GEMV is at the
-M1 bandwidth ceiling, the gap is the per-step elementwise dispatch tail lcpp's norm-chain
-fusion avoids; one combined deep-dive, fusion lever ledgered), the Q8 B=8/16 GEMM-tier residue
+"reds" were window-skew (gemma4-12B Q6 0.81→0.98), and the w13-gelu ew fusion shipped this
+pass lifted every gemma Q8 B=1 cell (gemma4-12B 0.83→0.90 = +6.3%, gemma3-4b 0.91→0.95,
+gemma2-q8 0.89→0.96). The remaining reds are structural and each has a named owner: the Q8
+dispatch-tail class (gemma2-q8 0.96, gemma3-4b 0.95, gemma4-q8 0.90 — the q8 GEMV is at the
+M1 bandwidth ceiling, the residual gap is the per-step elementwise dispatch tail lcpp's norm-chain
+fusion avoids; post_add_rms fusion still ledgered), the Q8 B=8/16 GEMM-tier residue
 (0.88/0.84 after scope C's fusion + hetero split-K — the rest is the dispatch-tail class
 plus GEMM-tier scheduling noise), the K-quant B=16 cells (0.88-0.91 — the kq mul_mm tier
 itself: K-quant files never dispatch split-K, which is a q8-blob kernel; earlier boards

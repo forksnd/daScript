@@ -904,7 +904,7 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                     let she = dim * nsh
                     let bwsh1 = blob_of(g_dev, t, t.wsh1_off + l * she)
                     enc_gemv_w13sw(enc, bwsh1.buf, bwsh1.boff, uint64(((t.wsh3_off + l * she) / 32l) * 34l),
-                        r.bxb, r.bh12, r.u_dim, r.u_moe_nsh, nsh)
+                        r.bxb, r.bh12, r.u_dim, r.u_moe_nsh, nsh, r.u_zero32)
                     enc_site_gemv(enc, t, KqFmt.q8, t.wsh2_off + l * she, dim, nsh, r.bh12, r.bxb2, r.u_moe_nsh, r.u_dim)
                 }
                 enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, g4 ? r.bmoe_rt : r.bxb, r.u_dim, r.u_moe_k, dim, 1l)
@@ -940,17 +940,17 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
             let f3 = kq_fmt_at(t.w3_fmt, l)
             let w13_q8 = f1 == KqFmt.q8 && f3 == KqFmt.q8
             if (g_skip != "gemv") {
-                if (w13_q8 && !geglu) {
-                    // fused gate+up dot with the swiglu epilogue — one dispatch over both tensors' blob slices
+                if (w13_q8) {
+                    // fused gate+up dot + silu/gelu epilogue — gemma geglu rides the act uniform, no separate ew pass
                     let bw1 = blob_of(g_dev, t, t.w1_offs[l])
                     enc_gemv_w13sw(enc, bw1.buf, bw1.boff, uint64((t.w3_offs[l] / 32l) * 34l),
-                        r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden)
+                        r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden, geglu ? r.u_one32 : r.u_zero32)
                 } else {
                     enc_site_gemv(enc, t, f1, t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
                     enc_site_gemv(enc, t, f3, t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
                 }
             }
-            if (g_skip != "ew" && !(w13_q8 && !geglu)) {
+            if (g_skip != "ew" && !w13_q8) {
                 enc_ew2(enc, geglu ? g_pso_geglu : g_pso_swiglu, r.bh12, 0ul, r.bh12, uint64(hidden * 4l), r.u_hidden, hidden)
             }
             if (g_skip != "gemv") {

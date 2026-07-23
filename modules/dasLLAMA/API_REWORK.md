@@ -401,10 +401,14 @@ what it costs today and what the fix would change.
 - **Gemma stage-1 Metal deferrals (wave B, 2026-07-17).** The gemma2 enablement chose
   correctness-first shapes; each entry names today's cost on gemma-class models only (llama/qwen
   paths untouched):
-  (1) *GeGLU fused-w13 stand-down* — the s16 w13sw fused GEMV (single) and the batch fuse13 rail
-  carry a hardcoded silu epilogue, so `ffn_act == gelu` falls back to unfused W1+W3 GEMVs + a
-  geglu ew pass (+1 dispatch/layer single, +1-2 batch). Fix: an `act` uniform (or gelu twin) on
-  the w13sw kernels. Same for prefill's legacy fused rail (`enc_swiglu_quant` has no gelu twin,
+  (1) *GeGLU fused-w13 stand-down* — SINGLE-STREAM HALF SHIPPED (2026-07-22): the decode
+  MetalQ8GemvW13Sw grew an `act` uniform (0 = silu, 1 = gelu using the CPU geglu4 tanh-via-exp
+  identity), and the dense-FFN gate fires the fused path for `w13_q8` regardless of activation
+  (gemma's geglu no longer stands it down), skipping the separate geglu ew pass — -2
+  dispatches/layer. Measured: gemma4-12B Q8 B=1 20.98→22.31 (+6.3%, 0.85→0.90x), gemma3-4b
+  0.92→0.95, gemma2-2b 0.93→0.96, gemma3-1b 1.22→1.24; parity green (fam-gemma3/gemma4 +
+  arm1-basic swiglu regression). STILL OPEN: the batch fuse13 rail (b2/b4 PSOs) keeps the
+  hardcoded silu epilogue, and prefill's legacy fused rail (`enc_swiglu_quant` has no gelu twin,
   and the deferred-W2-add trick has no post-ffn-norm slot, so `fused` stands down entirely —
   mm-path prefill, the default, is unaffected).
   (2) *pre_post_norm sites are composed, not fused* — each post-norm is a separate in-place rms
