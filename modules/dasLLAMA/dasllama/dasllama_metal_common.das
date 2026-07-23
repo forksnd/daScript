@@ -401,6 +401,10 @@ def public metal_batch_decode_stage_stats() : tuple<steps : int64; rows : int64;
         readback_us = g_us_breadback)
 }
 
+//! Lifetime dispatch-call count (dispatchThreadgroups + dispatchThreads, all rails) — read deltas
+//! around a window; the dispatch-count instrument for the split-too-much question.
+def public metal_dispatch_calls() : int64 => metal_dispatch_call_count()
+
 //! Cumulative per-stage wall since load/reset — (served steps, CPU setup us, encode us, commit+wait
 //! us, GPU-timestamp us within the wait, readback+writeback us). The chase harness's numbers rail.
 def public metal_decode_stage_stats() : tuple<steps : int64; setup_us : int64; encode_us : int64; wait_us : int64; gpu_us : double; readback_us : int64> {

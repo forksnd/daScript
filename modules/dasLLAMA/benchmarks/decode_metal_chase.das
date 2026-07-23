@@ -105,12 +105,14 @@ def private run_window(t; var s : Session; depth, n : int64; tok0 : int64; arm :
     forward(t, s, tok0, depth)
     var tok = greedy_top(s, t.config.vocab_size)
     metal_decode_stage_reset()
+    let d0 = metal_dispatch_calls()
     let t0 = ref_time_ticks()
     for (i in range64(n)) {
         forward(t, s, tok, depth + 1l + i)
         tok = greedy_top(s, t.config.vocab_size)
     }
     let us = get_time_usec(t0)
+    let disp = metal_dispatch_calls() - d0
     apply_arm("full")   // restore before anything else runs
     let st = metal_decode_stage_stats()
     let tps = double(n) / (double(us) * 1.0e-6lf)
@@ -122,7 +124,7 @@ def private run_window(t; var s : Session; depth, n : int64; tok0 : int64; arm :
         rb = double(float(st.readback_us) / fn))
     w.tail = double(us) / double(n) - w.setup - w.encode - w.wait - w.rb
     let miss = served != n ? "  ⚠ served {served}/{n}" : ""
-    print("  {arm} @{depth}: {n} tok in {us}us = {tps} t/s | per-step setup {w.setup} encode {w.encode} wait {w.wait} (gpu {w.gpu}) rb {w.rb} tail {w.tail} us{miss}\n")
+    print("  {arm} @{depth}: {n} tok in {us}us = {tps} t/s | per-step setup {w.setup} encode {w.encode} wait {w.wait} (gpu {w.gpu}) rb {w.rb} tail {w.tail} us  disp {disp / n}/step{miss}\n")
     if (w.tps > best.tps) {
         best = w
     }
