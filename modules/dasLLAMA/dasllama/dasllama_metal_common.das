@@ -148,7 +148,7 @@ var g_decodes = 0l
 var g_declines = 0l
 var g_declines_by_reason : table<string; int64>
 var g_logits_cpu = false
-var g_skip = ""                              // DASLLAMA_METAL_DECODE_SKIP=gemv|attn|ew knockout rail
+var g_skip = ""                              // DASLLAMA_METAL_DECODE_SKIP=gemv|attn|ew|moe_rt|moe_sh knockout rail
 
 var g_signs : MetalBuffer?                  // the tq4 rotation signs (128-float prefix rule)
 
