@@ -2026,6 +2026,8 @@ def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype) : ResidentPlan
 
 var private g_rdec_active = false       // this loaded model runs the resident decode driver
 var private g_rdec_cnt = 0l             // cached positions in the device KV mirror (built as we decode)
+var private g_rdec_cap = 0l             // mirror context the driver armed at (<= model ctx when VRAM-capped)
+let private RDEC_MIN_CTX = 4096l        // smallest ctx worth arming a capped mirror at
 
 // gather one prepared plane into device-layout bytes and place it in its format's arena; returns
 // the arena block index. Same gather the per-op tier uses (moe_gpu_gather_stack / _kq), then place
@@ -2055,6 +2057,12 @@ def private rdec_blocks_for(n, rows : int64; f : KqFmt) : int64 => rows * (n / (
 def resident_upload(var t : Model; seq_cap : int64) : bool {
     g_rdec_active = false
     if (!moe_gpu_resident_installed() || t.quant != QuantMode.q8 || t.config.n_expert > 0l) {
+        return false
+    }
+    // the driver is all-or-nothing across prefill AND decode (the KV lives in the device mirror
+    // only), so a pin away from it declines BEFORE any upload — the per-op rails take over
+    let pin = get_env_variable("DASLLAMA_PIN_PREFILL")
+    if ((!empty(pin) && pin != "vulkan") || !empty(active_prefill_override())) {
         return false
     }
     let c = t.config
@@ -2159,8 +2167,11 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
     delete norms
     g_rdec_active = true
     g_rdec_cnt = 0l
+    g_rdec_cap = seq_cap
+    // prefill + decode select together — the device prefill fills the mirror the decode reads
+    select_prefill_override("vulkan")
     select_decode_override("vulkan")
-    to_log(LOG_INFO, "dasLLAMA: resident decode driver armed ({c.n_layers} layers, dim {dim}, ctx {seq_cap})\n")
+    to_log(LOG_INFO, "dasLLAMA: resident driver armed ({c.n_layers} layers, dim {dim}, ctx {seq_cap}, device prefill + decode)\n")
     return true
 }
 
@@ -2168,7 +2179,15 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
 //! position's rope row, runs the whole forward on device, produces s.logits. Decode-from-scratch
 //! for now — the mirror builds as positions arrive (prefix-KV sync is a follow-up).
 def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int64) : bool {
-    if (!g_rdec_active) {
+    // continuity guard: a gap in the mirror means an earlier position took the CPU path — decline too
+    if (!g_rdec_active || pos > g_rdec_cnt) {
+        return false
+    }
+    if (pos + 1l > g_rdec_cap) {
+        // once the device path has run the mirror is the ONLY KV — capacity exhaustion fails closed
+        if (g_rdec_cnt > 0l) {
+            panic("dasLLAMA resident decode: position {pos} exceeds the device KV mirror capacity {g_rdec_cap} and host KV was never populated — reduce context or set DASLLAMA_PIN_PREFILL=cpu")
+        }
         return false
     }
     let c = t.config
@@ -2200,6 +2219,7 @@ def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int6
     rdec_token(x, cossin, pos, cnt, s.logits)
     delete x
     delete cossin
+    g_rdec_cnt = pos + 1l   // mirror continuity: rows [0, pos] are now live
     decode_override_logits_done()   // logits produced on device
     return true
 }
@@ -2240,6 +2260,47 @@ def resident_prefill(t : Model; var s : Session; tokens : array<int64>; npos : i
     rdec_prefill(xb, cb, npos, s.logits)
     delete xb
     delete cb
+    return true
+}
+
+// The "vulkan" whole-prefill override (PrefillOverrideFn): one-submit device prefill via the resident
+// driver. KV lands in the DEVICE f32 mirror only (arming also selects the mirror-based resident
+// decode); v1 takes full prompts only — continuation chunks (start_pos != 0) decline to the CPU loop.
+def private vulkan_resident_prefill(t : Model; var s : Session; npos, start_pos : int64) : bool {
+    if (!g_rdec_active) {
+        return false
+    }
+    if (start_pos != 0l) {
+        // a continuation over device-held history has no valid CPU fallback (host KV is empty)
+        if (g_rdec_cnt > 0l) {
+            panic("dasLLAMA resident prefill: continuation at start_pos {start_pos} over device-held KV — host KV was never populated (set DASLLAMA_PIN_PREFILL=cpu for continuation flows)")
+        }
+        return false
+    }
+    if (npos > g_rdec_cap) {
+        return false
+    }
+    let c = t.config
+    let hs = layer_head_size(c, 0l)
+    let half = hs / 2l
+    var cb : array<float>
+    cb |> resize(int(npos * hs))
+    for (p in range64(npos)) {
+        let theta = c.rope_freq_base
+        for (j in range64(half)) {
+            var freq = 1.0 / pow(theta, float(2l * j) / float(hs))
+            if (!empty(t.rope_freqs)) {
+                freq /= t.rope_freqs[j]
+            }
+            let ang = float(p) * freq * c.rope_freq_scale
+            cb[int(p * hs + j)] = cos(ang) * c.rope_mscale
+            cb[int(p * hs + half + j)] = sin(ang) * c.rope_mscale
+        }
+    }
+    rdec_prefill(s.x_b, cb, npos, s.logits)
+    delete cb
+    g_rdec_cnt = npos   // the mirror now holds [0, npos) — the decode's continuity witness
+    prefill_override_logits_done()
     return true
 }
 
@@ -2316,6 +2377,7 @@ def private vulkan_resident_batch_decode(t : Model; var ws : BatchWorkspace; var
 def resident_driver_register() {
     register_decode_override("vulkan", @@vulkan_resident_decode)
     register_batch_decode_override("vulkan", @@vulkan_resident_batch_decode)
+    register_prefill_override("vulkan", @@vulkan_resident_prefill)
 }
 
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
@@ -2344,6 +2406,29 @@ def moe_gpu_upload_resident(var t : Model) {
             || (moe_gpu_layer_count() == 0l && nstream <= 0l && !dn_want && !at_want
                 && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())) {
         return   // tier absent or nothing requested
+    }
+    // dense models that fully fit: try the whole-stack resident driver FIRST — it subsumes every
+    // rail below (all planes + classifier resident, one-submit device prefill + mirror decode).
+    // Any decline (shape, fit, placement) falls through to the per-op rails unchanged.
+    if (moe_gpu_resident_installed() && gpu_want_auto() && t.config.n_expert == 0l) {
+        var seq_cap = t.config.seq_len
+        var plan = resident_plan(t, seq_cap, KVDtype.f32, KVDtype.f32)
+        if (!plan.fits && plan.weight_bytes > 0l && plan.kv_bytes > 0l) {
+            // weights are fixed, the KV mirror is not: retry at the context that fits (the plan's
+            // own remedy), as long as it stays a usable window. The driver guards decode past the cap.
+            let fit_ctx = (plan.budget_bytes - plan.weight_bytes) / (plan.kv_bytes / seq_cap)
+            if (fit_ctx >= RDEC_MIN_CTX) {
+                seq_cap = fit_ctx
+                plan = resident_plan(t, seq_cap, KVDtype.f32, KVDtype.f32)
+            }
+        }
+        if (plan.fits) {
+            if (resident_upload(t, seq_cap)) {
+                return
+            }
+        } elif (!empty(plan.reason)) {
+            to_log(LOG_INFO, "dasLLAMA: resident driver declined — {plan.reason}\n")
+        }
     }
     // capability guard: the tier needs q8 serving mode — record WHY for the status surface when it
     // is armed but this model cannot ride it. Dense archs pass: every non-expert rail (cls, dense

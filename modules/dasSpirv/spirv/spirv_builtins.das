@@ -420,10 +420,12 @@ struct coopmatA_s8_16x32 {}
 struct coopmatB_s8_32x16 {}
 struct coopmatAcc_s32_16x16 {}
 
+// idx also takes uint: s8 element offsets run 4x larger than the uint-word offsets the packed
+// kernels index by, so a >2GB weight arena overflows int32 while still fitting uint.
 [unused_argument(dst, src, idx, stride, layout), sideeffects]
-def public coopmatLoad(var dst : coopmatA_s8_16x32; src; idx, stride, layout : int) : void {}
+def public coopmatLoad(var dst : coopmatA_s8_16x32; src; idx : int | uint; stride, layout : int) : void {}
 [unused_argument(dst, src, idx, stride, layout), sideeffects]
-def public coopmatLoad(var dst : coopmatB_s8_32x16; src; idx, stride, layout : int) : void {}
+def public coopmatLoad(var dst : coopmatB_s8_32x16; src; idx : int | uint; stride, layout : int) : void {}
 [unused_argument(mat, dst, idx, stride, layout), sideeffects]
 def public coopmatStore(mat : coopmatAcc_s32_16x16; dst; idx, stride, layout : int) : void {}
 [unused_argument(a, b), sideeffects]
