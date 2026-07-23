@@ -124,7 +124,7 @@ def generate_fileinfo_ctor_dtor(types : PrimitiveTypes; names : table<string>; j
         LLVMDisposeBuilder(dtor_builder)
     }
 
-    let functionType = LLVMFunctionType(types.t_void, null, 0u, 0)
+    let functionType = jit_fn_type($() : void {})
 
     let constructor = LLVMAddFunctionWithType(g_mod, "fileinfo_constructor", functionType)
     let destructor = LLVMAddFunctionWithType(g_mod, "fileinfo_destructor", functionType)
@@ -145,17 +145,9 @@ def generate_fileinfo_ctor_dtor(types : PrimitiveTypes; names : table<string>; j
 
     let void_ptr = types.LLVMVoidPtrType()
 
-    var initializeFuncType = LLVMFunctionType(types.t_void,
-        fixed_array<LLVMTypeRef>(
-            types.LLVMVoidPtrType(),
-            LLVMPointerType(types.t_int8, 0u), // filename
-        )
-    )
-    var freeFuncType = LLVMFunctionType(types.t_void,
-        fixed_array<LLVMTypeRef>(
-            types.LLVMVoidPtrType(),
-        )
-    )
+    // void jit_initialize_fileinfo ( void * fileInfo, char * filename ); void jit_free_fileinfo ( void * fileInfo )
+    var initializeFuncType = jit_fn_type($(fileInfo, filename : void?) : void {})
+    var freeFuncType = jit_fn_type($(fileInfo : void?) : void {})
 
     var initializeFunc = LLVMAddFunctionWithType(g_mod, "jit_initialize_fileinfo", initializeFuncType)
     var freeFunc = LLVMAddFunctionWithType(g_mod, "jit_free_fileinfo", freeFuncType)
@@ -754,10 +746,7 @@ class public LlvmJitVisitor : AstVisitor {
 
     def create_line_info_global(at : LineInfo; dummy : LLVMOpaqueValue?) {
         let uint8_ptr = LLVMPointerType(types.t_int8, 0u)
-        var line_info_members = fixed_array(
-            LLVMPointerType(types.t_int8, 0u), types.t_int32, types.t_int32, types.t_int32, types.t_int32
-        )
-        let line_info_type = StructType(types, line_info_members)
+        let line_info_type = jit_struct_type(type<tuple<fileName : void?; column : int; line : int; lastColumn : int; lastLine : int>>)
         let line_info_global = LLVMAddGlobal(g_mod, line_info_type, "li_{int(at.line)}_{int(at.column)}")
         set_globalvar_linkage(line_info_global)
         var init_values = fixed_array(g_builder |> LLVMBuildPointerCast(dummy, uint8_ptr, ""),
@@ -4736,105 +4725,44 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     def get_llvm_type_for_typeinfo() : LLVMTypeRef {
-        let void_ptr = types.LLVMVoidPtrType()
-        return StructType(types) <| fixed_array(
-            void_ptr,        // union StructInfo *, EnumInfo *, AnnotationInfo *
-            void_ptr,        // TypeInfo * firstType
-            void_ptr,        // TypeInfo * secondType
-            void_ptr,        // TypeInfo ** argTypes
-            void_ptr,        // const char ** argNames
-            void_ptr,        // uint32_t * dim
-            types.t_int64, // uint64_t hash
-            types.t_int32, // Type type (enum Type : uint32_t)
-            types.t_int32, // uint32_t enum flags: ref, refType, canCopy, etc
-            types.t_int32, // uint32_t size
-            types.t_int32, // uint32_t argCount
-            types.t_int32  // uint32_t dimSize
-        )
+        return jit_struct_type(type<tuple<
+            structEnumAnnInfo : void?; firstType : void?; secondType : void?; argTypes : void?; argNames : void?; dim : void?;
+            hash : int64; typeCode : int; flags : int; size : int; argCount : int; dimSize : int>>)
     }
 
     def get_llvm_type_for_varinfo() : LLVMTypeRef {
-        let void_ptr = types.LLVMVoidPtrType()
-        return StructType(types) <| fixed_array(
-        // Typeinfo fields
-            void_ptr,        // union StructInfo *, EnumInfo *, AnnotationInfo *
-            void_ptr,        // TypeInfo * firstType
-            void_ptr,        // TypeInfo * secondType
-            void_ptr,        // TypeInfo ** argTypes
-            void_ptr,        // const char ** argNames
-            void_ptr,        // uint32_t * dim
-            types.t_int64, // uint64_t hash
-            types.t_int32, // Type type (enum Type : uint32_t)
-            types.t_int32, // uint32_t enum flags: ref, refType, canCopy, etc
-            types.t_int32, // uint32_t size
-            types.t_int32, // uint32_t argCount
-            types.t_int32, // uint32_t dimSize
-
-        // Own fields
-            types.LLVMFloat4Type(), // union { vec4f value; char * sValue }
-            void_ptr,         // const char * name
-            void_ptr,         // AnnotationArgumentInfo * annotation_arguments
-            types.t_int32,  // uint32_t annotation_argument_count
-            types.t_int32,  // uint32_t offset
-            types.t_int32   // uint32_t nextGcField
-        )
+        // TypeInfo prefix + VarInfo own fields (value is the vec4f/char* union)
+        return jit_struct_type(type<tuple<
+            structEnumAnnInfo : void?; firstType : void?; secondType : void?; argTypes : void?; argNames : void?; dim : void?;
+            hash : int64; typeCode : int; flags : int; size : int; argCount : int; dimSize : int;
+            value : float4; name : void?; annotationArguments : void?; annotationArgumentCount : int; offset : int; nextGcField : int>>)
     }
 
     def get_llvm_type_for_structinfo() : LLVMTypeRef {
-        let void_ptr = types.LLVMVoidPtrType()
-        return StructType(types) <| fixed_array(
-            void_ptr,        // const char* name
-            void_ptr,        // const char* module_name
-            void_ptr,        // VarInfo **  fields
-            void_ptr,        // AnnotationInfo * annotations
-
-            types.t_int64, // uint64_t hash
-            types.t_int64, // uint64_t init_mnh
-
-            types.t_int32, // uint32_t flags
-            types.t_int32, // uint32_t count
-            types.t_int32, // uint32_t size
-            types.t_int32, // uint32_t firstGcField
-            types.t_int32) // uint32_t annotation_count
+        return jit_struct_type(type<tuple<
+            name : void?; moduleName : void?; fields : void?; annotations : void?;
+            hash : int64; initMnh : int64;
+            flags : int; count : int; size : int; firstGcField : int; annotationCount : int>>)
     }
 
     def get_llvm_type_for_enumvalueinfo() : LLVMTypeRef {
-        let void_ptr = types.LLVMVoidPtrType()
-        return StructType(types) <| fixed_array(
-            void_ptr,        // const char* name
-            types.t_int64)
+        return jit_struct_type(type<tuple<name : void?; value : int64>>)
     }
 
     def get_llvm_type_for_annotation_argument_info() : LLVMTypeRef {
-        let void_ptr = types.LLVMVoidPtrType()
-        return StructType(types) <| fixed_array(
-            types.t_int32,  // Type type
-            void_ptr,       // const char * name
-            void_ptr,       // const char * sValue
-            types.t_int32)  // int32_t iValue  (covers bool/int/float union)
+        // iValue covers the bool/int/float union
+        return jit_struct_type(type<tuple<typeCode : int; name : void?; sValue : void?; iValue : int>>)
     }
 
     def get_llvm_type_for_annotation_info() : LLVMTypeRef {
-        let void_ptr = types.LLVMVoidPtrType()
-        return StructType(types) <| fixed_array(
-            void_ptr,       // const char * name
-            void_ptr,       // const char * module_name
-            void_ptr,       // AnnotationArgumentInfo * arguments
-            types.t_int32,  // uint32_t count
-            void_ptr)       // Annotation * resolved (lazy cache, starts null)
+        // resolved is a lazy Annotation* cache, starts null
+        return jit_struct_type(type<tuple<name : void?; moduleName : void?; arguments : void?; count : int; resolved : void?>>)
     }
 
-    def get_llvm_type_for_enuminfo(len : uint) : LLVMTypeRef {
-        let void_ptr = types.LLVMVoidPtrType()
-        return StructType(types) <| fixed_array(
-            void_ptr,        // const char* name
-            void_ptr,        // const char* module_name
-            void_ptr,        // EnumValueInfo **  fields
-            types.t_int32,   // uint32_t count
-            types.t_int64,   // uint64_t hash
-            types.t_int32,   // uint32_t flags (EnumInfo::flag_unsigned for uint*-backed enums)
-            void_ptr,        // AnnotationInfo * annotations
-            types.t_int32)   // uint32_t annotation_count
+    def get_llvm_type_for_enuminfo(_len : uint) : LLVMTypeRef {
+        return jit_struct_type(type<tuple<
+            name : void?; moduleName : void?; fields : void?; count : int;
+            hash : int64; flags : int; annotations : void?; annotationCount : int>>)
     }
 
 /////////////////////////////////////////////////////////////////////////////////////////

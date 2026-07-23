@@ -14,6 +14,7 @@ require llvm/daslib/llvm_boost
 require llvm/daslib/llvm_dll_utils
 require llvm/daslib/llvm_targets
 
+require llvm/daslib/llvm_dsl
 require daslib/ast_boost
 require daslib/strings
 require daslib/strings_boost
@@ -334,18 +335,9 @@ def public get_string_table_at_after_packed_miss(g_builder : LLVMOpaqueBuilder?;
 // Generic Table header (Array base + keys/hashes/tombstones) with pointer fields as void*,
 // so it is independent of key/value type. Field order matches JIT_TABLE; used only to read
 // capacity / hashes for the inlined packed find.
-def public table_header_llvm_type(var types : PrimitiveTypes?) : LLVMOpaqueType? {
-    return types |> StructType(fixed_array(
-        types.LLVMVoidPtrType(),   // DATA
-        types.t_int64,             // SIZE
-        types.t_int64,             // CAPACITY
-        types.t_int32,             // MAGIC
-        types.t_int32,             // LOCK
-        types.t_int32,             // FLAGS
-        types.t_int32,             // PAD_AFTER_FLAGS
-        types.LLVMVoidPtrType(),   // KEYS
-        types.LLVMVoidPtrType(),   // HASHES (TableHashKey* = uint32*)
-        types.t_int64))            // TOMBSTONES
+def public table_header_llvm_type(var _types : PrimitiveTypes?) : LLVMOpaqueType? {
+    // padAfterFlags is an explicit slot (8-aligns keys on 32-bit ABIs); hashes is TableHashKey* = uint32*
+    return jit_struct_type(type<tuple<data : void?; size : int64; capacity : int64; magic : int; lock : int; flags : int; padAfterFlags : int; keys : void?; hashes : void?; tombstones : int64>>)
 }
 
 def public get_table_erase(g_builder : LLVMOpaqueBuilder?; llvm_module : LLVMOpaqueModule?; t : Type; var types : PrimitiveTypes?) {
@@ -533,6 +525,29 @@ def public LLVMAddFunctionWithType(mod : LLVMModuleRef; name : string; typ : LLV
     return rv
 }
 
+// ===== extern-helper declaration =====
+// jit_add_extern declares one C++ runtime helper (add + global-mapping + function attrs, plus optional
+// per-arg attrs). Pair with jit_fn_type(signature) (llvm_dsl) to derive `typ` from a das signature.
+
+def public jit_extern_type(t : Type) : LLVMTypeRef {
+    return t == Type.tVoid ? g_prim_t.t_void : base_type_to_llvm_type(t)
+}
+
+def public jit_add_extern(name : string; typ : LLVMTypeRef; fnAddr : void?; attrs : LLVMOpaqueAttributeRef? []) {
+    var f = LLVMAddFunctionWithType(g_mod, name, typ)
+    LLVMAddGlobalMapping(g_engine, f, fnAddr)
+    LLVMAddAttributesToFunction(f, attrs)
+    return f
+}
+
+// argAttr: (attribute, argument-indices) — e.g. (nocapture, [0, 1, 2, 3]) or (nocapture, [1]).
+def public jit_add_extern(name : string; typ : LLVMTypeRef; fnAddr : void?; attrs : LLVMOpaqueAttributeRef? []; argAttr : tuple<LLVMOpaqueAttributeRef?; array<int>>) {
+    var f = jit_add_extern(name, typ, fnAddr, attrs)
+    for (i in argAttr._1) {
+        LLVMAddAttributeToFunctionArgument(f, uint(i), argAttr._0)
+    }
+    return f
+}
 
 var g_jit_clopts_parsed = false
 
@@ -676,270 +691,85 @@ def public init_jit(cg_opt_level : uint; target_triple : string = ""; host_featu
     assume memory_arg_inaccessible_rw = attrs.memory_arg_inaccessible_rw
     build_jit_types()
 
-    // add default functions
-    var jit_exception = LLVMAddFunctionWithType(g_mod, FN_JIT_EXCEPTION,    // jit_exception(text,context *,lineinfo *)
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(g_prim_t.get_type_string(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_exception, get_jit_exception())
-    LLVMAddAttributeToFunction(jit_exception, noreturn)
-    // 'cold' tells opt that any branch ending in a jit_exception call is
-    // unlikely (panic/assert paths). Pairs with noreturn so block-placement
-    // sinks the failure block and keeps the hot path straight.
-    LLVMAddAttributeToFunction(jit_exception, cold)
-    LLVMAddAttributeToFunctionArgumentRange(jit_exception, urange(0, 2), nocapture)
-    // jit_call_or_fastcall(func,args *,context *)
-    var jit_call_or_fastcall = LLVMAddFunctionWithType(g_mod, FN_JIT_CALL_OR_FASTCALL,
-        LLVMFunctionType(g_prim_t.LLVMFloat4Type(),
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), LLVMPointerType(g_prim_t.LLVMFloat4Type(), 0u), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_call_or_fastcall, get_jit_call_or_fastcall())
-    LLVMAddAttributeToFunctionArgumentRange(jit_call_or_fastcall, urange(0, 3), nocapture)
-    LLVMAddAttributesToFunction(jit_call_or_fastcall, fixed_array(nounwind, willreturn))
-    // jit_call_with_cmres(func,args *,cmres *,context *)
-    var jit_call_with_cmres = LLVMAddFunctionWithType(g_mod, FN_JIT_CALL_WITH_CMRES,
-        LLVMFunctionType(g_prim_t.LLVMFloat4Type(),
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), LLVMPointerType(g_prim_t.LLVMFloat4Type(), 0u), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_call_with_cmres, get_jit_call_with_cmres())
-    LLVMAddAttributeToFunctionArgumentRange(jit_call_with_cmres, urange(0, 4), nocapture)
-    LLVMAddAttributesToFunction(jit_call_with_cmres, fixed_array(nounwind, willreturn))
-    // vec4f jit_invoke_block ( const Block & blk, vec4f * args, Context * context )
-    var jit_invoke_block = LLVMAddFunctionWithType(g_mod, FN_JIT_INVOKE_BLOCK,
-        LLVMFunctionType(g_prim_t.LLVMFloat4Type(),
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_t_block, 0u), LLVMPointerType(g_prim_t.LLVMFloat4Type(), 0u), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_invoke_block, get_jit_invoke_block())
-    LLVMAddAttributeToFunctionArgumentRange(jit_invoke_block, urange(0, 3), nocapture)
-    LLVMAddAttributesToFunction(jit_invoke_block, fixed_array(nounwind, willreturn))
-    // vec4f jit_invoke_block_with_cmres ( const Block & blk, vec4f * args, void * cmres, Context * context )
-    var jit_invoke_block_with_cmres = LLVMAddFunctionWithType(g_mod, FN_JIT_INVOKE_BLOCK_WITH_CMRES,
-        LLVMFunctionType(g_prim_t.LLVMFloat4Type(),
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_t_block, 0u), LLVMPointerType(g_prim_t.LLVMFloat4Type(), 0u), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_invoke_block_with_cmres, get_jit_invoke_block_with_cmres())
-    LLVMAddAttributeToFunctionArgumentRange(jit_invoke_block_with_cmres, urange(0, 4), nocapture)
-    LLVMAddAttributesToFunction(jit_invoke_block_with_cmres, fixed_array(nounwind, willreturn))
-    // jit_string_builder ( context *, int32 nArgs, TypeInfo ** types, LineInfoArg * at, vec4f * args )
-    var jit_string_builder = LLVMAddFunctionWithType(g_mod, FN_JIT_STRING_BUILDER,
-        LLVMFunctionType(g_prim_t.get_type_string(),
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.t_int32, g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), LLVMPointerType(g_prim_t.LLVMFloat4Type(), 0u))))
-    LLVMAddGlobalMapping(g_engine, jit_string_builder, get_jit_string_builder())
-    LLVMAddAttributesToFunction(jit_string_builder, fixed_array(nounwind, willreturn))
-    // jit_string_builder_temp ( context *, int32 nArgs, TypeInfo ** types, LineInfoArg * at, vec4f * args )
-    var jit_string_builder_temp = LLVMAddFunctionWithType(g_mod, FN_JIT_STRING_BUILDER_TEMP,
-        LLVMFunctionType(g_prim_t.get_type_string(),
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.t_int32, g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), LLVMPointerType(g_prim_t.LLVMFloat4Type(), 0u))))
-    LLVMAddGlobalMapping(g_engine, jit_string_builder_temp, get_jit_string_builder_temp())
-    LLVMAddAttributesToFunction(jit_string_builder_temp, fixed_array(nounwind, willreturn))
-    // void * jit_get_global_mnh ( uint64_t mnh, context * )
-    var jit_get_global_mnh = LLVMAddFunctionWithType(g_mod, FN_JIT_GET_GLOBAL_MNH,
-        LLVMFunctionType(g_prim_t.LLVMVoidPtrType(),
-            fixed_array<LLVMTypeRef>(g_prim_t.t_int64, g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_get_global_mnh, get_jit_get_global_mnh())
-    LLVMAddAttributesToFunction(jit_get_global_mnh, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgument(jit_get_global_mnh, 1u, nocapture)
-    // void * jit_get_shared_mnh ( uint64_t mnh, context * )
-    var jit_get_shared_mnh = LLVMAddFunctionWithType(g_mod, FN_JIT_GET_SHARED_MNH,
-        LLVMFunctionType(g_prim_t.LLVMVoidPtrType(),
-            fixed_array<LLVMTypeRef>(g_prim_t.t_int64, g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_get_shared_mnh, get_jit_get_shared_mnh())
-    LLVMAddAttributesToFunction(jit_get_shared_mnh, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgument(jit_get_shared_mnh, 1u, nocapture)
-    // uint32_t jit_get_handled_field_offset ( const char * module, const char * type, const char * field )
+    // cold: opt sinks the failure block off the hot path; pairs with noreturn.
+    jit_add_extern(FN_JIT_EXCEPTION, jit_fn_type($(text, ctx, at : void?) : void {}),
+        get_jit_exception(), fixed_array(noreturn, cold), (nocapture, [0, 1]))
+    jit_add_extern(FN_JIT_CALL_OR_FASTCALL, jit_fn_type($(func, args, ctx : void?) : float4 {}),
+        get_jit_call_or_fastcall(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2]))
+    jit_add_extern(FN_JIT_CALL_WITH_CMRES, jit_fn_type($(func, args, cmres, ctx : void?) : float4 {}),
+        get_jit_call_with_cmres(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2, 3]))
+    jit_add_extern(FN_JIT_INVOKE_BLOCK, jit_fn_type($(blk, args, ctx : void?) : float4 {}),
+        get_jit_invoke_block(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2]))
+    jit_add_extern(FN_JIT_INVOKE_BLOCK_WITH_CMRES, jit_fn_type($(blk, args, cmres, ctx : void?) : float4 {}),
+        get_jit_invoke_block_with_cmres(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2, 3]))
+    jit_add_extern(FN_JIT_STRING_BUILDER,
+        jit_fn_type($(ctx : void?; nArgs : int; types, at, args : void?) : void? {}),
+        get_jit_string_builder(), fixed_array(nounwind, willreturn))
+    jit_add_extern(FN_JIT_STRING_BUILDER_TEMP,
+        jit_fn_type($(ctx : void?; nArgs : int; types, at, args : void?) : void? {}),
+        get_jit_string_builder_temp(), fixed_array(nounwind, willreturn))
+    jit_add_extern(FN_JIT_GET_GLOBAL_MNH, jit_fn_type($(mnh : int64; ctx : void?) : void? {}),
+        get_jit_get_global_mnh(), fixed_array(nounwind, willreturn), (nocapture, [1]))
+    jit_add_extern(FN_JIT_GET_SHARED_MNH, jit_fn_type($(mnh : int64; ctx : void?) : void? {}),
+        get_jit_get_shared_mnh(), fixed_array(nounwind, willreturn), (nocapture, [1]))
     // Wasm-only: resolves a handled-type (C++) field offset against the TARGET runtime's annotation
     // registry, into per-field globals at init. Declared unconditionally; only used when g_target_is_wasm.
-    var jit_get_handled_field_offset = LLVMAddFunctionWithType(g_mod, FN_JIT_GET_HANDLED_FIELD_OFFSET,
-        LLVMFunctionType(g_prim_t.t_int32,
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_get_handled_field_offset, get_jit_get_handled_field_offset())
-    LLVMAddAttributesToFunction(jit_get_handled_field_offset, fixed_array(nounwind, willreturn))
+    jit_add_extern(FN_JIT_GET_HANDLED_FIELD_OFFSET,
+        jit_fn_type($(modName, typeName, field : void?) : int {}),
+        get_jit_get_handled_field_offset(), fixed_array(nounwind, willreturn))
     // --jit-check-abi safe-check trio (declared unconditionally; called only when g_jit_check_handled_abi).
     // Host bakes its layout into the call args; these resolve the TARGET annotation and record/abort on mismatch.
-    // void jit_check_handled_type_size ( const char * module, const char * type, uint32_t hostSize )
-    var jit_check_handled_type_size = LLVMAddFunctionWithType(g_mod, FN_JIT_CHECK_HANDLED_TYPE_SIZE,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.t_int32)))
-    LLVMAddGlobalMapping(g_engine, jit_check_handled_type_size, get_jit_check_handled_type_size())
-    LLVMAddAttributesToFunction(jit_check_handled_type_size, fixed_array(nounwind, willreturn))
-    // void jit_check_handled_field_offset ( const char * module, const char * type, const char * field, uint32_t hostOffset )
-    var jit_check_handled_field_offset = LLVMAddFunctionWithType(g_mod, FN_JIT_CHECK_HANDLED_FIELD_OFFSET,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.t_int32)))
-    LLVMAddGlobalMapping(g_engine, jit_check_handled_field_offset, get_jit_check_handled_field_offset())
-    LLVMAddAttributesToFunction(jit_check_handled_field_offset, fixed_array(nounwind, willreturn))
-    // void jit_handled_abi_check_report ()
-    // NO willreturn: this aborts (DAS_FATAL_ERROR) on any mismatch, so it may not return
-    // normally — willreturn would be UB. (The two check fns above keep willreturn.)
-    var jit_handled_abi_check_report = LLVMAddFunctionWithType(g_mod, FN_JIT_HANDLED_ABI_CHECK_REPORT,
-        LLVMFunctionType(g_prim_t.t_void, array<LLVMTypeRef>()))
-    LLVMAddGlobalMapping(g_engine, jit_handled_abi_check_report, get_jit_handled_abi_check_report())
-    LLVMAddAttributesToFunction(jit_handled_abi_check_report, fixed_array(nounwind))
-    // jit_alloc_heap ( uint64_t mnh, context * )
-    var jit_alloc_heap = LLVMAddFunctionWithType(g_mod, FN_JIT_ALLOC_HEAP,
-        LLVMFunctionType(g_prim_t.LLVMVoidPtrType(),
-            fixed_array<LLVMTypeRef>(g_prim_t.t_int32, g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_alloc_heap, get_jit_alloc_heap())
-    LLVMAddAttributesToFunction(jit_alloc_heap, fixed_array(nounwind, willreturn, nofree, memory_inaccessible_rw))
-    LLVMAddAttributeToFunctionArgument(jit_alloc_heap, 1u, nocapture)
-    // jit_alloc_persistent ( uint64_t mnh, context * )
-    var jit_alloc_persistent = LLVMAddFunctionWithType(g_mod, FN_JIT_ALLOC_PERSISTENT,
-        LLVMFunctionType(g_prim_t.LLVMVoidPtrType(),
-            fixed_array<LLVMTypeRef>(g_prim_t.t_int32, g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_alloc_persistent, get_jit_alloc_persistent())
-    LLVMAddAttributesToFunction(jit_alloc_persistent, fixed_array(nounwind, willreturn, nofree, memory_inaccessible_rw))
-    LLVMAddAttributeToFunctionArgument(jit_alloc_persistent, 1u, nocapture)
-    // void jit_free_heap ( void * bytes, uint32_t size, Context * context )
-    var jit_free_heap = LLVMAddFunctionWithType(g_mod, FN_JIT_FREE_HEAP,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.t_int32, g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_free_heap, get_jit_free_heap())
-    LLVMAddAttributesToFunction(jit_free_heap, fixed_array(nounwind, willreturn, memory_arg_inaccessible_rw))
-    LLVMAddAttributeToFunctionArgument(jit_free_heap, 0u, nocapture)
-    LLVMAddAttributeToFunctionArgument(jit_free_heap, 2u, nocapture)
-    // void jit_free_persistent ( void * bytes, Context * context )
-    var jit_free_persistent = LLVMAddFunctionWithType(g_mod, FN_JIT_FREE_PERSISTENT,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_free_persistent, get_jit_free_persistent())
-    LLVMAddAttributesToFunction(jit_free_persistent, fixed_array(nounwind, willreturn, memory_arg_inaccessible_rw))
-    LLVMAddAttributeToFunctionArgumentRange(jit_free_persistent, urange(0, 2), nocapture)
-    // void jit_array_lock ( Array & array, Context * context, LineInfoArg * at )
-    var jit_array_lock = LLVMAddFunctionWithType(g_mod, FN_JIT_ARRAY_LOCK,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_array_lock, get_jit_array_lock())
-    LLVMAddAttributesToFunction(jit_array_lock, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_array_lock, urange(0, 2), nocapture)
-    // void jit_array_unlock ( Array & array, Context * context, LineInfoArg * at )
-    var jit_array_unlock = LLVMAddFunctionWithType(g_mod, FN_JIT_ARRAY_UNLOCK,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(
-                g_prim_t.LLVMVoidPtrType(), // arr
-                g_prim_t.LLVMVoidPtrType(), // ctx
-                g_prim_t.LLVMVoidPtrType(), // lineInfo
-            )
-        ))
-    LLVMAddGlobalMapping(g_engine, jit_array_unlock, get_jit_array_unlock())
-    LLVMAddAttributesToFunction(jit_array_unlock, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_array_unlock, urange(0, 2), nocapture)
-    // void builtin_array_resize ( Array & array, int newSize, int stride, Context * context, LineInfoArg * at )
-    var jit_array_resize = LLVMAddFunctionWithType(g_mod, FN_JIT_ARRAY_RESIZE,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(
-                g_prim_t.LLVMVoidPtrType(), // arr
-                g_prim_t.t_int32,           // newSize
-                g_prim_t.t_int32,           // stride
-                g_prim_t.LLVMVoidPtrType(), // ctx
-                g_prim_t.LLVMVoidPtrType(), // lineInfo
-            )
-        ))
-    LLVMAddGlobalMapping(g_engine, jit_array_resize, get_jit_array_resize())
-    LLVMAddAttributesToFunction(jit_array_resize, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_array_resize, urange(0, 1), nocapture)
+    jit_add_extern(FN_JIT_CHECK_HANDLED_TYPE_SIZE,
+        jit_fn_type($(modName, typeName : void?; hostSize : int) : void {}),
+        get_jit_check_handled_type_size(), fixed_array(nounwind, willreturn))
+    jit_add_extern(FN_JIT_CHECK_HANDLED_FIELD_OFFSET,
+        jit_fn_type($(modName, typeName, field : void?; hostOffset : int) : void {}),
+        get_jit_check_handled_field_offset(), fixed_array(nounwind, willreturn))
+    // NO willreturn: this aborts (DAS_FATAL_ERROR) on any mismatch, so it may not return normally.
+    jit_add_extern(FN_JIT_HANDLED_ABI_CHECK_REPORT, jit_fn_type($() : void {}),
+        get_jit_handled_abi_check_report(), fixed_array(nounwind))
+    jit_add_extern(FN_JIT_ALLOC_HEAP, jit_fn_type($(size : int; ctx : void?) : void? {}),
+        get_jit_alloc_heap(), fixed_array(nounwind, willreturn, nofree, memory_inaccessible_rw), (nocapture, [1]))
+    jit_add_extern(FN_JIT_ALLOC_PERSISTENT, jit_fn_type($(size : int; ctx : void?) : void? {}),
+        get_jit_alloc_persistent(), fixed_array(nounwind, willreturn, nofree, memory_inaccessible_rw), (nocapture, [1]))
+    jit_add_extern(FN_JIT_FREE_HEAP, jit_fn_type($(bytes : void?; size : int; ctx : void?) : void {}),
+        get_jit_free_heap(), fixed_array(nounwind, willreturn, memory_arg_inaccessible_rw), (nocapture, [0, 2]))
+    jit_add_extern(FN_JIT_FREE_PERSISTENT, jit_fn_type($(bytes, ctx : void?) : void {}),
+        get_jit_free_persistent(), fixed_array(nounwind, willreturn, memory_arg_inaccessible_rw), (nocapture, [0, 1]))
+    jit_add_extern(FN_JIT_ARRAY_LOCK, jit_fn_type($(arr, ctx, at : void?) : void {}),
+        get_jit_array_lock(), fixed_array(nounwind, willreturn), (nocapture, [0, 1]))
+    jit_add_extern(FN_JIT_ARRAY_UNLOCK, jit_fn_type($(arr, ctx, at : void?) : void {}),
+        get_jit_array_unlock(), fixed_array(nounwind, willreturn), (nocapture, [0, 1]))
+    jit_add_extern(FN_JIT_ARRAY_RESIZE, jit_fn_type($(arr : void?; newSize, stride : int; ctx, at : void?) : void {}),
+        get_jit_array_resize(), fixed_array(nounwind, willreturn), (nocapture, [0]))
+    jit_add_extern(FN_JIT_TABLE_LOCK, jit_fn_type($(tab, ctx, at : void?) : void {}),
+        get_jit_table_lock(), fixed_array(nounwind, willreturn), (nocapture, [0, 1]))
+    jit_add_extern(FN_JIT_TABLE_UNLOCK, jit_fn_type($(tab, ctx, at : void?) : void {}),
+        get_jit_table_unlock(), fixed_array(nounwind, willreturn), (nocapture, [0, 1]))
 
-    // void jit_table_lock ( Table & tab, Context * context, LineInfoArg * at )
-    var jit_table_lock = LLVMAddFunctionWithType(g_mod, FN_JIT_TABLE_LOCK,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_table_lock, get_jit_table_lock())
-    LLVMAddAttributesToFunction(jit_table_lock, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_table_lock, urange(0, 2), nocapture)
-    // void jit_table_unlock ( Table & tab, Context * context, LineInfoArg * at )
-    var jit_table_unlock = LLVMAddFunctionWithType(g_mod, FN_JIT_TABLE_UNLOCK,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_table_unlock, get_jit_table_unlock())
-    LLVMAddAttributesToFunction(jit_table_unlock, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_table_unlock, urange(0, 2), nocapture)
-
-    // int jit_str_cmp ( char * a, char * b )
-    var jit_str_cmp = LLVMAddFunctionWithType(g_mod, FN_JIT_STR_CMP,
-        LLVMFunctionType(g_prim_t.t_int32,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_prim_t.t_int8, 0u), LLVMPointerType(g_prim_t.t_int8, 0u))))
-    LLVMAddGlobalMapping(g_engine, jit_str_cmp, get_jit_str_cmp())
-    LLVMAddAttributesToFunction(jit_str_cmp, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_str_cmp, urange(0, 2), nocapture)
-    // char * jit_str_cat ( char * a, char * b, Copntext * context )
-    var jit_str_cat = LLVMAddFunctionWithType(g_mod, FN_JIT_STR_CAT,
-        LLVMFunctionType(LLVMPointerType(g_prim_t.t_int8, 0u),
-            fixed_array<LLVMTypeRef>(
-                LLVMPointerType(g_prim_t.t_int8, 0u), // sA
-                LLVMPointerType(g_prim_t.t_int8, 0u), // sB
-                g_prim_t.LLVMVoidPtrType(),           // ctx
-                g_prim_t.LLVMVoidPtrType(),           // lineInfo
-            )
-        ))
-    LLVMAddGlobalMapping(g_engine, jit_str_cat, get_jit_str_cat())
-    LLVMAddAttributesToFunction(jit_str_cat, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_str_cat, urange(0, 3), nocapture)
-    // void jit_prologue ( char * funcName, void * funcLineInfo, int32_t stackSize, JitStackState * stackState, Context * context, LineInfoArg * at )
-    var jit_prologue = LLVMAddFunctionWithType(g_mod, FN_JIT_PROLOGUE,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(
-                g_prim_t.get_type_string(),    // funcName
-                g_prim_t.LLVMVoidPtrType(),    // funcLineInfo
-                g_prim_t.t_int32,              // stackSize
-                LLVMPointerType(g_t_stack_state, 0u), // stackState
-                g_prim_t.LLVMVoidPtrType(),    // context
-                g_prim_t.LLVMVoidPtrType()     // at
-            )
-        )
-    )
-    LLVMAddGlobalMapping(g_engine, jit_prologue, get_jit_prologue())
-    LLVMAddAttributesToFunction(jit_prologue, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_prologue, urange(3, 6), nocapture)
-    // void jit_epilogue ( JitStackState * stackState, Context * context )
-    var jit_epilogue = LLVMAddFunctionWithType(g_mod, FN_JIT_EPILOGUE,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_t_stack_state, 0u), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_epilogue, get_jit_epilogue())
-    LLVMAddAttributesToFunction(jit_epilogue, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_epilogue, urange(0, 2), nocapture)
-    // void jit_make_block ( Block * blk, int32_t argStackTop, uint64_t annotationData, void * bodyNode, void * jitImpl, void * funcInfo, Context * context )
-    var jit_make_block = LLVMAddFunctionWithType(g_mod, FN_JIT_MAKE_BLOCK,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(
-                LLVMPointerType(g_t_block, 0u), // blk
-                g_prim_t.t_int32,               // argStackTop
-                g_prim_t.t_int64,               // ad
-                g_prim_t.LLVMVoidPtrType(),     // bodyNode
-                g_prim_t.LLVMVoidPtrType(),     // jitImpl
-                g_prim_t.LLVMVoidPtrType(),     // funcInfo
-                g_prim_t.LLVMVoidPtrType(),     // lineInfo
-                g_prim_t.LLVMVoidPtrType()      // context
-            )))
-    LLVMAddGlobalMapping(g_engine, jit_make_block, get_jit_make_block())
-    LLVMAddAttributesToFunction(jit_make_block, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgument(jit_make_block, 0u, nocapture)
-    LLVMAddAttributeToFunctionArgumentRange(jit_make_block, urange(3, 7), nocapture)
-    // void jit_debug ( vec4f res, TypeInfo * typeInfo, char * message, Context * context, LineInfoArg * at )
-    var jit_debug = LLVMAddFunctionWithType(g_mod, FN_JIT_DEBUG,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(g_prim_t.LLVMFloat4Type(), g_prim_t.LLVMVoidPtrType(), g_prim_t.get_type_string(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_debug, get_jit_debug())
-    LLVMAddAttributesToFunction(jit_debug, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_debug, urange(1, 5), nocapture)
-    // bool builtin_iterator_iterate ( const Sequence & it, void * data, Context * context ) {
-    var jit_iterator_iterate = LLVMAddFunctionWithType(g_mod, FN_JIT_ITERATOR_ITERATE,
-        LLVMFunctionType(g_prim_t.t_int1,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_t_sequence, 0u), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_iterator_iterate, get_jit_iterator_iterate())
-    LLVMAddAttributesToFunction(jit_iterator_iterate, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_iterator_iterate, urange(0, 3), nocapture)
-    // void builtin_iterator_delete ( const Sequence & it, Context * context ) {
-    var jit_iterator_delete = LLVMAddFunctionWithType(g_mod, FN_JIT_ITERATOR_DELETE,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_t_sequence, 0u), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_iterator_delete, get_jit_iterator_delete())
-    LLVMAddAttributesToFunction(jit_iterator_delete, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_iterator_delete, urange(0, 2), nocapture)
-    // bool builtin_iterator_first ( const Sequence & it, void * data, Context * context, LineInfoArg * at ) {
-    var jit_iterator_first = LLVMAddFunctionWithType(g_mod, FN_JIT_ITERATOR_FIRST,
-        LLVMFunctionType(g_prim_t.t_int1,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_t_sequence, 0u), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_iterator_first, get_jit_iterator_first())
-    LLVMAddAttributesToFunction(jit_iterator_first, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_iterator_first, urange(0, 4), nocapture)
-    // bool builtin_iterator_next ( const Sequence & it, void * data, Context * context, LineInfoArg * at ) {
-    var jit_iterator_next = LLVMAddFunctionWithType(g_mod, FN_JIT_ITERATOR_NEXT,
-        LLVMFunctionType(g_prim_t.t_int1,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_t_sequence, 0u), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
+    jit_add_extern(FN_JIT_STR_CMP, jit_fn_type($(sA, sB : void?) : int {}),
+        get_jit_str_cmp(), fixed_array(nounwind, willreturn), (nocapture, [0, 1]))
+    jit_add_extern(FN_JIT_STR_CAT, jit_fn_type($(sA, sB, ctx, at : void?) : void? {}),
+        get_jit_str_cat(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2]))
+    jit_add_extern(FN_JIT_PROLOGUE,
+        jit_fn_type($(funcName, funcLineInfo : void?; stackSize : int; stackState, ctx, at : void?) : void {}),
+        get_jit_prologue(), fixed_array(nounwind, willreturn), (nocapture, [3, 4, 5]))
+    jit_add_extern(FN_JIT_EPILOGUE, jit_fn_type($(stackState, ctx : void?) : void {}),
+        get_jit_epilogue(), fixed_array(nounwind, willreturn), (nocapture, [0, 1]))
+    jit_add_extern(FN_JIT_MAKE_BLOCK,
+        jit_fn_type($(blk : void?; argStackTop : int; ad : int64; bodyNode, jitImpl, funcInfo, at, ctx : void?) : void {}),
+        get_jit_make_block(), fixed_array(nounwind, willreturn), (nocapture, [0, 3, 4, 5, 6]))
+    jit_add_extern(FN_JIT_DEBUG, jit_fn_type($(res : float4; typeInfo, message, ctx, at : void?) : void {}),
+        get_jit_debug(), fixed_array(nounwind, willreturn), (nocapture, [1, 2, 3, 4]))
+    jit_add_extern(FN_JIT_ITERATOR_ITERATE, jit_fn_type($(it, data, ctx : void?) : bool {}),
+        get_jit_iterator_iterate(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2]))
+    jit_add_extern(FN_JIT_ITERATOR_DELETE, jit_fn_type($(it, ctx : void?) : void {}),
+        get_jit_iterator_delete(), fixed_array(nounwind, willreturn), (nocapture, [0, 1]))
+    jit_add_extern(FN_JIT_ITERATOR_FIRST, jit_fn_type($(it, data, ctx, at : void?) : bool {}),
+        get_jit_iterator_first(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2, 3]))
+    jit_add_extern(FN_JIT_ITERATOR_NEXT, jit_fn_type($(it, data, ctx, at : void?) : bool {}),
+        get_jit_iterator_next(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2, 3]))
+    // jit_simnode_interop / jit_free_simnode_interop: literal names, mapping only, no attrs — kept hand-built.
     // void jit_simnode_interop ( void * ptr, int argCount, TypeInfo ** types )
     let simnode_interop_type = LLVMFunctionType(g_prim_t.t_void,
         fixed_array<LLVMTypeRef>(
@@ -961,103 +791,29 @@ def public init_jit(cg_opt_level : uint; target_triple : string = ""; host_featu
         g_mod, "jit_free_simnode_interop", simnode_free_interop_type
     )
     LLVMAddGlobalMapping(g_engine, jit_free_simnode_interop, get_jit_free_simnode_interop())
-    LLVMAddGlobalMapping(g_engine, jit_iterator_next, get_jit_iterator_next())
-    LLVMAddAttributesToFunction(jit_iterator_next, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_iterator_next, urange(0, 4), nocapture)
-    // void builtin_iterator_close ( const Sequence & it, void * data, Context * context ) {
-    var jit_iterator_close = LLVMAddFunctionWithType(g_mod, FN_JIT_ITERATOR_CLOSE,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_t_sequence, 0u), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_iterator_close, get_jit_iterator_close())
-    LLVMAddAttributesToFunction(jit_iterator_close, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_iterator_close, urange(0, 3), nocapture)
-    // void das_jit_debug_enter ( char * message, Context * context, LineInfoArg * at ) {
-    var jit_debug_enter = LLVMAddFunctionWithType(g_mod, FN_JIT_DEBUG_ENTER,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_prim_t.t_int8, 0u), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_debug_enter, get_jit_debug_enter())
-    LLVMAddAttributesToFunction(jit_debug_enter, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_debug_enter, urange(0, 3), nocapture)
-    // void das_jit_debug_exit ( char * message, Context * context, LineInfoArg * at ) {
-    var jit_debug_exit = LLVMAddFunctionWithType(g_mod, FN_JIT_DEBUG_EXIT,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_prim_t.t_int8, 0u), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_debug_exit, get_jit_debug_exit())
-    LLVMAddAttributesToFunction(jit_debug_exit, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_debug_exit, urange(0, 3), nocapture)
-    // void das_jit_debug_line ( char * message, Context * context, LineInfoArg * at ) {
-    var jit_debug_line = LLVMAddFunctionWithType(g_mod, FN_JIT_DEBUG_LINE,
-        LLVMFunctionType(g_prim_t.t_void,
-            fixed_array<LLVMTypeRef>(LLVMPointerType(g_prim_t.t_int8, 0u), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_debug_line, get_jit_debug_line())
-    LLVMAddAttributesToFunction(jit_debug_line, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_debug_line, urange(0, 3), nocapture)
-    // void * jit_ast_typedecl ( uint64_t hash, Context * context, LineInfoArg * at )
-    var jit_ast_typedecl = LLVMAddFunctionWithType(g_mod, FN_JIT_AST_TYPEDECL,
-        LLVMFunctionType(g_prim_t.LLVMVoidPtrType(),
-            fixed_array<LLVMTypeRef>(g_prim_t.t_int64, g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
-    LLVMAddGlobalMapping(g_engine, jit_ast_typedecl, get_jit_ast_typedecl())
-    LLVMAddAttributesToFunction(jit_ast_typedecl, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_ast_typedecl, urange(1, 3), nocapture)
-    // void jit_init_extern_function ( const char * moduleName, const char * funcMangledName, void ** dllGlobal )
-    let jit_init_extern_type = LLVMFunctionType(g_prim_t.t_void,
-        fixed_array<LLVMTypeRef>(
-            g_prim_t.LLVMVoidPtrType(),  // const char * moduleName
-            g_prim_t.LLVMVoidPtrType(),  // const char * funcMangledName
-            g_prim_t.LLVMVoidPtrType()   // void ** dllGlobal
-        ))
-    var jit_init_extern = LLVMAddFunctionWithType(g_mod, FN_JIT_INIT_EXTERN, jit_init_extern_type)
-    g_fn_types[FN_JIT_INIT_EXTERN] = jit_init_extern_type
-    LLVMAddGlobalMapping(g_engine, jit_init_extern, get_jit_init_extern_function())
-    LLVMAddAttributesToFunction(jit_init_extern, fixed_array(nounwind, willreturn))
-    LLVMAddAttributeToFunctionArgumentRange(jit_init_extern, urange(0, 3), nocapture)
+    jit_add_extern(FN_JIT_ITERATOR_CLOSE, jit_fn_type($(it, data, ctx : void?) : void {}),
+        get_jit_iterator_close(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2]))
+    jit_add_extern(FN_JIT_DEBUG_ENTER, jit_fn_type($(message, ctx, at : void?) : void {}),
+        get_jit_debug_enter(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2]))
+    jit_add_extern(FN_JIT_DEBUG_EXIT, jit_fn_type($(message, ctx, at : void?) : void {}),
+        get_jit_debug_exit(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2]))
+    jit_add_extern(FN_JIT_DEBUG_LINE, jit_fn_type($(message, ctx, at : void?) : void {}),
+        get_jit_debug_line(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2]))
+    jit_add_extern(FN_JIT_AST_TYPEDECL, jit_fn_type($(hash : int64; ctx, at : void?) : void? {}),
+        get_jit_ast_typedecl(), fixed_array(nounwind, willreturn), (nocapture, [1, 2]))
+    jit_add_extern(FN_JIT_INIT_EXTERN, jit_fn_type($(moduleName, funcMangledName, dllGlobal : void?) : void {}),
+        get_jit_init_extern_function(), fixed_array(nounwind, willreturn), (nocapture, [0, 1, 2]))
 }
 
 
 def private build_jit_types {
-    // simfunction type
-    var simfunction_fields <- fixed_array(
-        LLVMPointerType(g_prim_t.t_int8, 0u),// char * name
-        LLVMPointerType(g_prim_t.t_int8, 0u),// char * mangledName
-        g_prim_t.LLVMVoidPtrType(),// SimNode * code               // note void *
-        g_prim_t.LLVMVoidPtrType(),// FuncInfo *  debugInfo        // note void *
-        g_prim_t.t_int64,                    // uint64_t    mangledNameHash
-        g_prim_t.LLVMVoidPtrType(),// void *      aotFunction
-        g_prim_t.t_int32,                    // uint32_t    stackSize
-        g_prim_t.t_int32                     // uint32_t    flags
-    )
-    g_t_simFunction = g_prim_t |> StructType(simfunction_fields)
-    // function type
-    var function_fields <- fixed_array(
-        LLVMPointerType(g_t_simFunction, 0u)// SimFunction * func
-    )
-    g_t_function = g_prim_t |> StructType(function_fields)
-    // lambda type
-    var lambda_fields <- fixed_array(
-        LLVMPointerType(g_t_simFunction, 0u),   // SimFunction * __lambda
-        LLVMPointerType(g_t_simFunction, 0u)    // SimFunction * __finalize
-    )
-    g_t_lambda = g_prim_t |> StructType(lambda_fields)
-    // block type
-    var block_fields <- build_block_type()
-    g_t_block = g_prim_t |> StructType(block_fields)
-    // prologue\epilogue storage for the stack
-    var stack_state_fields <- fixed_array(
-        LLVMPointerType(g_prim_t.t_int8, 0u),   // char * EP
-        LLVMPointerType(g_prim_t.t_int8, 0u)    // char * SP
-    )
-    g_t_stack_state = g_prim_t |> StructType(stack_state_fields)
-    // iterator
-    var iterator_fields <- fixed_array(
-        g_prim_t.LLVMVoidPtrType(),   // __vtable
-        g_prim_t.t_int1                         // bool isOpen
-    )
-    g_t_iterator = g_prim_t |> StructType(iterator_fields)
-    // sequence
-    var sequence_fields <- fixed_array(
-        LLVMPointerType(g_t_iterator, 0u)       // iterator * iter
-    )
-    g_t_sequence = g_prim_t |> StructType(sequence_fields)
+    g_t_simFunction = jit_struct_type(type<tuple<name : void?; mangledName : void?; code : void?; debugInfo : void?; mangledNameHash : int64; aotFunction : void?; stackSize : int; flags : int>>)
+    g_t_function = jit_struct_type(type<tuple<func : void?>>)
+    g_t_lambda = jit_struct_type(type<tuple<lambdaFn : void?; finalizeFn : void?>>)
+    g_t_block = g_prim_t |> StructType(build_block_type())
+    g_t_stack_state = jit_struct_type(type<tuple<ep : void?; sp : void?>>)
+    g_t_iterator = jit_struct_type(type<tuple<vtable : void?; isOpen : bool>>)
+    g_t_sequence = jit_struct_type(type<tuple<iter : void?>>)
 }
 
 def public build_block_type {
@@ -1426,42 +1182,12 @@ def public type_to_llvm_type(t : TypeDeclPtr) {
     } elif (t.baseType == Type.tBlock) {
         res = g_t_block
     } elif (t.baseType == Type.tArray) {
-        // array type — must mirror Array layout in arraytype.h byte-for-byte
-        var array_fields <- fixed_array(
-            g_prim_t.LLVMVoidPtrType(),// char * data
-            g_prim_t.t_int64,                    // uint64_t size
-            g_prim_t.t_int64,                    // uint64_t capacity
-            g_prim_t.t_int32,                    // uint32_t magic
-            g_prim_t.t_int32,                    // uint32_t lock
-            g_prim_t.t_int32,                    // uint32_t flags
-            g_prim_t.t_int32                     // _pad_after_flags (mirror trailing alignment pad)
-        )
-        if (t.firstType != null) {
-            array_fields[int(JIT_ARRAY.DATA)] = LLVMPointerType(type_to_llvm_type(t.firstType), 0u)
-        }
-        res = g_prim_t |> StructType(array_fields)
+        // must mirror Array (arraytype.h) byte-for-byte; padAfterFlags mirrors the trailing alignment pad.
+        // Element-typed data pointer is a no-op under LLVM 22 opaque pointers, so it stays void?.
+        res = jit_struct_type(type<tuple<data : void?; size : int64; capacity : int64; magic : int; lock : int; flags : int; padAfterFlags : int>>)
     } elif (t.baseType == Type.tTable) {
-        // table type — must mirror Table layout (Array base + keys/hashes/tombstones).
-        // The explicit _pad_after_flags slot forces keys onto an 8-aligned offset on
-        // 32-bit ABIs, matching the C++ Table (where Table::keys lives at sizeof(Array)==40).
-        var table_fields <- fixed_array(
-            g_prim_t.LLVMVoidPtrType(),// char * data
-            g_prim_t.t_int64,                    // uint64_t size
-            g_prim_t.t_int64,                    // uint64_t capacity
-            g_prim_t.t_int32,                    // uint32_t magic
-            g_prim_t.t_int32,                    // uint32_t lock
-            g_prim_t.t_int32,                    // uint32_t flags
-            g_prim_t.t_int32,                    // _pad_after_flags
-            g_prim_t.LLVMVoidPtrType(),// char * keys
-            g_prim_t.LLVMVoidPtrType(),// TableHashKey * hashes
-            g_prim_t.t_int64)                    // uint64_t tombstones
-        if (t.firstType != null) {
-            table_fields[int(JIT_TABLE.KEYS)] = LLVMPointerType(type_to_llvm_type(t.firstType), 0u)
-        }
-        if (t.secondType != null) {
-            table_fields[int(JIT_ARRAY.DATA)] = t.secondType.isVoid ? g_prim_t.LLVMVoidPtrType() : LLVMPointerType(type_to_llvm_type(t.secondType), 0u)
-        }
-        res = g_prim_t |> StructType(table_fields)
+        // must mirror Table (Array base + keys/hashes/tombstones); padAfterFlags 8-aligns keys on 32-bit ABIs.
+        res = jit_struct_type(type<tuple<data : void?; size : int64; capacity : int64; magic : int; lock : int; flags : int; padAfterFlags : int; keys : void?; hashes : void?; tombstones : int64>>)
     } elif (t.isVoid) {
         res = g_prim_t.t_void
     } elif (t.isAnyType) {
