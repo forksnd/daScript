@@ -136,8 +136,27 @@ struct ServerArgs {
     help : bool
 }
 
+// One [[models]] config entry: a served model + its per-slot overrides. `backend` is the one
+// per-model serving knob (auto = the engine's decline ladder decides; cpu = never the device;
+// gpu = want the tier). The -1/-2/""/0 sentinels mean "inherit the global flat key".
+struct ModelEntry {
+    name : string           // route id (default: base_name(path))
+    path : string
+    backend : string = "auto"
+    ctx : int = 0
+    quant : string = ""
+    kv_dtype : string = ""
+    streams : int = -1
+    chunk : int = -1
+    page_rows : int = -1    // 0 = flat is meaningful, -1 = inherit
+    prefix : int = -2       // -1 = unbounded is meaningful, -2 = inherit
+    mtp : int = -1          // -1 inherit | 0 off | 1 on
+    is_default : bool = false
+}
+
 // Lifecycle state is global: JIT heap collection cannot see ordinary stack locals as GC roots.
 // main therefore keeps no collectable value alive across maybe_collect_gc().
+var private g_models : array<ModelEntry>
 var private g_cfg = ServerArgs()
 var private g_args_parsed = false
 var private g_args_ready = false
@@ -194,7 +213,7 @@ var private g_cfg_authoritative = false
 let CONFIG_KEYS = fixed_array("model", "port", "quant", "kv_dtype", "metal", "gpu", "gpu_layers",
     "gpu_stream", "gpu_dn", "gpu_attn", "gpu_dense", "gpu_vram_mb", "asr", "mmproj", "asr_workers",
     "ctx", "max_tokens", "streams", "threads", "team_dispatch", "affinity", "chunk", "page_rows",
-    "prefix", "flat", "mtp", "lcpp_bin")
+    "prefix", "flat", "mtp", "lcpp_bin", "models")
 
 def private from_cli(key : string) : bool
     => (g_cfg_sources?[key] ?? "") == "cli"
@@ -360,6 +379,32 @@ def apply_config(var cfg : ServerArgs) : bool {
     cfg_from_toml(root, "flat", cfg.flat, auth)
     cfg_from_toml(root, "mtp", cfg.mtp, auth)
     cfg_from_toml(root, "lcpp_bin", cfg.lcpp_bin, auth)
+    // [[models]] roster — per-model path + overrides; absent keys keep the ModelEntry sentinels
+    // (inherit the flat keys). An empty-path entry is a config mistake, skipped loudly.
+    if (toml_has(root, "models")) {
+        delete g_models
+        let mv = root?["models"]
+        if (mv != null && mv.value is _array) {
+            for (e in mv.value as _array) {
+                let has_mtp = e != null && (e.value is _object) && key_exists(e.value as _object, "mtp")
+                var ent = ModelEntry(
+                    name = e?["name"] ?? "", path = e?["path"] ?? "",
+                    backend = to_lower(e?["backend"] ?? "auto"),
+                    ctx = int(e?["ctx"] ?? 0l), quant = e?["quant"] ?? "",
+                    kv_dtype = e?["kv_dtype"] ?? "",
+                    streams = int(e?["streams"] ?? -1l), chunk = int(e?["chunk"] ?? -1l),
+                    page_rows = int(e?["page_rows"] ?? -1l), prefix = int(e?["prefix"] ?? -2l),
+                    mtp = has_mtp ? ((e?["mtp"] ?? false) ? 1 : 0) : -1,
+                    is_default = e?["default"] ?? false)
+                if (empty(ent.path)) {
+                    to_log(LOG_WARNING, "dasllama-server: [[models]] entry with no path — skipped\n")
+                } else {
+                    g_models |> push(ent)
+                }
+            }
+            g_cfg_sources["models"] = "toml"
+        }
+    }
     unsafe {
         delete root
     }
@@ -453,8 +498,23 @@ def private build_config_surface(cfg : ServerArgs; save_path : string) : string 
         mtp = cfg.mtp,
         lcpp_bin = cfg.lcpp_bin))
     var sources <- { for (k in CONFIG_KEYS); k => JV(g_cfg_sources?[k] ?? "default") }
+    // the [[models]] roster — the page's roster editor reads/writes this shape (a config-less
+    // single-model start serializes as a synthesized one-entry roster)
+    var mentries : array<JsonValue?>
+    mentries |> reserve(length(g_models))
+    for (ent in g_models) {
+        var etab <- {
+            "name" => JV(ent.name), "path" => JV(ent.path), "backend" => JV(ent.backend),
+            "ctx" => JV(int64(ent.ctx)), "quant" => JV(ent.quant), "kv_dtype" => JV(ent.kv_dtype),
+            "streams" => JV(int64(ent.streams)), "chunk" => JV(int64(ent.chunk)),
+            "page_rows" => JV(int64(ent.page_rows)), "prefix" => JV(int64(ent.prefix)),
+            "mtp" => JV(int64(ent.mtp)), "default" => JV(ent.is_default)
+        }
+        mentries |> push(JV(etab))
+    }
     var top <- {
         "config" => config,
+        "models" => JV(mentries),
         "sources" => JV(sources),
         "authoritative" => JV(g_cfg_authoritative),
         "config_path" => JV(cfg.config),
@@ -672,17 +732,83 @@ def init() {
             to_log(LOG_WARNING, "dasllama-server: gpu = vulkan requested but the tier did not arm (no vulkan device, or this build lacks the vulkan module)\n")
         }
     }
-    print("loading {g_cfg.model} ...\n")
+    // resolve the model roster: [[models]] entries, else the single legacy model key
+    if (empty(g_models)) {
+        g_models |> push(ModelEntry(path = g_cfg.model, is_default = true))
+    }
+    var def_idx = 0
+    for (i in range(length(g_models))) {
+        if (g_models[i].is_default) {
+            def_idx = i
+            break
+        }
+    }
+    // P1: exactly ONE slot owns the GPU tier — the default slot unless its backend pins cpu,
+    // else the first gpu/auto entry. Everything else serves on the CPU rails until the P2
+    // switch-on-demand lands. The want is toggled per load (the tier arms at each load tail).
+    var gpu_idx = -1
+    if (gpu == "vulkan") {
+        if (g_models[def_idx].backend != "cpu") {
+            gpu_idx = def_idx
+        } else {
+            for (i in range(length(g_models))) {
+                if (g_models[i].backend != "cpu") {
+                    gpu_idx = i
+                    break
+                }
+            }
+        }
+    }
     // A serving process prefers degrading (warn + nearest working mode) over dying on an
     // unsupported model/quant combo; API-facing tools keep the strict fail-loud default.
     set_resilient_load(true)
-    var m <- load_model(g_cfg.model, pick_quant(g_cfg.quant))
-    if (ctx > 0l) {
-        m.config.seq_len = min(m.config.seq_len, ctx)
+    for (i in range(length(g_models))) {
+        var ent & = unsafe(g_models[i])
+        if (empty(ent.name)) {
+            ent.name = base_name(ent.path)
+        }
+        if (gpu == "vulkan") {
+            if (i == gpu_idx) {
+                set_gpu_tier_want(GpuTierWant(
+                    moe_layers = gpu_detail_layers(g_cfg), moe_stream = gpu_detail_stream(g_cfg),
+                    vram_mb = int64(g_cfg.gpu_vram_mb), dn = gpu_detail_dn(g_cfg),
+                    attn = gpu_detail_attn(g_cfg), dense = g_cfg.gpu_dense, shexp = true))
+            } else {
+                set_gpu_tier_want(GpuTierWant())   // zero want: this slot loads CPU-only
+            }
+        }
+        print("loading {ent.path} ...\n")
+        var m <- load_model(ent.path, pick_quant(!empty(ent.quant) ? ent.quant : g_cfg.quant))
+        let ectx = ent.ctx > 0 ? int64(ent.ctx) : ctx
+        if (ectx > 0l) {
+            m.config.seq_len = min(m.config.seq_len, ectx)
+        }
+        let ctx_note = ectx > 0l ? "" : " (model default)"
+        to_log(LOG_INFO, "dasllama-server: {empty(ent.name) ? base_name(ent.path) : ent.name} ctx {m.config.seq_len}{ctx_note}\n")
+        var opts = SlotOpts(backend = empty(ent.backend) ? "auto" : ent.backend)
+        if (ent.streams > 0) {
+            opts.streams = int64(ent.streams)
+        }
+        if (ent.chunk > 0) {
+            opts.chunk = int64(ent.chunk)
+        }
+        if (ent.page_rows >= 0) {
+            opts.page_rows = int64(ent.page_rows)
+        }
+        if (ent.prefix != -2) {
+            opts.prefix = int64(ent.prefix)
+        }
+        if (!empty(ent.kv_dtype)) {
+            opts.kv_dtype = pick_kv_dtype(ent.kv_dtype)
+            opts.kv_dtype_set = true
+        }
+        opts.mtp = ent.mtp
+        add_model(m, ent.name, opts)
+        if (i == gpu_idx) {
+            set_slot_backend_effective(ent.name, "gpu")   // coarse P1 badge; P2's arm path refines
+        }
     }
-    let ctx_note = ctx > 0l ? "" : " (model default)"
-    to_log(LOG_INFO, "dasllama-server: ctx {m.config.seq_len}{ctx_note}\n")
-    set_model(m, base_name(g_cfg.model))
+    set_default_model(g_models[def_idx].name)
     set_default_max_tokens(g_cfg.max_tokens > 0 ? int64(g_cfg.max_tokens) : 256l)
 
     if (!empty(g_cfg.asr)) {
