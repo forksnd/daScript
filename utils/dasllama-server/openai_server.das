@@ -104,14 +104,17 @@ def private total_queued : int64 {
     return n
 }
 
-// Slot index for a request's "model" field: "" -> the default slot; the exact slot name (or the
-// legacy "{name}-asr" alias) -> that slot; unknown -> -1 (the caller owns the 404).
+// Slot index for a request's "model" field: "" -> the default slot; the exact slot name -> that
+// slot; unknown -> -1 (the caller owns the 404). The legacy "{name}-asr" alias routes to the
+// DEFAULT slot only — that is the only "-asr" id /v1/models ever advertises, so a made-up
+// "{other}-asr" stays a 404 instead of silently serving.
 def private slot_index(model_field : string) : int {
     if (empty(model_field)) {
         return g_default_slot
     }
     for (i in range(length(g_slots))) {
-        if (g_slots[i].name == model_field || "{g_slots[i].name}-asr" == model_field) {
+        if (g_slots[i].name == model_field
+                || (i == g_default_slot && "{g_slots[i].name}-asr" == model_field)) {
             return i
         }
     }
