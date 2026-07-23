@@ -5,10 +5,9 @@
     "threads":8,
     "daslang":"0.6.3",
     "llama_cpp":"ebd048f",
-    "date":"2026-07-13",
+    "date":"2026-07-22",
     "box_profile":"gen_profile.tune.json",
-    "parsec_off":true,
-    "tune":"k4q8_tile_gen=mr4 (fallback); k5q8_tile_gen=mr4 (fallback); k6q8_tile_gen=mr4 (fallback); q8q8_tile_gen=kstep2 (fallback)"
+    "parsec_off":true
   },
   "tests":[
     {
@@ -18,12 +17,12 @@
       "active_b":0.134479872,
       "prefill":{
         "context":512,
-        "das_tok_s":4634.8683317189752,
+        "das_tok_s":4407.4099579918739,
         "llama_cpp_tok_s":3964.7852170000001
       },
       "emission":{
         "context":128,
-        "das_tok_s":472.25850249780473,
+        "das_tok_s":457.52521750319909,
         "llama_cpp_tok_s":433.27633700000001
       }
     },
@@ -34,12 +33,12 @@
       "active_b":0.49396121599999998,
       "prefill":{
         "context":512,
-        "das_tok_s":2044.5324729259178,
+        "das_tok_s":2113.6499680062752,
         "llama_cpp_tok_s":1905.8817340000001
       },
       "emission":{
         "context":128,
-        "das_tok_s":178.49746965891643,
+        "das_tok_s":178.71054755236361,
         "llama_cpp_tok_s":176.539244
       }
     },
@@ -50,12 +49,12 @@
       "active_b":0.59598438399999998,
       "prefill":{
         "context":512,
-        "das_tok_s":1575.0744468781534,
+        "das_tok_s":1580.35909956571,
         "llama_cpp_tok_s":1416.620097
       },
       "emission":{
         "context":128,
-        "das_tok_s":139.73677085789646,
+        "das_tok_s":144.88045664508931,
         "llama_cpp_tok_s":143.69144800000001
       }
     },
@@ -66,12 +65,12 @@
       "active_b":0.99975168000000003,
       "prefill":{
         "context":512,
-        "das_tok_s":1095.0513091423952,
+        "das_tok_s":1107.2736198548,
         "llama_cpp_tok_s":1060.990904
       },
       "emission":{
         "context":128,
-        "das_tok_s":87.535911949814576,
+        "das_tok_s":93.390165140077954,
         "llama_cpp_tok_s":92.266851000000003
       }
     },
@@ -82,12 +81,12 @@
       "active_b":1.099956224,
       "prefill":{
         "context":512,
-        "das_tok_s":872.9737886209914,
+        "das_tok_s":889.34282428878635,
         "llama_cpp_tok_s":817.23752300000001
       },
       "emission":{
         "context":128,
-        "das_tok_s":87.29199102802005,
+        "das_tok_s":93.961022325285725,
         "llama_cpp_tok_s":92.226060000000004
       }
     },
@@ -98,12 +97,12 @@
       "active_b":1.235746816,
       "prefill":{
         "context":512,
-        "das_tok_s":894.02331445174718,
+        "das_tok_s":909.66267860125151,
         "llama_cpp_tok_s":855.90307399999995
       },
       "emission":{
         "context":128,
-        "das_tok_s":76.486588554738105,
+        "das_tok_s":81.040509491553109,
         "llama_cpp_tok_s":81.641603000000003
       }
     },
@@ -114,12 +113,12 @@
       "active_b":1.543569408,
       "prefill":{
         "context":512,
-        "das_tok_s":636.91415093870205,
+        "das_tok_s":647.57746582194909,
         "llama_cpp_tok_s":614.38253399999996
       },
       "emission":{
         "context":128,
-        "das_tok_s":59.780288757476043,
+        "das_tok_s":63.73743364211132,
         "llama_cpp_tok_s":63.898809999999997
       }
     },
@@ -130,12 +129,12 @@
       "active_b":1.711276032,
       "prefill":{
         "context":512,
-        "das_tok_s":542.69999607814464,
+        "das_tok_s":557.63822784313811,
         "llama_cpp_tok_s":505.503514
       },
       "emission":{
         "context":128,
-        "das_tok_s":54.545028412420073,
+        "das_tok_s":57.460015909241903,
         "llama_cpp_tok_s":58.577711999999998
       }
     },
@@ -146,12 +145,12 @@
       "active_b":2.6140999680000001,
       "prefill":{
         "context":512,
-        "das_tok_s":435.94131821161892,
+        "das_tok_s":437.88041930471093,
         "llama_cpp_tok_s":393.41931799999998
       },
       "emission":{
         "context":128,
-        "das_tok_s":35.794743989279475,
+        "das_tok_s":38.340744379561386,
         "llama_cpp_tok_s":35.141312999999997
       }
     },
@@ -178,12 +177,12 @@
       "active_b":3.8797312000000002,
       "prefill":{
         "context":512,
-        "das_tok_s":271.95968197714689,
+        "das_tok_s":283.03524341583739,
         "llama_cpp_tok_s":252.62205499999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":25.261221755043117,
+        "das_tok_s":26.375307437177316,
         "llama_cpp_tok_s":24.908518000000001
       }
     },
@@ -194,12 +193,12 @@
       "active_b":4.0222720000000001,
       "prefill":{
         "context":512,
-        "das_tok_s":232.56616780012391,
+        "das_tok_s":243.07624380737155,
         "llama_cpp_tok_s":218.12118599999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":23.546933453422696,
+        "das_tok_s":25.377671297298626,
         "llama_cpp_tok_s":25.567015999999999
       }
     },
@@ -210,12 +209,12 @@
       "active_b":2.2476226559999999,
       "prefill":{
         "context":512,
-        "das_tok_s":393.77466859862363,
+        "das_tok_s":400.60905094776905,
         "llama_cpp_tok_s":239.22868099999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":39.926186462776947,
+        "das_tok_s":42.205542972661689,
         "llama_cpp_tok_s":37.925621999999997
       }
     },
@@ -226,12 +225,12 @@
       "active_b":7.2477573120000001,
       "prefill":{
         "context":512,
-        "das_tok_s":125.03568523340768,
+        "das_tok_s":135.06975350297603,
         "llama_cpp_tok_s":120.35982799999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":14.26660881259572,
+        "das_tok_s":14.966966851793238,
         "llama_cpp_tok_s":14.915433
       }
     },
@@ -242,12 +241,12 @@
       "active_b":4.5888307199999998,
       "prefill":{
         "context":512,
-        "das_tok_s":199.67350262422462,
+        "das_tok_s":212.37093902797159,
         "llama_cpp_tok_s":120.31198500000001
       },
       "emission":{
         "context":128,
-        "das_tok_s":20.417147852052242,
+        "das_tok_s":21.711927837693842,
         "llama_cpp_tok_s":19.511258999999999
       }
     },
@@ -258,12 +257,12 @@
       "active_b":8.0299950080000002,
       "prefill":{
         "context":512,
-        "das_tok_s":123.58340709315654,
+        "das_tok_s":136.44724421871427,
         "llama_cpp_tok_s":120.37826800000001
       },
       "emission":{
         "context":128,
-        "das_tok_s":13.328274142606704,
+        "das_tok_s":14.264443389717634,
         "llama_cpp_tok_s":13.919404999999999
       }
     },
@@ -274,12 +273,12 @@
       "active_b":0.62547558400000003,
       "prefill":{
         "context":512,
-        "das_tok_s":1307.8306359326466,
+        "das_tok_s":1365.3442560873821,
         "llama_cpp_tok_s":944.75469899999996
       },
       "emission":{
         "context":128,
-        "das_tok_s":94.316196522532351,
+        "das_tok_s":106.71602282722426,
         "llama_cpp_tok_s":94.716910999999996
       }
     },
@@ -290,12 +289,12 @@
       "active_b":4.0222720000000001,
       "prefill":{
         "context":512,
-        "das_tok_s":174.79067792154768,
+        "das_tok_s":191.19509255971019,
         "llama_cpp_tok_s":173.879853
       },
       "emission":{
         "context":128,
-        "das_tok_s":37.46636076944197,
+        "das_tok_s":40.181419107269321,
         "llama_cpp_tok_s":39.771889000000002
       }
     },
@@ -306,12 +305,12 @@
       "active_b":4.1862758400000004,
       "prefill":{
         "context":512,
-        "das_tok_s":209.81525602788577,
+        "das_tok_s":208.77729090261113,
         "llama_cpp_tok_s":120.29203099999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":38.09874181881608,
+        "das_tok_s":41.119728763989144,
         "llama_cpp_tok_s":40.672154999999997
       }
     },
@@ -322,12 +321,12 @@
       "active_b":3.3528217599999999,
       "prefill":{
         "context":512,
-        "das_tok_s":196.00674538838621,
+        "das_tok_s":222.55673349309316,
         "llama_cpp_tok_s":138.34578999999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":43.44737250317624,
+        "das_tok_s":48.087724030562761,
         "llama_cpp_tok_s":43.770536999999997
       }
     },
@@ -338,12 +337,12 @@
       "active_b":2.8626124800000001,
       "prefill":{
         "context":512,
-        "das_tok_s":191.61002569520383,
+        "das_tok_s":212.83388315419816,
         "llama_cpp_tok_s":154.97509299999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":32.579308982675443,
+        "das_tok_s":34.095491883408336,
         "llama_cpp_tok_s":29.754365
       }
     },
@@ -354,13 +353,55 @@
       "active_b":3.2125747200000001,
       "prefill":{
         "context":512,
-        "das_tok_s":314.64571322870137,
+        "das_tok_s":320.55696773143342,
         "llama_cpp_tok_s":289.65947499999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":29.767698001122337,
+        "das_tok_s":31.949128999350787,
         "llama_cpp_tok_s":31.986651999999999
+      }
+    },
+    {
+      "model":"gemma-4-26B-A4B",
+      "arch":"gemma4",
+      "quant":"q8",
+      "active_b":3.2865648639999998,
+      "prefill":{
+        "context":512,
+        "das_tok_s":217.16641097301158
+      },
+      "emission":{
+        "context":128,
+        "das_tok_s":25.711980818862308
+      }
+    },
+    {
+      "model":"gemma-4-26B-A4B-q4k",
+      "arch":"gemma4",
+      "quant":"q4_k_m",
+      "active_b":3.2865648639999998,
+      "prefill":{
+        "context":512,
+        "das_tok_s":153.90904937113726
+      },
+      "emission":{
+        "context":128,
+        "das_tok_s":26.830618514929458
+      }
+    },
+    {
+      "model":"gemma-4-26B-A4B-q40",
+      "arch":"gemma4",
+      "quant":"q4_0",
+      "active_b":3.2865648639999998,
+      "prefill":{
+        "context":512,
+        "das_tok_s":192.26970633055521
+      },
+      "emission":{
+        "context":128,
+        "das_tok_s":36.578305292823622
       }
     }
   ]
