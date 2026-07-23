@@ -51,6 +51,8 @@ TEST_CASE("C API explicit-length strings accept non-null-terminated ranges") {
 
     const char function_name[] = {'m','a','i','n'};
     CHECK(das_context_find_function_n(capi.context, function_name, sizeof(function_name)) != nullptr);
+    const char function_name_terminated[] = "main";
+    CHECK(das_context_find_function_n(capi.context, function_name_terminated, sizeof(function_name_terminated)) != nullptr);
 
     const char value[] = {'D','-','s','l','i','c','e'};
     char * allocated = das_allocate_string_n(capi.context, value, sizeof(value));

@@ -121,6 +121,15 @@ namespace {
         return string(text, length);
     }
 
+    string c_string_from_range ( const char * text, size_t length, const char * argument ) {
+        auto result = string_from_range(text, length, argument);
+        auto zero = result.find('\0');
+        if ( zero != string::npos && zero + 1 != result.size() ) {
+            DAS_FATAL_ERROR("%s must not contain embedded null bytes\n", argument);
+        }
+        return result;
+    }
+
     uint32_t checked_u32 ( size_t value, const char * argument ) {
         if ( value > std::numeric_limits<uint32_t>::max() ) {
             DAS_FATAL_ERROR("%s does not fit in uint32_t (%llu)\n", argument, (unsigned long long)value);
@@ -301,7 +310,7 @@ das_file_access * das_fileaccess_make_project ( const char * project_file  ) {
 }
 
 das_file_access * das_fileaccess_make_project_n ( const char * project_file, size_t project_file_length ) {
-    auto project_file_string = string_from_range(project_file, project_file_length, "project_file");
+    auto project_file_string = c_string_from_range(project_file, project_file_length, "project_file");
     auto access = get_file_access((char *)project_file_string.c_str());
     return (das_file_access *) access.orphan();
 }
@@ -458,7 +467,7 @@ das_function * das_context_find_function ( das_context * context, const char * n
 }
 
 das_function * das_context_find_function_n ( das_context * context, const char * name, size_t name_length ) {
-    auto name_string = string_from_range(name, name_length, "name");
+    auto name_string = c_string_from_range(name, name_length, "name");
     return (das_function *) ((Context *)context)->findFunction(name_string.c_str());
 }
 
@@ -662,9 +671,9 @@ void das_module_bind_interop_function_n ( das_module * mod, das_module_group * l
                                           const char * cppName, size_t cppName_length,
                                           uint32_t sideffects,
                                           const char * args, size_t args_length ) {
-    auto name_string = string_from_range(name, name_length, "name");
-    auto cpp_name_string = string_from_range(cppName, cppName_length, "cppName");
-    auto args_string = string_from_range(args, args_length, "args");
+    auto name_string = c_string_from_range(name, name_length, "name");
+    auto cpp_name_string = c_string_from_range(cppName, cppName_length, "cppName");
+    auto args_string = c_string_from_range(args, args_length, "args");
     auto fn = new CFunction(name_string.c_str(), *(ModuleLibrary *)lib, cpp_name_string.c_str(), fun);
     fn->setSideEffects((das::SideEffects) sideffects);
     vector <TypeDeclPtr> arguments;
@@ -691,9 +700,9 @@ void das_module_bind_interop_function_unaligned_n ( das_module * mod, das_module
                                                     const char * cppName, size_t cppName_length,
                                                     uint32_t sideffects,
                                                     const char * args, size_t args_length ) {
-    auto name_string = string_from_range(name, name_length, "name");
-    auto cpp_name_string = string_from_range(cppName, cppName_length, "cppName");
-    auto args_string = string_from_range(args, args_length, "args");
+    auto name_string = c_string_from_range(name, name_length, "name");
+    auto cpp_name_string = c_string_from_range(cppName, cppName_length, "cppName");
+    auto args_string = c_string_from_range(args, args_length, "args");
     auto fn = new CFunction_Unaligned(name_string.c_str(), *(ModuleLibrary *)lib, cpp_name_string.c_str(), fun);
     fn->setSideEffects((das::SideEffects) sideffects);
     vector <TypeDeclPtr> arguments;
@@ -718,7 +727,7 @@ void das_module_bind_alias_n ( das_module * mod, das_module_group * lib,
                                const char * aname, size_t aname_length,
                                const char * tname, size_t tname_length ) {
     auto alias_name = string_from_range(aname, aname_length, "aname");
-    auto type_name = string_from_range(tname, tname_length, "tname");
+    auto type_name = c_string_from_range(tname, tname_length, "tname");
     MangledNameParser parser;
     auto tt = type_name.c_str();
     auto at = parser.parseTypeFromMangledName(tt, *(ModuleLibrary*)lib,(Module *)mod);
@@ -773,7 +782,7 @@ void das_structure_add_field_n ( das_structure * st, das_module * mod, das_modul
                                  const char * tname, size_t tname_length ) {
     auto name_string = string_from_range(name, name_length, "name");
     auto cpp_name_string = string_from_range(cppname, cppname_length, "cppname");
-    auto type_name = string_from_range(tname, tname_length, "tname");
+    auto type_name = c_string_from_range(tname, tname_length, "tname");
     MangledNameParser parser;
     auto tt = type_name.c_str();
     auto at = parser.parseTypeFromMangledName(tt, *(ModuleLibrary*)lib,(Module *)mod);
@@ -961,7 +970,7 @@ int das_context_find_variable ( das_context * context, const char * name ) {
 }
 
 int das_context_find_variable_n ( das_context * context, const char * name, size_t name_length ) {
-    auto name_string = string_from_range(name, name_length, "name");
+    auto name_string = c_string_from_range(name, name_length, "name");
     return ((Context *)context)->findVariable(name_string.c_str());
 }
 

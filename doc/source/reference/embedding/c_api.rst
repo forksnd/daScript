@@ -46,6 +46,10 @@ an ``_n`` suffix.  These functions take a ``const char *`` and a ``size_t``
 byte count, do not call ``strlen``, and do not require a trailing null byte.
 They map directly to slice types in languages such as D.  A null pointer is
 accepted for an empty range; a null pointer with a non-zero length is an error.
+Inputs which must pass through a legacy internal C-string interface reject
+interior null bytes, while tolerating one trailing null byte included in the
+length.  Byte payloads such as file contents and allocated strings preserve
+null bytes.
 
 The original null-terminated entry points remain available for source and ABI
 compatibility.  They delegate to the explicit-length implementation.  Where an

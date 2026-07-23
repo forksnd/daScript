@@ -1,6 +1,8 @@
 #include "daScript/daScript.h"
 
+#if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
 #include "modules/external_declare.inc"
+#endif
 
 using namespace das;
 
@@ -62,8 +64,10 @@ int main( int, char * [] ) {
     force_aot_stub();
     // request all da-script built in modules
     NEED_ALL_DEFAULT_MODULES;
+#if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
     // request external modules
     #include "modules/external_pull.inc"
+#endif
     // add job-que
     if (!Module::require("jobque")) {
         NEED_MODULE(Module_JobQue);
