@@ -14,8 +14,10 @@ require das_metal   // nolint:STYLE030 — MetalBuffer/MetalComputeEncoder are r
 // The dasLLAMA Metal kernel-dispatch lens. [metal_dispatch] reads a [metal_kernel] class's
 // @ssbo/@uniform field annotations and generates the enc_* dispatch builder that the hand-
 // written twin used to be: binds in @binding order (@off names an offset param), hz from
-// @role/@range, gate, dispatch. Variation points (fmt dispatchers, dummy binds, pso twins)
-// stay hand-written as thin wrappers over generated builders.
+// @role/@span, gate, dispatch. Variation points (fmt dispatchers, dummy binds, pso twins)
+// stay hand-written as thin wrappers over generated builders. Every @ssbo on a lensed class
+// MUST declare a @role (the compile-time half of the strictness ratchet; runtime STRICT
+// covers the un-lensed escapes).
 
 struct private BufField {
     name : string
@@ -236,10 +238,14 @@ class MetalDispatch : AstStructureAnnotation {
         var bufs : array<BufField>
         bufs |> reserve(length(st.fields))
         for (field in st.fields) {
+            var is_ssbo = false
             var is_buf = false
             var is_wg = false
             for (annDecl in field.annotation) {
-                if (annDecl.name == "ssbo" || annDecl.name == "uniform") {
+                if (annDecl.name == "ssbo") {
+                    is_ssbo = true
+                    is_buf = true
+                } elif (annDecl.name == "uniform") {
                     is_buf = true
                 } elif (annDecl.name == "workgroup") {
                     is_wg = true
@@ -252,6 +258,12 @@ class MetalDispatch : AstStructureAnnotation {
                 return false
             }
             let role = find_arg(field.annotation, "role") ?as tString ?? ""
+            // the strictness ratchet: every @ssbo on a lensed class declares its hazard role —
+            // an undeclared buffer is a compile error, not a silently-untracked bind
+            if (is_ssbo && empty(role)) {
+                errors := "[metal_dispatch] {fn_name}: @ssbo field '{field.name}' has no @role (read/write/readwrite/weight/alias)"
+                return false
+            }
             if (!role_ok(role)) {
                 errors := "[metal_dispatch] {fn_name}: field '{field.name}' has unknown @role '{role}' (read/write/readwrite/weight/alias)"
                 return false
