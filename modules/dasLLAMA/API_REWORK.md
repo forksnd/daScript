@@ -354,15 +354,24 @@ what it costs today and what the fix would change.
   knockout (routed vs shared vs cls) then disasm-grade reshape. lcpp does the token in 16.7ms vs
   our 19.9 — closing the routed GEMV to ~280 GB/s closes the whole gap.
 
-- **.dlim large-image mint aborts past ~11GB (2026-07-23, found via fam-gemma4moe).** Minting the
-  Q8 26B (27GB) `.dlim` aborts: every plane past ~11.4GB fails the writer's offset-accounting
-  check (`plane 'wq_offs' wrote 11456577776 != accounted 0xf0 — image save aborted`). The file
-  write position and the plane's accounted offset diverge past ~11GB — a >2GB / int-width
-  overflow class bug in the image serializer's offset math. The Q4_K 26B (smaller) mints fine;
-  only the 27GB Q8 trips it. This is the PRE-EXISTING master red on fam-gemma4moe (PARITY_FULL-
-  only, so CI never runs it → silently red). Real capability bug — a large model can't re-mint its
-  own image. Fix = audit the plane-offset accumulator width in the .dlim writer (likely a u32 /
-  int cast on a cumulative >2^33 byte offset).
+- **.dlim mint abort past ~11GB: root-caused as DISK-FULL, writer fixed, red cleared (2026-07-23).**
+  Not an int-width bug — the write rail is 64-bit clean end-to-end (ftello, long_fwrite → size_t
+  fwrite, long_length, uint64 offsets; the Jul-21 29GB mint of this same model and the image
+  suite's 5.4GB voxtral arm are standing proof). The disk had filled: 804 GiB of .dlim images
+  across ~27 identity generations back to Jul 16 — nothing ever deletes a superseded image, and
+  the Jul-22 sweep's ~92GB of MTP mints ate the last headroom. ENOSPC then surfaced as the
+  per-plane "offset-accounting" cascade (the quoted `0xf0` was the nbytes field — 240 bytes, the
+  30-layer offs plane), and the abort path removed the tmp, hiding the space pressure. Fixed in
+  the writer: `write_plane` now reports short writes honestly ("disk full?"), bails the walk on
+  the first failure instead of pushing the remaining planes at a full disk, and `save_image`
+  verifies the on-disk byte count after close (a buffered small-tail ENOSPC at fclose was
+  silent). Swept the 115 dead pre-v5 images (659 GiB; every pre-Jul-22-13:18 file predates the
+  IMAGE_VERSION=5 bump and is unloadable by construction); fam-gemma4moe re-mint verified green
+  (both 26B rows' engage + tolerance cells pass; the arm's remaining red is the tracked
+  pre-existing metal-object leak, 30 objects on this filter). OPEN (design, propose-first):
+  .dlim GC — every IMAGE_VERSION/knob change silently orphans the previous generation (~20GB per
+  big model). Candidate shapes: fold the tag into the filename and keep-one-per-(gguf, tag) on
+  successful save; or utime-touch images on load and age out cold siblings at save time.
 
 - **Q6-greedy spec-chain inversion on big pure-k6 files (2026-07-22 re-pair).** `spec_cls_capable`
   (dasllama_metal_llama.das:164) is a pure CAPABILITY test — it engages the greedy spec chain for
