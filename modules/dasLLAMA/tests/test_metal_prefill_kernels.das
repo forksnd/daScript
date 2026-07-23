@@ -456,6 +456,7 @@ def test_metal_prefill_kernels(t : T?) {
                 // vs the CPU reference. d = 21 exercises the row < ddim tail guard (grid pads to 24).
                 gemv_gate(t, dev, queue, 96, 21)            // 3 blocks per row, guarded tail
                 gemv_gate(t, dev, queue, 160, 64)           // 5 blocks per row, exact grid
+                gemv_gate(t, dev, queue, 1120, 8)           // 35 blocks: exercises the 4-chunk main loop, not only the tail
 
                 // ===== MoE routing kernels (Wave C) =====
                 // select: exact-tie + odd-ne shapes vs the moe_select_core mirror; router /
