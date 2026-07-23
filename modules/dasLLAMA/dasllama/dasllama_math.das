@@ -1441,6 +1441,7 @@ typedef RdecTokenFn = function<(x : array<float>; cossin : array<float>; pos : i
 typedef RdecPrefillFn = function<(x_batch : array<float>; cos_batch : array<float>; npos : int64; var logits : array<float>) : void>
 typedef RdecSyncKvFn = function<(l : int64; kp : float const?; vp : float const?; npos : int64) : void>
 typedef RdecReadKvFn = function<(l : int64; pos : int64; kp : float?; vp : float?) : void>
+typedef RdecReadKvBulkFn = function<(l : int64; kp : float?; vp : float?; npos : int64) : void>
 
 [unused_argument(fmt, cap_blocks)]
 def private rdec_unset_reserve(fmt : int; cap_blocks : int64) : bool => false
@@ -1466,6 +1467,10 @@ def private rdec_unset_prefill(x_batch : array<float>; cos_batch : array<float>;
 def private rdec_unset_sync(l : int64; kp : float const?; vp : float const?; npos : int64) {}
 [unused_argument(l, pos, kp, vp)]
 def private rdec_unset_read(l, pos : int64; kp : float?; vp : float?) {}
+[unused_argument(l, kp, vp, npos)]
+def private rdec_unset_read_bulk(l : int64; kp : float?; vp : float?; npos : int64) {
+    panic("dasLLAMA: resident KV bulk readback hit without an installed GPU driver")
+}
 
 var g_rdec_reserve = @@rdec_unset_reserve
 var g_rdec_place = @@rdec_unset_place
@@ -1477,13 +1482,15 @@ var g_rdec_token = @@rdec_unset_token
 var g_rdec_prefill = @@rdec_unset_prefill
 var g_rdec_sync_kv = @@rdec_unset_sync
 var g_rdec_read_kv = @@rdec_unset_read
+var g_rdec_read_kv_bulk = @@rdec_unset_read_bulk
 var g_rdec_installed = false
 
 //! Install the resident whole-stack decode driver (a GPU backend calls this at [init]).
 def public install_moe_gpu_resident(reserve : RdecReserveFn; place : RdecPlaceFn; prepare : RdecPrepareFn;
                                     norms : RdecNormsFn; set_layer : RdecSetLayerFn; set_cls : RdecSetClsFn;
                                     token : RdecTokenFn; prefill : RdecPrefillFn;
-                                    sync_kv : RdecSyncKvFn; read_kv : RdecReadKvFn) {
+                                    sync_kv : RdecSyncKvFn; read_kv : RdecReadKvFn;
+                                    read_kv_bulk : RdecReadKvBulkFn) {
     g_rdec_reserve = reserve
     g_rdec_place = place
     g_rdec_prepare = prepare
@@ -1494,6 +1501,7 @@ def public install_moe_gpu_resident(reserve : RdecReserveFn; place : RdecPlaceFn
     g_rdec_prefill = prefill
     g_rdec_sync_kv = sync_kv
     g_rdec_read_kv = read_kv
+    g_rdec_read_kv_bulk = read_kv_bulk
     g_rdec_installed = true
 }
 
@@ -1508,6 +1516,7 @@ def public rdec_token(x : array<float>; cossin : array<float>; pos, cnt : int64;
 def public rdec_prefill(x_batch : array<float>; cos_batch : array<float>; npos : int64; var logits : array<float>) { invoke(g_rdec_prefill, x_batch, cos_batch, npos, logits) }
 def public rdec_sync_kv(l : int64; kp : float const?; vp : float const?; npos : int64) { invoke(g_rdec_sync_kv, l, kp, vp, npos) }
 def public rdec_read_kv(l, pos : int64; kp : float?; vp : float?) { invoke(g_rdec_read_kv, l, pos, kp, vp) }
+def public rdec_read_kv_bulk(l : int64; kp : float?; vp : float?; npos : int64) { invoke(g_rdec_read_kv_bulk, l, kp, vp, npos) }
 
 //! Install the GPU MoE tier (a GPU backend calls this at [init] when its device probe passes).
 def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn; dense : MoeGpuDenseFn; drop : MoeGpuDropFn; dn : MoeGpuDnFn; attn : MoeGpuAttnFn) {

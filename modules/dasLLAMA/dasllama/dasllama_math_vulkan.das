@@ -1507,13 +1507,13 @@ def rope_kv_store {
     }
 }
 
-// decode attention (one query row): one wg/head, GQA head->kv-head, reads the f32 K/V mirror (K
-// vk_wsf, V vk_xqf). 3 phases (scores+max, exp+sum, thread c owns out dim c) dodge a per-position
-// barrier. Low-occupancy — split-K next. meta 0=cnt 2=kvd 3=hs 4=kv_mul; scale vk_xs[0].
+// decode attention (one query row): one wg/head, GQA, f32 K/V mirror (K vk_wsf, V vk_xqf).
+// Online softmax over 256-position chunks (running max/denom, alpha-rescaled V accumulators) —
+// shared use is chunk-sized, ANY cnt works. meta 0=cnt 2=kvd 3=hs 4=kv_mul; scale vk_xs[0].
 var @workgroup da_q : float[256]      // this head's query row (hs <= 256)
-var @workgroup da_sc : float[4096]    // per-position scores (DA_MAX_CNT)
+var @workgroup da_sc : float[256]     // chunk scores, then the cross-group V partial reduce
 var @workgroup da_part : float[64]    // per-subgroup partials — 64 covers subgroupSize >= 4 (was [8], OOB on subgroupSize < 32, e.g. Intel 16)
-var @workgroup da_ml : float[2]       // [0] = row max, [1] = softmax denom
+var @workgroup da_ml : float[2]       // [0] = running max, [1] = running softmax denom
 
 [compute_shader(local_size_x=256, name="da_attn_spv")]
 def da_attn {
@@ -1527,165 +1527,238 @@ def da_attn {
     let h = gl_WorkGroupID.x
     let kvh = h / kv_mul
     let tid = gl_LocalInvocationID.x
+    let npart = 256u / hs     // V-phase partial groups; thread tid = group g, output dim c
+    let g = tid / hs
+    let c = tid % hs
     var i = tid
     while (i < hs) {
         da_q[i] = vk_upf[h * hs + i]
         i += 256u
     }
-    barrier()
-    // phase 1: scores + running max (per thread over a strided set of positions)
-    var tmax = -3.0e38
-    var j = tid
-    while (j < cnt) {
-        var s = 0.0
-        var d = 0u
-        while (d < hs) {
-            s += da_q[d] * vk_wsf[kbase + j * kvd + kvh * hs + d]
-            d++
-        }
-        s *= scale
-        da_sc[j] = s
-        tmax = max(tmax, s)
-        j += 256u
-    }
-    tmax = subgroupMax(tmax)
-    if (gl_SubgroupInvocationID == 0u) {
-        da_part[gl_SubgroupID] = tmax
-    }
-    barrier()
     if (tid == 0u) {
-        var m = -3.0e38
-        var sgi = 0u
-        while (sgi < gl_NumSubgroups) {
-            m = max(m, da_part[sgi])
-            sgi++
+        da_ml[1u] = 0.0
+    }
+    barrier()
+    var acc = 0.0             // this thread's V partial (group g's slice of dim c)
+    var mrun = -3.0e38        // running max — uniform, tracked in lockstep by every thread
+    var c0 = 0u
+    while (c0 < cnt) {
+        let clen = min(256u, cnt - c0)
+        // chunk scores: thread tid owns position c0 + tid
+        var s = -3.0e38
+        if (tid < clen) {
+            var sv = 0.0
+            var d = 0u
+            while (d < hs) {
+                sv += da_q[d] * vk_wsf[kbase + (c0 + tid) * kvd + kvh * hs + d]
+                d++
+            }
+            s = sv * scale
         }
-        da_ml[0u] = m
-    }
-    barrier()
-    let m = da_ml[0u]
-    // phase 2: exp in place + running sum
-    var tsum = 0.0
-    j = tid
-    while (j < cnt) {
-        let e = exp(da_sc[j] - m)
-        da_sc[j] = e
-        tsum += e
-        j += 256u
-    }
-    tsum = subgroupAdd(tsum)
-    if (gl_SubgroupInvocationID == 0u) {
-        da_part[gl_SubgroupID] = tsum
-    }
-    barrier()
-    if (tid == 0u) {
-        var l = 0.0
-        var sgi = 0u
-        while (sgi < gl_NumSubgroups) {
-            l += da_part[sgi]
-            sgi++
+        let tmax = subgroupMax(s)
+        if (gl_SubgroupInvocationID == 0u) {
+            da_part[gl_SubgroupID] = tmax
         }
-        da_ml[1u] = l
+        barrier()
+        if (tid == 0u) {
+            var m = mrun
+            var sgi = 0u
+            while (sgi < gl_NumSubgroups) {
+                m = max(m, da_part[sgi])
+                sgi++
+            }
+            da_ml[0u] = m
+        }
+        barrier()
+        let mnew = da_ml[0u]
+        let alpha = exp(mrun - mnew)
+        mrun = mnew
+        // exp + chunk sum; denom rescale rides the same alpha
+        let e = tid < clen ? exp(s - mnew) : 0.0
+        da_sc[tid] = e
+        let tsum = subgroupAdd(e)
+        if (gl_SubgroupInvocationID == 0u) {
+            da_part[gl_SubgroupID] = tsum
+        }
+        barrier()
+        if (tid == 0u) {
+            var lsum = 0.0
+            var sgi = 0u
+            while (sgi < gl_NumSubgroups) {
+                lsum += da_part[sgi]
+                sgi++
+            }
+            da_ml[1u] = da_ml[1u] * alpha + lsum
+        }
+        // V accumulate: group g strides the chunk, rescaled by this chunk's alpha
+        acc *= alpha
+        if (tid < npart * hs) {
+            var jj = g
+            while (jj < clen) {
+                acc += da_sc[jj] * vk_xqf[vbase + (c0 + jj) * kvd + kvh * hs + c]
+                jj += npart
+            }
+        }
+        barrier()   // da_sc/da_part settle before the next chunk overwrites them
+        c0 += 256u
     }
+    // cross-group reduce (da_sc reused as the partial slab: slot tid == g * hs + c)
+    da_sc[tid] = acc
     barrier()
-    let linv = 1.0 / da_ml[1u]
-    // phase 3: thread c owns output dim c, weighted V sum over all positions
     if (tid < hs) {
-        var acc = 0.0
-        var jj = 0u
-        while (jj < cnt) {
-            acc += da_sc[jj] * vk_xqf[vbase + jj * kvd + kvh * hs + tid]
-            jj++
+        let linv = 1.0 / da_ml[1u]
+        var tot = 0.0
+        var gg = 0u
+        while (gg < npart) {
+            tot += da_sc[gg * hs + tid]
+            gg++
         }
-        vk_y[h * hs + tid] = acc * linv
+        vk_y[h * hs + tid] = tot * linv
     }
 }
 
-// batched causal decode attention (prefill): one workgroup per (query row p, head h). Query p
-// attends positions 0..p (causal). Same 3-phase online softmax as da_attn; q rows from vk_upf
-// ([npos x qd]), out to vk_y. meta 0=npos 2=kvd 3=hs 4=kv_mul 5=kbase 6=vbase; scale vk_xs[0].
+// batched causal attention (prefill), flash-style Q tile: one wg per (head, 8-query tile), // nolint:STYLE014
+// 32-position shared K/V tiles (V reuses the K staging), per-row online softmax, lane c owns dims
+// c + 32*jj. Needs hs % 32 == 0, <= 256 (resident_plan gates); reduce order differs from the row
+// kernel so the parity bar is IDS. meta 0=window rows 1=nh 2=kvd 3=hs 4=kv_mul 5=kbase 6=vbase
+// 7=w0 (window base — queries attend mirror positions [0, w0+row]); scale vk_xs[0].
 [compute_shader(local_size_x=256, name="da_attn_b_spv")]
 def da_attn_b {
+    let npos = vk_meta[0u]
+    let nh = vk_meta[1u]
     let kvd = vk_meta[2u]
     let hs = vk_meta[3u]
     let kv_mul = vk_meta[4u]
     let kbase = vk_meta[5u]
     let vbase = vk_meta[6u]
+    let w0 = vk_meta[7u]
     let scale = vk_xs[0u]
-    let nh = (vk_meta[1u])
-    let p = gl_WorkGroupID.x / nh
-    let h = gl_WorkGroupID.x % nh
-    let cnt = p + 1u          // causal: query p sees positions 0..p
-    let kvh = h / kv_mul
+    let qd = nh * hs
+    let dpl = hs / 32u
+    let qtiles = (npos + 7u) / 8u
+    let h = gl_WorkGroupID.x / qtiles
+    let q0 = (gl_WorkGroupID.x % qtiles) * 8u
     let tid = gl_LocalInvocationID.x
+    let r = tid / 32u
+    let c = tid % 32u
+    let kvh = h / kv_mul
     var i = tid
-    while (i < hs) {
-        da_q[i] = vk_upf[p * (nh * hs) + h * hs + i]
+    while (i < 8u * hs) {
+        let qr = q0 + i / hs
+        fa_q[i] = qr < npos ? vk_upf[qr * qd + h * hs + i % hs] : 0.0
         i += 256u
     }
+    if (tid < 8u) {
+        fa_m[tid] = -3.0e38
+        fa_l[tid] = 0.0
+    }
+    var o0 = 0.0
+    var o1 = 0.0
+    var o2 = 0.0
+    var o3 = 0.0
+    var o4 = 0.0
+    var o5 = 0.0
+    var o6 = 0.0
+    var o7 = 0.0
     barrier()
-    var tmax = -3.0e38
-    var j = tid
-    while (j < cnt) {
+    let gq = w0 + q0 + r
+    let kend = w0 + min(q0 + 8u, npos)   // causal bound (exclusive) of the tile's last valid row
+    var k0 = 0u
+    while (k0 < kend) {
+        i = tid
+        while (i < 32u * hs) {
+            let kr = k0 + i / hs
+            fa_kv[(i / hs) * 257u + i % hs] = kr < kend ? vk_wsf[kbase + kr * kvd + kvh * hs + i % hs] : 0.0
+            i += 256u
+        }
+        barrier()
         var s = 0.0
-        var d = 0u
-        while (d < hs) {
-            s += da_q[d] * vk_wsf[kbase + j * kvd + kvh * hs + d]
-            d++
+        var j = 0u
+        while (j < hs) {   // 4-wide manual unroll (hs % 32 == 0)
+            s += fa_q[r * hs + j] * fa_kv[c * 257u + j]
+            s += fa_q[r * hs + j + 1u] * fa_kv[c * 257u + j + 1u]
+            s += fa_q[r * hs + j + 2u] * fa_kv[c * 257u + j + 2u]
+            s += fa_q[r * hs + j + 3u] * fa_kv[c * 257u + j + 3u]
+            j += 4u
         }
-        s *= scale
-        da_sc[j] = s
-        tmax = max(tmax, s)
-        j += 256u
-    }
-    tmax = subgroupMax(tmax)
-    if (gl_SubgroupInvocationID == 0u) {
-        da_part[gl_SubgroupID] = tmax
-    }
-    barrier()
-    if (tid == 0u) {
-        var m = -3.0e38
-        var sgi = 0u
-        while (sgi < gl_NumSubgroups) {
-            m = max(m, da_part[sgi])
-            sgi++
+        let gk = k0 + c
+        fa_p[r * 32u + c] = (gk <= gq && q0 + r < npos) ? s * scale : -3.0e38
+        barrier()
+        if (tid < 8u) {   // per-row online-softmax update: max, rescale, exponentiate in place
+            var mt = fa_m[tid]
+            var j2 = 0u
+            while (j2 < 32u) {
+                mt = max(mt, fa_p[tid * 32u + j2])
+                j2++
+            }
+            let alpha = exp(fa_m[tid] - mt)
+            var lsum = 0.0
+            j2 = 0u
+            while (j2 < 32u) {
+                let e = exp(fa_p[tid * 32u + j2] - mt)
+                fa_p[tid * 32u + j2] = e
+                lsum += e
+                j2++
+            }
+            fa_l[tid] = fa_l[tid] * alpha + lsum
+            fa_m[tid] = mt
+            fa_a[tid] = alpha
         }
-        da_ml[0u] = m
-    }
-    barrier()
-    let m = da_ml[0u]
-    var tsum = 0.0
-    j = tid
-    while (j < cnt) {
-        let e = exp(da_sc[j] - m)
-        da_sc[j] = e
-        tsum += e
-        j += 256u
-    }
-    tsum = subgroupAdd(tsum)
-    if (gl_SubgroupInvocationID == 0u) {
-        da_part[gl_SubgroupID] = tsum
-    }
-    barrier()
-    if (tid == 0u) {
-        var l = 0.0
-        var sgi = 0u
-        while (sgi < gl_NumSubgroups) {
-            l += da_part[sgi]
-            sgi++
+        barrier()
+        let av = fa_a[r]
+        o0 *= av
+        if (dpl > 1u) {
+            o1 *= av
         }
-        da_ml[1u] = l
+        if (dpl > 2u) {
+            o2 *= av
+            o3 *= av
+        }
+        if (dpl > 4u) {
+            o4 *= av
+            o5 *= av
+            o6 *= av
+            o7 *= av
+        }
+        i = tid
+        while (i < 32u * hs) {   // V tile reuses the K staging (all K reads completed above)
+            let kr = k0 + i / hs
+            fa_kv[(i / hs) * 257u + i % hs] = kr < kend ? vk_xqf[vbase + kr * kvd + kvh * hs + i % hs] : 0.0
+            i += 256u
+        }
+        barrier()
+        var c2 = 0u
+        while (c2 < 32u) {
+            let pw = fa_p[r * 32u + c2]
+            let vb = c2 * 257u + c
+            o0 += pw * fa_kv[vb]
+            if (dpl > 1u) {
+                o1 += pw * fa_kv[vb + 32u]
+            }
+            if (dpl > 2u) {
+                o2 += pw * fa_kv[vb + 64u]
+                o3 += pw * fa_kv[vb + 96u]
+            }
+            if (dpl > 4u) {
+                o4 += pw * fa_kv[vb + 128u]
+                o5 += pw * fa_kv[vb + 160u]
+                o6 += pw * fa_kv[vb + 192u]
+                o7 += pw * fa_kv[vb + 224u]
+            }
+            c2++
+        }
+        barrier()
+        k0 += 32u
     }
-    barrier()
-    let linv = 1.0 / da_ml[1u]
-    if (tid < hs) {
-        var acc = 0.0
+    if (q0 + r < npos) {
+        let inv = 1.0 / fa_l[r]
+        let ob = (q0 + r) * qd + h * hs + c
         var jj = 0u
-        while (jj < cnt) {
-            acc += da_sc[jj] * vk_xqf[vbase + jj * kvd + kvh * hs + tid]
+        while (jj < dpl) {
+            vk_y[ob + jj * 32u] = (jj == 0u ? o0 : (jj == 1u ? o1 : (jj == 2u ? o2 : (jj == 3u ? o3
+                : (jj == 4u ? o4 : (jj == 5u ? o5 : (jj == 6u ? o6 : o7))))))) * inv
             jj++
         }
-        vk_y[p * (nh * hs) + h * hs + tid] = acc * linv
     }
 }
 
@@ -3604,6 +3677,7 @@ def vk_device_ready() : bool => vk_moe_init()
 let private RKS_MAX_QD = 8_192l
 let private RKS_MAX_KVD = 1_024l
 let private RKS_MAX_CTX = 4_096l   // K/V mirror rows in the standalone-kernel scratch
+let private KV_READBACK_ROWS = 256l   // bulk mirror->host hydration chunk (rows per submit)
 
 def private ensure_rks_state {
     if (g_gpu.rks_ready) {
@@ -3630,7 +3704,6 @@ def private ensure_rks_state {
     g_gpu.rks_ready = true
 }
 
-let private DA_MAX_CNT = 4_096l   // == da_sc workgroup slab
 
 def private ensure_da_state {
     if (g_gpu.da_ready) {
@@ -3659,7 +3732,7 @@ def private ensure_da_state {
 //! the device K/V mirror (the same planes vk_rope_kv_store wrote), GQA per kv_mul, into out[0..qd).
 def vk_decode_attn(var q : array<float>; var out : array<float>; cnt, qd, kv_dim, head_size, kv_mul : int64; scale : float) {
     verify(vk_moe_init())
-    assert(cnt <= DA_MAX_CNT && head_size <= 256l && qd <= RKS_MAX_QD, "dasLLAMA vulkan: decode-attn geometry over scratch")
+    assert(head_size <= 256l && qd <= RKS_MAX_QD, "dasLLAMA vulkan: decode-attn geometry over scratch")
     ensure_da_state()
     let n_heads = qd / head_size
     unsafe {
@@ -3803,7 +3876,7 @@ struct private RDec {
     pf_cmd : VkCommandBuffer
 }
 
-let private PF_MAX_NPOS = 512l
+let private PF_WINDOW = 512l   // prefill activation-buffer rows; longer prompts run as sequential windows
 
 var private g_rd : RDec?
 
@@ -3873,7 +3946,7 @@ def vk_rdec_prepare(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab
     r.dummy = make_device_buf(256l)
     r.x_host = make_host_buf(dim * 4l, false, [cached = true])
     r.logits_host = make_host_buf(vocab * 4l, false, [cached = true])
-    r.kv_readback = make_host_buf(2l * kv_dim * 4l, false, [cached = true])
+    r.kv_readback = make_host_buf(2l * kv_dim * 4l * KV_READBACK_ROWS, false, [cached = true])
     ensure_ffn_state()   // hq_dev/hs_dev for the FFN act+requant
     r.cmd = alloc_cmd()
     return true
@@ -4203,7 +4276,7 @@ def private pf_setup {
     if (g_rd.pf_ready) {
         return
     }
-    let np = PF_MAX_NPOS
+    let np = PF_WINDOW
     g_rd.pf_np = np
     let dim = g_rd.dim
     let qd = g_rd.qd
@@ -4306,6 +4379,33 @@ def vk_rdec_sync_kv(l : int64; kp : float const?; vp : float const?; npos : int6
     }
 }
 
+//! Bulk hydration: read layer `l`'s mirror rows [0, npos) into the caller's f32 cache (kp/vp,
+//! [npos x kvd] each), one submit per KV_READBACK_ROWS rows. The host-KV-authoritative rail —
+//! makes continuations, CPU fallback, and slot switches valid after a device-resident prefill.
+def vk_rdec_read_kv_bulk(l : int64; kp : float?; vp : float?; npos : int64) {
+    assert(g_rd != null, "vk_rdec_read_kv_bulk before prepare")
+    verify(vk_moe_init())
+    let kvd = g_rd.kv_dim
+    var p0 = 0l
+    while (p0 < npos) {
+        let rows = min(KV_READBACK_ROWS, npos - p0)
+        let bytes = rows * kvd * 4l
+        let off = ((l * g_rd.seq_cap) + p0) * kvd * 4l
+        unsafe {
+            var raw = alloc_cmd()
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+            cmd_copy_range(raw, g_rd.k_mirror, off, g_rd.kv_readback.buf, 0l, bytes)
+            cmd_copy_range(raw, g_rd.v_mirror, off, g_rd.kv_readback.buf, bytes, bytes)
+            vk_check(vkEndCommandBuffer(raw), null)
+            submit_wait(raw)
+            memcpy(reinterpret<void?>(kp + p0 * kvd), g_rd.kv_readback.mapped, int(bytes))
+            memcpy(reinterpret<void?>(vp + p0 * kvd), reinterpret<uint8?>(g_rd.kv_readback.mapped) + bytes, int(bytes))
+        }
+        p0 += rows
+    }
+}
+
 //! Batch-decode writeback: read layer `l`'s new K/V row at `pos` from the mirror back into the
 //! caller's f32 cache row (kp/vp, kvd each). Keeps the CPU cache current after a GPU decode step.
 def vk_rdec_read_kv(l, pos : int64; kp : float?; vp : float?) {
@@ -4330,9 +4430,7 @@ def vk_rdec_read_kv(l, pos : int64; kp : float?; vp : float?) {
 //! (cos_batch, [npos x hs]) -> the last row's logits, filling the KV mirror at positions [0, npos).
 def vk_rdec_prefill(x_batch : array<float>; cos_batch : array<float>; npos : int64; var logits : array<float>) {
     assert(g_rd != null && g_rd.ready, "vk_rdec_prefill before prepare/set_cls")
-    assert(npos <= PF_MAX_NPOS, "vk_rdec_prefill: npos over PF_MAX_NPOS")
     pf_setup()
-    let tp0 = ref_time_ticks()
     let dim = g_rd.dim
     let qd = g_rd.qd
     let kvd = g_rd.kv_dim
@@ -4346,92 +4444,107 @@ def vk_rdec_prefill(x_batch : array<float>; cos_batch : array<float>; npos : int
         sp[0] = g_rd.eps
         sp[1] = 1.0
         staged_upload(g_rd.ar_scal_dev, 0l, 64l)
-        upload_region_at(g_rd.pf_x, 0l, addr<uint8 const?>(x_batch[0]), npos * dim * 4l)
-        upload_region_at(g_rd.pf_cos, 0l, addr<uint8 const?>(cos_batch[0]), npos * g_rd.head_size * 4l)
-        fill_ffn_meta(hid, npos * hid / 32l, false)   // actrq over all npos rows
-        // fill metas
-        let mA = @(idx : int; n, d, blk : int64; fmt : int) {
-            fill_arena_batch_meta(g_rd.pf_meta[idx], n, d, blk, npos, fmt)
-        }
-        let mQ = @(idx : int; blocks : int64) { fill_quant_meta(g_rd.pf_meta[idx], blocks) }
-        let mR = @(idx : int; woff : int64; add : bool) { fill_addrms_meta(g_rd.pf_meta[idx], dim, woff, add) }
-        for (l in range64(g_rd.n_layers)) {
-            var L & = g_rd.layers[l]
-            let b = int(l * PF_ROLES)
-            invoke(mQ, b + 0, npos * dim / 32l)
-            invoke(mA, b + 1, dim, qd, L.bq, L.fq)
-            invoke(mA, b + 2, dim, kvd, L.bk, L.fk)
-            invoke(mA, b + 3, dim, kvd, L.bv, L.fv)
-            var mr = reinterpret<uint?>(g_rd.pf_meta[b + 4].mapped)
-            mr[0] = uint(qd); mr[1] = uint(kvd); mr[2] = uint(g_rd.head_size); mr[3] = uint(g_rd.head_size / 2l)
-            mr[4] = g_rd.neox ? 1u : 0u; mr[5] = uint(qd / 2l); mr[6] = uint(pairs)
-            mr[7] = uint(l * g_rd.seq_cap * kvd); mr[9] = uint(npos); mr[10] = 0u; mr[11] = uint(npos * kvd)
-            var ma = reinterpret<uint?>(g_rd.pf_meta[b + 5].mapped)
-            ma[1] = uint(g_rd.n_heads); ma[2] = uint(kvd); ma[3] = uint(g_rd.head_size); ma[4] = uint(g_rd.kv_mul)
-            ma[5] = uint(l * g_rd.seq_cap * kvd); ma[6] = uint(l * g_rd.seq_cap * kvd)
-            invoke(mQ, b + 6, npos * qd / 32l)
-            invoke(mA, b + 7, qd, dim, L.bo, L.fo)
-            invoke(mR, b + 8, (l * 2l + 1l) * dim, true)
-            invoke(mQ, b + 9, npos * dim / 32l)
-            invoke(mA, b + 10, dim, hid, L.b1, L.f1)
-            invoke(mA, b + 11, dim, hid, L.b3, L.f3)
-            invoke(mA, b + 13, hid, dim, L.b2, L.f2)
-            let nxt = l + 1l < g_rd.n_layers ? (l + 1l) * 2l * dim : nlfin
-            invoke(mR, b + 14, nxt, true)
-        }
-        let bp = int(g_rd.n_layers * PF_ROLES)
-        invoke(mR, bp + 0, 0l, false)   // prologue norm
-        // final quantize reads the LAST row of pf_xb
-        var mf = reinterpret<uint?>(g_rd.pf_meta[bp + 1].mapped)
-        mf[10] = uint((npos - 1l) * dim); mf[18] = uint(dim / 32l)
-        let t_prep = get_time_usec(tp0)
-        // record
-        var raw = g_rd.pf_cmd
-        let rf : VkCommandBufferResetFlags
-        vk_check(vkResetCommandBuffer(raw, rf), null)
-        let begin = VkCommandBufferBeginInfo()
-        vk_check(vkBeginCommandBuffer(raw, begin), null)
-        pfq_begin(raw)
-        pfq_ts(raw)   // q0: submit start
-        cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
-        comp_barrier(raw)
-        pfq_ts(raw)   // q1: meta copy
-        let ropewg = uint((npos * pairs + int64(WG_X) - 1l) / int64(WG_X))
-        let attnwg = uint(npos * g_rd.n_heads)
-        rd_dispatch(raw, g_gpu.ar_pipeline_b, g_rd.pf_sets[bp + 0], uint(npos))   // prologue norm
-        for (l in range64(g_rd.n_layers)) {
-            let b = int(l * PF_ROLES)
-            rd_dispatch(raw, g_gpu.dn_rq_pipeline, g_rd.pf_sets[b + 0], uint((npos * dim / 32l + 255l) / 256l))
-            rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 1], fill_arena_batch_meta(g_rd.pf_meta[b + 1], dim, qd, g_rd.layers[l].bq, npos, 0))
-            rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 2], fill_arena_batch_meta(g_rd.pf_meta[b + 2], dim, kvd, g_rd.layers[l].bk, npos, 0))
-            rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 3], fill_arena_batch_meta(g_rd.pf_meta[b + 3], dim, kvd, g_rd.layers[l].bv, npos, 0))
-            cmd_copy_range(raw, g_rd.pf_v, 0l, g_rd.pf_kv, npos * kvd * 4l, npos * kvd * 4l)   // v into pf_kv's v half
+        // prompts over the PF_WINDOW activation buffers run as sequential windows: each window's
+        // rope/attention address the mirror at absolute positions, so window w attends everything
+        // [0, w0 + row] the earlier windows stored. Only the last window runs fin_rq + cls.
+        var w0 = 0l
+        while (w0 < npos) {
+            let tp0 = ref_time_ticks()
+            let wlen = min(g_rd.pf_np, npos - w0)
+            let last = w0 + wlen >= npos
+            upload_region_at(g_rd.pf_x, 0l, addr<uint8 const?>(x_batch[int(w0 * dim)]), wlen * dim * 4l)
+            upload_region_at(g_rd.pf_cos, 0l, addr<uint8 const?>(cos_batch[int(w0 * g_rd.head_size)]), wlen * g_rd.head_size * 4l)
+            fill_ffn_meta(hid, wlen * hid / 32l, false)   // actrq over the window's rows
+            // fill metas
+            let mA = @(idx : int; n, d, blk : int64; fmt : int) {
+                fill_arena_batch_meta(g_rd.pf_meta[idx], n, d, blk, wlen, fmt)
+            }
+            let mQ = @(idx : int; blocks : int64) { fill_quant_meta(g_rd.pf_meta[idx], blocks) }
+            let mR = @(idx : int; woff : int64; add : bool) { fill_addrms_meta(g_rd.pf_meta[idx], dim, woff, add) }
+            for (l in range64(g_rd.n_layers)) {
+                var L & = g_rd.layers[l]
+                let b = int(l * PF_ROLES)
+                invoke(mQ, b + 0, wlen * dim / 32l)
+                invoke(mA, b + 1, dim, qd, L.bq, L.fq)
+                invoke(mA, b + 2, dim, kvd, L.bk, L.fk)
+                invoke(mA, b + 3, dim, kvd, L.bv, L.fv)
+                var mr = reinterpret<uint?>(g_rd.pf_meta[b + 4].mapped)
+                mr[0] = uint(qd); mr[1] = uint(kvd); mr[2] = uint(g_rd.head_size); mr[3] = uint(g_rd.head_size / 2l)
+                mr[4] = g_rd.neox ? 1u : 0u; mr[5] = uint(qd / 2l); mr[6] = uint(pairs)
+                mr[7] = uint(l * g_rd.seq_cap * kvd); mr[9] = uint(wlen); mr[10] = uint(w0); mr[11] = uint(wlen * kvd)
+                var ma = reinterpret<uint?>(g_rd.pf_meta[b + 5].mapped)
+                ma[0] = uint(wlen); ma[1] = uint(g_rd.n_heads); ma[2] = uint(kvd); ma[3] = uint(g_rd.head_size); ma[4] = uint(g_rd.kv_mul)
+                ma[5] = uint(l * g_rd.seq_cap * kvd); ma[6] = uint(l * g_rd.seq_cap * kvd); ma[7] = uint(w0)
+                invoke(mQ, b + 6, wlen * qd / 32l)
+                invoke(mA, b + 7, qd, dim, L.bo, L.fo)
+                invoke(mR, b + 8, (l * 2l + 1l) * dim, true)
+                invoke(mQ, b + 9, wlen * dim / 32l)
+                invoke(mA, b + 10, dim, hid, L.b1, L.f1)
+                invoke(mA, b + 11, dim, hid, L.b3, L.f3)
+                invoke(mA, b + 13, hid, dim, L.b2, L.f2)
+                let nxt = l + 1l < g_rd.n_layers ? (l + 1l) * 2l * dim : nlfin
+                invoke(mR, b + 14, nxt, true)
+            }
+            let bp = int(g_rd.n_layers * PF_ROLES)
+            invoke(mR, bp + 0, 0l, false)   // prologue norm
+            if (last) {
+                // final quantize reads the LAST row of pf_xb
+                var mf = reinterpret<uint?>(g_rd.pf_meta[bp + 1].mapped)
+                mf[10] = uint((wlen - 1l) * dim); mf[18] = uint(dim / 32l)
+            }
+            let t_prep = get_time_usec(tp0)
+            // record
+            var raw = g_rd.pf_cmd
+            let rf : VkCommandBufferResetFlags
+            vk_check(vkResetCommandBuffer(raw, rf), null)
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+            pfq_begin(raw)
+            pfq_ts(raw)   // q0: submit start
+            cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
             comp_barrier(raw)
-            rd_dispatch(raw, g_gpu.rks_b_pipeline, g_rd.pf_sets[b + 4], ropewg)
-            rd_dispatch(raw, g_gpu.da_b_pipeline, g_rd.pf_sets[b + 5], attnwg)
-            rd_dispatch(raw, g_gpu.dn_rq_pipeline, g_rd.pf_sets[b + 6], uint((npos * qd / 32l + 255l) / 256l))
-            rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 7], fill_arena_batch_meta(g_rd.pf_meta[b + 7], qd, dim, g_rd.layers[l].bo, npos, 0))
-            rd_dispatch(raw, g_gpu.ar_pipeline_b, g_rd.pf_sets[b + 8], uint(npos))
-            rd_dispatch(raw, g_gpu.dn_rq_pipeline, g_rd.pf_sets[b + 9], uint((npos * dim / 32l + 255l) / 256l))
-            rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 10], fill_arena_batch_meta(g_rd.pf_meta[b + 10], dim, hid, g_rd.layers[l].b1, npos, 0))
-            rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 11], fill_arena_batch_meta(g_rd.pf_meta[b + 11], dim, hid, g_rd.layers[l].b3, npos, 0))
-            rd_dispatch(raw, g_gpu.actrq_pipeline, g_rd.pf_sets[b + 12], uint((npos * hid / 32l + 255l) / 256l))
-            rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 13], fill_arena_batch_meta(g_rd.pf_meta[b + 13], hid, dim, g_rd.layers[l].b2, npos, 0))
-            rd_dispatch(raw, g_gpu.ar_pipeline_b, g_rd.pf_sets[b + 14], uint(npos))
+            pfq_ts(raw)   // q1: meta copy
+            let ropewg = uint((wlen * pairs + int64(WG_X) - 1l) / int64(WG_X))
+            let attnwg = uint(g_rd.n_heads * ((wlen + 7l) / 8l))
+            rd_dispatch(raw, g_gpu.ar_pipeline_b, g_rd.pf_sets[bp + 0], uint(wlen))   // prologue norm
+            for (l in range64(g_rd.n_layers)) {
+                let b = int(l * PF_ROLES)
+                rd_dispatch(raw, g_gpu.dn_rq_pipeline, g_rd.pf_sets[b + 0], uint((wlen * dim / 32l + 255l) / 256l))
+                rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 1], fill_arena_batch_meta(g_rd.pf_meta[b + 1], dim, qd, g_rd.layers[l].bq, wlen, 0))
+                rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 2], fill_arena_batch_meta(g_rd.pf_meta[b + 2], dim, kvd, g_rd.layers[l].bk, wlen, 0))
+                rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 3], fill_arena_batch_meta(g_rd.pf_meta[b + 3], dim, kvd, g_rd.layers[l].bv, wlen, 0))
+                cmd_copy_range(raw, g_rd.pf_v, 0l, g_rd.pf_kv, wlen * kvd * 4l, wlen * kvd * 4l)   // v into pf_kv's v half
+                comp_barrier(raw)
+                rd_dispatch(raw, g_gpu.rks_b_pipeline, g_rd.pf_sets[b + 4], ropewg)
+                rd_dispatch(raw, g_gpu.da_b_pipeline, g_rd.pf_sets[b + 5], attnwg)
+                rd_dispatch(raw, g_gpu.dn_rq_pipeline, g_rd.pf_sets[b + 6], uint((wlen * qd / 32l + 255l) / 256l))
+                rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 7], fill_arena_batch_meta(g_rd.pf_meta[b + 7], qd, dim, g_rd.layers[l].bo, wlen, 0))
+                rd_dispatch(raw, g_gpu.ar_pipeline_b, g_rd.pf_sets[b + 8], uint(wlen))
+                rd_dispatch(raw, g_gpu.dn_rq_pipeline, g_rd.pf_sets[b + 9], uint((wlen * dim / 32l + 255l) / 256l))
+                rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 10], fill_arena_batch_meta(g_rd.pf_meta[b + 10], dim, hid, g_rd.layers[l].b1, wlen, 0))
+                rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 11], fill_arena_batch_meta(g_rd.pf_meta[b + 11], dim, hid, g_rd.layers[l].b3, wlen, 0))
+                rd_dispatch(raw, g_gpu.actrq_pipeline, g_rd.pf_sets[b + 12], uint((wlen * hid / 32l + 255l) / 256l))
+                rd_dispatch(raw, q8_batch_pipe(), g_rd.pf_sets[b + 13], fill_arena_batch_meta(g_rd.pf_meta[b + 13], hid, dim, g_rd.layers[l].b2, wlen, 0))
+                rd_dispatch(raw, g_gpu.ar_pipeline_b, g_rd.pf_sets[b + 14], uint(wlen))
+            }
+            if (last) {
+                rd_dispatch(raw, g_gpu.dn_rq_pipeline, g_rd.pf_sets[bp + 1], uint((dim / 32l + 255l) / 256l))
+                rd_dispatch_gemv(raw, g_rd.cls_fmt_marker, g_rd.cls_set, rd_gemv_wg(g_rd.vocab))
+                cmd_copy_whole(raw, g_rd.logits_dev, g_rd.pf_logits_host.buf, g_rd.vocab * 4l)
+            }
+            pfq_end(raw)
+            vk_check(vkEndCommandBuffer(raw), null)
+            let t_record = get_time_usec(tp0) - t_prep
+            submit_wait(raw)
+            if (vk_prof()) {
+                to_log(LOG_INFO, "vk_rdpf w0 {w0} rows {wlen} prep {t_prep} record {t_record} submit {get_time_usec(tp0) - t_prep - t_record}\n")
+            }
+            w0 += wlen
         }
-        rd_dispatch(raw, g_gpu.dn_rq_pipeline, g_rd.pf_sets[bp + 1], uint((dim / 32l + 255l) / 256l))
-        rd_dispatch_gemv(raw, g_rd.cls_fmt_marker, g_rd.cls_set, rd_gemv_wg(g_rd.vocab))
-        cmd_copy_whole(raw, g_rd.logits_dev, g_rd.pf_logits_host.buf, g_rd.vocab * 4l)
-        pfq_end(raw)
-        vk_check(vkEndCommandBuffer(raw), null)
-        let t_record = get_time_usec(tp0) - t_prep
-        submit_wait(raw)
         memcpy(addr<void?>(logits[0]), g_rd.pf_logits_host.mapped, int(g_rd.vocab * 4l))
-        if (vk_prof()) {
-            to_log(LOG_INFO, "vk_rdpf prep {t_prep} record {t_record} submit {get_time_usec(tp0) - t_prep - t_record}\n")
-        }
         // per-role GPU aggregation: q0 start, q1 meta, q2 prologue, then 15/layer, final rq, cls —
-        // only when every stamp landed (a >135-layer graph would overflow PFQ_CAP and truncate)
+        // only when every stamp landed (a >135-layer graph would overflow PFQ_CAP and truncate).
+        // Multi-window prompts: the stamps cover the LAST window only (the one with fin_rq + cls).
         if (vk_prof() && g_pfq_n == 5u + uint(g_rd.n_layers * 15l)) {
             var role : double[15]
             for (l in range64(g_rd.n_layers)) {
@@ -6503,7 +6616,7 @@ def dasllama_math_vulkan_register() {
     set_moe_gpu_budget_hooks(@@vk_weight_budget, @@vk_plane_bytes)
     install_moe_gpu_resident(@@vk_arena_reserve, @@vk_arena_place, @@vk_rdec_prepare,
         @@vk_rdec_upload_norms, @@vk_rdec_set_layer, @@vk_rdec_set_cls, @@vk_rdec_token, @@vk_rdec_prefill,
-        @@vk_rdec_sync_kv, @@vk_rdec_read_kv)
+        @@vk_rdec_sync_kv, @@vk_rdec_read_kv, @@vk_rdec_read_kv_bulk)
     set_moe_gpu_dn_state_hooks(@@vk_dn_step_flush, @@vk_dn_step_invalidate)
     set_moe_gpu_heat_hooks(@@vk_moe_heat_query, @@vk_moe_heat_advise, @@vk_moe_ffn_begin, @@vk_moe_ffn_join)
     set_moe_gpu_qkv_hook(@@vk_moe_qkv)
