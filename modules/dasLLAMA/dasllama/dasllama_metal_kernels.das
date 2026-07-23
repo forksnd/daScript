@@ -1830,9 +1830,10 @@ class MetalQ8GemvW13Sw {
 // Row copy for the zero-copy logits rail: one batched-classifier staging row into a session's
 // bytesNoCopy-wrapped logits storage — the scatter rides the cb instead of the landing memcpy.
 // src binds at the row's byte offset; grid = ceil(n/256) x 256-tg.
+[metal_dispatch(name = "enc_copy_row", pso = "g_pso_copy_row", tg = 256, grid = "n/256", params = "n : int64")]
 class MetalCopyRow {
-    @ssbo @binding = 0 src : array<float>
-    @ssbo @binding = 1 dst : array<float>
+    @ssbo @binding = 0 @role = "read" @off = "soff" @span = "n*4" src : array<float>
+    @ssbo @binding = 1 @role = "write" @off = "doff" @span = "n*4" dst : array<float>
     @uniform @binding = 2 n : uint
 
     [metal_kernel(name="metal_copy_row_msl")]
@@ -6149,26 +6150,6 @@ def enc_rope_store_tq4(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
     kn_dispatch(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
-// per-head QK RMSNorm prepass over the fused QKV buffer — one grid covers the q heads then the
-// k heads (koffe = qd, [qnorm | knorm] weight plane at woffe = hs); grid.y = batch rows
-def enc_qk_norm(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps, bsoffe : MetalBuffer?; ntg, nrows, head_size : int64) {
-    kn_pipeline(enc, g_pso_qknorm)
-    kn_tgmem(enc, metal_qk_norm_msl_tgmem, 0)
-    kn_buffer(enc, bx, 0ul, 0)
-    kn_buffer(enc, bw, 0ul, 1)
-    kn_buffer(enc, bnq, 0ul, 2)
-    kn_buffer(enc, bkoffe, 0ul, 3)
-    kn_buffer(enc, brstride, 0ul, 4)
-    kn_buffer(enc, bhs, 0ul, 5)
-    kn_buffer(enc, bwoffe, 0ul, 6)
-    kn_buffer(enc, beps, 0ul, 7)
-    kn_buffer(enc, bsoffe, 0ul, 8)
-    hz_read(bx)
-    hz_write(bx)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
-}
-
 // the tq4 attention-output un-rotate: one threadgroup per (head, row), row stride = qstride
 def enc_fwht_unsign(enc : MetalComputeEncoder?; byo, bhs, bqs : MetalBuffer?; nheads, nrows, head_size : int64) {
     kn_pipeline(enc, g_pso_unsign)
@@ -6264,19 +6245,6 @@ def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off :
     kn_dispatch(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
-// zero-copy logits scatter: one staging row (src at its byte offset) into a session's wrapped
-// logits storage — replaces that row's landing memcpy
-def enc_copy_row(enc : MetalComputeEncoder?; bsrc : MetalBuffer?; soff : uint64; bdst, bn : MetalBuffer?; n : int64; doff : uint64 = 0ul) {
-    kn_pipeline(enc, g_pso_copy_row)
-    kn_buffer(enc, bsrc, soff, 0)
-    kn_buffer(enc, bdst, doff, 1)
-    kn_buffer(enc, bn, 0ul, 2)
-    hz_read(bsrc, soff, uint64(n * 4l))
-    hz_write(bdst, doff, uint64(n * 4l))
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((n + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
-}
-
 def enc_embed(enc : MetalComputeEncoder?; bw : MetalBuffer?; eoff : uint64; btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
     kn_pipeline(enc, g_pso_emb)
     kn_buffer(enc, bw, eoff, 0)   // byte view of the embed blob slice
@@ -6310,39 +6278,9 @@ def enc_embed_k6(enc : MetalComputeEncoder?; bq : MetalBuffer?; qoff : uint64; b
 
 // ===== MoE routing encoders (Wave C) =====
 
-// nst = streams (grid.y; the batch's live rows — single decode passes 1); brb/bhasb = the
-// optional router bias row (gpt-oss; identity = g_one + a zero uniform)
-def enc_moe_router(enc : MetalComputeEncoder?; bw, bx, by, bn, bd, bxs, brb, bhasb : MetalBuffer?; ne, nst : int64) {
-    kn_pipeline(enc, g_pso_moe_router)
-    kn_buffer(enc, bw, 0ul, 0)
-    kn_buffer(enc, bx, 0ul, 1)
-    kn_buffer(enc, by, 0ul, 2)
-    kn_buffer(enc, bn, 0ul, 3)
-    kn_buffer(enc, bd, 0ul, 4)
-    kn_buffer(enc, bxs, 0ul, 5)
-    kn_buffer(enc, brb, 0ul, 6)
-    kn_buffer(enc, bhasb, 0ul, 7)
-    hz_read(bx)
-    hz_write(by, 0ul, uint64(ne * nst * 4l))
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((ne + g_gemv_rows - 1l) / g_gemv_rows), uint(nst), 1u), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
-}
-
-// the selection buffer binds twice (uint idx + float w views, both at 0); one tg per stream
-// row; bgm = gating mode (0 = softmax + norm_topk, 1 = gpt-oss softmax_weight, 2 = softmax no-renorm)
-def enc_moe_select(enc : MetalComputeEncoder?; blg, bsel, bne, bnk, bgm : MetalBuffer?; nst : int64) {
-    kn_pipeline(enc, g_pso_moe_select)
-    kn_buffer(enc, blg, 0ul, 0)
-    kn_buffer(enc, bsel, 0ul, 1)
-    kn_buffer(enc, bsel, 0ul, 2)
-    kn_buffer(enc, bne, 0ul, 3)
-    kn_buffer(enc, bnk, 0ul, 4)
-    kn_buffer(enc, bgm, 0ul, 5)
-    hz_read(blg)
-    hz_write(bsel)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
-}
+// enc_moe_router / enc_moe_select / enc_moe_combine are [metal_dispatch]-generated from their
+// prefill classes (the selection buffer's idx/w views are the seli/selw fields — callers pass
+// the same buffer twice)
 
 // one expert-indexed weight site (gate/up/down): weight binds at the layer's expert STACK base,
 // grid.y = k slots, grid.z = streams; bes = blocks-per-expert (q8 ege/32, kq ege/256), bxs =
@@ -6459,23 +6397,6 @@ def enc_moe_gemv_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, rows, k, 
 // ===== deltanet (Wave D) — the recurrent-layer chain encoders =====
 // hist/state bind the per-session arena at the layer's byte offset; the rest are step scratch.
 
-def enc_dn_conv(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uint64;
-                bw, by, bcd, bdconv, bnp : MetalBuffer?; cd, npos : int64) {
-    kn_pipeline(enc, g_pso_dn_conv)
-    kn_buffer(enc, bx, 0ul, 0)
-    kn_buffer(enc, bhist, hoff, 1)
-    kn_buffer(enc, bw, 0ul, 2)
-    kn_buffer(enc, by, 0ul, 3)
-    kn_buffer(enc, bcd, 0ul, 4)
-    kn_buffer(enc, bdconv, 0ul, 5)
-    kn_buffer(enc, bnp, 0ul, 6)
-    hz_read(bx)
-    hz_read(bhist)
-    hz_write(by)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((cd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
-}
-
 def enc_dn_conv_hist(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uint64;
                      bcd, bdconv, bnp : MetalBuffer?; cd : int64; hmoff : uint64; bmid : MetalBuffer?) {
     kn_pipeline(enc, g_pso_dn_hist)
@@ -6565,20 +6486,6 @@ def enc_dn_deint(enc : MetalComputeEncoder?; bqg, bq, bgt, bhs, bqd, bqs : Metal
     hz_write(bgt)
     hz_gate(enc)
     kn_dispatch(enc, uint3(uint((qd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_moe_combine(enc : MetalComputeEncoder?; bdn, bsel, by, bdim, bnk : MetalBuffer?; dim, nst : int64) {
-    kn_pipeline(enc, g_pso_moe_combine)
-    kn_buffer(enc, bdn, 0ul, 0)
-    kn_buffer(enc, bsel, 0ul, 1)   // the float w view (stream s's w at s*2k + k)
-    kn_buffer(enc, by, 0ul, 2)
-    kn_buffer(enc, bdim, 0ul, 3)
-    kn_buffer(enc, bnk, 0ul, 4)
-    hz_read(bdn)
-    hz_read(bsel)
-    hz_write(by)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((dim + 255l) / 256l), uint(nst), 1u), uint3(256u, 1u, 1u))
 }
 
 def enc_axpy_sig(enc : MetalComputeEncoder?; by, bx, bg, btot, bdim : MetalBuffer?; total : int64) {

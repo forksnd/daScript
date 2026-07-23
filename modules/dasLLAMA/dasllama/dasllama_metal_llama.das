@@ -728,7 +728,7 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
         if (!recr && !kvsh && g_skip != "ew" && (t.wv_offs[l] < 0l || c.v_norm)) {
             // gemma4 V: no-wv layers fill the v segment from the PRE-norm/PRE-rope K projection (the CPU mm_qkv order, BEFORE qk_norm touches k); with v_norm the copy FUSES into the ones-RMS
             if (t.wv_offs[l] < 0l && !c.v_norm) {
-                enc_copy_row(enc, r.bqkv, uint64(qd * 4l), r.bqkv, u_kvd_l, kv_dim, uint64((qd + kv_dim) * 4l))
+                enc_copy_row(enc, r.bqkv, uint64(qd * 4l), r.bqkv, uint64((qd + kv_dim) * 4l), u_kvd_l, kv_dim)
             }
             if (c.v_norm) {
                 // MAX-width upload: the region cache is address-keyed and both classes read this one plane — a narrower first upload starved the hs-512 class (Metal OOB reads are ZEROS)
@@ -868,7 +868,7 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                 } else {
                     enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, brb, bhrb, c.n_expert, 1l)
                 }
-                enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_moe_gmode, 1l)
+                enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_moe_gmode, 1l)
                 if (g4) {
                     var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
                     enc_moe_wscale(enc, r.bmoe_sel, bw_ds, r.u_moe_k, 1l)
@@ -1048,7 +1048,7 @@ def private encode_cls_tail(t : Model; var r : StepRes; enc : MetalComputeEncode
     }
     if (r.bnc != null && r.blog != null) {
         // spec-capable step: mirror zero-copy logits into pooled staging — the next step's speculative argmax reads that, never session memory
-        enc_copy_row(enc, r.bnc, 0ul, r.blog, r.u_vocab, c.vocab_size)
+        enc_copy_row(enc, r.bnc, 0ul, r.blog, 0ul, r.u_vocab, c.vocab_size)
     }
 }
 
@@ -1063,10 +1063,10 @@ def private encode_draft_step(t : Model; var r : StepRes; with_cls : bool = true
     unsafe {
         var bw_en = upload_region(addr < void? >(t.fblob[t.mtp_enorm_off]), uint64(dim * 4l))
         enc_rms(enc, r.bx, bw_en, r.bxb, r.u_dim, r.u_eps)
-        enc_copy_row(enc, r.bxb, 0ul, r.bcat, r.u_dim, dim)
+        enc_copy_row(enc, r.bxb, 0ul, r.bcat, 0ul, r.u_dim, dim)
         var bw_hn = upload_region(addr < void? >(t.fblob[t.mtp_hnorm_off]), uint64(dim * 4l))
         enc_rms(enc, r.bxb2, bw_hn, r.bxb, r.u_dim, r.u_eps)
-        enc_copy_row(enc, r.bxb, 0ul, r.bcat, r.u_dim, dim, uint64(dim * 4l))
+        enc_copy_row(enc, r.bxb, 0ul, r.bcat, uint64(dim * 4l), r.u_dim, dim)
         enc_site_gemv(enc, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, dim, 2l * dim, r.bcat, r.bx, r.u_dim2, r.u_dim)
         var bw_att = upload_region(addr < void? >(t.fblob[t.rms_att_off + c.n_layers * dim]), uint64(dim * 4l))
         enc_rms(enc, r.bx, bw_att, r.bxb, r.u_dim, r.u_eps)
@@ -1319,7 +1319,7 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
                 bhrb = r.u_moe_gmode
             }
             enc_moe_router(enc, bw_rt, r.bxb, r.bmoe_lg, r.u_dim, r.u_moe_ne, r.u_dim, brb, bhrb, c.n_expert, 2l)
-            enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_moe_gmode, 2l)
+            enc_moe_select(enc, r.bmoe_lg, r.bmoe_sel, r.bmoe_sel, r.u_moe_ne, r.u_moe_k, r.u_moe_gmode, 2l)
             if (r.u_moe_nsh != null) {
                 var bw_shg = upload_region(addr < void? >(t.fblob[t.shexp_gate_off + l * dim]), uint64(dim * 4l))
                 enc_moe_router(enc, bw_shg, r.bxb, r.bmoe_lg, r.u_dim, r.u_one32, r.u_dim, g_one, g_zero, 1l, 2l)
@@ -1426,16 +1426,16 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
         r.bxf, r.blog, r.u_dim, r.u_vocab, r.u_vocab)
     // draft-slab warm: the draft block at B=2, no cls — future drafts need contiguous slab rows
     unsafe {
-        enc_copy_row(enc, r.bcat, uint64(2l * dim * 4l), r.bxb, r.u_dim, dim)
-        enc_copy_row(enc, r.bxf, 0ul, r.bxb, r.u_dim, dim, uint64(dim * 4l))
+        enc_copy_row(enc, r.bcat, uint64(2l * dim * 4l), r.bxb, 0ul, r.u_dim, dim)
+        enc_copy_row(enc, r.bxf, 0ul, r.bxb, uint64(dim * 4l), r.u_dim, dim)
         var bw_hn = upload_region(addr < void? >(t.fblob[t.mtp_hnorm_off]), uint64(dim * 4l))
         enc_rms_b(enc, r.bxb, bw_hn, r.bxb2, r.u_dim, r.u_eps, 2l)
         var bw_en = upload_region(addr < void? >(t.fblob[t.mtp_enorm_off]), uint64(dim * 4l))
         enc_rms_b(enc, r.bcat, bw_en, r.bh12, r.u_dim, r.u_eps, 2l)
-        enc_copy_row(enc, r.bh12, 0ul, r.bcat, r.u_dim, dim)
-        enc_copy_row(enc, r.bxb2, 0ul, r.bcat, r.u_dim, dim, uint64(dim * 4l))
-        enc_copy_row(enc, r.bh12, uint64(dim * 4l), r.bcat, r.u_dim, dim, uint64(2l * dim * 4l))
-        enc_copy_row(enc, r.bxb2, uint64(dim * 4l), r.bcat, r.u_dim, dim, uint64(3l * dim * 4l))
+        enc_copy_row(enc, r.bh12, 0ul, r.bcat, 0ul, r.u_dim, dim)
+        enc_copy_row(enc, r.bxb2, 0ul, r.bcat, uint64(dim * 4l), r.u_dim, dim)
+        enc_copy_row(enc, r.bh12, uint64(dim * 4l), r.bcat, uint64(2l * dim * 4l), r.u_dim, dim)
+        enc_copy_row(enc, r.bxb2, uint64(dim * 4l), r.bcat, uint64(3l * dim * 4l), r.u_dim, dim)
         enc_verify_site(t, r, enc, t.mtp_ehproj_fmt, t.mtp_ehproj_off, dim, 2l * dim, dim,
             r.bcat, r.bx, r.u_dim2, r.u_dim, r.u_dim)
         var bw_att = upload_region(addr < void? >(t.fblob[t.rms_att_off + c.n_layers * dim]), uint64(dim * 4l))
@@ -2679,8 +2679,8 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 bar_dep(enc, haz, HZ_BQKV, HZ_BQKV)
                 if (!has_wv && !c.v_norm) {
                     for (i in range64(nrows)) {
-                        enc_copy_row(enc, bqkv, uint64((i * qkvd_l + qd_l) * 4l), bqkv, u_kvd_l, kvd_l,
-                            uint64((i * qkvd_l + qd_l + kvd_l) * 4l))
+                        enc_copy_row(enc, bqkv, uint64((i * qkvd_l + qd_l) * 4l), bqkv,
+                            uint64((i * qkvd_l + qd_l + kvd_l) * 4l), u_kvd_l, kvd_l)
                     }
                 }
                 if (c.v_norm) {
@@ -2872,7 +2872,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     enc_moe_router(enc, bw_rt, bxb, bmlg, u_dim, u_moe_ne, u_dim, brb, bhrb, c.n_expert, nrows)
                 }
                 bar_dep(enc, haz, HZ_BMLG, HZ_BMSEL)
-                enc_moe_select(enc, bmlg, bmsel, u_moe_ne, u_moe_k, u_moe_gmode, nrows)
+                enc_moe_select(enc, bmlg, bmsel, bmsel, u_moe_ne, u_moe_k, u_moe_gmode, nrows)
                 if (g4moe) {
                     var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
                     bar_dep(enc, haz, HZ_BMSEL, HZ_BMSEL)
@@ -3102,7 +3102,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         if (nc_all) {
             bar_dep(enc, haz, HZ_BLOG, 0u)
             for (i in range64(nrows)) {
-                enc_copy_row(enc, blog, uint64(i * c.vocab_size * 4l), nc_logits_for(g_dev, *sessions[i]), u_vocab, c.vocab_size)
+                enc_copy_row(enc, blog, uint64(i * c.vocab_size * 4l), nc_logits_for(g_dev, *sessions[i]), 0ul, u_vocab, c.vocab_size)
             }
         }
     }
