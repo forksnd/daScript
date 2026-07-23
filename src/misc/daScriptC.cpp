@@ -986,6 +986,9 @@ int das_context_get_variable_size ( das_context * context, int idx ) {
 // --- Serialization ---
 
 das_serialized_data * das_program_serialize ( das_program * program, const void ** out_data, int64_t * out_size ) {
+    if ( !out_data || !out_size ) {
+        DAS_FATAL_ERROR("out_data and out_size must not be null\n");
+    }
     size_t size = 0;
     auto result = das_program_serialize_n(program, out_data, &size);
     if ( size > size_t(std::numeric_limits<int64_t>::max()) ) {
