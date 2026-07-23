@@ -7,6 +7,8 @@ require daslib/ast
 require daslib/ast_boost
 require daslib/templates_boost
 require daslib/rtti
+require strings
+require daslib/strings_boost   // split / strip — the grid & params micro-format tokenizers
 require das_metal   // nolint:STYLE030 — MetalBuffer/MetalComputeEncoder are referenced only inside qmacro_type(type<...>), which STYLE030 can't see; the require is load-bearing for macro-time type resolution
 
 // The dasLLAMA Metal kernel-dispatch lens (v1). [metal_dispatch] reads a [metal_kernel] class's
@@ -50,20 +52,91 @@ def private mk_var_call(at : LineInfo; call_name, arg0 : string) : ExpressionPtr
     return c
 }
 
-def private mk_uint3(at : LineInfo; x : uint) : ExpressionPtr {
+def private mk_uint_cast(at : LineInfo; var inner : Expression?) : Expression? {
+    var c = new ExprCall(at = at, name := "uint")
+    c.arguments |> emplace_new <| inner
+    return c
+}
+
+def private is_digit_tok(s : string) : bool {
+    if (empty(s)) {
+        return false
+    }
+    return is_number(first_character(s))
+}
+
+// A coverage token is either an int literal (e.g. "32") or a global/param name (e.g. "g_gemv_rows").
+def private mk_cov(at : LineInfo; tok : string) : Expression? {
+    if (is_digit_tok(tok)) {
+        return new ExprConstInt64(at = at, value = int64(to_int(tok)))
+    }
+    return new ExprVar(at = at, name := tok)
+}
+
+// One grid dim: "1" -> 1u ; "name" -> uint(name) ; "name/cov" -> uint((name + cov - 1) / cov) (ceil).
+def private mk_grid_dim(at : LineInfo; spec : string) : Expression? {
+    let s = strip(spec)
+    if (s == "1") {
+        return new ExprConstUInt(at = at, value = 1u)
+    }
+    let parts <- split(s, "/")
+    if (length(parts) == 1) {
+        return mk_uint_cast(at, new ExprVar(at = at, name := s))
+    }
+    let name = strip(parts[0])
+    let cov = strip(parts[1])
+    // ceil((name + cov - 1) / cov) — cov appears twice, so build two independent nodes
+    var add = new ExprOp2(at = at, op := "+", left = new ExprVar(at = at, name := name), right = mk_cov(at, cov))
+    var sub = new ExprOp2(at = at, op := "-", left = add, right = new ExprConstInt64(at = at, value = 1l))
+    var div = new ExprOp2(at = at, op := "/", left = sub, right = mk_cov(at, cov))
+    return mk_uint_cast(at, div)
+}
+
+// grid = comma-separated per WorkGroupID dim; padded to uint3 with trailing 1u.
+def private mk_grid(at : LineInfo; grid : string) : Expression? {
+    let dims <- split(grid, ",")
     var c = new ExprCall(at = at, name := "uint3")
-    c.arguments |> emplace_new <| new ExprConstUInt(at = at, value = x)
+    for (i in range(3)) {
+        if (i < length(dims)) {
+            c.arguments |> emplace_new <| mk_grid_dim(at, dims[i])
+        } else {
+            c.arguments |> emplace_new <| new ExprConstUInt(at = at, value = 1u)
+        }
+    }
+    return c
+}
+
+// tg = threads-per-threadgroup (a const, all dims): uint3(tg, 1, 1).
+def private mk_tg(at : LineInfo; tg : int) : Expression? {
+    var c = new ExprCall(at = at, name := "uint3")
+    c.arguments |> emplace_new <| new ExprConstUInt(at = at, value = uint(tg))
     c.arguments |> emplace_new <| new ExprConstUInt(at = at, value = 1u)
     c.arguments |> emplace_new <| new ExprConstUInt(at = at, value = 1u)
     return c
 }
 
-def private mk_kn_dispatch(at : LineInfo; tg : int) : ExpressionPtr {
+def private mk_kn_dispatch(at : LineInfo; grid : string; tg : int) : Expression? {
     var c = new ExprCall(at = at, name := "kn_dispatch")
     c.arguments |> emplace_new <| new ExprVar(at = at, name := "enc")
-    c.arguments |> emplace_new <| mk_uint3(at, 1u)          // grid "1" -> all ones
-    c.arguments |> emplace_new <| mk_uint3(at, uint(tg))    // threadgroup extent
+    c.arguments |> emplace_new <| mk_grid(at, grid)
+    c.arguments |> emplace_new <| mk_tg(at, tg)
     return c
+}
+
+// map a params-string type token to the param TypeDecl (the size/offset scalars the grid references)
+// a generated builder param is non-`var`, so its type carries the trailing const (the const model)
+def private const_t(var t : TypeDecl?) : TypeDecl? {
+    t.flags.constant = true
+    return t
+}
+
+def private param_type(tok : string; var ok : bool&) : TypeDecl? {
+    if (tok == "int64") { return qmacro_type(type<int64>) }
+    if (tok == "uint64") { return qmacro_type(type<uint64>) }
+    if (tok == "int") { return qmacro_type(type<int>) }
+    if (tok == "uint") { return qmacro_type(type<uint>) }
+    ok = false
+    return qmacro_type(type<int64>)
 }
 
 [structure_macro(name = metal_dispatch)]
@@ -88,8 +161,8 @@ class MetalDispatch : AstStructureAnnotation {
             errors := "[metal_dispatch] {fn_name}: 'tg' must be a positive int constant (v1 only supports a constant threadgroup size)"
             return false
         }
-        if (grid != "1") {
-            errors := "[metal_dispatch] {fn_name}: only grid == \"1\" is supported in v1 (got '{grid}')"
+        if (empty(grid)) {
+            errors := "[metal_dispatch] {fn_name}: 'grid' is required (per WorkGroupID dim: 1 | param | param/coverage)"
             return false
         }
 
@@ -137,15 +210,33 @@ class MetalDispatch : AstStructureAnnotation {
             }
         }
         body |> push(mk_var_call(at, "hz_gate", "enc"))
-        body |> push(mk_kn_dispatch(at, tg))
+        body |> push(mk_kn_dispatch(at, grid, tg))
 
-        // Build the builder: void return, enc + one MetalBuffer? per @ssbo/@uniform field.
+        // Build the builder: void return, enc + one MetalBuffer? per @ssbo/@uniform field + the
+        // declared size/offset params (int64/uint64/... — the scalars the grid references).
         var fn = new Function(at = at, atDecl = at, name := fn_name,
             flags = FunctionFlags.generated,
             result = new TypeDecl(at = at, baseType = Type.tVoid))
-        fn.arguments |> emplace_new <| new Variable(at = at, name := "enc", _type = qmacro_type(type<MetalComputeEncoder?>))
+        fn.arguments |> emplace_new <| new Variable(at = at, name := "enc", _type = const_t(qmacro_type(type<MetalComputeEncoder?>)))
         for (bf in bufs) {
-            fn.arguments |> emplace_new <| new Variable(at = at, name := "b{bf.name}", _type = qmacro_type(type<MetalBuffer?>))
+            fn.arguments |> emplace_new <| new Variable(at = at, name := "b{bf.name}", _type = const_t(qmacro_type(type<MetalBuffer?>)))
+        }
+        let params = find_arg(args, "params") ?as tString ?? ""
+        if (!empty(strip(params))) {
+            for (p in split(params, ",")) {
+                let nt <- split(p, ":")
+                if (length(nt) != 2) {
+                    errors := "[metal_dispatch] {fn_name}: param '{strip(p)}' must be 'name : type'"
+                    return false
+                }
+                var ok = true
+                var pt = param_type(strip(nt[1]), ok)
+                if (!ok) {
+                    errors := "[metal_dispatch] {fn_name}: param '{strip(p)}' has unsupported type '{strip(nt[1])}' (int/uint/int64/uint64)"
+                    return false
+                }
+                fn.arguments |> emplace_new <| new Variable(at = at, name := "{strip(nt[0])}", _type = const_t(pt))
+            }
         }
         fn.body = make_expression_block(body)
         fn.body |> force_at(at)

@@ -12,6 +12,7 @@ require dasllama/dasllama_common
 require dasllama/dasllama_math
 require dasllama/dasllama_math_metal
 require dasllama/dasllama_metal_common   // decline enums/tables + the shared block_q8_0 blob cache (W1 split)
+require dasllama/dasllama_metal_lens   // [metal_dispatch] — generates decode enc_* builders for shared classes defined here
 
 // Phase-6 dasMetal: the full-GPU-resident prefill kernel set — everything between the GEMMs:
 // rmsnorm, table-driven RoPE, fused causal-softmax attention scores, the P·V gather, fused
@@ -1340,10 +1341,11 @@ class MetalSwigluOai {
 // gemma4 MoE router input (stage 3): y = x * rsqrt(mean(x^2) + eps) * (1/sqrt(dim)) * rscale[k],
 // one tg per row. f32 accumulation (the CPU runs this sum in double for top-8 tie stability;
 // no GPU doubles — rare tie flips ride the tolerance methodology, per the wave ruling).
+[metal_dispatch(name = "enc_g4_router_norm", pso = "g_pso_g4rnorm", tgmem = "metal_g4_router_norm_msl_tgmem", tg = 256, grid = "nst", params = "nst : int64")]
 class MetalG4RouterNorm {
-    @ssbo @binding = 0 x : array<float>     // [rows x dim]
-    @ssbo @binding = 1 rs : array<float>    // [dim] per-channel router scale
-    @ssbo @binding = 2 y : array<float>     // [rows x dim]
+    @ssbo @binding = 0 @role = "read" x : array<float>     // [rows x dim]
+    @ssbo @binding = 1 @role = "weight" rs : array<float>    // [dim] per-channel router scale
+    @ssbo @binding = 2 @role = "write" y : array<float>     // [rows x dim]
     @uniform @binding = 3 dim : uint
     @uniform @binding = 4 eps : float
     @uniform @binding = 5 invd : float      // 1/sqrt(dim)

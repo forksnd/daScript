@@ -6414,21 +6414,6 @@ def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, 
 }
 
 // gemma4 router-input norm: one tg per stream row (weightless rms * 1/sqrt(dim) * rscale)
-def enc_g4_router_norm(enc : MetalComputeEncoder?; bx, brs, by, bdim, beps, binvd : MetalBuffer?; nst : int64) {
-    kn_pipeline(enc, g_pso_g4rnorm)
-    kn_tgmem(enc, metal_g4_router_norm_msl_tgmem, 0)
-    kn_buffer(enc, bx, 0ul, 0)
-    kn_buffer(enc, brs, 0ul, 1)
-    kn_buffer(enc, by, 0ul, 2)
-    kn_buffer(enc, bdim, 0ul, 3)
-    kn_buffer(enc, beps, 0ul, 4)
-    kn_buffer(enc, binvd, 0ul, 5)
-    hz_read(bx)
-    hz_write(by)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint(nst), 1u, 1u), uint3(256u, 1u, 1u))
-}
-
 // gemma4 per-expert down-scale fold: selw[row][j] *= ds[seli[row][j]]
 def enc_moe_wscale(enc : MetalComputeEncoder?; bsel, bds, bnk : MetalBuffer?; nst : int64) {
     kn_pipeline(enc, g_pso_moe_wscale)
