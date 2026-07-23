@@ -107,8 +107,9 @@ C Integration Tutorials
 =======================
 
 These tutorials show how to embed daslang in a C application using the
-``daScriptC.h`` API.  Each tutorial comes with a ``.c`` source file and a
-companion ``.das`` script in ``tutorials/integration/c/``.
+``daScriptC.h`` API. Each tutorial comes with a ``.c`` source file in
+``tutorials/integration/c/``. Most use a companion ``.das`` script; tutorials
+which focus on virtual files or explicit-length source embed the script in C.
 
 The installed SDK ships with a standalone ``CMakeLists.txt`` that lets you
 build all C tutorials directly against the SDK — see
@@ -131,6 +132,7 @@ build all C tutorials directly against the SDK — see
    tutorials/integration_c_12_ecs.rst
    tutorials/integration_c_13_shared_module.rst
    tutorials/integration_c_14_passing_arrays.rst
+   tutorials/integration_c_15_static_stbimage.rst
 
 .. _tutorials_integration_cpp:
 

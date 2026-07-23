@@ -228,6 +228,8 @@ Expected output::
 
    Previous tutorial: :ref:`tutorial_integration_c_shared_module`
 
+   Next tutorial: :ref:`tutorial_integration_c_static_stbimage`
+
    Tutorial :ref:`tutorial_integration_c_calling_functions` — argument
    packing for primitive types
 

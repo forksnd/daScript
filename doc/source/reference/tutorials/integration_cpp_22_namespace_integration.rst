@@ -12,9 +12,9 @@ inside a C++ namespace.
 
 Topics covered:
 
-* Why ``NEED_MODULE`` fails inside a namespace
-* ``DECLARE_MODULE`` / ``PULL_MODULE`` — the namespace-safe alternative
-* ``DECLARE_ALL_DEFAULT_MODULES`` / ``PULL_ALL_DEFAULT_MODULES``
+* Why module registration entry points use C linkage
+* Using ``NEED_MODULE`` safely inside a namespace
+* ``DECLARE_MODULE`` / ``PULL_MODULE`` for separately compiled modules
 
 
 Prerequisites
@@ -24,48 +24,45 @@ Prerequisites
   basic compile → simulate → eval cycle.
 
 
-The problem
-===========
+Global C-linkage entry points
+=============================
 
-The ``NEED_MODULE`` macro expands to an ``extern`` declaration followed
-by a call:
+``REGISTER_MODULE`` exposes an unmangled global C entry point.  For example,
+``REGISTER_MODULE(Module_BuiltIn)`` provides:
 
 .. code-block:: cpp
 
-   extern DAS_API das::Module * register_Module_BuiltIn();
-   *das::ModuleKarma += unsigned(intptr_t(register_Module_BuiltIn()));
+   extern "C" das::Module * register_Module_BuiltIn();
 
-When this macro is used inside a C++ namespace, the ``extern``
-declaration is placed in that namespace's scope.  The linker then looks
-for ``MyApp::register_Module_BuiltIn()`` instead of the global
-``::register_Module_BuiltIn()`` defined in the library:
+The built-in declarations are provided by ``daScriptModule.h``.
+``NEED_MODULE`` calls the global entry point explicitly, so it is safe inside
+a namespace:
 
 .. code-block:: cpp
 
    namespace MyApp {
        void init() {
-           NEED_ALL_DEFAULT_MODULES;   // FAILS: linker error!
+           NEED_ALL_DEFAULT_MODULES;
            das::Module::Initialize();
        }
    }
 
-The solution is to split the declaration and the call into two separate
-macros.
-
-
 ``DECLARE_MODULE`` / ``PULL_MODULE``
 ====================================
 
-``DECLARE_MODULE(ClassName)`` — forward-declares the global-scope
-``register_*`` function.  Must be placed at file or global scope (outside
-any namespace).
+Separately compiled custom modules are not known to ``daScriptModule.h``.
+``DECLARE_MODULE(ClassName)`` forward-declares their global C-linkage
+``register_*`` function.  It must be placed at file scope, outside any
+namespace.
 
 ``PULL_MODULE(ClassName)`` — performs the registration call using the
 ``::`` prefix to explicitly reference the global-scope function.  Safe
-inside any namespace, class, or function body.
+inside any namespace, class, or function body.  Once a declaration is
+visible, ``NEED_MODULE`` and ``PULL_MODULE`` have the same pull behavior.
 
 Convenience wrappers ``DECLARE_ALL_DEFAULT_MODULES`` and
-``PULL_ALL_DEFAULT_MODULES`` cover every built-in module.
+``PULL_ALL_DEFAULT_MODULES`` remain available, although the built-in
+declarations are already supplied by the header.
 
 
 The tutorial
@@ -82,32 +79,29 @@ but all daslang calls happen inside ``namespace MyApp``.
 How it works
 ============
 
-1. ``DECLARE_ALL_DEFAULT_MODULES`` at file scope forward-declares every
-   default module's ``register_*`` function as a global-scope symbol.
+1. ``daScriptModule.h`` declares the default module entry points globally
+   with C linkage.
 
-2. Inside ``MyApp::initialize()``, ``PULL_ALL_DEFAULT_MODULES`` calls
-   each ``::register_Module_*()`` function — the ``::`` prefix bypasses
-   the enclosing namespace.
+2. Inside ``MyApp::initialize()``, ``NEED_ALL_DEFAULT_MODULES`` calls each
+   ``::register_Module_*()`` function explicitly.
 
-3. ``Module::Initialize()`` and the rest of the daslang API continue to
-   work normally inside the namespace — only module registration has the
-   namespace restriction.
+3. ``Module::Initialize()`` and the rest of the daslang API work normally
+   inside the namespace.
 
 
 Custom modules
 ==============
 
-For custom modules, use ``DECLARE_MODULE`` at file scope alongside the
-convenience macros:
+For a separately compiled custom module, declare it at file scope before
+pulling it from a function or namespace:
 
 .. code-block:: cpp
 
-   DECLARE_ALL_DEFAULT_MODULES;
    DECLARE_MODULE(Module_MyMod);
 
    namespace MyApp {
        void init() {
-           PULL_ALL_DEFAULT_MODULES;
+           NEED_ALL_DEFAULT_MODULES;
            PULL_MODULE(Module_MyMod);
            das::Module::Initialize();
        }
@@ -121,8 +115,8 @@ CMake generates three ``.inc`` files for every module registered with
 ``ADD_MODULE_CPP``:
 
 ``external_need.inc``
-   Contains ``NEED_MODULE(...)`` — the traditional all-in-one macro
-   (works only at global scope).
+   Contains ``NEED_MODULE(...)`` calls.  The corresponding declarations
+   must already be visible.
 
 ``external_declare.inc``
    Contains ``DECLARE_MODULE(...)`` — include at file scope.
@@ -131,14 +125,7 @@ CMake generates three ``.inc`` files for every module registered with
    Contains ``PULL_MODULE(...)`` — include inside any namespace or
    function body.
 
-For namespace-safe code, replace:
-
-.. code-block:: cpp
-
-   // old (global scope only)
-   #include "modules/external_need.inc"
-
-with:
+The explicit declaration/pull pair is recommended:
 
 .. code-block:: cpp
 

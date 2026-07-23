@@ -23,7 +23,7 @@ Never merge with an unresolved thread or with Copilot's latest review targeting 
 1. Compare the PR's current `headRefOid` with Copilot's latest review `commit_id`.
 2. If the tip is unreviewed and the prior round has no unresolved threads, **request Copilot review** manually.
 3. **~5 min later, act on Copilot's review:** triage each comment (Section 3) and surface your verdicts. Wait for greenlight before applying any accepted or uncertain suggestion. A round containing only clear rejections can be replied to and resolved without blocking.
-4. If fixes changed the branch, run the gates and push them.
+4. If fixes changed the branch, run focused gates for the affected surface and push them.
 5. Reply to every comment and resolve every conversation from that completed round. Verify unresolved-thread count = 0.
 6. If step 4 pushed a new tip, re-request Copilot now. If the round was reject-only and produced no push, the existing review already covers the current tip.
 7. Repeat until the invariant in Section 0 holds. **Only then** wait for CI green and merge.
@@ -53,7 +53,7 @@ Stop polling and surface as soon as: (a) Copilot left new comments (react), (b) 
 If a check goes red:
 1. Identify the failing job: `gh pr checks <PR>` shows the URL; `gh run view <runID> --log-failed` fetches the log.
 2. Apply the same fix policy as Step 2 in `skills/make_pr.md`: own change → fix it; obvious pre-existing → fix it; non-obvious pre-existing → ask the user.
-3. After the fix, **re-run the gates from Step 1-5 in `skills/make_pr.md`** (lint + interpreted + AOT + Sphinx if `//!` or RST touched + format) — don't trust spot-checks. CI failures often come bundled (a missing format triggers a lint, a removed function triggers an AOT hash mismatch).
+3. After the fix, reproduce the failing lane locally when practical and run focused gates for the affected surface. Do not repeat the full preflight; CI is the authoritative complete rerun for the new tip.
 4. Push the fix. CI re-runs automatically. The push invalidates Copilot-dry state, so go **back into the Copilot loop** (Section 1), re-request Copilot on the fix commit, and don't merge until Copilot is dry again and CI is green. There are no exceptions for trivial or CI-only fixes.
 
 ## 3. Triaging review comments — discuss BEFORE acting
@@ -110,14 +110,14 @@ no reachable behavior. Hold the line the table already draws:
 
 A rejected comment still gets a reply (one-line reason, evidence if the reviewer is wrong) + a resolved thread (Section 5). Surface the verdicts and wait for the user's greenlight before applying accepted or uncertain suggestions. If every comment is a clear rejection under the rules above, close the round without a new push and continue toward merge.
 
-## 4. Apply fixes + re-run gates
+## 4. Apply fixes + run focused gates
 
 After greenlight:
 1. Edit the code per the agreed verdicts.
 2. **Watch for contradictory comments.** When fixing a bug, scan inline comments that describe the affected surface — they often need updating in the same pass. (If you forget, the next review round will flag it.)
-3. **Re-run the full gates** from Step 1-5 in `skills/make_pr.md`. Yes, full. CI is unforgiving; every amend goes back through the whole matrix.
+3. Run focused local gates that exercise the changed surface, plus `git diff --check` and any directly applicable formatter/generator check. The full preflight belongs to `skills/make_pr.md` and runs **once before the initial PR push**; never repeat it for Copilot or CI fix rounds. Let the automatically restarted CI matrix provide the complete validation of each later tip.
 4. **`//!` doc-comment changes:** re-run `bin/Release/daslang.exe -documentation doc/reflections/das2rst.das`, delete `doc/sphinx-build`, then run both Sphinx builders. Preflight's docs gate deletes that cache unconditionally so stale doctrees cannot hide warnings. Generated `doc/source/stdlib/generated/*.rst` are gitignored; Sphinx picks them up at build time.
-5. **`git commit --amend --no-edit`** + **`git push --force-with-lease`** (NOT `--force` — protects against racing pushes).
+5. Commit the fix. Because the pre-push token is SHA-bound to the one pre-PR full run, post-open review fixes may use `git push --no-verify` after their focused gates; CI remains mandatory before merge. If amending, use **`git push --force-with-lease`** (never `--force`).
 
 ## 5. Reply to each comment + resolve all threads
 
@@ -178,7 +178,7 @@ Each fix iteration: triage → discuss → fix → gate → amend → force-push
 | Watch PR | `gh pr checks`, `gh api .../comments`, `gh api .../reviews` | Surface as soon as Copilot comments, CI fails, or both CI + Copilot are done |
 | CI fail | `gh pr checks`, `gh run view --log-failed` | Fix own, fix obvious pre-existing, ask about unclear |
 | Triage comments | `gh api .../pulls/<PR>/comments` | **Default reject**; require realistic reachability, scale, and impact. Prose-only round → resolve and land |
-| Re-run gates | Follow Step 1-5 in `skills/make_pr.md` | Full rerun after every amend |
+| Re-run gates | Focused tests + directly applicable format/generator/doc checks | Full preflight once before initial PR push; CI handles complete reruns after review fixes |
 | Amend/push | `git commit --amend --no-edit`, `git push --force-with-lease` | Keep squashed branch squashed |
 | Reply | `mcp__github__add_reply_to_pull_request_comment` | Every addressed comment gets a reply |
 | Resolve | `gh api graphql ... resolveReviewThread` | Every addressed thread gets resolved; paginate and verify unresolved = 0 |

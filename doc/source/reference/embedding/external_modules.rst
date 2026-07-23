@@ -599,8 +599,9 @@ If your module is part of the main daScript repository (under
    Both are built automatically.
 
 ``ADD_MODULE_CPP(ClassName)``
-   Registers the module class in ``external_need.inc`` so the static
-   binary includes it via ``NEED_MODULE``.
+   Generates C-linkage declarations in ``external_declare.inc`` and static
+   registration calls in ``external_pull.inc``.  Static hosts include the
+   former at file scope and the latter in their initialization function.
 
 ``ADD_MODULE_DAS(category, subfolder, native)``
    Registers a pure-das module in ``external_resolve.inc`` for static
