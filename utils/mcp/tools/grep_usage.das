@@ -30,15 +30,19 @@ def detect_ast_grep() : string {
     // (`npm install -g @ast-grep/cli`) the global PATH only gets `sg.cmd`, so
     // CreateProcess(NULL, "sg ...") fails — fall through to the explicit
     // `.cmd` / `.exe` / `.bat` candidates so the shim is picked up.
-    let candidates = ["sg", "sg.exe", "sg.cmd", "sg.bat"]
+    // prefer the `ast-grep` binary: the `sg` alias is deprecated, and newer
+    // installs print a deprecation banner ahead of the JSON payload
+    let candidates = ["ast-grep", "ast-grep.exe", "ast-grep.cmd", "ast-grep.bat", "sg", "sg.exe", "sg.cmd", "sg.bat"]
     for (c in candidates) {
         if (try_ast_grep(c)) return c
     }
     // try .venv paths (not activated): Scripts/ on Windows, bin/ on Linux/macOS
     let das_root = get_das_root()
     for (subdir in ["Scripts", "bin"]) {
-        let venv_sg = "{das_root}/.venv/{subdir}/sg"
-        if (try_ast_grep(venv_sg)) return venv_sg
+        for (name in ["ast-grep", "sg"]) {
+            let venv_sg = "{das_root}/.venv/{subdir}/{name}"
+            if (try_ast_grep(venv_sg)) return venv_sg
+        }
     }
     return ""
 }
@@ -48,6 +52,18 @@ def get_ast_grep_cmd() : string {
         ast_grep_cmd = detect_ast_grep()
     }
     return ast_grep_cmd
+}
+
+// The deprecated `sg` alias of ast-grep prints a deprecation banner ahead of
+// the JSON payload — drop anything before the first JSON bracket.
+def strip_ast_grep_banner(raw : string) : string {
+    let ai = find(raw, "[")
+    let oi = find(raw, "\{")
+    var cut = ai
+    if (cut < 0 || (oi >= 0 && oi < cut)) {
+        cut = oi
+    }
+    return cut > 0 ? slice(raw, cut) : raw
 }
 
 def json_to_int(v : JsonValue?) : int {
@@ -92,6 +108,7 @@ def do_grep_usage(symbol, directory, context_lines_str, glob_filter : string) : 
             }
         }
     }
+    raw_json = strip_ast_grep_banner(raw_json)
     if (empty(raw_json) || raw_json == "[]") return make_tool_result("No matches found for '{symbol}' in {search_dir}")
     // parse JSON array from ast-grep
     var err : string

@@ -1,0 +1,185 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="1110" viewBox="0 0 860 1110" font-family="'JetBrains Mono','Cascadia Mono','Consolas',monospace">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5b5547"/>
+    </marker>
+    <marker id="arA" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#a87420"/>
+    </marker>
+    <marker id="arB" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6aa9c4"/>
+    </marker>
+  </defs>
+  <rect width="860" height="1110" fill="#0d0c0a"/>
+
+  <!-- prompt -->
+  <text x="232" y="54" text-anchor="end" font-size="10" letter-spacing="2" fill="#5b5547">PROMPT</text>
+  <rect x="280" y="28" width="300" height="42" rx="8" fill="#15130f" stroke="#2a2620"/>
+  <text x="430" y="55" text-anchor="middle" font-size="14" fill="#9bc46a">"Once upon a time"</text>
+  <line x1="430" y1="70" x2="430" y2="96" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <!-- tokenizer -->
+  <text x="232" y="126" text-anchor="end" font-size="10" letter-spacing="2" fill="#5b5547">TOKENIZE</text>
+  <rect x="280" y="100" width="300" height="42" rx="8" fill="#15130f" stroke="#2a2620"/>
+  <text x="430" y="126" text-anchor="middle" font-size="13" fill="#e8e2d2">BPE tokenizer</text>
+  <line x1="430" y1="142" x2="430" y2="168" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <!-- token chips -->
+  <rect x="276" y="170" width="48" height="34" rx="6" fill="#1c1a14" stroke="#2a2620"/>
+  <text x="300" y="191.5" text-anchor="middle" font-size="12" fill="#5b5547">&#60;s&#62;</text>
+  <rect x="334" y="170" width="62" height="34" rx="6" fill="#1c1a14" stroke="#2a2620"/>
+  <text x="365" y="191.5" text-anchor="middle" font-size="12" fill="#e8e2d2">Once</text>
+  <rect x="406" y="170" width="62" height="34" rx="6" fill="#1c1a14" stroke="#2a2620"/>
+  <text x="437" y="191.5" text-anchor="middle" font-size="12" fill="#e8e2d2">upon</text>
+  <rect x="478" y="170" width="34" height="34" rx="6" fill="#1c1a14" stroke="#2a2620"/>
+  <text x="495" y="191.5" text-anchor="middle" font-size="12" fill="#e8e2d2">a</text>
+  <rect x="522" y="170" width="62" height="34" rx="6" fill="#1c1a14" stroke="#2a2620"/>
+  <text x="553" y="191.5" text-anchor="middle" font-size="12" fill="#e8e2d2">time</text>
+  <text x="600" y="191" font-size="10.5" fill="#5b5547">one ID per piece</text>
+  <line x1="430" y1="204" x2="430" y2="230" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <!-- embedding -->
+  <text x="232" y="258" text-anchor="end" font-size="10" letter-spacing="2" fill="#5b5547">EMBED</text>
+  <rect x="250" y="232" width="360" height="42" rx="8" fill="#15130f" stroke="#2a2620"/>
+  <text x="430" y="258" text-anchor="middle" font-size="13" fill="#e8e2d2">token embedding &#8212; row lookup</text>
+  <line x1="430" y1="274" x2="430" y2="300" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <!-- x vector cells -->
+  <g>
+    <rect x="269" y="304" width="16" height="16" fill="#2a2115"/>
+    <rect x="287" y="304" width="16" height="16" fill="#e8a13a"/>
+    <rect x="305" y="304" width="16" height="16" fill="#57431f"/>
+    <rect x="323" y="304" width="16" height="16" fill="#a87420"/>
+    <rect x="341" y="304" width="16" height="16" fill="#33291a"/>
+    <rect x="359" y="304" width="16" height="16" fill="#c88a2e"/>
+    <rect x="377" y="304" width="16" height="16" fill="#241d12"/>
+    <rect x="395" y="304" width="16" height="16" fill="#8a5f1e"/>
+    <rect x="413" y="304" width="16" height="16" fill="#d89434"/>
+    <rect x="431" y="304" width="16" height="16" fill="#3f3319"/>
+    <rect x="449" y="304" width="16" height="16" fill="#6b4d1b"/>
+    <rect x="467" y="304" width="16" height="16" fill="#2a2115"/>
+    <rect x="485" y="304" width="16" height="16" fill="#b57d26"/>
+    <rect x="503" y="304" width="16" height="16" fill="#4a3a1c"/>
+    <rect x="521" y="304" width="16" height="16" fill="#a87420"/>
+    <rect x="539" y="304" width="16" height="16" fill="#33291a"/>
+    <rect x="557" y="304" width="16" height="16" fill="#d89434"/>
+    <rect x="575" y="304" width="16" height="16" fill="#57431f"/>
+  </g>
+  <text x="430" y="342" text-anchor="middle" font-size="11"><tspan fill="#e8a13a">x &#8212; the residual stream.</tspan><tspan fill="#9b9281"> 288 floats of evolving meaning</tspan></text>
+  <line x1="430" y1="352" x2="430" y2="404" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <!-- layer card -->
+  <rect x="150" y="382" width="560" height="442" rx="10" fill="#15130f" stroke="#2a2620"/>
+  <rect x="592" y="396" width="96" height="24" rx="12" fill="none" stroke="#a87420"/>
+  <text x="640" y="412" text-anchor="middle" font-size="11" fill="#e8a13a">&#215; 6 layers</text>
+
+  <circle cx="430" cy="392" r="3" fill="#a87420"/>
+  <rect x="350" y="408" width="160" height="30" rx="6" fill="#1c1a14" stroke="#2a2620"/>
+  <text x="430" y="427" text-anchor="middle" font-size="12" fill="#c1baa9">RMSNorm</text>
+  <line x1="430" y1="438" x2="430" y2="462" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <!-- attention block -->
+  <rect x="290" y="466" width="280" height="84" rx="8" fill="#15130f" stroke="#6aa9c4"/>
+  <text x="430" y="492" text-anchor="middle" font-size="13.5" fill="#6aa9c4">attention</text>
+  <text x="430" y="514" text-anchor="middle" font-size="10.5" fill="#9b9281">gather from every position so far:</text>
+  <text x="430" y="532" text-anchor="middle" font-size="10.5" fill="#9b9281">Q&#183;K scores &#8594; softmax &#8594; &#931; w&#183;V</text>
+
+  <!-- KV cache -->
+  <rect x="596" y="470" width="96" height="76" rx="8" fill="#1c1a14" stroke="#2a2620"/>
+  <text x="644" y="500" text-anchor="middle" font-size="11.5" fill="#6aa9c4">KV cache</text>
+  <text x="644" y="518" text-anchor="middle" font-size="9.5" fill="#9b9281">all past</text>
+  <text x="644" y="530" text-anchor="middle" font-size="9.5" fill="#9b9281">keys+values</text>
+  <line x1="572" y1="492" x2="592" y2="492" stroke="#6aa9c4" stroke-width="1.2" marker-end="url(#arB)"/>
+  <text x="582" y="483" text-anchor="middle" font-size="8.5" fill="#5b5547">append</text>
+  <line x1="594" y1="524" x2="574" y2="524" stroke="#6aa9c4" stroke-width="1.2" marker-end="url(#arB)"/>
+  <text x="583" y="538" text-anchor="middle" font-size="8.5" fill="#5b5547">read</text>
+
+  <line x1="430" y1="550" x2="430" y2="574" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+  <circle cx="430" cy="588" r="11" fill="#15130f" stroke="#e8a13a" stroke-width="1.4"/>
+  <line x1="424" y1="588" x2="436" y2="588" stroke="#e8a13a" stroke-width="1.4"/>
+  <line x1="430" y1="582" x2="430" y2="594" stroke="#e8a13a" stroke-width="1.4"/>
+  <path d="M 430,392 L 258,392 Q 250,392 250,400 L 250,580 Q 250,588 258,588 L 415,588" fill="none" stroke="#a87420" stroke-width="1.3" marker-end="url(#arA)"/>
+  <text x="452" y="592" font-size="10.5" fill="#a87420">x = x + attention</text>
+
+  <line x1="430" y1="599" x2="430" y2="622" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+  <circle cx="430" cy="610" r="3" fill="#a87420"/>
+  <rect x="350" y="626" width="160" height="30" rx="6" fill="#1c1a14" stroke="#2a2620"/>
+  <text x="430" y="645" text-anchor="middle" font-size="12" fill="#c1baa9">RMSNorm</text>
+  <line x1="430" y1="656" x2="430" y2="680" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <!-- ffn block -->
+  <rect x="290" y="684" width="280" height="84" rx="8" fill="#15130f" stroke="#9bc46a"/>
+  <text x="430" y="710" text-anchor="middle" font-size="13.5" fill="#9bc46a">feed-forward (SwiGLU)</text>
+  <text x="430" y="732" text-anchor="middle" font-size="10.5" fill="#9b9281">re-mix this token's own features:</text>
+  <text x="430" y="750" text-anchor="middle" font-size="10.5" fill="#9b9281">288 &#8594; 768, SiLU gate, &#8594; 288</text>
+
+  <line x1="430" y1="768" x2="430" y2="790" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+  <circle cx="430" cy="804" r="11" fill="#15130f" stroke="#e8a13a" stroke-width="1.4"/>
+  <line x1="424" y1="804" x2="436" y2="804" stroke="#e8a13a" stroke-width="1.4"/>
+  <line x1="430" y1="798" x2="430" y2="810" stroke="#e8a13a" stroke-width="1.4"/>
+  <path d="M 430,610 L 258,610 Q 250,610 250,618 L 250,796 Q 250,804 258,804 L 415,804" fill="none" stroke="#a87420" stroke-width="1.3" marker-end="url(#arA)"/>
+  <text x="452" y="808" font-size="10.5" fill="#a87420">x = x + ffn</text>
+
+  <line x1="430" y1="815" x2="430" y2="844" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <!-- final norm + classifier -->
+  <rect x="350" y="848" width="160" height="30" rx="6" fill="#1c1a14" stroke="#2a2620"/>
+  <text x="430" y="867" text-anchor="middle" font-size="12" fill="#c1baa9">final RMSNorm</text>
+  <line x1="430" y1="878" x2="430" y2="902" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+  <text x="232" y="932" text-anchor="end" font-size="10" letter-spacing="2" fill="#5b5547">PREDICT</text>
+  <rect x="250" y="906" width="360" height="42" rx="8" fill="#15130f" stroke="#2a2620"/>
+  <text x="430" y="932" text-anchor="middle" font-size="12.5" fill="#e8e2d2">classifier &#8212; 288 floats &#8594; 32,000 scores</text>
+  <line x1="430" y1="948" x2="430" y2="972" stroke="#5b5547" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <!-- logits bar chart -->
+  <g fill="#4a4335">
+    <rect x="252" y="1042" width="6" height="8"/>
+    <rect x="261" y="1036" width="6" height="14"/>
+    <rect x="270" y="1044" width="6" height="6"/>
+    <rect x="279" y="1030" width="6" height="20"/>
+    <rect x="288" y="1039" width="6" height="11"/>
+    <rect x="297" y="1045" width="6" height="5"/>
+    <rect x="306" y="1033" width="6" height="17"/>
+    <rect x="315" y="1041" width="6" height="9"/>
+    <rect x="324" y="1027" width="6" height="23"/>
+    <rect x="333" y="1043" width="6" height="7"/>
+    <rect x="342" y="1038" width="6" height="12"/>
+    <rect x="351" y="1024" width="6" height="26"/>
+    <rect x="360" y="1040" width="6" height="10"/>
+    <rect x="369" y="1044" width="6" height="6"/>
+    <rect x="378" y="1034" width="6" height="16"/>
+    <rect x="387" y="1042" width="6" height="8"/>
+    <rect x="396" y="1029" width="6" height="21"/>
+    <rect x="405" y="1037" width="6" height="13"/>
+    <rect x="414" y="1045" width="6" height="5"/>
+    <rect x="423" y="1032" width="6" height="18"/>
+    <rect x="432" y="1041" width="6" height="9"/>
+    <rect x="441" y="1026" width="6" height="24"/>
+    <rect x="450" y="1039" width="6" height="11"/>
+    <rect x="459" y="988" width="6" height="62" fill="#e8a13a"/>
+    <rect x="468" y="1042" width="6" height="8"/>
+    <rect x="477" y="1035" width="6" height="15"/>
+    <rect x="486" y="1044" width="6" height="6"/>
+    <rect x="495" y="1031" width="6" height="19"/>
+    <rect x="504" y="1038" width="6" height="12"/>
+    <rect x="513" y="1023" width="6" height="27"/>
+    <rect x="522" y="1043" width="6" height="7"/>
+    <rect x="531" y="1040" width="6" height="10"/>
+    <rect x="540" y="1028" width="6" height="22"/>
+    <rect x="549" y="1041" width="6" height="9"/>
+    <rect x="558" y="1036" width="6" height="14"/>
+    <rect x="567" y="1044" width="6" height="6"/>
+    <rect x="576" y="1033" width="6" height="17"/>
+    <rect x="585" y="1025" width="6" height="25"/>
+    <rect x="594" y="1042" width="6" height="8"/>
+    <rect x="603" y="1039" width="6" height="11"/>
+  </g>
+  <line x1="252" y1="1050" x2="612" y2="1050" stroke="#2a2620" stroke-width="1"/>
+  <line x1="614" y1="1000" x2="470" y2="990" stroke="#a87420" stroke-width="1" marker-end="url(#arA)"/>
+  <text x="620" y="1004" font-size="11" fill="#e8a13a">largest logit &#8658; next token</text>
+  <text x="430" y="1078" text-anchor="middle" font-size="11" fill="#9b9281">one score (logit) per vocabulary token</text>
+
+  <!-- feedback loop -->
+  <path d="M 618,1032 L 792,1032 Q 800,1032 800,1024 L 800,261 Q 800,253 792,253 L 616,253" fill="none" stroke="#a87420" stroke-width="1.4" marker-end="url(#arA)"/>
+  <text x="824" y="640" text-anchor="middle" font-size="11" fill="#a87420" transform="rotate(-90 824 640)">feed the chosen token back &#8212; position + 1</text>
+</svg>

@@ -10,7 +10,7 @@ require strings
 //
 // This file does not use dasLLAMA. It is a complete, if deliberately tiny,
 // Llama-2 inference engine: map a real checkpoint, run the transformer, greedily
-// choose the next token, and print a story.
+// choose the next token, and complete a prompt.
 //
 // It also tells another story. The first dasLLAMA commit was authored on
 // 2026-06-27. It began with the naive matmul below; about a day later PR #3297
@@ -18,17 +18,19 @@ require strings
 // That was possible because all the steps from readable script to real machine
 // code could stay in one programming environment.
 //
-// This is the seed, before it became a library.
+// This is the seed, before it became a library. The design — checkpoint
+// layout, tokenizer format, shape of the forward pass — follows Andrej
+// Karpathy's llama2.c (run.c); credit where credit is due.
 //
 // Get the two llama2.c files:
 //   https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
 //   https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin
 //
 // Run:
-//   daslang.exe -jit tutorials/dasLLAMA/00_problem_statement.das -- stories15M.bin tokenizer.bin
+//   daslang.exe -jit tutorials/dasLLAMA/00_problem_statement.das -- stories15M.bin tokenizer.bin "Once upon a time"
 //
-// JIT is much faster, but even the interpreter tells this story at about five
-// tokens per second. Try both: the same source runs unchanged in either tier.
+// The same source runs unchanged in either tier: the interpreter tells this
+// story at ~6 tokens per second on a fast desktop, JIT at ~75. Try both.
 
 // -----------------------------------------------------------------------------
 // The five operations used by a Llama transformer
@@ -163,8 +165,8 @@ struct State {
     x : array<float>
     xb : array<float>
     xb2 : array<float>
-    hidden : array<float>
     gate : array<float>
+    up : array<float>
     query : array<float>
     key : array<float>
     value : array<float>
@@ -185,8 +187,8 @@ def make_state(c : Config) : State {
         x <- zeros(c.dim),
         xb <- zeros(c.dim),
         xb2 <- zeros(c.dim),
-        hidden <- zeros(c.hidden_dim),
         gate <- zeros(c.hidden_dim),
+        up <- zeros(c.hidden_dim),
         query <- zeros(c.dim),
         key <- zeros(c.kv_dim),
         value <- zeros(c.kv_dim),
@@ -236,7 +238,7 @@ def forward(
     let dim = c.dim
     let kv_multiple = c.heads / c.kv_heads
     let attention_scale = 1.0 / sqrt(float(c.head_size))
-
+    // embedding: copy the token's learned row into x, the residual stream
     array_view(model, w.token_embedding + token * dim, dim) $(embedding : array<float>#) {
         for (i in range(dim)) {
             s.x[i] = embedding[i]
@@ -245,21 +247,21 @@ def forward(
 
     for (layer in range(c.layers)) {
         let cache_layer = layer * c.sequence * c.kv_dim
-
+        // attention: normalize x, then project it into query, key, value
         normalize(s.xb, model, w.attention_norm + layer * dim, s.x, dim)
         project(s.query, model, w.query + layer * dim * dim, s.xb, dim, dim)
         project(s.key, model, w.key + layer * dim * c.kv_dim, s.xb, dim, c.kv_dim)
         project(s.value, model, w.value + layer * dim * c.kv_dim, s.xb, dim, c.kv_dim)
-
+        // rotate Q and K so their scores depend on relative position (RoPE)
         rope(s.query, position, c.head_size, dim)
         rope(s.key, position, c.head_size, c.kv_dim)
-
+        // append this position's K and V to the layer's cache
         let cache_row = cache_layer + position * c.kv_dim
         for (i in range(c.kv_dim)) {
             s.key_cache[cache_row + i] = s.key[i]
             s.value_cache[cache_row + i] = s.value[i]
         }
-
+        // per-head: score cached keys, softmax, blend cached values into s.xb (spent by now, safe to reuse)
         for (head in range(c.heads)) {
             let query_row = head * c.head_size
             let cache_head = (head / kv_multiple) * c.head_size
@@ -285,25 +287,25 @@ def forward(
                 }
             }
         }
-
+        // mix the head outputs into one correction and add it to x
         project(s.xb2, model, w.attention_output + layer * dim * dim, s.xb, dim, dim)
         for (i in range(dim)) {
             s.x[i] += s.xb2[i]
         }
-
+        // feed-forward: expand, SiLU-gate, project back down, add to x
         normalize(s.xb, model, w.ffn_norm + layer * dim, s.x, dim)
-        project(s.hidden, model, w.ffn_gate + layer * dim * c.hidden_dim, s.xb, dim, c.hidden_dim)
-        project(s.gate, model, w.ffn_up + layer * dim * c.hidden_dim, s.xb, dim, c.hidden_dim)
-        silu(s.hidden, c.hidden_dim)
+        project(s.gate, model, w.ffn_gate + layer * dim * c.hidden_dim, s.xb, dim, c.hidden_dim)
+        project(s.up, model, w.ffn_up + layer * dim * c.hidden_dim, s.xb, dim, c.hidden_dim)
+        silu(s.gate, c.hidden_dim)
         for (i in range(c.hidden_dim)) {
-            s.hidden[i] *= s.gate[i]
+            s.gate[i] *= s.up[i]
         }
-        project(s.xb, model, w.ffn_down + layer * c.hidden_dim * dim, s.hidden, c.hidden_dim, dim)
+        project(s.xb, model, w.ffn_down + layer * c.hidden_dim * dim, s.gate, c.hidden_dim, dim)
         for (i in range(dim)) {
             s.x[i] += s.xb[i]
         }
     }
-
+    // final norm, then score x against every vocabulary row
     normalize(s.xb, model, w.final_norm, s.x, dim)
     project(s.logits, model, w.classifier, s.xb, dim, c.vocab)
 }
@@ -319,23 +321,17 @@ def most_likely(logits : array<float>) : int {
 }
 
 // -----------------------------------------------------------------------------
-// Just enough tokenizer to turn generated token ids back into text
+// A minimal llama2.c tokenizer: text to token ids and back
 // -----------------------------------------------------------------------------
 
-def read_i32_le(data : array<uint8>#; offset : int) : int {
-    if (offset < 0 || offset + 4 > length(data)) {
-        panic("tokenizer ends inside an int32")
-    }
-    return (
-        int(data[offset])
-        | (int(data[offset + 1]) << 8)
-        | (int(data[offset + 2]) << 16)
-        | (int(data[offset + 3]) << 24)
-    )
+struct Tokenizer {
+    pieces : array<string>
+    scores : array<float>
+    lookup : table<string; int>
 }
 
-def load_pieces(path : string; count : int) : array<string> {
-    var pieces : array<string>
+def load_tokenizer(path : string; count : int) : Tokenizer {
+    var tk = Tokenizer()
     let file = fopen(path, "rb")
     if (file == null) {
         panic("cannot open tokenizer '{path}'")
@@ -343,23 +339,70 @@ def load_pieces(path : string; count : int) : array<string> {
     fmap(file) $(var data : array<uint8>#) {
         var cursor = 4   // max_token_length, unused by decoding
         for (_ in range(count)) {
-            cursor += 4 // merge score, used by encoding but not decoding
-            let size = read_i32_le(data, cursor)
-            cursor += 4
-            array_view(data, cursor, size) $(piece : array<uint8>#) {
-                pieces |> push(string(piece))
+            // records are unaligned (variable piece length), so pod_view rather than a typed array_view
+            tk.scores |> push(pod_view(data, cursor, type<float>))
+            let size = pod_view(data, cursor + 4, type<int>)
+            array_view(data, cursor + 8, size) $(piece : array<uint8>#) {
+                let text = string(piece)
+                tk.lookup |> insert(text, length(tk.pieces))
+                tk.pieces |> push(text)
             }
-            cursor += size
+            cursor += 8 + size
         }
     }
     fclose(file)
-    return <- pieces
+    return <- tk
 }
 
-def token_text(pieces : array<string>; previous, token : int) : string {
-    let text = pieces[token]
+def encode(tk : Tokenizer; text : string) : array<int> {
+    var tokens = [1] // BOS
+    let dummy_prefix = tk.lookup?[" "] ?? -1 // SentencePiece marks word starts with a space
+    if (!empty(text) && dummy_prefix >= 0) {
+        tokens |> push(dummy_prefix)
+    }
+    peek_data(text) $(bytes : array<uint8> const#) {
+        var begin = 0
+        while (begin < length(bytes)) {
+            var end = begin + 1
+            while (end < length(bytes) && (int(bytes[end]) & int(0xC0)) == int(0x80)) {
+                end++
+            }
+            let id = tk.lookup?[slice(text, begin, end)] ?? -1
+            if (id >= 0) {
+                tokens |> push(id)
+            } else {
+                for (i in range(begin, end)) {
+                    tokens |> push(int(bytes[i]) + 3) // llama2.c byte-token fallback
+                }
+            }
+            begin = end
+        }
+    }
+    while (true) {
+        var best_score = -1.0e10
+        var best_id = -1
+        var best_at = -1
+        for (i in range(length(tokens) - 1)) {
+            let id = tk.lookup?[tk.pieces[tokens[i]] + tk.pieces[tokens[i + 1]]] ?? -1
+            if (id >= 0 && tk.scores[id] > best_score) {
+                best_score = tk.scores[id]
+                best_id = id
+                best_at = i
+            }
+        }
+        if (best_at < 0) {
+            break
+        }
+        tokens[best_at] = best_id
+        tokens |> erase(best_at + 1)
+    }
+    return <- tokens
+}
+
+def token_text(tk : Tokenizer; previous, token : int) : string {
+    let text = tk.pieces[token]
     if (length(text) == 6 && starts_with(text, "<0x") && ends_with(text, ">")) {
-        return string([uint8(to_int(slice(text, 1, 5), true))])
+        return to_char(to_int(slice(text, 1, 5), true))
     }
     if (previous == 1 && !empty(text) && first_character(text) == ' ') {
         return slice(text, 1)
@@ -368,10 +411,22 @@ def token_text(pieces : array<string>; previous, token : int) : string {
 }
 
 // -----------------------------------------------------------------------------
-// Map the checkpoint and let token 1 (BOS and sequence delimiter) become a story
+// Repeated forward calls prefill the prompt; then each result becomes the next input
 // -----------------------------------------------------------------------------
 
-def tell_story(model_path, tokenizer_path : string) {
+def prefill(
+            c : Config;
+            w : Weights;
+            model : array<float>#;
+            var s : State;
+            tokens : array<int>
+            ) {
+    for (position, token in range(length(tokens)), tokens) {
+        forward(c, w, model, s, token, position)
+    }
+}
+
+def complete(model_path, tokenizer_path, prompt : string) {
     let file = fopen(model_path, "rb")
     if (file == null) {
         panic("cannot open model '{model_path}'")
@@ -393,28 +448,39 @@ def tell_story(model_path, tokenizer_path : string) {
                 sequence = header[6],
                 head_size = header[0] / header[3],
                 kv_dim = header[0] * header[4] / header[3],
-                shared_classifier = signed_vocab > 0
+                shared_classifier = signed_vocab > 0   // llama2.c negates vocab to flag a separate classifier matrix
             )
             let w = weight_layout(c)
             if (length(bytes) < 28 + w.end * 4) {
                 panic("checkpoint ends before its declared weights")
             }
             array_view(bytes, 28, (length(bytes) - 28) / 4, type<float>) $(model : array<float>#) {
-                let pieces <- load_pieces(tokenizer_path, c.vocab)
+                let tk <- load_tokenizer(tokenizer_path, c.vocab)
                 var state <- make_state(c)
+                let prompt_tokens <- encode(tk, prompt)
+                if (length(prompt_tokens) > c.sequence) {
+                    panic("prompt has {length(prompt_tokens)} tokens; model context is {c.sequence}")
+                }
 
                 print("dim={c.dim}, layers={c.layers}, heads={c.heads}, parameters≈{w.end}\n\n")
                 let delimiter = 1
-                var token = delimiter
-                for (position in range(c.sequence)) {
-                    forward(c, w, model, state, token, position)
+                var token = prompt_tokens[length(prompt_tokens) - 1]
+                var position = length(prompt_tokens)
+                prefill(c, w, model, state, prompt_tokens)
+                fprint(fstdout(), prompt)
+                while (true) {
                     let next = most_likely(state.logits)
                     if (next == delimiter) {
                         break
                     }
-                    fprint(fstdout(), token_text(pieces, token, next))
+                    fprint(fstdout(), token_text(tk, token, next))
                     fflush(fstdout())
                     token = next
+                    if (position >= c.sequence) {
+                        break
+                    }
+                    forward(c, w, model, state, token, position)
+                    position++
                 }
                 print("\n")
             }
@@ -428,8 +494,9 @@ def main() {
     let args <- get_command_line_arguments()
     let paths <- [for (arg in args); arg; where ends_with(arg, ".bin")]
     if (length(paths) < 2) {
-        print("usage: daslang -jit tutorials/dasLLAMA/00_problem_statement.das -- stories15M.bin tokenizer.bin\n")
+        print("usage: daslang -jit tutorials/dasLLAMA/00_problem_statement.das -- stories15M.bin tokenizer.bin [\"prompt\"]\n")
         return
     }
-    tell_story(paths[length(paths) - 2], paths[length(paths) - 1])
+    let prompt = ends_with(args[length(args) - 1], ".bin") ? "Once upon a time" : args[length(args) - 1]
+    complete(paths[length(paths) - 2], paths[length(paths) - 1], prompt)
 }

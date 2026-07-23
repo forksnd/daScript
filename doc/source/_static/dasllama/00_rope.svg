@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="420" viewBox="0 0 860 420" font-family="'JetBrains Mono','Cascadia Mono','Consolas',monospace">
+  <defs>
+    <marker id="mA" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#e8a13a"/>
+    </marker>
+    <marker id="mA2" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b57d26"/>
+    </marker>
+    <marker id="mA3" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a5f1e"/>
+    </marker>
+    <marker id="mA4" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#57431f"/>
+    </marker>
+    <marker id="mB" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6aa9c4"/>
+    </marker>
+  </defs>
+  <rect width="860" height="420" fill="#0d0c0a"/>
+
+  <!-- panel A: one pair rotating with position -->
+  <circle cx="200" cy="140" r="80" fill="none" stroke="#2a2620"/>
+  <line x1="108" y1="140" x2="292" y2="140" stroke="#1c1a14"/>
+  <line x1="200" y1="48" x2="200" y2="232" stroke="#1c1a14"/>
+  <line x1="200" y1="140" x2="280" y2="140" stroke="#57431f" stroke-width="2" stroke-linecap="round" marker-end="url(#mA4)"/>
+  <line x1="200" y1="140" x2="270.6" y2="102.5" stroke="#8a5f1e" stroke-width="2" stroke-linecap="round" marker-end="url(#mA3)"/>
+  <line x1="200" y1="140" x2="244.7" y2="73.7" stroke="#b57d26" stroke-width="2" stroke-linecap="round" marker-end="url(#mA2)"/>
+  <line x1="200" y1="140" x2="208.4" y2="60.4" stroke="#e8a13a" stroke-width="2" stroke-linecap="round" marker-end="url(#mA)"/>
+  <text x="294" y="144" font-size="10" fill="#57431f">p=0</text>
+  <text x="287" y="98" font-size="10" fill="#8a5f1e">p=1</text>
+  <text x="256" y="58" font-size="10" fill="#b57d26">p=2</text>
+  <text x="210" y="42" text-anchor="middle" font-size="10" fill="#e8a13a">p=3</text>
+  <path d="M 244,140 A 44,44 0 0 0 238.9,119.4" fill="none" stroke="#9b9281" stroke-width="1"/>
+  <text x="256" y="130" font-size="10.5" fill="#c1baa9">&#952;</text>
+  <text x="200" y="262" text-anchor="middle" font-size="11.5" fill="#c1baa9">position p turns each pair by p&#183;&#952;</text>
+  <text x="200" y="280" text-anchor="middle" font-size="10" fill="#9b9281">length unchanged &#8212; the information survives</text>
+
+  <!-- panel B: only the gap matters -->
+  <circle cx="540" cy="140" r="60" fill="none" stroke="#2a2620"/>
+  <line x1="540" y1="140" x2="573.5" y2="90.3" stroke="#6aa9c4" stroke-width="2" stroke-linecap="round" marker-end="url(#mB)"/>
+  <line x1="540" y1="140" x2="517.5" y2="84.4" stroke="#e8a13a" stroke-width="2" stroke-linecap="round" marker-end="url(#mA)"/>
+  <text x="580" y="84" font-size="10.5" fill="#6aa9c4">K</text>
+  <text x="504" y="78" font-size="10.5" fill="#e8a13a">Q</text>
+  <path d="M 563.5,105.2 A 42,42 0 0 0 524.3,101.1" fill="none" stroke="#9b9281" stroke-width="1"/>
+  <text x="543" y="106" text-anchor="middle" font-size="10" fill="#e8e2d2">2&#952;</text>
+  <text x="540" y="226" text-anchor="middle" font-size="10.5" fill="#9b9281">positions 4 &#38; 2</text>
+
+  <circle cx="730" cy="140" r="60" fill="none" stroke="#2a2620"/>
+  <line x1="730" y1="140" x2="672.3" y2="156.5" stroke="#6aa9c4" stroke-width="2" stroke-linecap="round" marker-end="url(#mB)"/>
+  <line x1="730" y1="140" x2="711.5" y2="197.1" stroke="#e8a13a" stroke-width="2" stroke-linecap="round" marker-end="url(#mA)"/>
+  <text x="660" y="152" text-anchor="end" font-size="10.5" fill="#6aa9c4">K</text>
+  <text x="716" y="212" font-size="10.5" fill="#e8a13a">Q</text>
+  <path d="M 689.6,151.6 A 42,42 0 0 0 717.0,179.9" fill="none" stroke="#9b9281" stroke-width="1"/>
+  <text x="704" y="168" text-anchor="middle" font-size="10" fill="#e8e2d2">2&#952;</text>
+  <text x="730" y="226" text-anchor="middle" font-size="10.5" fill="#9b9281">positions 9 &#38; 7</text>
+
+  <text x="635" y="262" text-anchor="middle" font-size="11.5" fill="#c1baa9">same 2&#952; gap &#8212; the score sees only relative distance</text>
+  <text x="635" y="280" text-anchor="middle" font-size="10" fill="#9b9281">rotations on Q and K cancel in the dot product</text>
+
+  <!-- dials: one position, three speeds -->
+  <text x="40" y="346" font-size="11" fill="#c1baa9">position 6, seen by</text>
+  <text x="40" y="364" font-size="11" fill="#c1baa9">three pair speeds:</text>
+
+  <circle cx="270" cy="352" r="30" fill="none" stroke="#2a2620"/>
+  <line x1="300" y1="352" x2="306" y2="352" stroke="#5b5547"/>
+  <line x1="270" y1="352" x2="257" y2="374.5" stroke="#e8a13a" stroke-width="2" stroke-linecap="round" marker-end="url(#mA)"/>
+  <text x="270" y="402" text-anchor="middle" font-size="10" fill="#9b9281">first pair &#8212; fast</text>
+
+  <circle cx="430" cy="352" r="30" fill="none" stroke="#2a2620"/>
+  <line x1="460" y1="352" x2="466" y2="352" stroke="#5b5547"/>
+  <line x1="430" y1="352" x2="438" y2="327.3" stroke="#e8a13a" stroke-width="2" stroke-linecap="round" marker-end="url(#mA)"/>
+  <text x="430" y="402" text-anchor="middle" font-size="10" fill="#9b9281">middle &#8212; slower</text>
+
+  <circle cx="590" cy="352" r="30" fill="none" stroke="#2a2620"/>
+  <line x1="620" y1="352" x2="626" y2="352" stroke="#5b5547"/>
+  <line x1="590" y1="352" x2="614.7" y2="344" stroke="#e8a13a" stroke-width="2" stroke-linecap="round" marker-end="url(#mA)"/>
+  <text x="590" y="402" text-anchor="middle" font-size="10" fill="#9b9281">last pair &#8212; slow</text>
+
+  <text x="680" y="340" font-size="10.5" fill="#c1baa9">freq = 1 / 10000^(i/48)</text>
+  <text x="680" y="360" font-size="9.5" fill="#5b5547">fast pairs tell neighbors apart,</text>
+  <text x="680" y="374" font-size="9.5" fill="#5b5547">slow pairs tell near from far</text>
+</svg>
