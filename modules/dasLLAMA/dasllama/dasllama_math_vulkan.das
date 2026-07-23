@@ -4468,12 +4468,12 @@ def vk_rdec_read_kv_bulk(l : int64; kp : float?; vp : float?; npos : int64) {
     verify(vk_moe_init())
     let kvd = g_rd.kv_dim
     var p0 = 0l
+    var raw = alloc_transient_cmd()   // re-recorded per chunk (the pool allows reset), freed below
     while (p0 < npos) {
         let rows = min(KV_READBACK_ROWS, npos - p0)
         let bytes = rows * kvd * 4l
         let off = ((l * g_rd.seq_cap) + p0) * kvd * 4l
         unsafe {
-            var raw = alloc_cmd()
             let begin = VkCommandBufferBeginInfo()
             vk_check(vkBeginCommandBuffer(raw, begin), null)
             cmd_copy_range(raw, g_rd.k_mirror, off, g_rd.kv_readback.buf, 0l, bytes)
@@ -4485,6 +4485,7 @@ def vk_rdec_read_kv_bulk(l : int64; kp : float?; vp : float?; npos : int64) {
         }
         p0 += rows
     }
+    free_transient_cmd(raw)
 }
 
 //! Batch-decode writeback: read layer `l`'s new K/V row at `pos` from the mirror back into the
@@ -4495,7 +4496,7 @@ def vk_rdec_read_kv(l, pos : int64; kp : float?; vp : float?) {
     let off = ((l * g_rd.seq_cap) + pos) * kvd * 4l
     verify(vk_moe_init())
     unsafe {
-        var raw = alloc_cmd()
+        var raw = alloc_transient_cmd()
         let begin = VkCommandBufferBeginInfo()
         vk_check(vkBeginCommandBuffer(raw, begin), null)
         cmd_copy_range(raw, g_rd.k_mirror, off, g_rd.kv_readback.buf, 0l, kvd * 4l)
@@ -4504,6 +4505,7 @@ def vk_rdec_read_kv(l, pos : int64; kp : float?; vp : float?) {
         submit_wait(raw)
         memcpy(reinterpret<void?>(kp), g_rd.kv_readback.mapped, int(kvd * 4l))
         memcpy(reinterpret<void?>(vp), reinterpret<float?>(g_rd.kv_readback.mapped) + kvd, int(kvd * 4l))
+        free_transient_cmd(raw)
     }
 }
 
@@ -4795,7 +4797,9 @@ def vk_arena_gemv(var y : array<float>; blk : int64; n, d : int64; fmt : int; xq
     }
 }
 
-def private alloc_cmd : VkCommandBuffer {
+// One-shot command buffers (the KV readback rails) are freed by their caller — registering them
+// in model_cmds would grow it per hydration until the next model drop.
+def private alloc_transient_cmd : VkCommandBuffer {
     var ai = VkCommandBufferAllocateInfo()
     ai.commandPool = boost_value_to_vk(g_gpu.pool)
     ai.level = VkCommandBufferLevel.PRIMARY
@@ -4804,6 +4808,17 @@ def private alloc_cmd : VkCommandBuffer {
     unsafe {
         vk_check(vkAllocateCommandBuffers(dev_raw(), ai, addr(raw)), null)
     }
+    return raw
+}
+
+def private free_transient_cmd(var raw : VkCommandBuffer) {
+    unsafe {
+        vkFreeCommandBuffers(dev_raw(), boost_value_to_vk(g_gpu.pool), 1u, addr(raw))
+    }
+}
+
+def private alloc_cmd : VkCommandBuffer {
+    var raw = alloc_transient_cmd()
     g_gpu.model_cmds |> push(raw)   // all persistent cmds are model-owned; freed by the model drop
     return raw
 }

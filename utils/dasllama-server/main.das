@@ -387,6 +387,7 @@ def apply_config(var cfg : ServerArgs) : bool {
         let mv = root?["models"]
         if (mv != null && mv.value is _array) {
             var have_default = false
+            var seen_routes : table<string>
             for (e in mv.value as _array) {
                 let has_mtp = e != null && (e.value is _object) && key_exists(e.value as _object, "mtp")
                 var ent = ModelEntry(
@@ -410,7 +411,13 @@ def apply_config(var cfg : ServerArgs) : bool {
                 if (empty(ent.path)) {
                     to_log(LOG_WARNING, "dasllama-server: [[models]] entry with no path — skipped\n")
                 } else {
-                    g_models |> push(ent)
+                    let route = empty(ent.name) ? base_name(ent.path) : ent.name
+                    if (key_exists(seen_routes, route)) {
+                        to_log(LOG_WARNING, "dasllama-server: duplicate [[models]] name '{route}' — entry skipped (requests route on the first)\n")
+                    } else {
+                        seen_routes |> insert(route)
+                        g_models |> push(ent)
+                    }
                 }
             }
             g_cfg_sources["models"] = "toml"
