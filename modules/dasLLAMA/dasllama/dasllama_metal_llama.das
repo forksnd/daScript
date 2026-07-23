@@ -1625,7 +1625,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
     var cb = metal_new_command_buffer_unretained(g_queue)
     let conc = decode_concurrent() && empty(g_skip)
     var enc = conc ? metal_new_compute_encoder_concurrent(cb) : metal_new_compute_encoder(cb)
-    hz_arm(conc)
+    gr_arm(conc)   // capture the step as a graph; graph_flush replays it in schedule order
     let hz_d0 = conc ? metal_dispatch_calls() : 0l
     let hz_g0 = g_hz_gated
     if (r.spec) {
@@ -1657,9 +1657,9 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
         encode_cls_tail(t, r, enc, t.rms_final_off)
     }
     if (conc) {
+        graph_flush(enc)
         hz_coverage_check(metal_dispatch_calls() - hz_d0, g_hz_gated - hz_g0)
     }
-    hz_arm(false)
     metal_end_encoding(enc)
     metal_release(enc)
     if (commit_now) {

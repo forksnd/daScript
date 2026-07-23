@@ -1276,25 +1276,25 @@ var g_hz_undeclared = 0l            // conservative fallbacks taken (0 once migr
 var g_hz_cover_warned = false
 
 def hz_read(b : MetalBuffer?; off, len : uint64) {
-    if (g_hz_on && b != null) {
+    if ((g_hz_on || g_gr_on) && b != null) {
         g_hz_stage |> push(MemRange(buf = intptr(b), p0 = off, p1 = off + len, dst = false))
     }
 }
 
 def hz_read(b : MetalBuffer?) {
-    if (g_hz_on && b != null) {
+    if ((g_hz_on || g_gr_on) && b != null) {
         g_hz_stage |> push(MemRange(buf = intptr(b), p0 = 0ul, p1 = HZ_WHOLE, dst = false))
     }
 }
 
 def hz_write(b : MetalBuffer?; off, len : uint64) {
-    if (g_hz_on && b != null) {
+    if ((g_hz_on || g_gr_on) && b != null) {
         g_hz_stage |> push(MemRange(buf = intptr(b), p0 = off, p1 = off + len, dst = true))
     }
 }
 
 def hz_write(b : MetalBuffer?) {
-    if (g_hz_on && b != null) {
+    if ((g_hz_on || g_gr_on) && b != null) {
         g_hz_stage |> push(MemRange(buf = intptr(b), p0 = 0ul, p1 = HZ_WHOLE, dst = true))
     }
 }
@@ -1348,6 +1348,128 @@ def hz_arm(on : bool) {
     g_hz_stage |> clear()
     g_hz_pend |> clear()
     g_hz_dirty = false
+}
+
+// ===== the step graph (the dispatch port, session 2) =====
+// Graph mode: the kn_* twins RECORD each dispatch as a KNode; graph_flush replays in schedule
+// order with the hz oracle deriving barriers — a schedule can only change speed, not correctness.
+
+struct KNode {
+    pso : MetalComputePipeline?
+    grid : uint3
+    tg : uint3
+    tgmem : uint64   // threadgroup memory bytes at index 0 (0 = none)
+    bind0 : int      // g_gr_binds slice
+    nbind : int
+    range0 : int     // g_gr_ranges slice (the hz declarations)
+    nrange : int
+}
+
+struct KBind {
+    buf : MetalBuffer?
+    off : uint64
+    slot : int
+}
+
+var g_gr_on = false
+var g_gr_nodes : array<KNode>
+var g_gr_binds : array<KBind>
+var g_gr_ranges : array<MemRange>
+var g_gr_open = false            // a node is being built (kn_pipeline .. kn_dispatch)
+
+def kn_pipeline(enc : MetalComputeEncoder?; pso : MetalComputePipeline?) {
+    if (!g_gr_on) {
+        metal_set_pipeline(enc, pso)
+        return
+    }
+    // the helpers hold handles as const params; the node stores for deferred encoding only —
+    // nothing writes through these, the strip is capture-side plumbing
+    g_gr_nodes |> push(KNode(pso = unsafe(reinterpret<MetalComputePipeline?>(pso)),
+        bind0 = length(g_gr_binds), range0 = length(g_gr_ranges)))
+    g_gr_open = true
+}
+
+def kn_buffer(enc : MetalComputeEncoder?; b : MetalBuffer?; off : uint64; slot : int) {
+    if (!g_gr_on) {
+        metal_set_buffer(enc, b, off, slot)
+        return
+    }
+    g_gr_binds |> push(KBind(buf = unsafe(reinterpret<MetalBuffer?>(b)), off = off, slot = slot))
+}
+
+def kn_tgmem(enc : MetalComputeEncoder?; bytes : uint64; idx : int) {
+    if (!g_gr_on) {
+        metal_set_threadgroup_memory_length(enc, bytes, idx)
+        return
+    }
+    g_gr_nodes[length(g_gr_nodes) - 1].tgmem = bytes
+}
+
+def kn_dispatch(enc : MetalComputeEncoder?; grid, tg : uint3) {
+    if (!g_gr_on) {
+        metal_dispatch_threadgroups(enc, grid, tg)
+        return
+    }
+    let i = length(g_gr_nodes) - 1
+    assert(g_gr_open)
+    g_gr_nodes[i].grid = grid
+    g_gr_nodes[i].tg = tg
+    g_gr_nodes[i].nbind = length(g_gr_binds) - g_gr_nodes[i].bind0
+    // the helper's hz declarations become the node's ranges (hz_gate no-ops in graph mode)
+    g_gr_ranges |> push_from(g_hz_stage)
+    g_hz_stage |> clear()
+    g_gr_nodes[i].nrange = length(g_gr_ranges) - g_gr_nodes[i].range0
+    g_gr_open = false
+}
+
+def gr_arm(on : bool) {
+    g_gr_on = on
+    g_gr_nodes |> clear()
+    g_gr_binds |> clear()
+    g_gr_ranges |> clear()
+    g_gr_open = false
+    g_hz_stage |> clear()
+}
+
+// encode one captured node with the hz oracle deciding the barrier in front of it
+def private gr_encode_node(enc : MetalComputeEncoder?; n : KNode) {
+    g_hz_stage |> reserve(n.nrange)
+    for (r in range(n.nrange)) {
+        g_hz_stage |> push(g_gr_ranges[n.range0 + r])
+    }
+    metal_set_pipeline(enc, n.pso)
+    if (n.tgmem > 0ul) {
+        metal_set_threadgroup_memory_length(enc, n.tgmem, 0)
+    }
+    for (b in range(n.nbind)) {
+        let kb = g_gr_binds[n.bind0 + b]
+        metal_set_buffer(enc, kb.buf, kb.off, kb.slot)
+    }
+    hz_gate(enc)
+    metal_dispatch_threadgroups(enc, n.grid, n.tg)
+}
+
+def graph_flush(enc : MetalComputeEncoder?) {
+    let ident : array<int>
+    graph_flush(enc, ident)
+}
+
+//! Replay the captured step graph onto `enc` in `order` (empty = capture order), the hz oracle
+//! deriving barriers per step — a schedule permutation can only change speed, never correctness.
+def graph_flush(enc : MetalComputeEncoder?; order : array<int>) {
+    g_gr_on = false
+    hz_arm(true)
+    if (empty(order)) {
+        for (n in g_gr_nodes) {
+            gr_encode_node(enc, n)
+        }
+    } else {
+        assert(length(order) == length(g_gr_nodes))
+        for (i in order) {
+            gr_encode_node(enc, g_gr_nodes[i])
+        }
+    }
+    hz_arm(false)
 }
 
 // the coverage check: every dispatch on a gated encoder must have passed hz_gate — a raw
