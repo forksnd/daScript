@@ -387,6 +387,9 @@ what it costs today and what the fix would change.
   bypass loud, DASLLAMA_METAL_HAZARD_PARANOID isolates the encoder flip. Measured on the 26B
   Q4_K_M chase (full arm, best of 3): @8 63.08 -> 65.78 t/s (+4.3%), gpu 15.81 -> 15.11ms; @512
   58.42 -> 60.84 t/s (+4.1%), gpu 17.07 -> 16.40ms; barriers 780/811 implicit -> 634/665 real.
+  DEFAULT flipped ON after the family gates (llama arm13 strict, arm7 q8/tq4, gemma4moe both
+  rows, qwen35/qwen35moe, gptoss, gemma4e — all green under CONCURRENT+STRICT); 12B Q4_K_M spot
+  pair confirms: @8 35.05 -> 36.31 t/s (+3.6%, gpu -0.83ms), @512 32.37 -> 33.34 (+3.0%, -0.88ms).
   The barrier floor is the PROGRAM-ORDER chain depth (~19 genuine links/layer on the g4 graph:
   qkv triple, we1||we3, pre_ffn2||router_norm, post_ffn2||shared-w13sw group — everything else
   chains); the original -1.5ms/<150-barrier bars need Session 2's load-time reorder + separate
