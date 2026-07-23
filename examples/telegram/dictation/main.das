@@ -47,6 +47,7 @@ struct DictationArgs {
 
 struct DictationConfig {
     server : string = "http://127.0.0.1:8080"   // dasllama-server base URL (needs asr = in ITS config)
+    model : string = ""               // served model to pin requests to ("" = the server's default slot)
     bot_token : string                // Telegram bot token (TELEGRAM_BOT_TOKEN env overrides)
     prompt : string = ""              // legacy name for dictation_prompt
     dictation_prompt : string = ""    // transcript-repair prompt; \{language\} or \{lang\} is replaced
@@ -162,6 +163,7 @@ struct CadmusToolDefinition {
 }
 
 struct CadmusChatRequest {
+    @optional model : string          // routes to that server slot; omitted = the default slot
     temperature : float
     top_k : int
     top_p : float
@@ -310,6 +312,7 @@ def load_config(path : string; var err : string&) : DictationConfig {
         return cfg
     }
     cfg.server        = js?["server"] ?? cfg.server
+    cfg.model         = js?["model"] ?? cfg.model
     cfg.bot_token     = js?["bot_token"] ?? cfg.bot_token
     cfg.prompt        = js?["prompt"] ?? cfg.prompt
     cfg.dictation_prompt = js?["dictation_prompt"] ?? cfg.dictation_prompt
@@ -651,6 +654,7 @@ def private server_complete(
                             var tool_calls : array<CadmusToolCall>&
                             ) : bool {
     var request_body = CadmusChatRequest(
+        model = g_cfg.model,
         temperature = settings.temperature,
         top_k = settings.top_k,
         top_p = settings.top_p,
@@ -2095,6 +2099,8 @@ def poll_once(var offset : int64&; timeout : int) {
 
 // The server must be up AND have an ASR model loaded (asr = in ITS config) — /v1/models lists a
 // "<model>-asr" entry when it does. A clear startup error beats a 404 on the first voice note.
+// With a multi-model server, `model =` in the bot config pins requests to that slot; the pin is
+// verified against the served ids here so a typo fails at startup, not on the first voice note.
 def private check_server(var out_llm : string&; var out_asr : bool&; var err : string&) : bool {
     var ok = false
     GET("{g_cfg.server}/v1/models") $(resp) {
@@ -2108,21 +2114,38 @@ def private check_server(var out_llm : string&; var out_asr : bool&; var err : s
             if (js == null) {
                 err = "bad /v1/models JSON: {perr}"
             } else {
+                var ids : array<string>
                 let data = js?["data"]
                 if (data != null && data is _array) {
                     for (m in data as _array) {
                         let mid : string = m?["id"] ?? ""
                         if (ends_with(mid, "-asr")) {
                             out_asr = true
-                        } elif (empty(out_llm)) {
-                            out_llm = mid
+                        } else {
+                            ids |> push(mid)
                         }
                     }
                 }
-                ok = !empty(out_llm)
-                if (!ok) {
-                    err = "dasllama-server at {g_cfg.server} lists no model"
+                if (empty(g_cfg.model)) {
+                    out_llm = !empty(ids) ? ids[0] : ""
+                    ok = !empty(out_llm)
+                    if (!ok) {
+                        err = "dasllama-server at {g_cfg.server} lists no model"
+                    }
+                } else {
+                    for (mid in ids) {
+                        if (mid == g_cfg.model) {
+                            ok = true
+                        }
+                    }
+                    if (ok) {
+                        out_llm = g_cfg.model
+                    } else {
+                        err = ("model '{g_cfg.model}' is not served at {g_cfg.server} — " +
+                               "/v1/models lists: {join(ids, ", ")}")
+                    }
                 }
+                delete ids
                 unsafe {
                     delete js
                 }
