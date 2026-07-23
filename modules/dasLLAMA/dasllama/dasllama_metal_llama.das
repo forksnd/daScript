@@ -919,11 +919,19 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                     var bw_pf2 = upload_region(addr < void? >(t.fblob[t.rms_post_ffn2_off + l * dim]), uint64(dim * 4l))
                     enc_rms(enc, r.bmoe_rt, bw_pf2, r.bmoe_rt, r.u_dim, r.u_eps)
                 }
+                let sh_w13_q8 = kq_fmt_at(t.w1_fmt, l) == KqFmt.q8 && kq_fmt_at(t.w3_fmt, l) == KqFmt.q8
                 if (g_skip != "gemv") {
-                    enc_site_gemv(enc, t, kq_fmt_at(t.w1_fmt, l), t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
-                    enc_site_gemv(enc, t, kq_fmt_at(t.w3_fmt, l), t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
+                    if (sh_w13_q8) {
+                        // fused shared-branch gate+up + gelu (extends the dense w13sw fusion to the g4 shexp)
+                        let bw1 = blob_of(g_dev, t, t.w1_offs[l])
+                        enc_gemv_w13sw(enc, bw1.buf, bw1.boff, uint64((t.w3_offs[l] / 32l) * 34l),
+                            r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden, geglu ? r.u_one32 : r.u_zero32)
+                    } else {
+                        enc_site_gemv(enc, t, kq_fmt_at(t.w1_fmt, l), t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
+                        enc_site_gemv(enc, t, kq_fmt_at(t.w3_fmt, l), t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
+                    }
                 }
-                if (g_skip != "ew") {
+                if (g_skip != "ew" && !sh_w13_q8) {
                     enc_ew2(enc, g_pso_geglu, r.bh12, 0ul, r.bh12, uint64(hidden * 4l), r.u_hidden, hidden)
                 }
                 if (g_skip != "gemv") {
