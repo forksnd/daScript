@@ -826,12 +826,19 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
         }
         // ffn: [post-attn norm ->] fused add+norm -> W1|W3 -> swiglu/geglu -> W2 [-> post-ffn norm] -> fused add + next attn norm (pre_post_norm norms IN PLACE — the CPU order)
         if (g_skip != "ew") {
+            var bw_ffn = upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
             if (c.pre_post_norm) {
                 var bw_pa = upload_region(addr < void? >(t.fblob[t.rms_post_att_off + l * dim]), uint64(dim * 4l))
-                enc_rms(enc, r.bxb2, bw_pa, r.bxb2, r.u_dim, r.u_eps)
+                if (decode_fuse_pre()) {
+                    // post_attn_rms + add_rms collapse to one dispatch (R1 chain-depth fusion)
+                    enc_pre_add_rms_site(enc, r.bx, r.bxb2, bw_pa, bw_ffn, r.bxb, r.u_dim, r.u_eps, dim)
+                } else {
+                    enc_rms(enc, r.bxb2, bw_pa, r.bxb2, r.u_dim, r.u_eps)
+                    enc_add_rms_site(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, dim)
+                }
+            } else {
+                enc_add_rms_site(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, dim)
             }
-            var bw_ffn = upload_region(addr < void? >(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
-            enc_add_rms_site(enc, r.bx, r.bxb2, bw_ffn, r.bxb, r.u_dim, r.u_eps, dim)
         }
         if (r.moe) {
             // router -> select -> experts -> combine; g4 = gemma4's parallel-dense form
@@ -1620,6 +1627,24 @@ def private decode_concurrent : bool {
 //! negative restores the env default (`DASLLAMA_METAL_DECODE_CONCURRENT`).
 def public set_metal_decode_concurrent(v : int) {
     g_dconc = v < 0 ? -1 : (v != 0 ? 1 : 0)
+}
+
+// DASLLAMA_METAL_FUSE (default ON): the R1 epilogue-fusion kernel MetalPreAddRms (post_attn_rms +
+// add_rms, the pre_post_norm path) — off restores the separate per-op dispatches for A/B. (The g4
+// post_ffn1_rms+add fusion was measured and REFUTED, −1.0% on the 26B — see the ledger.)
+var private g_dfuse = -1
+
+def private decode_fuse_pre : bool {
+    if (g_dfuse < 0) {
+        g_dfuse = env_int("DASLLAMA_METAL_FUSE", 1)
+    }
+    return g_dfuse != 0
+}
+
+//! Epilogue-fusion rail for the single-stream decode: 1 forces on, 0 forces the separate
+//! per-op dispatches, negative restores the env default (`DASLLAMA_METAL_FUSE`).
+def public set_metal_decode_fuse(v : int) {
+    g_dfuse = v < 0 ? -1 : (v != 0 ? 1 : 0)
 }
 
 // encode the whole step (prologue rms, n_layers fused blocks, optional GPU classifier) into a

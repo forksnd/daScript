@@ -400,9 +400,30 @@ what it costs today and what the fix would change.
   vs serial @8 +9.7%/-1.41ms (das now well ahead of lcpp stock 58.50 same-window); barriers
   634->574 (the split's 2 levels/layer; leveling found nothing else — depth 574 IS the true
   chain). 12B (dense, no branch): unchanged, as expected. 26B/qwen35moe tolerance cells
-  byte-identical maxd under STRICT; llama arm1/7/13 token-exact. Remaining depth is FUSION
-  territory (lcpp prices it +1.46ms): wo+post_attn+add_rms and the g4 rms tails as fused
-  kernels would cut 2-4 levels/layer — new-MSL, ledger-class. Still open from the plan: the
+  byte-identical maxd under STRICT; llama arm1/7/13 token-exact.
+  **R1 ew-FUSION MEASURED (2026-07-23): one kernel ships, one refuted — the barrier lever has a
+  sub-1% ceiling on the MoE-bound 26B.** MetalPreAddRms collapses the pre_post_norm epilogue
+  post_attn_rms + add_rms into one dispatch (enc_pre_add_rms_site: two register reductions, x
+  staged for the trailing norm; bit-identical to the pair — reduction structure copied from
+  metal_rmsnorm/add_rms, the one reordered product is IEEE-multiply-commutative). DEFAULT ON via
+  DASLLAMA_METAL_FUSE; chase `nofuse` A/B arm. Correctness: gemma3 token-exact (pre_post_norm
+  fires it), gemma4moe-26b tolerance maxd byte-identical to baseline. 26B Q4_K_M 3-arm interleaved
+  chase (full/fuse1/nofuse — Parsec-active, read the DELTA): **fuse1 vs nofuse +0.35% @8 / +0.37%
+  @512, gpu -0.05ms, barriers 574->544 (-30 = one collapsed level/layer x 30 layers)** — small but
+  consistent + reusable capability (larger on dense gemma: shorter chain, 30 barriers a bigger
+  fraction). The SECOND fusion, MetalRmsAdd on the g4 dense-shared post_ffn1_rms + add, was
+  authored, correctness-proven, and **REFUTED** by the same run: **-1.0% at both depths and
+  DETERMINISTICALLY 0 barrier reduction** (720 vs 750 disp but 544 = 544 bar) — that tail is on the
+  SHARED branch, which the leveler already overlaps with the longer routed branch, so fusing rms
+  (inputs ready early) with the add (needs bmoe_rt, ready late) SERIALIZES the reduction behind the
+  routed branch it used to overlap. Reverted; kept as this ledger's negative control. **LESSON:
+  barrier COUNT isn't the whole story — a fusion OFF the critical path can't help and can hurt by
+  moving a bigger node into a later, tighter level; and the 26B's barrier lever is bounded (~sub-1%)
+  because the GPU is routed-GEMV-bandwidth-bound (round-1 dig), not barrier-bound.** Implication
+  for the plan's R2-R5: the [metal_dispatch] macro lens stays worth it as CAPABILITY/eDSL, but the
+  fusion+reorder PERF upside on this MoE model is small — the candidate deeper fusions
+  (router_norm+router, swiglu+we2) hit the same norm-into-GEMV grid-wide-dep wall or need the GEMV
+  kernel itself to fuse the activation (ledger-class). Still open from the plan: the
   [metal_dispatch] macro lens (generated builders + compile-time completeness), [tune]
   schedule axes (thin until fusion adds real choices), batch-rail unification;
   (2) the q51 w2 MoE kernel at 224 wGB/s in-lab —

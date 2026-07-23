@@ -25,6 +25,8 @@ require daslib/strings_boost   // nolint:STYLE030 — used only inside the Apple
 //   nomoesh   minus the dense-shared branch GEMVs only (g4 shared FFN / qwen35moe shexp)
 //   noqkv     minus the attention input GEMVs only (wq/wk/wv or the fused QKV dispatch)
 //   nowo      minus the attention output projection GEMV only
+//   nofuse    the R1 epilogue-fusion kernel OFF (separate norm/add dispatches) — concurrent +
+//             graph stay ON, so full-vs-nofuse is the clean fused-vs-unfused A/B (bar/step + t/s)
 // Knockout arms compute GARBAGE tokens by design; timing is shape-bound, not data-bound. Each
 // window is preceded by one unclocked step that absorbs the mirror's rewind re-upload (windows
 // restart at the same depth, so pos < watermark fires every time) and the first-touch region
@@ -96,6 +98,7 @@ def private apply_arm(arm) {   // untyped param = generic — non-Apple builds n
         (arm == "nomoert" ? "moe_rt" : (arm == "nomoesh" ? "moe_sh" : (arm == "noqkv" ? "qkv" :
         (arm == "nowo" ? "wo" : "")))))))
     set_metal_decode_logits_cpu(arm == "nologits")
+    set_metal_decode_fuse(arm == "nofuse" ? 0 : -1)   // A/B the R1 epilogue-fusion kernel (concurrent+graph stay on)
 }
 
 // one timed window: unclocked pre-step at `depth` (absorbs the rewind re-upload), then n greedy

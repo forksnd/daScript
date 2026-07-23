@@ -2017,6 +2017,82 @@ class MetalAddRms {
     }
 }
 
+// Fused post-attn-norm + residual add + ffn-norm: a_n = rms(a)·wpa; x += a_n; y = rms(x)·wffn — one
+// dispatch collapsing the pre_post_norm chain (enc_rms(a) + enc_add_rms_site) with two register
+// reductions, no inter-dispatch barrier. x is staged for the trailing norm; same slab cap as MetalAddRms.
+class MetalPreAddRms {
+    @ssbo @binding = 0 x : array<float>     // [dim] residual stream, add target + written back
+    @ssbo @binding = 1 a : array<float>     // [dim] attn out (post-wo); normed by wpa before the add
+    @ssbo @binding = 2 wpa : array<float>   // [dim] post-attention norm weight
+    @ssbo @binding = 3 wffn : array<float>  // [dim] ffn norm weight
+    @ssbo @binding = 4 y : array<float>     // [dim] ffn-normed out
+    @uniform @binding = 5 dim : uint
+    @uniform @binding = 6 eps : float
+    @workgroup xrow : float[4096]           // == ADD_RMS_MAX_DIM — stages x for the trailing norm
+    @workgroup partial : float[32]          // one per simdgroup at the 1024-thread dispatch
+    @workgroup inv_sh : float
+
+    [metal_kernel(name="metal_pre_add_rms_msl")]
+    def metal_pre_add_rms {
+        let lid = gl_LocalInvocationID.x
+        // reduction 1: mean(a²) → inv_a
+        var ssa = 0.0
+        var k = lid
+        while (k < dim) {
+            let av = a[k]
+            ssa += av * av
+            k += gl_WorkGroupSize.x
+        }
+        ssa = simd_sum(ssa)
+        if (gl_SubgroupInvocationID == 0u) {
+            partial[gl_SubgroupID] = ssa
+        }
+        barrier()
+        if (lid == 0u) {
+            var tot = 0.0
+            var sgi = 0u
+            while (sgi < gl_NumSubgroups) {
+                tot += partial[sgi]
+                sgi++
+            }
+            inv_sh = rsqrt(tot / float(dim) + eps)
+        }
+        barrier()
+        let inva = inv_sh
+        // x += a·inva·wpa; stage x; reduction 2: mean(x²) → inv_x
+        var ssx = 0.0
+        k = lid
+        while (k < dim) {
+            let xv = x[k] + a[k] * inva * wpa[k]
+            x[k] = xv
+            xrow[k] = xv
+            ssx += xv * xv
+            k += gl_WorkGroupSize.x
+        }
+        ssx = simd_sum(ssx)
+        if (gl_SubgroupInvocationID == 0u) {
+            partial[gl_SubgroupID] = ssx
+        }
+        barrier()
+        if (lid == 0u) {
+            var tot = 0.0
+            var sgi = 0u
+            while (sgi < gl_NumSubgroups) {
+                tot += partial[sgi]
+                sgi++
+            }
+            inv_sh = rsqrt(tot / float(dim) + eps)
+        }
+        barrier()
+        let invx = inv_sh
+        k = lid
+        while (k < dim) {
+            y[k] = wffn[k] * (xrow[k] * invx)
+            k += gl_WorkGroupSize.x
+        }
+    }
+}
+
 // Fused rope + KV-row store, one thread per rotation pair (ntok == 1): q pairs rope in place; k
 // pairs rope straight into the mirror K row (±65504 clamp) and the same thread copies its V pair.
 // Replaces the rope_qk + kv_store dispatch pair.
@@ -5676,6 +5752,7 @@ var g_gemv_rows = 4l                       // rows (simdgroups) per GEMV threadg
 var g_pso_rms : MetalComputePipeline?
 var g_pso_add : MetalComputePipeline?
 var g_pso_addrms : MetalComputePipeline?
+var g_pso_preaddrms : MetalComputePipeline?
 var g_pso_swiglu : MetalComputePipeline?
 var g_pso_geglu : MetalComputePipeline?
 var g_pso_softcap : MetalComputePipeline?
@@ -5809,6 +5886,7 @@ def metal_decode_init : bool {
     g_pso_rms = compile_pso(metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, ok)
     g_pso_add = compile_pso(metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath, ok)
     g_pso_addrms = compile_pso(metal_add_rms_msl, metal_add_rms_msl_entry, metal_add_rms_msl_fastmath, ok)
+    g_pso_preaddrms = compile_pso(metal_pre_add_rms_msl, metal_pre_add_rms_msl_entry, metal_pre_add_rms_msl_fastmath, ok)
     g_pso_swiglu = compile_pso(metal_swiglu_msl, metal_swiglu_msl_entry, metal_swiglu_msl_fastmath, ok)
     g_one = metal_new_buffer(g_dev, 4ul)
     unsafe {
@@ -6669,6 +6747,33 @@ def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Me
     }
 }
 
+// Fused post-attn-norm + residual add + ffn-norm for pre_post_norm models: a = rms(a)·wpa in place,
+// x += a, y = rms(x)·wffn — one dispatch collapsing enc_rms(a) + enc_add_rms_site. Falls back to the
+// separate pair past the slab cap. `ba` is normed in place (matches the un-fused enc_rms(a) write).
+def enc_pre_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bwpa, bwffn, by, bdim, beps : MetalBuffer?; dim : int64) {
+    if (dim <= ADD_RMS_MAX_DIM) {
+        kn_pipeline(enc, g_pso_preaddrms)
+        kn_tgmem(enc, metal_pre_add_rms_msl_tgmem, 0)
+        kn_buffer(enc, bx, 0ul, 0)
+        kn_buffer(enc, ba, 0ul, 1)
+        kn_buffer(enc, bwpa, 0ul, 2)
+        kn_buffer(enc, bwffn, 0ul, 3)
+        kn_buffer(enc, by, 0ul, 4)
+        kn_buffer(enc, bdim, 0ul, 5)
+        kn_buffer(enc, beps, 0ul, 6)
+        hz_read(ba)
+        hz_write(ba)   // a is re-normed in place before the add
+        hz_read(bx)
+        hz_write(bx)   // the residual add persists (x += rms(a))
+        hz_write(by)
+        hz_gate(enc)
+        kn_dispatch(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
+    } else {
+        enc_rms(enc, ba, bwpa, ba, bdim, beps)
+        enc_add_rms_site(enc, bx, ba, bwffn, by, bdim, beps, dim)
+    }
+}
+
 def enc_attn(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; koff, voff : uint64;
              bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
     kn_pipeline(enc, f16 ? g_pso_attn16 : g_pso_attn32)
@@ -7394,6 +7499,10 @@ def metal_kernels_release {
     if (g_pso_addrms != null) {
         metal_release(g_pso_addrms)
         g_pso_addrms = null
+    }
+    if (g_pso_preaddrms != null) {
+        metal_release(g_pso_preaddrms)
+        g_pso_preaddrms = null
     }
     if (g_one != null) {
         metal_release(g_one)
