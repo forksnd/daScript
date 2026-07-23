@@ -754,11 +754,13 @@ class MetalMoeGemvQ8 {
 }
 
 // Expert-indexed Q4_K GEMV — MetalKqGemvK4's dot; the superblock index shifts by sel[slot] * esb.
+// x rides a float4 view: the 32-scalar-x-load form was load-issue-bound at the routed expert
+// shapes (nfe-row planes) — the vector view is 2.25x there (lab: bench_metal_moe_lab, 142→321 wGB/s).
 class MetalMoeGemvK4 {
     @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
     @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
     @ssbo @binding = 2 kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
-    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 3 x4 : array<float4>   // activations, float4 view (every x stride is % 4)
     @ssbo @binding = 4 y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
@@ -788,17 +790,33 @@ class MetalMoeGemvK4 {
         var sumf : float[2]
         var ib = ix
         while (ib < nb) {
-            let yb = xoff + ib * 256u + iq * 64u + ir * 8u
+            let yb4 = (xoff + ib * 256u + iq * 64u + ir * 8u) / 4u
             var sumy : float[4]
-            for [unroll_full] (i in range(8)) {
-                yl[i] = x[yb + uint(i)]
-                sumy[0] += yl[i]
-                yl[i + 8] = x[yb + 32u + uint(i)]
-                sumy[1] += yl[i + 8]
-                yh[i] = x[yb + 128u + uint(i)]
-                sumy[2] += yh[i]
-                yh[i + 8] = x[yb + 160u + uint(i)]
-                sumy[3] += yh[i + 8]
+            for [unroll_full] (h in range(4)) {   // h: yl lo/hi, yh lo/hi — float4 pairs at 0/8/32/40
+                let xi = yb4 + (h < 2 ? uint(h) * 8u : 16u + uint(h) * 8u)
+                let va = x4[xi]
+                let vb = x4[xi + 1u]
+                let o = (h % 2) * 8
+                if (h < 2) {   // constant under unroll_full — folds per iteration
+                    yl[o] = va.x
+                    yl[o + 1] = va.y
+                    yl[o + 2] = va.z
+                    yl[o + 3] = va.w
+                    yl[o + 4] = vb.x
+                    yl[o + 5] = vb.y
+                    yl[o + 6] = vb.z
+                    yl[o + 7] = vb.w
+                } else {
+                    yh[o] = va.x
+                    yh[o + 1] = va.y
+                    yh[o + 2] = va.z
+                    yh[o + 3] = va.w
+                    yh[o + 4] = vb.x
+                    yh[o + 5] = vb.y
+                    yh[o + 6] = vb.z
+                    yh[o + 7] = vb.w
+                }
+                sumy[h] = va.x + va.y + va.z + va.w + vb.x + vb.y + vb.z + vb.w
             }
             for [unroll_full] (r in range(2)) {
                 let blk = eb + (first_row + uint(r)) * nb + ib
