@@ -242,22 +242,26 @@ Run any tutorial from the project root::
 dasLLAMA (CPU LLM Inference) Tutorials
 ======================================
 
-These tutorials cover the ``dasllama`` module — CPU large-language-model
-inference in pure daslang: loading GGUF models, tokenization, streaming
-generation, chat with templates, sampling, sessions and memory, performance,
-and the architecture registry. Everything is written against the public
-``dasllama/dasllama`` facade.
+Tutorial 00 states the problem with a complete, minimal Llama-2 inference
+engine over a tiny llama2.c checkpoint. The remaining tutorials cover the
+``dasllama`` module — CPU large-language-model inference in pure daslang:
+loading GGUF models, tokenization, streaming generation, chat with templates,
+sampling, sessions and memory, performance, and the architecture registry.
+Tutorial 01 onward is written against the public ``dasllama/dasllama`` facade.
 
-You'll need a GGUF model file on disk (models are not shipped with the repo) —
-a good tiny one is `SmolLM2-135M-Instruct Q8_0
+For tutorials 01 onward, you'll need a GGUF model file on disk (models are not
+shipped with the repo) — a good tiny one is `SmolLM2-135M-Instruct Q8_0
 <https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF>`_ (~145 MB).
-Run from the project root, always with ``-jit``::
+dasLLAMA's tuning framework intentionally requires the JIT; interpreted and
+AOT execution are not supported. Run those tutorials from the project root
+with ``-jit``::
 
    daslang.exe -jit tutorials/dasLLAMA/01_hello_generate.das -- path/to/model.gguf
 
 .. toctree::
    :maxdepth: 1
 
+   tutorials/dasLLAMA_00_problem_statement.rst
    tutorials/dasLLAMA_01_hello_generate.rst
    tutorials/dasLLAMA_02_chat.rst
    tutorials/dasLLAMA_03_sampling.rst

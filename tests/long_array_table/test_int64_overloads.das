@@ -147,3 +147,58 @@ def test_array_view_int64(t : T?) {
     t |> equal(observed[1], 300)
     t |> equal(observed[2], 400)
 }
+
+[test]
+def test_array_view_borrowed_subview(t : T?) {
+    let values <- [10, 20, 30, 40]
+    array_view(values, 0, length(values)) $(whole : array<int>#) {
+        array_view(whole, 1, 2) $(middle : array<int>#) {
+            t |> equal(length(middle), 2)
+            t |> equal(middle[0], 20)
+            t |> equal(middle[1], 30)
+        }
+        array_view(whole, length(whole), 0) $(empty : array<int>#) {
+            t |> equal(length(empty), 0)
+        }
+    }
+}
+
+[test]
+def test_array_view_typed_bytes(t : T?) {
+    let bytes <- [
+        uint8(1), uint8(0), uint8(0), uint8(0),
+        uint8(0xFE), uint8(0xFF), uint8(0xFF), uint8(0xFF)
+    ]
+    array_view(bytes, 0, 2, type<int>) $(values : array<int>#) {
+        t |> equal(length(values), 2)
+        t |> equal(values[0], 1)
+        t |> equal(values[1], -2)
+    }
+    array_view(bytes, 0_l, long_length(bytes)) $(borrowed : array<uint8>#) {
+        array_view(borrowed, 4_l, 1_l, type<int>) $(tail : array<int>#) {
+            t |> equal(length(tail), 1)
+            t |> equal(tail[0], -2)
+        }
+    }
+    array_view(bytes, length(bytes), 0, type<int>) $(empty : array<int>#) {
+        t |> equal(length(empty), 0)
+    }
+
+    var unaligned_panicked = false
+    try {
+        array_view(bytes, 1, 1, type<int>) $(_ : array<int>#) {
+        }
+    } recover {
+        unaligned_panicked = true
+    }
+    t |> success(unaligned_panicked, "typed array_view rejects unaligned data")
+
+    var out_of_range_panicked = false
+    try {
+        array_view(bytes, 4, 2, type<int>) $(_ : array<int>#) {
+        }
+    } recover {
+        out_of_range_panicked = true
+    }
+    t |> success(out_of_range_panicked, "typed array_view rejects out-of-range data")
+}

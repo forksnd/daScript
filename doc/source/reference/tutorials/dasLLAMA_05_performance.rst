@@ -18,12 +18,13 @@ and the weight quantization. The tutorial measures all of them with
 Always -jit
 ===========
 
-The kernels are daslang code; the LLVM JIT compiles them to native SIMD.
-Interpreted inference is orders of magnitude slower — never benchmark it.
-``jit_enabled()`` tells you which world you're in. On top of that,
-``options _jit_fast_math = true`` lets the JIT relax FP ordering in the
-kernels (non-bit-exact, roughly +10%) — matching how llama.cpp compiles its
-own; the parity test suite stays bit-exact.
+The kernels are daslang code, and the tuning framework specializes them for
+the current box through the LLVM JIT. This is part of dasLLAMA's execution
+model, not an optional acceleration: interpreted and AOT execution are
+intentionally unsupported. ``jit_enabled()`` verifies that requirement. On
+top of that, ``options _jit_fast_math = true`` lets the JIT relax FP ordering
+in the kernels (non-bit-exact, roughly +10%) — matching how llama.cpp compiles
+its own; the parity test suite stays bit-exact.
 
 Threads: the job queue
 ======================

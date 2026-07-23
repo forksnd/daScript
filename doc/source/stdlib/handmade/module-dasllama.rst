@@ -15,6 +15,7 @@ K-quant files such as Q4_K_M / Q5_K_M / Q6_K run on native K-quant kernels):
 The architecture is picked from GGUF metadata at load — the same program runs any of these.
 
 Hands-on tutorials (:ref:`overview <tutorials_dasllama>`):
+:ref:`the problem statement <tutorial_dasLLAMA_problem_statement>`,
 :ref:`hello, generation <tutorial_dasLLAMA_hello_generate>`,
 :ref:`chat and templates <tutorial_dasLLAMA_chat>`,
 :ref:`sampling <tutorial_dasLLAMA_sampling>`,

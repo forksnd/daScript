@@ -182,3 +182,92 @@ def array_view(var bytes : array<auto(TT)> ==const; offset, length : int | int64
         }
     }
 }
+
+def array_view(bytes : array<auto(TT)>#; offset, length : int | int64; blk : block<(view : array<TT>#) : void>) {
+    //! creates a subview of an existing borrowed array, valid only within the block
+    unsafe {
+        static_if (typeinfo is_int(offset)) {
+            if (offset < 0 || length < 0 || uint(offset) + uint(length) > uint(_::length(bytes))) {
+                panic("array_view: out of range")
+            }
+            var res : array<TT>#
+            if (length > 0) {
+                _builtin_make_temp_array(res, addr(bytes[offset]), length)
+            }
+            invoke(blk, res)
+        } else {
+            if (offset < 0_l || length < 0_l || uint64(offset) + uint64(length) > uint64(_::long_length(bytes))) {
+                panic("array_view: out of range")
+            }
+            var res : array<TT>#
+            if (length > 0_l) {
+                _builtin_make_temp_array_i64(res, addr(bytes[offset]), length)
+            }
+            invoke(blk, res)
+        }
+    }
+}
+
+[template(t), unused_argument(t)]
+def array_view(
+               bytes : array<uint8> ==const;
+               byte_offset, length : int | int64;
+               t : type<auto(TT)>;
+               blk : block<(view : array<TT>#) : void>
+               ) {
+    //! creates a checked, aligned native-layout typed view over bytes; length is in TT elements
+    static_if (typeinfo is_int(byte_offset)) {
+        array_view(bytes, 0, _::length(bytes)) $(view : array<uint8>#) {
+            array_view(view, byte_offset, length, type<TT>, blk)
+        }
+    } else {
+        array_view(bytes, 0_l, _::long_length(bytes)) $(view : array<uint8>#) {
+            array_view(view, byte_offset, length, type<TT>, blk)
+        }
+    }
+}
+
+[template(t), unused_argument(t)]
+def array_view(
+               bytes : array<uint8>#;
+               byte_offset, length : int | int64;
+               t : type<auto(TT)>;
+               blk : block<(view : array<TT>#) : void>
+               ) {
+    //! creates a checked, aligned native-layout typed view over borrowed bytes; length is in TT elements
+    concept_assert(typeinfo is_pod(type<TT>), "typed array_view requires a POD element type")
+    concept_assert(typeinfo sizeof(type<TT>) > 0, "typed array_view requires a non-empty element type")
+    let element_size = typeinfo sizeof(type<TT>)
+    let element_align = typeinfo alignof(type<TT>)
+    unsafe {
+        static_if (typeinfo is_int(byte_offset)) {
+            if (byte_offset < 0 || length < 0 || byte_offset > _::length(bytes)
+                    || uint(length) > (uint(_::length(bytes)) - uint(byte_offset)) / uint(element_size)) {
+                panic("array_view: out of range")
+            }
+            var res : array<TT -const>#
+            if (length > 0) {
+                let data = addr<TT -const?>(bytes[byte_offset])
+                if (intptr(reinterpret<void? -const>(data)) % uint64(element_align) != 0_ul) {
+                    panic("array_view: unaligned typed view")
+                }
+                _builtin_make_temp_array(res, data, length)
+            }
+            invoke(blk, res)
+        } else {
+            if (byte_offset < 0_l || length < 0_l || byte_offset > _::long_length(bytes)
+                    || uint64(length) > (uint64(_::long_length(bytes)) - uint64(byte_offset)) / uint64(element_size)) {
+                panic("array_view: out of range")
+            }
+            var res : array<TT -const>#
+            if (length > 0_l) {
+                let data = addr<TT -const?>(bytes[byte_offset])
+                if (intptr(reinterpret<void? -const>(data)) % uint64(element_align) != 0_ul) {
+                    panic("array_view: unaligned typed view")
+                }
+                _builtin_make_temp_array_i64(res, data, length)
+            }
+            invoke(blk, res)
+        }
+    }
+}
