@@ -10,6 +10,7 @@ require dasllama/dasllama_common
 require dasllama/dasllama_math
 require dasllama/dasllama_metal_prefill
 require dasllama/dasllama_metal_common
+require dasllama/dasllama_metal_lens
 
 // The family-agnostic dasMetal kernel + PSO registry (the format-matrix arc's W1 split): every
 // [metal_kernel] class the resident decode drivers dispatch — GEMV/GEMM/mul_mm forms, the
@@ -1846,9 +1847,10 @@ class MetalCopyRow {
 // GPU-side greedy sampling — the speculative chain's token source: one threadgroup, strided
 // argmax over the logits with the CPU sampler's exact tie-break (lowest index wins; per-lane the
 // strict > keeps the earliest, cross-lane the (==, <) rule picks the lower index).
+[metal_dispatch(name = "enc_argmax", pso = "g_pso_argmax", tgmem = "metal_argmax_msl_tgmem", tg = 1024, grid = "1")]
 class MetalArgmax {
-    @ssbo @binding = 0 lg : array<float>
-    @ssbo @binding = 1 tok : array<uint>    // [1] winner index out
+    @ssbo @binding = 0 @role = "read" lg : array<float>
+    @ssbo @binding = 1 @role = "write" tok : array<uint>    // [1] winner index out
     @uniform @binding = 2 n : uint
     @workgroup redv : float[32]
     @workgroup redi : uint[32]
@@ -6362,18 +6364,6 @@ def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off :
     hz_write(bh, 0ul, uint64(hidden * 4l))
     hz_gate(enc)
     kn_dispatch(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
-}
-
-def enc_argmax(enc : MetalComputeEncoder?; blg, btok, bn : MetalBuffer?) {
-    kn_pipeline(enc, g_pso_argmax)
-    kn_tgmem(enc, metal_argmax_msl_tgmem, 0)
-    kn_buffer(enc, blg, 0ul, 0)
-    kn_buffer(enc, btok, 0ul, 1)
-    kn_buffer(enc, bn, 0ul, 2)
-    hz_read(blg)
-    hz_write(btok)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
 }
 
 // zero-copy logits scatter: one staging row (src at its byte offset) into a session's wrapped
