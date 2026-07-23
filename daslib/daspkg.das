@@ -142,7 +142,7 @@ struct ReleaseSpec {
     embed_paths : array<string>         //!< "src@dst" embed pairs this module needs in the wasm MEMFS (e.g. a HUD font); gathered from every referenced module
     web_shell : string                  //!< optional emcc `--shell-file` HTML for `release wasm`; empty = daslang's minimal canvas shell
     wasm_build_command : string         //!< shell command that builds this EXTERNAL module's wasm archives (run with cwd = module dir); empty = in-tree module built by `daspkg build --wasm`
-    wasm_archives : array<string>       //!< archives (relative to module dir) produced by wasm_build_command, staged into the release wasm lib dir
+    wasm_archives : array<string>       //!< archives required by wasm link; build outputs are module-relative, SDK archives may be named from the staged wasm lib dir
     requires_jit : bool                 //!< app is JIT-only (per-box [tune]/[llvm_code] kernels); a baked -exe would run broken, so `daspkg release` refuses it
     include_symbols : bool              //!< ship debug symbols for every shipped binary into `<bundle>/symbols/`
     external_files : array<string>      //!< "src@dst" pairs shipped from outside the package; src is relative to <das_root>, dst to the bundle root
@@ -236,7 +236,7 @@ def release_wasm_build(command : string) {
     _release_spec.wasm_build_command = command
 }
 
-//! Declare a wasm archive produced by release_wasm_build() (path relative to the module directory) to stage into the release's wasm lib dir. Repeatable. The archive's basename must match the daspkg convention (`liblib<CppModule>.a`, the name the in-tree web build emits) so the link step resolves it for the shared module.
+//! Declare a wasm archive needed by this module's `release wasm` link. Paths produced by release_wasm_build() are relative to the module directory; a bare filename may name an archive already staged by `daspkg build --wasm`. Every declared archive is linked in declaration order, so repeat this for the module archive and its private static dependencies.
 def release_wasm_archive(path : string) {
     _release_spec.wasm_archives |> push(path)
 }
