@@ -1454,6 +1454,115 @@ def graph_flush(enc : MetalComputeEncoder?) {
     graph_flush(enc, ident)
 }
 
+// ===== the load-time schedule (compile once per shape class, replay per token) =====
+// ASAP leveling over the conflict DAG (write-involved overlap = ORDERING edge, capture-order
+// direction) — levels are antichains, and the level count is the barrier floor.
+
+struct KSched {
+    order : array<int>
+    depth : int
+    nodes : int
+}
+
+var g_gr_scheds : table<uint64; KSched>
+var g_gr_sched_mode = -1   // DASLLAMA_METAL_SCHED: 1 = leveled reorder (default), 0 = capture order
+
+def private sched_enabled : bool {
+    if (g_gr_sched_mode < 0) {
+        g_gr_sched_mode = env_int("DASLLAMA_METAL_SCHED", 1)
+    }
+    return g_gr_sched_mode != 0
+}
+
+// the shape-class key: pso sequence + per-node bind/range counts (pooled buffer identities and
+// arena offsets vary per step, but the conflict STRUCTURE is role-determined within a class —
+// grid values never enter, the oracle re-derives barriers per step anyway)
+def private gr_shape_hash : uint64 {
+    var h = 14695981039346656037ul
+    for (n in g_gr_nodes) {
+        h = (h ^ intptr(n.pso)) * 1099511628211ul
+        h = (h ^ uint64(n.nbind)) * 1099511628211ul
+        h = (h ^ uint64(n.nrange)) * 1099511628211ul
+    }
+    return h
+}
+
+// level[j] = 1 + max level of any conflicting predecessor; scan partitioned per buffer id.
+// An UNDECLARED node has no edges and would float freely — refuse and keep capture order.
+def private gr_schedule(var sched : KSched) : bool {
+    let n = length(g_gr_nodes)
+    sched.nodes = n
+    for (nd in g_gr_nodes) {
+        if (nd.nrange == 0) {
+            return false
+        }
+    }
+    var level : array<int>
+    level |> resize(n)
+    // per-buffer event lists: indices into g_gr_ranges, with a parallel range->node map
+    var rnode : array<int>
+    rnode |> resize(length(g_gr_ranges))
+    for (j in range(n)) {
+        let nd & = unsafe(g_gr_nodes[j])
+        for (r in range(nd.range0, nd.range0 + nd.nrange)) {
+            rnode[r] = j
+        }
+    }
+    var by_buf : table<uint64; array<int>>
+    for (j in range(n)) {
+        let nd & = unsafe(g_gr_nodes[j])
+        var lvl = 0
+        for (r in range(nd.range0, nd.range0 + nd.nrange)) {
+            let rj = g_gr_ranges[r]
+            if (key_exists(by_buf, rj.buf)) {
+                for (k in by_buf[rj.buf]) {
+                    let ri = g_gr_ranges[k]
+                    if ((ri.dst || rj.dst) && rj.p0 < ri.p1 && ri.p0 < rj.p1) {
+                        lvl = max(lvl, level[rnode[k]] + 1)
+                    }
+                }
+            }
+        }
+        level[j] = lvl
+        sched.depth = max(sched.depth, lvl)
+        for (r in range(nd.range0, nd.range0 + nd.nrange)) {
+            by_buf[g_gr_ranges[r].buf] |> push(r)   // nolint:PERF006 — per-buffer lists grow by ones across the whole walk
+        }
+    }
+    // stable counting emit: capture order within a level keeps locality + determinism
+    sched.order |> reserve(n)
+    for (lvl in range(sched.depth + 1)) {
+        for (j in range(n)) {
+            if (level[j] == lvl) {
+                sched.order |> push(j)
+            }
+        }
+    }
+    delete level
+    delete rnode
+    delete by_buf
+    return true
+}
+
+//! Replay the captured graph under the shape class's cached schedule (compiled on first sight,
+//! ~sub-ms one-time); DASLLAMA_METAL_SCHED=0 or an undeclared node fall back to capture order.
+def graph_flush_sched(enc : MetalComputeEncoder?) {
+    if (!sched_enabled()) {
+        graph_flush(enc)
+        return
+    }
+    let h = gr_shape_hash()
+    if (!key_exists(g_gr_scheds, h)) {
+        var s : KSched
+        if (!gr_schedule(s)) {
+            to_log(LOG_WARNING, "dasLLAMA metal decode: step graph holds undeclared dispatches — schedule stays capture-order\n")
+        }
+        to_log(LOG_INFO, "dasLLAMA metal decode: schedule compiled — {s.nodes} nodes, depth {s.depth} (class {h})\n")
+        g_gr_scheds[h] <- s
+    }
+    graph_flush(enc, g_gr_scheds[h].order)
+}
+
 //! Replay the captured step graph onto `enc` in `order` (empty = capture order), the hz oracle
 //! deriving barriers per step — a schedule permutation can only change speed, never correctness.
 def graph_flush(enc : MetalComputeEncoder?; order : array<int>) {
@@ -1690,6 +1799,10 @@ def weight_caches_flush_on_reload {
 }
 
 def metal_common_release {
+    // schedules key on PSO pointers — a re-init reallocates PSOs, so cached classes would lie
+    unsafe {
+        delete g_gr_scheds
+    }
     nc_logits_release()
     for (mr in values(g_mirrors)) {
         mirror_release(mr)

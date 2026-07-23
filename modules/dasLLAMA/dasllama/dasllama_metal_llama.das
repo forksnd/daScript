@@ -308,6 +308,9 @@ struct private StepRes {
     u_moe_eblk : MetalBuffer?  // q8 blocks per expert plane (ege / 32)
     u_moe_esb : MetalBuffer?   // kq superblocks per expert plane (ege / 256)
     u_moe_xs_dn : MetalBuffer? // the down site's per-slot x stride (nfe)
+    bh12s : MetalBuffer?       // the dense-shared/shexp branch's OWN gate|up panel — off bh12 so
+                               // the schedule can run the shared chain under the routed chain
+    bytes_h12s : uint64
     bmoe_rt : MetalBuffer?     // gemma4: router-input row, reused as the routed-branch acc
     u_moe_invd : MetalBuffer?  // gemma4: 1/sqrt(dim) router scale
     u_moe_gmode : MetalBuffer? // select gating mode (1 = gpt-oss softmax_weight)
@@ -487,6 +490,10 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
         }
         if (nsh > 0l) {
             r.u_moe_nsh = uniform_u32(uint(nsh))
+        }
+        if (c.moe_dense_shexp || nsh > 0l) {
+            r.bytes_h12s = uint64(nrows * max(2l * hidden, 2l * nsh) * 4l)
+            r.bh12s = pool_acquire(g_pool, g_dev, r.bytes_h12s)
         }
         r.u_moe_gmode = uniform_u32(c.moe_gate == MoeGate.softmax_weight ? 1u : (c.norm_topk_prob ? 0u : 2u))
     }
@@ -903,13 +910,13 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                     }
                 }
                 if (r.u_moe_nsh != null && g_skip != "moe_sh") {
-                    // shexp FFN reads bxb BEFORE combine overwrites it; bh12/bxb2 are free here
+                    // shexp reads bxb BEFORE combine overwrites it; own bh12s panel = schedulable under the routed chain
                     let nsh = c.n_ff_shexp
                     let she = dim * nsh
                     let bwsh1 = blob_of(g_dev, t, t.wsh1_off + l * she)
                     enc_gemv_w13sw(enc, bwsh1.buf, bwsh1.boff, uint64(((t.wsh3_off + l * she) / 32l) * 34l),
-                        r.bxb, r.bh12, r.u_dim, r.u_moe_nsh, nsh, r.u_zero32)
-                    enc_site_gemv(enc, t, KqFmt.q8, t.wsh2_off + l * she, dim, nsh, r.bh12, r.bxb2, r.u_moe_nsh, r.u_dim)
+                        r.bxb, r.bh12s, r.u_dim, r.u_moe_nsh, nsh, r.u_zero32)
+                    enc_site_gemv(enc, t, KqFmt.q8, t.wsh2_off + l * she, dim, nsh, r.bh12s, r.bxb2, r.u_moe_nsh, r.u_dim)
                 }
                 enc_moe_combine(enc, r.bmoe_dn, r.bmoe_sel, g4 ? r.bmoe_rt : r.bxb, r.u_dim, r.u_moe_k, dim, 1l)
                 if (r.u_moe_nsh != null && g_skip != "ew") {
@@ -929,17 +936,17 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
                         // fused shared-branch gate+up + gelu (extends the dense w13sw fusion to the g4 shexp)
                         let bw1 = blob_of(g_dev, t, t.w1_offs[l])
                         enc_gemv_w13sw(enc, bw1.buf, bw1.boff, uint64((t.w3_offs[l] / 32l) * 34l),
-                            r.bxb, r.bh12, r.u_dim, r.u_hidden, hidden, geglu ? r.u_one32 : r.u_zero32)
+                            r.bxb, r.bh12s, r.u_dim, r.u_hidden, hidden, geglu ? r.u_one32 : r.u_zero32)
                     } else {
-                        enc_site_gemv(enc, t, kq_fmt_at(t.w1_fmt, l), t.w1_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden)
-                        enc_site_gemv(enc, t, kq_fmt_at(t.w3_fmt, l), t.w3_offs[l], hidden, dim, r.bxb, r.bh12, r.u_dim, r.u_hidden, uint64(hidden * 4l))
+                        enc_site_gemv(enc, t, kq_fmt_at(t.w1_fmt, l), t.w1_offs[l], hidden, dim, r.bxb, r.bh12s, r.u_dim, r.u_hidden)
+                        enc_site_gemv(enc, t, kq_fmt_at(t.w3_fmt, l), t.w3_offs[l], hidden, dim, r.bxb, r.bh12s, r.u_dim, r.u_hidden, uint64(hidden * 4l))
                     }
                 }
                 if (g_skip != "ew" && !sh_w13_q8) {
-                    enc_ew2(enc, g_pso_geglu, r.bh12, 0ul, r.bh12, uint64(hidden * 4l), r.u_hidden, hidden)
+                    enc_ew2(enc, g_pso_geglu, r.bh12s, 0ul, r.bh12s, uint64(hidden * 4l), r.u_hidden, hidden)
                 }
                 if (g_skip != "gemv" && g_skip != "moe_sh") {
-                    enc_site_gemv(enc, t, kq_fmt_at(t.w2_fmt, l), t.w2_offs[l], dim, hidden, r.bh12, r.bxb, r.u_hidden, r.u_dim)
+                    enc_site_gemv(enc, t, kq_fmt_at(t.w2_fmt, l), t.w2_offs[l], dim, hidden, r.bh12s, r.bxb, r.u_hidden, r.u_dim)
                 }
                 if (g_skip != "ew") {
                     var bw_pf1 = upload_region(addr < void? >(t.fblob[t.rms_post_ffn1_off + l * dim]), uint64(dim * 4l))
@@ -1657,7 +1664,7 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
         encode_cls_tail(t, r, enc, t.rms_final_off)
     }
     if (conc) {
-        graph_flush(enc)
+        graph_flush_sched(enc)
         hz_coverage_check(metal_dispatch_calls() - hz_d0, g_hz_gated - hz_g0)
     }
     metal_end_encoding(enc)
@@ -1750,6 +1757,9 @@ def private release_step(var r : StepRes) {
     pool_release(g_pool, r.bxb2, r.bytes_x)
     pool_release(g_pool, r.bqkv, r.bytes_qkv)
     pool_release(g_pool, r.bh12, r.bytes_h2)
+    if (r.bh12s != null) {
+        pool_release(g_pool, r.bh12s, r.bytes_h12s)
+    }
     pool_release(g_upool, r.bcos, r.bytes_tab)
     pool_release(g_upool, r.bsin, r.bytes_tab)
     if (r.bcos_swa != null) {
