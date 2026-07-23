@@ -343,6 +343,27 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
+- **gemma-4-26B-A4B tg 0.84x — the real lever is the routed expert-GEMV dispatch (2026-07-23).**
+  Knockout attribution (decode_metal_chase @512): the MoE GEMV is 67% of the step running
+  ~181 GB/s — HALF the M1 bandwidth ceiling the dense gemma4-12B hit (340), so genuine ~2x
+  headroom, NOT a bandwidth wall. Byte breakdown: routed k4/q51 experts 40%, dense-shared q8
+  24%, classifier (262k vocab) 21%, attention 16%. The dense-shared 24% got the w13-gelu fusion
+  (+1%, shipped f7337d92f). The remaining gap is the routed k4/q51 expert-GEMV dispatch/streaming
+  (the 40% chunk) — "already 2-row" yet the aggregate is sub-ceiling, so the expert-indexed
+  dispatch (per-slot scatter, x-reload) is the suspect. Deep AGX kernel-lab: finer per-component
+  knockout (routed vs shared vs cls) then disasm-grade reshape. lcpp does the token in 16.7ms vs
+  our 19.9 — closing the routed GEMV to ~280 GB/s closes the whole gap.
+
+- **.dlim large-image mint aborts past ~11GB (2026-07-23, found via fam-gemma4moe).** Minting the
+  Q8 26B (27GB) `.dlim` aborts: every plane past ~11.4GB fails the writer's offset-accounting
+  check (`plane 'wq_offs' wrote 11456577776 != accounted 0xf0 — image save aborted`). The file
+  write position and the plane's accounted offset diverge past ~11GB — a >2GB / int-width
+  overflow class bug in the image serializer's offset math. The Q4_K 26B (smaller) mints fine;
+  only the 27GB Q8 trips it. This is the PRE-EXISTING master red on fam-gemma4moe (PARITY_FULL-
+  only, so CI never runs it → silently red). Real capability bug — a large model can't re-mint its
+  own image. Fix = audit the plane-offset accumulator width in the .dlim writer (likely a u32 /
+  int cast on a cumulative >2^33 byte offset).
+
 - **Q6-greedy spec-chain inversion on big pure-k6 files (2026-07-22 re-pair).** `spec_cls_capable`
   (dasllama_metal_llama.das:164) is a pure CAPABILITY test — it engages the greedy spec chain for
   any tied-k6 classifier with no BENEFICIAL condition, so a big pure-k6 file eats the spec-chain
