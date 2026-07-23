@@ -347,6 +347,63 @@ class MoeGemvK4R4 {
     }
 }
 
+// q51 integer-compose variant: the production kernel's per-element 5th-bit SELECT chain (4 cmps +
+// 4 selects + 3 adds + the 16*hx mad per float4) becomes an integer OR into the nibble before the
+// convert — q | (hbit << 4) == q + 16*hbit exactly, one dot chain instead of two.
+class MoeGemvQ51Ic {
+    @ssbo @binding = 0 wqu : array<uint>
+    @ssbo @binding = 1 wsh : array<float16>
+    @ssbo @binding = 2 xf : array<float4>
+    @ssbo @binding = 3 y : array<float>
+    @uniform @binding = 4 ndim : uint
+    @uniform @binding = 5 ddim : uint
+    @ssbo @binding = 6 sel : array<uint>
+    @uniform @binding = 7 eblk : uint
+    @uniform @binding = 8 xs : uint
+
+    [metal_kernel(name="lab_moe_q51_ic_msl")]
+    def lab_moe_q51_ic {
+        let lane = gl_SubgroupInvocationID
+        let ix = lane / 8u
+        let it = lane % 8u
+        let nb = ndim / 32u
+        let slot = gl_WorkGroupID.y
+        let eb = sel[slot] * eblk
+        let xoff = slot * xs
+        let y0 = slot * ddim
+        let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
+        let half = it / 4u
+        let ku = it % 4u
+        let nsh = half * 4u
+        let hb = ku * 4u + half * 16u
+        var sumf : float[2]
+        var ib = ix
+        while (ib < nb) {
+            let xv = xf[(xoff + ib * 32u) / 4u + it]
+            let sx = xv.x + xv.y + xv.z + xv.w
+            for [unroll_full] (r in range(2)) {
+                let blk = eb + (first_row + uint(r)) * nb + ib
+                let qb = blk * 5u
+                let u = wqu[qb + ku]
+                let qh = wqu[qb + 4u] >> hb
+                let q0 = ((u >> nsh) & 15u) | ((qh & 1u) << 4u)
+                let q1 = ((u >> (8u + nsh)) & 15u) | ((qh & 2u) << 3u)
+                let q2 = ((u >> (16u + nsh)) & 15u) | ((qh & 4u) << 2u)
+                let q3 = ((u >> (24u + nsh)) & 15u) | ((qh & 8u) << 1u)
+                sumf[r] += float(wsh[blk * 2u]) * (float(q0) * xv.x + float(q1) * xv.y
+                    + float(q2) * xv.z + float(q3) * xv.w) + float(wsh[blk * 2u + 1u]) * sx
+            }
+            ib += 4u
+        }
+        for [unroll_full] (r in range(2)) {
+            let sr = simd_sum(sumf[r])
+            if (lane == 0u && first_row + uint(r) < ddim) {
+                y[y0 + first_row + uint(r)] = sr
+            }
+        }
+    }
+}
+
 // ===== exact-arithmetic fills (bench_metal_gemv_kernels contract, gg stream dropped) =====
 
 def private fill_k4_stack(var kq : array<uint8>; var kc : array<uint8>; rows, k, seed : int64) {
@@ -534,6 +591,7 @@ let RP_GLU = 2     // production geglu ew
 let RP_PAIR = 3    // the lab W1+W3 paired kernel
 let RP_X4 = 4      // float4-x variant
 let RP_R4 = 5      // 4-rows-per-simdgroup variant
+let RP_Q51IC = 6   // q51 integer-compose variant
 
 let SEL_ROW_BYTES = 32ul                          // 8 idx uints per row
 let SEL_W3_BASE = uint64(LAYERS) * SEL_ROW_BYTES  // block starts in bsel
@@ -605,8 +663,8 @@ def private enc_lab_glu(bufs; psos; enc; l : int64) {
     metal_dispatch_threadgroups(enc, uint3(uint((KNFE + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
-def private enc_lab_w2(bufs; psos; enc; l : int64; sel_base : uint64) {
-    metal_set_pipeline(enc, psos[RP_Q51])
+def private enc_lab_w2(bufs; psos; enc; l : int64; sel_base : uint64; pslot : int = RP_Q51) {
+    metal_set_pipeline(enc, psos[pslot])
     metal_set_buffer(enc, bufs[RB_Q51Q], 0ul, 0)
     metal_set_buffer(enc, bufs[RB_Q51S], 0ul, 1)
     metal_set_buffer(enc, bufs[RB_H12], h12_off(l), 2)
@@ -677,6 +735,7 @@ def private main_apple(dummy) {
     psos |> push(compile_or_die(dev, lab_moe_k4_pair_msl, lab_moe_k4_pair_msl_entry, lab_moe_k4_pair_msl_fastmath))
     psos |> push(compile_or_die(dev, lab_moe_k4_x4_msl, lab_moe_k4_x4_msl_entry, lab_moe_k4_x4_msl_fastmath))
     psos |> push(compile_or_die(dev, lab_moe_k4_r4_msl, lab_moe_k4_r4_msl_entry, lab_moe_k4_r4_msl_fastmath))
+    psos |> push(compile_or_die(dev, lab_moe_q51_ic_msl, lab_moe_q51_ic_msl_entry, lab_moe_q51_ic_msl_fastmath))
 
     // host fills (exact-arithmetic contract)
     let t_fill = ref_time_ticks()
@@ -828,6 +887,32 @@ def private main_apple(dummy) {
     }
     print("w2 q51 correctness: worst rel {worst}\n")
 
+    // the ic variant against the same refs (h0 still resident in the gate half)
+    t = time_arm(queue, false) $(enc : MetalComputeEncoder?) {
+        enc_lab_w2(bufs, psos, enc, 0l, 0ul, RP_Q51IC)
+    }
+    worst = 0.0
+    unsafe {
+        var y = reinterpret<float const?>(metal_buffer_contents(bufs[RB_DN]))
+        var hslot : array<float>
+        hslot |> resize(int(NFE))
+        for (s in range64(8l)) {
+            for (i in range64(NFE)) {
+                hslot[i] = h0[s * NFE + i]
+            }
+            for (row in [0l, 1l, 1500l, DIM - 1l]) {
+                let e = int64(sel[s])
+                let want_v = ref_q51_row(q51q, q51s, hslot, e * EBLK, row, NFE)
+                worst = max(worst, abs(y[s * DIM + row] - want_v) / max(1.0, abs(want_v)))
+            }
+        }
+        delete hslot
+    }
+    if (worst > 1e-4) {
+        panic("w2_ic q51 correctness: worst rel diff {worst}")
+    }
+    print("w2_ic q51 correctness: worst rel {worst}\n")
+
     // ===== the timing matrix =====
     // per-pass routed weight bytes: K slots x (2 k4 planes + 1 q51 plane) x LAYERS
     let bytes_pass = double(LAYERS * K * (2l * NFE * NSB_ROW * 144l + DIM * NBLK_ROW * 24l))
@@ -873,7 +958,7 @@ def private main_apple(dummy) {
     let bytes_w13 = double(LAYERS * K * 2l * NFE * NSB_ROW * 144l)
     let bytes_w2 = double(LAYERS * K * DIM * NBLK_ROW * 24l)
     var sarms <- [("w13", RP_K4, 4l), ("w13_x4", RP_X4, 4l), ("w13_r4", RP_R4, 8l),
-                  ("w13_pair", -1, 4l), ("w2", -2, 4l)]
+                  ("w13_pair", -1, 4l), ("w2", -2, 4l), ("w2_ic", -3, 4l)]
     var sbest : table<string; double>
     for (a in sarms) {
         sbest[a._0] = 1e18lf
@@ -893,6 +978,8 @@ def private main_apple(dummy) {
                             enc_lab_pair(bufs, psos, enc, l, 0ul)
                         } elif (pslot == -2) {
                             enc_lab_w2(bufs, psos, enc, l, 0ul)
+                        } elif (pslot == -3) {
+                            enc_lab_w2(bufs, psos, enc, l, 0ul, RP_Q51IC)
                         } else {
                             enc_lab_w13v(bufs, psos, enc, l, 0ul, false, pslot, rtg)
                             enc_lab_w13v(bufs, psos, enc, l, SEL_W3_BASE, true, pslot, rtg)
@@ -912,7 +999,7 @@ def private main_apple(dummy) {
             continue
         }
         let per = sbest[a._0]
-        let bytes_arm = a._1 == -2 ? bytes_w2 : bytes_w13
+        let bytes_arm = a._1 <= -2 ? bytes_w2 : bytes_w13
         print("  {a._0}: {per} us/pass  {bytes_arm / per / 1000.0lf} wGB/s\n")
     }
     delete sarms

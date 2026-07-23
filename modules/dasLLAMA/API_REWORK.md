@@ -368,9 +368,12 @@ what it costs today and what the fix would change.
   the lab chain priced barriers at ~4.5us each at these shapes (serial 3838 vs pipe 3292us/pass
   on 120 barriers) → whole-graph ~1-1.5ms/step; the batch rail's concurrent-encoder +
   explicit-hazards form (dasllama_metal_llama.das:2511) is the template, g_skip runs must stay
-  serial (the knockout-unbarriered caveat there); (2) the q51 w2 MoE kernel at 224 wGB/s in-lab,
-  ALU-bound on the per-element qh select — integer-compose of the 5th bit (q | hbit<<4 pre-cvt,
-  bit-exact) saves ~15% ALU ≈ +0.3ms; (3) WO ~0.2ms slack; (4) MetalMoeGemvK5 carries the same
+  serial (the knockout-unbarriered caveat there); (2) the q51 w2 MoE kernel at 224 wGB/s in-lab —
+  the integer-compose form (q | hbit<<4 pre-convert, replacing the select chain) TESTED + REFUTED
+  2026-07-23: 226 vs 224 wGB/s (+1%), bit-exact but the dot stays issue-bound in the shift/mask
+  decode regardless of compose shape; kept as the lab's w2_ic negative control, do not re-chase —
+  a real q51 win needs a different decode strategy (per-thread multi-block amortization or an
+  upload-time qh transpose, both ledger-class); (3) WO ~0.2ms slack; (4) MetalMoeGemvK5 carries the same
   scalar-x block — mechanical sibling of the shipped fix, prove via a lab arm first. Lab kept as
   the standing rig: variants stay as arms/negative controls.
 
