@@ -363,12 +363,22 @@ what it costs today and what the fix would change.
   ideal 2.60ms; the old "3x" was a byte-estimate error. WO 1.52ms vs 1.30 ideal (~85%, ~0.2ms
   slack). The residual gemv-class remainder 1.23ms = router (~0.15) + the greedy spec chain's
   classifier dispatches (~1.1ms, gemv-gated, useful work). Routed experts post-fix: 3.84ms.
-  Remaining quantified levers, by size: (1) **serial-encoder barrier tax — now the biggest**:
-  the single-decode driver encodes ~330 dispatches on a SERIAL encoder (implicit barrier each);
-  the lab chain priced barriers at ~4.5us each at these shapes (serial 3838 vs pipe 3292us/pass
-  on 120 barriers) → whole-graph ~1-1.5ms/step; the batch rail's concurrent-encoder +
-  explicit-hazards form (dasllama_metal_llama.das:2511) is the template, g_skip runs must stay
-  serial (the knockout-unbarriered caveat there); (2) the q51 w2 MoE kernel at 224 wGB/s in-lab —
+  Remaining quantified levers, by size: (1) **the dispatch model — MEASURED from both sides
+  (2026-07-23 evening, same-window)**: das encodes **780 dispatches/step @8 / 811 @512** (new
+  metal_dispatch_call_count instrument), every one implicitly barriered on the serial encoder.
+  llama.cpp's own knobs price the structure on this exact model (tg128, ±0.4% reps): stock 58.50
+  t/s; GGML_METAL_CONCURRENCY_DISABLE **52.17 (+2.08ms/tok)**; FUSION_DISABLE 53.90 (+1.46);
+  GRAPH_OPTIMIZE_DISABLE 53.96 (+1.44) — lcpp-with-serial-encoder lands in OUR class, i.e. no
+  kernel section loses; the whole gap is dispatch structure. Same-window das: chase full @8
+  **62.3 t/s (16.05ms) — AHEAD of lcpp stock 58.50** under real greedy decode; the llama-bench-
+  protocol rail reads 55.75 ±3.20 (synthetic-id feed perturbs the spec chain + the rail's tg is
+  intrinsically noisy — the recorded 50.31 ±2.2 board cell is protocol-dragged and/or tinted).
+  The port blueprint is llama.cpp's ggml_mem_ranges (ggml-metal-common.h): concurrent encoder +
+  per-op src/dst range tracking — barrier + reset only when a new op's ranges conflict with the
+  live set — plus ew-chain fusion and a graph-reorder pass that grows concurrent sets. Our shape:
+  an enc_dispatch wrapper in dasllama_metal_common taking declared read/write (buffer, off, len)
+  ranges per dispatch (every enc_* helper already knows its buffers), auto-barriering on conflict;
+  g_skip runs must stay serial (the knockout-unbarriered caveat at dasllama_metal_llama.das:2511); (2) the q51 w2 MoE kernel at 224 wGB/s in-lab —
   the integer-compose form (q | hbit<<4 pre-convert, replacing the select chain) TESTED + REFUTED
   2026-07-23: 226 vs 224 wGB/s (+1%), bit-exact but the dot stays issue-bound in the shift/mask
   decode regardless of compose shape; kept as the lab's w2_ic negative control, do not re-chase —
