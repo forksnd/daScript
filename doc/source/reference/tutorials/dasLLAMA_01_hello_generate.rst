@@ -20,7 +20,8 @@ model file on disk (models are not shipped with the repo) — a good tiny one is
 `SmolLM2-135M-Instruct Q8_0
 <https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF>`_ (~145 MB).
 Pass the model path on the command line (or set ``DASLLAMA_MODEL``), and always
-run with ``-jit`` — interpreted inference is far too slow for model work::
+run with ``-jit``. The tuning framework makes the JIT part of dasLLAMA's
+execution model; interpreted and AOT execution are intentionally unsupported::
 
    daslang.exe -jit tutorials/dasLLAMA/01_hello_generate.das -- path/to/SmolLM2-135M-Instruct-Q8_0.gguf
 
@@ -110,4 +111,4 @@ Function                                        Description
 
    Full source: :download:`tutorials/dasLLAMA/01_hello_generate.das <../../../../tutorials/dasLLAMA/01_hello_generate.das>`
 
-   Next tutorial: :ref:`tutorial_dasLLAMA_chat`
+   Previous tutorial: :ref:`tutorial_dasLLAMA_problem_statement` · Next tutorial: :ref:`tutorial_dasLLAMA_chat`
