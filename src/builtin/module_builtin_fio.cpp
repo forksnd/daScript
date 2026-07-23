@@ -192,6 +192,7 @@ namespace das {
     char * get_full_file_name ( const char * path, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     bool has_env_variable ( const char * var, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * get_env_variable ( const char * var, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    void set_env_variable ( const char * var, const char * value, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * sanitize_command_line ( const char * cmd, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     // filesystem stubs
     char * builtin_fs_extension ( const char * path, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
@@ -1651,6 +1652,16 @@ namespace das {
         return context->allocateString(res, at);
     }
 
+    void set_env_variable ( const char * var, const char * value, Context *, LineInfoArg * ) {
+        // process-wide; children spawned via popen/popen_argv inherit it
+        if ( !var || !*var ) return;
+#ifdef _MSC_VER
+        _putenv_s(var, value ? value : "");
+#else
+        setenv(var, value ? value : "", 1);
+#endif
+    }
+
     enum class RegisterOnError {
         Quiet = 0,      // missing/unloadable .shared_module is silent (deferred for retry); broken artifacts still report
         ErrorMsg,       // error message is displayed
@@ -2344,6 +2355,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(get_env_variable)>(*this, lib, "get_env_variable",
                 SideEffects::accessExternal, "get_env_variable")
                     ->args({"var","context","at"});
+            addExtern<DAS_BIND_FUN(set_env_variable)>(*this, lib, "set_env_variable",
+                SideEffects::modifyExternal, "set_env_variable")
+                    ->args({"var","value","context","at"});
             addExtern<DAS_BIND_FUN(has_env_variable)>(*this, lib, "has_env_variable",
                 SideEffects::accessExternal, "has_env_variable")
                     ->args({"var","context","at"});

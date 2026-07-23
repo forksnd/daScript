@@ -115,6 +115,7 @@ namespace das {
     DAS_API bool builtin_rmdir_rec ( const char * path );
     DAS_API bool has_env_variable ( const char * var, Context * context, LineInfoArg * at );
     DAS_API char * get_env_variable ( const char * var, Context * context, LineInfoArg * at );
+    DAS_API void set_env_variable ( const char * var, const char * value, Context * context, LineInfoArg * at );
     DAS_API char * sanitize_command_line ( const char * cmd, Context * context, LineInfoArg * at );
     // filesystem operations (C++17 <filesystem>)
     struct DiskSpaceInfo {
