@@ -6,6 +6,7 @@ require daslib/fio
 def initialize(project_path : string) {
     let daslib_paths = [
         "llvm_boost", "llvm_debug", "llvm_jit", "llvm_targets",
+        "llvm_dsl",
         "llvm_jit_intrin", "llvm_jit_common", "llvm_dll_utils",
         "llvm_exe", "llvm_macro", "llvm_jit_cli", "llvm_jit_run",
         "aarch64_neon", // public NEON-intrinsic header (portable fallbacks + name-based JIT recognition)
