@@ -230,6 +230,12 @@ def private path_to_uri(path : string) : string {
     return gp |> starts_with("/") ? "file://{gp}" : "file:///{gp}"
 }
 
+def private uri_for_compare(uri : string) : string {
+    // Windows paths are case-insensitive, and pathlib.resolve() may return
+    // different component casing than get_das_root() for the same file.
+    return get_platform_name() == "windows" ? to_lower(uri) : uri
+}
+
 // ===== the test =====
 
 [test]
@@ -329,7 +335,7 @@ def test_lsp_protocol(t : T?) {
                 let def_resp = read_until(r) $(js) => (js?["id"] ?? -1) == 2
                 t |> success(def_resp != null, "definition response received")
                 let loc0 = def_resp?["result"]?[0]
-                t |> equal(loc0?["uri"] ?? "", uri)
+                t |> equal(uri_for_compare(loc0?["uri"] ?? ""), uri_for_compare(uri))
                 t |> equal(loc0?["range"]?["start"]?["line"] ?? -1, def_line0)
                 t |> equal(loc0?["range"]?["start"]?["character"] ?? -1, 4)
 
@@ -385,7 +391,7 @@ def test_lsp_protocol(t : T?) {
                 let impl_resp = read_until(r) $(js) => (js?["id"] ?? -1) == 7
                 t |> success(impl_resp != null, "implementation response received")
                 let impl0 = impl_resp?["result"]?[0]
-                t |> equal(impl0?["uri"] ?? "", uri)
+                t |> equal(uri_for_compare(impl0?["uri"] ?? ""), uri_for_compare(uri))
                 t |> equal(impl0?["range"]?["start"]?["line"] ?? -1, derived_speak_line0)
                 t |> equal(impl0?["range"]?["start"]?["character"] ?? -1, derived_speak_char)
 

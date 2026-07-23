@@ -1059,7 +1059,7 @@ def cmd_build_wasm(_root : string; lib_dir_override : string) : int {
 
     // Build the wasm64 runtime + the module archives release wasm links against.
     log("build --wasm: building wasm64 archives...\n")
-    let targets = "libDaScript_runtime libDasModuleOpenGL libDasModuleGlfw libDasModuleStbImage libDasModuleAudio libDasModuleMinfft libDasModuleLiveHost"
+    let targets = "libDaScript_runtime libDasModuleOpenGL libDasModuleGlfw libDasModuleStbImage libDasModuleAudio libDasModuleMinfft libDasModuleLiveHost libDasModuleClipboard"
     var bld_out : string
     let bld_rc = run_cmd("cmake --build \"{build_dir}\" --target {targets}", bld_out)
     if (bld_rc != 0) {
@@ -2473,17 +2473,42 @@ def private wasm_archive_name(rel : string) : string {
     return "liblib{base}.a"
 }
 
+def private wasm_path_key(path : string) : string {
+    let full_path = get_full_file_name(path)
+    return get_platform_name() == "windows" ? to_lower(full_path) : full_path
+}
+
+def private push_unique_archive(var archives : array<string>; archive : string) {
+    let archive_key = wasm_path_key(archive)
+    for (existing in archives) {
+        if (wasm_path_key(existing) == archive_key) return
+    }
+    archives |> push(archive)
+}
+
 // Run a referenced module's .das_package release() (if present) and accumulate
-// the emcc flags + MEMFS embeds it contributes (e.g. dasGlfw → -sUSE_GLFW=3,
-// dasStbImage → its HUD font). Deduped by package dir.
-def private gather_wasm_module(pkg_dir : string; var emcc_args, embeds : array<string>; var seen : table<string>) {
-    let key = get_full_file_name(pkg_dir)
-    if (key_exists(seen, key)) return
+// every archive, emcc flag, and MEMFS embed it contributes. The module archive
+// discovered from deps JSON is only the package's public entry point; declared
+// archives also carry its private static-link closure (for example FreeType
+// behind dasImgui). Deduped by package dir and archive path.
+def private gather_wasm_module(pkg_dir, wasm_lib_dir : string;
+                               var archives, emcc_args, embeds : array<string>;
+                               var seen : table<string>) : bool {
+    let key = wasm_path_key(pkg_dir)
+    if (key_exists(seen, key)) return true
     seen |> insert(key)
     let pkg_file = "{pkg_dir}/.das_package"
-    if (!fexist(pkg_file)) return
+    if (!fexist(pkg_file)) return true
     var info : PackageReleaseInfo
-    if (!run_das_package_release(pkg_file, info)) return
+    if (!run_das_package_release(pkg_file, info)) return true
+    for (a in info.wasm_archives) {
+        let staged = path_join(wasm_lib_dir, base_name(a))
+        if (!fexist(staged)) {
+            to_log(LOG_ERROR, "release wasm: declared wasm archive was not staged: {staged}\n")
+            return false
+        }
+        push_unique_archive(archives, staged)
+    }
     emcc_args |> push_from(info.emcc_args)
     // release_embed_file() src is module-relative (like release_main / release_wasm_archive); resolve it
     // against the module dir HERE, where pkg_dir is known, into an absolute path. An external module
@@ -2495,22 +2520,33 @@ def private gather_wasm_module(pkg_dir : string; var emcc_args, embeds : array<s
         let abs_src = get_full_file_name(path_join(pkg_dir, slice(e, 0, at)))
         embeds |> push("{abs_src}@{slice(e, at + 1)}")
     }
+    return true
 }
 
 // An EXTERNAL module (not part of daslang's in-tree web build, so `daspkg build --wasm`
 // never produced its archives) can declare in its .das_package how to build them:
 // release_wasm_build(command) + release_wasm_archive(path). When a released app links
-// such a module and its archive is not already staged, run that build once (cwd = the
-// module dir) and copy the declared archives into wasm_lib_dir. Deduped by module dir,
-// so a module that emits several archives builds only once.
+// such a module and any declared archive is not already staged, run that build once
+// (cwd = the module dir) and copy the declared archives into wasm_lib_dir. Deduped by
+// module dir, so a module that emits several archives builds only once.
 def private ensure_external_wasm_archives(pkg_dir, wasm_lib_dir : string; var built : table<string>) {
-    let key = get_full_file_name(pkg_dir)
+    let key = wasm_path_key(pkg_dir)
     return if (key_exists(built, key))
     built |> insert(key)
     let pkg_file = "{pkg_dir}/.das_package"
     return if (!fexist(pkg_file))
     var info : PackageReleaseInfo
-    return if (!run_das_package_release(pkg_file, info) || empty(info.wasm_build_command))
+    return if (!run_das_package_release(pkg_file, info))
+    // A complete cache needs every declared archive, not just the native module's
+    // one-to-one liblibDasModule*.a. Rebuild a partial external package cache so
+    // private dependency archives cannot disappear from a later link.
+    var all_staged = true
+    for (a in info.wasm_archives) {
+        if (!fexist(path_join(wasm_lib_dir, base_name(a)))) {
+            all_staged = false
+        }
+    }
+    return if (all_staged || empty(info.wasm_build_command))
     log("release wasm: building wasm archives for external module at {pkg_dir}...\n")
     let cd = get_platform_name() == "windows" ? "cd /d" : "cd"
     var bld_out : string
@@ -2521,13 +2557,16 @@ def private ensure_external_wasm_archives(pkg_dir, wasm_lib_dir : string; var bu
     }
     mkdir_rec(wasm_lib_dir)
     for (a in info.wasm_archives) {
-        let src = path_join(pkg_dir, a)
+        let src = is_absolute(a) ? a : path_join(pkg_dir, a)
+        let dst = path_join(wasm_lib_dir, base_name(a))
         if (!fexist(src)) {
+            // A bare archive name may declare an SDK archive already staged by
+            // `daspkg build --wasm` (for example dasImgui -> clipboard).
+            if (fexist(dst)) continue
             to_log(LOG_ERROR, "release wasm: declared wasm archive not found after build: {src}\n")
             continue
         }
-        let dst = path_join(wasm_lib_dir, base_name(a))
-        continue if (get_full_file_name(src) == get_full_file_name(dst))
+        continue if (wasm_path_key(src) == wasm_path_key(dst))
         var err : string
         if (copy_file(src, dst, true, err)) {
             log("  staged {base_name(a)}\n")
@@ -2622,21 +2661,32 @@ def private release_one_wasm_app(root, out_dir, app_name, main_script : string;
         if (empty(e.rel)) continue
         let arch = "{wasm_lib_dir}/{wasm_archive_name(e.rel)}"
         // In-tree archives come from `daspkg build --wasm`; an external module instead
-        // declares its own wasm build in its .das_package (release_wasm_build) -- run it
-        // on demand to produce the missing archive.
-        if (!fexist(arch)) {
-            ensure_external_wasm_archives(dir_name(e.abs), wasm_lib_dir, built_external)
-        }
+        // declares its own wasm build in its .das_package (release_wasm_build).
+        // Check the whole declaration even when this primary archive is cached:
+        // a partial cache may be missing a private dependency archive.
+        ensure_external_wasm_archives(dir_name(e.abs), wasm_lib_dir, built_external)
         if (!fexist(arch)) {
             to_log(LOG_ERROR, "release wasm: missing module archive {arch} (module `{e.das_name}`); for an in-tree module run `daspkg build --wasm`, for an external module declare release_wasm_build/release_wasm_archive in its .das_package\n")
             remove(obj_path)
             return 1
         }
-        archives |> push(arch)
-        gather_wasm_module(dir_name(e.abs), emcc_args, embeds, seen)
+        push_unique_archive(archives, arch)
+    }
+    // Primary module archives stay in dependency-discovery order. Append each
+    // package's declared private closure afterward, preserving declaration order.
+    for (e in deps.shared_modules) {
+        if (empty(e.rel)) continue
+        if (!gather_wasm_module(dir_name(e.abs), wasm_lib_dir, archives, emcc_args, embeds, seen)) {
+            remove(obj_path)
+            return 1
+        }
     }
     for (dm in deps.das_modules) {
-        gather_wasm_module(dm.package_dir, emcc_args, embeds, seen)
+        ensure_external_wasm_archives(dm.package_dir, wasm_lib_dir, built_external)
+        if (!gather_wasm_module(dm.package_dir, wasm_lib_dir, archives, emcc_args, embeds, seen)) {
+            remove(obj_path)
+            return 1
+        }
     }
 
     // 4. emcc link → <app>.{html,js,wasm}. run_cmd handles the Windows
