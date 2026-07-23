@@ -2109,12 +2109,13 @@ class MetalMoeMulMmK6 {
 
 // One simdgroup per output row over the 34B q8 blob (f16 scale + 32 int8 inline — the SAME
 // dual-view W the mul_mm reads, bound at the tensor's byte offset): lane owns chunk lane%8 of
-// every 4th block, 4 in flight; the scale rides the quants' cacheline. 128 threads = 4 rows/group.
+// every 4th block, 4 in flight; the scale rides the quants' cacheline. Width-agnostic — rows/tg via DASLLAMA_METAL_GEMV_TG (g_gemv_rows).
+[metal_dispatch(name = "enc_gemv_c", pso = "g_pso_gemv", tg = "g_gemv_rows*32", grid = "d/g_gemv_rows", params = "d : int64")]
 class MetalQ8Gemv {
-    @ssbo @binding = 0 wsh : array<float16> // 34B-block W blob, half-scale view (block b at 17*b)
-    @ssbo @binding = 1 wqb : array<int8>    // the same blob buffer, byte view (quants at 34*b + 2)
-    @ssbo @binding = 2 x : array<float4>    // [n] f32 vector, float4 view
-    @ssbo @binding = 3 y : array<float>     // [d] outputs
+    @ssbo @binding = 0 @role = "weight" @off = "boff" wsh : array<float16> // 34B-block W blob, half-scale view (block b at 17*b)
+    @ssbo @binding = 1 @role = "weight" @off = "boff" wqb : array<int8>    // the same blob buffer, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 @role = "read" x : array<float4>    // [n] f32 vector, float4 view
+    @ssbo @binding = 3 @role = "write" @off = "yoff" @span = "d*4" y : array<float>     // [d] outputs
     @uniform @binding = 4 ndim : uint       // n (reduction dim, % 32)
     @uniform @binding = 5 ddim : uint       // d (output rows)
 

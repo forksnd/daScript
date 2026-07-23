@@ -1541,28 +1541,29 @@ class MetalSqAttnComb {
 // The 2-rows-per-simdgroup fused QKV GEMV + rope + KV-row store: the rope pair's two elements
 // of q/k ARE two weight rows of the fused region — adjacent (2p, 2p+1) under NORM, (r, r+hs/2)
 // within the head under NEOX. Deletes the separate rope_store dispatch entirely.
+[metal_dispatch(name = "enc_qkvrs16_c", pso = "g_pso_qkvrs16", tg = 128, grid = "pairs/4", params = "pairs : int64")]
 class MetalQ8GemvQkvRsF16 {
-    @ssbo @binding = 0 wqbq : array<int8>   // wq blob, byte view @ the q tensor's byte offset
-    @ssbo @binding = 1 wshq : array<float16>   // ... half-scale view (same offset). Segments bind
+    @ssbo @binding = 0 @role = "weight" @off = "wqoff" wqbq : array<int8>   // wq blob, byte view @ the q tensor's byte offset
+    @ssbo @binding = 1 @role = "weight" @off = "wqoff" wshq : array<float16>   // ... half-scale view (same offset). Segments bind
                                             // separately — kind-major layout keeps q/k/v apart
-    @ssbo @binding = 2 x : array<float4>
-    @ssbo @binding = 3 qo : array<float>    // q out, roped ([0, qd) of the QKV buffer)
-    @ssbo @binding = 4 kd : array<float16>  // mirror K row (bound at the row offset)
-    @ssbo @binding = 5 vd : array<float16>
-    @ssbo @binding = 6 tcos : array<float>  // [hs/2] this position's rope row
-    @ssbo @binding = 7 tsin : array<float>
+    @ssbo @binding = 2 @role = "read" x : array<float4>
+    @ssbo @binding = 3 @role = "write" qo : array<float>    // q out, roped ([0, qd) of the QKV buffer)
+    @ssbo @binding = 4 @role = "write" @off = "koff" kd : array<float16>  // mirror K row (bound at the row offset)
+    @ssbo @binding = 5 @role = "write" @off = "voff" vd : array<float16>
+    @ssbo @binding = 6 @role = "weight" tcos : array<float>  // [hs/2] this position's rope row
+    @ssbo @binding = 7 @role = "weight" tsin : array<float>
     @uniform @binding = 8 ndim : uint
     @uniform @binding = 9 ddim : uint       // qd + 2*kvd
     @uniform @binding = 10 qd : uint
     @uniform @binding = 11 kvd : uint
     @uniform @binding = 12 hs : uint
     @uniform @binding = 13 neox : uint      // rope pair = rows (r, r+hs/2) instead of (2p, 2p+1)
-    @ssbo @binding = 14 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @ssbo @binding = 14 @role = "weight" bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 15 has_bias : uint
-    @ssbo @binding = 16 wqbk : array<int8>  // wk blob views
-    @ssbo @binding = 17 wshk : array<float16>
-    @ssbo @binding = 18 wqbv : array<int8>  // wv blob views
-    @ssbo @binding = 19 wshv : array<float16>
+    @ssbo @binding = 16 @role = "weight" @off = "wkoff" wqbk : array<int8>  // wk blob views
+    @ssbo @binding = 17 @role = "weight" @off = "wkoff" wshk : array<float16>
+    @ssbo @binding = 18 @role = "weight" @off = "wvoff" wqbv : array<int8>  // wv blob views
+    @ssbo @binding = 19 @role = "weight" @off = "wvoff" wshv : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs16_msl")]
     def metal_q8_gemv_qkv_rs16 {
@@ -1662,27 +1663,28 @@ class MetalQ8GemvQkvRsF16 {
 }
 
 // f32-mirror twin — straight stores, no clamp.
+[metal_dispatch(name = "enc_qkvrs32_c", pso = "g_pso_qkvrs32", tg = 128, grid = "pairs/4", params = "pairs : int64")]
 class MetalQ8GemvQkvRsF32 {
-    @ssbo @binding = 0 wqbq : array<int8>   // per-segment blob views — the F16 twin's scheme
-    @ssbo @binding = 1 wshq : array<float16>
-    @ssbo @binding = 2 x : array<float4>
-    @ssbo @binding = 3 qo : array<float>
-    @ssbo @binding = 4 kd : array<float>
-    @ssbo @binding = 5 vd : array<float>
-    @ssbo @binding = 6 tcos : array<float>
-    @ssbo @binding = 7 tsin : array<float>
+    @ssbo @binding = 0 @role = "weight" @off = "wqoff" wqbq : array<int8>   // per-segment blob views — the F16 twin's scheme
+    @ssbo @binding = 1 @role = "weight" @off = "wqoff" wshq : array<float16>
+    @ssbo @binding = 2 @role = "read" x : array<float4>
+    @ssbo @binding = 3 @role = "write" qo : array<float>
+    @ssbo @binding = 4 @role = "write" @off = "koff" kd : array<float>
+    @ssbo @binding = 5 @role = "write" @off = "voff" vd : array<float>
+    @ssbo @binding = 6 @role = "weight" tcos : array<float>
+    @ssbo @binding = 7 @role = "weight" tsin : array<float>
     @uniform @binding = 8 ndim : uint
     @uniform @binding = 9 ddim : uint
     @uniform @binding = 10 qd : uint
     @uniform @binding = 11 kvd : uint
     @uniform @binding = 12 hs : uint
     @uniform @binding = 13 neox : uint
-    @ssbo @binding = 14 bias : array<float>
+    @ssbo @binding = 14 @role = "weight" bias : array<float>
     @uniform @binding = 15 has_bias : uint
-    @ssbo @binding = 16 wqbk : array<int8>
-    @ssbo @binding = 17 wshk : array<float16>
-    @ssbo @binding = 18 wqbv : array<int8>
-    @ssbo @binding = 19 wshv : array<float16>
+    @ssbo @binding = 16 @role = "weight" @off = "wkoff" wqbk : array<int8>
+    @ssbo @binding = 17 @role = "weight" @off = "wkoff" wshk : array<float16>
+    @ssbo @binding = 18 @role = "weight" @off = "wvoff" wqbv : array<int8>
+    @ssbo @binding = 19 @role = "weight" @off = "wvoff" wshv : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs32_msl")]
     def metal_q8_gemv_qkv_rs32 {
@@ -1780,16 +1782,17 @@ class MetalQ8GemvQkvRsF32 {
 // The W1|W3 twin of the same shape: one simdgroup dots BOTH ffn rows of an output element (gate
 // off the w1 blob views, up off the w3 views — kind-major layout keeps them apart) and writes
 // act(g)·u directly (act = silu or gelu per the uniform). Deletes the swiglu/geglu dispatch AND its serialization level.
+[metal_dispatch(name = "enc_w13sw_c", pso = "g_pso_w13sw", tg = 128, grid = "hidden/4", params = "hidden : int64")]
 class MetalQ8GemvW13Sw {
-    @ssbo @binding = 0 wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
-    @ssbo @binding = 1 wsh1 : array<float16>   // ... half-scale view
-    @ssbo @binding = 2 x : array<float4>
-    @ssbo @binding = 3 ho : array<float>    // [hidden] silu(gate)·up
+    @ssbo @binding = 0 @role = "weight" @off = "w1off" wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
+    @ssbo @binding = 1 @role = "weight" @off = "w1off" wsh1 : array<float16>   // ... half-scale view
+    @ssbo @binding = 2 @role = "read" x : array<float4>
+    @ssbo @binding = 3 @role = "write" @span = "hidden*4" ho : array<float>    // [hidden] silu(gate)·up
     @uniform @binding = 4 ndim : uint
     @uniform @binding = 5 hidden : uint
-    @ssbo @binding = 6 wqb3 : array<int8>   // w3 blob views
-    @ssbo @binding = 7 wsh3 : array<float16>
-    @uniform @binding = 8 act : uint        // gate activation: 0 = silu (swiglu), 1 = gelu (geglu, gemma line)
+    @ssbo @binding = 6 @role = "weight" @off = "w3off" wqb3 : array<int8>   // w3 blob views
+    @ssbo @binding = 7 @role = "weight" @off = "w3off" wsh3 : array<float16>
+    @uniform @binding = 8 @role = "weight" act : uint        // gate activation: 0 = silu (swiglu), 1 = gelu (geglu, gemma line)
 
     [metal_kernel(name="metal_q8_gemv_w13sw16_msl")]
     def metal_q8_gemv_w13sw16 {
@@ -1905,13 +1908,14 @@ class MetalArgmax {
 // Speculative embed gather: dequant the argmax winner's Q8 embedding row (the cls_q8 linear
 // copy's slice of the whole-model 34B blob, bound at emb_q8_off's byte offset) into the next
 // step's residual input — the GPU chain's embed_row.
+[metal_dispatch(name = "enc_embed_c", pso = "g_pso_emb", tg = 64, grid = "dim/64", params = "dim : int64")]
 class MetalEmbedQ8 {
-    @ssbo @binding = 0 q : array<int8>      // the embed blob slice, byte view (quants at 34*b + 2)
-    @ssbo @binding = 1 sc : array<float16>  // the same buffer, half-scale view (block b at 17*b)
-    @ssbo @binding = 2 tok : array<uint>
-    @ssbo @binding = 3 xo : array<float>    // [dim] residual input out
+    @ssbo @binding = 0 @role = "weight" @off = "eoff" q : array<int8>      // the embed blob slice, byte view (quants at 34*b + 2)
+    @ssbo @binding = 1 @role = "weight" @off = "eoff" sc : array<float16>  // the same buffer, half-scale view (block b at 17*b)
+    @ssbo @binding = 2 @role = "read" tok : array<uint>
+    @ssbo @binding = 3 @role = "write" xo : array<float>    // [dim] residual input out
     @uniform @binding = 4 dim : uint
-    @uniform @binding = 5 escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere)
+    @uniform @binding = 5 @role = "weight" escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere — g_one or an uploaded scalar)
 
     [metal_kernel(name="metal_embed_q8_msl")]
     def metal_embed_q8 {
@@ -1928,14 +1932,15 @@ class MetalEmbedQ8 {
 // k6 twin (tied Q6_K classifiers — the spec chain for kq): dequant the winner's row from the
 // disk-order k6 planes, dequant_k6_plane_superblock's exact math — (d * sc16) * (q - 32), the
 // same split scale layout as MetalKqGemvK6 (16B sub-scale blocks @0, f16 d plane @nsb*16).
+[metal_dispatch(name = "enc_embed_k6_c", pso = "g_pso_emb_k6", tg = 64, grid = "dim/64", params = "dim : int64")]
 class MetalEmbedK6 {
-    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
-    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
-    @ssbo @binding = 2 kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
-    @ssbo @binding = 3 tok : array<uint>
-    @ssbo @binding = 4 xo : array<float>    // [dim] residual input out
+    @ssbo @binding = 0 @role = "weight" @off = "doff" kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 @role = "weight" @off = "soff" kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
+    @ssbo @binding = 2 @role = "weight" @off = "qoff" kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
+    @ssbo @binding = 3 @role = "read" tok : array<uint>
+    @ssbo @binding = 4 @role = "write" xo : array<float>    // [dim] residual input out
     @uniform @binding = 5 dim : uint
-    @uniform @binding = 6 escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere)
+    @uniform @binding = 6 @role = "weight" escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere — g_one or an uploaded scalar)
 
     [metal_kernel(name="metal_embed_k6_msl")]
     def metal_embed_k6 {
@@ -1971,15 +1976,16 @@ class MetalEmbedK6 {
 // Fused residual-add + rmsnorm: x += a in place, then y = rms(x)·w, one dispatch instead of two.
 // The added row stages through the threadgroup slab since barrier() is a threadgroup fence only.
 // dim caps at the slab; wider models take the unfused pair (enc_add_rms_site).
+[metal_dispatch(name = "enc_addrms_c", pso = "g_pso_addrms", tgmem = "metal_add_rms_msl_tgmem", tg = 1024, grid = "1")]
 class MetalAddRms {
-    @ssbo @binding = 0 x : array<float>     // [dim] residual stream, add target
-    @ssbo @binding = 1 a : array<float>     // [dim] addend (fully read before y is written — y may alias a)
-    @ssbo @binding = 2 w : array<float>     // [dim] norm weight
-    @ssbo @binding = 3 y : array<float>     // [dim] normed out
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>     // [dim] residual stream, add target
+    @ssbo @binding = 1 @role = "read" a : array<float>     // [dim] addend (fully read before y is written — y may alias a)
+    @ssbo @binding = 2 @role = "weight" w : array<float>     // [dim] norm weight
+    @ssbo @binding = 3 @role = "write" y : array<float>     // [dim] normed out
     @uniform @binding = 4 dim : uint
     @uniform @binding = 5 eps : float
-    @uniform @binding = 6 ascale : float    // (x + a) * ascale — gemma4 layer_out_scale scales
-                                            // the whole layer output; every other site binds 1.0
+    @uniform @binding = 6 @role = "weight" ascale : float    // (x + a) * ascale — gemma4 layer_out_scale scales
+                                            // the whole layer output; every other site binds 1.0 (g_one)
     @workgroup xrow : float[4096]           // == ADD_RMS_MAX_DIM
     @workgroup partial : float[32]          // one per simdgroup at the 1024-thread dispatch
     @workgroup inv_sh : float
@@ -2023,12 +2029,13 @@ class MetalAddRms {
 // Fused post-attn-norm + residual add + ffn-norm: a_n = rms(a)·wpa; x += a_n; y = rms(x)·wffn — one
 // dispatch collapsing the pre_post_norm chain (enc_rms(a) + enc_add_rms_site) with two register
 // reductions, no inter-dispatch barrier. x is staged for the trailing norm; same slab cap as MetalAddRms.
+[metal_dispatch(name = "enc_preaddrms_c", pso = "g_pso_preaddrms", tgmem = "metal_pre_add_rms_msl_tgmem", tg = 1024, grid = "1")]
 class MetalPreAddRms {
-    @ssbo @binding = 0 x : array<float>     // [dim] residual stream, add target + written back
-    @ssbo @binding = 1 a : array<float>     // [dim] attn out (post-wo); normed by wpa before the add
-    @ssbo @binding = 2 wpa : array<float>   // [dim] post-attention norm weight
-    @ssbo @binding = 3 wffn : array<float>  // [dim] ffn norm weight
-    @ssbo @binding = 4 y : array<float>     // [dim] ffn-normed out
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>     // [dim] residual stream, add target + written back
+    @ssbo @binding = 1 @role = "readwrite" a : array<float>     // [dim] attn out (post-wo); normed by wpa in place before the add
+    @ssbo @binding = 2 @role = "weight" wpa : array<float>   // [dim] post-attention norm weight
+    @ssbo @binding = 3 @role = "weight" wffn : array<float>  // [dim] ffn norm weight
+    @ssbo @binding = 4 @role = "write" y : array<float>     // [dim] ffn-normed out
     @uniform @binding = 5 dim : uint
     @uniform @binding = 6 eps : float
     @workgroup xrow : float[4096]           // == ADD_RMS_MAX_DIM — stages x for the trailing norm
@@ -2500,9 +2507,10 @@ class MetalRopeStoreTq4 {
 // The tq4 un-rotate: attention output is in the rotated basis per head — fwht_unsign_row it
 // (butterfly + 1/sqrt(n), then signs) before the wo projection. One threadgroup per (head, row);
 // the single-stream path dispatches one row.
+[metal_dispatch(name = "enc_unsign_c", pso = "g_pso_unsign", tgmem = "metal_fwht_unsign_msl_tgmem", tg = "head_size", grid = "nheads, nrows", params = "nheads : int64, nrows : int64, head_size : int64")]
 class MetalFwhtUnsign {
-    @ssbo @binding = 0 yo : array<float>    // [rows x qstride] attention out, un-rotated in place
-    @ssbo @binding = 1 signs : array<float>
+    @ssbo @binding = 0 @role = "readwrite" yo : array<float>    // [rows x qstride] attention out, un-rotated in place
+    @ssbo @binding = 1 @role = "weight" signs : array<float>
     @uniform @binding = 2 head_size : uint
     @uniform @binding = 3 qstride : uint
     @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
@@ -5925,18 +5933,7 @@ def metal_decode_init : bool {
 // ===== encoders =====
 
 def enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64; bx, by, bn, bd : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
-    kn_pipeline(enc, g_pso_gemv)
-    kn_buffer(enc, bw, boff, 0)   // half-scale view
-    kn_buffer(enc, bw, boff, 1)   // byte view — the same blob slice
-    kn_buffer(enc, bx, 0ul, 2)
-    kn_buffer(enc, by, yoff, 3)
-    kn_buffer(enc, bn, 0ul, 4)
-    kn_buffer(enc, bd, 0ul, 5)
-    hz_read(bx)
-    hz_write(by, yoff, uint64(d * 4l))
-    hz_gate(enc)
-    // the kernel is width-agnostic (one row per simdgroup) — rows/tg via DASLLAMA_METAL_GEMV_TG
-    kn_dispatch(enc, uint3(uint((d + g_gemv_rows - 1l) / g_gemv_rows), 1u, 1u), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
+    enc_gemv_c(enc, bw, boff, bw, bx, by, yoff, bn, bd, d)
 }
 
 // K-quant site GEMV — the per-format twin of enc_gemv over the kq plane pair
@@ -6137,16 +6134,7 @@ def enc_rope_store_tq4(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
 
 // the tq4 attention-output un-rotate: one threadgroup per (head, row), row stride = qstride
 def enc_fwht_unsign(enc : MetalComputeEncoder?; byo, bhs, bqs : MetalBuffer?; nheads, nrows, head_size : int64) {
-    kn_pipeline(enc, g_pso_unsign)
-    kn_tgmem(enc, metal_fwht_unsign_msl_tgmem, 0)
-    kn_buffer(enc, byo, 0ul, 0)
-    kn_buffer(enc, signs_buffer(), 0ul, 1)
-    kn_buffer(enc, bhs, 0ul, 2)
-    kn_buffer(enc, bqs, 0ul, 3)
-    hz_read(byo)
-    hz_write(byo)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint(nheads), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
+    enc_unsign_c(enc, byo, signs_buffer(), bhs, bqs, nheads, nrows, head_size)
 }
 
 // q8_0-mirror rope+store: the K/V mirror rows bind TWICE each (half-scale + byte views at the
@@ -6182,83 +6170,29 @@ def enc_rope_store_q8(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : u
 def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bw : MetalBuffer?; wqoff, wkoff, wvoff : uint64;
                     bx, bq : MetalBuffer?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
                     bcos, bsin, bn, bd, bqd, bkvd, bhs, bneox, bbias, bhasb : MetalBuffer?; d : int64) {
-    kn_pipeline(enc, f16 ? g_pso_qkvrs16 : g_pso_qkvrs32)
-    kn_buffer(enc, bw, wqoff, 0)   // q segment: byte + half views
-    kn_buffer(enc, bw, wqoff, 1)
-    kn_buffer(enc, bw, wkoff, 16)  // k segment
-    kn_buffer(enc, bw, wkoff, 17)
-    kn_buffer(enc, bw, wvoff, 18)  // v segment
-    kn_buffer(enc, bw, wvoff, 19)
-    kn_buffer(enc, bx, 0ul, 2)
-    kn_buffer(enc, bq, 0ul, 3)
-    kn_buffer(enc, kmb, koff, 4)
-    kn_buffer(enc, vmb, voff, 5)
-    kn_buffer(enc, bcos, 0ul, 6)
-    kn_buffer(enc, bsin, 0ul, 7)
-    kn_buffer(enc, bn, 0ul, 8)
-    kn_buffer(enc, bd, 0ul, 9)
-    kn_buffer(enc, bqd, 0ul, 10)
-    kn_buffer(enc, bkvd, 0ul, 11)
-    kn_buffer(enc, bhs, 0ul, 12)
-    kn_buffer(enc, bneox, 0ul, 13)
-    kn_buffer(enc, bbias, 0ul, 14)
-    kn_buffer(enc, bhasb, 0ul, 15)
-    hz_read(bx)
-    hz_write(bq)
-    hz_write(kmb)
-    hz_write(vmb)
-    hz_gate(enc)
     let pairs = d / 2l
-    kn_dispatch(enc, uint3(uint((pairs + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
+    if (f16) {
+        enc_qkvrs16_c(enc, bw, wqoff, bw, bx, bq, kmb, koff, vmb, voff, bcos, bsin,
+            bn, bd, bqd, bkvd, bhs, bneox, bbias, bhasb, bw, wkoff, bw, bw, wvoff, bw, pairs)
+    } else {
+        enc_qkvrs32_c(enc, bw, wqoff, bw, bx, bq, kmb, koff, vmb, voff, bcos, bsin,
+            bn, bd, bqd, bkvd, bhs, bneox, bbias, bhasb, bw, wkoff, bw, bw, wvoff, bw, pairs)
+    }
 }
 
 // the fused W1|W3 + silu/gelu dispatch (2 rows per simdgroup — gate + up of one output element; bact picks the activation)
 def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off : uint64; bx, bh : MetalBuffer?; bn, bhid : MetalBuffer?; hidden : int64; bact : MetalBuffer?) {
-    kn_pipeline(enc, g_pso_w13sw)
-    kn_buffer(enc, bw, w1off, 0)   // w1: byte + half views
-    kn_buffer(enc, bw, w1off, 1)
-    kn_buffer(enc, bw, w3off, 6)   // w3 views
-    kn_buffer(enc, bw, w3off, 7)
-    kn_buffer(enc, bx, 0ul, 2)
-    kn_buffer(enc, bh, 0ul, 3)
-    kn_buffer(enc, bn, 0ul, 4)
-    kn_buffer(enc, bhid, 0ul, 5)
-    kn_buffer(enc, bact, 0ul, 8)   // 0 = silu, 1 = gelu
-    hz_read(bx)
-    hz_write(bh, 0ul, uint64(hidden * 4l))
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
+    enc_w13sw_c(enc, bw, w1off, bw, bx, bh, bn, bhid, bw, w3off, bw, bact, hidden)
 }
 
 def enc_embed(enc : MetalComputeEncoder?; bw : MetalBuffer?; eoff : uint64; btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
-    kn_pipeline(enc, g_pso_emb)
-    kn_buffer(enc, bw, eoff, 0)   // byte view of the embed blob slice
-    kn_buffer(enc, bw, eoff, 1)   // half-scale view
-    kn_buffer(enc, btok, 0ul, 2)
-    kn_buffer(enc, bx, 0ul, 3)
-    kn_buffer(enc, bdim, 0ul, 4)
-    kn_buffer(enc, bescale != null ? bescale : g_one, 0ul, 5)   // embed_scale (identity 1.0)
-    hz_read(btok)
-    hz_write(bx)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    enc_embed_c(enc, bw, eoff, bw, btok, bx, bdim, bescale != null ? bescale : g_one, dim)
 }
 
 // the tied-k6 spec embed gather: the scale buffer binds twice (f16 d plane @doff + sub-scale
 // strips @soff — kq_scales_of's whole-plane offsets), the quant plane once @qoff
 def enc_embed_k6(enc : MetalComputeEncoder?; bq : MetalBuffer?; qoff : uint64; bs : MetalBuffer?; soff, doff : uint64; btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
-    kn_pipeline(enc, g_pso_emb_k6)
-    kn_buffer(enc, bs, doff, 0)
-    kn_buffer(enc, bs, soff, 1)
-    kn_buffer(enc, bq, qoff, 2)
-    kn_buffer(enc, btok, 0ul, 3)
-    kn_buffer(enc, bx, 0ul, 4)
-    kn_buffer(enc, bdim, 0ul, 5)
-    kn_buffer(enc, bescale != null ? bescale : g_one, 0ul, 6)   // embed_scale (identity 1.0)
-    hz_read(btok)
-    hz_write(bx)
-    hz_gate(enc)
-    kn_dispatch(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    enc_embed_k6_c(enc, bs, doff, bs, soff, bq, qoff, btok, bx, bdim, bescale != null ? bescale : g_one, dim)
 }
 
 // ===== MoE routing encoders (Wave C) =====
@@ -6368,21 +6302,7 @@ def enc_moe_gemv_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, rows, k, 
 // fused add + rms when dim fits the kernel's row slab, the unfused pair otherwise
 def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; dim : int64; bascale : MetalBuffer? = null) {
     if (dim <= ADD_RMS_MAX_DIM) {
-        kn_pipeline(enc, g_pso_addrms)
-        kn_tgmem(enc, metal_add_rms_msl_tgmem, 0)
-        kn_buffer(enc, bx, 0ul, 0)
-        kn_buffer(enc, ba, 0ul, 1)
-        kn_buffer(enc, bw, 0ul, 2)
-        kn_buffer(enc, by, 0ul, 3)
-        kn_buffer(enc, bdim, 0ul, 4)
-        kn_buffer(enc, beps, 0ul, 5)
-        kn_buffer(enc, bascale != null ? bascale : g_one, 0ul, 6)
-        hz_read(bx)
-        hz_read(ba)
-        hz_write(bx)   // the residual add persists (x += a), then y = rms(x)
-        hz_write(by)
-        hz_gate(enc)
-        kn_dispatch(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
+        enc_addrms_c(enc, bx, ba, bw, by, bdim, beps, bascale != null ? bascale : g_one)
     } else {
         enc_ew2(enc, g_pso_add, bx, 0ul, ba, 0ul, bdim, dim, bascale)
         enc_rms(enc, bx, bw, by, bdim, beps)
@@ -6394,22 +6314,7 @@ def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : Me
 // separate pair past the slab cap. `ba` is normed in place (matches the un-fused enc_rms(a) write).
 def enc_pre_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bwpa, bwffn, by, bdim, beps : MetalBuffer?; dim : int64) {
     if (dim <= ADD_RMS_MAX_DIM) {
-        kn_pipeline(enc, g_pso_preaddrms)
-        kn_tgmem(enc, metal_pre_add_rms_msl_tgmem, 0)
-        kn_buffer(enc, bx, 0ul, 0)
-        kn_buffer(enc, ba, 0ul, 1)
-        kn_buffer(enc, bwpa, 0ul, 2)
-        kn_buffer(enc, bwffn, 0ul, 3)
-        kn_buffer(enc, by, 0ul, 4)
-        kn_buffer(enc, bdim, 0ul, 5)
-        kn_buffer(enc, beps, 0ul, 6)
-        hz_read(ba)
-        hz_write(ba)   // a is re-normed in place before the add
-        hz_read(bx)
-        hz_write(bx)   // the residual add persists (x += rms(a))
-        hz_write(by)
-        hz_gate(enc)
-        kn_dispatch(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
+        enc_preaddrms_c(enc, bx, ba, bwpa, bwffn, by, bdim, beps)
     } else {
         enc_rms(enc, ba, bwpa, ba, bdim, beps)
         enc_add_rms_site(enc, bx, ba, bwffn, by, bdim, beps, dim)
