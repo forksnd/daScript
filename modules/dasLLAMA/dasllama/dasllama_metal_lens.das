@@ -243,6 +243,26 @@ class MetalDispatch : AstStructureAnnotation {
             errors := "[metal_dispatch] {fn_name}: 'grid' is required (per WorkGroupID dim: 1 | param | param/coverage)"
             return false
         }
+        // micro-grammar validation up front — a malformed spec must fail the compile here, not
+        // silently emit wrong dispatch geometry (mk_* helpers assume validated input)
+        if (!empty(strip(tgs))) {
+            let tparts <- split(tgs, "*")
+            if (length(tparts) > 2) {
+                errors := "[metal_dispatch] {fn_name}: tg '{tgs}' has more than one '*' (int const | param | name*int)"
+                return false
+            }
+            if (length(tparts) == 2 && !is_digit_tok(strip(tparts[1]))) {
+                errors := "[metal_dispatch] {fn_name}: tg '{tgs}' multiplier '{strip(tparts[1])}' must be an integer literal"
+                return false
+            }
+        }
+        for (dspec in split(grid, ",")) {
+            let dparts <- split(dspec, "/")
+            if (length(dparts) > 2) {
+                errors := "[metal_dispatch] {fn_name}: grid dim '{strip(dspec)}' has more than one '/' (1 | param | param/coverage)"
+                return false
+            }
+        }
 
         // Collect @ssbo/@uniform buffer fields in @binding order. @workgroup + hidden/method
         // fields are skipped; field-annotation validity is msl_emit's job, not the lens's.
