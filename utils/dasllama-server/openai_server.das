@@ -1233,6 +1233,13 @@ def private handle_activate(var req : HttpRequest?; var resp : HttpResponse?) : 
         }
     }
     let want = js?["model"] ?? ""
+    if (empty(want)) {
+        // an admin switch has one required parameter — silently activating the default slot on
+        // a malformed body would hide the client bug behind a real VRAM-state switch
+        return resp |> JSON(
+            error_body("'model' is required — GET /v1/models lists the served ids", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
     let mi = slot_index(want)
     if (mi < 0) {
         return resp |> JSON(

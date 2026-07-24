@@ -568,7 +568,7 @@ $("mcards").addEventListener("click", async e => {
             body: JSON.stringify({ model: b.dataset.activate }),
         });
         const j = await r.json().catch(() => null);
-        $("m-note").textContent = r.ok
+        $("m-note").textContent = r.ok && j
             ? j.model + " active · switch " + j.switch_ms + "ms · " + j.backend_effective
             : (j && j.error ? j.error.message : "activate failed: " + r.status);
     } catch (_e) {
