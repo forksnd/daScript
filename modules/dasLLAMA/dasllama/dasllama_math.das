@@ -1441,6 +1441,7 @@ typedef RdecTokenFn = function<(x : array<float>; cossin : array<float>; pos : i
 typedef RdecPrefillFn = function<(x_batch : array<float>; cos_batch : array<float>; npos : int64; var logits : array<float>) : void>
 typedef RdecSyncKvFn = function<(l : int64; kp : float const?; vp : float const?; npos : int64) : void>
 typedef RdecReadKvFn = function<(l : int64; pos : int64; kp : float?; vp : float?) : void>
+typedef RdecReadKvBulkFn = function<(l : int64; kp : float?; vp : float?; npos : int64) : void>
 
 [unused_argument(fmt, cap_blocks)]
 def private rdec_unset_reserve(fmt : int; cap_blocks : int64) : bool => false
@@ -1466,6 +1467,10 @@ def private rdec_unset_prefill(x_batch : array<float>; cos_batch : array<float>;
 def private rdec_unset_sync(l : int64; kp : float const?; vp : float const?; npos : int64) {}
 [unused_argument(l, pos, kp, vp)]
 def private rdec_unset_read(l, pos : int64; kp : float?; vp : float?) {}
+[unused_argument(l, kp, vp, npos)]
+def private rdec_unset_read_bulk(l : int64; kp : float?; vp : float?; npos : int64) {
+    panic("dasLLAMA: resident KV bulk readback hit without an installed GPU driver")
+}
 
 var g_rdec_reserve = @@rdec_unset_reserve
 var g_rdec_place = @@rdec_unset_place
@@ -1477,13 +1482,15 @@ var g_rdec_token = @@rdec_unset_token
 var g_rdec_prefill = @@rdec_unset_prefill
 var g_rdec_sync_kv = @@rdec_unset_sync
 var g_rdec_read_kv = @@rdec_unset_read
+var g_rdec_read_kv_bulk = @@rdec_unset_read_bulk
 var g_rdec_installed = false
 
 //! Install the resident whole-stack decode driver (a GPU backend calls this at [init]).
 def public install_moe_gpu_resident(reserve : RdecReserveFn; place : RdecPlaceFn; prepare : RdecPrepareFn;
                                     norms : RdecNormsFn; set_layer : RdecSetLayerFn; set_cls : RdecSetClsFn;
                                     token : RdecTokenFn; prefill : RdecPrefillFn;
-                                    sync_kv : RdecSyncKvFn; read_kv : RdecReadKvFn) {
+                                    sync_kv : RdecSyncKvFn; read_kv : RdecReadKvFn;
+                                    read_kv_bulk : RdecReadKvBulkFn) {
     g_rdec_reserve = reserve
     g_rdec_place = place
     g_rdec_prepare = prepare
@@ -1494,6 +1501,7 @@ def public install_moe_gpu_resident(reserve : RdecReserveFn; place : RdecPlaceFn
     g_rdec_prefill = prefill
     g_rdec_sync_kv = sync_kv
     g_rdec_read_kv = read_kv
+    g_rdec_read_kv_bulk = read_kv_bulk
     g_rdec_installed = true
 }
 
@@ -1508,6 +1516,7 @@ def public rdec_token(x : array<float>; cossin : array<float>; pos, cnt : int64;
 def public rdec_prefill(x_batch : array<float>; cos_batch : array<float>; npos : int64; var logits : array<float>) { invoke(g_rdec_prefill, x_batch, cos_batch, npos, logits) }
 def public rdec_sync_kv(l : int64; kp : float const?; vp : float const?; npos : int64) { invoke(g_rdec_sync_kv, l, kp, vp, npos) }
 def public rdec_read_kv(l, pos : int64; kp : float?; vp : float?) { invoke(g_rdec_read_kv, l, pos, kp, vp) }
+def public rdec_read_kv_bulk(l : int64; kp : float?; vp : float?; npos : int64) { invoke(g_rdec_read_kv_bulk, l, kp, vp, npos) }
 
 //! Install the GPU MoE tier (a GPU backend calls this at [init] when its device probe passes).
 def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn; dense : MoeGpuDenseFn; drop : MoeGpuDropFn; dn : MoeGpuDnFn; attn : MoeGpuAttnFn) {
@@ -1799,6 +1808,96 @@ def public moe_gpu_qkv_on_gpu(l : int64) : bool {
 //! Runtime routing gate over the qkv marks (the --qkv-ab in-process lever; uploads stay).
 def public set_moe_gpu_qkv_route(on : bool) {
     g_moe_gpu_qkv_route = on
+}
+
+// ===== per-model mark sets + whole-model drop (multi-model hosts) =====
+// The loader-contract marks are keyed by WEIGHT ELEMENT OFFSETS and two models' offset spaces
+// overlap — a multi-model host must swap the whole set per switch or funnels read wrong planes.
+
+//! One loaded model's tier routing marks — everything the loader contract sets per load.
+//! A multi-model host saves these after each load and restores them before stepping that model.
+struct MoeGpuMarks {
+    layer_count : int64
+    from_layer : int64 = 1000000l
+    stream_from : int64 = 1000000l
+    total_layers : int64
+    cls_off : int64 = -1l
+    dense_offs : table<int64>
+    dn_layers : table<int64; int64>
+    attn_layers : table<int64>
+    shexp_layers : table<int64>
+    qkv_layers : table<int64>
+    unsupported : string
+}
+
+//! Move the installed marks out into `m`; the globals read as no-marks after (routing gates —
+//! the process-wide A/B levers — stay put).
+def public moe_gpu_marks_save(var m : MoeGpuMarks) {
+    m.layer_count = g_moe_gpu_layer_count
+    m.from_layer = g_moe_gpu_from_layer
+    m.stream_from = g_moe_gpu_stream_from
+    m.total_layers = g_moe_gpu_total_layers
+    m.cls_off = g_moe_gpu_cls_off
+    m.dense_offs <- g_moe_gpu_dense_offs
+    m.dn_layers <- g_moe_gpu_dn_layers
+    m.attn_layers <- g_moe_gpu_attn_layers
+    m.shexp_layers <- g_moe_gpu_shexp_layers
+    m.qkv_layers <- g_moe_gpu_qkv_layers
+    m.unsupported = g_moe_gpu_unsupported
+    g_moe_gpu_layer_count = 0l
+    g_moe_gpu_from_layer = 1000000l
+    g_moe_gpu_stream_from = 1000000l
+    g_moe_gpu_total_layers = 0l
+    g_moe_gpu_cls_off = -1l
+    g_moe_gpu_unsupported = ""
+}
+
+//! Does a saved mark set carry any armed state? A multi-model host uses this to attribute a
+//! load's arm outcome to the slot that captured it — the process-global VRAM counter cannot
+//! tell WHOSE planes are resident.
+def public moe_gpu_marks_armed(m : MoeGpuMarks) : bool {
+    return (!empty(m.dense_offs) || !empty(m.dn_layers) || !empty(m.attn_layers)
+        || !empty(m.shexp_layers) || !empty(m.qkv_layers) || m.cls_off >= 0l
+        || (m.total_layers > 0l && (m.from_layer < m.total_layers || m.stream_from < m.total_layers)))
+}
+
+//! Install `m` as the global marks (moves the tables in; `m` reads as no-marks after).
+def public moe_gpu_marks_restore(var m : MoeGpuMarks) {
+    g_moe_gpu_layer_count = m.layer_count
+    g_moe_gpu_from_layer = m.from_layer
+    g_moe_gpu_stream_from = m.stream_from
+    g_moe_gpu_total_layers = m.total_layers
+    g_moe_gpu_cls_off = m.cls_off
+    g_moe_gpu_dense_offs <- m.dense_offs
+    g_moe_gpu_dn_layers <- m.dn_layers
+    g_moe_gpu_attn_layers <- m.attn_layers
+    g_moe_gpu_shexp_layers <- m.shexp_layers
+    g_moe_gpu_qkv_layers <- m.qkv_layers
+    g_moe_gpu_unsupported = m.unsupported
+    m.layer_count = 0l
+    m.from_layer = 1000000l
+    m.stream_from = 1000000l
+    m.total_layers = 0l
+    m.cls_off = -1l
+    m.unsupported = ""
+}
+
+typedef MoeGpuDropModelFn = function<() : void>
+
+def private moe_gpu_noop_drop_model() {}
+
+var g_moe_gpu_drop_model = @@moe_gpu_noop_drop_model
+
+//! Tier registration of the whole-model VRAM drop (beside install_moe_gpu_tier).
+def public set_moe_gpu_drop_model_hook(f : MoeGpuDropModelFn) {
+    g_moe_gpu_drop_model = f
+}
+
+//! Destroy every model-owned device object the tier holds (stacks, arenas, the resident
+//! driver, all lazy dispatch state); device-lifetime state survives and rebuilds lazily.
+//! Callers use dasllama_common's ``moe_gpu_drop_model``, which also resets the marks.
+def public moe_gpu_drop_model_state() {
+    invoke(g_moe_gpu_drop_model)
 }
 
 //! One attention layer's q/k/v decode projections on the tier — one submit, one shared

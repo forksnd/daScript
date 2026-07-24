@@ -33,10 +33,93 @@ require dasllama/dasllama_vad        // POST /vad: silero speech spans for the p
 // the small buffered holdouts (/v1/models, /v1/embeddings, /shutdown, /v1/stats) still complete
 // in-handler.
 
-// ===== Served state (set once at startup; handlers run serially on the tick thread) =====
+// ===== Served state (slots set at startup; handlers run serially on the tick thread) =====
 
-var g_model = Model()
-var g_model_name = ""
+//! Per-slot serving options (main.das resolves them from a [[models]] config entry). The -1/-2/""
+//! sentinels mean "inherit the init_server default". `backend` is a REQUEST (auto | cpu | gpu);
+//! the arm outcome lands in ModelSlot.backend_effective.
+struct SlotOpts {
+    backend : string = "auto"
+    streams : int64 = -1l
+    chunk : int64 = -1l
+    page_rows : int64 = -2l         // -2 = inherit (0 is meaningful: flat sessions)
+    prefix : int64 = -2l
+    kv_dtype : KVDtype = KVDtype.f16
+    kv_dtype_set : bool = false
+    mtp : int = -1                  // -1 inherit | 0 off | 1 on
+}
+
+//! One live served model: the loaded model, its scheduler (sessions + KV pool + prefix cache —
+//! the host caches that survive switches), and its serving options. Execution is SERIALIZED:
+//! the tick loop steps one slot's scheduler at a time (round-robin over slots with work).
+struct ModelSlot {
+    name : string
+    model : Model = Model()
+    sched : Scheduler = Scheduler()
+    opts : SlotOpts = SlotOpts()
+    backend_effective : string = "cpu"   // arm outcome: cpu | gpu:rails | gpu:resident
+    is_default : bool
+    last_used : int64
+    sw_count : int64                // gpu-switch telemetry (count / total usec)
+    sw_us : int64
+    gpu_want : GpuTierWant = GpuTierWant()   // the tier request this slot re-arms with on switch-in
+    gpu_capable : bool              // want is non-zero and backend != cpu (set_slot_gpu_want)
+    gpu_marks : GpuModelMarks <- GpuModelMarks()   // this model's tier routing marks while NOT installed
+}
+
+var g_slots : array<ModelSlot>
+var g_default_slot = 0
+var g_active = 0                // slot the tick loop stepped last
+var g_cur = 0                   // slot the request being handled resolved to (handlers are serial)
+var g_gpu_owner = -1            // slot holding the GPU tier's VRAM state (-1 = none)
+var g_marks_slot = -1           // slot whose routing marks are INSTALLED in the engine globals
+
+def private cur_model : Model & {
+    unsafe {
+        return g_slots[g_cur].model
+    }
+}
+
+def private cur_sched : Scheduler & {
+    unsafe {
+        return g_slots[g_cur].sched
+    }
+}
+
+def private cur_name : string => g_slots[g_cur].name
+
+def private total_active : int64 {
+    var n = 0l
+    for (s in g_slots) {
+        n += n_active(s.sched)
+    }
+    return n
+}
+
+def private total_queued : int64 {
+    var n = 0l
+    for (s in g_slots) {
+        n += n_queued(s.sched)
+    }
+    return n
+}
+
+// Slot index for a request's "model" field: "" -> the default slot; the exact slot name -> that
+// slot; unknown -> -1 (the caller owns the 404). The legacy "{name}-asr" alias routes to the
+// DEFAULT slot only — that is the only "-asr" id /v1/models ever advertises, so a made-up
+// "{other}-asr" stays a 404 instead of silently serving.
+def private slot_index(model_field : string) : int {
+    if (empty(model_field)) {
+        return g_default_slot
+    }
+    for (i in range(length(g_slots))) {
+        if (g_slots[i].name == model_field
+                || (i == g_default_slot && "{g_slots[i].name}-asr" == model_field)) {
+            return i
+        }
+    }
+    return -1
+}
 var g_has_asr = false
 var g_asr_path = ""
 var g_asr_mmproj = ""
@@ -45,7 +128,6 @@ var g_asr_team_dispatch = false
 var g_shutdown_requested = false
 var g_gc_requested = false
 var g_req_counter = 0l
-var g_sched = Scheduler()       // live from run_server on; handlers submit into it
 var g_events : array<SchedEvent>
 
 // One registered request's HTTP side: where this stream id's SchedEvents go. The writer is owned by
@@ -54,6 +136,7 @@ struct private StreamWire {
     @do_not_delete writer : HttpResponseWriter?
     streaming : bool
     is_chat : bool                  // chat.completion.chunk vs text_completion framing
+    slot : int                      // the ModelSlot this stream runs on (flush sets g_cur from it)
     id : string                     // "chatcmpl-N" / "cmpl-N"
     created : int64
     reply_parts : array<string>     // non-streaming (or has_tools): pieces accumulate until the finished event
@@ -69,11 +152,140 @@ var g_default_max_new = 256l
 var private g_started_at = 0l   // ref_time_ticks at init_server; /v1/stats derives uptime_s from it
                                 // (created_ts is a per-request monotone stand-in, NOT a clock)
 
-//! Move a loaded model into the server (call once, before run_server). ``name`` is the id reported
-//! by ``/v1/models`` and echoed back in responses.
+//! Append a loaded model as a serving slot (call once per model, before ``run_server``). ``name``
+//! is the id ``/v1/models`` reports and requests route on via their ``"model"`` field. The first
+//! slot added is the default until ``set_default_model`` says otherwise.
+def add_model(var m : Model; name : string; opts : SlotOpts = SlotOpts()) {
+    var slot <- ModelSlot(name = name, is_default = empty(g_slots))
+    slot.model <- m
+    slot.opts = opts
+    // the load's arm outcome (routing marks + resident-driver state) belongs to THIS slot:
+    // capture it, so two models' offset-keyed marks never mix. Whichever slot is stepped gets
+    // its set re-installed (install_slot_marks); an armed capture makes this slot the GPU owner.
+    // Attribution reads the CAPTURED marks, not the process-global VRAM counter — that still
+    // holds the previous load's bytes when a later CPU-only slot loads.
+    let was_resident = moe_gpu_resident_active()
+    moe_gpu_model_marks_save(slot.gpu_marks)
+    let was_gpu = was_resident || moe_gpu_marks_armed(slot.gpu_marks.marks)
+    slot.backend_effective = was_resident ? "gpu:resident" : (was_gpu ? "gpu:rails" : "cpu")
+    g_slots |> emplace(slot)
+    if (was_gpu) {
+        g_gpu_owner = length(g_slots) - 1
+    }
+}
+
+//! Move a loaded model into the server as the ONLY slot (call once, before run_server). ``name``
+//! is the id reported by ``/v1/models`` and echoed back in responses. Single-model compatibility
+//! wrapper over ``add_model``; multi-model hosts call ``add_model`` per entry instead.
 def set_model(var m : Model; name : string) {
-    g_model <- m
-    g_model_name = name
+    unsafe {
+        delete g_slots
+    }
+    g_default_slot = 0
+    g_active = 0
+    g_cur = 0
+    g_gpu_owner = -1
+    g_marks_slot = -1
+    add_model(m, name)
+}
+
+//! Record the GPU tier want slot `name` re-arms with when the tier switches to it (main.das
+//! passes the same want it set before that slot's load). A zero want or ``backend = "cpu"``
+//! keeps the slot off the device permanently.
+def set_slot_gpu_want(name : string; want : GpuTierWant) {
+    for (s in g_slots) {
+        if (s.name == name) {
+            s.gpu_want = want
+            s.gpu_capable = (s.opts.backend != "cpu"
+                && (want.auto_tier || want.moe_layers != 0l || want.moe_stream != 0l || want.dn
+                    || want.attn || want.dense || want.dnd || want.shexp || want.qkv || want.heat > 0l))
+        }
+    }
+}
+
+// The stepped slot's marks must be the installed ones — swap on change (pure table moves, no
+// device work; this is what keeps gpu<->cpu slot alternation free).
+def private install_slot_marks(si : int) {
+    if (g_marks_slot == si) {
+        return
+    }
+    if (g_marks_slot >= 0 && g_marks_slot < length(g_slots)) {
+        moe_gpu_model_marks_save(g_slots[g_marks_slot].gpu_marks)
+    }
+    moe_gpu_model_marks_restore(g_slots[si].gpu_marks)
+    g_marks_slot = si
+}
+
+// Move the GPU tier's VRAM state to slot `si`: hydrate + drop the current owner's whole state,
+// re-arm `si` from its mmap'd image (the same walk its load ran). Serialized with stepping —
+// only called between scheduler steps.
+def private bind_gpu_slot(si : int) {
+    if (g_gpu_owner == si || !g_slots[si].gpu_capable) {
+        return
+    }
+    let t0 = ref_time_ticks()
+    let prev = g_gpu_owner
+    var prev_note = ""
+    if (prev >= 0) {
+        install_slot_marks(prev)   // the drop acts on the INSTALLED per-model state
+        for (st in g_slots[prev].sched.streams) {   // server flow keeps host KV authoritative; belt-and-braces
+            moe_gpu_hydrate_session(g_slots[prev].model, st.session)
+        }
+        moe_gpu_drop_model()
+        g_slots[prev].backend_effective = "cpu"
+        prev_note = "from {g_slots[prev].name}, "
+    }
+    install_slot_marks(si)
+    set_gpu_tier_want(g_slots[si].gpu_want)
+    moe_gpu_tier_arm()
+    moe_gpu_upload_resident(g_slots[si].model)
+    g_gpu_owner = si
+    let us = int64(get_time_usec(t0))
+    g_slots[si].sw_count ++
+    g_slots[si].sw_us += us
+    g_slots[si].backend_effective = (moe_gpu_resident_active() ? "gpu:resident"
+        : (gpu_tier_status().vram_bytes > 0l ? "gpu:rails" : "cpu"))
+    to_log(LOG_INFO, "dasllama-server: GPU tier -> {g_slots[si].name} ({prev_note}{us / 1000l}ms, {g_slots[si].backend_effective})\n")
+}
+
+// Auto-switch policy: move the tier to a gpu-wanting slot only when the current owner is idle
+// (drain, never preempt — its live streams keep their device speed). gpu<->cpu alternation
+// never lands here: cpu slots are not gpu_capable and never evict the owner.
+def private maybe_bind_gpu(si : int) {
+    if (g_gpu_owner == si || !g_slots[si].gpu_capable
+            || (g_gpu_owner >= 0
+                && (n_active(g_slots[g_gpu_owner].sched) > 0l || n_queued(g_slots[g_gpu_owner].sched) > 0l))) {
+        return
+    }
+    bind_gpu_slot(si)
+}
+
+//! Record a slot's backend arm outcome for the stats/config surfaces (P1: coarse gpu/cpu; the
+//! P2 switch path refines to gpu:resident / gpu:rails). No-op on an unknown name.
+def set_slot_backend_effective(name : string; eff : string) {
+    for (s in g_slots) {
+        if (s.name == name) {
+            s.backend_effective = eff
+        }
+    }
+}
+
+//! Mark the default slot (the one serving requests with no ``"model"`` field). No-op on an
+//! unknown name.
+def set_default_model(name : string) {
+    var ni = -1
+    for (i in range(length(g_slots))) {
+        if (g_slots[i].name == name) {
+            ni = i
+        }
+    }
+    if (ni < 0) {
+        return
+    }
+    g_default_slot = ni
+    for (i in range(length(g_slots))) {
+        g_slots[i].is_default = i == ni
+    }
 }
 
 //! Default reply token budget for requests that omit ``max_tokens`` (call before run_server;
@@ -272,7 +484,7 @@ def private handle_bench_start(var resp : HttpResponse?) : http_status {
             error_body(empty(g_lcpp_bin) ? "set lcpp_bin in the config to enable benchmarking" : "benchmarking needs a source-tree daslang (standalone exe cannot spawn the bench child)", "invalid_request_error"),
             http_status.BAD_REQUEST)
     }
-    if (n_active(g_sched) > 0l || n_queued(g_sched) > 0l || g_asr_pending > 0) {
+    if (total_active() > 0l || total_queued() > 0l || g_asr_pending > 0) {
         return resp |> JSON(
             error_body("streams are active — contended numbers are misleading; drain first, then bench", "invalid_request_error"),
             http_status.CONFLICT)
@@ -649,7 +861,7 @@ def private utf8_hold_bytes(s : string) : int {
 // empty delta + finish_reason for the terminating chunk.
 def private send_chat_chunk(srv : WebSocketServer; var writer : HttpResponseWriter?;
                             id : string; created : int64; role, content, finish : string) {
-    var chunk = OaiStreamChunk(id = id, _object = "chat.completion.chunk", created = created, model = g_model_name)
+    var chunk = OaiStreamChunk(id = id, _object = "chat.completion.chunk", created = created, model = cur_name())
     chunk.choices |> emplace(OaiStreamChoice(index = 0, delta <- OaiDelta(role = role, content = content),
                                              finish_reason = finish))
     sse_event(srv, writer, sprint_json(chunk, false), "")
@@ -660,7 +872,7 @@ def private send_chat_chunk(srv : WebSocketServer; var writer : HttpResponseWrit
 // OpenAI incremental framing); the caller follows with the finish_reason="tool_calls" chunk.
 def private send_chat_tool_calls_chunk(srv : WebSocketServer; var writer : HttpResponseWriter?;
                                        id : string; created : int64; calls : array<OaiToolCall>) {
-    var chunk = OaiStreamChunk(id = id, _object = "chat.completion.chunk", created = created, model = g_model_name)
+    var chunk = OaiStreamChunk(id = id, _object = "chat.completion.chunk", created = created, model = cur_name())
     var delta = OaiDelta()
     delta.tool_calls |> reserve(length(calls))
     var idx = 0
@@ -835,7 +1047,7 @@ def parse_tool_calls_auto(full : string; declared_open, declared_close, id_base 
 
 def private send_compl_chunk(srv : WebSocketServer; var writer : HttpResponseWriter?;
                              id : string; created : int64; text, finish : string) {
-    var chunk = OaiComplStreamChunk(id = id, _object = "text_completion", created = created, model = g_model_name)
+    var chunk = OaiComplStreamChunk(id = id, _object = "text_completion", created = created, model = cur_name())
     chunk.choices |> push(OaiComplStreamChoice(index = 0, text = text, finish_reason = finish))
     sse_event(srv, writer, sprint_json(chunk, false), "")
     delete chunk
@@ -843,7 +1055,7 @@ def private send_compl_chunk(srv : WebSocketServer; var writer : HttpResponseWri
 
 // Clamp a requested reply budget to [1, model context].
 def private clamp_max(requested : int64) : int64 {
-    return clamp(requested, 1l, g_model.config.seq_len)
+    return clamp(requested, 1l, cur_model().config.seq_len)
 }
 
 // Error on a buffered (resp-based) route — /v1/models and the audio endpoints use the response path.
@@ -940,11 +1152,16 @@ def private handle_unknown(var req : HttpRequest?; var resp : HttpResponse?) : h
 
 def private handle_models(var resp : HttpResponse?) : http_status {
     var list = OaiModelList(_object = "list")
-    list.data |> push(OaiModel(id = g_model_name, _object = "model", created = created_ts(), owned_by = "dasllama"))
-    if (g_has_asr) {
-        list.data |> push(OaiModel(id = "{g_model_name}-asr", _object = "model", created = created_ts(), owned_by = "dasllama"))
+    list.data |> reserve(length(g_slots) + 1)
+    for (s in g_slots) {
+        list.data |> push(OaiModel(id = s.name, _object = "model", created = created_ts(), owned_by = "dasllama"))
     }
-    return resp |> JSON(sprint_json(list, false), http_status.OK)
+    if (g_has_asr && !empty(g_slots)) {
+        list.data |> push(OaiModel(id = "{g_slots[g_default_slot].name}-asr", _object = "model", created = created_ts(), owned_by = "dasllama"))
+    }
+    let body = sprint_json(list, false)
+    delete list
+    return resp |> JSON(body, http_status.OK)
 }
 
 // /v1/embeddings: mean-pooled, L2-normalized sentence embeddings over the facade `embed` verb.
@@ -958,6 +1175,13 @@ def private handle_embeddings(var req : HttpRequest?; var resp : HttpResponse?) 
     }
     defer() { unsafe { delete js } }
     warn_ignored_fields(js, EMB_FIELDS, "/v1/embeddings")
+    let want_model = js?["model"] ?? ""
+    let mi = slot_index(want_model)
+    if (mi < 0) {
+        return resp_error(resp, http_status.NOT_FOUND, "model '{want_model}' not found — GET /v1/models lists the served ids")
+    }
+    g_cur = mi
+    install_slot_marks(mi)   // this handler evals IN-handler — the embed forward needs ITS marks
     let iv = js?["input"]
     if (iv == null) {
         return resp_error(resp, http_status.BAD_REQUEST, "'input' is required (a string or array of strings)")
@@ -976,19 +1200,82 @@ def private handle_embeddings(var req : HttpRequest?; var resp : HttpResponse?) 
         return resp_error(resp, http_status.BAD_REQUEST, "'input' is empty")
     }
 
-    var out = OaiEmbeddingList(_object = "list", model = g_model_name)
+    var out = OaiEmbeddingList(_object = "list", model = cur_name())
     out.data |> reserve(length(inputs))
     var prompt_tokens = 0l
     var idx = 0
     for (text in inputs) {
-        let toks <- encode(g_model, text, true, false)
+        let toks <- encode(cur_model(), text, true, false)
         prompt_tokens += int64(length(toks))
-        var vec = embed(g_model, text)
+        var vec = embed(cur_model(), text)
         out.data |> emplace(OaiEmbedding(_object = "embedding", embedding <- vec, index = idx))
         idx ++
     }
     out.usage = OaiEmbUsage(prompt_tokens = prompt_tokens, total_tokens = prompt_tokens)
-    return resp |> JSON(sprint_json(out, false), http_status.OK)
+    let body = sprint_json(out, false)
+    delete out
+    delete inputs
+    return resp |> JSON(body, http_status.OK)
+}
+
+// POST /v1/models/activate {"model": name}: admin warm-switch — make `name` the stepped slot
+// and move the GPU tier to it NOW instead of waiting for the owner to drain. 409 while any
+// work is live: the switch drops the owner's whole VRAM state.
+def private handle_activate(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    var perr = ""
+    var js = read_json(string(req.body), perr)
+    if (js == null) {
+        return resp_error(resp, http_status.BAD_REQUEST, "invalid JSON: {perr}")
+    }
+    defer() {
+        unsafe {
+            delete js
+        }
+    }
+    let want = js?["model"] ?? ""
+    if (empty(want)) {
+        // an admin switch has one required parameter — silently activating the default slot on
+        // a malformed body would hide the client bug behind a real VRAM-state switch
+        return resp |> JSON(
+            error_body("'model' is required — GET /v1/models lists the served ids", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    let mi = slot_index(want)
+    if (mi < 0) {
+        return resp |> JSON(
+            error_body("model '{want}' not found — GET /v1/models lists the served ids", "model_not_found"),
+            http_status.NOT_FOUND)
+    }
+    if (total_active() > 0l || total_queued() > 0l || g_asr_pending > 0) {
+        return resp |> JSON(
+            error_body("streams are live (active {total_active()}, queued {total_queued()}) — retry when idle", "busy"),
+            http_status.CONFLICT)
+    }
+    let t0 = ref_time_ticks()
+    g_active = mi
+    g_cur = mi
+    set_mtp_spec(g_slots[mi].sched.mtp)
+    install_slot_marks(mi)
+    bind_gpu_slot(mi)   // no-op for cpu slots and the current owner
+    g_slots[mi].last_used = ref_time_ticks()
+    let sw_ms = int64(get_time_usec(t0)) / 1000l
+    return resp |> JSON(
+        "\{\"ok\":true,\"model\":{json_str(g_slots[mi].name)},\"backend_effective\":{json_str(g_slots[mi].backend_effective)},\"switch_ms\":{sw_ms}}",
+        http_status.OK)
+}
+
+// Resolve a streaming request's "model" field to a slot (sets g_cur). False = unknown model —
+// the 404 with OpenAI error framing is already on the wire.
+def private resolve_stream_slot(srv : WebSocketServer; var writer : HttpResponseWriter?; js : JsonValue?) : bool {
+    let want = js?["model"] ?? ""
+    let mi = slot_index(want)
+    if (mi < 0) {
+        respond(srv, writer, int(http_status.NOT_FOUND), "application/json",
+                error_body("model '{want}' not found — GET /v1/models lists the served ids", "model_not_found"))
+        return false
+    }
+    g_cur = mi
+    return true
 }
 
 // Validate the rendered prompt, submit it to the scheduler, and register the wire that routes its
@@ -1001,8 +1288,8 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
                              tools_declared : bool = false; call_open : string = ""; call_close : string = "";
                              seed : int = 0) {
     let np = int64(length(prompt))
-    if (np + 1l > g_model.config.seq_len) {
-        bad_request(srv, writer, "the rendered prompt is {np} tokens; the model context is {g_model.config.seq_len} — shorten the conversation or raise --ctx")
+    if (np + 1l > cur_model().config.seq_len) {
+        bad_request(srv, writer, "the rendered prompt is {np} tokens; the model context is {cur_model().config.seq_len} — shorten the conversation or raise --ctx")
         return
     }
     let rid = next_id()
@@ -1012,17 +1299,18 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
     preq.prompt <- prompt
     preq.stop_ids <- stop_ids
     preq.close_toks <- close_toks
-    if (!submit(g_model, g_sched, preq)) {
+    if (!submit(cur_model(), cur_sched(), preq)) {
         delete preq
-        to_log(LOG_WARNING, "dasllama-server: 503 queue full ({g_sched.max_queue}) — rejected {prefix} request ({np} tok)\n")
+        to_log(LOG_WARNING, "dasllama-server: 503 queue full ({cur_sched().max_queue}) — rejected {prefix} request ({np} tok)\n")
         respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
-                error_body("the server is at capacity ({g_sched.max_queue} requests queued) — retry shortly", "server_error"))
+                error_body("the server is at capacity ({cur_sched().max_queue} requests queued) — retry shortly", "server_error"))
         return
     }
+    g_slots[g_cur].last_used = ref_time_ticks()
     set_writer_keepalive_timeout(srv, writer, LLM_WRITER_KEEPALIVE_MS)
     to_log(LOG_INFO, "[req {rid}] {prefix}: prompt={np} tok, stream={streaming}, max_new={max_new}\n")
     var wire <- StreamWire(writer = writer, streaming = streaming, is_chat = is_chat,
-                           id = cid, created = created,
+                           slot = g_cur, id = cid, created = created,
                            has_tools = tools_declared && !empty(call_open),
                            last_keepalive_ticks = ref_time_ticks(),
                            call_open = call_open, call_close = call_close)
@@ -1041,14 +1329,14 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
                                max_new : int64; start : int; thinking : bool;
                                var prompt, stop_ids, close : array<int64>&;
                                var call_open, call_close : string&) : string {
-    var chat <- create_chat_renderer(g_model, system, max_new)
+    var chat <- create_chat_renderer(cur_model(), system, max_new)
     defer() { delete chat }
     if (!thinking) {
         set_thinking(chat, false)
     }
     if (!empty(tools)) {
         if (empty(chat.tmpl.tool_call_open)) {
-            return "'tools' is not supported: the {g_model_name} chat template declares no tool-call format"
+            return "'tools' is not supported: the {cur_name()} chat template declares no tool-call format"
         }
         var render_tools <- [for (tool in tools); tool]
         set_tools(chat, render_tools)
@@ -1101,9 +1389,9 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
             }
             if (pending) {
                 if (!empty(calls)) {
-                    render_assistant_calls(g_model, chat, content, calls, rendered)
+                    render_assistant_calls(cur_model(), chat, content, calls, rendered)
                 } else {
-                    render_assistant(g_model, chat, content, rendered)
+                    render_assistant(cur_model(), chat, content, rendered)
                 }
                 pending = false
             }
@@ -1122,12 +1410,12 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
         delete rendered
         return "the last message must be a user or tool message"
     }
-    var turn <- render_turn(g_model, chat)
+    var turn <- render_turn(cur_model(), chat)
     rendered |> push_from(turn)
     delete turn
     prompt <- rendered
     stop_ids <- chat.stop_ids
-    close <- render_close(g_model, chat)
+    close <- render_close(cur_model(), chat)
     call_open = chat.tmpl.tool_call_open
     call_close = chat.tmpl.tool_call_close
     return ""
@@ -1159,6 +1447,9 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     }
     defer() { unsafe { delete js } }
     warn_ignored_fields(js, CHAT_FIELDS, "/v1/chat/completions")
+    if (!resolve_stream_slot(srv, writer, js)) {
+        return
+    }
     let msgs_v = js?["messages"]
     if (msgs_v == null || !(msgs_v.value is _array)) {
         bad_request(srv, writer, "'messages' must be an array")
@@ -1249,13 +1540,13 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
             return
         }
         let required = int64(length(prompt)) + (truncation == "auto" ? max_new : 1l)
-        if (required <= g_model.config.seq_len || truncation != "auto") {
+        if (required <= cur_model().config.seq_len || truncation != "auto") {
             break
         }
         let next = next_user_start(msgs_v, start)
         if (next < 0) {
             bad_request(srv, writer,
-                        "the system prompt, tools, and latest turn need {required} tokens including the requested output; the model context is {g_model.config.seq_len} - shorten the request, lower max_tokens, or raise --ctx")
+                        "the system prompt, tools, and latest turn need {required} tokens including the requested output; the model context is {cur_model().config.seq_len} - shorten the request, lower max_tokens, or raise --ctx")
             return
         }
         to_log(LOG_INFO, "/v1/chat/completions: auto truncation dropped messages [0, {next}) to reserve {max_new} output tokens\n")
@@ -1280,6 +1571,9 @@ def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var
     }
     defer() { unsafe { delete js } }
     warn_ignored_fields(js, COMPL_FIELDS, "/v1/completions")
+    if (!resolve_stream_slot(srv, writer, js)) {
+        return
+    }
     let prompt = js?["prompt"] ?? ""
     if (empty(prompt)) {
         bad_request(srv, writer, "'prompt' must be a non-empty string")
@@ -1289,7 +1583,7 @@ def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var
     let params = parse_sampling(js)
     let seed = js?["seed"] ?? 0
     let max_new = clamp_max(js?["max_tokens"] ?? g_default_max_new)
-    var toks <- encode(g_model, prompt, true, false)
+    var toks <- encode(cur_model(), prompt, true, false)
     defer() { delete toks }
     // no stop ids and no close: raw completions run to the budget, matching bare generate()
     var none_stop : array<int64>
@@ -1304,7 +1598,7 @@ def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var
 def private reap_disconnected(srv : WebSocketServer) {
     for (id, w in keys(g_wires), values(g_wires)) {
         if (!is_writer_connected(srv, w.writer)) {
-            evict(g_sched, id, g_events)
+            evict(g_slots[w.slot].sched, id, g_events)
         }
     }
     var disconnected_asr : array<int64>
@@ -1330,6 +1624,7 @@ def private flush_tool_keepalives(srv : WebSocketServer) {
         var w = unsafe(g_wires?[id])
         if (w != null && w.streaming && w.has_tools &&
             get_time_usec(w.last_keepalive_ticks) >= 10000000) {
+            g_cur = w.slot
             send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "")
             w.last_keepalive_ticks = ref_time_ticks()
         }
@@ -1346,6 +1641,7 @@ def private flush_events(srv : WebSocketServer) {
         if (w == null) {
             continue
         }
+        g_cur = w.slot   // response builders read the wire's slot (cur_name / cur_model)
         if (e.kind == SchedEventKind.piece) {
             if (!w.streaming || w.has_tools) {
                 w.reply_parts |> push(e.text)   // buffered reply, and/or the finish-time tool-call parse
@@ -1415,7 +1711,7 @@ def private flush_events(srv : WebSocketServer) {
                     finish = "tool_calls"
                 }
             }
-            var out = OaiChatResponse(id = w.id, _object = "chat.completion", created = w.created, model = g_model_name)
+            var out = OaiChatResponse(id = w.id, _object = "chat.completion", created = w.created, model = cur_name())
             out.choices |> emplace(OaiChoice(index = 0,
                                              message <- OaiMessage(role = "assistant", content = content,
                                                                    tool_calls <- calls),
@@ -1426,7 +1722,7 @@ def private flush_events(srv : WebSocketServer) {
             respond(srv, w.writer, int(http_status.OK), "application/json", sprint_json(out, false))
             delete out
         } else {
-            var out = OaiComplResponse(id = w.id, _object = "text_completion", created = w.created, model = g_model_name)
+            var out = OaiComplResponse(id = w.id, _object = "text_completion", created = w.created, model = cur_name())
             out.choices |> push(OaiComplChoice(index = 0, text = join(w.reply_parts, ""), finish_reason = e.finish))
             out.usage = OaiUsage(prompt_tokens = e.n_prompt, completion_tokens = e.n_gen,
                                  total_tokens = e.n_prompt + e.n_gen)
@@ -1443,8 +1739,35 @@ def private flush_events(srv : WebSocketServer) {
 }
 
 // /v1/stats: the scheduler's counters as JSON (buffered — cheap enough to run in-handler).
+// Top-level counters describe the ACTIVE slot (single-model deployments see the old shape
+// unchanged); `models` carries one entry per slot for the page's roster panel.
+struct private OaiSlotStats {
+    name : string
+    is_default : bool
+    is_active : bool          // the slot the tick loop is stepping
+    holds_gpu : bool          // the slot whose VRAM state is armed (the GPU owner)
+    backend : string          // requested: auto | cpu | gpu
+    backend_effective : string
+    ctx : int64
+    active : int64
+    queued : int64
+    admitted : int64
+    finished : int64
+    gen_tokens : int64
+    cached_tokens : int64
+    prefill_tokens : int64
+    prefix_pages : int64
+    weights_bytes : int64
+    kv_bytes : int64
+    last_used_s : float       // seconds since this slot last admitted a request (-1 = never)
+    sw_count : int64          // P2 gpu-switch telemetry
+    sw_avg_ms : float
+}
+
 struct private OaiStatsResponse {
     model : string
+    active_model : string
+    models : array<OaiSlotStats>
     ctx : int64
     uptime_s : int64
     draining : bool
@@ -1474,41 +1797,76 @@ struct private OaiStatsResponse {
     kv_bytes : int64
     heap_bytes : int64
     string_heap_bytes : int64
+    gpu_vram_bytes : int64    // resident weight bytes on the device (0 = no tier / nothing resident)
+    gpu_budget_bytes : int64  // the tier's weight cap — the page's VRAM bar denominator
     hardware : string
     asr_done_jobs : int64
     asr_audio_s : float
 }
 
 def private handle_stats(var resp : HttpResponse?) : http_status {
-    let out = OaiStatsResponse(
-        model = g_model_name, ctx = g_model.config.seq_len,
+    // budget only when the device already EXISTS (tier.device is "" until first upload creates
+    // it) — the budget hook device-inits on first call, and `supported` can read true while the
+    // tier is merely armed, so it must not gate this
+    let tier = gpu_tier_status()
+    var out = OaiStatsResponse(
+        model = g_slots[g_active].name, active_model = g_slots[g_active].name,
+        ctx = g_slots[g_active].model.config.seq_len,
         uptime_s = g_started_at > 0l ? get_time_nsec(g_started_at) / 1_000_000_000l : 0l,
         draining = g_shutdown_requested,
-        active = n_active(g_sched), queued = n_queued(g_sched), peak_active = g_sched.peak_active,
-        admitted = g_sched.n_admitted, finished = g_sched.n_finished, evicted = g_sched.n_evicted,
-        decode_steps = g_sched.decode_steps, gen_tokens = g_sched.gen_tokens,
-        avg_batch = float(g_sched.sum_batch) / float(max(g_sched.decode_steps, 1l)),
-        cached_tokens = g_sched.cached_tokens, prefix_pages = prefix_held_groups(g_sched.prefix),
-        max_streams = g_sched.max_streams, chunk_tokens = g_sched.chunk_tokens,
+        active = n_active(g_slots[g_active].sched), queued = n_queued(g_slots[g_active].sched),
+        peak_active = g_slots[g_active].sched.peak_active,
+        admitted = g_slots[g_active].sched.n_admitted, finished = g_slots[g_active].sched.n_finished,
+        evicted = g_slots[g_active].sched.n_evicted,
+        decode_steps = g_slots[g_active].sched.decode_steps, gen_tokens = g_slots[g_active].sched.gen_tokens,
+        avg_batch = float(g_slots[g_active].sched.sum_batch) / float(max(g_slots[g_active].sched.decode_steps, 1l)),
+        cached_tokens = g_slots[g_active].sched.cached_tokens,
+        prefix_pages = prefix_held_groups(g_slots[g_active].sched.prefix),
+        max_streams = g_slots[g_active].sched.max_streams, chunk_tokens = g_slots[g_active].sched.chunk_tokens,
         asr_workers = g_asr_worker_count, asr_ready = g_asr_ready,
         asr_active = g_asr_active, asr_pending = g_asr_pending,
-        mtp_drafted = g_sched.mtp_drafted, mtp_accepted = g_sched.mtp_accepted,
-        prefill_tokens = g_sched.prefill_tokens,
-        ttft_avg_ms = g_sched.ttft_count > 0l ? float(g_sched.ttft_sum_us / g_sched.ttft_count) / 1000.0 : 0.0,
-        ttft_last_ms = float(g_sched.last_ttft_us) / 1000.0,
-        weights_bytes = model_weights_bytes(g_model),
-        kv_bytes = kv_pool_bytes(g_sched.pool),
+        mtp_drafted = g_slots[g_active].sched.mtp_drafted, mtp_accepted = g_slots[g_active].sched.mtp_accepted,
+        prefill_tokens = g_slots[g_active].sched.prefill_tokens,
+        ttft_avg_ms = g_slots[g_active].sched.ttft_count > 0l
+            ? float(g_slots[g_active].sched.ttft_sum_us / g_slots[g_active].sched.ttft_count) / 1000.0 : 0.0,
+        ttft_last_ms = float(g_slots[g_active].sched.last_ttft_us) / 1000.0,
+        weights_bytes = model_weights_bytes(g_slots[g_active].model),
+        kv_bytes = kv_pool_bytes(g_slots[g_active].sched.pool),
         heap_bytes = int64(heap_bytes_allocated()),
         string_heap_bytes = int64(string_heap_bytes_allocated()),
+        gpu_vram_bytes = tier.vram_bytes,
+        gpu_budget_bytes = !empty(tier.device) ? moe_gpu_weight_budget() : 0l,
         hardware = g_hardware_line,
         asr_done_jobs = g_asr_done_jobs, asr_audio_s = g_asr_audio_s)
-    return resp |> JSON(sprint_json(out, false), http_status.OK)
+    out.models |> reserve(length(g_slots))
+    for (i in range(length(g_slots))) {
+        var s & = unsafe(g_slots[i])
+        out.models |> push(OaiSlotStats(
+            name = s.name, is_default = s.is_default, is_active = i == g_active,
+            holds_gpu = i == g_gpu_owner,
+            backend = s.opts.backend, backend_effective = s.backend_effective,
+            ctx = s.model.config.seq_len,
+            active = n_active(s.sched), queued = n_queued(s.sched),
+            admitted = s.sched.n_admitted, finished = s.sched.n_finished,
+            gen_tokens = s.sched.gen_tokens, cached_tokens = s.sched.cached_tokens,
+            prefill_tokens = s.sched.prefill_tokens,
+            prefix_pages = prefix_held_groups(s.sched.prefix),
+            weights_bytes = model_weights_bytes(s.model),
+            kv_bytes = kv_pool_bytes(s.sched.pool),
+            last_used_s = s.last_used > 0l ? age_seconds(s.last_used) : -1.0,
+            sw_count = s.sw_count,
+            sw_avg_ms = s.sw_count > 0l ? float(s.sw_us / s.sw_count) / 1000.0 : 0.0))
+    }
+    let body = sprint_json(out, false)
+    delete out
+    return resp |> JSON(body, http_status.OK)
 }
 
 // /v1/streams: the poll surface behind the page's swimlane + stream cards — per-stream state,
 // token counts, TTFT, and capped text tails. Finished streams linger ~10 s flagged "finished".
 struct private OaiStreamInfo {
     id : int64
+    model : string       // the slot this stream runs on
     state : string       // "queued" | "prefilling" | "decoding" | "finished"
     finish : string      // finished only: "stop" | "length" | "evicted"
     age_s : float
@@ -1524,6 +1882,7 @@ struct private OaiStreamInfo {
 
 // One prefix-cache donation chain: what a re-sent conversation would reuse.
 struct private OaiCacheEntry {
+    model : string
     tokens : int64
     pages : int64
     hits : int64
@@ -1556,41 +1915,52 @@ def private age_seconds(t : int64) : float {
 }
 
 def private handle_streams(var resp : HttpResponse?) : http_status {
-    var out = OaiStreamsResponse(max_streams = g_sched.max_streams)
-    out.streams |> reserve(length(g_sched.streams) + length(g_sched.queue) + length(g_sched.recent_done))
-    for (st in g_sched.streams) {
-        out.streams |> push(OaiStreamInfo(
-            id = st.id,
-            state = st.state == StreamState.prefilling ? "prefilling" : "decoding",
-            age_s = age_seconds(st.t_admit),
-            n_prompt = int64(length(st.prompt)), n_cached = st.n_cached,
-            n_prefilled = st.n_prefilled, n_gen = st.n_gen, max_new = st.max_new,
-            ttft_ms = float(st.ttft_us) / 1000.0,
-            prompt_head = st.prompt_head, gen_tail = utf8_trim_partial_end(string(st.gen_tail_bytes))))
+    // the stream list below aggregates every slot, so the lane capacity the page sizes its
+    // swimlane from must be the cross-slot total, not the active slot's own cap
+    var total_cap = 0l
+    for (slot in g_slots) {
+        total_cap += slot.sched.max_streams
     }
-    for (q in g_sched.queue) {
-        out.streams |> push(OaiStreamInfo(
-            id = q.id, state = "queued",
-            age_s = q.t_submit != 0l ? age_seconds(q.t_submit) : 0.0,
-            n_prompt = int64(length(q.prompt)), max_new = q.max_new))
+    var out = OaiStreamsResponse(max_streams = total_cap)
+    for (slot in g_slots) {
+        var sch & = unsafe(slot.sched)
+        let mname = slot.name
+        out.streams |> reserve(length(out.streams) + length(sch.streams) + length(sch.queue) + length(sch.recent_done))
+        for (st in sch.streams) {
+            out.streams |> push(OaiStreamInfo(
+                id = st.id, model = mname,
+                state = st.state == StreamState.prefilling ? "prefilling" : "decoding",
+                age_s = age_seconds(st.t_admit),
+                n_prompt = int64(length(st.prompt)), n_cached = st.n_cached,
+                n_prefilled = st.n_prefilled, n_gen = st.n_gen, max_new = st.max_new,
+                ttft_ms = float(st.ttft_us) / 1000.0,
+                prompt_head = st.prompt_head, gen_tail = utf8_trim_partial_end(string(st.gen_tail_bytes))))
+        }
+        for (q in sch.queue) {
+            out.streams |> push(OaiStreamInfo(
+                id = q.id, model = mname, state = "queued",
+                age_s = q.t_submit != 0l ? age_seconds(q.t_submit) : 0.0,
+                n_prompt = int64(length(q.prompt)), max_new = q.max_new))
+        }
+        for (d in sch.recent_done) {
+            out.streams |> push(OaiStreamInfo(
+                id = d.id, model = mname, state = "finished", finish = d.finish,
+                n_prompt = d.n_prompt, n_cached = d.n_cached, n_prefilled = d.n_prompt, n_gen = d.n_gen,
+                ttft_ms = float(d.ttft_us) / 1000.0,
+                prompt_head = d.prompt_head, gen_tail = utf8_trim_partial_end(d.gen_tail)))
+        }
+        var chains <- prefix_chain_list(sch.prefix)
+        out.cache |> reserve(length(out.cache) + length(chains))
+        for (c in chains) {
+            let age = age_seconds(c.born_at)
+            out.cache |> push(OaiCacheEntry(
+                model = mname,
+                tokens = c.n_tokens, pages = c.pages_live, hits = c.hits, age_s = age,
+                idle_s = c.last_hit_at != 0l ? age_seconds(c.last_hit_at) : age,
+                preview = c.preview))
+        }
+        delete chains
     }
-    for (d in g_sched.recent_done) {
-        out.streams |> push(OaiStreamInfo(
-            id = d.id, state = "finished", finish = d.finish,
-            n_prompt = d.n_prompt, n_cached = d.n_cached, n_prefilled = d.n_prompt, n_gen = d.n_gen,
-            ttft_ms = float(d.ttft_us) / 1000.0,
-            prompt_head = d.prompt_head, gen_tail = utf8_trim_partial_end(d.gen_tail)))
-    }
-    var chains <- prefix_chain_list(g_sched.prefix)
-    out.cache |> reserve(length(chains))
-    for (c in chains) {
-        let age = age_seconds(c.born_at)
-        out.cache |> push(OaiCacheEntry(
-            tokens = c.n_tokens, pages = c.pages_live, hits = c.hits, age_s = age,
-            idle_s = c.last_hit_at != 0l ? age_seconds(c.last_hit_at) : age,
-            preview = c.preview))
-    }
-    delete chains
     out.asr |> reserve(length(g_asr_recent))
     for (j in g_asr_recent) {
         out.asr |> push(OaiAsrRow(
@@ -1604,13 +1974,103 @@ def private handle_streams(var resp : HttpResponse?) : http_status {
 
 // key -> expected JSON kind for POST /config bodies: "s"tring | "i"nteger | "b"ool. The one
 // schema the save endpoint validates against — mirrors ServerArgs (main.das CONFIG_KEYS).
+// "models" is the [[models]] array-of-tables; entries validate against MODEL_KEY_KINDS.
 let private CONFIG_KEY_KINDS <- {
     "model" => "s", "port" => "i", "quant" => "s", "kv_dtype" => "s", "metal" => "s",
     "gpu" => "s", "gpu_layers" => "i", "gpu_stream" => "i", "gpu_dn" => "b", "gpu_attn" => "b",
     "gpu_dense" => "b", "gpu_vram_mb" => "i", "asr" => "s", "mmproj" => "s", "asr_workers" => "i",
     "ctx" => "i", "max_tokens" => "i", "streams" => "i", "threads" => "i", "team_dispatch" => "s",
     "affinity" => "i", "chunk" => "i", "page_rows" => "i", "prefix" => "i", "flat" => "b",
-    "mtp" => "b", "lcpp_bin" => "s"
+    "mtp" => "b", "lcpp_bin" => "s", "models" => "a"
+}
+
+let private MODEL_KEY_KINDS <- {
+    "name" => "s", "path" => "s", "backend" => "s", "ctx" => "i", "quant" => "s",
+    "kv_dtype" => "s", "streams" => "i", "chunk" => "i", "page_rows" => "i", "prefix" => "i",
+    "mtp" => "b", "default" => "b"
+}
+
+// Validate + sanitize a POST /config "models" array: objects only, per-key kinds, a non-empty
+// path per entry, backend in {auto, cpu, gpu}, unique route names, at most one default = true.
+// Returns the sanitized array (JV) or null with verr set.
+def private validate_models_array(v : JsonValue?; var verr : string&) : JsonValue? {
+    if (v == null || !(v.value is _array)) {
+        verr = "'models' must be an array of model entries"
+        return null
+    }
+    var marr : array<JsonValue?>
+    var names : table<string>
+    var ndefault = 0
+    for (e in v.value as _array) {
+        if (e == null || !(e.value is _object)) {
+            verr = "'models' entries must be objects"
+            break
+        }
+        var ent : table<string; JsonValue?>
+        for (mk, mv in keys(e.value as _object), values(e.value as _object)) {
+            let kind = MODEL_KEY_KINDS?[mk] ?? ""
+            if (empty(kind)) {
+                verr = "unknown models key '{mk}'"
+                break
+            }
+            if (kind == "s" && mv != null && (mv.value is _string)) {
+                ent |> insert(mk, JV(mv.value as _string))
+            } elif (kind == "i" && mv != null && (mv.value is _longint)) {
+                ent |> insert(mk, JV(mv.value as _longint))
+            } elif (kind == "i" && mv != null && (mv.value is _number) && (mv.value as _number) == floor(mv.value as _number)) {
+                ent |> insert(mk, JV(int64(mv.value as _number)))
+            } elif (kind == "b" && mv != null && (mv.value is _bool)) {
+                ent |> insert(mk, JV(mv.value as _bool))
+            } else {
+                verr = "models key '{mk}' must be a {kind_name(kind)}"
+                break
+            }
+        }
+        if (!empty(verr)) {
+            var junk = JV(ent)
+            unsafe {
+                delete junk
+            }
+            break
+        }
+        let path = e?["path"] ?? ""
+        if (empty(path)) {
+            verr = "every models entry needs a non-empty 'path'"
+        } else {
+            let backend = e?["backend"] ?? "auto"
+            if (backend != "auto" && backend != "cpu" && backend != "gpu") {
+                verr = "models backend '{backend}' is not auto | cpu | gpu"
+            }
+        }
+        let rname = e?["name"] ?? ""
+        let route = empty(rname) ? base_name(e?["path"] ?? "") : rname
+        if (empty(verr) && key_exists(names, route)) {
+            verr = "duplicate models name '{route}'"
+        }
+        if (empty(verr) && (e?["default"] ?? false)) {
+            ndefault ++
+            if (ndefault > 1) {
+                verr = "more than one models entry marked default = true"
+            }
+        }
+        if (!empty(verr)) {
+            var junk = JV(ent)
+            unsafe {
+                delete junk
+            }
+            break
+        }
+        names |> insert(route)
+        marr |> push(JV(ent))
+    }
+    if (!empty(verr)) {
+        var junk = JV(marr)
+        unsafe {
+            delete junk
+        }
+        return null
+    }
+    return JV(marr)
 }
 
 // POST /vad: the page's waveform-overlay preview — silero speech spans over an uploaded clip.
@@ -1700,7 +2160,7 @@ def private handle_config_get(var resp : HttpResponse?) : http_status {
     var extras <- {
         "model_files" => JV(entries),
         "active_model" => JV(base_name(g_config_model_path)),
-        "dlim_rail" => JV(g_model.image_map != null),
+        "dlim_rail" => JV(g_slots[g_default_slot].model.image_map != null),
         "metal" => JV("{get_metal_mode()}"),
         "gpu" => JV((
             backend = tier.backend, supported = tier.supported, reason = tier.reason,
@@ -1746,6 +2206,12 @@ def private handle_config_save(var req : HttpRequest?; var resp : HttpResponse?)
         if (v == null) {
             verr = "config key '{k}' is null"
             break
+        }
+        if (kind == "a") {
+            var sanitized = validate_models_array(v, verr)
+            break if (!empty(verr))
+            out_tab |> insert(k, sanitized)
+            continue
         }
         if (kind == "s" && (v.value is _string)) {
             out_tab |> insert(k, JV(v.value as _string))
@@ -2093,6 +2559,9 @@ class OpenAiServer : HvWebServer {
             }
             return handle_embeddings(req, resp)
         }
+        POST("/v1/models/activate") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_activate(req, resp)
+        }
         GET("/v1/stats") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_stats(resp)
         }
@@ -2122,7 +2591,7 @@ class OpenAiServer : HvWebServer {
             if (!g_shutdown_requested) {
                 to_log(
                     LOG_INFO,
-                    "dasllama-server: restart requested; draining llm_active={n_active(g_sched)}, llm_queued={n_queued(g_sched)}, asr_pending={g_asr_pending}\n")
+                    "dasllama-server: restart requested; draining llm_active={total_active()}, llm_queued={total_queued()}, asr_pending={g_asr_pending}\n")
             }
             g_shutdown_requested = true
             g_restart_requested = true
@@ -2132,7 +2601,7 @@ class OpenAiServer : HvWebServer {
             if (!g_shutdown_requested) {
                 to_log(
                     LOG_INFO,
-                    "dasllama-server: graceful shutdown requested; draining llm_active={n_active(g_sched)}, llm_queued={n_queued(g_sched)}, asr_pending={g_asr_pending}\n")
+                    "dasllama-server: graceful shutdown requested; draining llm_active={total_active()}, llm_queued={total_queued()}, asr_pending={g_asr_pending}\n")
             }
             g_shutdown_requested = true
             return resp |> JSON("\{\"ok\":true,\"draining\":true}", http_status.OK)
@@ -2194,22 +2663,41 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     g_bench_state = "idle"
     g_bench_result_json = ""
     start_asr_worker_threads()
-    var pfx = prefix_groups
-    if (page_rows > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
-        pfx = max_streams * ((g_model.config.seq_len + page_rows - 1l) / page_rows)
+    if (empty(g_slots)) {
+        to_log(LOG_ERROR, "dasllama-server: init_server with no model slots (call set_model/add_model first)\n")
+        return false
     }
-    if (pfx < 0l) {
-        pfx = 0l   // explicit unbounded
+    // one scheduler per slot: the init args are the defaults, SlotOpts sentinels override per slot
+    for (s in g_slots) {
+        let s_streams = s.opts.streams >= 0l ? s.opts.streams : max_streams
+        let s_chunk = s.opts.chunk >= 0l ? s.opts.chunk : chunk_tokens
+        let s_pages = s.opts.page_rows != -2l ? s.opts.page_rows : page_rows
+        var pfx = s.opts.prefix != -2l ? s.opts.prefix : prefix_groups
+        if (s_pages > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
+            pfx = s_streams * ((s.model.config.seq_len + s_pages - 1l) / s_pages)
+        }
+        if (pfx < 0l) {
+            pfx = 0l   // explicit unbounded
+        }
+        let s_kv = s.opts.kv_dtype_set ? s.opts.kv_dtype : kv_dtype
+        var spec = s.opts.mtp >= 0 ? s.opts.mtp != 0 : mtp
+        if (spec && s.model.config.n_layer_nextn <= 0l) {
+            to_log(LOG_WARNING, "dasllama-server: mtp requested for {s.name} but the model has no NextN head — self-spec stays off\n")
+            spec = false
+        }
+        s.sched <- create_scheduler(s.model, s_streams, max_queue, s_chunk, s_pages, pfx, s_kv, spec)
     }
-    var spec = mtp
-    if (spec && g_model.config.n_layer_nextn <= 0l) {
-        to_log(LOG_WARNING, "dasllama-server: --mtp requested but the model has no NextN head — self-spec stays off\n")
-        spec = false
-    }
+    g_active = g_default_slot
+    g_cur = g_default_slot
     g_prev_mtp_spec = get_mtp_spec()
     g_mtp_spec_changed = true
-    set_mtp_spec(spec)   // engine gate: prefills maintain the draft head's KV (chunked included); restored at exit
-    g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx, kv_dtype, spec)
+    // engine gate: prefills maintain the draft head's KV (chunked included); follows the stepped
+    // slot on switch (update_server); restored at exit
+    set_mtp_spec(g_slots[g_active].sched.mtp)
+    // the single shared KV mirror + chunked multi-stream prefill don't mix: a second stream's
+    // resident prefill would strand the first's device-only KV. The batch-decode override (which
+    // resyncs host<->mirror per step) stays on; per-slot mirrors re-enable device prefill here.
+    set_resident_prefill_allowed(false)
     g_server = new OpenAiServer()
     g_server->init(port)
     let rc = g_server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
@@ -2220,11 +2708,24 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     g_server_started = true
     g_started_at = ref_time_ticks()
     compose_hardware_line()
-    let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
-    let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
-    let spec_desc = spec ? ", mtp: on" : ""
-    to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode}{spec_desc})\n")
+    var names <- [for (s in g_slots); s.is_default && length(g_slots) > 1 ? "{s.name}*" : s.name]
+    let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}" : "{kv_dtype} flat"
+    to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (models: {join(names, ", ")}; streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode})\n")
+    delete names
     return true
+}
+
+// Round-robin pick of the next slot to step, starting AFTER the last stepped one so concurrent
+// work on several slots interleaves fairly. -1 = everything idle.
+def private pick_step_slot : int {
+    let n = length(g_slots)
+    for (k in range(n)) {
+        let i = (g_active + 1 + k) % n
+        if (n_active(g_slots[i].sched) > 0l || n_queued(g_slots[i].sched) > 0l) {
+            return i
+        }
+    }
+    return -1
 }
 
 //! Drive one non-blocking server iteration. False means the graceful drain completed (or the
@@ -2237,17 +2738,30 @@ def update_server() : bool {
     drain_asr_events(g_server.server)
     drain_bench_events()
     reap_disconnected(g_server.server)
-    let t_step = ref_time_ticks()
-    let busy = scheduler_step(g_model, g_sched, g_events)
-    let step_ms = int64(get_time_usec(t_step)) / 1000l
-    if (step_ms > 3000l) {
-        // the "why does it pause" catcher: one decode step / prefill chunk should be
-        // well under a second — anything slower means contention or a stall
-        to_log(LOG_WARNING, "dasllama-server: slow scheduler step: {step_ms}ms (active={n_active(g_sched)}, queued={n_queued(g_sched)})\n")
+    // serialized multi-model stepping: ONE scheduler step per tick, slots with work interleave
+    // round-robin. Every step runs under ITS model's routing marks; the GPU tier follows a
+    // gpu-wanting slot once the current owner drains.
+    let si = pick_step_slot()
+    var busy = false
+    if (si >= 0) {
+        if (si != g_active) {
+            g_active = si
+            set_mtp_spec(g_slots[si].sched.mtp)   // the engine prefill-warm gate follows the stepped slot
+        }
+        install_slot_marks(si)
+        maybe_bind_gpu(si)
+        let t_step = ref_time_ticks()
+        busy = scheduler_step(g_slots[si].model, g_slots[si].sched, g_events)
+        let step_ms = int64(get_time_usec(t_step)) / 1000l
+        if (step_ms > 3000l) {
+            // the "why does it pause" catcher: one decode step / prefill chunk should be
+            // well under a second — anything slower means contention or a stall
+            to_log(LOG_WARNING, "dasllama-server: slow scheduler step: {step_ms}ms ({g_slots[si].name}: active={n_active(g_slots[si].sched)}, queued={n_queued(g_slots[si].sched)})\n")
+        }
     }
     flush_events(g_server.server)
     flush_tool_keepalives(g_server.server)
-    if (g_shutdown_requested && n_active(g_sched) == 0l && n_queued(g_sched) == 0l &&
+    if (g_shutdown_requested && total_active() == 0l && total_queued() == 0l &&
         g_asr_pending == 0) {
         to_log(LOG_INFO, "dasllama-server: graceful shutdown drain complete\n")
         return false
@@ -2274,10 +2788,22 @@ def shutdown_server() {
         }
         g_server = null
     }
-    unsafe {
-        delete g_sched   // live sessions + workspace go with it (writers already died with the server)
+    // clean tier epoch: drop the owner's VRAM state and leave the engine globals bare, so a
+    // same-context restart (tests) starts from an unarmed device with no stale marks
+    if (g_gpu_owner >= 0 && g_gpu_owner < length(g_slots)) {
+        install_slot_marks(g_gpu_owner)
+        moe_gpu_drop_model()
+    } elif (g_marks_slot >= 0 && g_marks_slot < length(g_slots)) {
+        moe_gpu_model_marks_save(g_slots[g_marks_slot].gpu_marks)
     }
-    g_sched = Scheduler()
+    g_gpu_owner = -1
+    g_marks_slot = -1
+    unsafe {
+        delete g_slots   // per slot: live sessions + workspace + the model go together (writers already died with the server)
+    }
+    g_default_slot = 0
+    g_active = 0
+    g_cur = 0
     delete g_events
     delete g_wires
     delete g_asr_wires
@@ -2303,9 +2829,6 @@ def shutdown_server() {
         set_mtp_spec(g_prev_mtp_spec)   // a /shutdown + restart in the same context starts from a clean gate
         g_mtp_spec_changed = false
     }
-    delete g_model
-    g_model = Model()
-    g_model_name = ""
     g_has_asr = false
     g_asr_path = ""
     g_asr_mmproj = ""

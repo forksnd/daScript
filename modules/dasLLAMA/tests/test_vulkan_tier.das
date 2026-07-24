@@ -2821,3 +2821,114 @@ def test_vulkan_arena(t : T?) {
         }
     }
 }
+
+// ===== whole-model drop/re-arm (the multi-model switch primitive) =====
+
+// vk_drop_model_state (via the math-side hook) destroys EVERY model-owned object — stacks,
+// arenas, lazy dispatch families, their descriptor sets and command buffers — while the device
+// survives. Two full cycles re-upload the SAME offsets with DIFFERENT content: a stale stack
+// registry or arena would resolve the old plane and fail the cycle's own reference. Declared
+// LAST in the file on purpose: the drop nukes every stack earlier tests uploaded.
+let DMWOFF = 50000000l
+let DMROWS = 64l
+
+[test]
+def test_vulkan_drop_model(t : T?) {
+    t |> run("vulkan whole-model drop — stacks + arena rebuild and serve across two cycles") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            install_moe_gpu_tier(@@vk_moe_ffn, @@vk_moe_upload_stack, @@vk_moe_cls, @@vk_moe_dense, @@vk_moe_drop_stacks, @@vk_moe_dn, @@vk_moe_attn)
+            let nb = int(N / 32l)
+            for (cycle in range(2)) {
+                // per-op stack rail: upload -> dense GEMV -> parity vs THIS cycle's content
+                var wq : array<int8>
+                var ws : array<float>
+                fill_stack(wq, ws, DMROWS, N, 17l + int64(cycle) * 31l, false)
+                var wqb : array<uint8>
+                var wsb : array<uint8>
+                pack_upload(wq, ws, wqb, wsb)
+                if (!moe_gpu_upload_stack(wqb, wsb, DMWOFF, N, DMROWS, 0)) {
+                    feint("no Vulkan device (or probe/budget refused the upload); skipping\n")
+                    return
+                }
+                var xq : array<int8>
+                var xs : array<float>
+                fill_acts(xq, xs, 2l)
+                var y : array<float>
+                y |> resize(int(2l * DMROWS))
+                matmul_gpu_dense(y, DMWOFF, xq, xs, N, DMROWS, 2l, 0)
+                var refy : array<float>
+                refy |> resize(int(2l * DMROWS))
+                for (r in range(2)) {
+                    for (c in range(int(DMROWS))) {
+                        var acc = 0.0lf
+                        for (b in range(nb)) {
+                            var id = 0
+                            for (k in range(32)) {
+                                id += int(xq[r * int(N) + b * 32 + k]) * int(wq[c * int(N) + b * 32 + k])
+                            }
+                            acc += double(ws[c * nb + b]) * double(xs[r * nb + b]) * double(id)
+                        }
+                        refy[r * int(DMROWS) + c] = float(acc)
+                    }
+                }
+                let cs = compare_gout(y, refy)
+                t |> success(cs.maxdiff <= float(REL_TOL) * cs.maxref,
+                    "cycle {cycle} stack serves its own content (maxdiff {cs.maxdiff} vs {float(REL_TOL) * cs.maxref} bar)")
+                // arena rail: reserve (fresh after a drop) -> place -> GEMV -> parity
+                t |> success(vk_arena_reserve(0, ARENA_BLOCKS / 2l), "cycle {cycle} arena reserve")
+                var awq : array<int8>
+                var aws : array<float>
+                fill_stack(awq, aws, DMROWS, N, 91l + int64(cycle) * 13l, false)
+                var apq : array<uint8>
+                var aps : array<uint8>
+                pack_upload(awq, aws, apq, aps)
+                let blk = vk_arena_place(apq, aps, N, DMROWS, 0)
+                t |> success(blk >= 0l, "cycle {cycle} arena placement (block {blk})")
+                var axq : array<int8>
+                var axs : array<float>
+                fill_acts(axq, axs, 1l)
+                var ay : array<float>
+                ay |> resize(int(DMROWS))
+                vk_arena_gemv(ay, blk, N, DMROWS, 0, axq, axs)
+                var aref : array<float>
+                aref |> resize(int(DMROWS))
+                for (c in range(int(DMROWS))) {
+                    var acc = 0.0lf
+                    for (b in range(nb)) {
+                        var id = 0
+                        for (k in range(32)) {
+                            id += int(axq[b * 32 + k]) * int(awq[c * int(N) + b * 32 + k])
+                        }
+                        acc += double(aws[c * nb + b]) * double(axs[b]) * double(id)
+                    }
+                    aref[c] = float(acc)
+                }
+                let ca = compare_gout(ay, aref)
+                t |> success(ca.maxdiff <= float(REL_TOL) * ca.maxref,
+                    "cycle {cycle} arena serves its own content (maxdiff {ca.maxdiff} vs {float(REL_TOL) * ca.maxref} bar)")
+                // the whole-model drop: every stack (this file's earlier tests included), the
+                // arena, and all lazy dispatch state die; cycle 1 re-runs the ladder from bare
+                moe_gpu_drop_model_state()
+                t |> equal(0l, gpu_tier_status().vram_bytes, "cycle {cycle} drop left zero resident bytes")
+                delete wq
+                delete ws
+                delete wqb
+                delete wsb
+                delete xq
+                delete xs
+                delete y
+                delete refy
+                delete awq
+                delete aws
+                delete apq
+                delete aps
+                delete axq
+                delete axs
+                delete ay
+                delete aref
+            }
+        } else {
+            feint("dasVulkan not installed; whole-model drop untestable here\n")
+        }
+    }
+}

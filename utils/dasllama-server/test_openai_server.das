@@ -552,3 +552,224 @@ def test_parse_tool_calls_auto(t : T?) {
         delete calls
     }
 }
+
+// ===== multi-model: two slots, "model" routing, per-slot caches surviving interleaved traffic =====
+
+let MODEL2_PATH = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
+let TEST_PORT_MM = 18121
+
+// Two-slot variant of with_llama_server: tinyllama as the default slot "tiny", SmolLM2-135M as
+// "smol" (backend pinned cpu — asserts the requested-vs-effective surface). Same thread/context
+// discipline: both models load INSIDE the server thread.
+def private with_llama_server2(path_a, path_b : string; port : int; blk : block<(base_url : string) : void>) {
+    with_job_status(1) $(finished) {
+        new_thread() @() {
+            set_metal_mode(MetalMode.off)
+            var ma <- load_model(path_a, QuantMode.q8)
+            add_model(ma, "tiny")
+            var mb <- load_model(path_b, QuantMode.q8)
+            add_model(mb, "smol", SlotOpts(backend = "cpu"))
+            set_default_model("tiny")
+            set_default_max_tokens(4l)
+            var surf <- {
+                "config" => JV((port = port, model = path_a, streams = 4)),
+                "sources" => JV((port = "cli")),
+                "authoritative" => JV(false),
+                "config_path" => JV(""),
+                "save_path" => JV(TEST_SAVE_PATH)
+            }
+            var sdoc = JV(surf)
+            set_config_surface(write_json_compact(sdoc), TEST_SAVE_PATH, path_a)
+            unsafe {
+                delete sdoc
+            }
+            run_server(port)   // blocks until POST /shutdown
+            finished |> notify_and_release
+        }
+        let base_url = "http://127.0.0.1:{port}"
+        var ready = false
+        for (_attempt in range(600)) {   // up to ~60s: two loads + JIT
+            GET("{base_url}/v1/models") $(resp) {
+                if (resp != null && resp.status_code == http_status.OK) {
+                    ready = true
+                }
+            }
+            if (ready) {
+                break
+            }
+            sleep(100u)
+        }
+        if (ready) {
+            invoke(blk, base_url)
+        }
+        POST("{base_url}/shutdown", "") $(_resp) {}
+        finished |> join
+        assert(ready, "dasllama two-slot server became ready")
+    }
+}
+
+[test]
+def test_openai_server_multimodel(t : T?) {
+    t |> run("multi-model: routing + per-slot caches (needs tinyllama + SmolLM2-135M q8)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA server test is JIT-only)")
+            return
+        }
+        if (!stat(MODEL_PATH).is_valid || !stat(MODEL2_PATH).is_valid) {
+            t |> success(true, "skipped: tinyllama/SmolLM2-135M not present (set DASLLAMA_MODELS_DIR)")
+            return
+        }
+        with_llama_server2(MODEL_PATH, MODEL2_PATH, TEST_PORT_MM) $(base_url) {
+            // /v1/models lists both slots
+            GET("{base_url}/v1/models") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                let body = string(resp.body)
+                t |> success(find(body, "\"tiny\"") >= 0, "default slot listed")
+                t |> success(find(body, "\"smol\"") >= 0, "second slot listed")
+            }
+            // routed by "model": the response echoes the slot id
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"model\":\"smol\",\"messages\":[\{\"role\":\"user\",\"content\":\"Say hi.\"}],\"max_tokens\":4}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "routed chat JSON parses")
+                if (js != null) {
+                    t |> equal(string(js?["model"] ?? ""), "smol")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            // no "model" field -> the default slot serves and is echoed
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"messages\":[\{\"role\":\"user\",\"content\":\"Say hi.\"}],\"max_tokens\":4}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                if (js != null) {
+                    t |> equal(string(js?["model"] ?? ""), "tiny")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            // unknown model -> OpenAI-shaped 404
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"model\":\"nope\",\"messages\":[\{\"role\":\"user\",\"content\":\"hi\"}]}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.NOT_FOUND))
+                t |> success(find(string(resp.body), "model_not_found") >= 0, "404 carries model_not_found")
+            }
+            // POST /v1/models/activate: admin warm-switch — 200 flips the active slot; 404 on an
+            // unknown id. The GPU rebind inside is a no-op on this rig (no tier armed).
+            POST("{base_url}/v1/models/activate", "\{\"model\":\"smol\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                t |> success(find(string(resp.body), "\"model\":\"smol\"") >= 0, "activate echoes the slot")
+            }
+            GET("{base_url}/v1/stats") $(resp) {
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "post-activate stats JSON parses")
+                if (js != null) {
+                    t |> equal(string(js?["active_model"] ?? ""), "smol")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            POST("{base_url}/v1/models/activate", "\{\"model\":\"nope\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.NOT_FOUND))
+                t |> success(find(string(resp.body), "model_not_found") >= 0, "activate 404 carries model_not_found")
+            }
+            // THE directive test: slot caches survive interleaved traffic on another slot.
+            // Same >1-page prompt on tiny twice, a smol request between them — the re-send must
+            // hit tiny's prefix cache even though smol served in between.
+            var long2 = ""
+            for (_i in range(12)) {
+                long2 += "Pack my box with five dozen liquor jugs. "
+            }
+            let body_a = "\{\"model\":\"tiny\",\"prompt\":\"{long2}\",\"max_tokens\":4}"
+            POST("{base_url}/v1/completions", body_a) $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+            }
+            POST("{base_url}/v1/completions", "\{\"model\":\"smol\",\"prompt\":\"Hello\",\"max_tokens\":2}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+            }
+            POST("{base_url}/v1/completions", body_a) $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+            }
+            // per-slot stats: roster present, default marked, smol's requested backend recorded,
+            // tiny's cache hit counted, smol's cache untouched
+            GET("{base_url}/v1/stats") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "stats JSON parses")
+                if (js != null) {
+                    let mv = js?["models"]
+                    t |> success(mv != null && mv.value is _array, "stats carries a models roster")
+                    if (mv != null && mv.value is _array) {
+                        t |> equal(length(mv.value as _array), 2)
+                        for (e in mv.value as _array) {
+                            let nm = string(e?["name"] ?? "")
+                            if (nm == "tiny") {
+                                t |> success(e?["is_default"] ?? false, "tiny is the default slot")
+                                t |> success((e?["cached_tokens"] ?? 0l) > 0l, "tiny's prefix cache hit across the smol interleave")
+                            } elif (nm == "smol") {
+                                t |> equal(string(e?["backend"] ?? ""), "cpu")
+                                t |> equal(string(e?["backend_effective"] ?? ""), "cpu")
+                                t |> equal(e?["cached_tokens"] ?? -1l, 0l)
+                                t |> equal(e?["holds_gpu"] ?? true, false)
+                            }
+                        }
+                    }
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            // /v1/streams entries carry the model tag
+            GET("{base_url}/v1/streams") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                t |> success(find(string(resp.body), "\"model\":\"tiny\"") >= 0, "stream cards tag their slot")
+            }
+            // POST /config with a [[models]] roster — validated, TOML round-trips as array-of-tables
+            POST("{base_url}/config",
+                 "\{\"port\":8123,\"models\":[\{\"name\":\"a\",\"path\":\"a.gguf\",\"backend\":\"cpu\",\"default\":true},\{\"name\":\"b\",\"path\":\"b.gguf\"}]}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+            }
+            {
+                let saved = fread(TEST_SAVE_PATH)
+                t |> success(!empty(saved), "saved roster config readable")
+                var terr : string
+                var troot = read_toml(saved, terr)
+                t |> success(troot != null, "saved roster config re-parses as TOML")
+                if (troot != null) {
+                    let mv = troot?["models"]
+                    t |> success(mv != null && mv.value is _array, "[[models]] survives the TOML round-trip")
+                    if (mv != null && mv.value is _array) {
+                        t |> equal(length(mv.value as _array), 2)
+                        t |> equal(string((mv.value as _array)[0]?["name"] ?? ""), "a")
+                        t |> equal(string((mv.value as _array)[0]?["backend"] ?? ""), "cpu")
+                    }
+                    unsafe {
+                        delete troot
+                    }
+                }
+                remove(TEST_SAVE_PATH)
+            }
+            // roster validation: duplicate names, bad backend, missing path — honest 400s
+            POST("{base_url}/config",
+                 "\{\"models\":[\{\"name\":\"x\",\"path\":\"p.gguf\"},\{\"name\":\"x\",\"path\":\"q.gguf\"}]}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.BAD_REQUEST))
+            }
+            POST("{base_url}/config",
+                 "\{\"models\":[\{\"name\":\"x\",\"path\":\"p.gguf\",\"backend\":\"turbo\"}]}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.BAD_REQUEST))
+            }
+            POST("{base_url}/config", "\{\"models\":[\{\"name\":\"x\"}]}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.BAD_REQUEST))
+            }
+        }
+    }
+}

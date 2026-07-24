@@ -2027,6 +2027,29 @@ def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype) : ResidentPlan
 var private g_rdec_active = false       // this loaded model runs the resident decode driver
 var private g_rdec_cnt = 0l             // cached positions in the device KV mirror (built as we decode)
 var private g_rdec_cap = 0l             // mirror context the driver armed at (<= model ctx when VRAM-capped)
+var private g_rdec_gen = 0l             // mirror ownership generation (bumped per resident prefill)
+var private g_resident_prefill_allowed = true   // multi-stream schedulers pin this off (see set_resident_prefill_allowed)
+
+//! Allow/forbid the whole-prefill resident override. A multi-stream scheduler (dasllama-server)
+//! pins it OFF: the single shared mirror + chunked prefill would leave device-only KV that a
+//! second stream's steal strands. Single-session tools keep the fast path (default on).
+def set_resident_prefill_allowed(allowed : bool) {
+    g_resident_prefill_allowed = allowed
+}
+
+// Bulk-hydrate the session's host KV from the device mirror rows [0, g_rdec_cnt) — the rail that
+// keeps host KV authoritative at rest after device-resident prefills/decodes.
+def private rdec_hydrate_host(t : Model; var s : Session) {
+    let c = t.config
+    for (l in range64(c.n_layers)) {
+        unsafe {
+            rdec_read_kv_bulk(l, reinterpret<float?>(kv_layer_kbase(s, l, c.seq_len)),
+                reinterpret<float?>(kv_layer_vbase(s, l, c.seq_len)), g_rdec_cnt)
+        }
+    }
+    s.rdec_hydrated = true
+    to_log(LOG_INFO, "dasLLAMA: resident KV hydrated to host ({g_rdec_cnt} positions x {c.n_layers} layers)\n")
+}
 let private RDEC_MIN_CTX = 4096l        // smallest ctx worth arming a capped mirror at
 
 // gather one prepared plane into device-layout bytes and place it in its format's arena; returns
@@ -2079,6 +2102,10 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
     let hs = layer_head_size(c, 0l)
     let qd = layer_qd(c, 0l)
     let kvd = layer_kv_dim(c, 0l)
+    // the prefill Q-tile attention kernel's geometry (da_attn_b: 32-dim lanes, hs-strided staging)
+    if (hs % 32l != 0l || hs > 256l) {
+        return false
+    }
     let neox = c.rope_neox
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     // reject non-uniform per-layer geometry (the recorder assumes fixed dims across layers)
@@ -2183,11 +2210,16 @@ def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int6
     if (!g_rdec_active || pos > g_rdec_cnt) {
         return false
     }
-    if (pos + 1l > g_rdec_cap) {
-        // once the device path has run the mirror is the ONLY KV — capacity exhaustion fails closed
-        if (g_rdec_cnt > 0l) {
-            panic("dasLLAMA resident decode: position {pos} exceeds the device KV mirror capacity {g_rdec_cap} and host KV was never populated — reduce context or set DASLLAMA_PIN_PREFILL=cpu")
+    // ownership guard: the single mirror holds ONE session's rows (superseded => host has ours)
+    if (s.rdec_gen != g_rdec_gen) {
+        if (s.rdec_gen != 0l && !s.rdec_hydrated) {
+            panic("dasLLAMA resident decode: session's mirror rows were superseded before hydration — engine bug (the steal path must hydrate first)")
         }
+        return false
+    }
+    if (pos + 1l > g_rdec_cap) {
+        // capacity exhausted: hydrate host KV from the mirror, then the CPU rails take over
+        rdec_hydrate_host(t, s)
         return false
     }
     let c = t.config
@@ -2220,6 +2252,7 @@ def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int6
     delete x
     delete cossin
     g_rdec_cnt = pos + 1l   // mirror continuity: rows [0, pos] are now live
+    s.rdec_hydrated = false   // the mirror advanced past any earlier hydration
     decode_override_logits_done()   // logits produced on device
     return true
 }
@@ -2263,23 +2296,26 @@ def resident_prefill(t : Model; var s : Session; tokens : array<int64>; npos : i
     return true
 }
 
-// The "vulkan" whole-prefill override (PrefillOverrideFn): one-submit device prefill via the resident
-// driver. KV lands in the DEVICE f32 mirror only (arming also selects the mirror-based resident
-// decode); v1 takes full prompts only — continuation chunks (start_pos != 0) decline to the CPU loop.
+// The "vulkan" whole-prefill override (PrefillOverrideFn): one-submit device prefill via the
+// resident driver. The mirror gets the rows; host KV is hydrated back on demand (continuation,
+// cap exhaustion) so the CPU rails always take over from a valid host authority.
 def private vulkan_resident_prefill(t : Model; var s : Session; npos, start_pos : int64) : bool {
-    if (!g_rdec_active) {
+    // gates: armed + embedder-allowed + the hydratable flat-f32 shape (else device would hold the only KV copy)
+    if (!g_rdec_active || !g_resident_prefill_allowed
+            || s.kv_dtype_k != KVDtype.f32 || s.kv_dtype_v != KVDtype.f32 || s.kv_pool != null) {
         return false
     }
     if (start_pos != 0l) {
-        // a continuation over device-held history has no valid CPU fallback (host KV is empty)
-        if (g_rdec_cnt > 0l) {
-            panic("dasLLAMA resident prefill: continuation at start_pos {start_pos} over device-held KV — host KV was never populated (set DASLLAMA_PIN_PREFILL=cpu for continuation flows)")
+        // continuation over OUR device-held history: hydrate host KV, then decline to the CPU loop
+        if (g_rdec_cnt > 0l && s.rdec_gen == g_rdec_gen && !s.rdec_hydrated) {
+            rdec_hydrate_host(t, s)
         }
         return false
     }
     if (npos > g_rdec_cap) {
         return false
     }
+    // a DIFFERENT session's re-prefill steals the single mirror — fine for serial flows; a stranded owner's decode fails LOUD via the ownership guard
     let c = t.config
     let hs = layer_head_size(c, 0l)
     let half = hs / 2l
@@ -2300,6 +2336,9 @@ def private vulkan_resident_prefill(t : Model; var s : Session; npos, start_pos 
     rdec_prefill(s.x_b, cb, npos, s.logits)
     delete cb
     g_rdec_cnt = npos   // the mirror now holds [0, npos) — the decode's continuity witness
+    g_rdec_gen ++
+    s.rdec_gen = g_rdec_gen
+    s.rdec_hydrated = false
     prefill_override_logits_done()
     return true
 }
@@ -2378,6 +2417,88 @@ def resident_driver_register() {
     register_decode_override("vulkan", @@vulkan_resident_decode)
     register_batch_decode_override("vulkan", @@vulkan_resident_batch_decode)
     register_prefill_override("vulkan", @@vulkan_resident_prefill)
+}
+
+// ===== multi-model GPU slot switch (marks swap + whole-model drop/re-arm) =====
+
+//! One model's complete per-model tier state for a multi-model host: the loader-contract marks
+//! plus the resident driver's activation. Save after the model's load (or arm), restore before
+//! stepping that model — two models' offset-keyed marks must never be installed together.
+struct GpuModelMarks {
+    marks : MoeGpuMarks <- MoeGpuMarks()
+    rdec_active : bool
+    rdec_cnt : int64
+    rdec_cap : int64
+}
+
+//! Move the INSTALLED per-model tier state out into `st`; the globals read as no-model after.
+def moe_gpu_model_marks_save(var st : GpuModelMarks) {
+    moe_gpu_marks_save(st.marks)
+    st.rdec_active = g_rdec_active
+    st.rdec_cnt = g_rdec_cnt
+    st.rdec_cap = g_rdec_cap
+    g_rdec_active = false
+    g_rdec_cnt = 0l
+    g_rdec_cap = 0l
+}
+
+//! Install `st` as the per-model tier state (the save's inverse; `st` reads as no-model after).
+def moe_gpu_model_marks_restore(var st : GpuModelMarks) {
+    moe_gpu_marks_restore(st.marks)
+    g_rdec_active = st.rdec_active
+    g_rdec_cnt = st.rdec_cnt
+    g_rdec_cap = st.rdec_cap
+    st.rdec_active = false
+    st.rdec_cnt = 0l
+    st.rdec_cap = 0l
+}
+
+//! Is the resident whole-stack decode driver active for the INSTALLED model? (The arm-outcome
+//! discriminator status surfaces read: resident beats rails beats cpu.)
+def moe_gpu_resident_active() : bool => g_rdec_active
+
+//! Hydrate `s`'s host KV from the device mirror when `s` owns live mirror rows (no-op
+//! otherwise). Call over every live session of the outgoing model before ``moe_gpu_drop_model``
+//! — the drop destroys the mirror, and an unhydrated owner's rows exist nowhere else.
+def moe_gpu_hydrate_session(t : Model; var s : Session) {
+    if (g_rdec_active && g_rdec_cnt > 0l && s.rdec_gen == g_rdec_gen && !s.rdec_hydrated) {
+        rdec_hydrate_host(t, s)
+    }
+}
+
+//! Drop the INSTALLED model's whole GPU state (every model-owned device object + the routing
+//! marks); the model keeps serving on the CPU rails, and re-arm = the same three calls a load
+//! runs. Caller guarantees quiescence: no step in flight, sessions hydrated first.
+def moe_gpu_drop_model() {
+    if (!moe_gpu_tier_installed()) {
+        return
+    }
+    moe_gpu_dn_invalidate()
+    g_rdec_active = false
+    g_rdec_cnt = 0l
+    g_rdec_cap = 0l
+    // resident_upload selected the "vulkan" overrides; deselect so (a) a later re-arm's
+    // resident_upload passes its no-active-override gate (the warm re-arm decline), and (b) a
+    // dropped model's prefill/decode take the plain CPU path without consulting dead state
+    if (active_prefill_override() == "vulkan") {
+        select_prefill_override("")
+    }
+    if (active_decode_override() == "vulkan") {
+        select_decode_override("")
+    }
+    moe_gpu_drop_model_state()
+    // loader-contract reset — the same clean slate moe_gpu_upload_resident starts from
+    set_moe_gpu_layer_count(0l)
+    set_moe_gpu_from_layer(1000000l)
+    set_moe_gpu_stream_from(1000000l)
+    set_moe_gpu_total_layers(0l)
+    set_moe_gpu_cls_off(-1l)
+    reset_moe_gpu_dense_offs()
+    reset_moe_gpu_dn_layers()
+    reset_moe_gpu_attn_layers()
+    reset_moe_gpu_shexp_layers()
+    reset_moe_gpu_qkv_layers()
+    set_moe_gpu_model_support("")
 }
 
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
@@ -4287,6 +4408,10 @@ struct Session {
     // their source layer's slab (same prefix value).
     kv_dtype_k : KVDtype      // key codec, snapshotted from the module knob in make_run_state
     kv_dtype_v : KVDtype      // value codec (independent of K by design)
+    // resident-driver mirror ownership: gen stamps which session's rows the device KV mirror
+    // holds (0 = never resident-prefilled); hydrated = host KV has been read back since
+    rdec_gen : int64
+    rdec_hydrated : bool
     kv_signs : array<float>   // tq4 rotation signs (±1, max head_size; smaller heads use a prefix)
     key_cache : array<uint8>
     value_cache : array<uint8>

@@ -9,6 +9,11 @@
 # (asr = in the SERVER's config), or the bot exits at startup with a clear error.
 server = "http://127.0.0.1:8080"
 
+# Served model to pin chat requests to — one of the ids GET /v1/models lists (a multi-model
+# server serves several). Verified at startup; a typo fails there, not on the first voice note.
+# Empty = the server's default slot.
+model = ""
+
 # Telegram bot token from @BotFather. Leave empty to read TELEGRAM_BOT_TOKEN from the environment.
 bot_token = ""
 
