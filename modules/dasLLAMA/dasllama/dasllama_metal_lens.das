@@ -24,7 +24,7 @@ struct private BufField {
     binding : int
     role : string
     off : string     // @off = "<param>" — bind at a caller-passed uint64 offset ("" = 0)
-    rng : string     // @range = "<a*b*4>" product over params — exact hz length ("" = whole buffer)
+    rng : string     // @span = "<a*b*4>" product over params — exact hz length ("" = whole buffer)
 }
 
 def private mk_kn_pipeline(at : LineInfo; pso : string) : ExpressionPtr {
@@ -70,14 +70,25 @@ def private mk_uint_cast(at : LineInfo; var inner : Expression?) : Expression? {
     return c
 }
 
+// every character must be a digit — a "4l"/"4x" typo falls through to the name path, where the
+// generated builder fails loudly (unresolved variable) instead of silently truncating via to_int
 def private is_digit_tok(s : string) : bool {
     if (empty(s)) {
         return false
     }
-    return is_number(first_character(s))
+    var all_digits = true
+    peek_data(s) $(arr) {
+        for (c in arr) {
+            if (!is_number(int(c))) {
+                all_digits = false
+                break
+            }
+        }
+    }
+    return all_digits
 }
 
-// @range product: factors 'param' | int, folded left — "n*4" -> uint64(n * 4l)
+// @span product: factors 'param' | int, folded left — "n*4" -> uint64(n * 4l)
 def private mk_range_len(at : LineInfo; spec : string) : Expression? {
     var e : Expression?
     for (tok in split(spec, "*")) {
@@ -99,7 +110,7 @@ def private mk_range_len(at : LineInfo; spec : string) : Expression? {
     return c
 }
 
-// hz_read/hz_write for one field: whole-buffer, or (@off, @range) exact
+// hz_read/hz_write for one field: whole-buffer, or (@off, @span) exact
 def private mk_hz(at : LineInfo; call_name : string; bf : BufField) : ExpressionPtr {
     var c = new ExprCall(at = at, name := call_name)
     c.arguments |> emplace_new <| new ExprVar(at = at, name := "b{bf.name}")
