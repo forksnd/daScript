@@ -1,0 +1,378 @@
+options gen2
+options indenting = 4
+
+module dasllama_metal_lens shared private
+
+require daslib/ast
+require daslib/ast_boost
+require daslib/templates_boost
+require daslib/rtti
+require strings
+require daslib/strings_boost   // split / strip — the grid & params micro-format tokenizers
+require das_metal   // nolint:STYLE030 — MetalBuffer/MetalComputeEncoder are referenced only inside qmacro_type(type<...>), which STYLE030 can't see; the require is load-bearing for macro-time type resolution
+
+// The dasLLAMA Metal kernel-dispatch lens. [metal_dispatch] reads a [metal_kernel] class's
+// @ssbo/@uniform field annotations and generates the enc_* dispatch builder that the hand-
+// written twin used to be: binds in @binding order (@off names an offset param), hz from
+// @role/@span, gate, dispatch. Variation points (fmt dispatchers, dummy binds, pso twins)
+// stay hand-written as thin wrappers over generated builders. Every @ssbo on a lensed class
+// MUST declare a @role (the compile-time half of the strictness ratchet; runtime STRICT
+// covers the un-lensed escapes).
+
+struct private BufField {
+    name : string
+    binding : int
+    role : string
+    off : string     // @off = "<param>" — bind at a caller-passed uint64 offset ("" = 0)
+    rng : string     // @span = "<a*b*4>" product over params — exact hz length ("" = whole buffer)
+}
+
+def private mk_kn_pipeline(at : LineInfo; pso : string) : ExpressionPtr {
+    var c = new ExprCall(at = at, name := "kn_pipeline")
+    c.arguments |> emplace_new <| new ExprVar(at = at, name := "enc")
+    c.arguments |> emplace_new <| new ExprVar(at = at, name := pso)
+    return c
+}
+
+def private mk_kn_tgmem(at : LineInfo; tgmem : string) : ExpressionPtr {
+    var c = new ExprCall(at = at, name := "kn_tgmem")
+    c.arguments |> emplace_new <| new ExprVar(at = at, name := "enc")
+    c.arguments |> emplace_new <| new ExprVar(at = at, name := tgmem)
+    c.arguments |> emplace_new <| new ExprConstInt(at = at, value = 0)
+    return c
+}
+
+def private mk_off_arg(at : LineInfo; off : string) : Expression? {
+    if (empty(off)) {
+        return new ExprConstUInt64(at = at, value = 0ul)
+    }
+    return new ExprVar(at = at, name := off)
+}
+
+def private mk_kn_buffer(at : LineInfo; pname : string; binding : int; off : string) : ExpressionPtr {
+    var c = new ExprCall(at = at, name := "kn_buffer")
+    c.arguments |> emplace_new <| new ExprVar(at = at, name := "enc")
+    c.arguments |> emplace_new <| new ExprVar(at = at, name := pname)
+    c.arguments |> emplace_new <| mk_off_arg(at, off)
+    c.arguments |> emplace_new <| new ExprConstInt(at = at, value = binding)
+    return c
+}
+
+def private mk_var_call(at : LineInfo; call_name, arg0 : string) : ExpressionPtr {
+    var c = new ExprCall(at = at, name := call_name)
+    c.arguments |> emplace_new <| new ExprVar(at = at, name := arg0)
+    return c
+}
+
+def private mk_uint_cast(at : LineInfo; var inner : Expression?) : Expression? {
+    var c = new ExprCall(at = at, name := "uint")
+    c.arguments |> emplace_new <| inner
+    return c
+}
+
+// every character must be a digit — a "4l"/"4x" typo falls through to the name path, where the
+// generated builder fails loudly (unresolved variable) instead of silently truncating via to_int
+def private is_digit_tok(s : string) : bool {
+    if (empty(s)) {
+        return false
+    }
+    var all_digits = true
+    peek_data(s) $(arr) {
+        for (c in arr) {
+            if (!is_number(int(c))) {
+                all_digits = false
+                break
+            }
+        }
+    }
+    return all_digits
+}
+
+// @span product: factors 'param' | int, folded left — "n*4" -> uint64(n * 4l)
+def private mk_range_len(at : LineInfo; spec : string) : Expression? {
+    var e : Expression?
+    for (tok in split(spec, "*")) {
+        let t = strip(tok)
+        var f : Expression?
+        if (is_digit_tok(t)) {
+            f = new ExprConstInt64(at = at, value = int64(to_int(t)))
+        } else {
+            f = new ExprVar(at = at, name := t)
+        }
+        if (e == null) {
+            e = f
+        } else {
+            e = new ExprOp2(at = at, op := "*", left = e, right = f)
+        }
+    }
+    var c = new ExprCall(at = at, name := "uint64")
+    c.arguments |> emplace_new <| e
+    return c
+}
+
+// hz_read/hz_write for one field: whole-buffer, or (@off, @span) exact
+def private mk_hz(at : LineInfo; call_name : string; bf : BufField) : ExpressionPtr {
+    var c = new ExprCall(at = at, name := call_name)
+    c.arguments |> emplace_new <| new ExprVar(at = at, name := "b{bf.name}")
+    if (!empty(bf.rng)) {
+        c.arguments |> emplace_new <| mk_off_arg(at, bf.off)
+        c.arguments |> emplace_new <| mk_range_len(at, bf.rng)
+    }
+    return c
+}
+
+// One grid dim: "1" -> 1u ; "name" -> uint(name) ; "name/cov" -> ceil. A literal coverage folds
+// the bias — uint((name + 255l) / 256l) — matching the hand-written spelling; a named coverage
+// (global or param) emits uint((name + cov - 1l) / cov).
+def private mk_grid_dim(at : LineInfo; spec : string) : Expression? {
+    let s = strip(spec)
+    if (s == "1") {
+        return new ExprConstUInt(at = at, value = 1u)
+    }
+    let parts <- split(s, "/")
+    if (length(parts) == 1) {
+        return mk_uint_cast(at, new ExprVar(at = at, name := s))
+    }
+    let name = strip(parts[0])
+    let cov = strip(parts[1])
+    var div : Expression?
+    if (is_digit_tok(cov)) {
+        let cv = int64(to_int(cov))
+        var add = new ExprOp2(at = at, op := "+", left = new ExprVar(at = at, name := name), right = new ExprConstInt64(at = at, value = cv - 1l))
+        div = new ExprOp2(at = at, op := "/", left = add, right = new ExprConstInt64(at = at, value = cv))
+    } else {
+        var add = new ExprOp2(at = at, op := "+", left = new ExprVar(at = at, name := name), right = new ExprVar(at = at, name := cov))
+        var sub = new ExprOp2(at = at, op := "-", left = add, right = new ExprConstInt64(at = at, value = 1l))
+        div = new ExprOp2(at = at, op := "/", left = sub, right = new ExprVar(at = at, name := cov))
+    }
+    return mk_uint_cast(at, div)
+}
+
+// grid = comma-separated per WorkGroupID dim; padded to uint3 with trailing 1u.
+def private mk_grid(at : LineInfo; grid : string) : Expression? {
+    let dims <- split(grid, ",")
+    var c = new ExprCall(at = at, name := "uint3")
+    for (i in range(3)) {
+        if (i < length(dims)) {
+            c.arguments |> emplace_new <| mk_grid_dim(at, dims[i])
+        } else {
+            c.arguments |> emplace_new <| new ExprConstUInt(at = at, value = 1u)
+        }
+    }
+    return c
+}
+
+// tg = threads-per-threadgroup: int constant, or "param" | "name*int" (e.g. "g_gemv_rows*32")
+def private mk_tg_dim(at : LineInfo; tgi : int; tgs : string) : Expression? {
+    if (empty(tgs)) {
+        return new ExprConstUInt(at = at, value = uint(tgi))
+    }
+    let parts <- split(tgs, "*")
+    if (length(parts) == 1) {
+        return mk_uint_cast(at, new ExprVar(at = at, name := strip(tgs)))
+    }
+    let name = strip(parts[0])
+    let mult = int64(to_int(strip(parts[1])))
+    var mul = new ExprOp2(at = at, op := "*", left = new ExprVar(at = at, name := name), right = new ExprConstInt64(at = at, value = mult))
+    return mk_uint_cast(at, mul)
+}
+
+def private mk_tg(at : LineInfo; tgi : int; tgs : string) : Expression? {
+    var c = new ExprCall(at = at, name := "uint3")
+    c.arguments |> emplace_new <| mk_tg_dim(at, tgi, tgs)
+    c.arguments |> emplace_new <| new ExprConstUInt(at = at, value = 1u)
+    c.arguments |> emplace_new <| new ExprConstUInt(at = at, value = 1u)
+    return c
+}
+
+def private mk_kn_dispatch(at : LineInfo; grid : string; tgi : int; tgs : string) : Expression? {
+    var c = new ExprCall(at = at, name := "kn_dispatch")
+    c.arguments |> emplace_new <| new ExprVar(at = at, name := "enc")
+    c.arguments |> emplace_new <| mk_grid(at, grid)
+    c.arguments |> emplace_new <| mk_tg(at, tgi, tgs)
+    return c
+}
+
+// map a params-string type token to the param TypeDecl (the size/offset scalars the grid references)
+// a generated builder param is non-`var`, so its type carries the trailing const (the const model)
+def private const_t(var t : TypeDecl?) : TypeDecl? {
+    t.flags.constant = true
+    return t
+}
+
+def private param_type(tok : string; var ok : bool&) : TypeDecl? {
+    if (tok == "int64") { return qmacro_type(type<int64>) }
+    if (tok == "uint64") { return qmacro_type(type<uint64>) }
+    if (tok == "int") { return qmacro_type(type<int>) }
+    if (tok == "uint") { return qmacro_type(type<uint>) }
+    ok = false
+    return qmacro_type(type<int64>)
+}
+
+def private role_ok(role : string) : bool {
+    // alias = a second view of a buffer another field already declares (hazard lives there);
+    // weight = never written during a step (untracked by design); "" = undeclared (ratchet)
+    return (role == "" || role == "read" || role == "write" || role == "readwrite" ||
+        role == "weight" || role == "alias")
+}
+
+[structure_macro(name = metal_dispatch)]
+class MetalDispatch : AstStructureAnnotation {
+    def override apply(var st : StructurePtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
+        let at = st.at
+        let fn_name = find_arg(args, "name") ?as tString ?? ""
+        let pso = find_arg(args, "pso") ?as tString ?? ""
+        let tgmem = find_arg(args, "tgmem") ?as tString ?? ""
+        let tgi = find_arg(args, "tg") ?as tInt ?? -1
+        let tgs = find_arg(args, "tg") ?as tString ?? ""
+        let grid = find_arg(args, "grid") ?as tString ?? ""
+
+        if (empty(fn_name)) {
+            errors := "[metal_dispatch]: 'name' (the enc_ builder name) is required"
+            return false
+        }
+        if (empty(pso)) {
+            errors := "[metal_dispatch]: 'pso' (the pipeline global name) is required"
+            return false
+        }
+        if (tgi <= 0 && empty(tgs)) {
+            errors := "[metal_dispatch] {fn_name}: 'tg' must be a positive int constant or a 'param' / 'name*int' string"
+            return false
+        }
+        if (empty(grid)) {
+            errors := "[metal_dispatch] {fn_name}: 'grid' is required (per WorkGroupID dim: 1 | param | param/coverage)"
+            return false
+        }
+        // micro-grammar validation up front — a malformed spec must fail the compile here, not
+        // silently emit wrong dispatch geometry (mk_* helpers assume validated input)
+        if (!empty(strip(tgs))) {
+            let tparts <- split(tgs, "*")
+            if (length(tparts) > 2) {
+                errors := "[metal_dispatch] {fn_name}: tg '{tgs}' has more than one '*' (int const | param | name*int)"
+                return false
+            }
+            if (length(tparts) == 2 && !is_digit_tok(strip(tparts[1]))) {
+                errors := "[metal_dispatch] {fn_name}: tg '{tgs}' multiplier '{strip(tparts[1])}' must be an integer literal"
+                return false
+            }
+        }
+        for (dspec in split(grid, ",")) {
+            let dparts <- split(dspec, "/")
+            if (length(dparts) > 2) {
+                errors := "[metal_dispatch] {fn_name}: grid dim '{strip(dspec)}' has more than one '/' (1 | param | param/coverage)"
+                return false
+            }
+        }
+
+        // Collect @ssbo/@uniform buffer fields in @binding order. @workgroup + hidden/method
+        // fields are skipped; field-annotation validity is msl_emit's job, not the lens's.
+        var bufs : array<BufField>
+        bufs |> reserve(length(st.fields))
+        for (field in st.fields) {
+            var is_ssbo = false
+            var is_buf = false
+            var is_wg = false
+            for (annDecl in field.annotation) {
+                if (annDecl.name == "ssbo") {
+                    is_ssbo = true
+                    is_buf = true
+                } elif (annDecl.name == "uniform") {
+                    is_buf = true
+                } elif (annDecl.name == "workgroup") {
+                    is_wg = true
+                }
+            }
+            if (is_wg || !is_buf) continue
+            let binding = find_arg(field.annotation, "binding") ?as tInt ?? -1
+            if (binding < 0) {
+                errors := "[metal_dispatch] {fn_name}: field '{field.name}' is @ssbo/@uniform but has no @binding"
+                return false
+            }
+            let role = find_arg(field.annotation, "role") ?as tString ?? ""
+            // the strictness ratchet: every @ssbo on a lensed class declares its hazard role —
+            // an undeclared buffer is a compile error, not a silently-untracked bind
+            if (is_ssbo && empty(role)) {
+                errors := "[metal_dispatch] {fn_name}: @ssbo field '{field.name}' has no @role (read/write/readwrite/weight/alias)"
+                return false
+            }
+            if (!role_ok(role)) {
+                errors := "[metal_dispatch] {fn_name}: field '{field.name}' has unknown @role '{role}' (read/write/readwrite/weight/alias)"
+                return false
+            }
+            let off = find_arg(field.annotation, "off") ?as tString ?? ""
+            let rangeStr = find_arg(field.annotation, "span") ?as tString ?? ""
+            bufs |> push(BufField(name = "{field.name}", binding = binding, role = role, off = off, rng = rangeStr))
+        }
+        sort(bufs) $(a, b) => a.binding < b.binding
+
+        // Emit the dispatch sequence, mirroring the hand-written enc_ builder exactly: binds in
+        // binding order, then all hz_reads, then all hz_writes (hz staging is order-free — the
+        // gate scans the whole staged set — but reads-then-writes matches the hand-written order).
+        var body : array<ExpressionPtr>
+        body |> reserve(length(bufs) * 3 + 4)
+        body |> push(mk_kn_pipeline(at, pso))
+        if (!empty(tgmem)) {
+            body |> push(mk_kn_tgmem(at, tgmem))
+        }
+        for (bf in bufs) {
+            body |> push(mk_kn_buffer(at, "b{bf.name}", bf.binding, bf.off))
+        }
+        for (bf in bufs) {
+            if (bf.role == "read" || bf.role == "readwrite") {
+                body |> push(mk_hz(at, "hz_read", bf))
+            }
+        }
+        for (bf in bufs) {
+            if (bf.role == "write" || bf.role == "readwrite") {
+                body |> push(mk_hz(at, "hz_write", bf))
+            }
+        }
+        body |> push(mk_var_call(at, "hz_gate", "enc"))
+        body |> push(mk_kn_dispatch(at, grid, tgi, tgs))
+
+        // Build the builder: void return, enc + one MetalBuffer? per @ssbo/@uniform field (its
+        // @off uint64 param interleaved right after — shared @off names emit once) + the declared
+        // size scalars (params=) the grid references.
+        var fn = new Function(at = at, atDecl = at, name := fn_name,
+            flags = FunctionFlags.generated,
+            result = new TypeDecl(at = at, baseType = Type.tVoid))
+        fn.arguments |> emplace_new <| new Variable(at = at, name := "enc", _type = const_t(qmacro_type(type<MetalComputeEncoder?>)))
+        var seen_offs : table<string>
+        for (bf in bufs) {
+            fn.arguments |> emplace_new <| new Variable(at = at, name := "b{bf.name}", _type = const_t(qmacro_type(type<MetalBuffer?>)))
+            if (!empty(bf.off) && !key_exists(seen_offs, bf.off)) {
+                seen_offs |> insert(bf.off)
+                fn.arguments |> emplace_new <| new Variable(at = at, name := "{bf.off}", _type = const_t(qmacro_type(type<uint64>)))
+            }
+        }
+        let params = find_arg(args, "params") ?as tString ?? ""
+        if (!empty(strip(params))) {
+            for (p in split(params, ",")) {
+                let nt <- split(p, ":")
+                if (length(nt) != 2) {
+                    errors := "[metal_dispatch] {fn_name}: param '{strip(p)}' must be 'name : type'"
+                    return false
+                }
+                var ok = true
+                var pt = param_type(strip(nt[1]), ok)
+                if (!ok) {
+                    errors := "[metal_dispatch] {fn_name}: param '{strip(p)}' has unsupported type '{strip(nt[1])}' (int/uint/int64/uint64)"
+                    return false
+                }
+                fn.arguments |> emplace_new <| new Variable(at = at, name := "{strip(nt[0])}", _type = const_t(pt))
+            }
+        }
+        fn.body = make_expression_block(body)
+        fn.body |> force_at(at)
+        // dump = true drops the generated flag + exports, so ast_dump shows the builder for the
+        // byte-identity proof against its hand-written twin; remove after the proof.
+        if (find_arg(args, "dump") ?as tBool ?? false) {
+            fn.flags = FunctionFlags.exports
+        }
+        if (!(compiling_module() |> add_function(fn))) {
+            errors := "[metal_dispatch]: failed to add generated function '{fn_name}'"
+            return false
+        }
+        return true
+    }
+}

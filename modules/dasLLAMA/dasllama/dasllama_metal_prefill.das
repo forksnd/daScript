@@ -12,6 +12,7 @@ require dasllama/dasllama_common
 require dasllama/dasllama_math
 require dasllama/dasllama_math_metal
 require dasllama/dasllama_metal_common   // decline enums/tables + the shared block_q8_0 blob cache (W1 split)
+require dasllama/dasllama_metal_lens   // [metal_dispatch] — generates decode enc_* builders for shared classes defined here
 
 // Phase-6 dasMetal: the full-GPU-resident prefill kernel set — everything between the GEMMs:
 // rmsnorm, table-driven RoPE, fused causal-softmax attention scores, the P·V gather, fused
@@ -32,10 +33,11 @@ require dasllama/dasllama_metal_common   // decline enums/tables + the shared bl
 
 // One threadgroup per row: cooperative sum of squares (simd_sum + per-simdgroup partials),
 // lane 0 folds partials into rsqrt(mean + eps), every thread scales its strided slice.
+[metal_dispatch(name = "enc_rms", pso = "g_pso_rms", tgmem = "metal_rmsnorm_msl_tgmem", tg = 1024, grid = "1")]
 class MetalRmsNorm {
-    @ssbo @binding = 0 x : array<float>     // [nrows x dim] source
-    @ssbo @binding = 1 w : array<float>     // [dim] weight
-    @ssbo @binding = 2 y : array<float>     // [nrows x dim] out (x aliasing is safe: x is fully
+    @ssbo @binding = 0 @role = "read" x : array<float>     // [nrows x dim] source
+    @ssbo @binding = 1 @role = "weight" w : array<float>     // [dim] weight
+    @ssbo @binding = 2 @role = "write" y : array<float>     // [nrows x dim] out (x aliasing is safe: x is fully
                                             // read before the barrier that precedes any write)
     @uniform @binding = 3 dim : uint
     @uniform @binding = 4 eps : float
@@ -489,14 +491,15 @@ class MetalKqMulMmK6 {
 
 // Router GEMV over the uploaded fp32 router slab: y[ne] = W[ne x dim] . x per stream. ne <= 256
 // rows — latency-trivial next to the expert GEMVs. grid.y = stream (batch; single decode = 1).
+[metal_dispatch(name = "enc_moe_router", pso = "g_pso_moe_router", tg = "g_gemv_rows*32", grid = "ne/g_gemv_rows, nst", params = "ne : int64, nst : int64")]
 class MetalMoeRouter {
-    @ssbo @binding = 0 w : array<float4>    // [ne x dim] router weights, float4 view
-    @ssbo @binding = 1 x : array<float4>    // [streams x dim] activations, float4 view
-    @ssbo @binding = 2 y : array<float>     // [streams x ne] logits out
+    @ssbo @binding = 0 @role = "weight" w : array<float4>    // [ne x dim] router weights, float4 view
+    @ssbo @binding = 1 @role = "read" x : array<float4>    // [streams x dim] activations, float4 view
+    @ssbo @binding = 2 @role = "write" @span = "ne*nst*4" y : array<float>     // [streams x ne] logits out
     @uniform @binding = 3 ndim : uint       // dim (% 32)
     @uniform @binding = 4 ddim : uint       // ne
     @uniform @binding = 5 xs : uint         // per-stream x stride, elements
-    @ssbo @binding = 6 rb : array<float>    // [ne] router bias row (hasb models — gpt-oss)
+    @ssbo @binding = 6 @role = "weight" rb : array<float>    // [ne] router bias row (hasb models — gpt-oss)
     @uniform @binding = 7 hasb : uint
 
     [metal_kernel(name="metal_moe_router_msl")]
@@ -571,10 +574,11 @@ class MetalMoeRouterB {
 // Router select — moe_select_core's softmax + top-k + norm_topk on one simdgroup per stream
 // (grid.x): per-lane strided ownership (ne <= 256), per-winner argmax butterfly with the CPU
 // tie-break (lowest index), register knockout. Stream row layout: [k idx u32][k w f32].
+[metal_dispatch(name = "enc_moe_select", pso = "g_pso_moe_select", tg = 32, grid = "nst", params = "nst : int64")]
 class MetalMoeSelect {
-    @ssbo @binding = 0 lg : array<float>     // [streams x ne] router logits
-    @ssbo @binding = 1 seli : array<uint>    // selection buffer, uint view — idx of stream s at s*2k
-    @ssbo @binding = 2 selw : array<float>   // the same buffer, float view — w of stream s at s*2k + k
+    @ssbo @binding = 0 @role = "read" lg : array<float>     // [streams x ne] router logits
+    @ssbo @binding = 1 @role = "write" seli : array<uint>    // selection buffer, uint view — idx of stream s at s*2k
+    @ssbo @binding = 2 @role = "alias" selw : array<float>   // the same buffer, float view — w of stream s at s*2k + k
     @uniform @binding = 3 ne : uint
     @uniform @binding = 4 nk : uint
     @uniform @binding = 5 gmode : uint       // 0 = softmax + norm_topk; 1 = softmax_weight (gpt-oss); 2 = softmax, no renorm (qwen2moe)
@@ -754,11 +758,13 @@ class MetalMoeGemvQ8 {
 }
 
 // Expert-indexed Q4_K GEMV — MetalKqGemvK4's dot; the superblock index shifts by sel[slot] * esb.
+// x rides a float4 view: the 32-scalar-x-load form was load-issue-bound at the routed expert
+// shapes (nfe-row planes) — the vector view is 2.25x there (lab: bench_metal_moe_lab, 142→321 wGB/s).
 class MetalMoeGemvK4 {
     @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
     @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
     @ssbo @binding = 2 kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
-    @ssbo @binding = 3 x : array<float>
+    @ssbo @binding = 3 x4 : array<float4>   // activations, float4 view (every x stride is % 4)
     @ssbo @binding = 4 y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
@@ -788,17 +794,33 @@ class MetalMoeGemvK4 {
         var sumf : float[2]
         var ib = ix
         while (ib < nb) {
-            let yb = xoff + ib * 256u + iq * 64u + ir * 8u
+            let yb4 = (xoff + ib * 256u + iq * 64u + ir * 8u) / 4u
             var sumy : float[4]
-            for [unroll_full] (i in range(8)) {
-                yl[i] = x[yb + uint(i)]
-                sumy[0] += yl[i]
-                yl[i + 8] = x[yb + 32u + uint(i)]
-                sumy[1] += yl[i + 8]
-                yh[i] = x[yb + 128u + uint(i)]
-                sumy[2] += yh[i]
-                yh[i + 8] = x[yb + 160u + uint(i)]
-                sumy[3] += yh[i + 8]
+            for [unroll_full] (h in range(4)) {   // h: yl lo/hi, yh lo/hi — float4 pairs at 0/8/32/40
+                let xi = yb4 + (h < 2 ? uint(h) * 8u : 16u + uint(h) * 8u)
+                let va = x4[xi]
+                let vb = x4[xi + 1u]
+                let o = (h % 2) * 8
+                if (h < 2) {   // constant under unroll_full — folds per iteration
+                    yl[o] = va.x
+                    yl[o + 1] = va.y
+                    yl[o + 2] = va.z
+                    yl[o + 3] = va.w
+                    yl[o + 4] = vb.x
+                    yl[o + 5] = vb.y
+                    yl[o + 6] = vb.z
+                    yl[o + 7] = vb.w
+                } else {
+                    yh[o] = va.x
+                    yh[o + 1] = va.y
+                    yh[o + 2] = va.z
+                    yh[o + 3] = va.w
+                    yh[o + 4] = vb.x
+                    yh[o + 5] = vb.y
+                    yh[o + 6] = vb.z
+                    yh[o + 7] = vb.w
+                }
+                sumy[h] = va.x + va.y + va.z + va.w + vb.x + vb.y + vb.z + vb.w
             }
             for [unroll_full] (r in range(2)) {
                 let blk = eb + (first_row + uint(r)) * nb + ib
@@ -1274,10 +1296,11 @@ class MetalMoeBiasRows {
 // Weighted top-k reduce per stream (grid.y): y[st*dim + i] = sum_j w[st][j] * dn[(st*k+j)*dim + i]
 // — the CPU slot-order axpy chain as one deterministic in-kernel loop. Overwrites y (the dense
 // w2 site's write shape).
+[metal_dispatch(name = "enc_moe_combine", pso = "g_pso_moe_combine", tg = 256, grid = "dim/256, nst", params = "dim : int64, nst : int64")]
 class MetalMoeCombine {
-    @ssbo @binding = 0 dn : array<float>    // [streams x k x dim] per-slot down outputs
-    @ssbo @binding = 1 selw : array<float>  // the selection buffer's float view — w of stream s at s*2k + k
-    @ssbo @binding = 2 y : array<float>     // [streams x dim] combined out
+    @ssbo @binding = 0 @role = "read" dn : array<float>    // [streams x k x dim] per-slot down outputs
+    @ssbo @binding = 1 @role = "read" selw : array<float>  // the selection buffer's float view — w of stream s at s*2k + k
+    @ssbo @binding = 2 @role = "write" y : array<float>     // [streams x dim] combined out
     @uniform @binding = 3 dim : uint
     @uniform @binding = 4 nk : uint
 
@@ -1322,10 +1345,11 @@ class MetalSwigluOai {
 // gemma4 MoE router input (stage 3): y = x * rsqrt(mean(x^2) + eps) * (1/sqrt(dim)) * rscale[k],
 // one tg per row. f32 accumulation (the CPU runs this sum in double for top-8 tie stability;
 // no GPU doubles — rare tie flips ride the tolerance methodology, per the wave ruling).
+[metal_dispatch(name = "enc_g4_router_norm", pso = "g_pso_g4rnorm", tgmem = "metal_g4_router_norm_msl_tgmem", tg = 256, grid = "nst", params = "nst : int64")]
 class MetalG4RouterNorm {
-    @ssbo @binding = 0 x : array<float>     // [rows x dim]
-    @ssbo @binding = 1 rs : array<float>    // [dim] per-channel router scale
-    @ssbo @binding = 2 y : array<float>     // [rows x dim]
+    @ssbo @binding = 0 @role = "read" x : array<float>     // [rows x dim]
+    @ssbo @binding = 1 @role = "weight" rs : array<float>    // [dim] per-channel router scale
+    @ssbo @binding = 2 @role = "write" y : array<float>     // [rows x dim]
     @uniform @binding = 3 dim : uint
     @uniform @binding = 4 eps : float
     @uniform @binding = 5 invd : float      // 1/sqrt(dim)
@@ -1380,10 +1404,11 @@ class MetalG4RouterNorm {
 
 // gemma4 per-expert down-scale fold (stage 3): selw[row][j] *= ds[seli[row][j]] — the CPU
 // folds ffn_down_exps_s into the selection weights right after select.
+[metal_dispatch(name = "enc_moe_wscale", pso = "g_pso_moe_wscale", tg = 32, grid = "nst", params = "nst : int64")]
 class MetalMoeWScale {
-    @ssbo @binding = 0 seli : array<uint>   // selection rows, uint view (idx of row r at r*2k)
-    @ssbo @binding = 1 selw : array<float>  // the same buffer, float view (w of row r at r*2k + k)
-    @ssbo @binding = 2 ds : array<float>    // [ne] this layer's per-expert down scales
+    @ssbo @binding = 0 @role = "readwrite" seli : array<uint>   // selection rows, uint view (idx of row r at r*2k)
+    @ssbo @binding = 1 @role = "alias" selw : array<float>  // the same buffer, float view (w of row r at r*2k + k)
+    @ssbo @binding = 2 @role = "weight" ds : array<float>    // [ne] this layer's per-expert down scales
     @uniform @binding = 3 nk : uint
 
     [metal_kernel(name="metal_moe_wscale_msl")]
@@ -2084,12 +2109,13 @@ class MetalMoeMulMmK6 {
 
 // One simdgroup per output row over the 34B q8 blob (f16 scale + 32 int8 inline — the SAME
 // dual-view W the mul_mm reads, bound at the tensor's byte offset): lane owns chunk lane%8 of
-// every 4th block, 4 in flight; the scale rides the quants' cacheline. 128 threads = 4 rows/group.
+// every 4th block, 4 in flight; the scale rides the quants' cacheline. Width-agnostic — rows/tg via DASLLAMA_METAL_GEMV_TG (g_gemv_rows).
+[metal_dispatch(name = "enc_gemv_c", pso = "g_pso_gemv", tg = "g_gemv_rows*32", grid = "d/g_gemv_rows", params = "d : int64")]
 class MetalQ8Gemv {
-    @ssbo @binding = 0 wsh : array<float16> // 34B-block W blob, half-scale view (block b at 17*b)
-    @ssbo @binding = 1 wqb : array<int8>    // the same blob buffer, byte view (quants at 34*b + 2)
-    @ssbo @binding = 2 x : array<float4>    // [n] f32 vector, float4 view
-    @ssbo @binding = 3 y : array<float>     // [d] outputs
+    @ssbo @binding = 0 @role = "weight" @off = "boff" wsh : array<float16> // 34B-block W blob, half-scale view (block b at 17*b)
+    @ssbo @binding = 1 @role = "weight" @off = "boff" wqb : array<int8>    // the same blob buffer, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 @role = "read" x : array<float4>    // [n] f32 vector, float4 view
+    @ssbo @binding = 3 @role = "write" @off = "yoff" @span = "d*4" y : array<float>     // [d] outputs
     @uniform @binding = 4 ndim : uint       // n (reduction dim, % 32)
     @uniform @binding = 5 ddim : uint       // d (output rows)
 
@@ -3234,9 +3260,10 @@ class MetalAddBiasRows {
 // Per-head RMSNorm on Q/K before rope (qwen3-line QK-norm): one threadgroup = hs threads per
 // (head, row), nq q-head groups then the k heads, weight w[(k ? woffe : 0) + j]. Decode covers
 // q+k in ONE grid over the fused QKV buffer; prefill dispatches separate q/k panels per-plane.
+[metal_dispatch(name = "enc_qk_norm", pso = "g_pso_qknorm", tgmem = "metal_qk_norm_msl_tgmem", tg = "head_size", grid = "ntg, nrows", params = "ntg : int64, nrows : int64, head_size : int64")]
 class MetalQkNorm {
-    @ssbo @binding = 0 x : array<float>     // bound at the panel offset; normalized in place
-    @ssbo @binding = 1 w : array<float>
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>     // bound at the panel offset; normalized in place
+    @ssbo @binding = 1 @role = "weight" w : array<float>
     @uniform @binding = 2 nq : uint         // q-head threadgroups before the k heads
     @uniform @binding = 3 koffe : uint      // k region's element offset within a row (the WRITE side)
     @uniform @binding = 4 rstride : uint    // row stride (qkvd / qd / kv_dim)
@@ -3835,9 +3862,10 @@ class MetalPfCat2 {
 
 // Suppress-token pinning (gemma4): logits[ids[i]] = -1e30 after the soft cap — the CPU
 // forward's pin value exactly; one thread per suppressed id.
+[metal_dispatch(name = "enc_suppress_row", pso = "g_pso_suppress", tg = 64, grid = "n/64", params = "n : int64")]
 class MetalSuppressRow {
-    @ssbo @binding = 0 x : array<float>
-    @ssbo @binding = 1 ids : array<uint>
+    @ssbo @binding = 0 @role = "readwrite" @off = "xoff" x : array<float>
+    @ssbo @binding = 1 @role = "weight" ids : array<uint>
     @uniform @binding = 2 n : uint
 
     [metal_kernel(name="metal_suppress_row_msl")]
@@ -3852,8 +3880,9 @@ class MetalSuppressRow {
 
 // Logit soft-cap, one thread per element: x = cap * tanh(x / cap) — softcap4's scalar reference
 // (gemma2/gemma4 final_logit_softcap on the GPU classifier row).
+[metal_dispatch(name = "enc_softcap_row", pso = "g_pso_softcap", tg = 64, grid = "total/64", params = "total : int64")]
 class MetalSoftcapRow {
-    @ssbo @binding = 0 x : array<float>
+    @ssbo @binding = 0 @role = "readwrite" @off = "xoff" @span = "total*4" x : array<float>
     @uniform @binding = 1 total : uint      // grid guard
     @uniform @binding = 2 cap : float
 
@@ -3873,11 +3902,12 @@ class MetalSoftcapRow {
 // Causal depthwise conv over the fused [q;k;v] rows + SiLU (dn_conv_step's batch form): one
 // thread per (channel, position); positions reaching before the window read the channel-major
 // history taps (the CPU dn_conv_state layout). Never writes history — MetalDnConvHist advances.
+[metal_dispatch(name = "enc_dn_conv", pso = "g_pso_dn_conv", tg = 256, grid = "cd/256, npos", params = "cd : int64, npos : int64")]
 class MetalDnConv {
-    @ssbo @binding = 0 x : array<float>     // [npos x cd] fused qkv projection rows
-    @ssbo @binding = 1 hist : array<float>  // [cd x taps] channel-major history (layer slice)
-    @ssbo @binding = 2 w : array<float>     // [cd x dconv] conv taps (raw fblob layout)
-    @ssbo @binding = 3 y : array<float>     // [npos x cd] conv output, silu'd
+    @ssbo @binding = 0 @role = "read" x : array<float>     // [npos x cd] fused qkv projection rows
+    @ssbo @binding = 1 @role = "read" @off = "hoff" hist : array<float>  // [cd x taps] channel-major history (layer slice)
+    @ssbo @binding = 2 @role = "weight" w : array<float>     // [cd x dconv] conv taps (raw fblob layout)
+    @ssbo @binding = 3 @role = "write" y : array<float>     // [npos x cd] conv output, silu'd
     @uniform @binding = 4 cd : uint
     @uniform @binding = 5 dconv : uint
     @uniform @binding = 6 npos : uint
@@ -3905,13 +3935,14 @@ class MetalDnConv {
 // Advance the channel-major conv history past an npos window: the new taps are the window's
 // last `taps` input rows, shifted in from the old history when npos < taps (straddle). Reads
 // land in registers before any write, so the in-place buffer update is safe per channel.
+[metal_dispatch(name = "enc_dn_conv_hist", pso = "g_pso_dn_hist", tg = 256, grid = "cd/256", params = "cd : int64")]
 class MetalDnConvHist {
-    @ssbo @binding = 0 x : array<float>     // [npos x cd] the window's fused qkv rows
-    @ssbo @binding = 1 hist : array<float>  // [cd x taps] channel-major history (layer slice)
+    @ssbo @binding = 0 @role = "read" x : array<float>     // [npos x cd] the window's fused qkv rows
+    @ssbo @binding = 1 @role = "readwrite" @off = "hoff" hist : array<float>  // [cd x taps] channel-major history (layer slice)
     @uniform @binding = 2 cd : uint
     @uniform @binding = 3 dconv : uint
     @uniform @binding = 4 npos : uint
-    @ssbo @binding = 5 histm : array<float> // dual-store: the npos-1 window's history (verify shadow region)
+    @ssbo @binding = 5 @role = "alias" @off = "hmoff" histm : array<float> // dual-store: the npos-1 window's history (verify shadow region)
     @uniform @binding = 6 mid : uint        // 1 = also store the npos-1 window's history to histm
 
     [metal_kernel(name="metal_dn_conv_hist_msl")]
@@ -3947,8 +3978,9 @@ class MetalDnConvHist {
 // Per-head L2 norm over the conv-out q/k regions in place, q pre-scale folded (l2_norm_rows +
 // scale_inplace): one simdgroup per (head block, position). CPU accumulates the square-sum in
 // DOUBLE — the f32 simd tree here is the deltanet drift class (same as the Vulkan tier).
+[metal_dispatch(name = "enc_dn_l2norm", pso = "g_pso_dn_l2", tg = 256, grid = "nblk/8, npos", params = "nblk : int64, npos : int64")]
 class MetalDnL2Norm {
-    @ssbo @binding = 0 y : array<float>     // [npos x cd] conv rows: q at 0, k at kd
+    @ssbo @binding = 0 @role = "readwrite" y : array<float>     // [npos x cd] conv rows: q at 0, k at kd
     @uniform @binding = 1 cd : uint
     @uniform @binding = 2 kd : uint         // key_dim = nkh * ds
     @uniform @binding = 3 ds : uint         // 128 (gated)
@@ -3982,14 +4014,15 @@ class MetalDnL2Norm {
 // The fused sequential delta rule (llama.cpp's gated_delta_net shape): one simdgroup per
 // (state column j, v-head) holds S[:,j] in registers and walks ALL npos tokens in-kernel —
 // zero per-token state traffic; β/σ/softplus fold into the loop (redundant per column, trivial).
+[metal_dispatch(name = "enc_dn_scan", pso = "g_pso_dn_scan", tg = 128, grid = "ds/4, nvh", params = "ds : int64, nvh : int64")]
 class MetalDnScan {
-    @ssbo @binding = 0 cv : array<float>    // [npos x cd] conv rows: q at 0 / k at kd / v at 2kd
-    @ssbo @binding = 1 st : array<float>    // state layer slice [nvh x ds x ds] row-major (i·ds + j)
-    @ssbo @binding = 2 braw : array<float>  // [npos x nvh] raw beta projections
-    @ssbo @binding = 3 graw : array<float>  // [npos x nvh] raw alpha projections
-    @ssbo @binding = 4 aa : array<float>    // [nvh] ssm_a = -exp(A_log) (fblob row)
-    @ssbo @binding = 5 dtb : array<float>   // [nvh] dt_bias (fblob row)
-    @ssbo @binding = 6 o : array<float>     // [npos x di] delta-rule output rows
+    @ssbo @binding = 0 @role = "read" cv : array<float>    // [npos x cd] conv rows: q at 0 / k at kd / v at 2kd
+    @ssbo @binding = 1 @role = "readwrite" @off = "stoff" st : array<float>    // state layer slice [nvh x ds x ds] row-major (i·ds + j)
+    @ssbo @binding = 2 @role = "read" braw : array<float>  // [npos x nvh] raw beta projections
+    @ssbo @binding = 3 @role = "read" graw : array<float>  // [npos x nvh] raw alpha projections
+    @ssbo @binding = 4 @role = "weight" aa : array<float>    // [nvh] ssm_a = -exp(A_log) (fblob row)
+    @ssbo @binding = 5 @role = "weight" dtb : array<float>   // [nvh] dt_bias (fblob row)
+    @ssbo @binding = 6 @role = "write" o : array<float>     // [npos x di] delta-rule output rows
     @uniform @binding = 7 cd : uint
     @uniform @binding = 8 kd : uint
     @uniform @binding = 9 ds : uint         // 128 (gated)
@@ -3997,7 +4030,7 @@ class MetalDnScan {
     @uniform @binding = 11 nkh : uint
     @uniform @binding = 12 di : uint        // nvh * ds
     @uniform @binding = 13 npos : uint
-    @ssbo @binding = 14 stm : array<float>  // dual-store: post-token-(npos-2) state (verify shadow region)
+    @ssbo @binding = 14 @role = "alias" @off = "stmoff" stm : array<float>  // dual-store: post-token-(npos-2) state (verify shadow region)
     @uniform @binding = 15 mid : uint       // 1 = store S after token npos-2 to stm
 
     [metal_kernel(name="metal_dn_scan_msl")]
@@ -4058,10 +4091,11 @@ class MetalDnScan {
 
 // Gated out-norm (dn_token_core's tail): per (v-head, position) RMSNorm over ds with the
 // SHARED ssm_norm row, then ⊙ SiLU(z) — in place on o, one simdgroup per (head, position).
+[metal_dispatch(name = "enc_dn_gate", pso = "g_pso_dn_gate", tg = 256, grid = "nvh/8, npos", params = "nvh : int64, npos : int64")]
 class MetalDnGate {
-    @ssbo @binding = 0 o : array<float>     // [npos x di] delta-rule output, gated in place
-    @ssbo @binding = 1 z : array<float>     // [npos x di] raw gate projections
-    @ssbo @binding = 2 wn : array<float>    // [ds] shared norm weight (fblob row)
+    @ssbo @binding = 0 @role = "readwrite" o : array<float>     // [npos x di] delta-rule output, gated in place
+    @ssbo @binding = 1 @role = "read" z : array<float>     // [npos x di] raw gate projections
+    @ssbo @binding = 2 @role = "weight" wn : array<float>    // [ds] shared norm weight (fblob row)
     @uniform @binding = 3 ds : uint         // 128 (gated)
     @uniform @binding = 4 di : uint
     @uniform @binding = 5 eps : float
@@ -4093,10 +4127,11 @@ class MetalDnGate {
 // Deinterleave the 2x-wide gated-attention Q projection (head h's q at 2h·hs, its gate at
 // (2h+1)·hs): q lands in the qkv panel's q segment, the gate in its own rows — keeps the
 // rope/attention classes untouched by the packing.
+[metal_dispatch(name = "enc_dn_deint", pso = "g_pso_dn_deint", tg = 256, grid = "qd/256, npos", params = "qd : int64, npos : int64")]
 class MetalDnDeint {
-    @ssbo @binding = 0 qg : array<float>    // [npos x 2qd] packed [q|gate] projection rows
-    @ssbo @binding = 1 q : array<float>     // qkv panel, q segment at row stride qs
-    @ssbo @binding = 2 gt : array<float>    // [npos x qd] sigmoid-gate rows
+    @ssbo @binding = 0 @role = "read" qg : array<float>    // [npos x 2qd] packed [q|gate] projection rows
+    @ssbo @binding = 1 @role = "write" q : array<float>     // qkv panel, q segment at row stride qs
+    @ssbo @binding = 2 @role = "write" gt : array<float>    // [npos x qd] sigmoid-gate rows
     @uniform @binding = 3 hs : uint
     @uniform @binding = 4 qd : uint
     @uniform @binding = 5 qs : uint         // q panel row stride, elements (qkvd; decode binds qd)
@@ -4133,10 +4168,11 @@ class MetalSigmul {
 
 // Shared-expert combine (qwen35moe): y += x ⊙ σ(g[row]) — one raw gate dot per position
 // (decode total = dim; prefill total = npos x dim, row = the position).
+[metal_dispatch(name = "enc_axpy_sig", pso = "g_pso_axpy_sig", tg = 256, grid = "total/256", params = "total : int64")]
 class MetalAxpySig {
-    @ssbo @binding = 0 y : array<float>
-    @ssbo @binding = 1 x : array<float>
-    @ssbo @binding = 2 g : array<float>     // per-position raw gate dots (σ applied here)
+    @ssbo @binding = 0 @role = "readwrite" y : array<float>
+    @ssbo @binding = 1 @role = "read" x : array<float>
+    @ssbo @binding = 2 @role = "read" g : array<float>     // per-position raw gate dots (σ applied here)
     @uniform @binding = 3 total : uint      // grid guard
     @uniform @binding = 4 dim : uint
 
@@ -4243,7 +4279,7 @@ var private g_pso_gemm64 : MetalComputePipeline?
 var private g_pf_pso_rms : MetalComputePipeline?
 var private g_pso_rope : MetalComputePipeline?
 var private g_pso_addbias : MetalComputePipeline?
-var private g_pso_qknorm : MetalComputePipeline?
+var private g_pf_pso_qknorm : MetalComputePipeline?
 var private g_pso_qk : MetalComputePipeline?
 var private g_pso_softmax : MetalComputePipeline?
 var private g_pso_av : MetalComputePipeline?
@@ -4408,9 +4444,9 @@ def public metal_prefill_shutdown {
         metal_release(g_pso_addbias)
         g_pso_addbias = null
     }
-    if (g_pso_qknorm != null) {
-        metal_release(g_pso_qknorm)
-        g_pso_qknorm = null
+    if (g_pf_pso_qknorm != null) {
+        metal_release(g_pf_pso_qknorm)
+        g_pf_pso_qknorm = null
     }
     if (g_pso_qk != null) {
         metal_release(g_pso_qk)
@@ -4557,7 +4593,7 @@ def private metal_prefill_init : bool {
     g_pf_pso_rms = pf_compile_pso(metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, ok)
     g_pso_rope = pf_compile_pso(metal_rope_msl, metal_rope_msl_entry, metal_rope_msl_fastmath, ok)
     g_pso_addbias = pf_compile_pso(metal_add_bias_rows_msl, metal_add_bias_rows_msl_entry, metal_add_bias_rows_msl_fastmath, ok)
-    g_pso_qknorm = pf_compile_pso(metal_qk_norm_msl, metal_qk_norm_msl_entry, metal_qk_norm_msl_fastmath, ok)
+    g_pf_pso_qknorm = pf_compile_pso(metal_qk_norm_msl, metal_qk_norm_msl_entry, metal_qk_norm_msl_fastmath, ok)
     g_pso_qk = pf_compile_pso(metal_attn_qk_msl, metal_attn_qk_msl_entry, metal_attn_qk_msl_fastmath, ok)
     g_pso_softmax = pf_compile_pso(metal_attn_softmax_msl, metal_attn_softmax_msl_entry, metal_attn_softmax_msl_fastmath, ok)
     g_pso_av = pf_compile_pso(metal_attn_av_msl, metal_attn_av_msl_entry, metal_attn_av_msl_fastmath, ok)
@@ -5055,7 +5091,7 @@ def private enc_add_bias_rows(enc : MetalComputeEncoder?; bx, bb, bn, btotal : M
 }
 
 def private enc_qk_norm_pf(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps, bsoffe : MetalBuffer?; ntg, nrows, hs : int64; off : uint64 = 0ul) {
-    metal_set_pipeline(enc, g_pso_qknorm)
+    metal_set_pipeline(enc, g_pf_pso_qknorm)
     metal_set_threadgroup_memory_length(enc, metal_qk_norm_msl_tgmem, 0)
     metal_set_buffer(enc, bx, off, 0)
     metal_set_buffer(enc, bw, 0ul, 1)

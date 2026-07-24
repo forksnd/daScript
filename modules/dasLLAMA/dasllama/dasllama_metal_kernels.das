@@ -10,6 +10,7 @@ require dasllama/dasllama_common
 require dasllama/dasllama_math
 require dasllama/dasllama_metal_prefill
 require dasllama/dasllama_metal_common
+require dasllama/dasllama_metal_lens
 
 // The family-agnostic dasMetal kernel + PSO registry (the format-matrix arc's W1 split): every
 // [metal_kernel] class the resident decode drivers dispatch — GEMV/GEMM/mul_mm forms, the
@@ -24,11 +25,12 @@ require dasllama/dasllama_metal_common
 // One threadgroup per (stream, head), head_size threads — lane owns one V column. Pass 1 scores
 // the context simdgroup-cooperatively so every K load coalesces (per-lane-per-row form gathered
 // cache lines 2KB apart — measured 27us/layer at depth 24). Pass 2 softmax, pass 3 V-accumulate.
+[metal_dispatch(name = "enc_attn16_c", pso = "g_pso_attn16", tgmem = "metal_sq_attn16_msl_tgmem", tg = "head_size", grid = "nheads", params = "nheads : int64, head_size : int64")]
 class MetalSqAttnF16 {
-    @ssbo @binding = 0 kc : array<float16>  // this layer's K mirror slab (bound at the layer's byte offset)
-    @ssbo @binding = 1 vc : array<float16>
-    @ssbo @binding = 2 q : array<float>     // [B x qd] roped queries
-    @ssbo @binding = 3 yo : array<float>    // [B x qd] attention out
+    @ssbo @binding = 0 @role = "read" @off = "koff" kc : array<float16>  // this layer's K mirror slab (bound at the layer's byte offset)
+    @ssbo @binding = 1 @role = "read" @off = "voff" vc : array<float16>
+    @ssbo @binding = 2 @role = "read" q : array<float>     // [B x qd] roped queries
+    @ssbo @binding = 3 @role = "write" yo : array<float>    // [B x qd] attention out
     @uniform @binding = 4 cnt : uint        // context depth (pos + 1)
     @uniform @binding = 5 kv_dim : uint
     @uniform @binding = 6 nheads : uint
@@ -36,7 +38,7 @@ class MetalSqAttnF16 {
     @uniform @binding = 8 hs : uint         // head_size == threads per group
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 softcap : float  // > 0 = attention-logit soft cap (gemma2)
-    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @ssbo @binding = 20 @role = "weight" sink : array<float> // [nheads] this layer's attention sinks (hass models)
     @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]  // >= ATTN_CHUNK_ROWS — the single-tg depth ceiling
     @workgroup red : float[16]
@@ -195,11 +197,12 @@ class MetalSqAttnF16 {
 }
 
 // f32-mirror twin (sessions created with f32 KV) — same math, f32 loads.
+[metal_dispatch(name = "enc_attn32_c", pso = "g_pso_attn32", tgmem = "metal_sq_attn32_msl_tgmem", tg = "head_size", grid = "nheads", params = "nheads : int64, head_size : int64")]
 class MetalSqAttnF32 {
-    @ssbo @binding = 0 kc : array<float>
-    @ssbo @binding = 1 vc : array<float>
-    @ssbo @binding = 2 q : array<float>
-    @ssbo @binding = 3 yo : array<float>
+    @ssbo @binding = 0 @role = "read" @off = "koff" kc : array<float>
+    @ssbo @binding = 1 @role = "read" @off = "voff" vc : array<float>
+    @ssbo @binding = 2 @role = "read" q : array<float>
+    @ssbo @binding = 3 @role = "write" yo : array<float>
     @uniform @binding = 4 cnt : uint
     @uniform @binding = 5 kv_dim : uint
     @uniform @binding = 6 nheads : uint
@@ -207,7 +210,7 @@ class MetalSqAttnF32 {
     @uniform @binding = 8 hs : uint
     @uniform @binding = 9 scale : float
     @uniform @binding = 10 softcap : float
-    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @ssbo @binding = 20 @role = "weight" sink : array<float> // [nheads] this layer's attention sinks (hass models)
     @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]
     @workgroup red : float[16]
@@ -362,13 +365,14 @@ class MetalSqAttnF32 {
 // q8_0-mirror twin — K/V rows are ggml block_q8_0 (34B/32 elems); the mirror slab binds twice
 // (half view for scale, byte view for quants — the dual-view pattern) and dequant rides the
 // stream. Measured 1.1-1.7x over the f16 form at d512-2048 (benchmarks/attn/bench_metal_sq_attn.das).
+[metal_dispatch(name = "enc_attn_q8_c", pso = "g_pso_attn_q8", tgmem = "metal_sq_attn_q8_msl_tgmem", tg = "head_size", grid = "nheads", params = "nheads : int64, head_size : int64")]
 class MetalSqAttnQ8 {
-    @ssbo @binding = 0 ksh : array<float16> // K mirror slab, HALF-SCALE view (bound at the layer's byte offset)
-    @ssbo @binding = 1 kqb : array<int8>    // the SAME K slab, BYTE view
-    @ssbo @binding = 2 vsh : array<float16>
-    @ssbo @binding = 3 vqb : array<int8>
-    @ssbo @binding = 4 q : array<float>     // [B x qd] roped queries
-    @ssbo @binding = 5 yo : array<float>    // [B x qd] attention out
+    @ssbo @binding = 0 @role = "read" @off = "koff" ksh : array<float16> // K mirror slab, HALF-SCALE view (bound at the layer's byte offset)
+    @ssbo @binding = 1 @role = "alias" @off = "koff" kqb : array<int8>    // the SAME K slab, BYTE view
+    @ssbo @binding = 2 @role = "read" @off = "voff" vsh : array<float16>
+    @ssbo @binding = 3 @role = "alias" @off = "voff" vqb : array<int8>
+    @ssbo @binding = 4 @role = "read" q : array<float>     // [B x qd] roped queries
+    @ssbo @binding = 5 @role = "write" yo : array<float>    // [B x qd] attention out
     @uniform @binding = 6 cnt : uint        // context depth (pos + 1)
     @uniform @binding = 7 nblk : uint       // blocks per row = kv_dim / 32
     @uniform @binding = 8 nheads : uint
@@ -376,7 +380,7 @@ class MetalSqAttnQ8 {
     @uniform @binding = 10 hs : uint        // head_size == threads per group
     @uniform @binding = 11 scale : float
     @uniform @binding = 12 softcap : float
-    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @ssbo @binding = 20 @role = "weight" sink : array<float> // [nheads] this layer's attention sinks (hass models)
     @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]  // >= ATTN_CHUNK_ROWS — the single-tg depth ceiling
     @workgroup red : float[16]
@@ -545,13 +549,14 @@ class MetalSqAttnQ8 {
 
 // tq4-mirror twin — 18B rotated 4-bit blocks; q arrives already rotated (the rope-store twin
 // rotates it), so attention runs in the rotated basis and yo needs one fwht-unsign pass downstream.
+[metal_dispatch(name = "enc_attn_tq4_c", pso = "g_pso_attn_tq4", tgmem = "metal_sq_attn_tq4_msl_tgmem", tg = "head_size", grid = "nheads", params = "nheads : int64, head_size : int64")]
 class MetalSqAttnTq4 {
-    @ssbo @binding = 0 ksh : array<float16> // K mirror slab, HALF-SCALE view (bound at the layer's byte offset)
-    @ssbo @binding = 1 kqb : array<uint8>   // the SAME K slab, BYTE view
-    @ssbo @binding = 2 vsh : array<float16>
-    @ssbo @binding = 3 vqb : array<uint8>
-    @ssbo @binding = 4 q : array<float>     // [B x qd] roped + rotated queries
-    @ssbo @binding = 5 yo : array<float>    // [B x qd] attention out (rotated basis)
+    @ssbo @binding = 0 @role = "read" @off = "koff" ksh : array<float16> // K mirror slab, HALF-SCALE view (bound at the layer's byte offset)
+    @ssbo @binding = 1 @role = "alias" @off = "koff" kqb : array<uint8>   // the SAME K slab, BYTE view
+    @ssbo @binding = 2 @role = "read" @off = "voff" vsh : array<float16>
+    @ssbo @binding = 3 @role = "alias" @off = "voff" vqb : array<uint8>
+    @ssbo @binding = 4 @role = "read" q : array<float>     // [B x qd] roped + rotated queries
+    @ssbo @binding = 5 @role = "write" yo : array<float>    // [B x qd] attention out (rotated basis)
     @uniform @binding = 6 cnt : uint
     @uniform @binding = 7 nblk : uint       // blocks per row = kv_dim / 32
     @uniform @binding = 8 nheads : uint
@@ -559,7 +564,7 @@ class MetalSqAttnTq4 {
     @uniform @binding = 10 hs : uint
     @uniform @binding = 11 scale : float
     @uniform @binding = 12 softcap : float
-    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @ssbo @binding = 20 @role = "weight" sink : array<float> // [nheads] this layer's attention sinks (hass models)
     @uniform @binding = 21 hass : uint
     @workgroup scores : float[128]
     @workgroup red : float[16]
@@ -721,11 +726,12 @@ class MetalSqAttnTq4 {
 // Chunked split-K twin for deeper contexts (cnt > ATTN_CHUNK_ROWS): each threadgroup owns one
 // 128-row chunk, writes an unnormalized partial (acc[hs] + chunk max + expsum); a comb kernel
 // rescales across chunks. The single-tg form is latency-bound (measured 7.5ms/token at depth 512).
+[metal_dispatch(name = "enc_attnp16_c", pso = "g_pso_attnp16", tgmem = "metal_sq_attn_part16_msl_tgmem", tg = "head_size", grid = "ntg", params = "ntg : int64, head_size : int64")]
 class MetalSqAttnPartF16 {
-    @ssbo @binding = 0 kc : array<float16>
-    @ssbo @binding = 1 vc : array<float16>
-    @ssbo @binding = 2 q : array<float>
-    @ssbo @binding = 3 part : array<float>  // [B x nheads x nchunks x (hs+2)]: acc[hs], chunk max, chunk expsum
+    @ssbo @binding = 0 @role = "read" @off = "koff" kc : array<float16>
+    @ssbo @binding = 1 @role = "read" @off = "voff" vc : array<float16>
+    @ssbo @binding = 2 @role = "read" q : array<float>
+    @ssbo @binding = 3 @role = "write" part : array<float>  // [B x nheads x nchunks x (hs+2)]: acc[hs], chunk max, chunk expsum
     @uniform @binding = 4 cnt : uint
     @uniform @binding = 5 kv_dim : uint
     @uniform @binding = 6 nheads : uint
@@ -911,11 +917,12 @@ class MetalSqAttnPartF16 {
 }
 
 // f32-mirror twin — same math, f32 K/V loads.
+[metal_dispatch(name = "enc_attnp32_c", pso = "g_pso_attnp32", tgmem = "metal_sq_attn_part32_msl_tgmem", tg = "head_size", grid = "ntg", params = "ntg : int64, head_size : int64")]
 class MetalSqAttnPartF32 {
-    @ssbo @binding = 0 kc : array<float>
-    @ssbo @binding = 1 vc : array<float>
-    @ssbo @binding = 2 q : array<float>
-    @ssbo @binding = 3 part : array<float>
+    @ssbo @binding = 0 @role = "read" @off = "koff" kc : array<float>
+    @ssbo @binding = 1 @role = "read" @off = "voff" vc : array<float>
+    @ssbo @binding = 2 @role = "read" q : array<float>
+    @ssbo @binding = 3 @role = "write" part : array<float>
     @uniform @binding = 4 cnt : uint
     @uniform @binding = 5 kv_dim : uint
     @uniform @binding = 6 nheads : uint
@@ -1097,13 +1104,14 @@ class MetalSqAttnPartF32 {
 
 // q8_0-mirror chunked twin — the Part kernel's block-codec form (dual-view reads, see
 // MetalSqAttnQ8); partials stay f32, so the comb below serves this form unchanged.
+[metal_dispatch(name = "enc_attnp_q8_c", pso = "g_pso_attnp_q8", tgmem = "metal_sq_attn_part_q8_msl_tgmem", tg = "head_size", grid = "ntg", params = "ntg : int64, head_size : int64")]
 class MetalSqAttnPartQ8 {
-    @ssbo @binding = 0 ksh : array<float16>
-    @ssbo @binding = 1 kqb : array<int8>
-    @ssbo @binding = 2 vsh : array<float16>
-    @ssbo @binding = 3 vqb : array<int8>
-    @ssbo @binding = 4 q : array<float>
-    @ssbo @binding = 5 part : array<float>  // [B x nheads x nchunks x (hs+2)]: acc[hs], chunk max, chunk expsum
+    @ssbo @binding = 0 @role = "read" @off = "koff" ksh : array<float16>
+    @ssbo @binding = 1 @role = "alias" @off = "koff" kqb : array<int8>
+    @ssbo @binding = 2 @role = "read" @off = "voff" vsh : array<float16>
+    @ssbo @binding = 3 @role = "alias" @off = "voff" vqb : array<int8>
+    @ssbo @binding = 4 @role = "read" q : array<float>
+    @ssbo @binding = 5 @role = "write" part : array<float>  // [B x nheads x nchunks x (hs+2)]: acc[hs], chunk max, chunk expsum
     @uniform @binding = 6 cnt : uint
     @uniform @binding = 7 nblk : uint       // blocks per row = kv_dim / 32
     @uniform @binding = 8 nheads : uint
@@ -1300,13 +1308,14 @@ class MetalSqAttnPartQ8 {
 
 // tq4-mirror chunked twin (nibble reads — see MetalSqAttnTq4); partials stay f32, so the comb
 // below serves this form unchanged and the fwht-unsign runs after it.
+[metal_dispatch(name = "enc_attnp_tq4_c", pso = "g_pso_attnp_tq4", tgmem = "metal_sq_attn_part_tq4_msl_tgmem", tg = "head_size", grid = "ntg", params = "ntg : int64, head_size : int64")]
 class MetalSqAttnPartTq4 {
-    @ssbo @binding = 0 ksh : array<float16>
-    @ssbo @binding = 1 kqb : array<uint8>
-    @ssbo @binding = 2 vsh : array<float16>
-    @ssbo @binding = 3 vqb : array<uint8>
-    @ssbo @binding = 4 q : array<float>
-    @ssbo @binding = 5 part : array<float>  // [B x nheads x nchunks x (hs+2)]
+    @ssbo @binding = 0 @role = "read" @off = "koff" ksh : array<float16>
+    @ssbo @binding = 1 @role = "alias" @off = "koff" kqb : array<uint8>
+    @ssbo @binding = 2 @role = "read" @off = "voff" vsh : array<float16>
+    @ssbo @binding = 3 @role = "alias" @off = "voff" vqb : array<uint8>
+    @ssbo @binding = 4 @role = "read" q : array<float>
+    @ssbo @binding = 5 @role = "write" part : array<float>  // [B x nheads x nchunks x (hs+2)]
     @uniform @binding = 6 cnt : uint
     @uniform @binding = 7 nblk : uint
     @uniform @binding = 8 nheads : uint
@@ -1494,14 +1503,15 @@ class MetalSqAttnPartTq4 {
 
 // Cross-chunk combine: one threadgroup per (stream, head), hs threads — rescale each chunk's
 // unnormalized partial to the global max, sum, normalize. Dtype-agnostic (partials are f32).
+[metal_dispatch(name = "enc_attncomb_c", pso = "g_pso_attncomb", tg = "head_size", grid = "nheads", params = "nheads : int64, head_size : int64")]
 class MetalSqAttnComb {
-    @ssbo @binding = 0 part : array<float>
-    @ssbo @binding = 1 yo : array<float>
+    @ssbo @binding = 0 @role = "read" part : array<float>
+    @ssbo @binding = 1 @role = "write" yo : array<float>
     @uniform @binding = 2 nchunks : uint
     @uniform @binding = 3 nheads : uint
     @uniform @binding = 4 hs : uint
     @uniform @binding = 5 chlo : uint       // first live chunk (sliding: chunks below the window are unwritten)
-    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @ssbo @binding = 20 @role = "weight" sink : array<float> // [nheads] this layer's attention sinks (hass models)
     @uniform @binding = 21 hass : uint
 
     [metal_kernel(name="metal_sq_attn_comb_msl")]
@@ -1540,28 +1550,29 @@ class MetalSqAttnComb {
 // The 2-rows-per-simdgroup fused QKV GEMV + rope + KV-row store: the rope pair's two elements
 // of q/k ARE two weight rows of the fused region — adjacent (2p, 2p+1) under NORM, (r, r+hs/2)
 // within the head under NEOX. Deletes the separate rope_store dispatch entirely.
+[metal_dispatch(name = "enc_qkvrs16_c", pso = "g_pso_qkvrs16", tg = 128, grid = "pairs/4", params = "pairs : int64")]
 class MetalQ8GemvQkvRsF16 {
-    @ssbo @binding = 0 wqbq : array<int8>   // wq blob, byte view @ the q tensor's byte offset
-    @ssbo @binding = 1 wshq : array<float16>   // ... half-scale view (same offset). Segments bind
+    @ssbo @binding = 0 @role = "weight" @off = "wqoff" wqbq : array<int8>   // wq blob, byte view @ the q tensor's byte offset
+    @ssbo @binding = 1 @role = "weight" @off = "wqoff" wshq : array<float16>   // ... half-scale view (same offset). Segments bind
                                             // separately — kind-major layout keeps q/k/v apart
-    @ssbo @binding = 2 x : array<float4>
-    @ssbo @binding = 3 qo : array<float>    // q out, roped ([0, qd) of the QKV buffer)
-    @ssbo @binding = 4 kd : array<float16>  // mirror K row (bound at the row offset)
-    @ssbo @binding = 5 vd : array<float16>
-    @ssbo @binding = 6 tcos : array<float>  // [hs/2] this position's rope row
-    @ssbo @binding = 7 tsin : array<float>
+    @ssbo @binding = 2 @role = "read" x : array<float4>
+    @ssbo @binding = 3 @role = "write" qo : array<float>    // q out, roped ([0, qd) of the QKV buffer)
+    @ssbo @binding = 4 @role = "write" @off = "koff" kd : array<float16>  // mirror K row (bound at the row offset)
+    @ssbo @binding = 5 @role = "write" @off = "voff" vd : array<float16>
+    @ssbo @binding = 6 @role = "weight" tcos : array<float>  // [hs/2] this position's rope row
+    @ssbo @binding = 7 @role = "weight" tsin : array<float>
     @uniform @binding = 8 ndim : uint
     @uniform @binding = 9 ddim : uint       // qd + 2*kvd
     @uniform @binding = 10 qd : uint
     @uniform @binding = 11 kvd : uint
     @uniform @binding = 12 hs : uint
     @uniform @binding = 13 neox : uint      // rope pair = rows (r, r+hs/2) instead of (2p, 2p+1)
-    @ssbo @binding = 14 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @ssbo @binding = 14 @role = "weight" bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 15 has_bias : uint
-    @ssbo @binding = 16 wqbk : array<int8>  // wk blob views
-    @ssbo @binding = 17 wshk : array<float16>
-    @ssbo @binding = 18 wqbv : array<int8>  // wv blob views
-    @ssbo @binding = 19 wshv : array<float16>
+    @ssbo @binding = 16 @role = "weight" @off = "wkoff" wqbk : array<int8>  // wk blob views
+    @ssbo @binding = 17 @role = "weight" @off = "wkoff" wshk : array<float16>
+    @ssbo @binding = 18 @role = "weight" @off = "wvoff" wqbv : array<int8>  // wv blob views
+    @ssbo @binding = 19 @role = "weight" @off = "wvoff" wshv : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs16_msl")]
     def metal_q8_gemv_qkv_rs16 {
@@ -1661,27 +1672,28 @@ class MetalQ8GemvQkvRsF16 {
 }
 
 // f32-mirror twin — straight stores, no clamp.
+[metal_dispatch(name = "enc_qkvrs32_c", pso = "g_pso_qkvrs32", tg = 128, grid = "pairs/4", params = "pairs : int64")]
 class MetalQ8GemvQkvRsF32 {
-    @ssbo @binding = 0 wqbq : array<int8>   // per-segment blob views — the F16 twin's scheme
-    @ssbo @binding = 1 wshq : array<float16>
-    @ssbo @binding = 2 x : array<float4>
-    @ssbo @binding = 3 qo : array<float>
-    @ssbo @binding = 4 kd : array<float>
-    @ssbo @binding = 5 vd : array<float>
-    @ssbo @binding = 6 tcos : array<float>
-    @ssbo @binding = 7 tsin : array<float>
+    @ssbo @binding = 0 @role = "weight" @off = "wqoff" wqbq : array<int8>   // per-segment blob views — the F16 twin's scheme
+    @ssbo @binding = 1 @role = "weight" @off = "wqoff" wshq : array<float16>
+    @ssbo @binding = 2 @role = "read" x : array<float4>
+    @ssbo @binding = 3 @role = "write" qo : array<float>
+    @ssbo @binding = 4 @role = "write" @off = "koff" kd : array<float>
+    @ssbo @binding = 5 @role = "write" @off = "voff" vd : array<float>
+    @ssbo @binding = 6 @role = "weight" tcos : array<float>
+    @ssbo @binding = 7 @role = "weight" tsin : array<float>
     @uniform @binding = 8 ndim : uint
     @uniform @binding = 9 ddim : uint
     @uniform @binding = 10 qd : uint
     @uniform @binding = 11 kvd : uint
     @uniform @binding = 12 hs : uint
     @uniform @binding = 13 neox : uint
-    @ssbo @binding = 14 bias : array<float>
+    @ssbo @binding = 14 @role = "weight" bias : array<float>
     @uniform @binding = 15 has_bias : uint
-    @ssbo @binding = 16 wqbk : array<int8>
-    @ssbo @binding = 17 wshk : array<float16>
-    @ssbo @binding = 18 wqbv : array<int8>
-    @ssbo @binding = 19 wshv : array<float16>
+    @ssbo @binding = 16 @role = "weight" @off = "wkoff" wqbk : array<int8>
+    @ssbo @binding = 17 @role = "weight" @off = "wkoff" wshk : array<float16>
+    @ssbo @binding = 18 @role = "weight" @off = "wvoff" wqbv : array<int8>
+    @ssbo @binding = 19 @role = "weight" @off = "wvoff" wshv : array<float16>
 
     [metal_kernel(name="metal_q8_gemv_qkv_rs32_msl")]
     def metal_q8_gemv_qkv_rs32 {
@@ -1779,16 +1791,17 @@ class MetalQ8GemvQkvRsF32 {
 // The W1|W3 twin of the same shape: one simdgroup dots BOTH ffn rows of an output element (gate
 // off the w1 blob views, up off the w3 views — kind-major layout keeps them apart) and writes
 // act(g)·u directly (act = silu or gelu per the uniform). Deletes the swiglu/geglu dispatch AND its serialization level.
+[metal_dispatch(name = "enc_w13sw_c", pso = "g_pso_w13sw", tg = 128, grid = "hidden/4", params = "hidden : int64")]
 class MetalQ8GemvW13Sw {
-    @ssbo @binding = 0 wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
-    @ssbo @binding = 1 wsh1 : array<float16>   // ... half-scale view
-    @ssbo @binding = 2 x : array<float4>
-    @ssbo @binding = 3 ho : array<float>    // [hidden] silu(gate)·up
+    @ssbo @binding = 0 @role = "weight" @off = "w1off" wqb1 : array<int8>   // w1 blob, byte view @ its tensor offset
+    @ssbo @binding = 1 @role = "weight" @off = "w1off" wsh1 : array<float16>   // ... half-scale view
+    @ssbo @binding = 2 @role = "read" x : array<float4>
+    @ssbo @binding = 3 @role = "write" @span = "hidden*4" ho : array<float>    // [hidden] silu(gate)·up
     @uniform @binding = 4 ndim : uint
     @uniform @binding = 5 hidden : uint
-    @ssbo @binding = 6 wqb3 : array<int8>   // w3 blob views
-    @ssbo @binding = 7 wsh3 : array<float16>
-    @uniform @binding = 8 act : uint        // gate activation: 0 = silu (swiglu), 1 = gelu (geglu, gemma line)
+    @ssbo @binding = 6 @role = "weight" @off = "w3off" wqb3 : array<int8>   // w3 blob views
+    @ssbo @binding = 7 @role = "weight" @off = "w3off" wsh3 : array<float16>
+    @uniform @binding = 8 @role = "weight" act : uint        // gate activation: 0 = silu (swiglu), 1 = gelu (geglu, gemma line)
 
     [metal_kernel(name="metal_q8_gemv_w13sw16_msl")]
     def metal_q8_gemv_w13sw16 {
@@ -1829,9 +1842,10 @@ class MetalQ8GemvW13Sw {
 // Row copy for the zero-copy logits rail: one batched-classifier staging row into a session's
 // bytesNoCopy-wrapped logits storage — the scatter rides the cb instead of the landing memcpy.
 // src binds at the row's byte offset; grid = ceil(n/256) x 256-tg.
+[metal_dispatch(name = "enc_copy_row", pso = "g_pso_copy_row", tg = 256, grid = "n/256", params = "n : int64")]
 class MetalCopyRow {
-    @ssbo @binding = 0 src : array<float>
-    @ssbo @binding = 1 dst : array<float>
+    @ssbo @binding = 0 @role = "read" @off = "soff" @span = "n*4" src : array<float>
+    @ssbo @binding = 1 @role = "write" @off = "doff" @span = "n*4" dst : array<float>
     @uniform @binding = 2 n : uint
 
     [metal_kernel(name="metal_copy_row_msl")]
@@ -1846,9 +1860,10 @@ class MetalCopyRow {
 // GPU-side greedy sampling — the speculative chain's token source: one threadgroup, strided
 // argmax over the logits with the CPU sampler's exact tie-break (lowest index wins; per-lane the
 // strict > keeps the earliest, cross-lane the (==, <) rule picks the lower index).
+[metal_dispatch(name = "enc_argmax", pso = "g_pso_argmax", tgmem = "metal_argmax_msl_tgmem", tg = 1024, grid = "1")]
 class MetalArgmax {
-    @ssbo @binding = 0 lg : array<float>
-    @ssbo @binding = 1 tok : array<uint>    // [1] winner index out
+    @ssbo @binding = 0 @role = "read" lg : array<float>
+    @ssbo @binding = 1 @role = "write" tok : array<uint>    // [1] winner index out
     @uniform @binding = 2 n : uint
     @workgroup redv : float[32]
     @workgroup redi : uint[32]
@@ -1902,13 +1917,14 @@ class MetalArgmax {
 // Speculative embed gather: dequant the argmax winner's Q8 embedding row (the cls_q8 linear
 // copy's slice of the whole-model 34B blob, bound at emb_q8_off's byte offset) into the next
 // step's residual input — the GPU chain's embed_row.
+[metal_dispatch(name = "enc_embed_c", pso = "g_pso_emb", tg = 64, grid = "dim/64", params = "dim : int64")]
 class MetalEmbedQ8 {
-    @ssbo @binding = 0 q : array<int8>      // the embed blob slice, byte view (quants at 34*b + 2)
-    @ssbo @binding = 1 sc : array<float16>  // the same buffer, half-scale view (block b at 17*b)
-    @ssbo @binding = 2 tok : array<uint>
-    @ssbo @binding = 3 xo : array<float>    // [dim] residual input out
+    @ssbo @binding = 0 @role = "weight" @off = "eoff" q : array<int8>      // the embed blob slice, byte view (quants at 34*b + 2)
+    @ssbo @binding = 1 @role = "weight" @off = "eoff" sc : array<float16>  // the same buffer, half-scale view (block b at 17*b)
+    @ssbo @binding = 2 @role = "read" tok : array<uint>
+    @ssbo @binding = 3 @role = "write" xo : array<float>    // [dim] residual input out
     @uniform @binding = 4 dim : uint
-    @uniform @binding = 5 escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere)
+    @uniform @binding = 5 @role = "weight" escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere — g_one or an uploaded scalar)
 
     [metal_kernel(name="metal_embed_q8_msl")]
     def metal_embed_q8 {
@@ -1925,14 +1941,15 @@ class MetalEmbedQ8 {
 // k6 twin (tied Q6_K classifiers — the spec chain for kq): dequant the winner's row from the
 // disk-order k6 planes, dequant_k6_plane_superblock's exact math — (d * sc16) * (q - 32), the
 // same split scale layout as MetalKqGemvK6 (16B sub-scale blocks @0, f16 d plane @nsb*16).
+[metal_dispatch(name = "enc_embed_k6_c", pso = "g_pso_emb_k6", tg = 64, grid = "dim/64", params = "dim : int64")]
 class MetalEmbedK6 {
-    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
-    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
-    @ssbo @binding = 2 kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
-    @ssbo @binding = 3 tok : array<uint>
-    @ssbo @binding = 4 xo : array<float>    // [dim] residual input out
+    @ssbo @binding = 0 @role = "weight" @off = "doff" kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 @role = "weight" @off = "soff" kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
+    @ssbo @binding = 2 @role = "weight" @off = "qoff" kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
+    @ssbo @binding = 3 @role = "read" tok : array<uint>
+    @ssbo @binding = 4 @role = "write" xo : array<float>    // [dim] residual input out
     @uniform @binding = 5 dim : uint
-    @uniform @binding = 6 escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere)
+    @uniform @binding = 6 @role = "weight" escale : float    // embed_scale (gemma: sqrt(dim); 1.0 elsewhere — g_one or an uploaded scalar)
 
     [metal_kernel(name="metal_embed_k6_msl")]
     def metal_embed_k6 {
@@ -1968,15 +1985,16 @@ class MetalEmbedK6 {
 // Fused residual-add + rmsnorm: x += a in place, then y = rms(x)·w, one dispatch instead of two.
 // The added row stages through the threadgroup slab since barrier() is a threadgroup fence only.
 // dim caps at the slab; wider models take the unfused pair (enc_add_rms_site).
+[metal_dispatch(name = "enc_addrms_c", pso = "g_pso_addrms", tgmem = "metal_add_rms_msl_tgmem", tg = 1024, grid = "1")]
 class MetalAddRms {
-    @ssbo @binding = 0 x : array<float>     // [dim] residual stream, add target
-    @ssbo @binding = 1 a : array<float>     // [dim] addend (fully read before y is written — y may alias a)
-    @ssbo @binding = 2 w : array<float>     // [dim] norm weight
-    @ssbo @binding = 3 y : array<float>     // [dim] normed out
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>     // [dim] residual stream, add target
+    @ssbo @binding = 1 @role = "read" a : array<float>     // [dim] addend (fully read before y is written — y may alias a)
+    @ssbo @binding = 2 @role = "weight" w : array<float>     // [dim] norm weight
+    @ssbo @binding = 3 @role = "write" y : array<float>     // [dim] normed out
     @uniform @binding = 4 dim : uint
     @uniform @binding = 5 eps : float
-    @uniform @binding = 6 ascale : float    // (x + a) * ascale — gemma4 layer_out_scale scales
-                                            // the whole layer output; every other site binds 1.0
+    @uniform @binding = 6 @role = "weight" ascale : float    // (x + a) * ascale — gemma4 layer_out_scale scales
+                                            // the whole layer output; every other site binds 1.0 (g_one)
     @workgroup xrow : float[4096]           // == ADD_RMS_MAX_DIM
     @workgroup partial : float[32]          // one per simdgroup at the 1024-thread dispatch
     @workgroup inv_sh : float
@@ -2017,22 +2035,100 @@ class MetalAddRms {
     }
 }
 
+// Fused post-attn-norm + residual add + ffn-norm: a_n = rms(a)·wpa; x += a_n; y = rms(x)·wffn — one
+// dispatch collapsing the pre_post_norm chain (enc_rms(a) + enc_add_rms_site) with two register
+// reductions, no inter-dispatch barrier. x is staged for the trailing norm; same slab cap as MetalAddRms.
+[metal_dispatch(name = "enc_preaddrms_c", pso = "g_pso_preaddrms", tgmem = "metal_pre_add_rms_msl_tgmem", tg = 1024, grid = "1")]
+class MetalPreAddRms {
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>     // [dim] residual stream, add target + written back
+    @ssbo @binding = 1 @role = "readwrite" a : array<float>     // [dim] attn out (post-wo); normed by wpa in place before the add
+    @ssbo @binding = 2 @role = "weight" wpa : array<float>   // [dim] post-attention norm weight
+    @ssbo @binding = 3 @role = "weight" wffn : array<float>  // [dim] ffn norm weight
+    @ssbo @binding = 4 @role = "write" y : array<float>     // [dim] ffn-normed out
+    @uniform @binding = 5 dim : uint
+    @uniform @binding = 6 eps : float
+    @workgroup xrow : float[4096]           // == ADD_RMS_MAX_DIM — stages x for the trailing norm
+    @workgroup partial : float[32]          // one per simdgroup at the 1024-thread dispatch
+    @workgroup inv_sh : float
+
+    [metal_kernel(name="metal_pre_add_rms_msl")]
+    def metal_pre_add_rms {
+        let lid = gl_LocalInvocationID.x
+        // reduction 1: mean(a²) → inv_a
+        var ssa = 0.0
+        var k = lid
+        while (k < dim) {
+            let av = a[k]
+            ssa += av * av
+            k += gl_WorkGroupSize.x
+        }
+        ssa = simd_sum(ssa)
+        if (gl_SubgroupInvocationID == 0u) {
+            partial[gl_SubgroupID] = ssa
+        }
+        barrier()
+        if (lid == 0u) {
+            var tot = 0.0
+            var sgi = 0u
+            while (sgi < gl_NumSubgroups) {
+                tot += partial[sgi]
+                sgi++
+            }
+            inv_sh = rsqrt(tot / float(dim) + eps)
+        }
+        barrier()
+        let inva = inv_sh
+        // x += a·inva·wpa; stage x; reduction 2: mean(x²) → inv_x
+        var ssx = 0.0
+        k = lid
+        while (k < dim) {
+            let xv = x[k] + a[k] * inva * wpa[k]
+            x[k] = xv
+            xrow[k] = xv
+            ssx += xv * xv
+            k += gl_WorkGroupSize.x
+        }
+        ssx = simd_sum(ssx)
+        if (gl_SubgroupInvocationID == 0u) {
+            partial[gl_SubgroupID] = ssx
+        }
+        barrier()
+        if (lid == 0u) {
+            var tot = 0.0
+            var sgi = 0u
+            while (sgi < gl_NumSubgroups) {
+                tot += partial[sgi]
+                sgi++
+            }
+            inv_sh = rsqrt(tot / float(dim) + eps)
+        }
+        barrier()
+        let invx = inv_sh
+        k = lid
+        while (k < dim) {
+            y[k] = wffn[k] * (xrow[k] * invx)
+            k += gl_WorkGroupSize.x
+        }
+    }
+}
+
 // Fused rope + KV-row store, one thread per rotation pair (ntok == 1): q pairs rope in place; k
 // pairs rope straight into the mirror K row (±65504 clamp) and the same thread copies its V pair.
 // Replaces the rope_qk + kv_store dispatch pair.
+[metal_dispatch(name = "enc_rpst16_c", pso = "g_pso_rpst16", tg = 64, grid = "npairs/64", params = "npairs : int64")]
 class MetalRopeStoreF16 {
-    @ssbo @binding = 0 qk : array<float>    // q at [0, qd) roped in place, k at [qd, qd + kvd)
-    @ssbo @binding = 1 vs : array<float>    // raw v (the QKV buffer at the v offset)
-    @ssbo @binding = 2 kd : array<float16>  // mirror K row (bound at the (layer, pos) row offset)
-    @ssbo @binding = 3 vd : array<float16>
-    @ssbo @binding = 4 tcos : array<float>  // [head_size/2] this position's rope row
-    @ssbo @binding = 5 tsin : array<float>
+    @ssbo @binding = 0 @role = "readwrite" qk : array<float>    // q at [0, qd) roped in place, k at [qd, qd + kvd)
+    @ssbo @binding = 1 @role = "alias" @off = "vsoff" vs : array<float>    // raw v (the QKV buffer at the v offset)
+    @ssbo @binding = 2 @role = "write" @off = "koff" kd : array<float16>  // mirror K row (bound at the (layer, pos) row offset)
+    @ssbo @binding = 3 @role = "write" @off = "voff" vd : array<float16>
+    @ssbo @binding = 4 @role = "weight" tcos : array<float>  // [head_size/2] this position's rope row
+    @ssbo @binding = 5 @role = "weight" tsin : array<float>
     @uniform @binding = 6 qd : uint
     @uniform @binding = 7 head_size : uint
     @uniform @binding = 8 npairs_q : uint   // qd/2 — the q half of the grid
     @uniform @binding = 9 npairs : uint     // + kvd/2 — grid guard
     @uniform @binding = 10 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
-    @ssbo @binding = 11 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @ssbo @binding = 11 @role = "weight" bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 12 has_bias : uint
     @uniform @binding = 13 rot : uint       // partial rotary width (qwen35: 64 of 256); == head_size for full
 
@@ -2078,15 +2174,16 @@ class MetalRopeStoreF16 {
 // The head-cooperative fused form (QK-norm models): ONE threadgroup per head folds bias ->
 // per-head RMSNorm -> rope -> f16 store — the thread-per-pair kernels can't host the head-wide
 // reduction. Grid: nheads q + nkvh k + nkvh v; rope pairs via the tgmem-staged POST-NORM partner.
+[metal_dispatch(name = "enc_rpst_h16_c", pso = "g_pso_rpst_h16", tgmem = "metal_rope_store_h16_msl_tgmem", tg = "head_size", grid = "ntg", params = "ntg : int64, head_size : int64")]
 class MetalRopeStoreHF16 {
-    @ssbo @binding = 0 qk : array<float>    // q at [0, qd) roped in place, k at [qd, qd + kvd)
-    @ssbo @binding = 1 vs : array<float>    // raw v (the QKV buffer at the v offset)
-    @ssbo @binding = 2 kd : array<float16>  // mirror K row (bound at the (layer, pos) row offset)
-    @ssbo @binding = 3 vd : array<float16>
-    @ssbo @binding = 4 tcos : array<float>  // [head_size/2] this position's rope row
-    @ssbo @binding = 5 tsin : array<float>
-    @ssbo @binding = 6 w : array<float>     // [qnorm | knorm] per-head RMS weights
-    @ssbo @binding = 7 bias : array<float>  // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @ssbo @binding = 0 @role = "readwrite" qk : array<float>    // q at [0, qd) roped in place, k at [qd, qd + kvd)
+    @ssbo @binding = 1 @role = "alias" @off = "vsoff" vs : array<float>    // raw v (the QKV buffer at the v offset)
+    @ssbo @binding = 2 @role = "write" @off = "koff" kd : array<float16>  // mirror K row (bound at the (layer, pos) row offset)
+    @ssbo @binding = 3 @role = "write" @off = "voff" vd : array<float16>
+    @ssbo @binding = 4 @role = "weight" tcos : array<float>  // [head_size/2] this position's rope row
+    @ssbo @binding = 5 @role = "weight" tsin : array<float>
+    @ssbo @binding = 6 @role = "weight" w : array<float>     // [qnorm | knorm] per-head RMS weights
+    @ssbo @binding = 7 @role = "weight" bias : array<float>  // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 8 qd : uint
     @uniform @binding = 9 head_size : uint
     @uniform @binding = 10 nheads : uint
@@ -2152,19 +2249,20 @@ class MetalRopeStoreHF16 {
 }
 
 // f32-mirror twin — straight stores, no clamp.
+[metal_dispatch(name = "enc_rpst32_c", pso = "g_pso_rpst32", tg = 64, grid = "npairs/64", params = "npairs : int64")]
 class MetalRopeStoreF32 {
-    @ssbo @binding = 0 qk : array<float>
-    @ssbo @binding = 1 vs : array<float>
-    @ssbo @binding = 2 kd : array<float>
-    @ssbo @binding = 3 vd : array<float>
-    @ssbo @binding = 4 tcos : array<float>
-    @ssbo @binding = 5 tsin : array<float>
+    @ssbo @binding = 0 @role = "readwrite" qk : array<float>
+    @ssbo @binding = 1 @role = "alias" @off = "vsoff" vs : array<float>
+    @ssbo @binding = 2 @role = "write" @off = "koff" kd : array<float>
+    @ssbo @binding = 3 @role = "write" @off = "voff" vd : array<float>
+    @ssbo @binding = 4 @role = "weight" tcos : array<float>
+    @ssbo @binding = 5 @role = "weight" tsin : array<float>
     @uniform @binding = 6 qd : uint
     @uniform @binding = 7 head_size : uint
     @uniform @binding = 8 npairs_q : uint
     @uniform @binding = 9 npairs : uint
     @uniform @binding = 10 neox : uint
-    @ssbo @binding = 11 bias : array<float>
+    @ssbo @binding = 11 @role = "weight" bias : array<float>
     @uniform @binding = 12 has_bias : uint
     @uniform @binding = 13 rot : uint       // partial rotary width; == head_size for full
 
@@ -2205,21 +2303,22 @@ class MetalRopeStoreF32 {
 // q8_0-mirror rope + KV-row store: q pairs rope in place; K/V rows quantize per 32-block (one
 // thread per block) matching quantize_q8kv_row's exact semantics, so CPU fallback steps read the
 // same codec. K blocks rope their 16 pairs first; V blocks copy raw.
+[metal_dispatch(name = "enc_rpst_q8_c", pso = "g_pso_rpst_q8", tg = 64, grid = "nthreads/64", params = "nthreads : int64")]
 class MetalRopeStoreQ8 {
-    @ssbo @binding = 0 qk : array<float>    // q at [0, qd) roped in place, k at [qd, qd + kvd)
-    @ssbo @binding = 1 vs : array<float>    // raw v (the QKV buffer at the v offset)
-    @ssbo @binding = 2 ksh : array<float16> // mirror K row, HALF-SCALE view (bound at the (layer, pos) row offset)
-    @ssbo @binding = 3 kqb : array<int8>    // the SAME K row, BYTE view
-    @ssbo @binding = 4 vsh : array<float16>
-    @ssbo @binding = 5 vqb : array<int8>
-    @ssbo @binding = 6 tcos : array<float>  // [head_size/2] this position's rope row
-    @ssbo @binding = 7 tsin : array<float>
+    @ssbo @binding = 0 @role = "readwrite" qk : array<float>    // q at [0, qd) roped in place, k at [qd, qd + kvd)
+    @ssbo @binding = 1 @role = "alias" @off = "vsoff" vs : array<float>    // raw v (the QKV buffer at the v offset)
+    @ssbo @binding = 2 @role = "write" @off = "koff" ksh : array<float16> // mirror K row, HALF-SCALE view (bound at the (layer, pos) row offset)
+    @ssbo @binding = 3 @role = "alias" @off = "koff" kqb : array<int8>    // the SAME K row, BYTE view
+    @ssbo @binding = 4 @role = "write" @off = "voff" vsh : array<float16>
+    @ssbo @binding = 5 @role = "alias" @off = "voff" vqb : array<int8>
+    @ssbo @binding = 6 @role = "weight" tcos : array<float>  // [head_size/2] this position's rope row
+    @ssbo @binding = 7 @role = "weight" tsin : array<float>
     @uniform @binding = 8 qd : uint
     @uniform @binding = 9 head_size : uint
     @uniform @binding = 10 npairs_q : uint  // qd/2 — the q-rope half of the grid
     @uniform @binding = 11 nblk : uint      // kv_dim/32 — K blocks (V adds the same again)
     @uniform @binding = 12 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
-    @ssbo @binding = 13 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @ssbo @binding = 13 @role = "weight" bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 14 has_bias : uint
 
     [metal_kernel(name="metal_rope_store_q8_msl")]
@@ -2314,22 +2413,23 @@ class MetalRopeStoreQ8 {
 // tq4-mirror rope + KV-row store: one threadgroup per head (head_size threads — the FWHT spans
 // the head). Q heads rope + rotate in place; K heads rope + rotate + quantize into the mirror
 // row; V heads rotate + quantize, matching the CPU seam's fwht_signs_row / quantize_tq4kv_row bit-for-bit.
+[metal_dispatch(name = "enc_rpst_tq4_c", pso = "g_pso_rpst_tq4", tgmem = "metal_rope_store_tq4_msl_tgmem", tg = "head_size", grid = "ntg", params = "ntg : int64, head_size : int64")]
 class MetalRopeStoreTq4 {
-    @ssbo @binding = 0 qk : array<float>    // q at [0, qd) ropes + rotates in place, k at [qd, qd + kvd)
-    @ssbo @binding = 1 vs : array<float>    // raw v (the QKV buffer at the v offset)
-    @ssbo @binding = 2 ksh : array<float16> // mirror K row, HALF-SCALE view (bound at the (layer, pos) row offset)
-    @ssbo @binding = 3 kqb : array<uint8>   // the SAME row, BYTE view
-    @ssbo @binding = 4 vsh : array<float16>
-    @ssbo @binding = 5 vqb : array<uint8>
-    @ssbo @binding = 6 tcos : array<float>  // [head_size/2] this position's rope row
-    @ssbo @binding = 7 tsin : array<float>
-    @ssbo @binding = 8 signs : array<float> // the tq4 rotation signs (prefix per head_size)
+    @ssbo @binding = 0 @role = "readwrite" qk : array<float>    // q at [0, qd) ropes + rotates in place, k at [qd, qd + kvd)
+    @ssbo @binding = 1 @role = "alias" @off = "vsoff" vs : array<float>    // raw v (the QKV buffer at the v offset)
+    @ssbo @binding = 2 @role = "write" @off = "koff" ksh : array<float16> // mirror K row, HALF-SCALE view (bound at the (layer, pos) row offset)
+    @ssbo @binding = 3 @role = "alias" @off = "koff" kqb : array<uint8>   // the SAME row, BYTE view
+    @ssbo @binding = 4 @role = "write" @off = "voff" vsh : array<float16>
+    @ssbo @binding = 5 @role = "alias" @off = "voff" vqb : array<uint8>
+    @ssbo @binding = 6 @role = "weight" tcos : array<float>  // [head_size/2] this position's rope row
+    @ssbo @binding = 7 @role = "weight" tsin : array<float>
+    @ssbo @binding = 8 @role = "weight" signs : array<float> // the tq4 rotation signs (prefix per head_size)
     @uniform @binding = 9 qd : uint
     @uniform @binding = 10 head_size : uint
     @uniform @binding = 11 nheads : uint
     @uniform @binding = 12 kv_mul : uint
     @uniform @binding = 13 neox : uint      // pair (j, j+half) instead of (2j, 2j+1); same table row j
-    @ssbo @binding = 14 bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
+    @ssbo @binding = 14 @role = "weight" bias : array<float> // [qd | kvd | kvd] QKV bias (dummy-bound when has_bias == 0)
     @uniform @binding = 15 has_bias : uint
     @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
 
@@ -2421,9 +2521,10 @@ class MetalRopeStoreTq4 {
 // The tq4 un-rotate: attention output is in the rotated basis per head — fwht_unsign_row it
 // (butterfly + 1/sqrt(n), then signs) before the wo projection. One threadgroup per (head, row);
 // the single-stream path dispatches one row.
+[metal_dispatch(name = "enc_unsign_c", pso = "g_pso_unsign", tgmem = "metal_fwht_unsign_msl_tgmem", tg = "head_size", grid = "nheads, nrows", params = "nheads : int64, nrows : int64, head_size : int64")]
 class MetalFwhtUnsign {
-    @ssbo @binding = 0 yo : array<float>    // [rows x qstride] attention out, un-rotated in place
-    @ssbo @binding = 1 signs : array<float>
+    @ssbo @binding = 0 @role = "readwrite" yo : array<float>    // [rows x qstride] attention out, un-rotated in place
+    @ssbo @binding = 1 @role = "weight" signs : array<float>
     @uniform @binding = 2 head_size : uint
     @uniform @binding = 3 qstride : uint
     @workgroup buf : float[512]     // <= max head_size (gemma4 global heads are 512)
@@ -5671,110 +5772,9 @@ class MetalAddRmsB {
 }
 
 
-var g_pso_gemv : MetalComputePipeline?
-var g_gemv_rows = 4l                       // rows (simdgroups) per GEMV threadgroup
-var g_pso_rms : MetalComputePipeline?
-var g_pso_add : MetalComputePipeline?
-var g_pso_addrms : MetalComputePipeline?
-var g_pso_swiglu : MetalComputePipeline?
-var g_pso_geglu : MetalComputePipeline?
-var g_pso_softcap : MetalComputePipeline?
-var g_pso_suppress : MetalComputePipeline?
-var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind
-var g_zero : MetalBuffer?                   // persistent 0u — the sink/hass identity bind
-var g_pso_attn16 : MetalComputePipeline?
-var g_pso_attn32 : MetalComputePipeline?
-var g_pso_attn_q8 : MetalComputePipeline?   // q8_0-mirror twin (dual-view block reads)
-var g_pso_attn_tq4 : MetalComputePipeline?  // tq4-mirror twin (rotated-basis nibble reads)
-var g_pso_attnp16 : MetalComputePipeline?
-var g_pso_attnp32 : MetalComputePipeline?
-var g_pso_attnp_q8 : MetalComputePipeline?
-var g_pso_attnp_tq4 : MetalComputePipeline?
-var g_pso_attncomb : MetalComputePipeline?
-var g_pso_rpst16 : MetalComputePipeline?
-var g_pso_rpst_h16 : MetalComputePipeline?  // head-cooperative fused bias+norm+rope+store (QK-norm models)
-var g_pso_rpst32 : MetalComputePipeline?
-var g_pso_rpst_q8 : MetalComputePipeline?   // per-32-block quantizing store
-var g_pso_rpst_tq4 : MetalComputePipeline?  // threadgroup-per-head FWHT + quantizing store
-var g_pso_unsign : MetalComputePipeline?    // the tq4 attention-output un-rotate
-var g_pso_qknorm : MetalComputePipeline?    // per-head QK RMSNorm prepass (MSL owned by prefill)
-
-var g_pso_argmax : MetalComputePipeline?
-var g_pso_copy_row : MetalComputePipeline?   // zero-copy logits: staging row -> wrapped session storage
-var g_pso_emb : MetalComputePipeline?
-var g_pso_emb_k6 : MetalComputePipeline?     // tied-k6 spec chain's embed gather
-var g_pso_moe_router : MetalComputePipeline?   // MoE (Wave C): router GEMV over the fp32 slab
-var g_pso_moe_select : MetalComputePipeline?   // softmax + top-k + renorm (one simdgroup)
-var g_pso_moe_gemv_q8 : MetalComputePipeline?  // expert-indexed GEMV twins (grid.y = slot)
-var g_pso_moe_kq_k4 : MetalComputePipeline?
-var g_pso_moe_kq_k5 : MetalComputePipeline?
-var g_pso_moe_kq_k6 : MetalComputePipeline?
-var g_pso_moe_combine : MetalComputePipeline?  // weighted top-k reduce into the w2 write shape
-var g_pso_g4rnorm : MetalComputePipeline?      // gemma4 MoE router-input norm (stage 3)
-var g_pso_moe_wscale : MetalComputePipeline?   // gemma4 per-expert down-scale fold
-var g_pso_swiglu_oai : MetalComputePipeline?   // gpt-oss clamped swiglu (stage 4)
-var g_pso_moe_gemv_mx4 : MetalComputePipeline?  // gpt-oss MXFP4 expert GEMV
-var g_pso_moe_gemv_q51 : MetalComputePipeline?  // Q5_1 expert GEMV (per-32 planes)
-var g_e8m0_tab : MetalBuffer?                   // [256] exact e8m0_half scales
-var g_mx4_vtab : MetalBuffer?                   // [16] signed doubled-e2m1 values
-var g_pso_dn_conv : MetalComputePipeline?      // deltanet (Wave D): causal conv + SiLU
-var g_pso_dn_hist : MetalComputePipeline?      // conv-history advance
-var g_pso_dn_l2 : MetalComputePipeline?        // q/k per-head L2 norm + q pre-scale
-var g_pso_dn_scan : MetalComputePipeline?      // the fused sequential delta rule
-var g_pso_dn_gate : MetalComputePipeline?      // z-gated out-norm
-var g_pso_dn_deint : MetalComputePipeline?     // 2x-wide [q|gate] deinterleave
-var g_pso_sigmul : MetalComputePipeline?       // x ⊙ σ(g) — the gated-attention out-gate
-var g_pso_axpy_sig : MetalComputePipeline?     // y += x ⊙ σ(g[row]) — the shexp combine (stage 3)
-var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
-var g_pso_qkvrs32 : MetalComputePipeline?
-var g_pso_w13sw : MetalComputePipeline?
-var g_pso_kq_k4 : MetalComputePipeline?
-var g_pso_kq_k5 : MetalComputePipeline?
-var g_pso_kq_k5c : MetalComputePipeline?   // the select-form nr0=1 twin — n < 3072 / small-d sites
-var g_pso_kq_k6 : MetalComputePipeline?
-var g_pso_kq_mvb2_k4 : MetalComputePipeline?   // batch B=2..8: the kq ext small-batch mv twins
-var g_pso_kq_mvb4_k4 : MetalComputePipeline?
-var g_pso_kq_mvb2_k5 : MetalComputePipeline?
-var g_pso_kq_mvb4_k5 : MetalComputePipeline?
-var g_pso_kq_mvb2_k6 : MetalComputePipeline?
-var g_pso_kq_mvb4_k6 : MetalComputePipeline?
-var g_pso_kq_mvb8_k4 : MetalComputePipeline?   // B=5..8 single-pass twins (in-graph A/B vs 2 x B4 groups)
-var g_pso_kq_mvb8_k5 : MetalComputePipeline?
-var g_pso_kq_mvb8_k6 : MetalComputePipeline?
-var g_pso_kq_mm_b4 : MetalComputePipeline?   // batch B>=9: the prefill-owned kq mul_mm twins
-var g_pso_kq_mm_b5 : MetalComputePipeline?
-var g_pso_kq_mm_b6 : MetalComputePipeline?     // fused W1|W3+swiglu (s16 path)
-// the batched-step set (P4): fixed-B GEMVs + the M-pad-32 GEMM twin (f32 X) + row-table kernels
-var g_pso_gemv_b2 : MetalComputePipeline?
-var g_pso_gemv_b4 : MetalComputePipeline?
-var g_pso_mv_b2 : MetalComputePipeline?
-var g_pso_mv_b4 : MetalComputePipeline?
-var g_pso_w13sw_b2 : MetalComputePipeline?
-var g_pso_w13sw_b4 : MetalComputePipeline?
-var g_pso_gemm_b : MetalComputePipeline?
-var g_pso_gemm_b_sk : MetalComputePipeline? // split-K twin (per-site policy)
-var g_pso_skred : MetalComputePipeline?     // the split-K plane reduce
-var g_pso_gemm64_b : MetalComputePipeline?  // 64-wide N tile (classifier site)
-var g_pso_mm : MetalComputePipeline?        // the prefill module's MetalQ8MulMm (34B blob)
-var g_pso_attnb16 : MetalComputePipeline?
-var g_pso_attnb32 : MetalComputePipeline?
-var g_pso_attnb_q8 : MetalComputePipeline?
-var g_pso_attnb_tq4 : MetalComputePipeline?
-var g_pso_attnpb16 : MetalComputePipeline?
-var g_pso_attnpb32 : MetalComputePipeline?
-var g_pso_attnpb_q8 : MetalComputePipeline?
-var g_pso_attnpb_tq4 : MetalComputePipeline?
-var g_pso_attncombb : MetalComputePipeline?
-var g_pso_attnd16 : MetalComputePipeline?   // fused single-pass batch attention (hs 128)
-var g_pso_attnd32 : MetalComputePipeline?
-var g_pso_attnd_q8 : MetalComputePipeline?
-var g_pso_attnd_tq4 : MetalComputePipeline?
-var g_pso_attncombd : MetalComputePipeline?
-var g_pso_rpstb16 : MetalComputePipeline?
-var g_pso_rpstb32 : MetalComputePipeline?
-var g_pso_rpstb_q8 : MetalComputePipeline?
-var g_pso_rpstb_tq4 : MetalComputePipeline?
-var g_pso_addrmsb : MetalComputePipeline?
+// The decode PSO + resource globals moved to dasllama_metal_common (declared there so
+// [metal_dispatch]-generated builders can see the pipeline they dispatch); the compile_pso()
+// assignments below and the shutdown releases stay here.
 
 def release_pso(var pso : MetalComputePipeline?&) {
     if (pso != null) {
@@ -5809,6 +5809,7 @@ def metal_decode_init : bool {
     g_pso_rms = compile_pso(metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, ok)
     g_pso_add = compile_pso(metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath, ok)
     g_pso_addrms = compile_pso(metal_add_rms_msl, metal_add_rms_msl_entry, metal_add_rms_msl_fastmath, ok)
+    g_pso_preaddrms = compile_pso(metal_pre_add_rms_msl, metal_pre_add_rms_msl_entry, metal_pre_add_rms_msl_fastmath, ok)
     g_pso_swiglu = compile_pso(metal_swiglu_msl, metal_swiglu_msl_entry, metal_swiglu_msl_fastmath, ok)
     g_one = metal_new_buffer(g_dev, 4ul)
     unsafe {
@@ -5946,15 +5947,7 @@ def metal_decode_init : bool {
 // ===== encoders =====
 
 def enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64; bx, by, bn, bd : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, g_pso_gemv)
-    metal_set_buffer(enc, bw, boff, 0)   // half-scale view
-    metal_set_buffer(enc, bw, boff, 1)   // byte view — the same blob slice
-    metal_set_buffer(enc, bx, 0ul, 2)
-    metal_set_buffer(enc, by, yoff, 3)
-    metal_set_buffer(enc, bn, 0ul, 4)
-    metal_set_buffer(enc, bd, 0ul, 5)
-    // the kernel is width-agnostic (one row per simdgroup) — rows/tg via DASLLAMA_METAL_GEMV_TG
-    metal_dispatch_threadgroups(enc, uint3(uint((d + g_gemv_rows - 1l) / g_gemv_rows), 1u, 1u), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
+    enc_gemv_c(enc, bw, boff, bw, bx, by, yoff, bn, bd, d)
 }
 
 // K-quant site GEMV — the per-format twin of enc_gemv over the kq plane pair
@@ -5965,25 +5958,28 @@ def enc_kq_gemv(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff
                 rows, n : int64; yoff : uint64 = 0ul; xoff : uint64 = 0ul) {
     var groups = (rows + 3l) / 4l
     if (fmt == KqFmt.k6) {
-        metal_set_pipeline(enc, g_pso_kq_k6)
-        metal_set_buffer(enc, bs, doff, 0)   // the split plane's f16 d tail
+        kn_pipeline(enc, g_pso_kq_k6)
+        kn_buffer(enc, bs, doff, 0)   // the split plane's f16 d tail
     } elif (fmt == KqFmt.k5 && (n < 3072l || rows <= 1024l)) {
         // the select-form nr0=1 twin: wins every d at n < 3072 (gemv lab, 4B round) and the
         // small-d kv shape (b2r under-occupied); 2 rows/tg instead of b2r's 4
-        metal_set_pipeline(enc, g_pso_kq_k5c)
-        metal_set_buffer(enc, bs, soff, 0)
+        kn_pipeline(enc, g_pso_kq_k5c)
+        kn_buffer(enc, bs, soff, 0)
         groups = (rows + 1l) / 2l
     } else {
-        metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_k4 : g_pso_kq_k5)
-        metal_set_buffer(enc, bs, soff, 0)
+        kn_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_k4 : g_pso_kq_k5)
+        kn_buffer(enc, bs, soff, 0)
     }
-    metal_set_buffer(enc, bs, soff, 1)
-    metal_set_buffer(enc, bq, qoff, 2)
-    metal_set_buffer(enc, bx, xoff, 3)
-    metal_set_buffer(enc, by, yoff, 4)
-    metal_set_buffer(enc, bn, 0ul, 5)
-    metal_set_buffer(enc, bd, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint(groups), 1u, 1u), uint3(64u, 1u, 1u))
+    kn_buffer(enc, bs, soff, 1)
+    kn_buffer(enc, bq, qoff, 2)
+    kn_buffer(enc, bx, xoff, 3)
+    kn_buffer(enc, by, yoff, 4)
+    kn_buffer(enc, bn, 0ul, 5)
+    kn_buffer(enc, bd, 0ul, 6)
+    hz_read(bx, xoff, uint64(n * 4l))
+    hz_write(by, yoff, uint64(rows * 4l))
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(groups), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // K-quant small-batch mv (B = 2..8): R=4 column groups via grid.y, R=2 via the B2 PSO; B = 5..8
@@ -6004,34 +6000,34 @@ def enc_kq_mvb(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?; qoff 
     let two = nlive == 2l
     let b8 = nlive >= 5l && kq_b8_on()
     if (fmt == KqFmt.k6) {
-        metal_set_pipeline(enc, b8 ? g_pso_kq_mvb8_k6 : (two ? g_pso_kq_mvb2_k6 : g_pso_kq_mvb4_k6))
+        kn_pipeline(enc, b8 ? g_pso_kq_mvb8_k6 : (two ? g_pso_kq_mvb2_k6 : g_pso_kq_mvb4_k6))
         if (b8) {
-            metal_set_threadgroup_memory_length(enc, metal_kq_mvb8_k6_msl_tgmem, 0)
+            kn_tgmem(enc, metal_kq_mvb8_k6_msl_tgmem, 0)
         }
-        metal_set_buffer(enc, bs, doff, 0)
+        kn_buffer(enc, bs, doff, 0)
     } elif (fmt == KqFmt.k5) {
-        metal_set_pipeline(enc, b8 ? g_pso_kq_mvb8_k5 : (two ? g_pso_kq_mvb2_k5 : g_pso_kq_mvb4_k5))
+        kn_pipeline(enc, b8 ? g_pso_kq_mvb8_k5 : (two ? g_pso_kq_mvb2_k5 : g_pso_kq_mvb4_k5))
         if (b8) {
-            metal_set_threadgroup_memory_length(enc, metal_kq_mvb8_k5_msl_tgmem, 0)
+            kn_tgmem(enc, metal_kq_mvb8_k5_msl_tgmem, 0)
         }
-        metal_set_buffer(enc, bs, soff, 0)
+        kn_buffer(enc, bs, soff, 0)
     } else {
-        metal_set_pipeline(enc, b8 ? g_pso_kq_mvb8_k4 : (two ? g_pso_kq_mvb2_k4 : g_pso_kq_mvb4_k4))
+        kn_pipeline(enc, b8 ? g_pso_kq_mvb8_k4 : (two ? g_pso_kq_mvb2_k4 : g_pso_kq_mvb4_k4))
         if (b8) {
-            metal_set_threadgroup_memory_length(enc, metal_kq_mvb8_k4_msl_tgmem, 0)
+            kn_tgmem(enc, metal_kq_mvb8_k4_msl_tgmem, 0)
         }
-        metal_set_buffer(enc, bs, soff, 0)
+        kn_buffer(enc, bs, soff, 0)
     }
-    metal_set_buffer(enc, bs, soff, 1)
-    metal_set_buffer(enc, bq, qoff, 2)
-    metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, yoff, 4)
-    metal_set_buffer(enc, bn, 0ul, 5)
-    metal_set_buffer(enc, bd, 0ul, 6)
-    metal_set_buffer(enc, bys, 0ul, 7)
-    metal_set_buffer(enc, bnr, 0ul, 8)
+    kn_buffer(enc, bs, soff, 1)
+    kn_buffer(enc, bq, qoff, 2)
+    kn_buffer(enc, bx, 0ul, 3)
+    kn_buffer(enc, by, yoff, 4)
+    kn_buffer(enc, bn, 0ul, 5)
+    kn_buffer(enc, bd, 0ul, 6)
+    kn_buffer(enc, bys, 0ul, 7)
+    kn_buffer(enc, bnr, 0ul, 8)
     let gcols = (two || b8) ? 1l : (nlive + 3l) / 4l
-    metal_dispatch_threadgroups(enc, uint3(uint((rows + 7l) / 8l), uint(gcols), 1u), uint3(64u, 1u, 1u))
+    kn_dispatch(enc, uint3(uint((rows + 7l) / 8l), uint(gcols), 1u), uint3(64u, 1u, 1u))
 }
 
 // the batched kq GEMM (B >= 9): the prefill-owned kq mul_mm twins over the padded x panel —
@@ -6040,33 +6036,21 @@ def enc_kq_gemm_mm_b(enc : MetalComputeEncoder?; fmt : KqFmt; bq : MetalBuffer?;
                      bs : MetalBuffer?; soff, doff : uint64; bx, by : MetalBuffer?; yoff : uint64;
                      bk, bn : MetalBuffer?; mp, rows : int64) {
     if (fmt == KqFmt.k6) {
-        metal_set_pipeline(enc, g_pso_kq_mm_b6)
-        metal_set_threadgroup_memory_length(enc, metal_kq_mulmm_k6_msl_tgmem, 0)
-        metal_set_buffer(enc, bs, doff, 0)
+        kn_pipeline(enc, g_pso_kq_mm_b6)
+        kn_tgmem(enc, metal_kq_mulmm_k6_msl_tgmem, 0)
+        kn_buffer(enc, bs, doff, 0)
     } else {
-        metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_mm_b4 : g_pso_kq_mm_b5)
-        metal_set_threadgroup_memory_length(enc, fmt == KqFmt.k4 ? metal_kq_mulmm_k4_msl_tgmem : metal_kq_mulmm_k5_msl_tgmem, 0)
-        metal_set_buffer(enc, bs, soff, 0)
+        kn_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_mm_b4 : g_pso_kq_mm_b5)
+        kn_tgmem(enc, fmt == KqFmt.k4 ? metal_kq_mulmm_k4_msl_tgmem : metal_kq_mulmm_k5_msl_tgmem, 0)
+        kn_buffer(enc, bs, soff, 0)
     }
-    metal_set_buffer(enc, bs, soff, 1)
-    metal_set_buffer(enc, bq, qoff, 2)
-    metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, yoff, 4)
-    metal_set_buffer(enc, bk, 0ul, 5)
-    metal_set_buffer(enc, bn, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(rows / 64l), 1u), uint3(128u, 1u, 1u))
-}
-
-def enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?) {
-    metal_set_pipeline(enc, g_pso_rms)
-    metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, bw, 0ul, 1)
-    metal_set_buffer(enc, by, 0ul, 2)
-    metal_set_buffer(enc, bdim, 0ul, 3)
-    metal_set_buffer(enc, beps, 0ul, 4)
-    // one row, latency-bound — the widest tg shortens the strided-load rounds (1024 max on M1)
-    metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
+    kn_buffer(enc, bs, soff, 1)
+    kn_buffer(enc, bq, qoff, 2)
+    kn_buffer(enc, bx, 0ul, 3)
+    kn_buffer(enc, by, yoff, 4)
+    kn_buffer(enc, bk, 0ul, 5)
+    kn_buffer(enc, bn, 0ul, 6)
+    kn_dispatch(enc, uint3(uint(mp / 32l), uint(rows / 64l), 1u), uint3(128u, 1u, 1u))
 }
 
 // fused rope + KV-row store: the v source binds the SAME QKV buffer at its v byte offset
@@ -6074,22 +6058,14 @@ def enc_rope_store(enc : MetalComputeEncoder?; f16 : bool; bqkv : MetalBuffer?; 
                    kmb, vmb : MetalBuffer?; koff, voff : uint64;
                    bcos, bsin, bqd, bhs, bnpq, bnpall, bneox, bbias, bhasb : MetalBuffer?; npairs : int64;
                    brot : MetalBuffer? = null) {
-    metal_set_pipeline(enc, f16 ? g_pso_rpst16 : g_pso_rpst32)
-    metal_set_buffer(enc, bqkv, 0ul, 0)
-    metal_set_buffer(enc, bqkv, vsoff, 1)
-    metal_set_buffer(enc, kmb, koff, 2)
-    metal_set_buffer(enc, vmb, voff, 3)
-    metal_set_buffer(enc, bcos, 0ul, 4)
-    metal_set_buffer(enc, bsin, 0ul, 5)
-    metal_set_buffer(enc, bqd, 0ul, 6)
-    metal_set_buffer(enc, bhs, 0ul, 7)
-    metal_set_buffer(enc, bnpq, 0ul, 8)
-    metal_set_buffer(enc, bnpall, 0ul, 9)
-    metal_set_buffer(enc, bneox, 0ul, 10)
-    metal_set_buffer(enc, bbias, 0ul, 11)
-    metal_set_buffer(enc, bhasb, 0ul, 12)
-    metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 13)   // rot defaults to head_size (full rope)
-    metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    // rot defaults to head_size (full rope)
+    if (f16) {
+        enc_rpst16_c(enc, bqkv, bqkv, vsoff, kmb, koff, vmb, voff, bcos, bsin,
+            bqd, bhs, bnpq, bnpall, bneox, bbias, bhasb, brot != null ? brot : bhs, npairs)
+    } else {
+        enc_rpst32_c(enc, bqkv, bqkv, vsoff, kmb, koff, vmb, voff, bcos, bsin,
+            bqd, bhs, bnpq, bnpall, bneox, bbias, bhasb, brot != null ? brot : bhs, npairs)
+    }
 }
 
 // the head-cooperative fused rope-store (QK-norm models, f16 mirror): grid = nheads + 2*nkvh
@@ -6098,26 +6074,9 @@ def enc_rope_store_h16(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
                        kmb, vmb : MetalBuffer?; koff, voff : uint64;
                        bcos, bsin, bqkw, bbias, bqd, bhs, bnh, bkvm, bneox, bhasb, bhasn, beps : MetalBuffer?;
                        ntg, head_size : int64; brot : MetalBuffer? = null) {
-    metal_set_pipeline(enc, g_pso_rpst_h16)
-    metal_set_threadgroup_memory_length(enc, metal_rope_store_h16_msl_tgmem, 0)
-    metal_set_buffer(enc, bqkv, 0ul, 0)
-    metal_set_buffer(enc, bqkv, vsoff, 1)
-    metal_set_buffer(enc, kmb, koff, 2)
-    metal_set_buffer(enc, vmb, voff, 3)
-    metal_set_buffer(enc, bcos, 0ul, 4)
-    metal_set_buffer(enc, bsin, 0ul, 5)
-    metal_set_buffer(enc, bqkw, 0ul, 6)
-    metal_set_buffer(enc, bbias, 0ul, 7)
-    metal_set_buffer(enc, bqd, 0ul, 8)
-    metal_set_buffer(enc, bhs, 0ul, 9)
-    metal_set_buffer(enc, bnh, 0ul, 10)
-    metal_set_buffer(enc, bkvm, 0ul, 11)
-    metal_set_buffer(enc, bneox, 0ul, 12)
-    metal_set_buffer(enc, bhasb, 0ul, 13)
-    metal_set_buffer(enc, bhasn, 0ul, 14)
-    metal_set_buffer(enc, beps, 0ul, 15)
-    metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 16)   // rot defaults to head_size (full rope)
-    metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    // rot defaults to head_size (full rope)
+    enc_rpst_h16_c(enc, bqkv, bqkv, vsoff, kmb, koff, vmb, voff, bcos, bsin, bqkw, bbias,
+        bqd, bhs, bnh, bkvm, bneox, bhasb, bhasn, beps, brot != null ? brot : bhs, ntg, head_size)
 }
 
 // The tq4 rotation signs, uploaded once at max head size (smaller heads read a prefix — the
@@ -6126,53 +6085,13 @@ def enc_rope_store_h16(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : 
 def enc_rope_store_tq4(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : uint64;
                        kmb, vmb : MetalBuffer?; koff, voff : uint64;
                        bcos, bsin, bqd, bhs, bnh, bkvm, bneox, bbias, bhasb : MetalBuffer?; ntg, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_rpst_tq4)
-    metal_set_threadgroup_memory_length(enc, metal_rope_store_tq4_msl_tgmem, 0)
-    metal_set_buffer(enc, bqkv, 0ul, 0)
-    metal_set_buffer(enc, bqkv, vsoff, 1)
-    metal_set_buffer(enc, kmb, koff, 2)
-    metal_set_buffer(enc, kmb, koff, 3)
-    metal_set_buffer(enc, vmb, voff, 4)
-    metal_set_buffer(enc, vmb, voff, 5)
-    metal_set_buffer(enc, bcos, 0ul, 6)
-    metal_set_buffer(enc, bsin, 0ul, 7)
-    metal_set_buffer(enc, signs_buffer(), 0ul, 8)
-    metal_set_buffer(enc, bqd, 0ul, 9)
-    metal_set_buffer(enc, bhs, 0ul, 10)
-    metal_set_buffer(enc, bnh, 0ul, 11)
-    metal_set_buffer(enc, bkvm, 0ul, 12)
-    metal_set_buffer(enc, bneox, 0ul, 13)
-    metal_set_buffer(enc, bbias, 0ul, 14)
-    metal_set_buffer(enc, bhasb, 0ul, 15)
-    metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
-}
-
-// per-head QK RMSNorm prepass over the fused QKV buffer — one grid covers the q heads then the
-// k heads (koffe = qd, [qnorm | knorm] weight plane at woffe = hs); grid.y = batch rows
-def enc_qk_norm(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps, bsoffe : MetalBuffer?; ntg, nrows, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_qknorm)
-    metal_set_threadgroup_memory_length(enc, metal_qk_norm_msl_tgmem, 0)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, bw, 0ul, 1)
-    metal_set_buffer(enc, bnq, 0ul, 2)
-    metal_set_buffer(enc, bkoffe, 0ul, 3)
-    metal_set_buffer(enc, brstride, 0ul, 4)
-    metal_set_buffer(enc, bhs, 0ul, 5)
-    metal_set_buffer(enc, bwoffe, 0ul, 6)
-    metal_set_buffer(enc, beps, 0ul, 7)
-    metal_set_buffer(enc, bsoffe, 0ul, 8)
-    metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
+    enc_rpst_tq4_c(enc, bqkv, bqkv, vsoff, kmb, koff, kmb, vmb, voff, vmb, bcos, bsin, signs_buffer(),
+        bqd, bhs, bnh, bkvm, bneox, bbias, bhasb, ntg, head_size)
 }
 
 // the tq4 attention-output un-rotate: one threadgroup per (head, row), row stride = qstride
 def enc_fwht_unsign(enc : MetalComputeEncoder?; byo, bhs, bqs : MetalBuffer?; nheads, nrows, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_unsign)
-    metal_set_threadgroup_memory_length(enc, metal_fwht_unsign_msl_tgmem, 0)
-    metal_set_buffer(enc, byo, 0ul, 0)
-    metal_set_buffer(enc, signs_buffer(), 0ul, 1)
-    metal_set_buffer(enc, bhs, 0ul, 2)
-    metal_set_buffer(enc, bqs, 0ul, 3)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
+    enc_unsign_c(enc, byo, signs_buffer(), bhs, bqs, nheads, nrows, head_size)
 }
 
 // q8_0-mirror rope+store: the K/V mirror rows bind TWICE each (half-scale + byte views at the
@@ -6180,227 +6099,112 @@ def enc_fwht_unsign(enc : MetalComputeEncoder?; byo, bhs, bqs : MetalBuffer?; nh
 def enc_rope_store_q8(enc : MetalComputeEncoder?; bqkv : MetalBuffer?; vsoff : uint64;
                       kmb, vmb : MetalBuffer?; koff, voff : uint64;
                       bcos, bsin, bqd, bhs, bnpq, bnblk, bneox, bbias, bhasb : MetalBuffer?; nthreads : int64) {
-    metal_set_pipeline(enc, g_pso_rpst_q8)
-    metal_set_buffer(enc, bqkv, 0ul, 0)
-    metal_set_buffer(enc, bqkv, vsoff, 1)
-    metal_set_buffer(enc, kmb, koff, 2)
-    metal_set_buffer(enc, kmb, koff, 3)
-    metal_set_buffer(enc, vmb, voff, 4)
-    metal_set_buffer(enc, vmb, voff, 5)
-    metal_set_buffer(enc, bcos, 0ul, 6)
-    metal_set_buffer(enc, bsin, 0ul, 7)
-    metal_set_buffer(enc, bqd, 0ul, 8)
-    metal_set_buffer(enc, bhs, 0ul, 9)
-    metal_set_buffer(enc, bnpq, 0ul, 10)
-    metal_set_buffer(enc, bnblk, 0ul, 11)
-    metal_set_buffer(enc, bneox, 0ul, 12)
-    metal_set_buffer(enc, bbias, 0ul, 13)
-    metal_set_buffer(enc, bhasb, 0ul, 14)
-    metal_dispatch_threadgroups(enc, uint3(uint((nthreads + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    enc_rpst_q8_c(enc, bqkv, bqkv, vsoff, kmb, koff, kmb, vmb, voff, vmb, bcos, bsin,
+        bqd, bhs, bnpq, bnblk, bneox, bbias, bhasb, nthreads)
 }
 
 // the fused QKV+rope+store dispatch (2 rows per simdgroup — grid covers ddim/2 pairs)
 def enc_gemv_qkv_rs(enc : MetalComputeEncoder?; f16 : bool; bw : MetalBuffer?; wqoff, wkoff, wvoff : uint64;
                     bx, bq : MetalBuffer?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
                     bcos, bsin, bn, bd, bqd, bkvd, bhs, bneox, bbias, bhasb : MetalBuffer?; d : int64) {
-    metal_set_pipeline(enc, f16 ? g_pso_qkvrs16 : g_pso_qkvrs32)
-    metal_set_buffer(enc, bw, wqoff, 0)   // q segment: byte + half views
-    metal_set_buffer(enc, bw, wqoff, 1)
-    metal_set_buffer(enc, bw, wkoff, 16)  // k segment
-    metal_set_buffer(enc, bw, wkoff, 17)
-    metal_set_buffer(enc, bw, wvoff, 18)  // v segment
-    metal_set_buffer(enc, bw, wvoff, 19)
-    metal_set_buffer(enc, bx, 0ul, 2)
-    metal_set_buffer(enc, bq, 0ul, 3)
-    metal_set_buffer(enc, kmb, koff, 4)
-    metal_set_buffer(enc, vmb, voff, 5)
-    metal_set_buffer(enc, bcos, 0ul, 6)
-    metal_set_buffer(enc, bsin, 0ul, 7)
-    metal_set_buffer(enc, bn, 0ul, 8)
-    metal_set_buffer(enc, bd, 0ul, 9)
-    metal_set_buffer(enc, bqd, 0ul, 10)
-    metal_set_buffer(enc, bkvd, 0ul, 11)
-    metal_set_buffer(enc, bhs, 0ul, 12)
-    metal_set_buffer(enc, bneox, 0ul, 13)
-    metal_set_buffer(enc, bbias, 0ul, 14)
-    metal_set_buffer(enc, bhasb, 0ul, 15)
     let pairs = d / 2l
-    metal_dispatch_threadgroups(enc, uint3(uint((pairs + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
+    if (f16) {
+        enc_qkvrs16_c(enc, bw, wqoff, bw, bx, bq, kmb, koff, vmb, voff, bcos, bsin,
+            bn, bd, bqd, bkvd, bhs, bneox, bbias, bhasb, bw, wkoff, bw, bw, wvoff, bw, pairs)
+    } else {
+        enc_qkvrs32_c(enc, bw, wqoff, bw, bx, bq, kmb, koff, vmb, voff, bcos, bsin,
+            bn, bd, bqd, bkvd, bhs, bneox, bbias, bhasb, bw, wkoff, bw, bw, wvoff, bw, pairs)
+    }
 }
 
 // the fused W1|W3 + silu/gelu dispatch (2 rows per simdgroup — gate + up of one output element; bact picks the activation)
 def enc_gemv_w13sw(enc : MetalComputeEncoder?; bw : MetalBuffer?; w1off, w3off : uint64; bx, bh : MetalBuffer?; bn, bhid : MetalBuffer?; hidden : int64; bact : MetalBuffer?) {
-    metal_set_pipeline(enc, g_pso_w13sw)
-    metal_set_buffer(enc, bw, w1off, 0)   // w1: byte + half views
-    metal_set_buffer(enc, bw, w1off, 1)
-    metal_set_buffer(enc, bw, w3off, 6)   // w3 views
-    metal_set_buffer(enc, bw, w3off, 7)
-    metal_set_buffer(enc, bx, 0ul, 2)
-    metal_set_buffer(enc, bh, 0ul, 3)
-    metal_set_buffer(enc, bn, 0ul, 4)
-    metal_set_buffer(enc, bhid, 0ul, 5)
-    metal_set_buffer(enc, bact, 0ul, 8)   // 0 = silu, 1 = gelu
-    metal_dispatch_threadgroups(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
-}
-
-def enc_argmax(enc : MetalComputeEncoder?; blg, btok, bn : MetalBuffer?) {
-    metal_set_pipeline(enc, g_pso_argmax)
-    metal_set_threadgroup_memory_length(enc, metal_argmax_msl_tgmem, 0)
-    metal_set_buffer(enc, blg, 0ul, 0)
-    metal_set_buffer(enc, btok, 0ul, 1)
-    metal_set_buffer(enc, bn, 0ul, 2)
-    metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
-}
-
-// zero-copy logits scatter: one staging row (src at its byte offset) into a session's wrapped
-// logits storage — replaces that row's landing memcpy
-def enc_copy_row(enc : MetalComputeEncoder?; bsrc : MetalBuffer?; soff : uint64; bdst, bn : MetalBuffer?; n : int64; doff : uint64 = 0ul) {
-    metal_set_pipeline(enc, g_pso_copy_row)
-    metal_set_buffer(enc, bsrc, soff, 0)
-    metal_set_buffer(enc, bdst, doff, 1)
-    metal_set_buffer(enc, bn, 0ul, 2)
-    metal_dispatch_threadgroups(enc, uint3(uint((n + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
+    enc_w13sw_c(enc, bw, w1off, bw, bx, bh, bn, bhid, bw, w3off, bw, bact, hidden)
 }
 
 def enc_embed(enc : MetalComputeEncoder?; bw : MetalBuffer?; eoff : uint64; btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
-    metal_set_pipeline(enc, g_pso_emb)
-    metal_set_buffer(enc, bw, eoff, 0)   // byte view of the embed blob slice
-    metal_set_buffer(enc, bw, eoff, 1)   // half-scale view
-    metal_set_buffer(enc, btok, 0ul, 2)
-    metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, bdim, 0ul, 4)
-    metal_set_buffer(enc, bescale != null ? bescale : g_one, 0ul, 5)   // embed_scale (identity 1.0)
-    metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    enc_embed_c(enc, bw, eoff, bw, btok, bx, bdim, bescale != null ? bescale : g_one, dim)
 }
 
 // the tied-k6 spec embed gather: the scale buffer binds twice (f16 d plane @doff + sub-scale
 // strips @soff — kq_scales_of's whole-plane offsets), the quant plane once @qoff
 def enc_embed_k6(enc : MetalComputeEncoder?; bq : MetalBuffer?; qoff : uint64; bs : MetalBuffer?; soff, doff : uint64; btok, bx, bdim, bescale : MetalBuffer?; dim : int64) {
-    metal_set_pipeline(enc, g_pso_emb_k6)
-    metal_set_buffer(enc, bs, doff, 0)
-    metal_set_buffer(enc, bs, soff, 1)
-    metal_set_buffer(enc, bq, qoff, 2)
-    metal_set_buffer(enc, btok, 0ul, 3)
-    metal_set_buffer(enc, bx, 0ul, 4)
-    metal_set_buffer(enc, bdim, 0ul, 5)
-    metal_set_buffer(enc, bescale != null ? bescale : g_one, 0ul, 6)   // embed_scale (identity 1.0)
-    metal_dispatch_threadgroups(enc, uint3(uint((dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    enc_embed_k6_c(enc, bs, doff, bs, soff, bq, qoff, btok, bx, bdim, bescale != null ? bescale : g_one, dim)
 }
 
 // ===== MoE routing encoders (Wave C) =====
 
-// nst = streams (grid.y; the batch's live rows — single decode passes 1); brb/bhasb = the
-// optional router bias row (gpt-oss; identity = g_one + a zero uniform)
-def enc_moe_router(enc : MetalComputeEncoder?; bw, bx, by, bn, bd, bxs, brb, bhasb : MetalBuffer?; ne, nst : int64) {
-    metal_set_pipeline(enc, g_pso_moe_router)
-    metal_set_buffer(enc, bw, 0ul, 0)
-    metal_set_buffer(enc, bx, 0ul, 1)
-    metal_set_buffer(enc, by, 0ul, 2)
-    metal_set_buffer(enc, bn, 0ul, 3)
-    metal_set_buffer(enc, bd, 0ul, 4)
-    metal_set_buffer(enc, bxs, 0ul, 5)
-    metal_set_buffer(enc, brb, 0ul, 6)
-    metal_set_buffer(enc, bhasb, 0ul, 7)
-    metal_dispatch_threadgroups(enc, uint3(uint((ne + g_gemv_rows - 1l) / g_gemv_rows), uint(nst), 1u), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
-}
-
-// the selection buffer binds twice (uint idx + float w views, both at 0); one tg per stream
-// row; bgm = gating mode (0 = softmax + norm_topk, 1 = gpt-oss softmax_weight, 2 = softmax no-renorm)
-def enc_moe_select(enc : MetalComputeEncoder?; blg, bsel, bne, bnk, bgm : MetalBuffer?; nst : int64) {
-    metal_set_pipeline(enc, g_pso_moe_select)
-    metal_set_buffer(enc, blg, 0ul, 0)
-    metal_set_buffer(enc, bsel, 0ul, 1)
-    metal_set_buffer(enc, bsel, 0ul, 2)
-    metal_set_buffer(enc, bne, 0ul, 3)
-    metal_set_buffer(enc, bnk, 0ul, 4)
-    metal_set_buffer(enc, bgm, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
-}
+// enc_moe_router / enc_moe_select / enc_moe_combine are [metal_dispatch]-generated from their
+// prefill classes (the selection buffer's idx/w views are the seli/selw fields — callers pass
+// the same buffer twice)
 
 // one expert-indexed weight site (gate/up/down): weight binds at the layer's expert STACK base,
 // grid.y = k slots, grid.z = streams; bes = blocks-per-expert (q8 ege/32, kq ege/256), bxs =
 // per-slot x stride, bss/bbxs/bbys = per-stream sel/x/y strides (single decode binds zeros)
 def enc_moe_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; stack_off, rows, k, nst : int64;
                  bx, by, bn, bd, bsel, bes, bxs, bss, bbxs, bbys : MetalBuffer?; yoff : uint64 = 0ul) {
+    hz_read(bx)
+    hz_read(bsel)
+    hz_write(by, yoff, uint64(rows * k * nst * 4l))
     if (fmt == KqFmt.q8) {
         let bw = blob_of(g_dev, t, stack_off)
-        metal_set_pipeline(enc, g_pso_moe_gemv_q8)
-        metal_set_buffer(enc, bw.buf, bw.boff, 0)
-        metal_set_buffer(enc, bw.buf, bw.boff, 1)
-        metal_set_buffer(enc, bx, 0ul, 2)
-        metal_set_buffer(enc, by, yoff, 3)
-        metal_set_buffer(enc, bn, 0ul, 4)
-        metal_set_buffer(enc, bd, 0ul, 5)
-        metal_set_buffer(enc, bsel, 0ul, 6)
-        metal_set_buffer(enc, bes, 0ul, 7)
-        metal_set_buffer(enc, bxs, 0ul, 8)
-        metal_set_buffer(enc, bss, 0ul, 9)
-        metal_set_buffer(enc, bbxs, 0ul, 10)
-        metal_set_buffer(enc, bbys, 0ul, 11)
-        metal_dispatch_threadgroups(enc, uint3(uint((rows + g_gemv_rows - 1l) / g_gemv_rows), uint(k), uint(nst)), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
+        kn_pipeline(enc, g_pso_moe_gemv_q8)
+        kn_buffer(enc, bw.buf, bw.boff, 0)
+        kn_buffer(enc, bw.buf, bw.boff, 1)
+        kn_buffer(enc, bx, 0ul, 2)
+        kn_buffer(enc, by, yoff, 3)
+        kn_buffer(enc, bn, 0ul, 4)
+        kn_buffer(enc, bd, 0ul, 5)
+        kn_buffer(enc, bsel, 0ul, 6)
+        kn_buffer(enc, bes, 0ul, 7)
+        kn_buffer(enc, bxs, 0ul, 8)
+        kn_buffer(enc, bss, 0ul, 9)
+        kn_buffer(enc, bbxs, 0ul, 10)
+        kn_buffer(enc, bbys, 0ul, 11)
+        hz_gate(enc)
+        kn_dispatch(enc, uint3(uint((rows + g_gemv_rows - 1l) / g_gemv_rows), uint(k), uint(nst)), uint3(uint(g_gemv_rows * 32l), 1u, 1u))
     } elif (fmt == KqFmt.q51) {
         let qp = q51_planes_of(g_dev, t, stack_off)
-        metal_set_pipeline(enc, g_pso_moe_gemv_q51)
-        metal_set_buffer(enc, qp.qbuf, qp.qoff, 0)
-        metal_set_buffer(enc, qp.sbuf, qp.soff, 1)
-        metal_set_buffer(enc, bx, 0ul, 2)
-        metal_set_buffer(enc, by, yoff, 3)
-        metal_set_buffer(enc, bn, 0ul, 4)
-        metal_set_buffer(enc, bd, 0ul, 5)
-        metal_set_buffer(enc, bsel, 0ul, 6)
-        metal_set_buffer(enc, bes, 0ul, 7)
-        metal_set_buffer(enc, bxs, 0ul, 8)
-        metal_set_buffer(enc, bss, 0ul, 9)
-        metal_set_buffer(enc, bbxs, 0ul, 10)
-        metal_set_buffer(enc, bbys, 0ul, 11)
-        metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
+        kn_pipeline(enc, g_pso_moe_gemv_q51)
+        kn_buffer(enc, qp.qbuf, qp.qoff, 0)
+        kn_buffer(enc, qp.sbuf, qp.soff, 1)
+        kn_buffer(enc, bx, 0ul, 2)
+        kn_buffer(enc, by, yoff, 3)
+        kn_buffer(enc, bn, 0ul, 4)
+        kn_buffer(enc, bd, 0ul, 5)
+        kn_buffer(enc, bsel, 0ul, 6)
+        kn_buffer(enc, bes, 0ul, 7)
+        kn_buffer(enc, bxs, 0ul, 8)
+        kn_buffer(enc, bss, 0ul, 9)
+        kn_buffer(enc, bbxs, 0ul, 10)
+        kn_buffer(enc, bbys, 0ul, 11)
+        hz_gate(enc)
+        kn_dispatch(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
     } else {
         let bq = kq_quants_of(g_dev, t, fmt, stack_off)
         let bs = kq_scales_of(g_dev, t, fmt, stack_off)
         if (fmt == KqFmt.k6) {
-            metal_set_pipeline(enc, g_pso_moe_kq_k6)
-            metal_set_buffer(enc, bs.buf, bs.doff, 0)
+            kn_pipeline(enc, g_pso_moe_kq_k6)
+            kn_buffer(enc, bs.buf, bs.doff, 0)
         } else {
-            metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_moe_kq_k4 : g_pso_moe_kq_k5)
-            metal_set_buffer(enc, bs.buf, bs.soff, 0)
+            kn_pipeline(enc, fmt == KqFmt.k4 ? g_pso_moe_kq_k4 : g_pso_moe_kq_k5)
+            kn_buffer(enc, bs.buf, bs.soff, 0)
         }
-        metal_set_buffer(enc, bs.buf, bs.soff, 1)
-        metal_set_buffer(enc, bq.buf, bq.qoff, 2)
-        metal_set_buffer(enc, bx, 0ul, 3)
-        metal_set_buffer(enc, by, yoff, 4)
-        metal_set_buffer(enc, bn, 0ul, 5)
-        metal_set_buffer(enc, bd, 0ul, 6)
-        metal_set_buffer(enc, bsel, 0ul, 7)
-        metal_set_buffer(enc, bes, 0ul, 8)
-        metal_set_buffer(enc, bxs, 0ul, 9)
-        metal_set_buffer(enc, bss, 0ul, 10)
-        metal_set_buffer(enc, bbxs, 0ul, 11)
-        metal_set_buffer(enc, bbys, 0ul, 12)
-        metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
+        kn_buffer(enc, bs.buf, bs.soff, 1)
+        kn_buffer(enc, bq.buf, bq.qoff, 2)
+        kn_buffer(enc, bx, 0ul, 3)
+        kn_buffer(enc, by, yoff, 4)
+        kn_buffer(enc, bn, 0ul, 5)
+        kn_buffer(enc, bd, 0ul, 6)
+        kn_buffer(enc, bsel, 0ul, 7)
+        kn_buffer(enc, bes, 0ul, 8)
+        kn_buffer(enc, bxs, 0ul, 9)
+        kn_buffer(enc, bss, 0ul, 10)
+        kn_buffer(enc, bbxs, 0ul, 11)
+        kn_buffer(enc, bbys, 0ul, 12)
+        hz_gate(enc)
+        kn_dispatch(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
     }
-}
-
-// gemma4 router-input norm: one tg per stream row (weightless rms * 1/sqrt(dim) * rscale)
-def enc_g4_router_norm(enc : MetalComputeEncoder?; bx, brs, by, bdim, beps, binvd : MetalBuffer?; nst : int64) {
-    metal_set_pipeline(enc, g_pso_g4rnorm)
-    metal_set_threadgroup_memory_length(enc, metal_g4_router_norm_msl_tgmem, 0)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, brs, 0ul, 1)
-    metal_set_buffer(enc, by, 0ul, 2)
-    metal_set_buffer(enc, bdim, 0ul, 3)
-    metal_set_buffer(enc, beps, 0ul, 4)
-    metal_set_buffer(enc, binvd, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(256u, 1u, 1u))
-}
-
-// gemma4 per-expert down-scale fold: selw[row][j] *= ds[seli[row][j]]
-def enc_moe_wscale(enc : MetalComputeEncoder?; bsel, bds, bnk : MetalBuffer?; nst : int64) {
-    metal_set_pipeline(enc, g_pso_moe_wscale)
-    metal_set_buffer(enc, bsel, 0ul, 0)
-    metal_set_buffer(enc, bsel, 0ul, 1)
-    metal_set_buffer(enc, bds, 0ul, 2)
-    metal_set_buffer(enc, bnk, 0ul, 3)
-    metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
 }
 
 // the MXFP4 expert site (gpt-oss): the mx4 planes bind at the layer stack's byte offsets;
@@ -6408,320 +6212,118 @@ def enc_moe_wscale(enc : MetalComputeEncoder?; bsel, bds, bnk : MetalBuffer?; ns
 def enc_moe_gemv_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, rows, k, nst : int64;
                      bx, by, bn, bd, bsel, beblk, bxs, bss, bbxs, bbys, bwb, bhasb : MetalBuffer?; yoff : uint64 = 0ul) {
     let mp = mx4_of(g_dev, t, stack_off)
-    metal_set_pipeline(enc, g_pso_moe_gemv_mx4)
-    metal_set_buffer(enc, mp.qbuf, mp.qoff, 0)
-    metal_set_buffer(enc, mp.sbuf, mp.soff, 1)
-    metal_set_buffer(enc, bx, 0ul, 2)
-    metal_set_buffer(enc, by, yoff, 3)
-    metal_set_buffer(enc, bn, 0ul, 4)
-    metal_set_buffer(enc, bd, 0ul, 5)
-    metal_set_buffer(enc, bsel, 0ul, 6)
-    metal_set_buffer(enc, beblk, 0ul, 7)
-    metal_set_buffer(enc, bxs, 0ul, 8)
-    metal_set_buffer(enc, bss, 0ul, 9)
-    metal_set_buffer(enc, bbxs, 0ul, 10)
-    metal_set_buffer(enc, bbys, 0ul, 11)
-    metal_set_buffer(enc, bwb, 0ul, 12)
-    metal_set_buffer(enc, bhasb, 0ul, 13)
-    metal_set_buffer(enc, g_e8m0_tab, 0ul, 14)
-    metal_set_buffer(enc, g_mx4_vtab, 0ul, 15)
-    metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
-}
-
-// ===== deltanet (Wave D) — the recurrent-layer chain encoders =====
-// hist/state bind the per-session arena at the layer's byte offset; the rest are step scratch.
-
-def enc_dn_conv(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uint64;
-                bw, by, bcd, bdconv, bnp : MetalBuffer?; cd, npos : int64) {
-    metal_set_pipeline(enc, g_pso_dn_conv)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, bhist, hoff, 1)
-    metal_set_buffer(enc, bw, 0ul, 2)
-    metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, bcd, 0ul, 4)
-    metal_set_buffer(enc, bdconv, 0ul, 5)
-    metal_set_buffer(enc, bnp, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((cd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_dn_conv_hist(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uint64;
-                     bcd, bdconv, bnp : MetalBuffer?; cd : int64; hmoff : uint64; bmid : MetalBuffer?) {
-    metal_set_pipeline(enc, g_pso_dn_hist)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, bhist, hoff, 1)
-    metal_set_buffer(enc, bcd, 0ul, 2)
-    metal_set_buffer(enc, bdconv, 0ul, 3)
-    metal_set_buffer(enc, bnp, 0ul, 4)
-    metal_set_buffer(enc, bhist, hmoff, 5)
-    metal_set_buffer(enc, bmid, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((cd + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_dn_l2norm(enc : MetalComputeEncoder?; by, bcd, bkd, bds, beps, bqscale : MetalBuffer?; nblk, npos : int64) {
-    metal_set_pipeline(enc, g_pso_dn_l2)
-    metal_set_buffer(enc, by, 0ul, 0)
-    metal_set_buffer(enc, bcd, 0ul, 1)
-    metal_set_buffer(enc, bkd, 0ul, 2)
-    metal_set_buffer(enc, bds, 0ul, 3)
-    metal_set_buffer(enc, beps, 0ul, 4)
-    metal_set_buffer(enc, bqscale, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint((nblk + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_dn_scan(enc : MetalComputeEncoder?; bcv, bst : MetalBuffer?; stoff : uint64;
-                bbraw, bgraw, baa, bdtb, bo, bcd, bkd, bds, bnvh, bnkh, bdi, bnp : MetalBuffer?; ds, nvh : int64;
-                stmoff : uint64; bmid : MetalBuffer?) {
-    metal_set_pipeline(enc, g_pso_dn_scan)
-    metal_set_buffer(enc, bcv, 0ul, 0)
-    metal_set_buffer(enc, bst, stoff, 1)
-    metal_set_buffer(enc, bbraw, 0ul, 2)
-    metal_set_buffer(enc, bgraw, 0ul, 3)
-    metal_set_buffer(enc, baa, 0ul, 4)
-    metal_set_buffer(enc, bdtb, 0ul, 5)
-    metal_set_buffer(enc, bo, 0ul, 6)
-    metal_set_buffer(enc, bcd, 0ul, 7)
-    metal_set_buffer(enc, bkd, 0ul, 8)
-    metal_set_buffer(enc, bds, 0ul, 9)
-    metal_set_buffer(enc, bnvh, 0ul, 10)
-    metal_set_buffer(enc, bnkh, 0ul, 11)
-    metal_set_buffer(enc, bdi, 0ul, 12)
-    metal_set_buffer(enc, bnp, 0ul, 13)
-    metal_set_buffer(enc, bst, stmoff, 14)
-    metal_set_buffer(enc, bmid, 0ul, 15)
-    metal_dispatch_threadgroups(enc, uint3(uint(ds / 4l), uint(nvh), 1u), uint3(128u, 1u, 1u))
-}
-
-def enc_dn_gate(enc : MetalComputeEncoder?; bo, bz, bwn, bds, bdi, beps : MetalBuffer?; nvh, npos : int64) {
-    metal_set_pipeline(enc, g_pso_dn_gate)
-    metal_set_buffer(enc, bo, 0ul, 0)
-    metal_set_buffer(enc, bz, 0ul, 1)
-    metal_set_buffer(enc, bwn, 0ul, 2)
-    metal_set_buffer(enc, bds, 0ul, 3)
-    metal_set_buffer(enc, bdi, 0ul, 4)
-    metal_set_buffer(enc, beps, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint((nvh + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_dn_deint(enc : MetalComputeEncoder?; bqg, bq, bgt, bhs, bqd, bqs : MetalBuffer?; qd, npos : int64) {
-    metal_set_pipeline(enc, g_pso_dn_deint)
-    metal_set_buffer(enc, bqg, 0ul, 0)
-    metal_set_buffer(enc, bq, 0ul, 1)
-    metal_set_buffer(enc, bgt, 0ul, 2)
-    metal_set_buffer(enc, bhs, 0ul, 3)
-    metal_set_buffer(enc, bqd, 0ul, 4)
-    metal_set_buffer(enc, bqs, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint((qd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_moe_combine(enc : MetalComputeEncoder?; bdn, bsel, by, bdim, bnk : MetalBuffer?; dim, nst : int64) {
-    metal_set_pipeline(enc, g_pso_moe_combine)
-    metal_set_buffer(enc, bdn, 0ul, 0)
-    metal_set_buffer(enc, bsel, 0ul, 1)   // the float w view (stream s's w at s*2k + k)
-    metal_set_buffer(enc, by, 0ul, 2)
-    metal_set_buffer(enc, bdim, 0ul, 3)
-    metal_set_buffer(enc, bnk, 0ul, 4)
-    metal_dispatch_threadgroups(enc, uint3(uint((dim + 255l) / 256l), uint(nst), 1u), uint3(256u, 1u, 1u))
-}
-
-def enc_axpy_sig(enc : MetalComputeEncoder?; by, bx, bg, btot, bdim : MetalBuffer?; total : int64) {
-    metal_set_pipeline(enc, g_pso_axpy_sig)
-    metal_set_buffer(enc, by, 0ul, 0)
-    metal_set_buffer(enc, bx, 0ul, 1)
-    metal_set_buffer(enc, bg, 0ul, 2)
-    metal_set_buffer(enc, btot, 0ul, 3)
-    metal_set_buffer(enc, bdim, 0ul, 4)
-    metal_dispatch_threadgroups(enc, uint3(uint((total + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pso_moe_gemv_mx4)
+    kn_buffer(enc, mp.qbuf, mp.qoff, 0)
+    kn_buffer(enc, mp.sbuf, mp.soff, 1)
+    kn_buffer(enc, bx, 0ul, 2)
+    kn_buffer(enc, by, yoff, 3)
+    kn_buffer(enc, bn, 0ul, 4)
+    kn_buffer(enc, bd, 0ul, 5)
+    kn_buffer(enc, bsel, 0ul, 6)
+    kn_buffer(enc, beblk, 0ul, 7)
+    kn_buffer(enc, bxs, 0ul, 8)
+    kn_buffer(enc, bss, 0ul, 9)
+    kn_buffer(enc, bbxs, 0ul, 10)
+    kn_buffer(enc, bbys, 0ul, 11)
+    kn_buffer(enc, bwb, 0ul, 12)
+    kn_buffer(enc, bhasb, 0ul, 13)
+    kn_buffer(enc, g_e8m0_tab, 0ul, 14)
+    kn_buffer(enc, g_mx4_vtab, 0ul, 15)
+    hz_read(bx)
+    hz_read(bsel)
+    hz_write(by, yoff, uint64(rows * k * nst * 4l))
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((rows + 3l) / 4l), uint(k), uint(nst)), uint3(64u, 1u, 1u))
 }
 
 // fused add + rms when dim fits the kernel's row slab, the unfused pair otherwise
 def enc_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; dim : int64; bascale : MetalBuffer? = null) {
     if (dim <= ADD_RMS_MAX_DIM) {
-        metal_set_pipeline(enc, g_pso_addrms)
-        metal_set_threadgroup_memory_length(enc, metal_add_rms_msl_tgmem, 0)
-        metal_set_buffer(enc, bx, 0ul, 0)
-        metal_set_buffer(enc, ba, 0ul, 1)
-        metal_set_buffer(enc, bw, 0ul, 2)
-        metal_set_buffer(enc, by, 0ul, 3)
-        metal_set_buffer(enc, bdim, 0ul, 4)
-        metal_set_buffer(enc, beps, 0ul, 5)
-        metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 6)
-        metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(1024u, 1u, 1u))
+        enc_addrms_c(enc, bx, ba, bw, by, bdim, beps, bascale != null ? bascale : g_one)
     } else {
         enc_ew2(enc, g_pso_add, bx, 0ul, ba, 0ul, bdim, dim, bascale)
         enc_rms(enc, bx, bw, by, bdim, beps)
     }
 }
 
+// Fused post-attn-norm + residual add + ffn-norm for pre_post_norm models: a = rms(a)·wpa in place,
+// x += a, y = rms(x)·wffn — one dispatch collapsing enc_rms(a) + enc_add_rms_site. Falls back to the
+// separate pair past the slab cap. `ba` is normed in place (matches the un-fused enc_rms(a) write).
+def enc_pre_add_rms_site(enc : MetalComputeEncoder?; bx, ba, bwpa, bwffn, by, bdim, beps : MetalBuffer?; dim : int64) {
+    if (dim <= ADD_RMS_MAX_DIM) {
+        enc_preaddrms_c(enc, bx, ba, bwpa, bwffn, by, bdim, beps)
+    } else {
+        enc_rms(enc, ba, bwpa, ba, bdim, beps)
+        enc_add_rms_site(enc, bx, ba, bwffn, by, bdim, beps, dim)
+    }
+}
+
 def enc_attn(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; koff, voff : uint64;
              bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
-    metal_set_pipeline(enc, f16 ? g_pso_attn16 : g_pso_attn32)
-    metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn16_msl_tgmem : metal_sq_attn32_msl_tgmem, 0)
-    metal_set_buffer(enc, kmb, koff, 0)
-    metal_set_buffer(enc, vmb, voff, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
-    metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, bcnt, 0ul, 4)
-    metal_set_buffer(enc, bkvd, 0ul, 5)
-    metal_set_buffer(enc, bnh, 0ul, 6)
-    metal_set_buffer(enc, bkvm, 0ul, 7)
-    metal_set_buffer(enc, bhs, 0ul, 8)
-    metal_set_buffer(enc, bscale, 0ul, 9)
-    metal_set_buffer(enc, bcap, 0ul, 10)
-    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
-    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    if (f16) {
+        enc_attn16_c(enc, kmb, koff, vmb, voff, bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale, bcap,
+            bsink != null ? bsink : g_one, bhass != null ? bhass : g_zero, nheads, head_size)
+    } else {
+        enc_attn32_c(enc, kmb, koff, vmb, voff, bq, by, bcnt, bkvd, bnh, bkvm, bhs, bscale, bcap,
+            bsink != null ? bsink : g_one, bhass != null ? bhass : g_zero, nheads, head_size)
+    }
 }
 
 def enc_attn_part(enc : MetalComputeEncoder?; f16 : bool; kmb, vmb : MetalBuffer?; koff, voff : uint64;
                   bq, bpart, bcnt, bkvd, bnh, bkvm, bhs, bscale, bnch, bcap, bwin : MetalBuffer?; ntg, head_size : int64) {
-    metal_set_pipeline(enc, f16 ? g_pso_attnp16 : g_pso_attnp32)
-    metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_part16_msl_tgmem : metal_sq_attn_part32_msl_tgmem, 0)
-    metal_set_buffer(enc, kmb, koff, 0)
-    metal_set_buffer(enc, vmb, voff, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
-    metal_set_buffer(enc, bpart, 0ul, 3)
-    metal_set_buffer(enc, bcnt, 0ul, 4)
-    metal_set_buffer(enc, bkvd, 0ul, 5)
-    metal_set_buffer(enc, bnh, 0ul, 6)
-    metal_set_buffer(enc, bkvm, 0ul, 7)
-    metal_set_buffer(enc, bhs, 0ul, 8)
-    metal_set_buffer(enc, bscale, 0ul, 9)
-    metal_set_buffer(enc, bnch, 0ul, 10)
-    metal_set_buffer(enc, bcap, 0ul, 11)
-    metal_set_buffer(enc, bwin, 0ul, 12)
-    metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    if (f16) {
+        enc_attnp16_c(enc, kmb, koff, vmb, voff, bq, bpart, bcnt, bkvd, bnh, bkvm, bhs, bscale,
+            bnch, bcap, bwin, ntg, head_size)
+    } else {
+        enc_attnp32_c(enc, kmb, koff, vmb, voff, bq, bpart, bcnt, bkvd, bnh, bkvm, bhs, bscale,
+            bnch, bcap, bwin, ntg, head_size)
+    }
 }
 
 // tq4-mirror attention twins — same dual-view shape as the q8_0 encoders below
 def enc_attn_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
                  bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
-    metal_set_pipeline(enc, g_pso_attn_tq4)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_tq4_msl_tgmem, 0)
-    metal_set_buffer(enc, kmb, koff, 0)
-    metal_set_buffer(enc, kmb, koff, 1)
-    metal_set_buffer(enc, vmb, voff, 2)
-    metal_set_buffer(enc, vmb, voff, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, by, 0ul, 5)
-    metal_set_buffer(enc, bcnt, 0ul, 6)
-    metal_set_buffer(enc, bnblk, 0ul, 7)
-    metal_set_buffer(enc, bnh, 0ul, 8)
-    metal_set_buffer(enc, bkvm, 0ul, 9)
-    metal_set_buffer(enc, bhs, 0ul, 10)
-    metal_set_buffer(enc, bscale, 0ul, 11)
-    metal_set_buffer(enc, bcap, 0ul, 12)
-    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
-    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    enc_attn_tq4_c(enc, kmb, koff, kmb, vmb, voff, vmb, bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap,
+        bsink != null ? bsink : g_one, bhass != null ? bhass : g_zero, nheads, head_size)
 }
 
 def enc_attn_part_tq4(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
                       bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch, bcap, bwin : MetalBuffer?; ntg, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_attnp_tq4)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_tq4_msl_tgmem, 0)
-    metal_set_buffer(enc, kmb, koff, 0)
-    metal_set_buffer(enc, kmb, koff, 1)
-    metal_set_buffer(enc, vmb, voff, 2)
-    metal_set_buffer(enc, vmb, voff, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, bpart, 0ul, 5)
-    metal_set_buffer(enc, bcnt, 0ul, 6)
-    metal_set_buffer(enc, bnblk, 0ul, 7)
-    metal_set_buffer(enc, bnh, 0ul, 8)
-    metal_set_buffer(enc, bkvm, 0ul, 9)
-    metal_set_buffer(enc, bhs, 0ul, 10)
-    metal_set_buffer(enc, bscale, 0ul, 11)
-    metal_set_buffer(enc, bnch, 0ul, 12)
-    metal_set_buffer(enc, bcap, 0ul, 13)
-    metal_set_buffer(enc, bwin, 0ul, 14)
-    metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    enc_attnp_tq4_c(enc, kmb, koff, kmb, vmb, voff, vmb, bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale,
+        bnch, bcap, bwin, ntg, head_size)
 }
 
 // q8_0-mirror attention twins: the K/V slabs bind TWICE each (half-scale + byte views at the
 // same layer offset); nblk (blocks per row) replaces the kv_dim uniform
 def enc_attn_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
                 bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap : MetalBuffer?; nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
-    metal_set_pipeline(enc, g_pso_attn_q8)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_q8_msl_tgmem, 0)
-    metal_set_buffer(enc, kmb, koff, 0)
-    metal_set_buffer(enc, kmb, koff, 1)
-    metal_set_buffer(enc, vmb, voff, 2)
-    metal_set_buffer(enc, vmb, voff, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, by, 0ul, 5)
-    metal_set_buffer(enc, bcnt, 0ul, 6)
-    metal_set_buffer(enc, bnblk, 0ul, 7)
-    metal_set_buffer(enc, bnh, 0ul, 8)
-    metal_set_buffer(enc, bkvm, 0ul, 9)
-    metal_set_buffer(enc, bhs, 0ul, 10)
-    metal_set_buffer(enc, bscale, 0ul, 11)
-    metal_set_buffer(enc, bcap, 0ul, 12)
-    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
-    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    enc_attn_q8_c(enc, kmb, koff, kmb, vmb, voff, vmb, bq, by, bcnt, bnblk, bnh, bkvm, bhs, bscale, bcap,
+        bsink != null ? bsink : g_one, bhass != null ? bhass : g_zero, nheads, head_size)
 }
 
 def enc_attn_part_q8(enc : MetalComputeEncoder?; kmb, vmb : MetalBuffer?; koff, voff : uint64;
                      bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale, bnch, bcap, bwin : MetalBuffer?; ntg, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_attnp_q8)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_q8_msl_tgmem, 0)
-    metal_set_buffer(enc, kmb, koff, 0)
-    metal_set_buffer(enc, kmb, koff, 1)
-    metal_set_buffer(enc, vmb, voff, 2)
-    metal_set_buffer(enc, vmb, voff, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, bpart, 0ul, 5)
-    metal_set_buffer(enc, bcnt, 0ul, 6)
-    metal_set_buffer(enc, bnblk, 0ul, 7)
-    metal_set_buffer(enc, bnh, 0ul, 8)
-    metal_set_buffer(enc, bkvm, 0ul, 9)
-    metal_set_buffer(enc, bhs, 0ul, 10)
-    metal_set_buffer(enc, bscale, 0ul, 11)
-    metal_set_buffer(enc, bnch, 0ul, 12)
-    metal_set_buffer(enc, bcap, 0ul, 13)
-    metal_set_buffer(enc, bwin, 0ul, 14)
-    metal_dispatch_threadgroups(enc, uint3(uint(ntg), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    enc_attnp_q8_c(enc, kmb, koff, kmb, vmb, voff, vmb, bq, bpart, bcnt, bnblk, bnh, bkvm, bhs, bscale,
+        bnch, bcap, bwin, ntg, head_size)
 }
 
 def enc_attn_comb(enc : MetalComputeEncoder?; bpart, by, bnch, bnh, bhs, bchlo : MetalBuffer?; nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
-    metal_set_pipeline(enc, g_pso_attncomb)
-    metal_set_buffer(enc, bpart, 0ul, 0)
-    metal_set_buffer(enc, by, 0ul, 1)
-    metal_set_buffer(enc, bnch, 0ul, 2)
-    metal_set_buffer(enc, bnh, 0ul, 3)
-    metal_set_buffer(enc, bhs, 0ul, 4)
-    metal_set_buffer(enc, bchlo, 0ul, 5)
-    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
-    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads), 1u, 1u), uint3(uint(head_size), 1u, 1u))
-}
-
-// suppress-token pinning over a logits row in place (gemma4) — ids as a u32 buffer
-def enc_suppress_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64; bids, bn : MetalBuffer?; n : int64) {
-    metal_set_pipeline(enc, g_pso_suppress)
-    metal_set_buffer(enc, bx, xoff, 0)
-    metal_set_buffer(enc, bids, 0ul, 1)
-    metal_set_buffer(enc, bn, 0ul, 2)
-    metal_dispatch_threadgroups(enc, uint3(uint((n + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
-}
-
-// logit soft-cap over a row in place (gemma2/gemma4 final_logit_softcap on the GPU classifier)
-def enc_softcap_row(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64; btot, bcap : MetalBuffer?; total : int64) {
-    metal_set_pipeline(enc, g_pso_softcap)
-    metal_set_buffer(enc, bx, xoff, 0)
-    metal_set_buffer(enc, btot, 0ul, 1)
-    metal_set_buffer(enc, bcap, 0ul, 2)
-    metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    enc_attncomb_c(enc, bpart, by, bnch, bnh, bhs, bchlo,
+        bsink != null ? bsink : g_one, bhass != null ? bhass : g_zero, nheads, head_size)
 }
 
 // swiglu and add share the (a, b, total) elementwise shape; offsets serve the fused-buffer binds
 def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalBuffer?; aoff : uint64; bb : MetalBuffer?; boff : uint64; btot : MetalBuffer?; total : int64; bascale : MetalBuffer? = null) {
-    metal_set_pipeline(enc, pso)
-    metal_set_buffer(enc, ba, aoff, 0)
-    metal_set_buffer(enc, bb, boff, 1)
-    metal_set_buffer(enc, btot, 0ul, 2)
-    metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 3)   // the add's ascale slot (unused by swiglu/geglu)
-    metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    kn_pipeline(enc, pso)
+    kn_buffer(enc, ba, aoff, 0)
+    kn_buffer(enc, bb, boff, 1)
+    kn_buffer(enc, btot, 0ul, 2)
+    kn_buffer(enc, bascale != null ? bascale : g_one, 0ul, 3)   // the add's ascale slot (unused by swiglu/geglu)
+    hz_read(ba, aoff, uint64(total * 4l))
+    hz_read(bb, boff, uint64(total * 4l))
+    hz_write(ba, aoff, uint64(total * 4l))
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // ===== the batched-step encoders (P4) =====
@@ -6731,16 +6333,16 @@ def enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba : MetalB
 // 4 rows/tg — the x-staged cooperative-load slot math bakes 128 threads in.
 def enc_gemv_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; boff : uint64;
                bx, by, bn, bd, bys : MetalBuffer?; d : int64; yoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, four ? g_pso_gemv_b4 : g_pso_gemv_b2)
-    metal_set_threadgroup_memory_length(enc, four ? metal_gemv_b4_msl_tgmem : metal_gemv_b2_msl_tgmem, 0)
-    metal_set_buffer(enc, bw, boff, 0)   // byte view
-    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
-    metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, yoff, 4)
-    metal_set_buffer(enc, bn, 0ul, 5)
-    metal_set_buffer(enc, bd, 0ul, 6)
-    metal_set_buffer(enc, bys, 0ul, 7)
-    metal_dispatch_threadgroups(enc, uint3(uint((d + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, four ? g_pso_gemv_b4 : g_pso_gemv_b2)
+    kn_tgmem(enc, four ? metal_gemv_b4_msl_tgmem : metal_gemv_b2_msl_tgmem, 0)
+    kn_buffer(enc, bw, boff, 0)   // byte view
+    kn_buffer(enc, bw, boff, 2)   // half-scale view
+    kn_buffer(enc, bx, 0ul, 3)
+    kn_buffer(enc, by, yoff, 4)
+    kn_buffer(enc, bn, 0ul, 5)
+    kn_buffer(enc, bd, 0ul, 6)
+    kn_buffer(enc, bys, 0ul, 7)
+    kn_dispatch(enc, uint3(uint((d + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the mul_mv-shape fixed-B GEMV on an interleaved 34B blob (dual views of the SAME buffer);
@@ -6749,23 +6351,23 @@ def enc_gemv_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; boff 
 def enc_mv_b(enc : MetalComputeEncoder?; four : bool; bwblob : MetalBuffer?; wboff : uint64;
              bx, by, bn, bd, bxs, bys : MetalBuffer?; d : int64;
              bnr : MetalBuffer? = null; xoff : uint64 = 0ul; yoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, four ? g_pso_mv_b4 : g_pso_mv_b2)
-    metal_set_buffer(enc, bwblob, wboff, 0)
-    metal_set_buffer(enc, bwblob, wboff, 1)
-    metal_set_buffer(enc, bx, xoff, 2)
-    metal_set_buffer(enc, by, yoff, 3)
-    metal_set_buffer(enc, bn, 0ul, 4)
-    metal_set_buffer(enc, bd, 0ul, 5)
+    kn_pipeline(enc, four ? g_pso_mv_b4 : g_pso_mv_b2)
+    kn_buffer(enc, bwblob, wboff, 0)
+    kn_buffer(enc, bwblob, wboff, 1)
+    kn_buffer(enc, bx, xoff, 2)
+    kn_buffer(enc, by, yoff, 3)
+    kn_buffer(enc, bn, 0ul, 4)
+    kn_buffer(enc, bd, 0ul, 5)
     if (four) {
-        metal_set_buffer(enc, bnr, 0ul, 6)
-        metal_set_buffer(enc, bxs, 0ul, 7)
-        metal_set_buffer(enc, bys, 0ul, 8)
+        kn_buffer(enc, bnr, 0ul, 6)
+        kn_buffer(enc, bxs, 0ul, 7)
+        kn_buffer(enc, bys, 0ul, 8)
     } else {
-        metal_set_buffer(enc, bxs, 0ul, 6)
-        metal_set_buffer(enc, bys, 0ul, 7)
+        kn_buffer(enc, bxs, 0ul, 6)
+        kn_buffer(enc, bys, 0ul, 7)
     }
     // b2 = 4 rows/tg (16 lanes/row); b4 = 8 rows/tg (8 lanes/row)
-    metal_dispatch_threadgroups(enc, uint3(uint(four ? (d + 7l) / 8l : (d + 3l) / 4l), 1u, 1u), uint3(64u, 1u, 1u))
+    kn_dispatch(enc, uint3(uint(four ? (d + 7l) / 8l : (d + 3l) / 4l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // one mv GEMV site: a single form dispatch at B <= 4, two 4-column tiles at B = 5..8 (the
@@ -6788,17 +6390,17 @@ def enc_mv_site(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wboff : uint6
 // with one dispatch. Same 4-rows/tg geometry, gridded over the hidden output rows.
 def enc_gemv_w13sw_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?; w1off, w3off : uint64;
                      bx, by, bn, bhid : MetalBuffer?; hidden : int64) {
-    metal_set_pipeline(enc, four ? g_pso_w13sw_b4 : g_pso_w13sw_b2)
-    metal_set_threadgroup_memory_length(enc, four ? metal_gemv_w13sw_b4_msl_tgmem : metal_gemv_w13sw_b2_msl_tgmem, 0)
-    metal_set_buffer(enc, bw, w1off, 0)   // w1: byte view
-    metal_set_buffer(enc, bw, w1off, 2)   // w1: half-scale view
-    metal_set_buffer(enc, bw, w3off, 8)   // w3: byte view
-    metal_set_buffer(enc, bw, w3off, 9)   // w3: half-scale view
-    metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, 0ul, 4)
-    metal_set_buffer(enc, bn, 0ul, 5)
-    metal_set_buffer(enc, bhid, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, four ? g_pso_w13sw_b4 : g_pso_w13sw_b2)
+    kn_tgmem(enc, four ? metal_gemv_w13sw_b4_msl_tgmem : metal_gemv_w13sw_b2_msl_tgmem, 0)
+    kn_buffer(enc, bw, w1off, 0)   // w1: byte view
+    kn_buffer(enc, bw, w1off, 2)   // w1: half-scale view
+    kn_buffer(enc, bw, w3off, 8)   // w3: byte view
+    kn_buffer(enc, bw, w3off, 9)   // w3: half-scale view
+    kn_buffer(enc, bx, 0ul, 3)
+    kn_buffer(enc, by, 0ul, 4)
+    kn_buffer(enc, bn, 0ul, 5)
+    kn_buffer(enc, bhid, 0ul, 6)
+    kn_dispatch(enc, uint3(uint((hidden + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the production mul_mm dispatch (the prefill kernel: 34B-blob dual-view W, raw f32 X): y binds
@@ -6806,30 +6408,30 @@ def enc_gemv_w13sw_b(enc : MetalComputeEncoder?; four : bool; bw : MetalBuffer?;
 // y ROW STRIDE while this tensor's output width d shapes the grid (d % 64 == 0, mp % 32 == 0)
 def enc_gemm_mm_b(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wboff : uint64;
                   bx, by : MetalBuffer?; yoff : uint64; bk, bn : MetalBuffer?; mp, d : int64) {
-    metal_set_pipeline(enc, g_pso_mm)
-    metal_set_threadgroup_memory_length(enc, metal_q8_mulmm_msl_tgmem, 0)
-    metal_set_buffer(enc, bwblob, wboff, 0)
-    metal_set_buffer(enc, bwblob, wboff, 1)
-    metal_set_buffer(enc, bx, 0ul, 2)
-    metal_set_buffer(enc, by, yoff, 3)
-    metal_set_buffer(enc, bk, 0ul, 4)
-    metal_set_buffer(enc, bn, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(d / 64l), 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_mm)
+    kn_tgmem(enc, metal_q8_mulmm_msl_tgmem, 0)
+    kn_buffer(enc, bwblob, wboff, 0)
+    kn_buffer(enc, bwblob, wboff, 1)
+    kn_buffer(enc, bx, 0ul, 2)
+    kn_buffer(enc, by, yoff, 3)
+    kn_buffer(enc, bk, 0ul, 4)
+    kn_buffer(enc, bn, 0ul, 5)
+    kn_dispatch(enc, uint3(uint(mp / 32l), uint(d / 64l), 1u), uint3(128u, 1u, 1u))
 }
 
 // the M-pad-32 GEMM (B >= 5): raw f32 X, dual-view blob W at the tensor's byte offset
 def enc_gemm_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
                bx, by, bk, bn, bys : MetalBuffer?; mp32, d : int64; yoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, g_pso_gemm_b)
-    metal_set_threadgroup_memory_length(enc, metal_q8_gemm_b_msl_tgmem, 0)
-    metal_set_buffer(enc, bw, boff, 0)   // byte view
-    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
-    metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, yoff, 4)
-    metal_set_buffer(enc, bk, 0ul, 5)
-    metal_set_buffer(enc, bn, 0ul, 6)
-    metal_set_buffer(enc, bys, 0ul, 7)
-    metal_dispatch_threadgroups(enc, uint3(uint((mp32 / 32l) * (d / 32l)), 1u, 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_gemm_b)
+    kn_tgmem(enc, metal_q8_gemm_b_msl_tgmem, 0)
+    kn_buffer(enc, bw, boff, 0)   // byte view
+    kn_buffer(enc, bw, boff, 2)   // half-scale view
+    kn_buffer(enc, bx, 0ul, 3)
+    kn_buffer(enc, by, yoff, 4)
+    kn_buffer(enc, bk, 0ul, 5)
+    kn_buffer(enc, bn, 0ul, 6)
+    kn_buffer(enc, bys, 0ul, 7)
+    kn_dispatch(enc, uint3(uint((mp32 / 32l) * (d / 32l)), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the split-K pair (per-site policy): the GEMM's grid.y is the k-slice axis, partial planes land
@@ -6837,39 +6439,39 @@ def enc_gemm_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
 // Planes and grids assume mp == 32 (the policy gate).
 def enc_gemm_sk_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
                   bx, bpart, bk, bn, bsk : MetalBuffer?; d, nsk : int64) {
-    metal_set_pipeline(enc, g_pso_gemm_b_sk)
-    metal_set_threadgroup_memory_length(enc, metal_q8_gemm_b_sk_msl_tgmem, 0)
-    metal_set_buffer(enc, bw, boff, 0)   // byte view
-    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
-    metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, bpart, 0ul, 4)
-    metal_set_buffer(enc, bk, 0ul, 5)
-    metal_set_buffer(enc, bn, 0ul, 6)
-    metal_set_buffer(enc, bsk, 0ul, 8)
-    metal_dispatch_threadgroups(enc, uint3(uint(d / 32l), uint(nsk), 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_gemm_b_sk)
+    kn_tgmem(enc, metal_q8_gemm_b_sk_msl_tgmem, 0)
+    kn_buffer(enc, bw, boff, 0)   // byte view
+    kn_buffer(enc, bw, boff, 2)   // half-scale view
+    kn_buffer(enc, bx, 0ul, 3)
+    kn_buffer(enc, bpart, 0ul, 4)
+    kn_buffer(enc, bk, 0ul, 5)
+    kn_buffer(enc, bn, 0ul, 6)
+    kn_buffer(enc, bsk, 0ul, 8)
+    kn_dispatch(enc, uint3(uint(d / 32l), uint(nsk), 1u), uint3(128u, 1u, 1u))
 }
 
 def enc_sk_reduce_b(enc : MetalComputeEncoder?; bpart, by, btot, bsk : MetalBuffer?; total : int64) {
-    metal_set_pipeline(enc, g_pso_skred)
-    metal_set_buffer(enc, bpart, 0ul, 0)
-    metal_set_buffer(enc, by, 0ul, 1)
-    metal_set_buffer(enc, btot, 0ul, 2)
-    metal_set_buffer(enc, bsk, 0ul, 3)
-    metal_dispatch_threadgroups(enc, uint3(uint((total + 127l) / 128l), 1u, 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_skred)
+    kn_buffer(enc, bpart, 0ul, 0)
+    kn_buffer(enc, by, 0ul, 1)
+    kn_buffer(enc, btot, 0ul, 2)
+    kn_buffer(enc, bsk, 0ul, 3)
+    kn_dispatch(enc, uint3(uint((total + 127l) / 128l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // the 64-wide N tile (classifier site): the caller gates d % 64 == 0
 def enc_gemm64_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
                  bx, by, bk, bn : MetalBuffer?; mp32, d : int64) {
-    metal_set_pipeline(enc, g_pso_gemm64_b)
-    metal_set_threadgroup_memory_length(enc, metal_q8_gemm64_b_msl_tgmem, 0)
-    metal_set_buffer(enc, bw, boff, 0)   // byte view
-    metal_set_buffer(enc, bw, boff, 2)   // half-scale view
-    metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, 0ul, 4)
-    metal_set_buffer(enc, bk, 0ul, 5)
-    metal_set_buffer(enc, bn, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((mp32 / 32l) * (d / 64l)), 1u, 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_gemm64_b)
+    kn_tgmem(enc, metal_q8_gemm64_b_msl_tgmem, 0)
+    kn_buffer(enc, bw, boff, 0)   // byte view
+    kn_buffer(enc, bw, boff, 2)   // half-scale view
+    kn_buffer(enc, bx, 0ul, 3)
+    kn_buffer(enc, by, 0ul, 4)
+    kn_buffer(enc, bk, 0ul, 5)
+    kn_buffer(enc, bn, 0ul, 6)
+    kn_dispatch(enc, uint3(uint((mp32 / 32l) * (d / 64l)), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // Per-encoder buffer-hazard tracker for concurrent encoding (g_bconcurrent): each scratch buffer
@@ -6877,326 +6479,326 @@ def enc_gemm64_b(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64;
 // write hits a pending write/read (WAW/WAR) — read-after-read runs concurrently.
 
 def enc_attn_b(enc : MetalComputeEncoder?; f16 : bool; bq, by, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null; rtoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, f16 ? g_pso_attnb16 : g_pso_attnb32)
-    metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_b16_msl_tgmem : metal_sq_attn_b32_msl_tgmem, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
-    metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, brt, rtoff, 4)
-    metal_set_buffer(enc, blay, 0ul, 5)
-    metal_set_buffer(enc, bkvd, 0ul, 6)
-    metal_set_buffer(enc, bnh, 0ul, 7)
-    metal_set_buffer(enc, bkvm, 0ul, 8)
-    metal_set_buffer(enc, bhs, 0ul, 9)
-    metal_set_buffer(enc, bscale, 0ul, 10)
-    metal_set_buffer(enc, bqs, 0ul, 11)
-    metal_set_buffer(enc, bcap, 0ul, 12)
-    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
-    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    kn_pipeline(enc, f16 ? g_pso_attnb16 : g_pso_attnb32)
+    kn_tgmem(enc, f16 ? metal_sq_attn_b16_msl_tgmem : metal_sq_attn_b32_msl_tgmem, 0)
+    kn_buffer(enc, g_arena, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, bq, 0ul, 2)
+    kn_buffer(enc, by, 0ul, 3)
+    kn_buffer(enc, brt, rtoff, 4)
+    kn_buffer(enc, blay, 0ul, 5)
+    kn_buffer(enc, bkvd, 0ul, 6)
+    kn_buffer(enc, bnh, 0ul, 7)
+    kn_buffer(enc, bkvm, 0ul, 8)
+    kn_buffer(enc, bhs, 0ul, 9)
+    kn_buffer(enc, bscale, 0ul, 10)
+    kn_buffer(enc, bqs, 0ul, 11)
+    kn_buffer(enc, bcap, 0ul, 12)
+    kn_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    kn_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
+    kn_dispatch(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_part_b(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64; rtoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, f16 ? g_pso_attnpb16 : g_pso_attnpb32)
-    metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_part_b16_msl_tgmem : metal_sq_attn_part_b32_msl_tgmem, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
-    metal_set_buffer(enc, bpart, 0ul, 3)
-    metal_set_buffer(enc, brt, rtoff, 4)
-    metal_set_buffer(enc, blay, 0ul, 5)
-    metal_set_buffer(enc, bkvd, 0ul, 6)
-    metal_set_buffer(enc, bnh, 0ul, 7)
-    metal_set_buffer(enc, bkvm, 0ul, 8)
-    metal_set_buffer(enc, bhs, 0ul, 9)
-    metal_set_buffer(enc, bscale, 0ul, 10)
-    metal_set_buffer(enc, bqs, 0ul, 11)
-    metal_set_buffer(enc, bnch, 0ul, 12)
-    metal_set_buffer(enc, bcap, 0ul, 13)
-    metal_set_buffer(enc, bwin, 0ul, 14)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    kn_pipeline(enc, f16 ? g_pso_attnpb16 : g_pso_attnpb32)
+    kn_tgmem(enc, f16 ? metal_sq_attn_part_b16_msl_tgmem : metal_sq_attn_part_b32_msl_tgmem, 0)
+    kn_buffer(enc, g_arena, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, bq, 0ul, 2)
+    kn_buffer(enc, bpart, 0ul, 3)
+    kn_buffer(enc, brt, rtoff, 4)
+    kn_buffer(enc, blay, 0ul, 5)
+    kn_buffer(enc, bkvd, 0ul, 6)
+    kn_buffer(enc, bnh, 0ul, 7)
+    kn_buffer(enc, bkvm, 0ul, 8)
+    kn_buffer(enc, bhs, 0ul, 9)
+    kn_buffer(enc, bscale, 0ul, 10)
+    kn_buffer(enc, bqs, 0ul, 11)
+    kn_buffer(enc, bnch, 0ul, 12)
+    kn_buffer(enc, bcap, 0ul, 13)
+    kn_buffer(enc, bwin, 0ul, 14)
+    kn_dispatch(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // tq4-mirror batch attention twins — same four-way arena binding as the q8_0 encoders below
 def enc_attn_b_tq4(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
-    metal_set_pipeline(enc, g_pso_attnb_tq4)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_b_tq4_msl_tgmem, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, g_arena, 0ul, 2)
-    metal_set_buffer(enc, g_arena, 0ul, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, by, 0ul, 5)
-    metal_set_buffer(enc, brt, 0ul, 6)
-    metal_set_buffer(enc, blay, 0ul, 7)
-    metal_set_buffer(enc, bnblk, 0ul, 8)
-    metal_set_buffer(enc, bnh, 0ul, 9)
-    metal_set_buffer(enc, bkvm, 0ul, 10)
-    metal_set_buffer(enc, bhs, 0ul, 11)
-    metal_set_buffer(enc, bscale, 0ul, 12)
-    metal_set_buffer(enc, bqs, 0ul, 13)
-    metal_set_buffer(enc, bcap, 0ul, 14)
-    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
-    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    kn_pipeline(enc, g_pso_attnb_tq4)
+    kn_tgmem(enc, metal_sq_attn_b_tq4_msl_tgmem, 0)
+    kn_buffer(enc, g_arena, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, g_arena, 0ul, 2)
+    kn_buffer(enc, g_arena, 0ul, 3)
+    kn_buffer(enc, bq, 0ul, 4)
+    kn_buffer(enc, by, 0ul, 5)
+    kn_buffer(enc, brt, 0ul, 6)
+    kn_buffer(enc, blay, 0ul, 7)
+    kn_buffer(enc, bnblk, 0ul, 8)
+    kn_buffer(enc, bnh, 0ul, 9)
+    kn_buffer(enc, bkvm, 0ul, 10)
+    kn_buffer(enc, bhs, 0ul, 11)
+    kn_buffer(enc, bscale, 0ul, 12)
+    kn_buffer(enc, bqs, 0ul, 13)
+    kn_buffer(enc, bcap, 0ul, 14)
+    kn_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    kn_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
+    kn_dispatch(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_part_b_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_attnpb_tq4)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_b_tq4_msl_tgmem, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, g_arena, 0ul, 2)
-    metal_set_buffer(enc, g_arena, 0ul, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, bpart, 0ul, 5)
-    metal_set_buffer(enc, brt, 0ul, 6)
-    metal_set_buffer(enc, blay, 0ul, 7)
-    metal_set_buffer(enc, bnblk, 0ul, 8)
-    metal_set_buffer(enc, bnh, 0ul, 9)
-    metal_set_buffer(enc, bkvm, 0ul, 10)
-    metal_set_buffer(enc, bhs, 0ul, 11)
-    metal_set_buffer(enc, bscale, 0ul, 12)
-    metal_set_buffer(enc, bqs, 0ul, 13)
-    metal_set_buffer(enc, bnch, 0ul, 14)
-    metal_set_buffer(enc, bcap, 0ul, 15)
-    metal_set_buffer(enc, bwin, 0ul, 16)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    kn_pipeline(enc, g_pso_attnpb_tq4)
+    kn_tgmem(enc, metal_sq_attn_part_b_tq4_msl_tgmem, 0)
+    kn_buffer(enc, g_arena, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, g_arena, 0ul, 2)
+    kn_buffer(enc, g_arena, 0ul, 3)
+    kn_buffer(enc, bq, 0ul, 4)
+    kn_buffer(enc, bpart, 0ul, 5)
+    kn_buffer(enc, brt, 0ul, 6)
+    kn_buffer(enc, blay, 0ul, 7)
+    kn_buffer(enc, bnblk, 0ul, 8)
+    kn_buffer(enc, bnh, 0ul, 9)
+    kn_buffer(enc, bkvm, 0ul, 10)
+    kn_buffer(enc, bhs, 0ul, 11)
+    kn_buffer(enc, bscale, 0ul, 12)
+    kn_buffer(enc, bqs, 0ul, 13)
+    kn_buffer(enc, bnch, 0ul, 14)
+    kn_buffer(enc, bcap, 0ul, 15)
+    kn_buffer(enc, bwin, 0ul, 16)
+    kn_dispatch(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_d_tq4(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnsg : MetalBuffer?; nsgs, nrows, nheads : int64) {
-    metal_set_pipeline(enc, g_pso_attnd_tq4)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_d_tq4_msl_tgmem, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, g_arena, 0ul, 2)
-    metal_set_buffer(enc, g_arena, 0ul, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, bpart, 0ul, 5)
-    metal_set_buffer(enc, brt, 0ul, 6)
-    metal_set_buffer(enc, blay, 0ul, 7)
-    metal_set_buffer(enc, bnblk, 0ul, 8)
-    metal_set_buffer(enc, bnh, 0ul, 9)
-    metal_set_buffer(enc, bkvm, 0ul, 10)
-    metal_set_buffer(enc, bhs, 0ul, 11)
-    metal_set_buffer(enc, bscale, 0ul, 12)
-    metal_set_buffer(enc, bqs, 0ul, 13)
-    metal_set_buffer(enc, bnsg, 0ul, 14)
+    kn_pipeline(enc, g_pso_attnd_tq4)
+    kn_tgmem(enc, metal_sq_attn_d_tq4_msl_tgmem, 0)
+    kn_buffer(enc, g_arena, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, g_arena, 0ul, 2)
+    kn_buffer(enc, g_arena, 0ul, 3)
+    kn_buffer(enc, bq, 0ul, 4)
+    kn_buffer(enc, bpart, 0ul, 5)
+    kn_buffer(enc, brt, 0ul, 6)
+    kn_buffer(enc, blay, 0ul, 7)
+    kn_buffer(enc, bnblk, 0ul, 8)
+    kn_buffer(enc, bnh, 0ul, 9)
+    kn_buffer(enc, bkvm, 0ul, 10)
+    kn_buffer(enc, bhs, 0ul, 11)
+    kn_buffer(enc, bscale, 0ul, 12)
+    kn_buffer(enc, bqs, 0ul, 13)
+    kn_buffer(enc, bnsg, 0ul, 14)
     // HEAD-FASTEST launch: consecutive tgs share position rows (SLC locality at depth)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
+    kn_dispatch(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
 }
 
 // q8_0-mirror batch attention twins: the arena binds FOUR times (half-scale + byte views for K
 // and V); the row table carries byte offsets and nblk replaces the kv_dim uniform
 def enc_attn_b_q8(enc : MetalComputeEncoder?; bq, by, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bcap : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
-    metal_set_pipeline(enc, g_pso_attnb_q8)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_b_q8_msl_tgmem, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, g_arena, 0ul, 2)
-    metal_set_buffer(enc, g_arena, 0ul, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, by, 0ul, 5)
-    metal_set_buffer(enc, brt, 0ul, 6)
-    metal_set_buffer(enc, blay, 0ul, 7)
-    metal_set_buffer(enc, bnblk, 0ul, 8)
-    metal_set_buffer(enc, bnh, 0ul, 9)
-    metal_set_buffer(enc, bkvm, 0ul, 10)
-    metal_set_buffer(enc, bhs, 0ul, 11)
-    metal_set_buffer(enc, bscale, 0ul, 12)
-    metal_set_buffer(enc, bqs, 0ul, 13)
-    metal_set_buffer(enc, bcap, 0ul, 14)
-    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
-    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    kn_pipeline(enc, g_pso_attnb_q8)
+    kn_tgmem(enc, metal_sq_attn_b_q8_msl_tgmem, 0)
+    kn_buffer(enc, g_arena, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, g_arena, 0ul, 2)
+    kn_buffer(enc, g_arena, 0ul, 3)
+    kn_buffer(enc, bq, 0ul, 4)
+    kn_buffer(enc, by, 0ul, 5)
+    kn_buffer(enc, brt, 0ul, 6)
+    kn_buffer(enc, blay, 0ul, 7)
+    kn_buffer(enc, bnblk, 0ul, 8)
+    kn_buffer(enc, bnh, 0ul, 9)
+    kn_buffer(enc, bkvm, 0ul, 10)
+    kn_buffer(enc, bhs, 0ul, 11)
+    kn_buffer(enc, bscale, 0ul, 12)
+    kn_buffer(enc, bqs, 0ul, 13)
+    kn_buffer(enc, bcap, 0ul, 14)
+    kn_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    kn_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
+    kn_dispatch(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_part_b_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnch, bcap, bwin : MetalBuffer?; nrows, nchmax, nheads, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_attnpb_q8)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_part_b_q8_msl_tgmem, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, g_arena, 0ul, 2)
-    metal_set_buffer(enc, g_arena, 0ul, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, bpart, 0ul, 5)
-    metal_set_buffer(enc, brt, 0ul, 6)
-    metal_set_buffer(enc, blay, 0ul, 7)
-    metal_set_buffer(enc, bnblk, 0ul, 8)
-    metal_set_buffer(enc, bnh, 0ul, 9)
-    metal_set_buffer(enc, bkvm, 0ul, 10)
-    metal_set_buffer(enc, bhs, 0ul, 11)
-    metal_set_buffer(enc, bscale, 0ul, 12)
-    metal_set_buffer(enc, bqs, 0ul, 13)
-    metal_set_buffer(enc, bnch, 0ul, 14)
-    metal_set_buffer(enc, bcap, 0ul, 15)
-    metal_set_buffer(enc, bwin, 0ul, 16)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    kn_pipeline(enc, g_pso_attnpb_q8)
+    kn_tgmem(enc, metal_sq_attn_part_b_q8_msl_tgmem, 0)
+    kn_buffer(enc, g_arena, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, g_arena, 0ul, 2)
+    kn_buffer(enc, g_arena, 0ul, 3)
+    kn_buffer(enc, bq, 0ul, 4)
+    kn_buffer(enc, bpart, 0ul, 5)
+    kn_buffer(enc, brt, 0ul, 6)
+    kn_buffer(enc, blay, 0ul, 7)
+    kn_buffer(enc, bnblk, 0ul, 8)
+    kn_buffer(enc, bnh, 0ul, 9)
+    kn_buffer(enc, bkvm, 0ul, 10)
+    kn_buffer(enc, bhs, 0ul, 11)
+    kn_buffer(enc, bscale, 0ul, 12)
+    kn_buffer(enc, bqs, 0ul, 13)
+    kn_buffer(enc, bnch, 0ul, 14)
+    kn_buffer(enc, bcap, 0ul, 15)
+    kn_buffer(enc, bwin, 0ul, 16)
+    kn_dispatch(enc, uint3(uint(nheads * nchmax * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_d_q8(enc : MetalComputeEncoder?; bq, bpart, brt, blay, bnblk, bnh, bkvm, bhs, bscale, bqs, bnsg : MetalBuffer?; nsgs, nrows, nheads : int64) {
-    metal_set_pipeline(enc, g_pso_attnd_q8)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_d_q8_msl_tgmem, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, g_arena, 0ul, 2)
-    metal_set_buffer(enc, g_arena, 0ul, 3)
-    metal_set_buffer(enc, bq, 0ul, 4)
-    metal_set_buffer(enc, bpart, 0ul, 5)
-    metal_set_buffer(enc, brt, 0ul, 6)
-    metal_set_buffer(enc, blay, 0ul, 7)
-    metal_set_buffer(enc, bnblk, 0ul, 8)
-    metal_set_buffer(enc, bnh, 0ul, 9)
-    metal_set_buffer(enc, bkvm, 0ul, 10)
-    metal_set_buffer(enc, bhs, 0ul, 11)
-    metal_set_buffer(enc, bscale, 0ul, 12)
-    metal_set_buffer(enc, bqs, 0ul, 13)
-    metal_set_buffer(enc, bnsg, 0ul, 14)
+    kn_pipeline(enc, g_pso_attnd_q8)
+    kn_tgmem(enc, metal_sq_attn_d_q8_msl_tgmem, 0)
+    kn_buffer(enc, g_arena, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, g_arena, 0ul, 2)
+    kn_buffer(enc, g_arena, 0ul, 3)
+    kn_buffer(enc, bq, 0ul, 4)
+    kn_buffer(enc, bpart, 0ul, 5)
+    kn_buffer(enc, brt, 0ul, 6)
+    kn_buffer(enc, blay, 0ul, 7)
+    kn_buffer(enc, bnblk, 0ul, 8)
+    kn_buffer(enc, bnh, 0ul, 9)
+    kn_buffer(enc, bkvm, 0ul, 10)
+    kn_buffer(enc, bhs, 0ul, 11)
+    kn_buffer(enc, bscale, 0ul, 12)
+    kn_buffer(enc, bqs, 0ul, 13)
+    kn_buffer(enc, bnsg, 0ul, 14)
     // HEAD-FASTEST launch: consecutive tgs share position rows (SLC locality at depth)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
+    kn_dispatch(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
 }
 
 def enc_attn_comb_b(enc : MetalComputeEncoder?; bpart, by, brt, bnch, bnh, bhs, bwin : MetalBuffer?; nrows, nheads, head_size : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null; rtoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, g_pso_attncombb)
-    metal_set_buffer(enc, bpart, 0ul, 0)
-    metal_set_buffer(enc, by, 0ul, 1)
-    metal_set_buffer(enc, brt, rtoff, 2)
-    metal_set_buffer(enc, bnch, 0ul, 3)
-    metal_set_buffer(enc, bnh, 0ul, 4)
-    metal_set_buffer(enc, bhs, 0ul, 5)
-    metal_set_buffer(enc, bwin, 0ul, 6)
-    metal_set_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
-    metal_set_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
+    kn_pipeline(enc, g_pso_attncombb)
+    kn_buffer(enc, bpart, 0ul, 0)
+    kn_buffer(enc, by, 0ul, 1)
+    kn_buffer(enc, brt, rtoff, 2)
+    kn_buffer(enc, bnch, 0ul, 3)
+    kn_buffer(enc, bnh, 0ul, 4)
+    kn_buffer(enc, bhs, 0ul, 5)
+    kn_buffer(enc, bwin, 0ul, 6)
+    kn_buffer(enc, bsink != null ? bsink : g_one, 0ul, 20)
+    kn_buffer(enc, bhass != null ? bhass : g_zero, 0ul, 21)
+    kn_dispatch(enc, uint3(uint(nheads * nrows), 1u, 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_attn_d(enc : MetalComputeEncoder?; f16 : bool; bq, bpart, brt, blay, bkvd, bnh, bkvm, bhs, bscale, bqs, bnsg : MetalBuffer?; nsgs, nrows, nheads : int64) {
-    metal_set_pipeline(enc, f16 ? g_pso_attnd16 : g_pso_attnd32)
-    metal_set_threadgroup_memory_length(enc, f16 ? metal_sq_attn_d16_msl_tgmem : metal_sq_attn_d32_msl_tgmem, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, bq, 0ul, 2)
-    metal_set_buffer(enc, bpart, 0ul, 3)
-    metal_set_buffer(enc, brt, 0ul, 4)
-    metal_set_buffer(enc, blay, 0ul, 5)
-    metal_set_buffer(enc, bkvd, 0ul, 6)
-    metal_set_buffer(enc, bnh, 0ul, 7)
-    metal_set_buffer(enc, bkvm, 0ul, 8)
-    metal_set_buffer(enc, bhs, 0ul, 9)
-    metal_set_buffer(enc, bscale, 0ul, 10)
-    metal_set_buffer(enc, bqs, 0ul, 11)
-    metal_set_buffer(enc, bnsg, 0ul, 12)
+    kn_pipeline(enc, f16 ? g_pso_attnd16 : g_pso_attnd32)
+    kn_tgmem(enc, f16 ? metal_sq_attn_d16_msl_tgmem : metal_sq_attn_d32_msl_tgmem, 0)
+    kn_buffer(enc, g_arena, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, bq, 0ul, 2)
+    kn_buffer(enc, bpart, 0ul, 3)
+    kn_buffer(enc, brt, 0ul, 4)
+    kn_buffer(enc, blay, 0ul, 5)
+    kn_buffer(enc, bkvd, 0ul, 6)
+    kn_buffer(enc, bnh, 0ul, 7)
+    kn_buffer(enc, bkvm, 0ul, 8)
+    kn_buffer(enc, bhs, 0ul, 9)
+    kn_buffer(enc, bscale, 0ul, 10)
+    kn_buffer(enc, bqs, 0ul, 11)
+    kn_buffer(enc, bnsg, 0ul, 12)
     // HEAD-FASTEST launch: consecutive tgs share position rows (SLC locality at depth)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
+    kn_dispatch(enc, uint3(uint(nheads), uint((nsgs + 3l) / 4l), uint(nrows)), uint3(128u, 1u, 1u))
 }
 
 def enc_attn_comb_d(enc : MetalComputeEncoder?; bpart, by, brt, bnsg, bnh, bhs : MetalBuffer?; nrows, nheads, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_attncombd)
-    metal_set_threadgroup_memory_length(enc, metal_sq_attn_comb_d_msl_tgmem, 0)
-    metal_set_buffer(enc, bpart, 0ul, 0)
-    metal_set_buffer(enc, by, 0ul, 1)
-    metal_set_buffer(enc, brt, 0ul, 2)
-    metal_set_buffer(enc, bnsg, 0ul, 3)
-    metal_set_buffer(enc, bnh, 0ul, 4)
-    metal_set_buffer(enc, bhs, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint(nheads), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
+    kn_pipeline(enc, g_pso_attncombd)
+    kn_tgmem(enc, metal_sq_attn_comb_d_msl_tgmem, 0)
+    kn_buffer(enc, bpart, 0ul, 0)
+    kn_buffer(enc, by, 0ul, 1)
+    kn_buffer(enc, brt, 0ul, 2)
+    kn_buffer(enc, bnsg, 0ul, 3)
+    kn_buffer(enc, bnh, 0ul, 4)
+    kn_buffer(enc, bhs, 0ul, 5)
+    kn_dispatch(enc, uint3(uint(nheads), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 def enc_rope_store_b(enc : MetalComputeEncoder?; f16 : bool; bqkv, bcos, bsin, brt, blay, bkvd, bqd, bhs, bnpq, bnpall, bqs, bneox, bbias, bhasb : MetalBuffer?; npairs, nrows : int64; rtoff : uint64 = 0ul; brot : MetalBuffer? = null) {
-    metal_set_pipeline(enc, f16 ? g_pso_rpstb16 : g_pso_rpstb32)
-    metal_set_buffer(enc, bqkv, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, g_arena, 0ul, 2)
-    metal_set_buffer(enc, bcos, 0ul, 3)
-    metal_set_buffer(enc, bsin, 0ul, 4)
-    metal_set_buffer(enc, brt, rtoff, 5)
-    metal_set_buffer(enc, blay, 0ul, 6)
-    metal_set_buffer(enc, bkvd, 0ul, 7)
-    metal_set_buffer(enc, bqd, 0ul, 8)
-    metal_set_buffer(enc, bhs, 0ul, 9)
-    metal_set_buffer(enc, bnpq, 0ul, 10)
-    metal_set_buffer(enc, bnpall, 0ul, 11)
-    metal_set_buffer(enc, bqs, 0ul, 12)
-    metal_set_buffer(enc, bneox, 0ul, 13)
-    metal_set_buffer(enc, bbias, 0ul, 14)
-    metal_set_buffer(enc, bhasb, 0ul, 15)
-    metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 16)   // rot defaults to head_size (full rope)
-    metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
+    kn_pipeline(enc, f16 ? g_pso_rpstb16 : g_pso_rpstb32)
+    kn_buffer(enc, bqkv, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, g_arena, 0ul, 2)
+    kn_buffer(enc, bcos, 0ul, 3)
+    kn_buffer(enc, bsin, 0ul, 4)
+    kn_buffer(enc, brt, rtoff, 5)
+    kn_buffer(enc, blay, 0ul, 6)
+    kn_buffer(enc, bkvd, 0ul, 7)
+    kn_buffer(enc, bqd, 0ul, 8)
+    kn_buffer(enc, bhs, 0ul, 9)
+    kn_buffer(enc, bnpq, 0ul, 10)
+    kn_buffer(enc, bnpall, 0ul, 11)
+    kn_buffer(enc, bqs, 0ul, 12)
+    kn_buffer(enc, bneox, 0ul, 13)
+    kn_buffer(enc, bbias, 0ul, 14)
+    kn_buffer(enc, bhasb, 0ul, 15)
+    kn_buffer(enc, brot != null ? brot : bhs, 0ul, 16)   // rot defaults to head_size (full rope)
+    kn_dispatch(enc, uint3(uint((npairs + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
 }
 
 // tq4-mirror batched rope+store: one threadgroup per (head, batch row), arena bound four ways
 def enc_rope_store_b_tq4(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bqd, bhs, bnh, bkvm, bqs, bneox, bbias, bhasb : MetalBuffer?; ntg, nrows, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_rpstb_tq4)
-    metal_set_threadgroup_memory_length(enc, metal_rope_store_b_tq4_msl_tgmem, 0)
-    metal_set_buffer(enc, bqkv, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, g_arena, 0ul, 2)
-    metal_set_buffer(enc, g_arena, 0ul, 3)
-    metal_set_buffer(enc, g_arena, 0ul, 4)
-    metal_set_buffer(enc, bcos, 0ul, 5)
-    metal_set_buffer(enc, bsin, 0ul, 6)
-    metal_set_buffer(enc, signs_buffer(), 0ul, 7)
-    metal_set_buffer(enc, brt, 0ul, 8)
-    metal_set_buffer(enc, blay, 0ul, 9)
-    metal_set_buffer(enc, bqd, 0ul, 10)
-    metal_set_buffer(enc, bhs, 0ul, 11)
-    metal_set_buffer(enc, bnh, 0ul, 12)
-    metal_set_buffer(enc, bkvm, 0ul, 13)
-    metal_set_buffer(enc, bqs, 0ul, 14)
-    metal_set_buffer(enc, bneox, 0ul, 15)
-    metal_set_buffer(enc, bbias, 0ul, 16)
-    metal_set_buffer(enc, bhasb, 0ul, 17)
-    metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
+    kn_pipeline(enc, g_pso_rpstb_tq4)
+    kn_tgmem(enc, metal_rope_store_b_tq4_msl_tgmem, 0)
+    kn_buffer(enc, bqkv, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, g_arena, 0ul, 2)
+    kn_buffer(enc, g_arena, 0ul, 3)
+    kn_buffer(enc, g_arena, 0ul, 4)
+    kn_buffer(enc, bcos, 0ul, 5)
+    kn_buffer(enc, bsin, 0ul, 6)
+    kn_buffer(enc, signs_buffer(), 0ul, 7)
+    kn_buffer(enc, brt, 0ul, 8)
+    kn_buffer(enc, blay, 0ul, 9)
+    kn_buffer(enc, bqd, 0ul, 10)
+    kn_buffer(enc, bhs, 0ul, 11)
+    kn_buffer(enc, bnh, 0ul, 12)
+    kn_buffer(enc, bkvm, 0ul, 13)
+    kn_buffer(enc, bqs, 0ul, 14)
+    kn_buffer(enc, bneox, 0ul, 15)
+    kn_buffer(enc, bbias, 0ul, 16)
+    kn_buffer(enc, bhasb, 0ul, 17)
+    kn_dispatch(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(head_size), 1u, 1u))
 }
 
 // q8_0-mirror batched rope+store: arena bound four ways (K/V x scale/byte views); grid covers
 // the q pairs + one thread per K/V 32-block, one grid row per batch row
 def enc_rope_store_b_q8(enc : MetalComputeEncoder?; bqkv, bcos, bsin, brt, blay, bnblk, bqd, bhs, bnpq, bqs, bneox, bbias, bhasb : MetalBuffer?; nthreads, nrows : int64) {
-    metal_set_pipeline(enc, g_pso_rpstb_q8)
-    metal_set_buffer(enc, bqkv, 0ul, 0)
-    metal_set_buffer(enc, g_arena, 0ul, 1)
-    metal_set_buffer(enc, g_arena, 0ul, 2)
-    metal_set_buffer(enc, g_arena, 0ul, 3)
-    metal_set_buffer(enc, g_arena, 0ul, 4)
-    metal_set_buffer(enc, bcos, 0ul, 5)
-    metal_set_buffer(enc, bsin, 0ul, 6)
-    metal_set_buffer(enc, brt, 0ul, 7)
-    metal_set_buffer(enc, blay, 0ul, 8)
-    metal_set_buffer(enc, bnblk, 0ul, 9)
-    metal_set_buffer(enc, bqd, 0ul, 10)
-    metal_set_buffer(enc, bhs, 0ul, 11)
-    metal_set_buffer(enc, bnpq, 0ul, 12)
-    metal_set_buffer(enc, bqs, 0ul, 13)
-    metal_set_buffer(enc, bneox, 0ul, 14)
-    metal_set_buffer(enc, bbias, 0ul, 15)
-    metal_set_buffer(enc, bhasb, 0ul, 16)
-    metal_dispatch_threadgroups(enc, uint3(uint((nthreads + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
+    kn_pipeline(enc, g_pso_rpstb_q8)
+    kn_buffer(enc, bqkv, 0ul, 0)
+    kn_buffer(enc, g_arena, 0ul, 1)
+    kn_buffer(enc, g_arena, 0ul, 2)
+    kn_buffer(enc, g_arena, 0ul, 3)
+    kn_buffer(enc, g_arena, 0ul, 4)
+    kn_buffer(enc, bcos, 0ul, 5)
+    kn_buffer(enc, bsin, 0ul, 6)
+    kn_buffer(enc, brt, 0ul, 7)
+    kn_buffer(enc, blay, 0ul, 8)
+    kn_buffer(enc, bnblk, 0ul, 9)
+    kn_buffer(enc, bqd, 0ul, 10)
+    kn_buffer(enc, bhs, 0ul, 11)
+    kn_buffer(enc, bnpq, 0ul, 12)
+    kn_buffer(enc, bqs, 0ul, 13)
+    kn_buffer(enc, bneox, 0ul, 14)
+    kn_buffer(enc, bbias, 0ul, 15)
+    kn_buffer(enc, bhasb, 0ul, 16)
+    kn_dispatch(enc, uint3(uint((nthreads + 63l) / 64l), uint(nrows), 1u), uint3(64u, 1u, 1u))
 }
 
 def enc_add_rms_b(enc : MetalComputeEncoder?; bx, ba, bw, by, bdim, beps : MetalBuffer?; nrows : int64; bascale : MetalBuffer? = null) {
-    metal_set_pipeline(enc, g_pso_addrmsb)
-    metal_set_threadgroup_memory_length(enc, metal_add_rms_b_msl_tgmem, 0)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, ba, 0ul, 1)
-    metal_set_buffer(enc, bw, 0ul, 2)
-    metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, bdim, 0ul, 4)
-    metal_set_buffer(enc, beps, 0ul, 5)
-    metal_set_buffer(enc, bascale != null ? bascale : g_one, 0ul, 6)   // the add's ascale slot
-    metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(1024u, 1u, 1u))
+    kn_pipeline(enc, g_pso_addrmsb)
+    kn_tgmem(enc, metal_add_rms_b_msl_tgmem, 0)
+    kn_buffer(enc, bx, 0ul, 0)
+    kn_buffer(enc, ba, 0ul, 1)
+    kn_buffer(enc, bw, 0ul, 2)
+    kn_buffer(enc, by, 0ul, 3)
+    kn_buffer(enc, bdim, 0ul, 4)
+    kn_buffer(enc, beps, 0ul, 5)
+    kn_buffer(enc, bascale != null ? bascale : g_one, 0ul, 6)   // the add's ascale slot
+    kn_dispatch(enc, uint3(uint(nrows), 1u, 1u), uint3(1024u, 1u, 1u))
 }
 
 // batched rmsnorm (the prologue): the prefill rms kernel is width-agnostic — one tg per row
 def enc_rms_b(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64) {
-    metal_set_pipeline(enc, g_pso_rms)
-    metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, bw, 0ul, 1)
-    metal_set_buffer(enc, by, 0ul, 2)
-    metal_set_buffer(enc, bdim, 0ul, 3)
-    metal_set_buffer(enc, beps, 0ul, 4)
-    metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(1024u, 1u, 1u))
+    kn_pipeline(enc, g_pso_rms)
+    kn_tgmem(enc, metal_rmsnorm_msl_tgmem, 0)
+    kn_buffer(enc, bx, 0ul, 0)
+    kn_buffer(enc, bw, 0ul, 1)
+    kn_buffer(enc, by, 0ul, 2)
+    kn_buffer(enc, bdim, 0ul, 3)
+    kn_buffer(enc, beps, 0ul, 4)
+    kn_dispatch(enc, uint3(uint(nrows), 1u, 1u), uint3(1024u, 1u, 1u))
 }
 
 
@@ -7234,6 +6836,10 @@ def metal_kernels_release {
     if (g_pso_addrms != null) {
         metal_release(g_pso_addrms)
         g_pso_addrms = null
+    }
+    if (g_pso_preaddrms != null) {
+        metal_release(g_pso_preaddrms)
+        g_pso_preaddrms = null
     }
     if (g_one != null) {
         metal_release(g_one)

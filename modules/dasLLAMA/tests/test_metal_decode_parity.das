@@ -789,6 +789,28 @@ def test_metal_decode_parity(t : T?) {
                 t |> success(same(cpu16, hyb), "40-token continuation matches the CPU control (Metal prefill → GPU decode)")
             }
 
+            // arm 13: the concurrent encoder + hazard tracker. Paranoid window isolates the
+            // encoder flip (barrier every dispatch); STRICT window proves declaration coverage
+            // (an undeclared dispatch panics) with elision live — the migration's standing gate
+            if (arm_on(t, "arm13-conc")) {
+                set_metal_decode_concurrent(1)
+                set_metal_decode_hazard(true, false)
+                select_decode_override("metal")
+                let par <- continuation(tr, trg, prompt, 40, KVDtype.f16)
+                t |> success(same(cpu16, par), "40-token continuation matches the CPU control (PARANOID concurrent encode)")
+                set_metal_decode_hazard(false, true)
+                let h0 = metal_hazard_stats()
+                let cnc <- continuation(tr, trg, prompt, 40, KVDtype.f16)
+                let hz = metal_hazard_stats()
+                select_decode_override("")
+                set_metal_decode_hazard(false, false)
+                set_metal_decode_concurrent(-1)
+                t |> success(same(cpu16, cnc), "40-token continuation matches the CPU control (STRICT concurrent encode)")
+                t |> success(hz.gated > h0.gated, "hz_gate saw the step's dispatches")
+                t |> success(hz.barriers - h0.barriers < hz.gated - h0.gated, "barrier elision engaged (barriers < gated dispatches)")
+                t |> equal(hz.undeclared, h0.undeclared)
+            }
+
             // arm 3: single-step logits + stored-KV-row tolerance, both mirror dtypes (NOT
             // byte-equality — f32-X GEMVs vs CPU q8 activations, online GPU softmax)
             if (arm_on(t, "arm3-step")) {

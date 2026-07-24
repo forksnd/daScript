@@ -41,7 +41,7 @@
         "flavor":"clean-cpu",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
+        "date":"2026-07-23",
         "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-clean-cpu/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -54,12 +54,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":154.37838400000001,
-            "stddev":0.136466
+            "tok_s":155.006328,
+            "stddev":0.24594299999999999
           },
           "tg128":{
-            "tok_s":30.592524000000001,
-            "stddev":0.25006800000000001
+            "tok_s":30.651721999999999,
+            "stddev":0.047743000000000001
           }
         },
         "source":"official",
@@ -72,8 +72,8 @@
         "flavor":"tuned",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99 --ref /Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench --ref-flavor stock",
+        "date":"2026-07-23",
+        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -85,18 +85,19 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":855.1137294694505,
-            "stddev":8.1007452011108398
+            "tok_s":855.58603723669455,
+            "stddev":2.7025599479675293
           },
           "tg128":{
-            "tok_s":56.599404303029281,
-            "stddev":0.20269836485385895
+            "tok_s":64.830871712349889,
+            "stddev":0.094792187213897705
           }
         },
         "source":"official",
-        "sha":"dd21245c9",
+        "sha":"fe68b4d09",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
+        "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr8 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "exec_fmt":"weights k4/k5/k6/q8 native; q8 activations; f16 scales; metal blob"
       },
       {
         "engine":"llama.cpp",
@@ -104,8 +105,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench -m /Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf\" -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -117,16 +118,17 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":833.31334400000003,
-            "stddev":7.3460479999999997
+            "tok_s":826.69044299999996,
+            "stddev":5.8008490000000004
           },
           "tg128":{
-            "tok_s":54.105434000000002,
-            "stddev":0.023674000000000001
+            "tok_s":53.709640999999998,
+            "stddev":0.144675
           }
         },
         "source":"official",
-        "sha":"ebd048f"
+        "sha":"ebd048f",
+        "exec_fmt":"native gguf formats"
       },
       {
         "engine":"llama.cpp",
@@ -134,8 +136,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
-        "cmd":"\"/Users/borisbatkin/Work/llama.cpp/build/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -147,16 +149,16 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":147.693634,
-            "stddev":0.298875
+            "tok_s":148.24855400000001,
+            "stddev":0.227715
           },
           "tg128":{
-            "tok_s":30.025062999999999,
-            "stddev":0.31151800000000002
+            "tok_s":30.361609000000001,
+            "stddev":0.092561000000000004
           }
         },
         "source":"official",
-        "sha":"7642f1c",
+        "sha":"ebd048f",
         "exec_fmt":"native gguf formats; cpu runtime layout repack"
       }
     ],
@@ -208,7 +210,7 @@
         "flavor":"clean-cpu",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
+        "date":"2026-07-23",
         "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-clean-cpu/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-27B-MTP-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -221,12 +223,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":26.277823999999999,
-            "stddev":0.36598399999999998
+            "tok_s":26.578140999999999,
+            "stddev":0.044850000000000001
           },
           "tg128":{
-            "tok_s":6.4219200000000001,
-            "stddev":0.094798999999999994
+            "tok_s":6.4721029999999997,
+            "stddev":0.0066270000000000001
           }
         },
         "source":"official",
@@ -239,8 +241,8 @@
         "flavor":"tuned",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-27B-MTP-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99 --ref /Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench --ref-flavor stock",
+        "date":"2026-07-23",
+        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-27B-MTP-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -252,18 +254,19 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":144.06797304695436,
-            "stddev":1.917594313621521
+            "tok_s":144.85133747270925,
+            "stddev":2.3238134384155273
           },
           "tg128":{
-            "tok_s":14.213366025789409,
-            "stddev":0.002345583401620388
+            "tok_s":14.177693742273112,
+            "stddev":0.40047913789749146
           }
         },
         "source":"official",
-        "sha":"dd21245c9",
+        "sha":"fe68b4d09",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
+        "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr8 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "exec_fmt":"weights k4/k6/q8 native; q8 activations; f16 scales; metal blob"
       },
       {
         "engine":"llama.cpp",
@@ -271,8 +274,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench -m /Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-27B-MTP-Q4_K_M.gguf -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-27B-MTP-Q4_K_M.gguf\" -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -284,16 +287,17 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":127.235592,
-            "stddev":0.74168100000000003
+            "tok_s":126.00976300000001,
+            "stddev":2.484737
           },
           "tg128":{
-            "tok_s":11.735910000000001,
-            "stddev":0.15842800000000001
+            "tok_s":11.906041999999999,
+            "stddev":0.0043550000000000004
           }
         },
         "source":"official",
-        "sha":"ebd048f"
+        "sha":"ebd048f",
+        "exec_fmt":"native gguf formats"
       },
       {
         "engine":"llama.cpp",
@@ -301,8 +305,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
-        "cmd":"\"/Users/borisbatkin/Work/llama.cpp/build/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-27B-MTP-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3.6-27B-MTP-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -314,16 +318,16 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":26.349958999999998,
-            "stddev":0.13631299999999999
+            "tok_s":26.303937999999999,
+            "stddev":0.54536399999999996
           },
           "tg128":{
-            "tok_s":6.3638789999999998,
-            "stddev":0.080129000000000006
+            "tok_s":6.4785690000000002,
+            "stddev":0.0067169999999999999
           }
         },
         "source":"official",
-        "sha":"7642f1c",
+        "sha":"ebd048f",
         "exec_fmt":"native gguf formats; cpu runtime layout repack"
       }
     ],
@@ -375,7 +379,7 @@
         "flavor":"clean-cpu",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
+        "date":"2026-07-23",
         "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-clean-cpu/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-12B-it-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -388,12 +392,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":60.452703999999997,
-            "stddev":0.215444
+            "tok_s":60.157291999999998,
+            "stddev":1.0886439999999999
           },
           "tg128":{
-            "tok_s":14.247317000000001,
-            "stddev":0.032347000000000001
+            "tok_s":14.073108,
+            "stddev":0.35347299999999998
           }
         },
         "source":"official",
@@ -406,8 +410,8 @@
         "flavor":"tuned",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gemma-4-12B-it-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99 --ref /Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench --ref-flavor stock",
+        "date":"2026-07-23",
+        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gemma-4-12B-it-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -419,18 +423,19 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":322.61801161335717,
-            "stddev":1.3747810125350952
+            "tok_s":314.57624851014521,
+            "stddev":0.91757011413574219
           },
           "tg128":{
-            "tok_s":32.621352578464375,
-            "stddev":1.4271385669708252
+            "tok_s":33.163465671803706,
+            "stddev":1.3813973665237427
           }
         },
         "source":"official",
-        "sha":"dd21245c9",
+        "sha":"fe68b4d09",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
+        "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr8 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "exec_fmt":"weights k4/k6/q8 native; q8 activations; f32 scales; metal blob"
       },
       {
         "engine":"llama.cpp",
@@ -438,8 +443,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench -m /Users/borisbatkin/Work/llama.cpp/models/gemma-4-12B-it-Q4_K_M.gguf -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-12B-it-Q4_K_M.gguf\" -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -451,16 +456,17 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":288.24497300000002,
-            "stddev":1.1651640000000001
+            "tok_s":307.17621500000001,
+            "stddev":2.8383609999999999
           },
           "tg128":{
-            "tok_s":28.803851000000002,
-            "stddev":0.0067629999999999999
+            "tok_s":28.887463,
+            "stddev":0.096991999999999995
           }
         },
         "source":"official",
-        "sha":"ebd048f"
+        "sha":"ebd048f",
+        "exec_fmt":"native gguf formats"
       },
       {
         "engine":"llama.cpp",
@@ -468,8 +474,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
-        "cmd":"\"/Users/borisbatkin/Work/llama.cpp/build/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-12B-it-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-12B-it-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -481,16 +487,16 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":60.422522999999998,
-            "stddev":0.35036299999999998
+            "tok_s":60.992325999999998,
+            "stddev":0.25299500000000003
           },
           "tg128":{
-            "tok_s":14.078101,
-            "stddev":0.078953999999999996
+            "tok_s":14.19234,
+            "stddev":0.013088000000000001
           }
         },
         "source":"official",
-        "sha":"7642f1c",
+        "sha":"ebd048f",
         "exec_fmt":"native gguf formats; cpu runtime layout repack"
       }
     ],
@@ -542,7 +548,7 @@
         "flavor":"clean-cpu",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
+        "date":"2026-07-23",
         "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-clean-cpu/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-E4B-it-Q8_0.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -555,12 +561,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":120.385868,
-            "stddev":0.194107
+            "tok_s":119.706183,
+            "stddev":0.64033899999999999
           },
           "tg128":{
-            "tok_s":20.412303999999999,
-            "stddev":0.040924000000000002
+            "tok_s":20.356285,
+            "stddev":0.026186000000000001
           }
         },
         "source":"official",
@@ -573,8 +579,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
-        "cmd":"\"/Users/borisbatkin/Work/llama.cpp/build/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-E4B-it-Q8_0.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-E4B-it-Q8_0.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -586,16 +592,16 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":196.1814,
-            "stddev":1.5698909999999999
+            "tok_s":199.05345199999999,
+            "stddev":1.387148
           },
           "tg128":{
-            "tok_s":20.127203000000002,
-            "stddev":0.035373000000000002
+            "tok_s":20.301058000000001,
+            "stddev":0.034304000000000001
           }
         },
         "source":"official",
-        "sha":"7642f1c",
+        "sha":"ebd048f",
         "exec_fmt":"native gguf formats; cpu runtime layout repack"
       },
       {
@@ -604,8 +610,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench -m /Users/borisbatkin/Work/llama.cpp/models/gemma-4-E4B-it-Q8_0.gguf -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-E4B-it-Q8_0.gguf\" -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -617,16 +623,17 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":917.29826700000001,
-            "stddev":0.92462800000000001
+            "tok_s":908.59466899999995,
+            "stddev":1.769252
           },
           "tg128":{
-            "tok_s":52.324300999999998,
-            "stddev":0.14776800000000001
+            "tok_s":52.727697999999997,
+            "stddev":0.058049000000000003
           }
         },
         "source":"official",
-        "sha":"ebd048f"
+        "sha":"ebd048f",
+        "exec_fmt":"native gguf formats"
       },
       {
         "engine":"das",
@@ -634,7 +641,7 @@
         "flavor":"tuned",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
+        "date":"2026-07-23",
         "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gemma-4-E4B-it-Q8_0.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -647,18 +654,19 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":785.46586477772325,
-            "stddev":5.3444986343383789
+            "tok_s":785.31057310470601,
+            "stddev":4.1258759498596191
           },
           "tg128":{
-            "tok_s":50.485279926238185,
-            "stddev":0.16427034139633179
+            "tok_s":52.069153683921833,
+            "stddev":0.035958331078290939
           }
         },
         "source":"official",
-        "sha":"15ada7b6e",
+        "sha":"fe68b4d09",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
+        "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr8 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "exec_fmt":"weights q8 native; q8 activations; f16 scales; metal blob"
       }
     ],
     "arch":"gemma4",
@@ -709,7 +717,7 @@
         "flavor":"clean-cpu",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
+        "date":"2026-07-23",
         "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-clean-cpu/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -722,12 +730,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":120.847325,
-            "stddev":0.195886
+            "tok_s":120.58527100000001,
+            "stddev":1.1804699999999999
           },
           "tg128":{
-            "tok_s":42.631951999999998,
-            "stddev":0.114928
+            "tok_s":42.443016,
+            "stddev":0.155921
           }
         },
         "source":"official",
@@ -740,7 +748,7 @@
         "flavor":"tuned",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
+        "date":"2026-07-23",
         "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -753,18 +761,18 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":946.90685928332368,
-            "stddev":15.177724838256836
+            "tok_s":958.59631092466645,
+            "stddev":2.1222844123840332
           },
           "tg128":{
-            "tok_s":77.103618825696032,
-            "stddev":0.90228211879730225
+            "tok_s":80.079018245263711,
+            "stddev":0.095160163938999176
           }
         },
         "source":"official",
-        "sha":"4a3d6c690",
+        "sha":"fe68b4d09",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr8 (manifest); q8q8_tile_gen=kstep2 (manifest)",
         "exec_fmt":"weights mxfp4/q8 native; q8 activations; f16 scales; metal blob"
       },
       {
@@ -773,8 +781,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench -m /Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf\" -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -786,12 +794,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":1031.533553,
-            "stddev":2.7225839999999999
+            "tok_s":1018.32059,
+            "stddev":2.8474020000000002
           },
           "tg128":{
-            "tok_s":83.471146000000005,
-            "stddev":0.053529
+            "tok_s":83.125090999999998,
+            "stddev":0.35724
           }
         },
         "source":"official",
@@ -804,8 +812,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
-        "cmd":"\"/Users/borisbatkin/Work/llama.cpp/build/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gpt-oss-20b-mxfp4.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -817,16 +825,16 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":120.044656,
-            "stddev":0.839314
+            "tok_s":118.34537899999999,
+            "stddev":2.1800540000000002
           },
           "tg128":{
-            "tok_s":42.193209000000003,
-            "stddev":0.098493999999999998
+            "tok_s":42.478968000000002,
+            "stddev":0.30860100000000001
           }
         },
         "source":"official",
-        "sha":"7642f1c",
+        "sha":"ebd048f",
         "exec_fmt":"native gguf formats; cpu runtime layout repack"
       }
     ],
@@ -878,7 +886,7 @@
         "flavor":"clean-cpu",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
+        "date":"2026-07-23",
         "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-clean-cpu/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -891,12 +899,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":137.424871,
-            "stddev":0.19991
+            "tok_s":137.28578200000001,
+            "stddev":0.27767399999999998
           },
           "tg128":{
-            "tok_s":47.623058,
-            "stddev":0.093197000000000002
+            "tok_s":47.164296999999998,
+            "stddev":0.22700500000000001
           }
         },
         "source":"official",
@@ -909,8 +917,8 @@
         "flavor":"tuned",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99 --ref /Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench --ref-flavor stock",
+        "date":"2026-07-23",
+        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -922,18 +930,19 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":865.55945931379267,
-            "stddev":2.5992946624755859
+            "tok_s":867.88871293620355,
+            "stddev":5.7424349784851074
           },
           "tg128":{
-            "tok_s":71.488423899018699,
-            "stddev":0.15503133833408356
+            "tok_s":86.166316686526798,
+            "stddev":0.33126875758171082
           }
         },
         "source":"official",
-        "sha":"dd21245c9",
+        "sha":"fe68b4d09",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
+        "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr8 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "exec_fmt":"weights k4/k6/q8 native; q8 activations; f32 scales; metal blob"
       },
       {
         "engine":"llama.cpp",
@@ -941,8 +950,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench -m /Users/borisbatkin/Work/llama.cpp/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf\" -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -954,16 +963,17 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":843.35710600000004,
-            "stddev":4.0039670000000003
+            "tok_s":831.75601300000005,
+            "stddev":3.8852730000000002
           },
           "tg128":{
-            "tok_s":75.017623,
-            "stddev":0.13082299999999999
+            "tok_s":75.081489000000005,
+            "stddev":0.050722000000000003
           }
         },
         "source":"official",
-        "sha":"ebd048f"
+        "sha":"ebd048f",
+        "exec_fmt":"native gguf formats"
       },
       {
         "engine":"llama.cpp",
@@ -971,8 +981,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
-        "cmd":"\"/Users/borisbatkin/Work/llama.cpp/build/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -984,16 +994,16 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":134.487234,
-            "stddev":0.20582500000000001
+            "tok_s":134.34309200000001,
+            "stddev":0.41378599999999999
           },
           "tg128":{
-            "tok_s":46.567284999999998,
-            "stddev":0.86570800000000003
+            "tok_s":46.619402000000001,
+            "stddev":0.81359599999999999
           }
         },
         "source":"official",
-        "sha":"7642f1c",
+        "sha":"ebd048f",
         "exec_fmt":"native gguf formats; cpu runtime layout repack"
       }
     ],
@@ -1045,7 +1055,7 @@
         "flavor":"clean-cpu",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
+        "date":"2026-07-23",
         "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-clean-cpu/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -1058,12 +1068,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":31.370180000000001,
-            "stddev":0.35213100000000003
+            "tok_s":31.523233999999999,
+            "stddev":0.61619299999999999
           },
           "tg128":{
-            "tok_s":7.9739509999999996,
-            "stddev":0.34884399999999999
+            "tok_s":8.2318750000000005,
+            "stddev":0.0032100000000000002
           }
         },
         "source":"official",
@@ -1076,8 +1086,8 @@
         "flavor":"tuned",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99 --ref /Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench --ref-flavor stock",
+        "date":"2026-07-23",
+        "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -1089,18 +1099,19 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":108.99703899476303,
-            "stddev":3.5069448947906494
+            "tok_s":131.0770488769796,
+            "stddev":0.23995548486709595
           },
           "tg128":{
-            "tok_s":14.750855419789758,
-            "stddev":0.019187308847904205
+            "tok_s":19.07938773969677,
+            "stddev":0.62019234895706177
           }
         },
         "source":"official",
-        "sha":"dd21245c9",
+        "sha":"fe68b4d09",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
+        "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr8 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "exec_fmt":"weights k4/k6 native; q8 activations; f32 scales; metal blob"
       },
       {
         "engine":"llama.cpp",
@@ -1108,8 +1119,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench -m /Users/borisbatkin/Work/llama.cpp/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf\" -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -1121,16 +1132,17 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":114.33485899999999,
-            "stddev":2.129251
+            "tok_s":127.495332,
+            "stddev":0.29165799999999997
           },
           "tg128":{
-            "tok_s":12.41893,
-            "stddev":0.102697
+            "tok_s":15.471907,
+            "stddev":0.12234200000000001
           }
         },
         "source":"official",
-        "sha":"ebd048f"
+        "sha":"ebd048f",
+        "exec_fmt":"native gguf formats"
       },
       {
         "engine":"llama.cpp",
@@ -1138,8 +1150,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
-        "cmd":"\"/Users/borisbatkin/Work/llama.cpp/build/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -1151,16 +1163,16 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":31.328184,
-            "stddev":0.44247399999999998
+            "tok_s":32.299188000000001,
+            "stddev":0.161382
           },
           "tg128":{
-            "tok_s":8.202655,
-            "stddev":0.003388
+            "tok_s":8.1114669999999993,
+            "stddev":0.11877799999999999
           }
         },
         "source":"official",
-        "sha":"7642f1c",
+        "sha":"ebd048f",
         "exec_fmt":"native gguf formats; cpu runtime layout repack"
       }
     ],
@@ -1212,7 +1224,7 @@
         "flavor":"tuned",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
+        "date":"2026-07-23",
         "cmd":"bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m /Users/borisbatkin/Work/llama.cpp/models/gemma-4-26B-A4B-it-Q4_K_M.gguf -p 512 -n 128 -r 5 -t 8 -o json --json-path modules/dasLLAMA/performance/records/_cell_m1.json --ngl 99",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -1225,18 +1237,18 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":895.58974057297326,
-            "stddev":5.2121052742004395
+            "tok_s":901.03676675692407,
+            "stddev":9.7230615615844727
           },
           "tg128":{
-            "tok_s":52.20740565342571,
-            "stddev":2.0882432460784912
+            "tok_s":61.234489093455714,
+            "stddev":2.6443784236907959
           }
         },
         "source":"official",
-        "sha":"87e926707",
+        "sha":"fe68b4d09",
         "version":"0.6.3",
-        "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)",
+        "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr8 (manifest); q8q8_tile_gen=kstep2 (manifest)",
         "exec_fmt":"weights k4/q51/q8 native; q8 activations; f16 scales; metal blob"
       },
       {
@@ -1245,7 +1257,7 @@
         "flavor":"clean-cpu",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
+        "date":"2026-07-23",
         "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-clean-cpu/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-26B-A4B-it-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
@@ -1258,12 +1270,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":120.903505,
-            "stddev":0.66711600000000004
+            "tok_s":121.864158,
+            "stddev":0.52882399999999996
           },
           "tg128":{
-            "tok_s":27.990476000000001,
-            "stddev":0.089593999999999993
+            "tok_s":27.746113999999999,
+            "stddev":0.24158299999999999
           }
         },
         "source":"official",
@@ -1276,8 +1288,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-22",
-        "cmd":"\"/Users/borisbatkin/Work/llama.cpp/build/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-26B-A4B-it-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-26B-A4B-it-Q4_K_M.gguf\" -ngl 0 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -1289,16 +1301,16 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":156.67750699999999,
-            "stddev":1.3208839999999999
+            "tok_s":150.90444500000001,
+            "stddev":8.3212620000000008
           },
           "tg128":{
-            "tok_s":27.249096999999999,
-            "stddev":0.080323000000000006
+            "tok_s":27.555084000000001,
+            "stddev":0.121545
           }
         },
         "source":"official",
-        "sha":"7642f1c",
+        "sha":"ebd048f",
         "exec_fmt":"native gguf formats; cpu runtime layout repack"
       },
       {
@@ -1307,8 +1319,8 @@
         "flavor":"stock",
         "box":"m1",
         "threads":8,
-        "date":"2026-07-21",
-        "cmd":"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench -m /Users/borisbatkin/Work/llama.cpp/models/gemma-4-26B-A4B-it-Q4_K_M.gguf -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
+        "date":"2026-07-23",
+        "cmd":"\"/Users/borisbatkin/Work/llama.cpp-ref-ebd048f/build-stock/bin/llama-bench\" -m \"/Users/borisbatkin/Work/llama.cpp/models/gemma-4-26B-A4B-it-Q4_K_M.gguf\" -ngl 99 -t 8 -p 512 -n 128 -r 5 -o json",
         "hardware":{
           "cpu":"Apple M1 Max",
           "arch":"arm64",
@@ -1320,12 +1332,12 @@
         },
         "tests":{
           "pp512":{
-            "tok_s":815.93698300000005,
-            "stddev":3.435514
+            "tok_s":803.56115899999998,
+            "stddev":4.0264139999999999
           },
           "tg128":{
-            "tok_s":60.049984000000002,
-            "stddev":0.13614999999999999
+            "tok_s":60.086651000000003,
+            "stddev":0.067565
           }
         },
         "source":"official",

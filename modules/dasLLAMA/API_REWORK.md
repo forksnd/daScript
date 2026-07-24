@@ -343,6 +343,141 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
+- **gemma-4-26B-A4B tg 0.84x — routed k4 GEMV was load-issue-bound; float4-x fix SHIPPED, +8.7% tg
+  (2026-07-23).** Chapter 1, knockout (new moe_rt/moe_sh arms, decode_metal_chase nomoert/nomoesh,
+  Q4_K_M @512, best-of-3, clean window): full 18.80ms; routed k4/q51 expert GEMVs 5.48ms (29%) at
+  ~163 GB/s; other GEMVs (QKV/WO/router) 5.30ms; dense-shared 1.89ms; attention 1.93ms; ew 1.96ms;
+  non-gemv floor 6.13ms. Classifier ≈ ZERO time despite 21% byte share — the greedy spec chain
+  covers it (1342 hits / 3 misses). Chapter 2, kernel-lab (benchmarks/matmul/bench_metal_moe_lab
+  — exact 26B expert shapes E=128 nfe=704 dim=2816 k=8, exact-arith bit-exact contract, sel
+  rotation for DRAM honesty): the barrier/bubble theory REFUTED (pipelined-no-barriers ==
+  in-graph rate, ±7%; scatter-vs-contiguous sel: nil) — the production MoeGemvK4 kernel itself
+  ran **142 wGB/s** at expert shapes, load-issue-bound on 32 scalar x loads per 256-block
+  (the AGX checklist's vector-width-views item, missing in the MoE twins). float4-x view =
+  **321 wGB/s (2.25x)**; W13-pair fusion ties it (327) so NO driver surgery; 4-rows/sg partial
+  (202). FIX SHIPPED in MetalMoeGemvK4 (kernel-only; dispatch/driver/blob unchanged): in-graph
+  full 53.06 → **57.65 t/s (+8.7%)**, gpu 18.80 → 17.31ms/step; kernel units + fam tolerance
+  cells green. Chapter 3, the "other gemv" anomaly RESOLVED as a phantom (finer noqkv/nowo
+  knockout arms, post-fix @512, full 17.27ms): QKV 2.56ms is AT ceiling — the 26B is HETERO
+  (global heads 512-wide: wq 8192x2816 on global layers), so real QKV bytes are ~857MB/step,
+  ideal 2.60ms; the old "3x" was a byte-estimate error. WO 1.52ms vs 1.30 ideal (~85%, ~0.2ms
+  slack). The residual gemv-class remainder 1.23ms = router (~0.15) + the greedy spec chain's
+  classifier dispatches (~1.1ms, gemv-gated, useful work). Routed experts post-fix: 3.84ms.
+  Remaining quantified levers, by size: (1) **the dispatch model — MEASURED from both sides
+  (2026-07-23 evening, same-window)**: das encodes **780 dispatches/step @8 / 811 @512** (new
+  metal_dispatch_call_count instrument), every one implicitly barriered on the serial encoder.
+  llama.cpp's own knobs price the structure on this exact model (tg128, ±0.4% reps): stock 58.50
+  t/s; GGML_METAL_CONCURRENCY_DISABLE **52.17 (+2.08ms/tok)**; FUSION_DISABLE 53.90 (+1.46);
+  GRAPH_OPTIMIZE_DISABLE 53.96 (+1.44) — lcpp-with-serial-encoder lands in OUR class, i.e. no
+  kernel section loses; the whole gap is dispatch structure. Same-window das: chase full @8
+  **62.3 t/s (16.05ms) — AHEAD of lcpp stock 58.50** under real greedy decode; the llama-bench-
+  protocol rail reads 55.75 ±3.20 (synthetic-id feed perturbs the spec chain + the rail's tg is
+  intrinsically noisy — the recorded 50.31 ±2.2 board cell is protocol-dragged and/or tinted).
+  The port blueprint is llama.cpp's ggml_mem_ranges (ggml-metal-common.h): concurrent encoder +
+  per-op src/dst range tracking — barrier + reset only when a new op's ranges conflict with the
+  live set — plus ew-chain fusion and a graph-reorder pass that grows concurrent sets. Our shape:
+  an enc_dispatch wrapper in dasllama_metal_common taking declared read/write (buffer, off, len)
+  ranges per dispatch (every enc_* helper already knows its buffers), auto-barriering on conflict;
+  g_skip runs must stay serial (the knockout-unbarriered caveat at dasllama_metal_llama.das:2511).
+  **SESSION 1 SHIPPED (2026-07-23): the hazard-tracked concurrent encoder is in** — range tracker
+  in dasllama_metal_common (exact (buffer, off, len) ranges, mutable frame buffers only; weights/
+  uniforms untracked), hz_gate in every decode-path enc_* helper, undeclared dispatches take a
+  conservative barrier (or PANIC under DASLLAMA_METAL_HAZARD_STRICT — the parity suite's arm13
+  runs strict, so declaration coverage is test-enforced), a dispatch-counter check makes a gate
+  bypass loud, DASLLAMA_METAL_HAZARD_PARANOID isolates the encoder flip. Measured on the 26B
+  Q4_K_M chase (full arm, best of 3): @8 63.08 -> 65.78 t/s (+4.3%), gpu 15.81 -> 15.11ms; @512
+  58.42 -> 60.84 t/s (+4.1%), gpu 17.07 -> 16.40ms; barriers 780/811 implicit -> 634/665 real.
+  DEFAULT flipped ON after the family gates (llama arm13 strict, arm7 q8/tq4, gemma4moe both
+  rows, qwen35/qwen35moe, gptoss, gemma4e — all green under CONCURRENT+STRICT); 12B Q4_K_M spot
+  pair confirms: @8 35.05 -> 36.31 t/s (+3.6%, gpu -0.83ms), @512 32.37 -> 33.34 (+3.0%, -0.88ms).
+  The barrier floor is the PROGRAM-ORDER chain depth (~19 genuine links/layer on the g4 graph:
+  qkv triple, we1||we3, pre_ffn2||router_norm, post_ffn2||shared-w13sw group — everything else
+  chains). **SESSION 2 PHASES A-C SHIPPED (2026-07-23 night): step-graph capture (kn_* twins
+  record KNodes; graph_flush replays with the hz oracle deriving barriers, so a schedule can
+  only change speed) + a shape-class schedule cache (FNV over the pso sequence, compiled once)
+  with ASAP leveling over the conflict DAG + the g4 dense-shared/qwen35moe-shexp scratch split
+  (own bh12s panel).** Measured 26B: @8 69.23 t/s gpu 14.40ms, @512 62.90 gpu 15.87 — cumulative
+  vs serial @8 +9.7%/-1.41ms (das now well ahead of lcpp stock 58.50 same-window); barriers
+  634->574 (the split's 2 levels/layer; leveling found nothing else — depth 574 IS the true
+  chain). 12B (dense, no branch): unchanged, as expected. 26B/qwen35moe tolerance cells
+  byte-identical maxd under STRICT; llama arm1/7/13 token-exact.
+  **R1 ew-FUSION MEASURED (2026-07-23): one kernel ships, one refuted — the barrier lever has a
+  sub-1% ceiling on the MoE-bound 26B.** MetalPreAddRms collapses the pre_post_norm epilogue
+  post_attn_rms + add_rms into one dispatch (enc_pre_add_rms_site: two register reductions, x
+  staged for the trailing norm; bit-identical to the pair — reduction structure copied from
+  metal_rmsnorm/add_rms, the one reordered product is IEEE-multiply-commutative). DEFAULT ON via
+  DASLLAMA_METAL_FUSE; chase `nofuse` A/B arm. Correctness: gemma3 token-exact (pre_post_norm
+  fires it), gemma4moe-26b tolerance maxd byte-identical to baseline. 26B Q4_K_M 3-arm interleaved
+  chase (full/fuse1/nofuse — Parsec-active, read the DELTA): **fuse1 vs nofuse +0.35% @8 / +0.37%
+  @512, gpu -0.05ms, barriers 574->544 (-30 = one collapsed level/layer x 30 layers)** — small but
+  consistent + reusable capability (larger on dense gemma: shorter chain, 30 barriers a bigger
+  fraction). The SECOND fusion, MetalRmsAdd on the g4 dense-shared post_ffn1_rms + add, was
+  authored, correctness-proven, and **REFUTED** by the same run: **-1.0% at both depths and
+  DETERMINISTICALLY 0 barrier reduction** (720 vs 750 disp but 544 = 544 bar) — that tail is on the
+  SHARED branch, which the leveler already overlaps with the longer routed branch, so fusing rms
+  (inputs ready early) with the add (needs bmoe_rt, ready late) SERIALIZES the reduction behind the
+  routed branch it used to overlap. Reverted; kept as this ledger's negative control. **LESSON:
+  barrier COUNT isn't the whole story — a fusion OFF the critical path can't help and can hurt by
+  moving a bigger node into a later, tighter level; and the 26B's barrier lever is bounded (~sub-1%)
+  because the GPU is routed-GEMV-bandwidth-bound (round-1 dig), not barrier-bound.** Implication
+  for the plan's R2-R5: the [metal_dispatch] macro lens stays worth it as CAPABILITY/eDSL, but the
+  fusion+reorder PERF upside on this MoE model is small — the candidate deeper fusions
+  (router_norm+router, swiglu+we2) hit the same norm-into-GEMV grid-wide-dep wall or need the GEMV
+  kernel itself to fuse the activation (ledger-class). Still open from the plan: [tune]
+  schedule axes (thin until fusion adds real choices), batch-rail unification (R4), dasMetal
+  promotion of the graph/lens machinery;
+  (2) the q51 w2 MoE kernel at 224 wGB/s in-lab —
+  the integer-compose form (q | hbit<<4 pre-convert, replacing the select chain) TESTED + REFUTED
+  2026-07-23: 226 vs 224 wGB/s (+1%), bit-exact but the dot stays issue-bound in the shift/mask
+  decode regardless of compose shape; kept as the lab's w2_ic negative control, do not re-chase —
+  a real q51 win needs a different decode strategy (per-thread multi-block amortization or an
+  upload-time qh transpose, both ledger-class); (3) WO ~0.2ms slack; (4) MetalMoeGemvK5 carries the same
+  scalar-x block — mechanical sibling of the shipped fix, prove via a lab arm first. Lab kept as
+  the standing rig: variants stay as arms/negative controls.
+
+- **[metal_dispatch] lens ROLLED OUT across the decode path (2026-07-23): 34 kernels generate
+  their dispatch builders from the class; @role ratchet live.** The structure macro
+  (dasllama_metal_lens.das) reads a [metal_kernel] class's @ssbo/@uniform fields and generates
+  the enc_* builder — binds in @binding order, hz from @role (read/write/readwrite; weight =
+  untracked static upload; alias = second view of a dual-bound buffer), @off = caller-passed
+  bind offset (param interleaved after its buffer; shared names emit once — dual views ride
+  two fields sharing one @off), @span = exact hz byte length (product micro-grammar), grid =
+  per-WorkGroupID-dim `1|param|param/coverage` (literal coverage folds the ceil bias to the
+  hand-written spelling; named coverage like g_gemv_rows keeps the +cov-1 form), tg = int
+  const | "param" | "name*int". Every conversion was proven ast_dump byte-identical against
+  its hand-written twin before deletion (only sanctioned diffs: dn_scan's exact-div grid
+  emitted as value-identical ceil; order-free hz/bind permutations). Coverage: the simple
+  single-PSO set + moe routing chain + deltanet chain + embed/gemv/w13sw/qkv_rs cores + the
+  whole attn and rope-store families (14 cores) — variation points stay thin hand-written
+  wrappers (fmt dispatchers kq_*/moe_gemv*, pso-parameterized ew2, dummy binds, f16 picks);
+  batch rail untouched (R4). Net ≈ −690 lines of hand-maintained bind/hz code. RATCHET: a
+  role-less @ssbo on a lensed class is now a COMPILE ERROR (the flip immediately caught
+  RopeStoreQ8's undeclared bias plane); un-lensed classes stay covered by runtime STRICT.
+  Gates: decode-parity suite green under CONCURRENT+STRICT (arm13 coverage proof); six
+  fam matrix gates green — 26B q8/k4 tolerance cells BYTE-IDENTICAL to the pre-refactor
+  baseline (2.498179/5.1424093, 2.5177252/13.825883), gptoss/qwen35/gemma2/gemma4/gemma4e
+  clean; the only reds are the tracked pre-existing metal object leak (30/36/15 by filter,
+  unchanged counts). `range` is a lexer type token — the hz-length tag is @span, not @range.
+
+- **.dlim mint abort past ~11GB: root-caused as DISK-FULL, writer fixed, red cleared (2026-07-23).**
+  Not an int-width bug — the write rail is 64-bit clean end-to-end (ftello, long_fwrite → size_t
+  fwrite, long_length, uint64 offsets; the Jul-21 29GB mint of this same model and the image
+  suite's 5.4GB voxtral arm are standing proof). The disk had filled: 804 GiB of .dlim images
+  across ~27 identity generations back to Jul 16 — nothing ever deletes a superseded image, and
+  the Jul-22 sweep's ~92GB of MTP mints ate the last headroom. ENOSPC then surfaced as the
+  per-plane "offset-accounting" cascade (the quoted `0xf0` was the nbytes field — 240 bytes, the
+  30-layer offs plane), and the abort path removed the tmp, hiding the space pressure. Fixed in
+  the writer: `write_plane` now reports short writes honestly ("disk full?"), bails the walk on
+  the first failure instead of pushing the remaining planes at a full disk, and `save_image`
+  verifies the on-disk byte count after close (a buffered small-tail ENOSPC at fclose was
+  silent). Swept the 115 dead pre-v5 images (659 GiB; every pre-Jul-22-13:18 file predates the
+  IMAGE_VERSION=5 bump and is unloadable by construction); fam-gemma4moe re-mint verified green
+  (both 26B rows' engage + tolerance cells pass; the arm's remaining red is the tracked
+  pre-existing metal-object leak, 30 objects on this filter). OPEN (design, propose-first):
+  .dlim GC — every IMAGE_VERSION/knob change silently orphans the previous generation (~20GB per
+  big model). Candidate shapes: fold the tag into the filename and keep-one-per-(gguf, tag) on
+  successful save; or utime-touch images on load and age out cold siblings at save time.
+
 - **Q6-greedy spec-chain inversion on big pure-k6 files (2026-07-22 re-pair).** `spec_cls_capable`
   (dasllama_metal_llama.das:164) is a pure CAPABILITY test — it engages the greedy spec chain for
   any tied-k6 classifier with no BENEFICIAL condition, so a big pure-k6 file eats the spec-chain

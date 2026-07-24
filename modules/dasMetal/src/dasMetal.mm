@@ -38,6 +38,9 @@ namespace das {
     // every handle handed to das is one __bridge_retained ref, counted here;
     // Metal objects are invisible to all six das leak detectors, so the shim counts
     static std::atomic<int64_t> g_metalLiveObjects{0};
+    // lifetime dispatch-call counter (dispatchThreadgroups + dispatchThreads) — the dispatch-count
+    // instrument: callers read deltas around a window (never reset; deltas compose across readers)
+    static std::atomic<int64_t> g_metalDispatchCalls{0};
 
     template <typename HandleT>
     static HandleT * retain_handle ( id obj ) {
@@ -426,6 +429,7 @@ namespace das {
                 groups.x, groups.y, groups.z, threads_per_group.x, threads_per_group.y, threads_per_group.z);
         }
         id<MTLComputeCommandEncoder> e = (__bridge id<MTLComputeCommandEncoder>)(void *) enc;
+        g_metalDispatchCalls.fetch_add(1, std::memory_order_relaxed);
         [e dispatchThreadgroups:MTLSizeMake(groups.x, groups.y, groups.z)
             threadsPerThreadgroup:MTLSizeMake(threads_per_group.x, threads_per_group.y, threads_per_group.z)];
     }
@@ -438,6 +442,7 @@ namespace das {
                 threads.x, threads.y, threads.z, threads_per_group.x, threads_per_group.y, threads_per_group.z);
         }
         id<MTLComputeCommandEncoder> e = (__bridge id<MTLComputeCommandEncoder>)(void *) enc;
+        g_metalDispatchCalls.fetch_add(1, std::memory_order_relaxed);
         [e dispatchThreads:MTLSizeMake(threads.x, threads.y, threads.z)
             threadsPerThreadgroup:MTLSizeMake(threads_per_group.x, threads_per_group.y, threads_per_group.z)];
     }
@@ -510,6 +515,10 @@ namespace das {
 
     int64_t metal_live_object_count () {
         return g_metalLiveObjects.load(std::memory_order_relaxed);
+    }
+
+    int64_t metal_dispatch_call_count () {
+        return g_metalDispatchCalls.load(std::memory_order_relaxed);
     }
 
     // ===== module =====
@@ -681,6 +690,8 @@ namespace das {
 
             addExtern<DAS_BIND_FUN(metal_live_object_count)>(*this, lib, "metal_live_object_count",
                 SideEffects::modifyExternal, "metal_live_object_count");
+            addExtern<DAS_BIND_FUN(metal_dispatch_call_count)>(*this, lib, "metal_dispatch_call_count",
+                SideEffects::modifyExternal, "metal_dispatch_call_count");
         }
         virtual ModuleAotType aotRequire ( TextWriter & tw ) const override {
             tw << "#include \"../modules/dasMetal/src/dasMetal.h\"\n";

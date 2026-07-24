@@ -318,19 +318,25 @@ def private image_post_load(var t : Model) {
 // (voxtral-mini qblob = 3.6 G elements) does not fit the int32 length/byte-count rail
 def private write_plane(f : file; var sections : array<ImgSection>; var cur : uint64&;
                         var ok : bool&; name : string; var field : array<auto(TT)>) {
-    if (empty(field)) {
+    if (empty(field) || !ok) {   // a dead save stays dead — don't keep pushing bytes at a full disk
         return
     }
     let nbytes = uint64(long_length(field)) * uint64(typeinfo sizeof(field[0]))
     let at = pad_to_page(cur)
     write_zeros(f, at - cur)
-    f |> long_fwrite(field)
+    let wrote = f |> long_fwrite(field)
+    if (uint64(wrote) != nbytes) {
+        // a short write is an I/O failure (ENOSPC in practice), not an accounting bug
+        to_log(LOG_ERROR, "dasLLAMA image: plane '{name}' short write {wrote} of {int64(nbytes)} bytes at offset {int64(at)} — disk full? image save aborted\n")
+        ok = false
+        return
+    }
     sections |> push(ImgSection(name = name, off = at, bytes = nbytes))
     cur = at + nbytes
     // fwrite and the section table must agree byte-for-byte, or the mapped planes land at
     // the wrong offsets — fail the save loudly, not the load
     if (uint64(ftell(f)) != cur) {
-        to_log(LOG_ERROR, "dasLLAMA image: plane '{name}' wrote {ftell(f)} != accounted {cur} (nbytes {nbytes}) — image save aborted\n")
+        to_log(LOG_ERROR, "dasLLAMA image: plane '{name}' wrote {ftell(f)} != accounted {int64(cur)} (nbytes {int64(nbytes)}) — image save aborted\n")
         ok = false
     }
 }
@@ -343,6 +349,7 @@ def save_image(var t; path : string; tag : string = "") : bool {
     // not clobber each other's half-written file; last atomic rename wins with same content
     let tmp_path = "{path}.{ref_time_ticks()}.tmp"
     var ok = true
+    var fend = 0ul
     var meta <- new MemSerializer()
     var warch = Archive(reading = false, stream = meta)
     var sections : array<ImgSection>
@@ -389,7 +396,7 @@ def save_image(var t; path : string; tag : string = "") : bool {
         f |> fwrite(meta_blob)
         cur += meta_bytes
         // pad the file itself to a page multiple (the whole-file bytesNoCopy wrap needs it)
-        let fend = pad_to_page(cur)
+        fend = pad_to_page(cur)
         write_zeros(f, fend - cur)
         // patch the header
         var hdr : array<uint8>
@@ -414,6 +421,15 @@ def save_image(var t; path : string; tag : string = "") : bool {
     }
     unsafe {
         delete meta
+    }
+    if (ok) {
+        // buffered-tail backstop: the small tail writes can sit in the stdio buffer and hit
+        // ENOSPC only at fclose, which reports nothing here — verify what landed on disk
+        var st : FStat
+        if (!stat(tmp_path, st) || st.size != fend) {
+            to_log(LOG_ERROR, "dasLLAMA image: '{tmp_path}' is {int64(st.size)} bytes on disk, expected {int64(fend)} — disk full? image save aborted\n")
+            ok = false
+        }
     }
     if (!ok) {
         if (!remove(tmp_path)) {

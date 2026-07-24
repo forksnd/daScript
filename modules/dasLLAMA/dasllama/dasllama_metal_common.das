@@ -148,7 +148,7 @@ var g_decodes = 0l
 var g_declines = 0l
 var g_declines_by_reason : table<string; int64>
 var g_logits_cpu = false
-var g_skip = ""                              // DASLLAMA_METAL_DECODE_SKIP=gemv|attn|ew knockout rail
+var g_skip = ""                              // DASLLAMA_METAL_DECODE_SKIP=gemv|attn|ew|moe_rt|moe_sh|qkv|wo knockout rail
 
 var g_signs : MetalBuffer?                  // the tq4 rotation signs (128-float prefix rule)
 
@@ -218,6 +218,115 @@ var g_arena : MetalBuffer?
 var g_arena_bytes = 0ul
 var g_arena_epoch = 0l   // bumps on every grow-rebuild — pre-encoded steps referencing the old buffer are stale
 var g_arena_free : array<tuple<off : uint64; size : uint64>>   // sorted by off, coalesced
+
+// ===== decode PSO + resource globals (declared here, not kernels.das, so [metal_dispatch]-generated
+// builders — co-located with their kernel class, some in prefill.das — see the pipeline they
+// dispatch; compile_pso() assignments + shutdown releases stay in kernels' metal_decode_init) =====
+var g_pso_gemv : MetalComputePipeline?
+var g_gemv_rows = 4l                       // rows (simdgroups) per GEMV threadgroup
+var g_pso_rms : MetalComputePipeline?
+var g_pso_add : MetalComputePipeline?
+var g_pso_addrms : MetalComputePipeline?
+var g_pso_preaddrms : MetalComputePipeline?
+var g_pso_swiglu : MetalComputePipeline?
+var g_pso_geglu : MetalComputePipeline?
+var g_pso_softcap : MetalComputePipeline?
+var g_pso_suppress : MetalComputePipeline?
+var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind
+var g_zero : MetalBuffer?                   // persistent 0u — the sink/hass identity bind
+var g_pso_attn16 : MetalComputePipeline?
+var g_pso_attn32 : MetalComputePipeline?
+var g_pso_attn_q8 : MetalComputePipeline?   // q8_0-mirror twin (dual-view block reads)
+var g_pso_attn_tq4 : MetalComputePipeline?  // tq4-mirror twin (rotated-basis nibble reads)
+var g_pso_attnp16 : MetalComputePipeline?
+var g_pso_attnp32 : MetalComputePipeline?
+var g_pso_attnp_q8 : MetalComputePipeline?
+var g_pso_attnp_tq4 : MetalComputePipeline?
+var g_pso_attncomb : MetalComputePipeline?
+var g_pso_rpst16 : MetalComputePipeline?
+var g_pso_rpst_h16 : MetalComputePipeline?  // head-cooperative fused bias+norm+rope+store (QK-norm models)
+var g_pso_rpst32 : MetalComputePipeline?
+var g_pso_rpst_q8 : MetalComputePipeline?   // per-32-block quantizing store
+var g_pso_rpst_tq4 : MetalComputePipeline?  // threadgroup-per-head FWHT + quantizing store
+var g_pso_unsign : MetalComputePipeline?    // the tq4 attention-output un-rotate
+var g_pso_qknorm : MetalComputePipeline?    // per-head QK RMSNorm prepass (MSL owned by prefill)
+
+var g_pso_argmax : MetalComputePipeline?
+var g_pso_copy_row : MetalComputePipeline?   // zero-copy logits: staging row -> wrapped session storage
+var g_pso_emb : MetalComputePipeline?
+var g_pso_emb_k6 : MetalComputePipeline?     // tied-k6 spec chain's embed gather
+var g_pso_moe_router : MetalComputePipeline?   // MoE (Wave C): router GEMV over the fp32 slab
+var g_pso_moe_select : MetalComputePipeline?   // softmax + top-k + renorm (one simdgroup)
+var g_pso_moe_gemv_q8 : MetalComputePipeline?  // expert-indexed GEMV twins (grid.y = slot)
+var g_pso_moe_kq_k4 : MetalComputePipeline?
+var g_pso_moe_kq_k5 : MetalComputePipeline?
+var g_pso_moe_kq_k6 : MetalComputePipeline?
+var g_pso_moe_combine : MetalComputePipeline?  // weighted top-k reduce into the w2 write shape
+var g_pso_g4rnorm : MetalComputePipeline?      // gemma4 MoE router-input norm (stage 3)
+var g_pso_moe_wscale : MetalComputePipeline?   // gemma4 per-expert down-scale fold
+var g_pso_swiglu_oai : MetalComputePipeline?   // gpt-oss clamped swiglu (stage 4)
+var g_pso_moe_gemv_mx4 : MetalComputePipeline?  // gpt-oss MXFP4 expert GEMV
+var g_pso_moe_gemv_q51 : MetalComputePipeline?  // Q5_1 expert GEMV (per-32 planes)
+var g_e8m0_tab : MetalBuffer?                   // [256] exact e8m0_half scales
+var g_mx4_vtab : MetalBuffer?                   // [16] signed doubled-e2m1 values
+var g_pso_dn_conv : MetalComputePipeline?      // deltanet (Wave D): causal conv + SiLU
+var g_pso_dn_hist : MetalComputePipeline?      // conv-history advance
+var g_pso_dn_l2 : MetalComputePipeline?        // q/k per-head L2 norm + q pre-scale
+var g_pso_dn_scan : MetalComputePipeline?      // the fused sequential delta rule
+var g_pso_dn_gate : MetalComputePipeline?      // z-gated out-norm
+var g_pso_dn_deint : MetalComputePipeline?     // 2x-wide [q|gate] deinterleave
+var g_pso_sigmul : MetalComputePipeline?       // x ⊙ σ(g) — the gated-attention out-gate
+var g_pso_axpy_sig : MetalComputePipeline?     // y += x ⊙ σ(g[row]) — the shexp combine (stage 3)
+var g_pso_qkvrs16 : MetalComputePipeline?   // fused QKV+rope+store (s16 path)
+var g_pso_qkvrs32 : MetalComputePipeline?
+var g_pso_w13sw : MetalComputePipeline?
+var g_pso_kq_k4 : MetalComputePipeline?
+var g_pso_kq_k5 : MetalComputePipeline?
+var g_pso_kq_k5c : MetalComputePipeline?   // the select-form nr0=1 twin — n < 3072 / small-d sites
+var g_pso_kq_k6 : MetalComputePipeline?
+var g_pso_kq_mvb2_k4 : MetalComputePipeline?   // batch B=2..8: the kq ext small-batch mv twins
+var g_pso_kq_mvb4_k4 : MetalComputePipeline?
+var g_pso_kq_mvb2_k5 : MetalComputePipeline?
+var g_pso_kq_mvb4_k5 : MetalComputePipeline?
+var g_pso_kq_mvb2_k6 : MetalComputePipeline?
+var g_pso_kq_mvb4_k6 : MetalComputePipeline?
+var g_pso_kq_mvb8_k4 : MetalComputePipeline?   // B=5..8 single-pass twins (in-graph A/B vs 2 x B4 groups)
+var g_pso_kq_mvb8_k5 : MetalComputePipeline?
+var g_pso_kq_mvb8_k6 : MetalComputePipeline?
+var g_pso_kq_mm_b4 : MetalComputePipeline?   // batch B>=9: the prefill-owned kq mul_mm twins
+var g_pso_kq_mm_b5 : MetalComputePipeline?
+var g_pso_kq_mm_b6 : MetalComputePipeline?     // fused W1|W3+swiglu (s16 path)
+// the batched-step set (P4): fixed-B GEMVs + the M-pad-32 GEMM twin (f32 X) + row-table kernels
+var g_pso_gemv_b2 : MetalComputePipeline?
+var g_pso_gemv_b4 : MetalComputePipeline?
+var g_pso_mv_b2 : MetalComputePipeline?
+var g_pso_mv_b4 : MetalComputePipeline?
+var g_pso_w13sw_b2 : MetalComputePipeline?
+var g_pso_w13sw_b4 : MetalComputePipeline?
+var g_pso_gemm_b : MetalComputePipeline?
+var g_pso_gemm_b_sk : MetalComputePipeline? // split-K twin (per-site policy)
+var g_pso_skred : MetalComputePipeline?     // the split-K plane reduce
+var g_pso_gemm64_b : MetalComputePipeline?  // 64-wide N tile (classifier site)
+var g_pso_mm : MetalComputePipeline?        // the prefill module's MetalQ8MulMm (34B blob)
+var g_pso_attnb16 : MetalComputePipeline?
+var g_pso_attnb32 : MetalComputePipeline?
+var g_pso_attnb_q8 : MetalComputePipeline?
+var g_pso_attnb_tq4 : MetalComputePipeline?
+var g_pso_attnpb16 : MetalComputePipeline?
+var g_pso_attnpb32 : MetalComputePipeline?
+var g_pso_attnpb_q8 : MetalComputePipeline?
+var g_pso_attnpb_tq4 : MetalComputePipeline?
+var g_pso_attncombb : MetalComputePipeline?
+var g_pso_attnd16 : MetalComputePipeline?   // fused single-pass batch attention (hs 128)
+var g_pso_attnd32 : MetalComputePipeline?
+var g_pso_attnd_q8 : MetalComputePipeline?
+var g_pso_attnd_tq4 : MetalComputePipeline?
+var g_pso_attncombd : MetalComputePipeline?
+var g_pso_rpstb16 : MetalComputePipeline?
+var g_pso_rpstb32 : MetalComputePipeline?
+var g_pso_rpstb_q8 : MetalComputePipeline?
+var g_pso_rpstb_tq4 : MetalComputePipeline?
+var g_pso_addrmsb : MetalComputePipeline?
 // uids a batch step is actively encoding against — eviction must never free a batch row's slice
 // out from under the step being assembled (the single path's `keep` protects only one uid)
 var g_pin : table<uint64>
@@ -400,6 +509,10 @@ def public metal_batch_decode_stage_stats() : tuple<steps : int64; rows : int64;
         encode_us = g_us_bencode, wait_us = g_us_bwait, gpu_us = g_gpu_b_ms * 1000.0lf,
         readback_us = g_us_breadback)
 }
+
+//! Lifetime dispatch-call count (dispatchThreadgroups + dispatchThreads, all rails) — read deltas
+//! around a window; the dispatch-count instrument for the split-too-much question.
+def public metal_dispatch_calls() : int64 => metal_dispatch_call_count()
 
 //! Cumulative per-stage wall since load/reset — (served steps, CPU setup us, encode us, commit+wait
 //! us, GPU-timestamp us within the wait, readback+writeback us). The chase harness's numbers rail.
@@ -1247,6 +1360,366 @@ def bar_dep(enc : MetalComputeEncoder?; var h : HazTrack; rmask, wmask : uint) {
     h.w |= wmask
 }
 
+// ===== the single-decode range tracker (the dispatch port) =====
+// lcpp ggml_mem_ranges-shaped, finer: exact (buffer, off, len) ranges over mutable FRAME buffers
+// only; armed only while the single-stream concurrent encoder builds (others no-op the staging)
+
+struct MemRange {
+    buf : uint64    // intptr of the MetalBuffer handle (arena/pool handles are load-stable)
+    p0 : uint64
+    p1 : uint64
+    dst : bool
+}
+
+let HZ_WHOLE = 0xFFFFFFFFFFFFFFFFul   // whole-buffer p1 — for binds whose span lives in a uniform
+
+var g_hz_on = false                 // gating armed for the encoder being built
+var g_hz_paranoid = false           // DASLLAMA_METAL_HAZARD_PARANOID: barrier every dispatch
+var g_hz_strict = false             // DASLLAMA_METAL_HAZARD_STRICT: undeclared dispatch panics
+var g_hz_dirty = false              // an undeclared dispatch ran — the next gate must barrier
+var g_hz_stage : array<MemRange>    // the next dispatch's declared ranges
+var g_hz_pend : array<MemRange>     // unbarriered ranges live on the encoder
+var g_hz_barriers = 0l              // lifetime barrier count (chase prints the per-step delta)
+var g_hz_gated = 0l                 // lifetime gated dispatches — the coverage check's twin
+var g_hz_undeclared = 0l            // conservative fallbacks taken (0 once migration completes)
+var g_hz_cover_warned = false
+
+def hz_read(b : MetalBuffer?; off, len : uint64) {
+    if ((g_hz_on || g_gr_on) && b != null) {
+        g_hz_stage |> push(MemRange(buf = intptr(b), p0 = off, p1 = off + len, dst = false))
+    }
+}
+
+def hz_read(b : MetalBuffer?) {
+    if ((g_hz_on || g_gr_on) && b != null) {
+        g_hz_stage |> push(MemRange(buf = intptr(b), p0 = 0ul, p1 = HZ_WHOLE, dst = false))
+    }
+}
+
+def hz_write(b : MetalBuffer?; off, len : uint64) {
+    if ((g_hz_on || g_gr_on) && b != null) {
+        g_hz_stage |> push(MemRange(buf = intptr(b), p0 = off, p1 = off + len, dst = true))
+    }
+}
+
+def hz_write(b : MetalBuffer?) {
+    if ((g_hz_on || g_gr_on) && b != null) {
+        g_hz_stage |> push(MemRange(buf = intptr(b), p0 = 0ul, p1 = HZ_WHOLE, dst = true))
+    }
+}
+
+// the per-dispatch gate: barrier + reset only when this dispatch's staged ranges conflict with
+// the live set (any overlap involving a write) — then the staged set joins the live set
+def hz_gate(enc : MetalComputeEncoder?) {
+    if (!g_hz_on) {
+        return
+    }
+    g_hz_gated++
+    if (empty(g_hz_stage)) {
+        // undeclared dispatch: serial semantics — barrier before it, and dirty forces one after
+        if (g_hz_strict) {
+            panic("dasLLAMA metal decode: undeclared dispatch under DASLLAMA_METAL_HAZARD_STRICT")
+        }
+        g_hz_undeclared++
+        if (g_hz_dirty || !empty(g_hz_pend)) {
+            metal_memory_barrier(enc)
+            g_hz_barriers++
+            g_hz_pend |> clear()
+        }
+        g_hz_dirty = true
+        return
+    }
+    var bar = g_hz_dirty || (g_hz_paranoid && !empty(g_hz_pend))
+    if (!bar) {
+        for (s in g_hz_stage) {
+            for (p in g_hz_pend) {
+                if ((p.dst || s.dst) && s.buf == p.buf && s.p0 < p.p1 && p.p0 < s.p1) {
+                    bar = true
+                    break
+                }
+            }
+            break if (bar)
+        }
+    }
+    if (bar) {
+        metal_memory_barrier(enc)
+        g_hz_barriers++
+        g_hz_pend |> clear()
+    }
+    g_hz_dirty = false
+    g_hz_pend |> push_from(g_hz_stage)
+    g_hz_stage |> clear()
+}
+
+// arm/disarm around one encoder's build; lifetime counters survive
+def hz_arm(on : bool) {
+    g_hz_on = on
+    g_hz_stage |> clear()
+    g_hz_pend |> clear()
+    g_hz_dirty = false
+}
+
+// ===== the step graph (the dispatch port, session 2) =====
+// Graph mode: the kn_* twins RECORD each dispatch as a KNode; graph_flush replays in schedule
+// order with the hz oracle deriving barriers — a schedule can only change speed, not correctness.
+
+struct KNode {
+    pso : MetalComputePipeline?
+    grid : uint3
+    tg : uint3
+    tgmem : uint64   // threadgroup memory bytes at index 0 (0 = none)
+    bind0 : int      // g_gr_binds slice
+    nbind : int
+    range0 : int     // g_gr_ranges slice (the hz declarations)
+    nrange : int
+}
+
+struct KBind {
+    buf : MetalBuffer?
+    off : uint64
+    slot : int
+}
+
+var g_gr_on = false
+var g_gr_nodes : array<KNode>
+var g_gr_binds : array<KBind>
+var g_gr_ranges : array<MemRange>
+var g_gr_open = false            // a node is being built (kn_pipeline .. kn_dispatch)
+
+def kn_pipeline(enc : MetalComputeEncoder?; pso : MetalComputePipeline?) {
+    if (!g_gr_on) {
+        metal_set_pipeline(enc, pso)
+        return
+    }
+    // the helpers hold handles as const params; the node stores for deferred encoding only —
+    // nothing writes through these, the strip is capture-side plumbing
+    g_gr_nodes |> push(KNode(pso = unsafe(reinterpret<MetalComputePipeline?>(pso)),
+        bind0 = length(g_gr_binds), range0 = length(g_gr_ranges)))
+    g_gr_open = true
+}
+
+def kn_buffer(enc : MetalComputeEncoder?; b : MetalBuffer?; off : uint64; slot : int) {
+    if (!g_gr_on) {
+        metal_set_buffer(enc, b, off, slot)
+        return
+    }
+    g_gr_binds |> push(KBind(buf = unsafe(reinterpret<MetalBuffer?>(b)), off = off, slot = slot))
+}
+
+def kn_tgmem(enc : MetalComputeEncoder?; bytes : uint64; idx : int) {
+    if (!g_gr_on) {
+        metal_set_threadgroup_memory_length(enc, bytes, idx)
+        return
+    }
+    g_gr_nodes[length(g_gr_nodes) - 1].tgmem = bytes
+}
+
+def kn_dispatch(enc : MetalComputeEncoder?; grid, tg : uint3) {
+    if (!g_gr_on) {
+        metal_dispatch_threadgroups(enc, grid, tg)
+        return
+    }
+    let i = length(g_gr_nodes) - 1
+    assert(g_gr_open)
+    g_gr_nodes[i].grid = grid
+    g_gr_nodes[i].tg = tg
+    g_gr_nodes[i].nbind = length(g_gr_binds) - g_gr_nodes[i].bind0
+    // the helper's hz declarations become the node's ranges (hz_gate no-ops in graph mode)
+    g_gr_ranges |> push_from(g_hz_stage)
+    g_hz_stage |> clear()
+    g_gr_nodes[i].nrange = length(g_gr_ranges) - g_gr_nodes[i].range0
+    g_gr_open = false
+}
+
+def gr_arm(on : bool) {
+    g_gr_on = on
+    g_gr_nodes |> clear()
+    g_gr_binds |> clear()
+    g_gr_ranges |> clear()
+    g_gr_open = false
+    g_hz_stage |> clear()
+}
+
+// encode one captured node with the hz oracle deciding the barrier in front of it
+def private gr_encode_node(enc : MetalComputeEncoder?; n : KNode) {
+    g_hz_stage |> reserve(n.nrange)
+    for (r in range(n.nrange)) {
+        g_hz_stage |> push(g_gr_ranges[n.range0 + r])
+    }
+    metal_set_pipeline(enc, n.pso)
+    if (n.tgmem > 0ul) {
+        metal_set_threadgroup_memory_length(enc, n.tgmem, 0)
+    }
+    for (b in range(n.nbind)) {
+        let kb = g_gr_binds[n.bind0 + b]
+        metal_set_buffer(enc, kb.buf, kb.off, kb.slot)
+    }
+    hz_gate(enc)
+    metal_dispatch_threadgroups(enc, n.grid, n.tg)
+}
+
+def graph_flush(enc : MetalComputeEncoder?) {
+    let ident : array<int>
+    graph_flush(enc, ident)
+}
+
+// ===== the load-time schedule (compile once per shape class, replay per token) =====
+// ASAP leveling over the conflict DAG (write-involved overlap = ORDERING edge, capture-order
+// direction) — levels are antichains, and the level count is the barrier floor.
+
+struct KSched {
+    order : array<int>
+    depth : int
+    nodes : int
+}
+
+var g_gr_scheds : table<uint64; KSched>
+var g_gr_sched_mode = -1   // DASLLAMA_METAL_SCHED: 1 = leveled reorder (default), 0 = capture order
+
+def private sched_enabled : bool {
+    if (g_gr_sched_mode < 0) {
+        g_gr_sched_mode = env_int("DASLLAMA_METAL_SCHED", 1)
+    }
+    return g_gr_sched_mode != 0
+}
+
+// the shape-class key: pso sequence + per-node bind/range counts (pooled buffer identities and
+// arena offsets vary per step, but the conflict STRUCTURE is role-determined within a class —
+// grid values never enter, the oracle re-derives barriers per step anyway)
+def private gr_shape_hash : uint64 {
+    var h = 14695981039346656037ul
+    for (n in g_gr_nodes) {
+        h = (h ^ intptr(n.pso)) * 1099511628211ul
+        h = (h ^ uint64(n.nbind)) * 1099511628211ul
+        h = (h ^ uint64(n.nrange)) * 1099511628211ul
+    }
+    return h
+}
+
+// level[j] = 1 + max level of any conflicting predecessor; scan partitioned per buffer id.
+// An UNDECLARED node has no edges and would float freely — refuse and keep capture order.
+def private gr_schedule(var sched : KSched) : bool {
+    let n = length(g_gr_nodes)
+    sched.nodes = n
+    for (nd in g_gr_nodes) {
+        if (nd.nrange == 0) {
+            return false
+        }
+    }
+    var level : array<int>
+    level |> resize(n)
+    // per-buffer event lists: indices into g_gr_ranges, with a parallel range->node map
+    var rnode : array<int>
+    rnode |> resize(length(g_gr_ranges))
+    for (j in range(n)) {
+        let nd & = unsafe(g_gr_nodes[j])
+        for (r in range(nd.range0, nd.range0 + nd.nrange)) {
+            rnode[r] = j
+        }
+    }
+    var by_buf : table<uint64; array<int>>
+    for (j in range(n)) {
+        let nd & = unsafe(g_gr_nodes[j])
+        var lvl = 0
+        for (r in range(nd.range0, nd.range0 + nd.nrange)) {
+            let rj = g_gr_ranges[r]
+            if (key_exists(by_buf, rj.buf)) {
+                for (k in by_buf[rj.buf]) {
+                    let ri = g_gr_ranges[k]
+                    if ((ri.dst || rj.dst) && rj.p0 < ri.p1 && ri.p0 < rj.p1) {
+                        lvl = max(lvl, level[rnode[k]] + 1)
+                    }
+                }
+            }
+        }
+        level[j] = lvl
+        sched.depth = max(sched.depth, lvl)
+        for (r in range(nd.range0, nd.range0 + nd.nrange)) {
+            by_buf[g_gr_ranges[r].buf] |> push(r)   // nolint:PERF006 — per-buffer lists grow by ones across the whole walk
+        }
+    }
+    // stable counting emit: capture order within a level keeps locality + determinism
+    sched.order |> reserve(n)
+    for (lvl in range(sched.depth + 1)) {
+        for (j in range(n)) {
+            if (level[j] == lvl) {
+                sched.order |> push(j)
+            }
+        }
+    }
+    delete level
+    delete rnode
+    delete by_buf
+    return true
+}
+
+//! Replay the captured graph under the shape class's cached schedule (compiled on first sight,
+//! ~sub-ms one-time); DASLLAMA_METAL_SCHED=0 or an undeclared node fall back to capture order.
+def graph_flush_sched(enc : MetalComputeEncoder?) {
+    if (!sched_enabled()) {
+        graph_flush(enc)
+        return
+    }
+    let h = gr_shape_hash()
+    if (!key_exists(g_gr_scheds, h)) {
+        var s : KSched
+        if (!gr_schedule(s)) {
+            to_log(LOG_WARNING, "dasLLAMA metal decode: step graph holds undeclared dispatches — schedule stays capture-order\n")
+        }
+        to_log(LOG_INFO, "dasLLAMA metal decode: schedule compiled — {s.nodes} nodes, depth {s.depth} (class {h})\n")
+        g_gr_scheds[h] <- s
+    }
+    graph_flush(enc, g_gr_scheds[h].order)
+}
+
+//! Replay the captured step graph onto `enc` in `order` (empty = capture order), the hz oracle
+//! deriving barriers per step — a schedule permutation can only change speed, never correctness.
+def graph_flush(enc : MetalComputeEncoder?; order : array<int>) {
+    g_gr_on = false
+    hz_arm(true)
+    if (empty(order)) {
+        for (n in g_gr_nodes) {
+            gr_encode_node(enc, n)
+        }
+    } else {
+        assert(length(order) == length(g_gr_nodes))
+        for (i in order) {
+            gr_encode_node(enc, g_gr_nodes[i])
+        }
+    }
+    hz_arm(false)
+}
+
+// the coverage check: every dispatch on a gated encoder must have passed hz_gate — a raw
+// metal_dispatch_* in a decode-path helper would run UNBARRIERED (silent race), so a count
+// mismatch is loud: strict panics, otherwise one LOG_ERROR per process
+def hz_coverage_check(ndisp, ngated : int64) {
+    if (ndisp == ngated) {
+        return
+    }
+    if (g_hz_strict) {
+        panic("dasLLAMA metal decode: {ndisp - ngated} dispatch(es) bypassed hz_gate on a gated encoder")
+    }
+    if (!g_hz_cover_warned) {
+        g_hz_cover_warned = true
+        to_log(LOG_ERROR, "dasLLAMA metal decode: {ndisp - ngated} dispatch(es) bypassed hz_gate on a gated encoder — ungated dispatches are unbarriered\n")
+    }
+}
+
+//! (barriers issued, gated dispatches, conservative undeclared fallbacks) since load — read
+//! deltas around a window; the chase prints barriers/step next to disp/step.
+def public metal_hazard_stats() : tuple<barriers : int64; gated : int64; undeclared : int64> {
+    return (barriers = g_hz_barriers, gated = g_hz_gated, undeclared = g_hz_undeclared)
+}
+
+//! Hazard-mode rails: `paranoid` barriers every dispatch on the concurrent encoder (isolates
+//! encoder-flip bugs from barrier-elision bugs); `strict` panics on an undeclared dispatch
+//! (the migration-coverage gate). Env twins: `DASLLAMA_METAL_HAZARD_PARANOID` / `_STRICT`.
+def public set_metal_decode_hazard(paranoid, strict : bool) {
+    g_hz_paranoid = paranoid
+    g_hz_strict = strict
+}
+
 
 // ===== the pending-step (encode-ahead) machinery =====
 
@@ -1403,6 +1876,8 @@ def metal_common_init : bool {
     }
     g_queue = metal_new_command_queue(g_dev)
     g_attn_single_max = clamp(int64(env_int("DASLLAMA_METAL_ATTN_SINGLE", 64)), ATTN_CHUNK_ROWS, 128l)
+    g_hz_paranoid = env_int("DASLLAMA_METAL_HAZARD_PARANOID", 0) != 0
+    g_hz_strict = env_int("DASLLAMA_METAL_HAZARD_STRICT", 0) != 0
     return true
 }
 
@@ -1433,6 +1908,10 @@ def weight_caches_flush_on_reload {
 }
 
 def metal_common_release {
+    // schedules key on PSO pointers — a re-init reallocates PSOs, so cached classes would lie
+    unsafe {
+        delete g_gr_scheds
+    }
     nc_logits_release()
     for (mr in values(g_mirrors)) {
         mirror_release(mr)

@@ -21,6 +21,12 @@ require daslib/strings_boost   // nolint:STYLE030 — used only inside the Apple
 //   noattn    DASLLAMA_METAL_DECODE_SKIP=attn semantics: nologits minus single-query attention
 //   noew      minus rms/rope/kv-store/add/swiglu (the elementwise set)
 //   nogemv    minus every layer GEMV — attention + elementwise only
+//   nomoert   minus the ROUTED expert GEMVs only (router/select/combine + dense-shared stay live)
+//   nomoesh   minus the dense-shared branch GEMVs only (g4 shared FFN / qwen35moe shexp)
+//   noqkv     minus the attention input GEMVs only (wq/wk/wv or the fused QKV dispatch)
+//   nowo      minus the attention output projection GEMV only
+//   nofuse    the R1 epilogue-fusion kernel OFF (separate norm/add dispatches) — concurrent +
+//             graph stay ON, so full-vs-nofuse is the clean fused-vs-unfused A/B (bar/step + t/s)
 // Knockout arms compute GARBAGE tokens by design; timing is shape-bound, not data-bound. Each
 // window is preceded by one unclocked step that absorbs the mirror's rewind re-upload (windows
 // restart at the same depth, so pos < watermark fires every time) and the first-touch region
@@ -88,8 +94,11 @@ def private greedy_top(s : Session; vocab : int64) : int64 {
 }
 
 def private apply_arm(arm) {   // untyped param = generic — non-Apple builds never compile the Metal-typed body
-    set_metal_decode_skip(arm == "noattn" ? "attn" : (arm == "noew" ? "ew" : (arm == "nogemv" ? "gemv" : "")))
+    set_metal_decode_skip(arm == "noattn" ? "attn" : (arm == "noew" ? "ew" : (arm == "nogemv" ? "gemv" :
+        (arm == "nomoert" ? "moe_rt" : (arm == "nomoesh" ? "moe_sh" : (arm == "noqkv" ? "qkv" :
+        (arm == "nowo" ? "wo" : "")))))))
     set_metal_decode_logits_cpu(arm == "nologits")
+    set_metal_decode_fuse(arm == "nofuse" ? 0 : -1)   // A/B the R1 epilogue-fusion kernel (concurrent+graph stay on)
 }
 
 // one timed window: unclocked pre-step at `depth` (absorbs the rewind re-upload), then n greedy
@@ -99,12 +108,17 @@ def private run_window(t; var s : Session; depth, n : int64; tok0 : int64; arm :
     forward(t, s, tok0, depth)
     var tok = greedy_top(s, t.config.vocab_size)
     metal_decode_stage_reset()
+    let d0 = metal_dispatch_calls()
+    let h0 = metal_hazard_stats()
     let t0 = ref_time_ticks()
     for (i in range64(n)) {
         forward(t, s, tok, depth + 1l + i)
         tok = greedy_top(s, t.config.vocab_size)
     }
     let us = get_time_usec(t0)
+    let disp = metal_dispatch_calls() - d0
+    let hz = metal_hazard_stats()
+    let bar = hz.barriers - h0.barriers
     apply_arm("full")   // restore before anything else runs
     let st = metal_decode_stage_stats()
     let tps = double(n) / (double(us) * 1.0e-6lf)
@@ -116,7 +130,7 @@ def private run_window(t; var s : Session; depth, n : int64; tok0 : int64; arm :
         rb = double(float(st.readback_us) / fn))
     w.tail = double(us) / double(n) - w.setup - w.encode - w.wait - w.rb
     let miss = served != n ? "  ⚠ served {served}/{n}" : ""
-    print("  {arm} @{depth}: {n} tok in {us}us = {tps} t/s | per-step setup {w.setup} encode {w.encode} wait {w.wait} (gpu {w.gpu}) rb {w.rb} tail {w.tail} us{miss}\n")
+    print("  {arm} @{depth}: {n} tok in {us}us = {tps} t/s | per-step setup {w.setup} encode {w.encode} wait {w.wait} (gpu {w.gpu}) rb {w.rb} tail {w.tail} us  disp {disp / n}/step bar {bar / n}/step{miss}\n")
     if (w.tps > best.tps) {
         best = w
     }
