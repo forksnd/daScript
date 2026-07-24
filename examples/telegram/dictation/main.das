@@ -2115,19 +2115,25 @@ def private check_server(var out_llm : string&; var out_asr : bool&; var err : s
                 err = "bad /v1/models JSON: {perr}"
             } else {
                 var ids : array<string>
+                var asr_id = ""
                 let data = js?["data"]
                 if (data != null && data is _array) {
                     for (m in data as _array) {
                         let mid : string = m?["id"] ?? ""
                         if (ends_with(mid, "-asr")) {
                             out_asr = true
+                            asr_id = mid
                         } else {
                             ids |> push(mid)
                         }
                     }
                 }
                 if (empty(g_cfg.model)) {
-                    out_llm = !empty(ids) ? ids[0] : ""
+                    // unpinned requests route to the server's DEFAULT slot, which need not be
+                    // first in the list — but the "-asr" id is advertised for the default slot
+                    // only, so its stem names the slot unpinned chat actually lands on
+                    let def_id = !empty(asr_id) ? slice(asr_id, 0, length(asr_id) - 4) : ""
+                    out_llm = !empty(def_id) ? def_id : (!empty(ids) ? ids[0] : "")
                     ok = !empty(out_llm)
                     if (!ok) {
                         err = "dasllama-server at {g_cfg.server} lists no model"
