@@ -9,27 +9,34 @@ dasLLAMA-00 — The Problem Statement
     single: Tutorial; Transformer
     single: Tutorial; Llama 2
 
-Before using dasLLAMA, build the thing it has to become.
+**dasLLAMA** is daslang's LLM library. It loads and runs large language
+models: GGUF model files, quantized weights,
+CPU and GPU backends, chat, speech. It is the engine behind
+``dasllama-server``. If you are here to *use* it, skip this page and start
+with :ref:`tutorial 01 <tutorial_dasLLAMA_hello_generate>` — a few lines of
+code, and a model talks to you.
 
-This tutorial is a complete, deliberately tiny Llama-2 *inference* engine —
-inference is running a model, as opposed to training one — in one daslang
-file. It maps a real checkpoint (the file of 15 million learned numbers, or
-*parameters*, that training produced), runs every layer of the transformer,
-encodes a prompt, chooses the most likely next token, and prints the
-completion.
-There is no ``require dasllama``: only the problem, expressed directly.
+Here we go the other way: before using dasLLAMA, we build the thing it has
+to become.
 
-It tells a second story too. The first dasLLAMA commit was authored on
-2026-06-27. It began with the same naive fp32 matrix multiplication used here;
-about a day later, `PR #3297
-<https://github.com/GaijinEntertainment/daScript/pull/3297>`_ contained
-Llama-2 and Llama-3, GGUF loading, quantization, threading, batched prefill,
-tests, and chat. The path from this readable program to native machine code
-never had to leave one programming environment.
+We build an **inference** engine. Inference means the model *infers* the
+next word from the previous ones. :ref:`Training <t00-training>` is how the
+model was made — a separate story.
 
-No prior machine-learning background is assumed. By the end of the page you
-should be able to read ``forward`` top to bottom and know why every line is
-there.
+.. _t00-transformer:
+
+The machine that infers is a **transformer**: the network design behind
+every modern LLM. It is a stack of identical layers. Each layer reads a
+list of numbers, improves it a little, and passes it on. The stack
+*transforms* its input, step by step, until the result points at the next
+word — that is the name. We build a complete transformer in one daslang
+file: about 500 lines, nothing beyond the standard library. We load a real
+model, run it, and complete a **prompt** — the text you give the model to
+start from.
+
+No machine-learning background needed. By the end you should be able to
+read the code line by line and understand what every line does and why it
+is there.
 
 Get the model
 =============
@@ -39,28 +46,26 @@ Download the two files used by Karpathy's `llama2.c
 
 * `stories15M.bin
   <https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin>`_
-  — the TinyStories Llama-2 checkpoint
+  — the model: 15 million learned numbers. Trained on TinyStories, simple
+  children's stories — that is why something this small can tell a
+  coherent tale.
 * `tokenizer.bin
   <https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin>`_
-  — its tokenizer vocabulary
+  — its tokenizer: turns text into the model's :ref:`tokens <t00-token>` and
+  back.
 
-Put them anywhere convenient, then run from the daScript project root::
+Put them anywhere convenient. You can run this with the interpreter at
+about six :ref:`tokens <t00-token>` per second, and watch the words flow::
 
    daslang.exe tutorials/dasLLAMA/00_problem_statement.das -- stories15M.bin tokenizer.bin "Once upon a time"
 
-The interpreter is intentionally usable here. On a fast desktop it tells the
-story at about six tokens per second, which makes every operation
-inspectable. Add ``-jit`` to run the exact same source as native code — about
-75 tokens per second, twelve times the interpreter::
+Or run it with ``-jit`` at about 75, which may be more practical::
 
    daslang.exe -jit tutorials/dasLLAMA/00_problem_statement.das -- stories15M.bin tokenizer.bin "Once upon a time"
 
-Leave off the final argument to use the default prompt, ``Once upon a time``.
-
-Either way, the run ends in the same place. This tutorial decodes greedily —
-always the single most likely next token — so this checkpoint tells exactly
-one story for this prompt, every run, token-identical in the interpreter and
-under JIT::
+Leave off the final argument to use the default prompt. Try different
+prompts — you may end up with different stories. With the default one, you
+get exactly this::
 
    dim=288, layers=6, heads=6, parameters≈15204000
 
@@ -69,56 +74,62 @@ under JIT::
    was the sun! She thought it was so pretty.
    ...
 
-The rest of Lily's story follows, token by token. By the end of this page you
-should be able to read ``forward`` and say why every one of those tokens
-happened.
+The rest of Lily's story follows.
 
 Numbers, not words
 ==================
 
-The model cannot read. The tokenizer splits the prompt into pieces from a
-fixed 32,000-entry vocabulary and hands over their integer IDs. Everything
-after that is arithmetic on *vectors* — fixed-length arrays of floats — and
-all of it rests on one operation.
+.. _t00-token:
 
-One word has to be settled first: **learned**. Every number this program
-touches was chosen by *training*, a search that finished long before this
-program runs: show the model text, nudge all 15 million numbers so that the
-true next token scores slightly higher, repeat a few billion times. Training
-is not part of this program and is not covered here — this page only
-executes its result. But wherever a table or matrix below is called
-*learned*, that is what it means: its values were selected, example by
-example, to make the final prediction come out right.
+The model cannot read. Before it runs, a **tokenizer** cuts the prompt
+into **tokens**: short words or parts of words. The model knows exactly
+32,000 of them — that list is its **vocabulary**. ``Once`` is one token;
+so is ``upon``. The model receives only their integer IDs. Everything
+after that is arithmetic on **vectors** — fixed-length arrays of floats.
 
-First, each ID is traded for a vector: row ``token`` of a learned
-32,000 × 288 table. Those 288 floats are coordinates. Training pushed tokens
-that behave alike toward similar directions, so the row for ``dog`` ends up
-far closer to ``cat`` than to ``Tuesday`` — not by decree, but because these
-same rows double as the final classifier (visible at the end of the page):
-contexts that could continue with either word pull both rows toward the same
-directions, and rows pulled the same way end up neighbors. No individual
-coordinate means
-anything by itself; *direction* in this 288-dimensional space is what carries
-meaning.
+.. _t00-training:
 
-Second, vectors are compared with the **dot product**: multiply matching
+Where do the model's 15 million numbers — its **parameters** — come from?
+Long before this program runs,
+someone showed the model text, nudged every number so the true next token
+scores a little higher, and repeated that a few billion times. That is
+**training**, and that is why every table and matrix below is called
+**learned** — each value was picked, example by example, so the prediction
+comes out right. We never train here. We only run the result.
+
+.. _t00-embedding:
+
+Each token ID becomes a vector — 288 floats, one learned row from a
+32,000-row table. That vector is the token's **embedding**.
+
+Tokens that behave alike get similar embeddings: ``dog`` lands much closer
+to ``cat`` than to ``Tuesday``. Nobody programmed that — training pushed
+them together, because contexts that fit one usually fit the other. No
+single float means anything by itself; the pattern of all 288 together is
+what carries meaning.
+
+.. _t00-dot:
+
+Vectors are compared with the **dot product**: multiply matching
 coordinates and add everything up.
 
 .. figure:: /_static/dasllama/00_dot_product.*
    :width: 100%
    :alt: Aligned vectors have a large positive dot product, unrelated vectors near zero, opposed vectors negative.
 
-The result is a single number measuring agreement, and it is the only
-comparison this program ever makes. One geometric fact about it matters
-later: the dot product depends only on the two lengths and the angle between
-the vectors — turn both by the same amount and nothing changes.
+The result is one number that measures agreement, and it is the only
+comparison this program ever makes. The dot product depends only on the
+two arrows' lengths and the angle between them — turn both by the same
+amount, and nothing changes.
 
-A matrix multiplication is many dot products at once: each of the ``d`` rows
-of ``W`` is a learned pattern, and ``y[row] = dot(W[row], x)`` asks "how
-strongly does ``x`` express this pattern?" Every matrix you will meet below —
-the attention projections, the feed-forward, the classifier — is used
-exactly this way, one question per row, which is why nearly all inference
-time is spent in ``matmul``.
+.. _t00-projection:
+
+A matrix is a stack of patterns: one learned vector per row. Multiply the
+matrix by an embedding and you get one dot product per row — many
+questions asked at once, one answer each. This is called a **projection**:
+one vector goes in, a new vector of answers comes out. Every matrix in
+this program works exactly this way. Nearly all the running time is this
+one operation.
 
 The transformer at a glance
 ===========================
@@ -127,75 +138,48 @@ The transformer at a glance
    :width: 100%
    :alt: One token's journey: prompt to token IDs to embedding, through six layers of attention and feed-forward, to logits, with the chosen token fed back in.
 
-``x`` is the **residual stream**: the model's evolving representation of the
-current token in the context of everything before it — *residual* because
-each layer contributes only a difference on top of it, never a replacement.
-It starts as the token's embedding row. Each of the six layers then adds two
-corrections:
+   One :ref:`token <t00-token>`'s journey. The sections below walk through every box
+   on this diagram.
 
-* **attention** pulls in information from the tokens seen so far — the only
-  step where positions communicate; and
-* the **feed-forward** block transforms the token's own features in place.
+.. _t00-residual:
 
-"Adds" is literal — ``x = x + correction``, twice per layer. Erasing what
-came before would take a correction that actively cancels it, so the default
-is refinement: six layers work on one accumulating representation instead of
-computing six unrelated ones.
+``x`` starts as the token's :ref:`embedding <t00-embedding>` — the 288 floats from the
+table. Each of the six layers then adds two corrections to it. The first
+pulls in information from the tokens seen so far — this is **attention**,
+the only step where positions talk to each other. The second reworks the
+token's own features, in place — this is the **feed-forward** block.
+Correction means addition: ``x = x + correction``, twice per layer.
+Nothing ever replaces ``x``; layers only add their differences on top. A
+running sum of differences — residuals — is why ``x`` is called the
+**residual stream**: the model's working memory for the current token.
 
-After the last layer, the classifier compares ``x`` against every vocabulary
-row — one final matrix multiplication — producing one score, or *logit*, per
-possible next token; why this names the *next* token is taken up below. The
-largest logit wins, and the winner is fed back in at ``position + 1`` for the
-journey to repeat.
+.. _t00-classifier:
 
-Prompt processing is called **prefill**. Generation is the loop at the
-bottom: choose a token, display it, feed it back to ``forward``, and choose
-again. Both paths use exactly the same transformer in this tutorial.
+At the end we compare the result vector with every vocabulary row — the
+:ref:`dot product <t00-dot>` again. Rows that look alike get a higher score; the
+score is called a **logit**, and the winner is the highest one. The
+vocabulary helps us decide — *classify* — what our vector is most like,
+and that is why this final matrix is called the **classifier**. The
+winning token then feeds back in at ``position + 1``, and the journey
+repeats.
 
-The five numerical operations
-=============================
+.. _t00-prefill:
 
-A Llama transformer needs only five numerical building blocks:
+Before the model can continue our prompt, it must read it: every prompt
+token goes through the transformer, one after another, and the model
+builds up its memory of them. This warm-up is called **prefill**. Then
+comes the loop: pick the winner, print it, feed it back, pick again —
+that is **generation**. Same transformer both times. The only difference
+is where the next token comes from: the prompt, or the model's own last
+pick.
 
-``matmul``
-   Computes ``y = W x`` — ``d`` dot products against the input vector, one
-   per matrix row. These learned projections create Q, K, and V, run the
-   feed-forward network, and produce vocabulary logits. Nearly all inference
-   time is spent here.
+Five small functions
+====================
 
-``rmsnorm``
-   Scales a vector by
-   ``1 / sqrt(mean(x[i] * x[i]) + epsilon)``, then applies a learned weight per
-   coordinate. The residual stream is added to twice per layer, so its
-   magnitude would otherwise drift over six layers; rmsnorm resets the scale
-   before each use, and the learned weight restores whatever per-coordinate
-   scale training preferred. The two steps are not a wash: the division is
-   input-dependent — it cancels whatever magnitude this particular ``x``
-   arrived with — while the learned weight is a fixed constant, so downstream
-   matrices always see inputs at a predictable scale.
-
-``softmax``
-   Converts arbitrary attention scores ``s[i]`` into positive weights
-   ``exp(s[i] - max(s)) / sum(exp(s[j] - max(s)))``. The weights sum to one, so
-   attention becomes a weighted average of value vectors. Subtracting the
-   largest score changes no ratio but prevents ``exp`` from overflowing.
-
-``silu``
-   Computes ``x * sigmoid(x)``, where ``sigmoid(x) = 1 / (1 + exp(-x))``
-   slides smoothly from 0 to 1 — a soft switch. Without a non-linearity, stacked matrix
-   multiplications would collapse into one linear transformation. Llama uses
-   SiLU as the learned gate of its feed-forward block.
-
-``rope``
-   Rotary position embedding — how the model knows *where* a token is.
-   Each pair of Q and K coordinates is treated as a 2D arrow and turned by
-   ``position * frequency``; the rotations cancel in the dot product except
-   for the difference between positions. Explained in full in the attention
-   walkthrough below.
-
-They are ordinary, strongly typed daslang functions (the ``#`` in a
-signature marks a borrowed view — explained with the checkpoint below). For
-example, the entire matrix multiplication is:
+Five functions do all the math: ``matmul``, ``rmsnorm``, ``softmax``,
+``silu``, ``rope``. The first one you already know — the matrix
+multiplication. It takes a matrix in ``w``, multiplies it by the vector in
+``x``, and puts the result in ``y``:
 
 .. code-block:: das
 
@@ -210,26 +194,20 @@ example, the entire matrix multiplication is:
        }
    }
 
-The small loop invariants are worth naming even in reference code: they make
-the structure clearer and save repeated work in the interpreter. There is
-still an easy performance improvement left for the reader to find — a hint:
-daslang's ``for`` can walk several arrays in lockstep.
+You can easily make it a lot faster. Much of the work in real LLM engines
+is exactly that: making this one loop really, really fast.
 
-The checkpoint is already an array
-==================================
+Where the weights come from
+===========================
 
-A llama2.c checkpoint starts with seven integers describing the model. What
-follows is one flat fp32 array containing embeddings, normalization weights,
-attention matrices, feed-forward matrices, and the classifier — plus a
-stretch of precomputed RoPE tables this program computes on the fly and
-simply skips (the lone ``at +=`` in ``weight_layout``, and the reason the
-printed parameter count carries a ``≈``).
-
-``fmap`` memory-maps the file — its bytes appear as an array, nothing is
-copied — and scoped ``array_view`` blocks present the header as
-``array<int>#`` and the weights as ``array<float>#`` (the trailing ``#``
-marks a borrowed view that cannot outlive the block it is handed to).
-Further views select each matrix by element offset:
+Training runs for a long time, and from time to time the trainer saves
+all the numbers to disk — a save point: a **checkpoint**. The file we
+downloaded is one such save. Inside is one flat array of 32-bit floats
+with a seven-integer header in front. The :ref:`embedding <t00-embedding>` table, every
+:ref:`attention <t00-attention>` matrix, every :ref:`feed-forward <t00-ffn>` matrix, the
+:ref:`classifier <t00-classifier>` — all slices of that one array, at offsets the header
+determines. We map the file into memory and read each matrix as a view
+into it — no copies:
 
 .. code-block:: das
 
@@ -239,228 +217,361 @@ Further views select each matrix by element offset:
        }
    }
 
-The views are borrowed, checked, and confined to their blocks. Loading creates
-no second 60 MB copy, and the transformer does no pointer arithmetic.
-Alignment and lifetimes are properties of ``array_view``, not obligations
-pushed onto ``forward``. There is no ``unsafe`` anywhere in the file: even
-the tokenizer's floats — which sit at unaligned offsets, because its records
-carry variable-length text — are read with ``pod_view``, the checked,
-alignment-free counterpart of ``array_view``.
-
 One token through the model
 ===========================
 
-``forward`` takes one ``token`` at one ``position``. It does not return text or
-even a token ID: it fills ``state.logits`` with the scores from which the
-caller will choose the next token.
+The heart of the file is one function, ``forward``: one full pass through
+the transformer. It takes one ``token`` at one ``position`` and fills
+``state.logits`` — the scores from which the caller chooses the next
+:ref:`token <t00-token>`. In the code the state parameter is written ``s``, short for
+``state``, so ``s.x`` is the :ref:`residual stream <t00-residual>`.
 
 Embedding: an ID becomes a vector
 ---------------------------------
 
-The embedding table has one learned row of ``dim`` floats per vocabulary
-token. ``forward`` copies the selected row into ``s.x``. From this point on,
-the transformer manipulates vectors, not token IDs. ``s.x`` remains the
-residual stream throughout all layers.
+The :ref:`embedding <t00-embedding>` table has one learned row of 288 floats per
+vocabulary token. ``forward`` copies the selected row into ``s.x``. From
+this point on, the transformer works with vectors, not token IDs, and
+``s.x`` stays the residual stream through all six layers.
 
-Attention: retrieve relevant earlier information
-------------------------------------------------
+.. _t00-attention:
 
-The embedding row for ``time`` is the same in "once upon a time", "the time
-is now", and "time flies" — one context-free vector per vocabulary entry.
-Attention is how the vector picks its context back up: it lets the current
-position retrieve information from every position in the cache — everything
-so far, itself included.
+Attention: look back and gather
+-------------------------------
 
-Each layer first normalizes ``x``, then uses three matrix multiplications to
-make three views of the current token:
+The embedding row for ``time`` is the same in "once upon a time", "the
+time is now", and "time flies" — one context-free vector per vocabulary
+entry. **Attention** is how the vector picks its context back up: the
+current position retrieves information from every position so far —
+itself included.
+
+.. _t00-rmsnorm:
+
+Each layer begins with a clean-up. ``x`` gets added to twice per layer,
+so after a few layers its numbers would drift out of range. The fix:
+divide the whole vector by its own average size — the *root mean square*
+of its values — then multiply each float by a learned constant, so
+training decides what size everything comes back to. This clean-up is
+``rmsnorm``, and it runs before every use of the stream:
+
+.. code-block:: das
+
+   def rmsnorm(var out : array<float>; x : array<float>; weight : array<float>#; size : int) {
+       var sum = 0.0
+       for (i in range(size)) {
+           let xi = x[i]
+           sum += xi * xi
+       }
+       let scale = 1.0 / sqrt(sum / float(size) + 1e-5)
+       for (i in range(size)) {
+           out[i] = weight[i] * x[i] * scale
+       }
+   }
+
+Then three :ref:`projections <t00-projection>` — three matrices, each asking
+its own questions of the token — make three views of it:
 
 * the **query** (Q) — what this token is looking for;
-* the **key** (K) — what this token can be found *by*; and
+* the **key** (K) — what this token can be found by; and
 * the **value** (V) — what it hands over once found.
 
-The names describe use, not essence. The three matrices are three ordinary
-projections of the same normalized ``x``, and nothing intrinsic makes one a
-"query": Q earns its name because the code only ever compares it against
-keys, V because it only ever enters the final blend. Training exploits that
-structure and shapes each matrix for its role.
+If you have written a hash map, you already know two of these names. Key
+and value mean exactly the dictionary sense: the key is what you search
+by, the value is what the lookup returns. Attention is a soft
+dictionary — the query is searched against every key, and instead of one
+exact hit you get a weighted mix of all the values. What is *in* a value?
+A learned summary of that token — not floats you could read, just
+whatever training found useful for later tokens to receive. The three
+matrices themselves are ordinary; each becomes good at its job only
+because of where the code uses its result.
 
-One thing is still missing: nothing computed so far knows *where* anything
-is. The dot product is blind to order — without position information, "the
-dog bit the man" and "the man bit the dog" would attend identically. Position
-has to be written into Q and K themselves, and RoPE — *rotary position
-embedding* — writes it in as rotation.
+.. _t00-head:
 
-Take two adjacent coordinates of a vector and treat them as one 2D arrow.
-Rotating that arrow changes its direction but not its length, so whatever the
-two coordinates encoded is preserved — but the arrow's orientation now also
-says "position ``p``": each step forward in the sequence turns it by one more
-increment of that pair's angle.
+The comparing does not happen on all 288 floats as one block. Q, K, and V
+are split into six slices of 48, and each slice — a **head** — works
+alone: its own questions, its own answers. The name is old hardware:
+think read heads on a tape drive — six heads over the same tape, each
+reading its own track. Why six: one comparison would give
+one way of looking back per layer, and a token usually needs several at
+once — one eye on the previous word, another on the subject, a third on
+the opening ``Once``. In the code a head is just a slice of the 288
+floats: ``query_row = head * head_size`` finds where its 48 begin.
+
+One thing is still missing: nothing so far knows *where* anything is. A
+:ref:`dot product <t00-dot>` is blind to order — without extra work, "the dog bit
+the man" and "the man bit the dog" would look the same to attention. So
+position gets stamped into Q and K themselves. The tool is **RoPE** —
+*rotary position embedding* — and the stamp is rotation. (The "embedding"
+in RoPE's name is historical; nothing to do with the embedding table.)
+
+Here is the trick. Split a head's 48 floats into 24 pairs: floats 0 and 1
+are the first pair, 2 and 3 the second, and so on. Draw a pair on graph
+paper — first float across, second float up — and you get an arrow.
+Rotating the arrow keeps its length, so the pair still stores what it
+stored — but its direction can now say "position ``p``". That is exactly
+what RoPE does: at position ``p``, every arrow is turned ``p`` steps of
+its own fixed angle.
 
 .. figure:: /_static/dasllama/00_rope.*
    :width: 100%
    :alt: Position rotates each coordinate pair; rotations on Q and K cancel in the dot product, leaving only the relative distance; different pairs rotate at different speeds.
 
-The payoff appears in the dot product. First, note the 48-wide score splits
-cleanly: group the coordinate products two at a time and the head's dot
-product is just the sum of 24 independent 2D pair-dots, so a per-pair
-argument covers the whole thing. Now recall the geometric reading: a dot
-product depends only on the two lengths and the angle between the vectors.
-Rotation
-changes no lengths, so rotating Q by ``p * theta`` and K by ``q * theta``
-changes the angle between them by exactly the difference,
-``(p - q) * theta`` — the absolute positions cancel. Attention measures how
-far back a key sits, not where the pair happens to fall in the sequence:
-"three tokens ago" looks the same at position 10 as at position 210.
+A :ref:`head <t00-head>`'s score is one big dot product over 48 numbers — which is
+simply a sum of 48 little products. A sum does not care how you group it.
+So group it two at a time, along the same pairs RoPE used: each bracket
+is then the first-float product plus the second-float product of one
+pair — which is exactly the dot product of that pair's two arrows,
+query's against key's. The whole score is 24 arrow-to-arrow dot products,
+added up. Whatever we show about one pair of arrows is true for the
+score.
 
-A single rotation speed would be ambiguous — turn far enough and the arrow
-comes full circle. So each of a head's 24 pairs gets its own frequency (the
-``i % head_size`` in ``rope`` restarts the ladder for every head — enough,
-because scores never mix slices of different heads), from one full turn
-every ~6 tokens (the fastest pair turns one radian per token,
-and a full turn is 2π) down to a barely perceptible drift — the second,
-minute, and hour hands of a clock. That spread is the
-``1.0 / pow(10000.0, ...)`` line in ``rope``; the base 10000 is a convention
-inherited from the earliest transformers, and any wide spread of speeds
-works. V is never rotated: it is the payload, and only the Q–K match needs
-to know distance.
+Look at one pair — say floats 0 and 1. The query has an arrow there, and
+the cached key has its own arrow there; their dot product is one bracket
+of the score. Both arrows were turned by RoPE: the query sits at position
+``p``, so its arrow was turned ``p`` steps of the pair's angle ``θ``; the
+key came from position ``q``, so its arrow was turned ``q`` steps. A dot
+product only cares about lengths and the angle between the arrows — and
+rotation kept the lengths. The angle between them is now exactly their
+distance apart: ``(p − q) × θ``. A key right behind the query was turned
+almost as far — small gap between the arrows. A key from long ago lags
+far behind — big gap. The absolute positions cancel: "three tokens ago"
+means the same gap at position 10 and at position 210.
 
-The rotated K and the untouched V are then copied into the layer's
-**KV cache** — the model's memory of every position it has processed, the
-current one included: a token attends over its own K and V too. Without that
-cache, generating every new token would recompute keys and values for the
-entire prompt.
+One speed would not be enough: turn far enough and an arrow comes back to
+the start, and position 0 would look like position 6. So each of a head's
+24 pairs turns at its own speed, from one full turn every ~6 tokens down
+to a barely visible drift — the second, minute, and hour hands of a
+clock. That spread is the ``1.0 / pow(10000.0, ...)`` line in ``rope``;
+the base 10000 is a convention from the earliest transformers, and any
+wide spread of speeds works. V is never rotated. Rotation has one
+purpose — make the Q–K score feel distance. V never enters a score: it is
+what gets blended *after* the weights are already decided. Rotating it
+would add position where position is not wanted, and only scramble the
+value it returns.
 
-The retrieval itself happens in **heads**. Comparing all 288 coordinates as
-one block would produce a single softmax — one way of looking back per layer —
-and a token usually needs several at once: one eye on the previous word,
-another on the subject, a third on the opening "Once". So Q, K, and V are
-split into six slices of 48 coordinates, and each slice — each *head* — runs
-the whole retrieval independently, with its own scores and its own weights.
-"Head" is the standard name for one of these parallel readers; in the code it
-is literally a slice, ``query_row = head * head_size``.
+.. code-block:: das
 
-For one head and one cached position ``p``, the code computes:
+   def rope(var x : array<float>; position, head_size, size : int) {
+       for (pair in range(size / 2)) {
+           let i = pair * 2
+           let frequency = 1.0 / pow(10000.0, float(i % head_size) / float(head_size))
+           let angle = float(position) * frequency
+           let a = x[i]
+           let b = x[i + 1]
+           let sin_angle = sin(angle)
+           let cos_angle = cos(angle)
+           x[i] = a * cos_angle - b * sin_angle
+           x[i + 1] = a * sin_angle + b * cos_angle
+       }
+   }
+
+.. _t00-kvcache:
+
+The rotated K and the untouched V are then appended to the layer's
+**KV cache**: the model's stored keys and values for every position it
+has processed, the current one included. The cache is plain memoization —
+without it, every new token would recompute K and V for the entire past.
+
+Now the look-back itself. For one head and one cached position ``p``, the
+code computes:
 
 .. code-block:: text
 
    score[p] = dot(query, key_cache[p]) / sqrt(head_size)
 
-A high score means "this cached position holds what I am looking for" — the
-query direction agrees with that key's direction. The ``sqrt(head_size)``
-division keeps scores in the same range at any width: for typical,
-uncorrelated coordinates the 48 products partially cancel like a random
-walk, so the sum grows like ``sqrt(48)``, not 48. The range matters because
-``softmax`` exponentiates — scores a few units apart already produce
-near-winner-take-all weights, and unscaled scores would freeze every head
-into hard single-position lookups. ``softmax`` turns all of the head's
-scores into weights, and the weighted sum
+A high score means "this cached position holds what I am looking for" —
+the query's arrow agrees with that key's arrow. The ``sqrt(head_size)``
+division keeps scores in a fixed range at any width: 48 mostly-unrelated
+products partly cancel each other, and such a sum grows like
+``sqrt(48)``, not like 48. The range matters for the next step.
+
+.. _t00-softmax:
+
+``softmax`` turns the head's scores into **attention weights**: positive
+numbers that sum to one. It raises ``e`` to each score and divides by the
+total — ``exp(s[i] - max(s)) / sum(exp(s[j] - max(s)))`` — subtracting
+the largest score first, which changes no ratio but keeps ``exp`` from
+overflowing. The exponent is why the range mattered: scores a few units
+apart already produce a near-total winner, and unscaled scores would
+freeze every head into a hard single-position lookup instead of a soft
+blend. (Not the same "weights" as the model's
+:ref:`parameters <t00-training>` — older texts use one word for both. Here,
+parameters live in the checkpoint; weights come out of softmax.)
+
+.. code-block:: das
+
+   def softmax(var x : array<float>; size : int) {
+       var largest = x[0]
+       for (i in range(1, size)) {
+           largest = max(largest, x[i])
+       }
+       var sum = 0.0
+       for (i in range(size)) {
+           x[i] = exp(x[i] - largest)
+           sum += x[i]
+       }
+       for (i in range(size)) {
+           x[i] /= sum
+       }
+   }
+
+The weighted sum
 
 .. code-block:: text
 
    attention_head = sum(weight[p] * value_cache[p])
 
-retrieves a mixture of cached values: mostly those of high-scoring
+is the retrieved information: mostly the values of high-scoring
 positions, faint traces of the rest.
 
 .. figure:: /_static/dasllama/00_attention.*
    :width: 100%
    :alt: One attention head: the query from the current token is scored against every cached key, softmax turns scores into weights, and the weights blend the cached values.
 
-The score loop ends at ``position``, so future tokens are never considered;
-that loop bound is the **causal mask** expressed without a separate mask
-array. (The ``head / kv_multiple`` indexing supports **grouped-query
-attention** — larger models cut cache memory by sharing one cached K/V head
-among several query heads. stories15M has six of each, so the multiple is 1
-and the indexing is invisible here.)
+The score loop stops at the current position. Later positions are not in
+the cache — they do not exist yet — so the model cannot look ahead. This
+property has a name, the **causal mask**: *causal* as in cause and
+effect — the future must not influence the present. Here it costs
+nothing; it is simply the loop's end.
 
-The six 48-float head outputs are concatenated in ``s.xb`` — 288 again; the
-normalized copy that produced Q, K, and V is dead by then, so the buffer is
-reused. Each head retrieved on its private 48-coordinate slice, so one more
-learned projection, ``attention_output``, mixes the six answers into a
-single 288-wide correction, which is added to ``x``. This **residual
-connection** lets a layer contribute a correction while preserving the
-representation it received:
+The six 48-float head outputs are glued side by side — 288 again — and
+one more matrix, ``attention_output``, mixes the six separate answers
+into a single 288-wide correction, which is added to ``x``. This addition
+is the **residual connection**: the layer adds its finding and keeps
+everything it received:
 
 .. code-block:: text
 
    x = x + attention(x)
 
-Feed-forward: transform each token's features
----------------------------------------------
+.. _t00-ffn:
 
-Attention moves information between token positions. The feed-forward block
-then transforms the current token's features in place. After another RMSNorm,
-two projections expand ``dim`` to ``hidden_dim`` — from 288 to 768 features.
-One path passes through SiLU and gates the other element by element: where
-the gate is near zero, that feature is switched off. A final projection
-returns to ``dim``:
+Feed-forward: rework the token's features
+-----------------------------------------
+
+:ref:`Attention <t00-attention>` moved information between positions. The
+second block works on the current token alone. Values flow one way
+through it — input, a wider middle, output, no loops, no looking
+sideways — and that is its name: the **feed-forward** block.
+
+Its shape is: expand, gate, contract. After another :ref:`RMSNorm <t00-rmsnorm>`, two
+matrices expand the 288-float stream to 768 values each. Think of a
+workbench: ``x`` is a tight 288-float summary, and the two matrices
+unpack it by asking 768 more learned questions of it — more questions
+than the stream itself can carry. Each of the 768 answers is one
+**feature**: how strongly ``x`` contains one learned pattern.
+
+One of the two expanded copies goes through ``silu`` and becomes the
+**gate** for the other. **SiLU** — *sigmoid linear unit* — is
+``x * sigmoid(x)``, where ``sigmoid(x) = 1 / (1 + exp(-x))`` slides
+smoothly from 0 to 1: a soft switch. The code writes the product as one
+division:
+
+.. code-block:: das
+
+   def silu(var x : array<float>; size : int) {
+       for (i in range(size)) {
+           x[i] /= 1.0 + exp(-x[i])
+       }
+   }
+
+Why not simply ``x >= 0 ? x : 0``? That function exists — ReLU — and it
+ruled for years. The problem is training. Training moves every number in
+tiny steps along slopes, and ReLU is exactly flat below zero: a feature
+pushed negative goes dead, no slope left to pull it back. SiLU never goes
+fully flat — slightly negative inputs keep a little signal and a little
+slope, so training can change its mind about them. It costs an ``exp``
+and wins on quality; the SwiGLU paper famously admits it has no theory
+for why — it just measured better.
+
+Most "why" questions on this page end the same way. Why 288 and not 300?
+Why six heads? Why base 10000? The shamans of the past tried different
+incantations, kept what worked, and we get to rationalize later why
+*abra* is so much better than *cadabra*. When this page gives a reason,
+the reason is real — but the numbers came first, and the explanations
+came after.
+
+.. figure:: /_static/dasllama/00_silu.*
+   :width: 100%
+   :alt: The SiLU curve: near zero for negative inputs, close to the identity for positive inputs, smooth throughout.
+
+The two copies multiply element by element: where the gate is near zero,
+that feature is switched off; where it is large, the feature passes. A
+third matrix packs the 768 surviving answers back into 288 floats — the
+:ref:`residual stream <t00-residual>` has one fixed width, and the correction has to be
+addable to ``x``. The whole recipe:
 
 .. code-block:: text
 
    hidden = W_down (SiLU(W_gate x) * (W_up x))
    x      = x + hidden
 
-This is Llama's gated feed-forward network, commonly called **SwiGLU**.
+This gated shape is commonly called **SwiGLU** (SiLU + *gated linear
+unit*). Why 768 and not some other number: it is a capacity dial, not a
+law — roughly 8/3 of ``dim``, the ratio the Llama family settled on.
+Bigger would be more capacity and more compute.
 
-.. figure:: /_static/dasllama/00_silu.*
-   :width: 100%
-   :alt: The SiLU curve: near zero for negative inputs, close to the identity for positive inputs, smooth throughout.
+The bend in the SiLU curve is what makes depth work at all. Two matrix
+multiplications in a row are exactly one — purely linear chains collapse.
+Put a bend between them and they stop collapsing: each layer can reshape
+what earlier layers made instead of restating it. The feed-forward block
+also holds about two thirds of every layer's parameters, in these three
+matrices. The second residual addition closes the layer. Attention plus
+feed-forward, six times — the whole stack.
 
-The bend in that curve is what *non-linear* means — negative inputs are
-squeezed to nearly nothing, positive inputs pass through almost unchanged —
-and the bend is what makes depth count. Chains of purely linear operations
-collapse: two matrix multiplications in a row are exactly equivalent to one.
-Put a bend between them and they are not; each layer can now reshape what the
-previous ones produced instead of merely restating it. The feed-forward
-block also holds about two thirds of every layer's weights in these three
-matrices — the expansion to 768 gives the gate more features to switch than
-the stream itself carries. The second residual addition completes the layer.
-Attention plus feed-forward repeats for every layer in the checkpoint.
+Logits: the vector becomes a choice
+-----------------------------------
 
-Logits: a vector becomes the next-token choice
------------------------------------------------
+After the final layer, one last :ref:`RMSNorm <t00-rmsnorm>` steadies ``x``, and the
+:ref:`classifier <t00-classifier>` projects it from 288 values to 32,000
+:ref:`logits <t00-classifier>` — one :ref:`dot product <t00-dot>` of ``x`` against each of
+the 32,000 vocabulary rows. For stories15M the classifier *is* the
+:ref:`embedding <t00-embedding>` table (``shared_classifier`` in the code; larger models
+often train a separate matrix), so the question is literal: which token's
+row does ``x`` now point along?
 
-After the final layer, one last RMSNorm stabilizes ``x``. The classifier
-matrix projects it from ``dim`` values to ``vocab`` logits — one dot product
-of ``x`` against each of 32,000 rows. For stories15M the classifier *is* the
-embedding table (``shared_classifier`` in the code; larger models often
-train a separate matrix), so the question is literally: which token's row
-does ``x`` now point along?
+Stop on that question, because it is the heart of the whole page. ``x``
+*started* as the current token's own row — so why does the comparison
+name the token that comes *after*? Nothing in the arithmetic makes it so.
+It is what :ref:`training <t00-training>` selected every parameter to achieve: layer by
+layer, ``x`` is pushed away from "the token I am" and toward "the token
+that follows here", because that final comparison is exactly what
+training scored, billions of times. The code on this page is the
+pipeline; the checkpoint's numbers are why it points the right way.
 
-That question deserves a pause, because it is the whole trick. ``x``
-*started* as the current token's own row — so why does the comparison name
-the token that comes *after*? Nothing in the arithmetic makes it so. It is
-what training selected every weight to achieve: layer by layer, ``x`` is
-nudged away from "the token I am" toward "the token that follows here",
-because that final comparison is exactly what training scored, billions of
-times. The mechanics on this page are the pipeline; the checkpoint's numbers
-are why it points the right way.
+.. _t00-sampling:
 
-A logit is merely an unnormalized score: larger means the model considers
-that token more likely. ``most_likely`` chooses the largest one, so this
-tutorial is deterministic. Everything usually called *sampling* — the
-*temperature* and *top-p* knobs of chat UIs — is a different policy applied
-to this same vector: soften the logits into a probability distribution with
-``softmax`` and draw from it instead.
+``most_likely`` picks the largest logit — this is called **greedy
+decoding**, and it is deterministic: one prompt, one story. But we do not
+have to pick the top one every time. Turn the logits into probabilities
+with :ref:`softmax <t00-softmax>`, roll the dice, and every run can tell
+a different story. Choosing this way is called **sampling**, and the
+chat-UI knobs live here: **temperature** scales the logits before the
+softmax — higher means a wilder roll; **top-p** keeps only the most
+likely few in the roll.
 
 Prompting is repeated ``forward``
 =================================
 
-``tokenizer.bin`` stores a vocabulary piece and a precomputed merge score for
-every token. ``encode`` begins with token ``1`` — **BOS**, *beginning of
-sequence*, a marker the model saw at the start of every training text — and,
-before the first word, SentencePiece's dummy leading-space token, since
-pieces mark word starts with a space. It
-then splits the prompt into UTF-8 characters, falling back to raw bytes for
-anything the vocabulary lacks (IDs 0–2 are reserved markers, so byte ``b``
-lives at token ``b + 3``), and repeatedly joins the highest-scoring adjacent
-pair found in the vocabulary — the merge scores decide which pairs deserve
-to be one token. This is llama2.c's compact SentencePiece-style BPE encoder;
-``token_text`` is the decoder half of the same scheme (pieces carry a
-leading space marking a word start, which the first word after BOS drops,
-and ``<0xNN>`` pieces decode back to raw bytes).
+.. _t00-bos:
 
-Prefill is deliberately unsurprising:
+``tokenizer.bin`` stores, for every :ref:`token <t00-token>`, its text piece and a
+precomputed merge score. ``encode`` begins with token ``1`` — **BOS**,
+*beginning of sequence*, written ``<s>`` in the figures: a marker the
+model saw at the start of every training text. Before the first word it
+also inserts the tokenizer's leading-space token, because pieces mark
+word starts with a space. It then splits the prompt into UTF-8
+characters, falling back to raw bytes for anything the vocabulary lacks
+(IDs 0–2 are reserved markers, so byte ``b`` lives at token ``b + 3``),
+and then repeatedly joins the highest-scoring adjacent pair found in the
+vocabulary — the merge scores decide which pairs deserve to be one token.
+This is **BPE** — *byte-pair encoding* — in its **SentencePiece** flavor
+(SentencePiece is Google's tokenizer scheme; llama2.c reuses its file
+format). ``token_text`` is the decoder half of the same scheme: pieces
+carry a leading space that marks a word start, which the first word after
+BOS drops, and ``<0xNN>`` pieces decode back to raw bytes.
+
+:ref:`Prefill <t00-prefill>` is a plain loop:
 
 .. code-block:: das
 
@@ -469,41 +580,55 @@ Prefill is deliberately unsurprising:
    }
 
 After the last prompt token, ``state.logits`` already predicts the first
-completion token. Generation chooses it, prints its vocabulary piece, calls
-``forward`` with that token at the next position, and repeats. The KV cache
-written during prefill makes the whole prompt available to every generated
-token.
+completion token. :ref:`Generation <t00-prefill>` chooses it, prints its
+vocabulary piece, calls ``forward`` with that token at the next position,
+and repeats. The :ref:`KV cache <t00-kvcache>` written during prefill keeps the whole
+prompt available to every generated token.
 
 .. figure:: /_static/dasllama/00_generation.*
    :width: 100%
    :alt: Prefill runs forward once per prompt token and fills the KV cache; generation feeds each chosen token back in as the next input.
 
-This tutorial's serial prefill makes the relationship completely visible.
-Production dasLLAMA evaluates prompt tokens in batches, but computes the same
-causal result. Generation stops when the model predicts token ``1`` again:
-the training data was many stories laid end to end with the BOS marker
-between them, so predicting it is the model saying "this story is complete —
-a new one would start here." The checkpoint's sequence length is the other
-stop: the hard context bound.
+We prefill one token at a time so you can see it plainly; production
+dasLLAMA does batches, same result. Generation stops when the model
+predicts token ``1`` again:
+the training data was many stories laid end to end with the :ref:`BOS <t00-bos>`
+marker between them, so predicting it is the model saying "this story is
+complete — a new one would start here." The checkpoint's sequence length
+is the other stop: the hard bound on how many positions the model can
+hold.
 
 From seed to library
 ====================
 
-This program deliberately fixes the dimensions, format, precision, execution
-strategy, tokenizer direction, and sampling policy to one tiny model. dasLLAMA
-is what happens when each of those constraints becomes an interface:
+This program deliberately fixes everything to one tiny model: the
+dimensions, the file format, the precision, the execution strategy, the
+sampling policy. dasLLAMA is what happens when each of those constraints
+becomes an interface:
 
-* checkpoint layout becomes GGUF metadata and an architecture registry;
-* fp32 matrices become quantized tensor formats and tuned kernels;
+* the fixed layout becomes **GGUF** — the standard file format LLMs ship
+  in — plus an architecture registry;
+* fp32 matrices become **quantized** formats — :ref:`parameters
+  <t00-training>` stored in fewer bits, so bigger models fit in the same
+  memory — with tuned kernels;
 * serial row loops become job-queue work;
-* serial prompt prefill becomes a batched implementation;
-* greedy choice becomes a sampling pipeline;
-* one SentencePiece tokenizer becomes full model-specific tokenization; and
+* serial prompt :ref:`prefill <t00-prefill>` becomes a batched implementation;
+* :ref:`greedy <t00-sampling>` choice becomes a :ref:`sampling <t00-sampling>`
+  pipeline;
+* one tokenizer becomes model-specific tokenization; and
 * scratch arrays become reusable sessions with managed KV caches.
 
-The important part is visible before any of that machinery: a fully functional
-transformer is small enough to read, run, interpret, JIT, and improve in one
-source file. That is the problem dasLLAMA solves at production scale.
+This happened fast. The first dasLLAMA commit was authored on 2026-06-27,
+and it began with the same naive fp32 ``matmul`` used on this page. About a day later, `PR #3297
+<https://github.com/GaijinEntertainment/daScript/pull/3297>`_ contained
+Llama-2 and Llama-3, GGUF loading, quantization, threading, batched
+prefill, tests, and chat. The path from this readable file to native
+machine code never had to leave one programming environment.
+
+The important part is visible before any of that machinery: a fully
+functional :ref:`transformer <t00-transformer>` is small enough to read, run, interpret,
+JIT, and improve in one source file. That is the problem dasLLAMA solves
+at production scale.
 
 Credits and further reading
 ===========================

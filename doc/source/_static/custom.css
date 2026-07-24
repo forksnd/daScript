@@ -297,6 +297,19 @@ a:hover { color: var(--fg) !important; border-bottom-color: var(--fg) !important
 .rst-content dl.field-list > dt,
 .rst-content dl.field-list strong                        { color: var(--fg-soft) !important; }
 
+/* Term links pointing at in-page teaching anchors — quietly clickable,
+ * not amber link-noise. Scoped by the t00- anchor prefix so ordinary
+ * cross-page :ref: links keep their normal styling. */
+.rst-content a.reference.internal[href^="#t00-"] {
+    color: var(--fg-dim) !important;
+    border-bottom: 1px dotted var(--fg-faint);
+    text-decoration: none;
+}
+.rst-content a.reference.internal[href^="#t00-"]:hover {
+    color: var(--amber) !important;
+    border-bottom-color: var(--amber-dim);
+}
+
 /* Footer */
 .rst-footer-buttons .btn {
     background: transparent !important;
