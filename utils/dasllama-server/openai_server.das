@@ -1159,7 +1159,9 @@ def private handle_models(var resp : HttpResponse?) : http_status {
     if (g_has_asr && !empty(g_slots)) {
         list.data |> push(OaiModel(id = "{g_slots[g_default_slot].name}-asr", _object = "model", created = created_ts(), owned_by = "dasllama"))
     }
-    return resp |> JSON(sprint_json(list, false), http_status.OK)
+    let body = sprint_json(list, false)
+    delete list
+    return resp |> JSON(body, http_status.OK)
 }
 
 // /v1/embeddings: mean-pooled, L2-normalized sentence embeddings over the facade `embed` verb.
@@ -1210,7 +1212,10 @@ def private handle_embeddings(var req : HttpRequest?; var resp : HttpResponse?) 
         idx ++
     }
     out.usage = OaiEmbUsage(prompt_tokens = prompt_tokens, total_tokens = prompt_tokens)
-    return resp |> JSON(sprint_json(out, false), http_status.OK)
+    let body = sprint_json(out, false)
+    delete out
+    delete inputs
+    return resp |> JSON(body, http_status.OK)
 }
 
 // POST /v1/models/activate {"model": name}: admin warm-switch — make `name` the stepped slot
