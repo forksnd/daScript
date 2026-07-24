@@ -236,7 +236,7 @@ def forward(
             token, position : int
             ) {
     let dim = c.dim
-    let kv_multiple = c.heads / c.kv_heads
+    let kv_multiple = c.heads / c.kv_heads   // 1 for stories15M; larger models share one cached K/V head between several query heads to save memory
     let attention_scale = 1.0 / sqrt(float(c.head_size))
     // embedding: copy the token's learned row into x, the residual stream
     array_view(model, w.token_embedding + token * dim, dim) $(embedding : array<float>#) {
