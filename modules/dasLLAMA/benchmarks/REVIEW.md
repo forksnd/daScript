@@ -72,14 +72,17 @@ and corpus - or withdraws the affected rows and names the withdrawal and its rea
 body.** What a cell times changes when a change inside its timed body, to its input corpus, or
 to the pinned reference build (`DEFAULT_REF_SHA` in `setup_lcpp_ref.das`, or anything else
 deciding which reference binary or environment the run measures) moves the measured quantity; a
-change outside the timed body - a flag, a require, the submit path - does not. The new rows or
-the withdrawal land in `../performance/records/<box>.json`, the file the affected rows live in.
+change outside the timed body - a flag, a require, the submit path - does not, nor does a
+change to a GPU kernel emitter whose emitted kernel code - the `*_msl` source globals, the AIR
+they build into, the SPIR-V words the Vulkan dump writes - is byte-identical before and after,
+with the PR body naming that compare. The new rows or the withdrawal land in
+`../performance/records/<box>.json`, the file the affected rows live in.
 
-**A diff that adds an instrument, or changes how one reports or exits, makes every mode whose
-purpose is to report result rows exit non-zero on a run that reports none - wrong flags, failed
-load, a device that declines.** A result row is a row carrying a time or a rate. A run that
-matched nothing and reported success leaves a sidecar or a record untouched, and its caller
-cannot tell.
+**A diff that adds a file under this folder whose modes report result rows, or changes how such
+a mode reports or exits, makes every result-row mode of that file exit non-zero on a run that
+reports none - wrong flags, failed load, a device that declines.** A result row is a row
+carrying a time, a rate, or a per-kernel occupancy count. A run that matched nothing and
+reported success leaves a sidecar or a record untouched, and its caller cannot tell.
 
 **A diff that adds an A/B arm, or changes how an arm reports or exits, makes that instrument
 exit non-zero when the lever does not change what the run executes - or, when the instrument

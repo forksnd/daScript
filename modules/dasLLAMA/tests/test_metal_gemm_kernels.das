@@ -12,6 +12,7 @@ require ?das_metal metal/das_metal_boost  // device/pipeline/buffer plumbing + t
 require ?das_metal _metal_kernel_common   // shared buf helpers, kq plane builders + eyeball-dump compares
 require dasllama/dasllama_convert         // devw_dequant_*_core — the image mint's dev-W bake mirrors
 require math
+require strings
 
 // The production GEMM corpus vs CPU references on synthetic planes: the prefill K-quant
 // mul_mm trio (K4/K5/K6) and every Metal-4 tensor twin (kq T trio, Q8MulMmT, Bf16MulMm/T),
@@ -623,7 +624,7 @@ def private q8_dbuf_gate(t : T?; dev, queue; m, kdim, ndim : int; mt : int = 128
     var bn = buf_u32(dev, uint(ndim))
     let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso_a)
-        metal_set_threadgroup_memory_length(enc, MetalQ8MulMmTH128_metal_q8_mulmm_t_msl_tgmem, 0)
+        metal_set_threadgroup_memory_length(enc, mt == 128 ? MetalQ8MulMmTH128_metal_q8_mulmm_t_msl_tgmem : MetalQ8MulMmTH_metal_q8_mulmm_t_msl_tgmem, 0)
         metal_set_buffer(enc, bw, 0ul, 0)
         metal_set_buffer(enc, bw, 0ul, 1)
         metal_set_buffer(enc, bx, 0ul, 2)
@@ -632,7 +633,7 @@ def private q8_dbuf_gate(t : T?; dev, queue; m, kdim, ndim : int; mt : int = 128
         metal_set_buffer(enc, bn, 0ul, 5)
         metal_dispatch_threadgroups(enc, uint3(uint(m / mt), uint(ndim / 64), 1u), uint3(128u, 1u, 1u))
         metal_set_pipeline(enc, pso_b)
-        metal_set_threadgroup_memory_length(enc, MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl_tgmem, 0)
+        metal_set_threadgroup_memory_length(enc, mt == 128 ? MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl_tgmem : MetalQ8MulMmTHDb_metal_q8_mulmm_t_msl_tgmem, 0)
         metal_set_buffer(enc, by_b, 0ul, 3)
         metal_dispatch_threadgroups(enc, uint3(uint(m / mt), uint(ndim / 64), 1u), uint3(128u, 1u, 1u))
     }
@@ -2031,6 +2032,22 @@ def private attn_av_mm_gate(t : T?; dev, queue; tensor : bool; heads, hs, kv_mul
     delete vv
     delete want
     delete env
+}
+
+//! the stage width is a stamp constant the emitter's census records: the double-buffered stamps
+//! read the 128-wide body, the single-tile stamps the 64-wide one - device-free
+[test]
+def test_q8_mulmm_stamp_widths(t : T?) {
+    t |> run("q8 mul_mm stamps read the stage width their constants set") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            t |> success(find(MetalQ8MulMmTH_metal_q8_mulmm_t_msl_census, "call.tmm2d_q8u_f32.k64\n") >= 0, "TH width")
+            t |> success(find(MetalQ8MulMmTH128_metal_q8_mulmm_t_msl_census, "call.tmm2d_q8u_f32.k64\n") >= 0, "TH128 width")
+            t |> success(find(MetalQ8MulMmTHDb_metal_q8_mulmm_t_msl_census, "call.tmm2d_q8u_f32.k128\n") >= 0, "THDb width")
+            t |> success(find(MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl_census, "call.tmm2d_q8u_f32.k128\n") >= 0, "THDb128 width")
+        } else {
+            feint("no dasMetal in this build; the q8 stamp widths are Metal emission\n")
+        }
+    }
 }
 
 [test]

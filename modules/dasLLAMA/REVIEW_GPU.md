@@ -2,10 +2,9 @@
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
 docs: `ARCHITECTURE_GPU.md`, `ARCHITECTURE_GPU_MTP.md`, `ARCHITECTURE_GPU_VULKAN.md`. Planned
-work: `followup_metal.md` for Metal, `followup_vulkan.md` for Vulkan.
+work: `followup_metal.md` for Metal, `followup_vulkan.md` for Vulkan - never `followup_general.md`.
 
-**Routed from `REVIEW.md`: a diff that checklist routes here applies this list together with
-it.**
+**Routed from `REVIEW.md`: a diff it routes here applies this list together with it.**
 
 **A diff touching a GPU kernel timing arm - code that dispatches a kernel to measure it rather
 than to serve a call - wherever the diff puts it, applies `REVIEW_GPU_RACE.md` too.**
@@ -109,8 +108,7 @@ count is overrun silently into whatever the pool put next to it.
 **A row-splitting GEMM encoder - one that dispatches a subset of a site's output rows at an
 offset - is called only from a site whose output row stride equals the width it dispatches; a
 wider-row site passes the full stride or dispatches the padded tile.** A split row writes at
-`row x dispatched-width`, so a wider-row caller lands its split rows on top of the row beside
-them.
+`row x dispatched-width`, so a wider-row caller lands its split rows on the row beside them.
 
 **A scratch buffer a dispatch writes is never rebound for a new write before the reader of
 its previous write is encoded - rotate through as many buffers as the chain has dispatches in
@@ -234,7 +232,10 @@ anything a served GPU decode or prefill call executes or that selects what it ex
 driver, a kernel class it dispatches, that class's builder, a servability gate, a race that
 picks which kernel serves, a forwarder default, a weight-region or residency path, the tier
 forwarders and the Vulkan tier-dispatch seams (`dasllama/dasllama_vulkan_seams.das`) the call
-routes through; a rename, a comment or a bake path cannot.
+routes through; a rename, a comment, a bake path, or a change confined to kernel bodies whose
+emitted kernels - the `*_msl` globals or the AIR (Metal's compiled shader IR) they build into,
+the SPIR-V words `DASLLAMA_VK_SPV_DUMP` writes - are byte-identical before and after, the PR
+body naming that compare, cannot.
 
 **Parity evidence counts only when it comes from `harness/parity.das`,
 `benchmarks/lcpp_bench.das --parity` (`performance/model_specs.das`'s fixed model list), or an
