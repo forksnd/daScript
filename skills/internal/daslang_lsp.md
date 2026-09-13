@@ -21,9 +21,11 @@ works for development and wins over the checked-in copy (name-keyed dedup).
   `{uri -> text}` document shadow, 0.1 s debounce, das-path -> `file://` URI
   mapping. Zero language knowledge. One loop, no thread: stdin is polled
   (`fpoll`) with the time to the next due validate as the timeout; a validate is
-  a child (`spawn_process`) the loop polls between frames, and an edit of the
-  file kills the one in flight, so a stale buffer never publishes; nav subtools
-  run to completion inline (the client waits on those anyway).
+  a child (`spawn_process`) the loop polls between frames, ONE in flight at a
+  time (`MAX_INFLIGHT_VALIDATES` - a burst of edits across files queues rather
+  than spawning a compile per file), and an edit of the file kills the one in
+  flight, so a stale buffer never publishes; nav subtools run to completion
+  inline (the client waits on those anyway).
 - **`subtools/validate.das` / `subtools/nav.das`** (+ shared
   `subtools/lsp_common.das` module) = stateless spawn-per-request batch tools:
   argv in, LSP-shaped JSON on stdout, exit. das owns byte<->UTF-16 position
@@ -101,6 +103,7 @@ tests and their module gate).
   infer, so fidelity is unchanged; lint needs the unoptimized AST.
 - dastest expect-files: validate emits one Information note and suppresses
   diagnostics (intentional errors are not noise to report).
-- The plugin manifest names `bin/watchdog` (single-config layout); a Visual
-  Studio tree has `bin/Release/watchdog.exe` - README documents the local edit.
-  Don't hardcode a fallback chain in the manifest (no such mechanism).
+- The plugin manifest names `bin/watchdog` on every platform: a Windows spawn
+  resolves the bare name to `watchdog.exe`, and a multi-config build copies the
+  exe into `bin/` beside its `bin/Release/` home (`utils/CMakeLists.txt`). Don't
+  hardcode a fallback chain in the manifest (no such mechanism).

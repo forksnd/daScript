@@ -1,6 +1,7 @@
 options gen2
 options indenting = 4
 options remove_unused_symbols = false
+options no_aot
 
 module network shared public
 
@@ -55,6 +56,53 @@ class Server {
     def operator delete {
         unsafe {
             delete _server
+        }
+    }
+    def abstract onConnect : void
+    def abstract onDisconnect : void
+    def abstract onData(buf : uint8?; size : int) : void
+    def abstract onError(msg : string; code : int) : void
+    def abstract onLog(msg : string) : void
+}
+
+//! one outgoing TCP connection: `connect` resolves the host (a name, an IPv4 or IPv6 literal)
+//! and blocks until the peer answers, refuses, or `timeout_ms` passes; then the socket is
+//! non-blocking and `tick` hands every byte it holds to `onData`
+class Client {
+    _client : NetworkClient?
+    def Client {
+        pass
+    }
+    def make_client_adapter {
+        let classInfo = class_info(self)
+        unsafe {
+            if (!make_client(addr(self), classInfo)) {
+                panic("can't make client")
+            }
+        }
+    }
+    def connect(host : string; port : int; timeout_ms : int = 5000) : bool {
+        return client_connect(_client, host, port, timeout_ms)
+    }
+    def is_connected : bool {
+        return client_is_connected(_client)
+    }
+    def tick : void {
+        if (_client != null) {
+            client_tick(_client)
+        }
+    }
+    def send(data : uint8?; size : int) : bool {
+        return client_send(_client, data, size)
+    }
+    def close : void {
+        if (_client != null) {
+            client_close(_client)
+        }
+    }
+    def operator delete {
+        unsafe {
+            delete _client
         }
     }
     def abstract onConnect : void

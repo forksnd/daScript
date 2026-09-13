@@ -9,9 +9,10 @@ MCP server.
 
 ## Requirements
 
-- The watchdog exe, `bin/watchdog` (`bin/Release/watchdog.exe` in a Visual Studio
-  tree) - the endpoint is its `--lsp` front. The manifest names the single-config
-  path; in a Visual Studio tree edit its `command` locally.
+- The watchdog exe, `bin/watchdog` (`watchdog.exe` on Windows) - the endpoint is
+  its `--lsp` front. The manifest names `bin/watchdog` on every platform: Windows
+  resolves the bare name to the `.exe`, and a Visual Studio build copies the exe
+  from `bin/Release/` into `bin/` as well.
 - A daslang binary (`bin/daslang`, `bin/Release/daslang[.exe]`, `build/daslang`,
   or anywhere - see the lookup order below) for the subtools.
 

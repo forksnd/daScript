@@ -5,6 +5,7 @@ require daslib/fio
 require daslib/command_line
 require daslib/json
 require daslib/json_boost
+require daslib/jsonrpc
 require daslib/strings_boost
 require daslib/strings_convert
 require strings
@@ -18,21 +19,19 @@ require watchdog
 //! daslang running a subtool (`utils/lsp/subtools/*.das`) that prints LSP-shaped JSON and exits,
 //! the client's buffer riding along as a `--overlay` file. One loop polls stdin with the time to
 //! the next due validate as its timeout, so a validate fires while the client is silent; a
-//! validate runs as a child the loop polls between frames, and an edit of the file kills one
-//! still running, so an edit never waits on a compile and a stale buffer's diagnostics never
-//! publish. Stdout is the protocol; the log goes to its file only.
+//! validate runs as a child the loop polls between frames, one at a time - a burst of edits
+//! across files queues, never a compile per file racing the others for the box - and an edit
+//! of the file kills one still running, so an edit never waits on a compile and a stale
+//! buffer's diagnostics never publish. Stdout is the protocol; the log goes to its file only.
 
 let private DEBOUNCE_MS = 100
+let private MAX_INFLIGHT_VALIDATES = 1
 let private SUBTOOL_TIMEOUT_SEC = 60.0
 let private CONTENT_LENGTH_HEADER = "content-length:"
 let private MAX_FRAME_BYTES = 64 * 1024 * 1024
 let private SERVER_NAME = "daslang-lsp"
 let private SERVER_VERSION = "0.5.0"
 let private CAPABILITIES = "\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":false\}\},\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"implementationProvider\":true,\"callHierarchyProvider\":true\}"
-
-def private json_str(s : string) : string {
-    return write_json_compact(JV(s))
-}
 
 // ===== paths and URIs =====
 
@@ -72,7 +71,7 @@ def private under(path, root : string) : bool {
 
 //! a diagnostic that carries the endpoint's own trouble, on the file's first character
 def public tool_diagnostic(message : string; severity : int = 1) : string {
-    return "\{\"range\":\{\"start\":\{\"line\":0,\"character\":0\},\"end\":\{\"line\":0,\"character\":1\}\},\"severity\":{severity},\"source\":\"daslang-lsp\",\"message\":{json_str(message)}\}"
+    return "\{\"range\":\{\"start\":\{\"line\":0,\"character\":0\},\"end\":\{\"line\":0,\"character\":1\}\},\"severity\":{severity},\"source\":\"daslang-lsp\",\"message\":{quoted(message)}\}"
 }
 
 //! the warning for a file in another git worktree than the compiler serving it: that binary's
@@ -226,11 +225,11 @@ class public LspFront {
 
     def private reply_error(id_text : string; code : int; message : string) {
         let id = empty(id_text) ? "null" : id_text
-        write_frame("\{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":\{\"code\":{code},\"message\":{json_str(message)}\}\}")
+        write_frame("\{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":\{\"code\":{code},\"message\":{quoted(message)}\}\}")
     }
 
     def private publish(uri, diagnostics_json : string) {
-        write_frame("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":\{\"uri\":{json_str(uri)},\"diagnostics\":{diagnostics_json}\}\}")
+        write_frame("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":\{\"uri\":{quoted(uri)},\"diagnostics\":{diagnostics_json}\}\}")
         log->emit("published", JV({"uri" => JV(uri)}))
     }
 
@@ -409,22 +408,26 @@ class public LspFront {
         }
     }
 
-    //! starts the validates whose debounce has elapsed
+    //! starts the validates whose debounce has elapsed, as many as the in-flight cap leaves room
+    //! for; the rest stay due and start as slots free up
     def private run_due_validates() {
         var ready <- [for (uri, at in keys(due), values(due)); uri; where get_time_usec(at) >= DEBOUNCE_MS * 1000]
         for (uri in ready) {
+            break if (length(inflight) >= MAX_INFLIGHT_VALIDATES)
             due |> erase(uri)
             start_validate(uri)
         }
     }
 
-    //! how long the next wait on stdin may last: to the next due validate, a short poll while one
-    //! is in flight, else a second
+    //! how long the next wait on stdin may last: to the next due validate while a slot is free
+    //! for it, a short poll while one is in flight, else a second
     def private wait_ms() : int {
         var wait = empty(inflight) ? 1000 : 10
-        for (at in values(due)) {
-            let left = DEBOUNCE_MS - get_time_usec(at) / 1000
-            wait = clamp(left, 1, wait)
+        if (length(inflight) < MAX_INFLIGHT_VALIDATES) {
+            for (at in values(due)) {
+                let left = DEBOUNCE_MS - get_time_usec(at) / 1000
+                wait = clamp(left, 1, wait)
+            }
         }
         return wait
     }
@@ -442,7 +445,7 @@ class public LspFront {
                         write(w, ",")
                     }
                     first = false
-                    let uri = json_str(path_to_uri(l?["path"] ?? ""))
+                    let uri = quoted(path_to_uri(l?["path"] ?? ""))
                     let span = write_json_compact(l?["range"])
                     write(w, "\{\"uri\":{uri},\"range\":{span}\}")
                 }
@@ -455,20 +458,20 @@ class public LspFront {
         let name = it?["name"] ?? ""
         let symbol = it?["symbol"] ?? ""
         let detail = it?["detail"] ?? ""
-        let name_json = json_str(name)
+        let name_json = quoted(name)
         let kind = write_json_compact(it?["kind"])
-        let uri = json_str(path_to_uri(it?["path"] ?? ""))
+        let uri = quoted(path_to_uri(it?["path"] ?? ""))
         let span = write_json_compact(it?["range"])
         let selection = write_json_compact(it?["selectionRange"])
-        let data_uri_json = json_str(data_uri)
-        let file = json_str(it?["file"] ?? "")
+        let data_uri_json = quoted(data_uri)
+        let file = quoted(it?["file"] ?? "")
         let line = write_json_compact(it?["line"])
-        let data_name = json_str(empty(symbol) ? name : symbol)
+        let data_name = quoted(empty(symbol) ? name : symbol)
         return build_string() $(var w) {
             write(w, "\{\"name\":{name_json},\"kind\":{kind},\"uri\":{uri},\"range\":{span},\"selectionRange\":{selection}")
             write(w, ",\"data\":\{\"uri\":{data_uri_json},\"file\":{file},\"line\":{line},\"name\":{data_name}\}")
             if (!empty(detail)) {
-                let detail_json = json_str(detail)
+                let detail_json = quoted(detail)
                 write(w, ",\"detail\":{detail_json}")
             }
             write(w, "\}")
@@ -508,10 +511,10 @@ class public LspFront {
                     write(w, ",")
                 }
                 first = false
-                let name = json_str(s?["name"] ?? "")
+                let name = quoted(s?["name"] ?? "")
                 let kind = write_json_compact(s?["kind"])
-                let container = json_str(s?["containerName"] ?? "")
-                let uri = json_str(path_to_uri(s?["path"] ?? ""))
+                let container = quoted(s?["containerName"] ?? "")
+                let uri = quoted(path_to_uri(s?["path"] ?? ""))
                 let span = write_json_compact(s?["range"])
                 write(w, "\{\"name\":{name},\"kind\":{kind},\"containerName\":{container},\"location\":\{\"uri\":{uri},\"range\":{span}\}\}")
             }
@@ -551,7 +554,7 @@ class public LspFront {
             let has_range = payload?["hasRange"] ?? false
             let range_json = write_json_compact(payload?["range"])
             let span = has_range ? ",\"range\":{range_json}" : ""
-            let value = json_str(contents)
+            let value = quoted(contents)
             return "\{\"contents\":\{\"kind\":\"markdown\",\"value\":{value}\}{span}\}"
         } elif (op == "documentSymbol") {
             return symbols_json(payload, false)

@@ -1,0 +1,1 @@
+Binds a throwaway TCP socket to ``port`` on every interface, as a listener would, and returns the port it got: the same port when it is free, the one the system picked when ``port`` is 0, and -1 when the port is taken or ``host`` (an IPv4 address, or ``localhost``) does not resolve. The socket is closed before returning, so the port is a report, not a reservation.

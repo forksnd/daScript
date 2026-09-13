@@ -56,9 +56,11 @@ interpreter::
 
 .. note::
 
-   The plugin manifest names ``bin/watchdog``, the single-config layout.
-   In a Visual Studio tree the exe is ``bin/Release/watchdog.exe`` ---
-   edit the manifest's ``command`` locally.
+   The plugin manifest names ``bin/watchdog`` on every platform.  On
+   Windows the spawn resolves that bare name to ``watchdog.exe``, and a
+   multi-config (Visual Studio) build copies the exe it just built from
+   ``bin/<Config>/`` into ``bin/`` as well, so the checked-in manifest
+   needs no local edit.
 
 
 Diagnostics

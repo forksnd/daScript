@@ -18,6 +18,16 @@ struct CcEntry {
 }
 
 
+// The database spells every path the way CMake was configured - on a case-insensitive
+// filesystem that can differ from the checkout's spelling in case alone (a lowercase `work`
+// against the tree's `Work`), and a lookup that honors case then misses the whole database
+// and falls back silently. Windows and macOS filesystems fold case, so the key does too.
+def public cc_key(path : string) : string {
+    let platform = get_platform_name()
+    return platform == "windows" || platform == "darwin" ? to_lower(path) : path
+}
+
+
 // compile_commands.json writes each command shell-quoted: a define can carry escaped quotes
 // (-DX=\"y\") and a path can carry spaces, so splitting on whitespace mangles both.
 def public cc_tokenize(cmd : string) : array<string> {
@@ -79,7 +89,8 @@ def public cc_is_compile_switch(a : string) : bool {
 }
 
 
-// The exact flags CMake compiles each TU with, keyed by absolute source path. The gate's own
+// The exact flags CMake compiles each TU with, keyed by `cc_key` of the absolute source path
+// - the caller looks up through the same key. The gate's own
 // include list is a hand-rolled approximation: it models neither build-generated headers
 // (tests-cpp/big/standalone_ctx/_generated) nor per-module include dirs, and false-fails any
 // TU that needs one. This reflects the LOCAL configure's module ON/OFF set rather than CI's
@@ -116,7 +127,7 @@ def public load_compile_commands(build_dir : string; want_cl : bool) : table<str
                 i++
             }
         }
-        out[file_abs] <- flags
+        out[cc_key(file_abs)] <- flags
     }
     return <- out
 }

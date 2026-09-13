@@ -52,6 +52,20 @@ def test_cc_is_compile_switch(t : T?) {
 }
 
 
+// A configure done through a differently-cased spelling of the checkout (macOS and Windows
+// fold case) writes that spelling into the database; a case-honoring lookup then misses every
+// entry and the gate sweeps with its approximate include list instead, silently.
+[test]
+def test_cc_key_folds_case_where_the_filesystem_does(t : T?) {
+    t |> run("the key is one spelling per file") @(t : T?) {
+        let platform = get_platform_name()
+        let folded = platform == "windows" || platform == "darwin"
+        t |> equal(cc_key("/Users/x/Work/daScript/src/a.cpp") == cc_key("/Users/x/work/daScript/src/a.cpp"), folded)
+        t |> equal(cc_key("/tmp/A.cpp"), folded ? "/tmp/a.cpp" : "/tmp/A.cpp")
+    }
+}
+
+
 [test]
 def test_cc_tokenize_quoting(t : T?) {
     t |> run("an escaped quote in a define becomes a literal quote") @(t : T?) {

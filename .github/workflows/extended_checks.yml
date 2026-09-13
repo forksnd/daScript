@@ -530,6 +530,7 @@ jobs:
         cmake --build ./build --config Release --target tree_sitter_daslang
         $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/mcp/test_tools.das
         $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/mcp/test_crosstree_guard.das
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/mcp/test_setup.das
 
     - name: "Test daspkg"
       if: matrix.role != 'core'
@@ -539,13 +540,12 @@ jobs:
         set -eux
         $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/daspkg/test_daspkg.das --timeout 900
 
-    - name: "Test DAP MCP bridge (python)"
+    - name: "Test DAP MCP bridge"
       # the per-PR core cell runs it too: nightly-only, a red in this suite stays unseen until the next night
       if: matrix.target != 'windows' && matrix.role != 'modules'
       run: |
         set -eux
-        PYTHONDONTWRITEBYTECODE=1 python3 utils/dap/test_mcp_bridge.py
-        DAS_TEST_STEPPING=1 PYTHONDONTWRITEBYTECODE=1 python3 utils/dap/test_mcp_bridge.py
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/dap/test_dap_bridge.das --timeout 900
 
     - name: "Test CI matrix and role conditions (python)"
       # ci/ci_matrix.py is what pre_job fed this very run; the test pins its per-event cells and

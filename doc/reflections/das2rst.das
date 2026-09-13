@@ -259,7 +259,8 @@ def document_module_random(_root : string) {
 def document_module_network(_root : string) {
     var mod = get_module("network_core")
     var groups <- array<DocGroup>(
-        group_by_regex("Low level NetworkServer IO", mod, %regex~(make_server|server_init|server_is_open|server_is_connected|server_tick|server_send|server_restore)$%%)
+        group_by_regex("Low level NetworkServer IO", mod, %regex~(make_server|server_init|server_is_open|server_is_connected|server_tick|server_send|server_restore)$%%),
+        group_by_regex("Low level NetworkClient IO", mod, %regex~(make_client|client_connect|client_is_connected|client_tick|client_send|client_close|probe_local_port)$%%)
     )
     document("Network socket library", mod, "network.rst", groups)
 }
@@ -593,7 +594,7 @@ def document_module_json_boost(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Value conversion", mod, %regex~(JV|from_JV)$%%),
         group_by_regex("LINQ source builders", mod, %regex~(from_json|from_json_row|read_json_field)$%%),
-        group_by_regex("Element access operators", mod, %regex~(\[\]|\?\[\]|\?\.|\.)$%%),
+        group_by_regex("Element access operators", mod, %regex~(\[\]|\?\[\]|\?\.|\.|key_exists)$%%),
         group_by_regex("Null coalescing operators", mod, %regex~(\?\?)$%%),
         group_by_regex("Value extraction", mod, %regex~(\?\.)?`value$%%),
         group_by_regex("Annotation parsing", mod, %regex~(parse_json_annotation)$%%)
@@ -604,7 +605,7 @@ def document_module_json_boost(_root : string) {
 def document_module_jsonrpc(_root : string) {
     var mod = find_module("jsonrpc")
     var groups <- array<DocGroup>(
-        group_by_regex("Envelope builders", mod, %regex~(response|error|error_with_data|serialize_id)$%%),
+        group_by_regex("Envelope builders", mod, %regex~(response|error|error_with_data|serialize_id|quoted)$%%),
         group_by_regex("Server-side parsers", mod, %regex~(parse_request|parse_batch)$%%),
         group_by_regex("Request scope", mod, %regex~(free_request|free_batch)$%%),
         group_by_regex("Outgoing request builders", mod, %regex~(make_request|make_notification|make_batch)$%%),

@@ -14,18 +14,9 @@ required = true
 startup_timeout_sec = 20
 tool_timeout_sec = 120
 
-[mcp_servers.daslang-lsp]
-command = "python3"
-args = ["utils/lsp/mcp_bridge.py", "--repo-root", "."]
-cwd = "."
-enabled = true
-required = true
-startup_timeout_sec = 20
-tool_timeout_sec = 120
-
 [mcp_servers.daslang-dap]
-command = "python3"
-args = ["utils/dap/mcp_bridge.py", "--repo-root", "."]
+command = "bin/watchdog"
+args = ["--stdio", "--name", "daslang-dap", "--cwd", ".", "--program", "bin/daslang", "--", "utils/dap/main.das", "--", "--repo-root", ".", "--executable", "bin/daslang"]
 cwd = "."
 enabled = true
 required = true

@@ -795,7 +795,7 @@ def private build_sweep_argvs(ctx : PreflightCtx; in_scope : array<string>) : tu
     var group_flags : table<string; array<string>>
     var from_db = 0
     for (f in in_scope) {
-        let abs = path_join(cwd, f)
+        let abs = cc_key(path_join(cwd, f))
         var flags : array<string>
         if (cc |> key_exists(abs)) {
             flags := cc[abs]
