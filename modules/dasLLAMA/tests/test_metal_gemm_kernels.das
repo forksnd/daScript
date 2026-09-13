@@ -596,8 +596,8 @@ def private q8_dbuf_gate(t : T?; dev, queue; m, kdim, ndim : int; mt : int = 128
         ? pipeline_from_source(dev, MetalQ8MulMmTH128_metal_q8_mulmm_t_msl, MetalQ8MulMmTH128_metal_q8_mulmm_t_msl_entry, MetalQ8MulMmTH128_metal_q8_mulmm_t_msl_fastmath, err)
         : pipeline_from_source(dev, MetalQ8MulMmTH_metal_q8_mulmm_t_msl, MetalQ8MulMmTH_metal_q8_mulmm_t_msl_entry, MetalQ8MulMmTH_metal_q8_mulmm_t_msl_fastmath, err))
     var pso_b = (mt == 128
-        ? pipeline_from_source(dev, MetalQ8MulMmTHDb128_metal_q8_mulmm_db_msl, MetalQ8MulMmTHDb128_metal_q8_mulmm_db_msl_entry, MetalQ8MulMmTHDb128_metal_q8_mulmm_db_msl_fastmath, err)
-        : pipeline_from_source(dev, MetalQ8MulMmTHDb_metal_q8_mulmm_db_msl, MetalQ8MulMmTHDb_metal_q8_mulmm_db_msl_entry, MetalQ8MulMmTHDb_metal_q8_mulmm_db_msl_fastmath, err))
+        ? pipeline_from_source(dev, MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl, MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl_entry, MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl_fastmath, err)
+        : pipeline_from_source(dev, MetalQ8MulMmTHDb_metal_q8_mulmm_t_msl, MetalQ8MulMmTHDb_metal_q8_mulmm_t_msl_entry, MetalQ8MulMmTHDb_metal_q8_mulmm_t_msl_fastmath, err))
     if ((pso_a == null || pso_b == null) && !metal4_tensor_available(dev)) {
         to_log(LOG_INFO, "{tag}: no Metal-4 tensor toolchain on this box - arm skipped\n")
         return
@@ -632,7 +632,7 @@ def private q8_dbuf_gate(t : T?; dev, queue; m, kdim, ndim : int; mt : int = 128
         metal_set_buffer(enc, bn, 0ul, 5)
         metal_dispatch_threadgroups(enc, uint3(uint(m / mt), uint(ndim / 64), 1u), uint3(128u, 1u, 1u))
         metal_set_pipeline(enc, pso_b)
-        metal_set_threadgroup_memory_length(enc, MetalQ8MulMmTHDb128_metal_q8_mulmm_db_msl_tgmem, 0)
+        metal_set_threadgroup_memory_length(enc, MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl_tgmem, 0)
         metal_set_buffer(enc, by_b, 0ul, 3)
         metal_dispatch_threadgroups(enc, uint3(uint(m / mt), uint(ndim / 64), 1u), uint3(128u, 1u, 1u))
     }

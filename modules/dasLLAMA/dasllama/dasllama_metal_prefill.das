@@ -101,13 +101,15 @@ class MetalBf16MulMm : MetalMmTileBase {
 [ |> template_struct_instance]
 class template MetalQ8MulMmTensorT {
     @template_constant MT : uint = 32u      //!< M-tile rows: W re-streams M/MT times
+    @template_constant BK : uint = 64u      //!< K chunk the stage streams per step; 128 double-buffers two tiles
+    @template_constant TWB : int = 6144     //!< W stage halves: one 64 wcols x 72-half padded tile (12288B lands mid-plateau); 9216 = two tiles
     @ssbo @binding = 0 @role = "weight" @off = "wboff" wsh : array<float16> //!< 34B-block W blob, half-scale view
     @ssbo @binding = 1 @role = "weight" @off = "wboff" wqb : array<int8>    //!< the SAME blob buffer, byte view
     @ssbo @binding = 2 @off = "xoff" xf : array<XT>  //!< raw activations (float, or the converted f16 panel)
     @ssbo @binding = 3 @off = "yoff" @span = "mp*d*4" y : array<float>
     @uniform @binding = 4 kdim : uint
     @uniform @binding = 5 ndim : uint
-    @workgroup twb : float16[6144]          //!< W chunk: 64 wcols x 72-half padded rows (bk=64; 12288B lands mid-plateau)
+    @workgroup twb : float16[TWB]
 
     [metal_kernel(float_a_ok=true)]
     def metal_q8_mulmm_t {
@@ -118,7 +120,7 @@ class template MetalQ8MulMmTensorT {
         var wp = unsafe(addr(wqb[blk0 * 34u + 2u]))
         var ap = unsafe(addr(xf[mBase * kdim]))
         var cp = unsafe(addr(y[mBase * ndim + nBase]))
-        tmm2d_q8u_f32(MT, 64u, 4u, twb, sp, wp, ap, kdim, cp, ndim, kdim, kdim / 32u, gl_LocalInvocationIndex, 64u)
+        tmm2d_q8u_f32(MT, 64u, 4u, twb, sp, wp, ap, kdim, cp, ndim, kdim, kdim / 32u, gl_LocalInvocationIndex, BK)
     }
 }
 
@@ -144,39 +146,19 @@ class MetalQ8MulMmTH128 : MetalQ8MulMmTensorT {
     override MT = 128u
 }
 
-[ |> template_struct_instance]
-class template MetalQ8MulMmDbT {
-    @template_constant MT : uint = 128u
-    @ssbo @binding = 0 @role = "weight" @off = "wboff" wsh : array<float16>
-    @ssbo @binding = 1 @role = "weight" @off = "wboff" wqb : array<int8>
-    @ssbo @binding = 2 @off = "xoff" xf : array<XT>
-    @ssbo @binding = 3 @off = "yoff" @span = "mp*d*4" y : array<float>
-    @uniform @binding = 4 kdim : uint
-    @uniform @binding = 5 ndim : uint
-    @workgroup twb : float16[9216]   //!< two 64x72-half tiles = 18432B (probed: 0-2% off the alloc plateau)
-
-    [metal_kernel(float_a_ok=true)]
-    def metal_q8_mulmm_db {
-        let mBase = gl_WorkGroupID.x * MT
-        let nBase = gl_WorkGroupID.y * 64u
-        let blk0 = nBase * (kdim / 32u)
-        var sp = unsafe(addr(wsh[blk0 * 17u]))
-        var wp = unsafe(addr(wqb[blk0 * 34u + 2u]))
-        var ap = unsafe(addr(xf[mBase * kdim]))
-        var cp = unsafe(addr(y[mBase * ndim + nBase]))
-        tmm2d_q8u_f32(MT, 64u, 4u, twb, sp, wp, ap, kdim, cp, ndim, kdim, kdim / 32u, gl_LocalInvocationIndex, 128u)
-    }
+[metal_dispatch(name = "enc_gemm_mm_thdb128_c", pso = "g_pf_pso_mm_thdb128", tgmem = "MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl_tgmem", tg = 128, grid = "mp/128, d/64", params = "mp : int64, d : int64")]
+class MetalQ8MulMmTHDb128 : MetalQ8MulMmTensorT {
+    typedef XT = float16
+    override MT = 128u
+    override BK = 128u
+    override TWB = 9216
 }
 
-[metal_dispatch(name = "enc_gemm_mm_thdb128_c", pso = "g_pf_pso_mm_thdb128", tgmem = "MetalQ8MulMmTHDb128_metal_q8_mulmm_db_msl_tgmem", tg = 128, grid = "mp/128, d/64", params = "mp : int64, d : int64")]
-class MetalQ8MulMmTHDb128 : MetalQ8MulMmDbT {
+[metal_dispatch(name = "enc_gemm_mm_thdb_c", pso = "g_pf_pso_mm_thdb", tgmem = "MetalQ8MulMmTHDb_metal_q8_mulmm_t_msl_tgmem", tg = 128, grid = "mp/32, d/64", params = "mp : int64, d : int64")]
+class MetalQ8MulMmTHDb : MetalQ8MulMmTensorT {
     typedef XT = float16
-}
-
-[metal_dispatch(name = "enc_gemm_mm_thdb_c", pso = "g_pf_pso_mm_thdb", tgmem = "MetalQ8MulMmTHDb_metal_q8_mulmm_db_msl_tgmem", tg = 128, grid = "mp/32, d/64", params = "mp : int64, d : int64")]
-class MetalQ8MulMmTHDb : MetalQ8MulMmDbT {
-    typedef XT = float16
-    override MT = 32u
+    override BK = 128u
+    override TWB = 9216
 }
 
 struct CvtArgs {
@@ -4147,8 +4129,8 @@ def private metal_prefill_init : bool {   // nolint:STYLE038 — flat one-compil
         g_pf_pso_mm_th = compile_pso(MetalQ8MulMmTH_metal_q8_mulmm_t_msl, MetalQ8MulMmTH_metal_q8_mulmm_t_msl_entry, MetalQ8MulMmTH_metal_q8_mulmm_t_msl_fastmath, ok)
         g_pf_pso_mm_t128 = compile_pso(MetalQ8MulMmT128_metal_q8_mulmm_t_msl, MetalQ8MulMmT128_metal_q8_mulmm_t_msl_entry, MetalQ8MulMmT128_metal_q8_mulmm_t_msl_fastmath, ok)
         g_pf_pso_mm_th128 = compile_pso(MetalQ8MulMmTH128_metal_q8_mulmm_t_msl, MetalQ8MulMmTH128_metal_q8_mulmm_t_msl_entry, MetalQ8MulMmTH128_metal_q8_mulmm_t_msl_fastmath, ok)
-        g_pf_pso_mm_thdb128 = compile_pso(MetalQ8MulMmTHDb128_metal_q8_mulmm_db_msl, MetalQ8MulMmTHDb128_metal_q8_mulmm_db_msl_entry, MetalQ8MulMmTHDb128_metal_q8_mulmm_db_msl_fastmath, ok)
-        g_pf_pso_mm_thdb = compile_pso(MetalQ8MulMmTHDb_metal_q8_mulmm_db_msl, MetalQ8MulMmTHDb_metal_q8_mulmm_db_msl_entry, MetalQ8MulMmTHDb_metal_q8_mulmm_db_msl_fastmath, ok)
+        g_pf_pso_mm_thdb128 = compile_pso(MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl, MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl_entry, MetalQ8MulMmTHDb128_metal_q8_mulmm_t_msl_fastmath, ok)
+        g_pf_pso_mm_thdb = compile_pso(MetalQ8MulMmTHDb_metal_q8_mulmm_t_msl, MetalQ8MulMmTHDb_metal_q8_mulmm_t_msl_entry, MetalQ8MulMmTHDb_metal_q8_mulmm_t_msl_fastmath, ok)
         g_pf_pso_dq_q8 = compile_pso(metal_dequant_q8h_msl, metal_dequant_q8h_msl_entry, metal_dequant_q8h_msl_fastmath, ok)
     }
     g_pf_bf16_mm_tensor = metal_tensor_crowned("mulmm_bf16")
