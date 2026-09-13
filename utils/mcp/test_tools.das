@@ -42,6 +42,7 @@ require tools/detect_duplicates public
 require tools/export_corpus public
 require tools/arch_of public
 require tools/arch_sites public
+require tools/discover public
 
 def parse_result(result : string; var text : string&; var is_error : bool&) : bool {
     var err : string
@@ -3540,5 +3541,84 @@ def test_arch_sites(t : T?) {
         parse_result(do_arch_sites("nonexistent_arch_doc_12345.md"), text, is_error)
         t |> success(is_error, "should be error -- text={text}")
         t |> success(find(text, "Document not found") >= 0, "should mention the missing document -- text={text}")
+    }
+}
+
+def private discover_lines(query, limit, module_filter : string; var is_error : bool&) : array<string> {
+    //! The tool's text split into lines: line 0 is the header, the rows follow in rank order.
+    var text : string
+    parse_result(do_discover(query, limit, module_filter), text, is_error)
+    return <- split(text, "\n")
+}
+
+def private top_symbol(lines : array<string>) : string {
+    //! The `module::name` of the top row - the text before its ` - description` or `  [group]` tail.
+    return "" if (length(lines) < 2)
+    var cut = length(lines[1])
+    for (tail in [" - ", "  ["]) {
+        let at = find(lines[1], tail)
+        if (at >= 0 && at < cut) {
+            cut = at
+        }
+    }
+    return trim(slice(lines[1], 0, cut))
+}
+
+[test]
+def test_discover(t : T?) {
+    t |> run("query word order ranks a name over its mirror, and the group tail names the manual's heading") <| @(t : T?) {
+        var is_error = false
+        let lines <- discover_lines("convert uri to file name", "5", "", is_error)
+        t |> success(!is_error, "should not be error -- {lines}")
+        t |> success(top_symbol(lines) == "uriparser::uri_to_file_name", "uri_to_file_name ranks first, its mirror file_name_to_uri does not -- {lines}")
+        t |> success(find(lines[1], "[File name conversions]") >= 0, "the row carries its group heading -- {lines}")
+        t |> success(find(lines[1], " - Converts a URI string") >= 0, "the row carries its description -- {lines}")
+    }
+    t |> run("a word found only in descriptions still ranks its symbol first") <| @(t : T?) {
+        var is_error = false
+        let lines <- discover_lines("percent-encodes reserved characters", "3", "", is_error)
+        t |> success(top_symbol(lines) == "uriparser::escape_uri", "description words rank escape_uri first -- {lines}")
+    }
+    t |> run("synonyms bridge the query's word to the name") <| @(t : T?) {
+        var is_error = false
+        let lines <- discover_lines("url to path", "8", "", is_error)
+        let text = join(lines, "\n")
+        t |> success(find(text, "uri_to_file_name") >= 0 || find(text, "uri_to_unix_file_name") >= 0, "url reaches the uri family -- {lines}")
+    }
+    t |> run("fts5 syntax filters before ranking") <| @(t : T?) {
+        var is_error = false
+        let lines <- discover_lines("uri* NOT windows", "50", "uriparser", is_error)
+        let text = join(lines, "\n")
+        t |> success(!is_error, "should not be error -- {lines}")
+        t |> success(find(text, "uri_to_file_name") >= 0, "prefix match survives -- {lines}")
+        t |> success(find(text, "uri_to_windows_file_name") < 0, "NOT excludes the windows twin -- {lines}")
+    }
+    t |> run("an exact name ranks first, and the module filter keeps other modules out") <| @(t : T?) {
+        var is_error = false
+        let in_fio <- discover_lines("base_name", "3", "fio", is_error)
+        t |> success(top_symbol(in_fio) == "fio::base_name", "exact name first in the named module -- {in_fio}")
+        let elsewhere <- discover_lines("base_name", "50", "uriparser", is_error)
+        t |> success(find(join(elsewhere, "\n"), "fio::") < 0, "another module's rows never appear -- {elsewhere}")
+    }
+    t |> run("limit defaults to 12 on an empty or unparsable value and is honored otherwise") <| @(t : T?) {
+        var is_error = false
+        t |> success(find(discover_lines("string", "", "", is_error)[0], "showing 12") >= 0, "empty limit shows 12")
+        t |> success(find(discover_lines("string", "abc", "", is_error)[0], "showing 12") >= 0, "garbage limit shows 12")
+        t |> success(find(discover_lines("string", "3", "", is_error)[0], "showing 3") >= 0, "a numeric limit is honored")
+    }
+    t |> run("a query no symbol matches says so without an error") <| @(t : T?) {
+        var is_error = false
+        let lines <- discover_lines("zzqqxxyy", "5", "", is_error)
+        t |> success(!is_error, "no match is not a tool failure -- {lines}")
+        t |> success(find(lines[0], "no symbol matches") >= 0, "names the outcome -- {lines}")
+    }
+    t |> run("an empty query and a bad fts5 query are tool failures") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_discover("  ", "", ""), text, is_error)
+        t |> success(is_error, "empty query should be error -- text={text}")
+        parse_result(do_discover("(uri", "", ""), text, is_error)
+        t |> success(is_error, "unbalanced fts5 query should be error -- text={text}")
+        t |> success(find(text, "invalid FTS5 query") >= 0, "names the cause -- text={text}")
     }
 }

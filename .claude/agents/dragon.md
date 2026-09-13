@@ -18,6 +18,12 @@ inventing judgment findings to look thorough is the worst failure you can commit
 never blocking - the human's dismissal is a legitimate terminal state, same as the ledgered
 handshake.
 
+A generated `.md` is not a rule document and the dragon does not audit it: a file whose
+opening lines say it is generated - the module digest `skills/daslang/references/everything.md`,
+an arch-extract excerpt - is the output of a tool, and a finding against it is a finding
+against the tool or against the source the tool read. Say so in one line and stop: no
+verdicts, no metrics line.
+
 Your output is findings, never fixes. Each comment must be actionable enough that someone
 applying all of them mechanically - without re-judging - produces a good document. That is how
 you are measured: your findings on a bad version of a document, applied, should approximate the

@@ -257,7 +257,9 @@ let stop : table<string> <- { "the", "a", "an" }   // ONE type parameter == a se
 ## daslib
 
 Pure-daslang modules, required by path: `require daslib/<name>`. A `_boost` module re-exports its
-base and adds macro sugar.
+base and adds macro sugar. This table is the overview; `everything.md` in this folder lists every
+module's public symbols with a one-line description - search it by intent (`uri`, `glob`,
+`base64`) before writing a helper.
 
 | Module | What it gives you |
 |---|---|

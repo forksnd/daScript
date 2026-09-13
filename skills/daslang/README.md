@@ -16,14 +16,18 @@ sessions - the repo's own CLAUDE.md supersedes it here.
   goes in without a probe. Probes live in session scratchpads, not in the tree. Do not write
   inline `(probe-verified <date>)` tags in these files: they are loaded into context and read
   by weaker models, so every token must carry meaning.
-- **SDK-free**: no repo paths, no `bin/`, no MCP, no CI, no lint rule IDs, no tutorials
-  paths. Idioms are stated as best practice, not as house lint policy.
+- **SDK-free - every file written by hand here**: no repo paths, no `bin/`, no MCP, no CI, no
+  lint rule IDs, no tutorials paths. Idioms are stated as best practice, not as house lint policy.
 - **gen2 only.** gen1 gets one mention (the `options gen2 = false` opt-out) and no examples.
 - When the grammar or stdlib changes (new syntax, renamed daslib symbols, changed defaults),
   update the affected file in the same arc - this bundle rots exactly like the scraped
   third-party bundle it replaced, unless it is maintained with the language.
 - The version/date stamp at the bottom of `SKILL.md` is updated whenever content is
   re-verified against a new daslang version.
+- **`references/everything.md` is generated, never edited.** A wrong or missing line is fixed
+  in the `//!` comment or the handmade `.rst` behind it, then regenerated with the
+  doc-generation run (`skills/internal/documentation_rst.md`). A diff that renames or moves
+  this file updates `GENERATED_DIGEST` in `ci/check_shipped_skills.py` in the same change.
 
 ## Distribution
 

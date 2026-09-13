@@ -15,9 +15,10 @@ file adds only the two roles and the harness rules.
 The prompt assigns you files. Read every one of them in full - every function, every
 `class template`, every kernel body. Do not sample, do not stop at the sweep's pairs.
 
-Before the first function: read the folder's `ARCHITECTURE*.md` and `REVIEW*.md`, and the
-sweep report the prompt names (or run the sweep yourself into the scratch directory the
-prompt names - never into the repo).
+Before the first function: read the folder's `ARCHITECTURE*.md` and `REVIEW*.md`,
+`skills/daslang/references/everything.md` (the stdlib digest) in full, and the sweep report
+the prompt names (or run the sweep yourself into the scratch directory the prompt names -
+never into the repo).
 
 Return two things:
 

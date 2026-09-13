@@ -13,7 +13,18 @@
 
 ```
 bin/Release/daslang.exe -documentation doc/reflections/das2rst.das
+bin/Release/daslang.exe -documentation doc/reflections/das2rst.das -- --digest <path>   # writes the digest to <path> instead of the tracked one
 ```
+
+**The same run writes the module digest `skills/daslang/references/everything.md`** - one
+section per module, every public symbol with the first sentence of its description, overloads
+collapsed to one line. It is generated output; its editing rules are in
+`skills/daslang/README.md`. Commit it in the same change as the `//!` or handmade edit that
+changed its lines.
+
+**A symbol with no `generated/detail/` file takes its digest description from the matching
+`handmade/*.rst`.** So a module documented on both sides, C++ by hand and `daslib/*.das` by
+`//!` (`fio`, `ast`, `rtti`), lists both sides.
 
 ### Adding public functions to a module
 

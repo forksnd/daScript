@@ -16,7 +16,12 @@ is worse than no gate). Two escape hatches, both spelled `repo-only`:
   * on any LINE of a paragraph -> exempts that paragraph, because prose wraps.
 Files under skills/daslang/ get NO escape hatch: the bundle is standalone by
 contract (no repo paths, no MCP, no CI, no lint rule IDs -- see its README in
-the repo), so a violation there is fixed, never marked.
+the repo), so a violation there is fixed, never marked. The one file the purity
+bans skip is the generated module digest (GENERATED_DIGEST, written by
+doc/reflections/das2rst.das): its lines are the stdlib's own symbol descriptions,
+so a banned word there - a lint module naming its rule IDs, the logger naming the
+MCP server - is the stdlib's vocabulary, not the skill's. Every other check still
+applies to it.
 
 Also walks the REPO's skills/internal/ (when run from a checkout) for dead
 relative links -- internal skills rot too, they just rot privately.
@@ -75,6 +80,8 @@ HEADING = re.compile(r"^#+\s")
 BUNDLE_MCP = re.compile(r"\bMCP\b")
 BUNDLE_CI = re.compile(r"\bCI (?:lane|run|job|pipeline)|\.github/|workflows/|GitHub Actions")
 BUNDLE_LINT_ID = re.compile(r"\b(?:PERF|STYLE|LINT|IMGUI)\d{3}\b")
+
+GENERATED_DIGEST = "daslang/references/everything.md"
 
 
 def scan_file(path, relname, problems, *, standalone_skill, link_bases, shipped_exists,
@@ -163,7 +170,7 @@ def scan_file(path, relname, problems, *, standalone_skill, link_bases, shipped_
             for m in REPO_PATH.finditer(raw):
                 flag("not in bundle", m.group(1))
 
-        if standalone_skill:
+        if standalone_skill and relname != GENERATED_DIGEST:
             if BUNDLE_MCP.search(raw):
                 flag("bundle purity", "MCP mention -- the language skill is tool-agnostic")
             if BUNDLE_CI.search(raw):

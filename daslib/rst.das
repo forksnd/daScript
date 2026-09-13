@@ -55,6 +55,7 @@ var public {
     strict_struct_fields = true
     group_function_overloads = true
     property_assignment_operator = ":="
+    digest_path = ""
     doc_block_order = [
         DocumentBlock.Typedefs,
         DocumentBlock.GlobalConstants,
@@ -81,7 +82,136 @@ var private pageless_ref_modules : table<string>
 
 var private nosearch_symbols : table<string>
 
+var private md_section_lines : array<string>
+var private md_row_at : table<string; int>
+var private md_pending_group = ""
+var private md_index_lines : array<string>
 
+def private topic_path(topic : string) : string {
+    //! A `detail/` topic with no extracted file falls back to its `handmade/` twin: a promoted
+    //! builtin module documents its C++ half by hand and its daslib half by `//!`.
+    if (topic |> starts_with("|handmade/")) return "{handmade_root}/{slice(topic, 1, -1)}.rst"
+    let path = "{topic_root}/{slice(topic, 1, -1)}.rst"
+    var st : FStat
+    if (stat(path, st)) return path
+    let twin = "{handmade_root}/handmade/{slice(topic, length("|detail/"), -1)}.rst"
+    return stat(twin, st) ? twin : path
+}
+
+def private md_read_topic(topic : string) : string {
+    return fread(topic_path(topic))
+}
+
+def private md_strip_rst(text : string) : string {
+    var s = text |> replace("``", "`")
+    for (role in ["ref", "func", "class", "mod", "meth", "attr", "doc"]) {
+        s = s |> replace(":{role}:`", "`")
+    }
+    if (find(s, " <") < 0) return s
+    var parts <- split(s, "`")
+    for (p, i in parts, count()) {
+        if ((i & 1) == 0) continue
+        let lt = find(p, " <")
+        if (lt >= 0 && p |> ends_with(">")) {
+            p = slice(p, 0, lt)
+        }
+    }
+    return join(parts, "`")
+}
+
+def private entry_rows(tab : array<array<string>>) : int {
+    //! The rows of a field / value table under its header row - one description line each in the topic file.
+    return length(tab) - 1
+}
+
+def private strip_bom(text : string) : string {
+    //! A topic file saved with a byte-order mark would carry it into the digest's row; the digest is ASCII-gated.
+    let bom <- [uint8(0xEF), uint8(0xBB), uint8(0xBF)]
+    return text |> replace(string(bom), "")
+}
+
+def private md_first_paragraph(text : string; entry_lines : int = 0) : string {
+    var lines <- [for (raw in strip_bom(text) |> replace("\r\n", "\n") |> split("\n")); trim(raw)]
+    while (!empty(lines) && empty(lines[length(lines) - 1])) {
+        lines |> pop()
+    }
+    lines |> resize(max(0, length(lines) - entry_lines))
+    return "" if (!empty(lines) && lines[0] |> starts_with(STUB))
+    var out : array<string>
+    for (line in lines) {
+        let is_directive = line |> starts_with(":") || line |> starts_with("..")
+        if (empty(line) || is_directive) {
+            if (!empty(out)) break
+            continue
+        }
+        out |> push(line)
+    }
+    return md_strip_rst(join(out, " "))
+}
+
+def private md_first_sentence(paragraph : string) : string {
+    let dot = find(paragraph, ". ")
+    return dot < 0 ? paragraph : slice(paragraph, 0, dot + 1)
+}
+
+def private md_row(name : string; topic : string; entry_lines : int = 0) {
+    //! One row per name: the first overload claims it, and a later overload with a description
+    //! fills a row the first one left bare.
+    if (empty(digest_path)) return
+    let text = md_first_sentence(md_first_paragraph(md_read_topic(topic), entry_lines))
+    var at = -1
+    md_row_at |> get(name) $(idx) {
+        at = idx
+    }
+    if (at >= 0) {
+        if (!empty(text) && md_section_lines[at] == "- `{name}`") {
+            md_section_lines[at] = "- `{name}` - {text}"
+        }
+        return
+    }
+    if (!empty(md_pending_group)) {
+        md_section_lines |> push("\n### {md_pending_group}\n")
+        md_pending_group = ""
+    }
+    md_section_lines |> push(empty(text) ? "- `{name}`" : "- `{name}` - {text}")
+    md_row_at[name] = length(md_section_lines) - 1
+}
+
+def private md_begin(mod_name : string; mod : Module?) {
+    if (empty(digest_path)) return
+    clear(md_row_at)
+    md_pending_group = ""
+    md_section_lines |> push("\n## {mod_name}\n")
+    let intro = md_first_paragraph(md_read_topic(topic(mod)))
+    if (!empty(intro)) {
+        md_section_lines |> push("{intro}\n")
+    }
+    let brief = md_first_sentence(intro)
+    let anchor = to_lower(mod_name)
+    md_index_lines |> push(empty(brief) ? "- [{mod_name}](#{anchor})" : "- [{mod_name}](#{anchor}) - {brief}")
+}
+
+def public write_digest() {
+    //! Writes the module digest to `digest_path`: a sorted module index, then one section per module
+    //! documented so far - its intro paragraph and every public symbol with a one-line description.
+    //! A no-op while `digest_path` is empty.
+    if (empty(digest_path)) return
+    mkdir_rec(dir_name(digest_path))
+    sort(md_index_lines)
+    fopen(digest_path, "wb") $(f) {
+        if (f == null) {
+            PANIC("can't open {digest_path}")
+        }
+        fwrite(f, "# daslang modules\n\nGenerated from the module documentation - a fix goes into the `//!` comment or the handmade page behind a line, then the file is regenerated.\n")
+        fwrite(f, "One section per module: what the module is for, then its public symbols grouped as the reference manual groups them, one line each. A symbol with several overloads appears once.\n\n")
+        for (line in md_index_lines) {
+            fwrite(f, "{line}\n")
+        }
+        for (line in md_section_lines) {
+            fwrite(f, "{line}\n")
+        }
+    }
+}
 
 def PANIC(message : string) {
     to_log(LOG_ERROR, "PANIC: {message}\n")
@@ -651,7 +781,9 @@ def make_ref(name, text : string) {
 }
 
 def public make_group(name : string; plus : string = "+") {
-    //! Creates an RST group header with the given name surrounded by separator lines.
+    //! Creates an RST group header with the given name surrounded by separator lines, and
+    //! names the digest heading the next symbol row opens.
+    md_pending_group = name
     let len = length(name)
     return "\n{strings::repeat(plus,len)}\n{name}\n{strings::repeat(plus,len)}\n\n"
 }
@@ -899,8 +1031,7 @@ def document_topic(header : string; doc_file : file; topic, content : string imp
 
 def document_topic(doc_file : file; topic, content : string implicit; cb : block<(text : string; handmade : bool) : string>) {
     let is_handmade_topic = topic |> starts_with("|handmade/")
-    let base_root = is_handmade_topic ? handmade_root : topic_root
-    let topic_file_name = "{base_root}/{slice(topic,1,-1)}.rst"
+    let topic_file_name = topic_path(topic)
     mkdir_rec(dir_name(topic_file_name))
     var st : FStat
     if (is_handmade_topic && !stat(topic_file_name, st)) {
@@ -955,6 +1086,7 @@ def document_bitfield(mod : Module?; doc_file : file; name : string; value : Typ
     }
 
     document_topic("Fields", doc_file, topic("typedef", mod, name), describe(value), tab, is_nosearch(name))
+    md_row(name, topic("typedef", mod, name), entry_rows(tab))
 }
 
 def document_variant(mod : Module?; doc_file : file; name : string; value : TypeDeclPtr) {
@@ -965,6 +1097,7 @@ def document_variant(mod : Module?; doc_file : file; name : string; value : Type
         emplace(tab, line)
     }
     document_topic("Variants", doc_file, topic("typedef", mod, name), describe(value), tab, is_nosearch(name))
+    md_row(name, topic("typedef", mod, name), entry_rows(tab))
 }
 
 def document_typedef(doc_file : file; mod : Module?; name : string implicit; value) {
@@ -995,6 +1128,7 @@ def document_typedef(doc_file : file; mod : Module?; name : string implicit; val
         tp = replace(tp, "$::", "")
         fwrite(doc_file, " = {tp}\n\n")
         document_topic(doc_file, topic("typedef", mod, name), "typedef {name} = {describe(value)}")
+        md_row(name, topic("typedef", mod, name))
     }
 }
 
@@ -1023,6 +1157,7 @@ def document_global_constant(doc_file : file; mod : Module?; value : VariablePtr
     fwrite(doc_file, string(value.name))
     fwrite(doc_file, " = {describe(value.init)}\n\n")
     document_topic(doc_file, topic("Variable", mod, string(value.name)), describe(value))
+    md_row(string(value.name), topic("Variable", mod, string(value.name)))
 }
 
 def private is_global_constant(value : VariablePtr) {
@@ -1071,6 +1206,7 @@ def public document_enumeration(doc_file : file; mod : Module?; value) {
         emplace(tab, line)
     }
     document_topic("Values", doc_file, topic("enumeration", mod, string(value.name)), "enum {value.name}", tab, is_nosearch(string(value.name)))
+    md_row(string(value.name), topic("enumeration", mod, string(value.name)), entry_rows(tab))
 }
 
 
@@ -1161,7 +1297,9 @@ def document_class_method(doc_file : file; mod : Module?; value; var fld) {
     (document_function_declaration(doc_file, "das:function", "{value.name}.{fld.name}",
         argNames, argTypes, argInits, fld._type.firstType, 1))
     var args <- document_function_arguments(doc_file, argNames, argTypes, 1)
-    document_function_topic(doc_file, func.result, topic("function", mod, "{value.name}-{function_label_file(fld.name, fld.init._type, 1)}"), "def {fld.name} : {describe(fld._type)}", args)
+    let fn_topic = topic("function", mod, "{value.name}-{function_label_file(fld.name, fld.init._type, 1)}")
+    document_function_topic(doc_file, func.result, fn_topic, "def {fld.name} : {describe(fld._type)}", args)
+    md_row("{value.name}.{fld.name}", fn_topic)
 }
 
 def document_deprecated_unsafe(doc_file : file; func) {
@@ -1213,7 +1351,9 @@ def document_struct_method(doc_file : file; mod : Module?; value; var func) {
         }
     }
     let file_label = "{safe_function_name(fname)}-{hash(mn)}"
-    document_function_topic(doc_file, func.result, topic("function", mod, "{value.name}-{file_label}"), "def {value.name}.{fname}", args)
+    let fn_topic = topic("function", mod, "{value.name}-{file_label}")
+    document_function_topic(doc_file, func.result, fn_topic, "def {value.name}.{fname}", args)
+    md_row("{value.name}.{fname}", fn_topic)
 }
 
 def make_requirements_list(value : ast::Structure?) {
@@ -1310,6 +1450,7 @@ def document_classes(doc_file : file; mods : array<Module?>) {
             collect_field_rows(value, hasValues, fields)
 
             document_topic("Fields", doc_file, topic("class", mod, string(value.name)), "class {value.name}", fields, is_nosearch(string(value.name)))
+            md_row(string(value.name), topic("class", mod, string(value.name)), entry_rows(fields))
 
             for (fld in value.fields) {
                 if (is_class_method(value, fld) && !(fld.flags.generated) && !fld.flags.privateField && !(fld.flags.parentType) && (fld.flags.implemented)) {
@@ -1416,6 +1557,7 @@ def document_structure(doc_file : file; mod : Module?; var value : StructurePtr)
     }
     collect_field_rows(value, hasValues, tab)
     document_topic("Fields", doc_file, topic("structure", mod, string(value.name)), "struct {value.name}", tab, is_nosearch(string(value.name)))
+    md_row(string(value.name), topic("structure", mod, string(value.name)), entry_rows(tab))
 
     for (fld in value.fields) {
         if (is_class_method(value, fld) && !fld.flags.generated && !fld.flags.privateField && !fld.flags.parentType && fld.flags.implemented) {
@@ -1522,6 +1664,7 @@ def document_structure_annotation(doc_file : file; mod : Module?; value) {
     }
 
     document_topic("Fields", doc_file, topic("structure_annotation", mod, string(value.name)), "Annotation {value.name}", tab, is_nosearch(string(value.name)))
+    md_row(string(value.name), topic("structure_annotation", mod, string(value.name)), entry_rows(tab))
 }
 
 def document_structure_annotations(doc_file : file; mods : array<Module?>; hook = DocsHook()) {
@@ -1548,6 +1691,7 @@ def document_enumeration_annotation(doc_file : file; mod : Module?; value) {
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value.name}\n\n")
     document_topic(doc_file, topic("enumeration_macro", mod, string(value.name)), "Enumeration annotation {value.name}")
+    md_row(string(value.name), topic("enumeration_macro", mod, string(value.name)))
 }
 
 def document_enumeration_annotations(doc_file : file; mods : array<Module?>; hook = DocsHook()) {
@@ -1575,6 +1719,7 @@ def document_function_annotation(doc_file : file; mod : Module?; value) {
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value.name}\n\n")
     document_topic(doc_file, topic("function_annotation", mod, string(value.name)), "Function annotation {value.name}")
+    md_row(string(value.name), topic("function_annotation", mod, string(value.name)))
 }
 
 def document_function_annotations(doc_file : file; mods : array<Module?>; hook = DocsHook()) {
@@ -1601,6 +1746,7 @@ def document_annotation(doc_file : file; mod : Module?; value) {
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value.name}\n\n")
     document_topic(doc_file, topic("annotation", mod, string(value.name)), "Annotation {value.name}")
+    md_row(string(value.name), topic("annotation", mod, string(value.name)))
 }
 
 def document_annotations(doc_file : file; mods : array<Module?>; hook = DocsHook()) {
@@ -1632,6 +1778,7 @@ def document_structure_macro(doc_file : file; mod : Module?; value) {
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value.name}\n\n")
     document_topic(doc_file, topic("structure_macro", mod, string(value.name)), "Structure annotation {value.name}")
+    md_row(string(value.name), topic("structure_macro", mod, string(value.name)))
 }
 
 def document_structure_macros(doc_file : file; mods : array<Module?>) {
@@ -1658,6 +1805,7 @@ def document_call_macro(doc_file : file; mod : Module?; value : string implicit)
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value}\n\n")
     document_topic(doc_file, topic("function_annotation", mod, value), "Function annotation {value}")
+    md_row(value, topic("function_annotation", mod, value))
 }
 
 def document_call_macros(doc_file : file; mods : array<Module?>) {
@@ -1682,6 +1830,7 @@ def document_reader_macro(doc_file : file; mod : Module?; value : string implici
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value}\n\n")
     document_topic(doc_file, topic("reader_macro", mod, value), "Reader macro {value}")
+    md_row(value, topic("reader_macro", mod, value))
 }
 
 def document_reader_macros(doc_file : file; mods : array<Module?>) {
@@ -1706,6 +1855,7 @@ def document_variant_macro(doc_file : file; mod : Module?; value : string implic
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value}\n\n")
     document_topic(doc_file, topic("variant_macro", mod, value), "Variant macro {value}")
+    md_row(value, topic("variant_macro", mod, value))
 }
 
 def document_variant_macros(doc_file : file; mods : array<Module?>) {
@@ -1730,6 +1880,7 @@ def document_typeinfo_macro(doc_file : file; mod : Module?; value : string impli
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value}\n\n")
     document_topic(doc_file, topic("typeinfo_macro", mod, value), "Typeinfo macro {value}")
+    md_row(value, topic("typeinfo_macro", mod, value))
 }
 
 def document_typeinfo_macros(doc_file : file; mods : array<Module?>) {
@@ -1845,11 +1996,15 @@ def document_function(doc_file : file; mod : Module?; var func : FunctionPtr; dr
     let funcSafeName = function_name(func)
     (document_function_declaration(doc_file, objType, funcSafeName,
         argNames, argTypes, argInits, func.result, drop_args))
+    let fn_topic = topic("function", mod, "{prefix}{function_label_file(func,drop_args)}")
+    let owner_type = prefix |> trim_suffix("-")
+    let md_name = empty(owner_type) || funcSafeName |> starts_with("{owner_type}.") ? funcSafeName : "{owner_type}.{funcSafeName}"
+    md_row(md_name, fn_topic)
     if (skip_body) return
     document_deprecated_unsafe(doc_file, func)
 
     var args <- document_function_arguments(doc_file, argNames, argTypes, drop_args)
-    document_function_topic(doc_file, func.result, topic("function", mod, "{prefix}{function_label_file(func,drop_args)}"), "def {rst_describe_function_short(func)}", args)
+    document_function_topic(doc_file, func.result, fn_topic, "def {rst_describe_function_short(func)}", args)
 }
 
 
@@ -2129,6 +2284,7 @@ def public documents(name : string; mods : array<Module?>; fname : string; var g
     generate_substitute_stub(mods, "{topic_root}/detail/{fname}")
     for (mod in mods) {
         document_topic(doc_file, topic(mod), "Module {mod.name}")
+        md_begin(mod_name, mod)
         break
     }
 

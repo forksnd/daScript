@@ -28,6 +28,9 @@ EXEMPT_PREFIXES = (
 )
 # shipped, human-facing: typography stays, only mojibake is policed
 SHIPPED_BASENAMES = {"README.md", "CHANGELIST.md"}
+# generated from the module docs, so its typography is theirs and a rewrite would
+# be undone by the next regeneration
+SHIPPED_FILES = {"skills/daslang/references/everything.md"}
 
 EXEMPT_FILES = {
     "utils/internal/das-herd/LANGUAGE_SUPPORT_PLAN.md",  # non-English samples are the subject
@@ -151,7 +154,7 @@ def main():
     for rel in list_targets():
         path = REPO / rel
         text, was_broken = read_repaired(path)
-        if rel.rsplit("/", 1)[-1] in SHIPPED_BASENAMES:
+        if rel in SHIPPED_FILES or rel.rsplit("/", 1)[-1] in SHIPPED_BASENAMES:
             if was_broken:
                 dirty.append(rel)
                 if not args.check:

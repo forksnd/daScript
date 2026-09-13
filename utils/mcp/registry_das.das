@@ -8,6 +8,7 @@ require tools/list_types public
 require tools/run_test public
 require tools/list_module_api public
 require tools/list_modules public
+require tools/discover public
 require tools/find_symbol public
 require tools/format_file public
 require tools/run_script public
@@ -152,6 +153,19 @@ def build_das_tools(var reg : array<ToolDef>) { // nolint:STYLE038 — flat tool
         any_required <- ["expression", "file"],
         arg_names <- ["expression", "file", "function", "mode", "lineinfo"],
         handler = @@(arg1, arg2, arg3, arg4, arg5, arg6, project, project_root : string; load_modules : array<string>) => do_ast_dump(arg1, arg2, arg3, arg4, arg5, project, project_root, load_modules)))
+    reg |> emplace(ToolDef(
+        tool <- make_tool(
+            "discover",
+            "Does the standard library already do this? Intent search over the module digest (skills/daslang/references/everything.md): every public symbol of every module with its one-line description. Plain words rank by where they hit - the symbol name first, the manual's group heading next, the description last - with a small synonym list (path/file, uri/url, dir/folder, ...). FTS5 syntax filters first and ranks the survivors: prefix uri*, phrase \"file name\", AND / OR / NOT, NEAR(). Call it before writing any helper.",
+            {
+                "query" => PropertySchema(_type = "string", description = "What the helper should do, in a few words ('convert uri to file path'), a name fragment, or an FTS5 expression"),
+                "limit" => PropertySchema(_type = "string", description = "Rows to return (default 12)"),
+                "module" => PropertySchema(_type = "string", description = "Restrict to one module ('fio', 'uriparser', ...)")
+            },
+            ["query"]),
+        required <- ["query"],
+        arg_names <- ["query", "limit", "module"],
+        handler = @@(arg1, arg2, arg3, arg4, arg5, arg6, project, project_root : string; load_modules : array<string>) => do_discover(arg1, arg2, arg3)))
     reg |> emplace(ToolDef(
         tool <- make_tool(
             "list_modules",
