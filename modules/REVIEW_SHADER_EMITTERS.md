@@ -35,7 +35,8 @@ shape constant.
 
 **A Metal kernel that loads its operands with the `tmm2d_*` family receives a run-time-only
 matmul reduction width through a `matmul2d_descriptor` whose K extent is `dynamic_extent`, and
-no other way.**
+no other way.** The reduction width is the K loop's bound - the length of the loop the kernel
+accumulates over; the per-step chunk a `tmm2d_*` call takes is a shape constant.
 
 **A diff that makes a kernel need a shape constant known only at run time ships a
 specialization path, or records in an `ARCHITECTURE*.md` at the root of the module the kernel

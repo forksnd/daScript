@@ -117,7 +117,7 @@ zoo. Facts that decide the order:
   must set `IQ4XS` and `IQ4NL`; the Db forms sit on the sanctioned float-A list); the four dense
   mul_mm shells onto a `MetalMoeMulMmBase` twin (~145); the MoE GEMV `GATHERED` axis (~230, the
   `float4` x view stays its own axis - a measured 2.25x); the zero-risk singles (CrossVx f16/f32,
-  Q8MvB2/B4 onto `MetalGemvB24T`, argmax rows, rope-store batched, Q8MulMmDb, DequantK6H,
+  Q8MvB2/B4 onto `MetalGemvB24T`, argmax rows, rope-store batched, DequantK6H,
   G4aMag/Q3aPow, the bias pair; ~325).
 - Rules for every conversion: a stamp's `tgmem=` string is `<LeafClass>_<method>_msl_tgmem`, so a
   hand class becoming a stamp changes it and drops its `[metal_kernel(name=..)]`; a

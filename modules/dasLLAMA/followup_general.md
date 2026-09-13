@@ -1610,9 +1610,3 @@
     Nothing reaches it below `g_attn_single_max` rows of context. Unquirked: one chunk-count
     formula over the deepest row, used both to size `bpart` and to dispatch, with a cell that
     verifies at a context depth crossing a 64-row boundary.
-143. **The q8 mul_mm tensor and double-buffer kernels are one body one stage width apart.**
-    `MetalQ8MulMmTensorT` and `MetalQ8MulMmDbT` (`dasllama_metal_prefill.das`) carry the same
-    eight-line kernel; they differ in the chunk width `tmm2d_q8u_f32` takes (64 / 128), the
-    staging tile (`twb` 6144 / 9216 halves) and the default M tile (32 / 128). Unquirked: one
-    class template with the stage width as its constant, the stamps keeping their dispatch
-    names, gated by the emitted-kernel identity compare and the prefill kq arms.

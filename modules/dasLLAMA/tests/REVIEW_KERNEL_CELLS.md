@@ -6,15 +6,19 @@ doc: `CLAUDE.md`. Planned work: `../followup_general.md`, `../followup_vulkan.md
 
 **A diff another checklist routes here applies this list together with that checklist.**
 
-**A diff that changes a kernel's dispatch geometry - a grid divisor or a threadgroup size -
+**A diff that changes a kernel's dispatch geometry - a grid divisor or the threads per threadgroup -
 updates every gate (a cell or probe that dispatches a kernel) that hand-dispatches that kernel,
 in the same change.** A moved divisor leaves the gate dispatching the wrong shape with no error.
 
 **A diff that gives a `[metal_dispatch]` kernel `@workgroup` state, or takes it away, updates
 the threadgroup-memory length in every gate that hand-dispatches that kernel, in the same
-change.** A gate that sets none for a kernel with `@workgroup` state reads garbage silently; a
-change to the `@workgroup` array's own size needs no gate edit, and a Vulkan kernel's shared
-memory is compiled in.
+change.** A gate that sets none for a kernel with `@workgroup` state reads garbage silently.
+
+**A diff that changes the size of a `[metal_dispatch]` stamp's `@workgroup` array - a stamp
+being one leaf class of a kernel, whose overridden constants set that size - updates, in the
+same change, every gate that hand-dispatches a different stamp while reading this stamp's
+`*_tgmem` global for its threadgroup-memory length.** A gate reading the `*_tgmem` global of the
+stamp it dispatches follows the new size on its own.
 
 **A diff that changes a kernel's kargs - the kernel-argument struct, or any buffer binding -
 re-checks every gate that hand-binds that kernel and updates each bind the change made stale,
@@ -55,8 +59,7 @@ mechanism, or a second independent lane; a gate's own reference is never its con
 step - operands, accumulator, or the stored result - bounds that step's error by construction
 (f16-exact inputs, magnitude-bounded fixtures) or states, in the cell or at the shared bar
 helper the cell calls, how its bar follows from that step's error.** A bar moved without that
-derivation is a loosening: the compare then measures the narrowing until it no longer
-discriminates.
+derivation is a loosening: the compare then passes any result the wider bar admits.
 
 **A diff that changes a kernel's narrow step - the precision of its operands, its accumulator,
 or its stored result - restates in every kernel-unit cell of that kernel what bounds that

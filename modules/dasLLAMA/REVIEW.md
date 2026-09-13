@@ -7,8 +7,7 @@ docs: `ARCHITECTURE.md`, `ARCHITECTURE_ENGINE.md`, `ARCHITECTURE_RUNTIME.md`,
 the Vulkan tier), `followup_metal.md` (engine work on the Metal tier, or CPU engine work
 measured on macOS), `PERF_LEDGER.md` (performance; the rest goes to the followup ledgers).
 
-**A dasLLAMA `[test]` file, wherever the diff puts it, answers to this module's
-`tests/REVIEW.md`.**
+**A dasLLAMA `[test]` file, wherever the diff puts it, answers to `tests/REVIEW.md` here.**
 
 **A timing rig (a file that times a run itself and reports a wall-clock time or rate as its
 result, printed or returned to a caller that prints it - a driver reading a child's clock is
@@ -94,8 +93,8 @@ sidecars stay valid across code changes, and per-change invalidation lives in th
 mechanisms - `IMAGE_VERSION` and `layout_fingerprint()` (`dasllama/dasllama_image.das`).
 
 **A value that cannot change between dispatches of one compiled kernel never reaches that
-kernel as a uniform, a kargs field, an `@off` bind offset, or a helper parameter - stamp it
-into the class as a `@template_constant` instead.**
+kernel as a uniform, a kargs field, or an `@off` bind offset - stamp it into the class as a
+`@template_constant` instead.**
 
 **A function-typed global a serialized exe must re-establish lands in a `dasllama/` file with
 the `[init]` that establishes it at boot; landing one where `REVIEW.das`'s restore-check walk
@@ -268,8 +267,9 @@ keeps the charters true - in an `ARCHITECTURE_*.md` companion, never `ARCHITECTU
 same change.** A file added beside files with their own sec.1 charter lines gets one too; a
 module-root ledger has none.
 
-**A follow-up ledger row whose work landed in this change is deleted, and the rows below it
-keep their numbers** - checked-in text cites rows by number, and no lint follows the citations.
+**A follow-up ledger row whose work landed in this change is deleted, and the rows below keep
+their numbers; when a row lists several items and one item's work landed, that item is deleted
+and the row stays** - checked-in text cites rows by number.
 
 **A diff that adds, removes, or moves a section of an `ARCHITECTURE_*.md` companion, or adds
 or removes a companion, lands `ARCHITECTURE.md`'s index line and section range, the
