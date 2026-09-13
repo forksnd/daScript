@@ -75,6 +75,20 @@ class GateFixture(unittest.TestCase):
               "# bad\n\nPERF018 fires on this shape\n")
         self.assert_fires("bundle purity", "PERF018")
 
+    def test_generated_digest_skips_purity_bans(self):
+        write(self.bundle, "skills/" + gate.GENERATED_DIGEST,
+              "# daslang modules\n\nGenerated from the module documentation.\n\n"
+              "- `cold_path` - prunes the PERF026-028 walk\n"
+              "- `logger` - for daslang tools (MCP server, dastest)\n"
+              "- `ci_lane` - the CI lane runs it\n")
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+
+    def test_generated_digest_keeps_every_other_check(self):
+        write(self.bundle, "skills/" + gate.GENERATED_DIGEST,
+              "# daslang modules\n\n- `x` - see src/ast/ast.cpp for the C++ side\n")
+        self.assert_fires("not in bundle", "src/ast/ast.cpp")
+
     def test_no_marker_escape_under_daslang(self):
         # the repo-only marker must NOT exempt the language skill
         write(self.bundle, "skills/daslang/references/bad.md",

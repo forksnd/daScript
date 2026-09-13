@@ -1,4 +1,4 @@
-﻿Object which holds compilation and simulation settings and restrictions.
+Object which holds compilation and simulation settings and restrictions.
 Whether ahead-of-time compilation is enabled.
 AOT library mode.
 Whether standalone context AOT compilation is enabled.

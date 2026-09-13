@@ -1,7 +1,8 @@
 # daslib Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-docs: `ARCHITECTURE.md`, `ARCHITECTURE_LINT.md`, `ARCHITECTURE_EMIT.md`, `ARCHITECTURE_LINQ.md`.
+docs: `ARCHITECTURE.md`, `ARCHITECTURE_CAPI.md`, `ARCHITECTURE_LINT.md`, `ARCHITECTURE_EMIT.md`,
+`ARCHITECTURE_LINQ.md`.
 A diff touching the linq family - `linq*.das`, `sql_*.das` - applies `REVIEW_LINQ.md` too. A
 diff touching `daspkg.das` - the functions a `.das_package` manifest body calls - applies
 `utils/daspkg/REVIEW.md` (repo root) too; the folder walk never opens it for a `daslib/` diff.
@@ -267,10 +268,11 @@ KIND.** An rvalue stays materialized, because a reference to a temporary dangles
 **Never reuse a swizzle rewrite's source node in a second output lane without cloning it** -
 the first appearance moves it, and skipping the clone gives one node two parents.
 
-**A diff that changes how the RST label or topic key is computed makes the same change in
-every place `rst.das` computes it - the stub pass (`generate_module_stubs`) and the
-documenting pass (`documents`) - keeping them byte-for-byte equal.** When the two diverge, the page
-prints a bare signature and the symbol re-stubs.
+**A diff that changes how the RST label (the `.. _name:` target) or the topic key (the
+`|detail/...|` / `|handmade/...|` substitution name) is computed makes the same change at
+every site in `rst.das` that spells it, keeping them byte-for-byte equal; how a key resolves
+to a file is not the key.** When the two diverge, the page prints a bare signature and the
+symbol re-stubs.
 
 **A diff that adds a numeric value form to the toml lexer routes it through `rewind_to_bare`
 on a bare-key character.** Without the rewind, a bare key that starts like a number lexes as

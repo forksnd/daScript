@@ -12,6 +12,7 @@ The daslang MCP server (`utils/mcp/main.das`) exposes compiler diagnostics, prog
 | `list_functions` | Grepping for `def ` in `.das` files |
 | `list_types` | Grepping for `struct`/`class`/`enum` definitions |
 | `find_symbol` | Searching across modules for function/type names |
+| `discover` | Writing a helper without asking whether the stdlib has one - intent words (`convert uri to file path`) or FTS5 query syntax (`uri*`, `"file name"`, `path NOT windows`) over the generated digest of every module's public symbols (`skills/daslang/references/everything.md`); rows matching more of the query's words rank first |
 | `list_module_api` | Reading daslib source to find available functions |
 | `list_modules` | Guessing module names or scanning `daslib/` directory |
 | `ast_dump` | Manually inspecting AST or post-macro output (supports `lineinfo` for source locations) |

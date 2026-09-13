@@ -1,0 +1,1 @@
+Writes the markdown module digest to ``digest_path``: a sorted module index, then one section per documented module with its intro paragraph and every public symbol on one line. No-op while ``digest_path`` is empty.

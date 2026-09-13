@@ -69,6 +69,7 @@ Before reaching for `Bash`/`Grep`/`Read` to find a symbol or trace usages in thi
 
 | Question | Tool |
 |---|---|
+| Does the stdlib already do this? (before writing ANY helper) | `discover` - a few intent words over the generated digest of every module's public symbols |
 | Where is symbol X defined? (`.das`) | `find_symbol` - pass `with_cpp_source=true` for builtins / handled types to bridge daslang->C++ in one call |
 | Where is symbol X defined? (`.cpp`) | `cpp_find_symbol` |
 | Where is X used? (`.das`) | `grep_usage` |
@@ -194,11 +195,9 @@ Read `skills/internal/writing_skills.md` first - it carries the full checklist. 
 
 ## daslang Language
 
-Language, runtime and stdlib truth lives in **`skills/daslang/`** - `SKILL.md` plus thirteen
-references (`types`, `functions`, `structs-and-classes`, `closures`, `memory`, `generics`,
-`macros`, `modules-and-stdlib`, `strings`, `files-and-paths`, `json`, `queries`,
-`cli-and-config`). Read the one that covers what you are about to write or review, before you
-write it. Compiler internals no user-facing doc carries - the container collect banner, the
+Language, runtime and stdlib truth lives in **`skills/daslang/`** - `SKILL.md` plus the
+reference files under `skills/daslang/references/`. Read the one that covers what you are
+about to write or review, before you write it. Compiler internals no user-facing doc carries - the container collect banner, the
 `/*option*/` policy marker, known mangling defects - are in `skills/internal/daslang_internals.md`.
 
 What follows is only what the bundle deliberately does not carry: the shapes that fail

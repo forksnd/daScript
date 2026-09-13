@@ -39,6 +39,10 @@ Detailed semantics live in `./references/`:
 - `json.md` - `sprint_json`/`sscan_json`, `JV`, `JsonValue?`, safe navigation
 - `queries.md` - comprehensions, the linq surface, what fuses into one pass
 - `cli-and-config.md` - argv parsing, environment twins, config knobs
+- `everything.md` - generated digest of every module: what it is for, every public symbol,
+  each with a one-line description where the source carries one; search it by symbol or
+  intent before writing a helper, and read it whole only when auditing a file set for
+  duplicates
 
 ## Functions
 

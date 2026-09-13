@@ -17,6 +17,7 @@ require daslib/ast_boost
 require daslib/strings_boost
 require daslib/strings_convert
 require daslib/md_boost
+require daslib/clargs
 require daslib/rst
 require daslib/rst_comment
 require daslib/functional
@@ -637,7 +638,7 @@ def document_module_regex_boost(_root : string) {
 def document_module_rst(_root : string) {
     var mod = find_module("rst")
     var groups <- array<DocGroup>(
-        group_by_regex("Document writers", mod, %regex~document%%),
+        group_by_regex("Document writers", mod, %regex~(document|write_digest)%%),
         group_by_regex("Descriptions", mod, %regex~describe%%),
         group_by_regex("Label makers", mod, %regex~(\w+_label_name|function_label_file)%%),
         group_by_regex("RST section makers", mod, %regex~make%%),
@@ -1919,6 +1920,8 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     disable_profiler_log(this_context())
     ast_gc_guard() {
     let root = get_das_root() + "/doc/source/stdlib/generated"
+    digest_path = unwrap_or(find_flag_raw_value(get_command_line_arguments(), "--digest"),
+        get_das_root() + "/skills/daslang/references/everything.md")
     // document embedded modules
     document_module_builtin(root)
     document_module_math(root)
@@ -2074,5 +2077,6 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_uriparser_boost(root)
     document_module_utf8_utils(root)
     document_module_validate_code(root)
+    write_digest()
     }
 }

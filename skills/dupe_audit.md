@@ -54,22 +54,30 @@ can be noise. The audit is the reading of every function in scope.
 1. **Read the folder's `ARCHITECTURE*.md` and `REVIEW*.md` first.** They name the folding
    mechanisms the folder sanctions and the separations it has ruled. A fold the checklist
    already demands is reported in the checklist's words.
-2. **Run the structural sweep** over the scope against the corpus (commands below). Walk exact
+2. **Read `skills/daslang/references/everything.md` in full, before the first function in
+   scope.** It is the generated digest of every module: each public symbol, most with a
+   one-line description. Read whole, not grepped - a grep needs the right word and the helper
+   you are looking for was named by someone else - and the MCP `discover` tool answers one
+   targeted question against the same digest; it does not replace the whole read.
+3. **Run the structural sweep** over the scope against the corpus (commands below). Walk exact
    clusters first, then fuzzy matches from the highest similarity down. Every pair is a
    candidate, nothing more.
-3. **Read every function in scope, in full.** Build an inventory as you go: one line per
+4. **Read every function in scope, in full.** Build an inventory as you go: one line per
    function - `file:line name - job in ten words - axis-like parameters`. The inventory is
-   what finds the duplicates the sweep cannot: the same job with a different skeleton.
-4. **For each candidate, fresh-read both bodies.** Name the difference in words. Name the
+   what finds the duplicates the sweep cannot: the same job with a different skeleton. A digest
+   row whose description matches the job is a candidate - a name-only row (no description)
+   still counts when the name is close; open its source.
+5. **For each candidate, fresh-read both bodies.** Name the difference in words. Name the
    axis. Check the architecture doc for a ruling. Count the callers of each member (`grep_usage`
    or a repo-wide grep) - a fold that touches thirty call sites is still a fold, and the number
    is what the decision needs.
-5. **A DUPLICATE claim names the existing function** with file:line and states what the two
+6. **A DUPLICATE claim names the existing function** with file:line and states what the two
    bodies differ on - "nothing", or the one line. "An existing helper probably does this" is
    not a finding.
-6. **A claim of absence carries its evidence.** "No existing helper" comes with the search
-   command, run from the repo root over the whole tree (generated directories excluded), and
-   what it returned.
+7. **A claim of absence carries its evidence.** "No existing helper" comes with the nearest
+   digest rows - the symbol and its module, and why each one misses - and the search
+   (`grep_usage`, the MCP `discover` tool, or a repo-wide grep), run from the repo root over
+   the whole tree (generated directories excluded), and what it returned.
 
 ## Folding mechanisms
 

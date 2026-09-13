@@ -32,6 +32,10 @@ class MarkdownAsciiTest(unittest.TestCase):
         )
 
 
+    def test_generated_digest_is_shipped_not_rewritten(self):
+        import fix_md_ascii as m
+        self.assertIn("skills/daslang/references/everything.md", m.SHIPPED_FILES)
+
     def test_shipped_basenames_keep_typography_but_not_mojibake(self):
         import fix_md_ascii as m
         self.assertIn("README.md", m.SHIPPED_BASENAMES)

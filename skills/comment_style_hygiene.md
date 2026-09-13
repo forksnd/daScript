@@ -61,11 +61,16 @@ fixture corpora (directories of files the code under test reads as input, not te
 execute) the prose carrying the lesson passes that test, and a comment that adds nothing
 to its line still goes.
 
-**A `//!` is a doc only where one attaches: the file's header block, the first lines inside a
-`def` / `struct` / `class` body, or trailing on a struct field.** Anywhere else - an `options`
-or `require` line, a statement mid-body, a lambda body - a `//!` documents nothing and answers
-to the deletion test like any `//`. The formatter keeps every comment spelled `//!` wherever it
-sits, so the spelling is no evidence the comment is a doc.
+**A `//!` is a doc only where one attaches: the file's header block, anywhere inside a `def`
+body, anywhere in a `struct` / `class` body outside its methods (it lands on the struct), or
+trailing on a struct field.** Outside the header block, above a top-level `def`, above a
+global, or on an `options` / `require` line a `//!` documents nothing and answers to the
+deletion test like any `//`; above a method inside a class body it lands on the class, not
+the method. Inside a function body every `//!` attaches to that function, wherever it sits -
+a mid-body or lambda-body `//!` lands in the function's generated reference page, so it stays
+only when it states a contract a caller must know; otherwise respell it `//` and apply the
+deletion test. The formatter keeps every comment spelled `//!` wherever it sits, so the
+spelling is no evidence the comment is a doc.
 
 **The header block - the comments above the first declaration - describes the FILE.** A
 comment there that describes the next declaration moves onto that declaration: as a `//!`
@@ -89,7 +94,9 @@ the WHY goes dark it was load-bearing - restore it, rewritten in present tense; 
 it was noise. 1-2 lines is the default, not a limit - "why is this long?" is the finding.
 The leading header block (license, provenance) stays.
 
-**Other languages have no kept set: every comment answers to the deletion test.**
+**Other languages keep only their own documentation form - a Python docstring, a JSDoc block -
+on the `//!` terms, a contract a caller must know; every other comment answers to the deletion
+test.**
 
 **No incident citations in a comment** - no PR numbers, no dates, no "used to crash". Name
 the failure mode in present tense at the code that guards it.

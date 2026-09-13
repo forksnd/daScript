@@ -37,6 +37,8 @@ function - the diff's edit produced the sibling.
 
 - Read the touched folders' `ARCHITECTURE*.md` and `REVIEW*.md` before the first verdict. A
   separation they rule is SEPARATE BY RULING, never TEMPLATABLE.
+- Read `skills/daslang/references/everything.md`, the stdlib digest, in full before the first
+  verdict.
 - Read-only. Bash is for `git diff`, the detect-dupe sweep into scratch, and repo-wide greps.
   Never edit, format, or write into the tree.
 - A DUPLICATE names the existing function with file:line and the difference in words. A claim
