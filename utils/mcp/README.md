@@ -187,7 +187,7 @@ daslang                 utils/mcp/setup.das -- --root <worktree-abs-path>   # wh
 `setup.das` builds a worktree-local `daslang` (+ the `tree_sitter_daslang`
 grammar), copies the platform `sgconfig.yml` template, and writes/merges
 `.mcp.json` with the `daslang` server entry and the `daslang-dap` entry (the
-DAP bridge, `utils/dap/mcp_bridge.py`, over the same binary). The LSP needs no
+DAP bridge, `utils/dap/main.das`, under the same front). The LSP needs no
 entry: its plugin manifest is checked in. It adds no new secrets, and
 preserves any existing server entries (e.g. `github`, including their env
 blocks) as-is. Pass `--no-build` to only wire the

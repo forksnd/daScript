@@ -9,16 +9,16 @@
  DAP MCP Bridge --- AI Debugging
 ================================
 
-``utils/dap/mcp_bridge.py`` exposes the daslang TCP
+``utils/dap/main.das`` exposes the daslang TCP
 `Debug Adapter Protocol <https://microsoft.github.io/debug-adapter-protocol/>`_
 server as a stateful Model Context Protocol server.  An AI coding agent can
 launch or attach to a program, set breakpoints, inspect paused state, evaluate
 expressions, step, and terminate the session through MCP tool calls.
 
-The bridge requires Python 3.10 or newer and a daslang executable.  It contains no language
-semantics: requests and responses are translated between MCP JSON-RPC and DAP,
-while the native daslang debugger remains responsible for execution and state
-inspection.
+The bridge is a daslang program the daslang executable runs; nothing else is
+needed.  It contains no language semantics: requests and responses are
+translated between MCP JSON-RPC and DAP, while the native daslang debugger
+remains responsible for execution and state inspection.
 
 .. contents::
    :local:
@@ -28,15 +28,19 @@ inspection.
 Configuration
 =============
 
-Configure one bridge process per agent session.  Pin both the target workspace
-and compiler so source paths and dynamic modules resolve in the intended tree:
+``daslang utils/mcp/setup.das -- --root <project>`` writes the entry into the
+project's ``.mcp.json`` beside the compiler and LSP servers, behind the
+watchdog's stdio front.  Written by hand, one bridge process per agent
+session; pin both the target workspace and compiler so source paths and
+dynamic modules resolve in the intended tree:
 
 .. code-block:: toml
 
    [mcp_servers.daslang-dap]
-   command = "python3"
+   command = "/abs/path/to/sdk/bin/daslang"
    args = [
-       "/abs/path/to/sdk/utils/dap/mcp_bridge.py",
+       "/abs/path/to/sdk/utils/dap/main.das",
+       "--",
        "--repo-root",
        "/abs/path/to/project",
        "--executable",
@@ -48,7 +52,8 @@ and compiler so source paths and dynamic modules resolve in the intended tree:
 
 The configured executable is the default for ``debug_launch``; a launch call
 can override it.  Paths passed to tools may be absolute or relative to
-``--repo-root``.
+``--repo-root``.  ``--timeout <seconds>`` bounds every DAP request (default
+90).
 
 
 Launch workflow
@@ -176,17 +181,16 @@ require these state modules automatically.
 Tests
 =====
 
-Run the end-to-end suite in both debugger modes::
+Run the end-to-end suite; it drives the bridge in both debugger modes::
 
-   PYTHONDONTWRITEBYTECODE=1 python3 utils/dap/test_mcp_bridge.py
-   DAS_TEST_STEPPING=1 PYTHONDONTWRITEBYTECODE=1 python3 utils/dap/test_mcp_bridge.py
+   bin/daslang dastest/dastest.das -- --test utils/dap/test_dap_bridge.das
 
 The suite invokes all 21 MCP tools against real debuggee processes.  It covers
 launch, attach, automatic port selection, breakpoint mutation while stopped,
 stepping, termination, process failure diagnostics, and repeated cleanup.  The
 runtime probes also cover cancellation before source-context readiness and a
-repeated debugger-worker lifecycle in one process.  The Linux
-``extended_checks`` job executes both commands.
+repeated debugger-worker lifecycle in one process.  The ``extended_checks``
+job runs it on Linux and macOS.
 
 
 .. seealso::

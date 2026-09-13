@@ -84,7 +84,8 @@ def public response(id_str : string; result_json : string) : string {
     return "\{\"jsonrpc\":\"2.0\",\"id\":{id_str},\"result\":{result_json}}"
 }
 
-def private quoted(s : string) : string {
+def public quoted(s : string) : string {
+    //! ``s`` as a JSON string literal, quotes and escapes included.
     var jsv = JV(s)
     let text = write_json(jsv)
     delete_json(jsv)

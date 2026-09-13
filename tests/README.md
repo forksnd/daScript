@@ -928,6 +928,12 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 | test_metal_sgmat_tiled.das | Tiled sgmat GEMM (threadgroup staging + barriers) vs CPU reference | |
 | test_metal_simd.das | simd_sum/shuffle intrinsics under uniform flow - kernel reports width/lane/sgid (M1 width 32) | |
 
+## network/
+
+| File | Description | Expects errors |
+|---|---|---|
+| test_client.das | the TCP client end against the server end in one process - connect, an echo both ways, the server's close seen by the client, the port probe on a free and a held port | |
+
 ## option/
 
 | File | Description | Expects errors |

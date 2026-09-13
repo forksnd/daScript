@@ -55,6 +55,12 @@ def operator ?[] (var a : json::JsonValue? ==const; idx : int) : JsonValue? {
     return a != null && a.value is _array ? (a.value as _array)?[idx] ?? json_null_sentinel() : json_null_sentinel()
 }
 
+def key_exists(a : json::JsonValue const?; key : string) : bool {
+    //! True when ``a`` is a JSON object carrying ``key``; false for null, a non-object, or a
+    //! missing key - the ``?[]`` read alone cannot tell a missing key from a null value.
+    return a != null && a.value is _object && ((a.value as _object) |> key_exists(key))
+}
+
 def private null_coalescing(a : json::JsonValue const?; val : auto(TT)) : TT {
     //! Returns the value of the JSON object, if it exists, otherwise returns the default value.
     if (a != null) {

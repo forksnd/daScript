@@ -1987,6 +1987,7 @@ install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/main.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_main.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/mcp_core.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/tool_result.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/protocol_core.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/registry_das.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/registry_cpp.das
@@ -2049,7 +2050,8 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/daslang/
 install(FILES ${PROJECT_SOURCE_DIR}/.claude/agents/dragon.md DESTINATION .claude/agents)
 
 install(FILES
-    ${PROJECT_SOURCE_DIR}/utils/dap/mcp_bridge.py
+    ${PROJECT_SOURCE_DIR}/utils/dap/main.das
+    ${PROJECT_SOURCE_DIR}/utils/dap/dap_bridge.das
     ${PROJECT_SOURCE_DIR}/utils/dap/README.md
     DESTINATION utils/dap
 )

@@ -1,0 +1,1 @@
+Reads everything the socket holds without blocking, handing each chunk to ``onData``. A peer that closed the connection is reported through ``onDisconnect`` once, after which the client is no longer connected.

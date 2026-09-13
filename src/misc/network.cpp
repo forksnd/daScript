@@ -2,6 +2,8 @@
 
 #include "daScript/misc/network.h"
 
+#include <chrono>
+
 #ifdef _WIN32
 
 #include <winsock2.h>
@@ -21,9 +23,14 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <poll.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <string.h>
+#include <stdio.h>
 
 #define closesocket close
 
@@ -233,5 +240,257 @@ namespace das {
 
     bool Server::is_connected() const {
         return client_fd > 0;
+    }
+
+    static bool loopback_address ( const char * host, struct sockaddr_in & address ) {
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        if ( !host || !*host || strcmp(host, "localhost")==0 ) {
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            return true;
+        }
+        return inet_pton(AF_INET, host, &address.sin_addr) == 1;
+    }
+
+    static const int SEND_WAIT_MS = 10000;
+
+    static bool connect_pending ( int err ) {
+#ifdef _WIN32
+        return socket_would_block(err);
+#else
+        return err==EINPROGRESS || socket_would_block(err);
+#endif
+    }
+
+    typedef std::chrono::steady_clock::time_point deadline_t;
+
+    static deadline_t deadline_after_ms ( int timeout_ms ) {
+        return std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    }
+
+    static int wait_writable_until ( socket_t sock, deadline_t deadline ) {
+        for ( ;; ) {
+            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+            if ( left < 0 ) left = 0;
+#ifdef _WIN32
+            fd_set wset;
+            FD_ZERO(&wset);
+            FD_SET(sock, &wset);
+            fd_set eset;
+            FD_ZERO(&eset);
+            FD_SET(sock, &eset);
+            struct timeval tv;
+            tv.tv_sec = long(left / 1000);
+            tv.tv_usec = long((left % 1000) * 1000);
+            int res = select(0, nullptr, &wset, &eset, &tv);
+#else
+            struct pollfd pfd;
+            pfd.fd = sock;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            int res = poll(&pfd, 1, int(left));
+#endif
+            if ( res > 0 ) return 0;
+            if ( res == 0 ) return -1;
+            int err = last_socket_error();
+            if ( !socket_would_block(err) ) return err;
+        }
+    }
+
+    Client::Client() {
+    }
+
+    Client::~Client() {
+        disconnect();
+    }
+
+    bool Client::connect ( const char * host, int port, int timeout_ms ) {
+        errno = 0;
+        if ( connected ) {
+            onError("already connected", -1);
+            return false;
+        }
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        char portText[16];
+        snprintf(portText, sizeof(portText), "%d", port);
+        const char * node = (!host || !*host) ? "localhost" : host;
+        struct addrinfo * list = nullptr;
+        if ( getaddrinfo(node, portText, &hints, &list)!=0 || !list ) {
+            onError("can't resolve host", -1);
+            return false;
+        }
+        const char * failure = "can't connect";
+        int failureCode = -1;
+        socket_t sock = 0;
+        bool ok = false;
+        auto deadline = deadline_after_ms(timeout_ms);
+        for ( auto ai = list; ai && !ok; ai = ai->ai_next ) {
+            sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            if ( invalid_socket(sock) ) {
+                failure = "can't socket";
+                failureCode = last_socket_error();
+                continue;
+            }
+#if defined(__APPLE__)
+            int nosigpipe = 1;
+            setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
+            if ( !set_socket_blocking(sock,false) ) {
+                failure = "can't set nbio";
+                failureCode = last_socket_error();
+                closesocket(sock);
+                continue;
+            }
+            if ( ::connect(sock, ai->ai_addr, socklen_t(ai->ai_addrlen)) == 0 ) {
+                ok = true;
+            } else {
+                int err = last_socket_error();
+                if ( connect_pending(err) ) {
+                    int waited = wait_writable_until(sock, deadline);
+                    if ( waited == 0 ) {
+                        int soerr = 0;
+                        socklen_t len = sizeof(soerr);
+                        if ( getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&soerr, &len) != 0 ) {
+                            failureCode = last_socket_error();
+                        } else if ( soerr != 0 ) {
+                            failureCode = soerr;
+                        } else {
+                            ok = true;
+                        }
+                    } else if ( waited < 0 ) {
+                        failure = "connect timed out";
+                        failureCode = -1;
+                    } else {
+                        failureCode = waited;
+                    }
+                } else {
+                    failureCode = err;
+                }
+            }
+            if ( !ok ) closesocket(sock);
+        }
+        freeaddrinfo(list);
+        if ( !ok ) {
+            onError(failure, failureCode);
+            return false;
+        }
+        fd = sock;
+        connected = true;
+        onLog("connected");
+        onConnect();
+        return true;
+    }
+
+    bool Client::is_connected() const {
+        return connected;
+    }
+
+    void Client::disconnect() {
+        if ( connected ) {
+            connected = false;
+            closesocket(fd);
+            fd = 0;
+        }
+    }
+
+    bool Client::send_msg ( char * data, int size ) {
+        errno = 0;
+        if ( !connected ) {
+            onError("can't send, not connected", -1);
+            return false;
+        }
+#ifdef MSG_NOSIGNAL
+        const int sendFlags = MSG_NOSIGNAL;
+#else
+        const int sendFlags = 0;
+#endif
+        while ( size > 0 ) {
+            int res = send(fd, data, size, sendFlags);
+            if ( res > 0 ) {
+                data += res;
+                size -= res;
+            } else {
+                res = last_socket_error();
+                const char * failure = "can't send";
+                if ( socket_would_block(res) ) {
+                    int waited = wait_writable_until(fd, deadline_after_ms(SEND_WAIT_MS));
+                    if ( waited == 0 ) continue;
+                    if ( waited < 0 ) {
+                        failure = "send timed out";
+                        res = -1;
+                    } else {
+                        res = waited;
+                    }
+                }
+                onError(failure, res);
+                disconnect();
+                onDisconnect();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void Client::tick() {
+        errno = 0;
+        if ( !connected ) return;
+        char buffer[4097];
+        for ( ;; ) {
+            int res = recv(fd, buffer, 4096, 0);
+            if ( res > 0 ) {
+                buffer[res] = 0;
+                onData(buffer, res);
+                if ( !connected ) return;
+            } else if ( res == 0 ) {
+                onLog("connection closed");
+                disconnect();
+                onDisconnect();
+                return;
+            } else {
+                res = last_socket_error();
+                if ( !socket_would_block(res) ) {
+                    onError("connection closed on error", res);
+                    disconnect();
+                    onDisconnect();
+                }
+                return;
+            }
+        }
+    }
+
+    void Client::onData(char *, int) {
+    }
+
+    void Client::onConnect() {
+    }
+
+    void Client::onDisconnect() {
+    }
+
+    void Client::onError(const char *, int) {
+    }
+
+    void Client::onLog(const char *) {
+    }
+
+    int probe_local_port ( const char * host, int port ) {
+        struct sockaddr_in address;
+        if ( !loopback_address(host, address) ) return -1;
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        address.sin_port = htons(uint16_t(port));
+        socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+        if ( invalid_socket(sock) ) return -1;
+        int bound = -1;
+        if ( ::bind(sock, (struct sockaddr *)&address, sizeof(address)) == 0 ) {
+            socklen_t len = sizeof(address);
+            if ( getsockname(sock, (struct sockaddr *)&address, &len) == 0 ) {
+                bound = ntohs(address.sin_port);
+            }
+        }
+        closesocket(sock);
+        return bound;
     }
 }

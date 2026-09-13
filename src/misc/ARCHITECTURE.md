@@ -5,7 +5,8 @@
 - `job_que.cpp` - how many compute lanes a `JobQue` starts with, and where the OS puts them.
 - `sysos.cpp` - the per-platform core-count probes `job_que.cpp` calls.
 - `network.cpp` - the single-client TCP `Server` the DAP debugger and `daslib/network` sit on,
-  and the two helpers every socket error passes through.
+  the `Client` end beside it, `probe_local_port`, and the two helpers every socket error passes
+  through.
 - `alloc_tracker.cpp` - the RelWithDebInfo C++ heap leak tracker: the live-allocation map, the
   exit-time report, and the per-frame symbolizer. `alloc_tracker_overrides.cpp` beside it carries
   the global `operator new`/`delete` that feed it, compiled into every binary and shared module.
@@ -59,8 +60,11 @@ Winsock reports a failed socket call through `WSAGetLastError()` and leaves `err
 POSIX reports it in `errno`. `network.cpp` reads the error only through `last_socket_error()`,
 which returns whichever the platform set, and asks "retry later?" only through
 `socket_would_block()`, which knows that the would-block code is `WSAEWOULDBLOCK` on Windows and
-`EAGAIN`, `EWOULDBLOCK`, or `EINTR` elsewhere. `send_msg` loops on would-block and closes the
-client on any other error; `tick` treats any other `recv` error as a disconnect. A site that
+`EAGAIN`, `EWOULDBLOCK`, or `EINTR` elsewhere. `Server::send_msg` loops on would-block and closes
+the client on any other error; `Client::send_msg` waits for the socket to drain instead, and a
+peer that reads nothing for ten seconds is a closed connection, since the client runs on the
+caller's only thread and a spin there stalls everything else; `tick` treats any other `recv`
+error as a disconnect, and the client's `tick` stops once a callback closed the socket. A site that
 read `errno` after a Winsock call would see 0 and treat a dead peer as "no error", so a send to
 a disconnected client would retry forever while holding the debug-agent context lock, and the
 tick that notices the closed socket could never run. `REVIEW.das` beside this file fails a
@@ -69,7 +73,13 @@ outside `socket_would_block()`. A peer that closed never signals the process: th
 socket carries `SO_NOSIGPIPE` on Apple and every send passes `MSG_NOSIGNAL` where the platform
 defines it, so a write after the client went away is the `EPIPE` that `send_msg`'s error path
 closes on, not a `SIGPIPE` that ends the debuggee - a disconnect request resumes every context
-and their exit events race the client's close.
+and their exit events race the client's close. Two more Winsock differences the client end
+carries: a failed non-blocking connect is reported in `select`'s EXCEPT set, never the write
+set, so `wait_writable_until` watches both and `SO_ERROR` names the outcome either way (POSIX
+`poll` reports it as writable); and a specific-address `bind` succeeds beside a wildcard
+listener on the same port, so `probe_local_port` binds the wildcard address whatever host it
+was asked about - the question it answers is whether a listener, which binds the wildcard,
+could take the port, and a wildcard bind is refused by any holder on every platform.
 
 ## 6. The leak dump runs last, so a static dtor's free is not a leak
 

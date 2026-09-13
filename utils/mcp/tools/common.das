@@ -11,18 +11,9 @@ require math public
 require strings public
 require daslib/fio public
 require daslib/command_line public
+require ../tool_result.das public
 
 var ast_grep_cmd : string
-
-struct ContentItem {
-    @rename = "type" _type : string
-    text : string
-}
-
-struct ToolResult {
-    content : array<ContentItem>
-    isError : bool
-}
 
 // query matching: case-insensitive substring by default, "=foo" for exact case-sensitive
 def symbol_matches(name, query : string) : bool {
@@ -43,13 +34,6 @@ struct TryResult {
     text : string
     ok : bool
     retryable : bool
-}
-
-def make_tool_result(text : string; is_error : bool = false) : string {
-    var result : ToolResult
-    result.isError = is_error
-    result.content |> emplace(ContentItem(_type = "text", text = text))
-    return sprint_json(result, false)
 }
 
 // ── Cross-tree guard ─────────────────────────────────────────────────

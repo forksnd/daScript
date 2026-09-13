@@ -1,0 +1,1 @@
+Creates the native client behind a ``Client`` class instance: stores it in the instance's ``_client`` field and wires the instance's ``onConnect``, ``onDisconnect``, ``onData``, ``onError`` and ``onLog`` methods as the socket's callbacks. Called by ``Client.make_client_adapter``; returns false when the class carries no ``_client`` field.

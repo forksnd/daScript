@@ -1,20 +1,21 @@
-# daScript DAP MCP bridge
+# daslang DAP MCP bridge
 
-`mcp_bridge.py` exposes the repository's TCP Debug Adapter Protocol server as a
-stateful MCP server for Codex. One MCP process owns one DAP connection and, for
-`debug_launch`, the launched `daslang` process.
+`utils/dap/main.das` exposes the repository's TCP Debug Adapter Protocol server as a
+stateful MCP server. One bridge process owns one DAP connection and, for
+`debug_launch`, the `daslang` process it started. It runs on the daslang binary, under
+the watchdog's stdio front like the daslang MCP server; `utils/mcp/setup.das` writes the
+`daslang-dap` entry into a tree's `.mcp.json`.
 
-The bridge requires Python 3.10 or newer.
-
-For an external project, start the bridge with that project's workspace root
-and pinned compiler. The configured executable becomes the default for every
+For an external project, start the bridge with that project's workspace root and
+pinned compiler. The configured executable becomes the default for every
 `debug_launch`; an individual call can still override it:
 
 ```toml
 [mcp_servers.daslang-dap]
-command = "python3"
+command = "/abs/path/to/daScript/bin/daslang"
 args = [
-    "/abs/path/to/daScript/utils/dap/mcp_bridge.py",
+    "/abs/path/to/daScript/utils/dap/main.das",
+    "--",
     "--repo-root",
     "/abs/path/to/project",
     "--executable",
@@ -25,6 +26,13 @@ enabled = true
 required = true
 ```
 
+`--timeout <seconds>` sets the DAP request timeout (default 90).
+
+Behind the watchdog front the `initialize` answer is the front's own - server name
+`daslang`, no `instructions` - since the front answers before any child exists. The
+bridge's workflow guidance is in the tool descriptions, which the front does forward;
+the `instructions` text reaches only a client that runs `main.das` directly.
+
 ## Local launch workflow
 
 1. Call `debug_launch` with a `.das` file. The bridge starts `daslang` with
@@ -32,7 +40,7 @@ required = true
    `port` is omitted, the bridge chooses an available local port; pass an
    explicit port only when another process needs to know it in advance.
 2. Call `debug_set_breakpoints` as needed.
-3. Call `debug_threads`. The daScript startup gate requires this request.
+3. Call `debug_threads`. The daslang startup gate requires this request.
 4. Call `debug_configuration_done`.
 5. Wait for `stopped` with `debug_wait_event`, then use `debug_stack_trace`,
    `debug_scopes`, `debug_variables`, and `debug_evaluate`. A `debug_evaluate`
@@ -47,8 +55,12 @@ required = true
 `debug_disconnect` is safe to repeat. If the DAP peer has already gone away,
 it returns success with `already_disconnected=true` and a `session` snapshot
 containing the last endpoint, owned-process return code, termination reason,
-recent DAP events, and captured stdout/stderr tail. A `terminated` result from
+recent DAP events, and the captured output tail. A `terminated` result from
 `debug_wait_event` carries the same snapshot.
+
+The bridge has no thread: the socket and the debuggee's output are drained
+between MCP requests and while a tool waits, so an event or an exit is never
+missed, only read a little later.
 
 Local launch uses instrumentation mode by default. Source breakpoints are sent
 to DAP immediately; the native debug agent keeps unverified breakpoints and
@@ -66,7 +78,7 @@ own folding contexts are never reported as threads.
 
 ## Custom debugger state
 
-daScript debug-agent modules can add application-specific state to a paused
+daslang debug-agent modules can add application-specific state to a paused
 stack frame. Their `DapiDebugAgent.onCollect` implementation calls
 `report_context_state`; each reported category then appears as an extra result
 from `debug_scopes`, and `debug_variables` expands the values normally. The
@@ -89,23 +101,25 @@ For a runtime already started with the debug server, use `debug_connect`,
 `debug_initialize`, and `debug_attach`, followed by `debug_threads` and
 `debug_configuration_done`.
 
+## Layout
+
+- `dap_bridge.das` - the library: the frame parser, `DapClient` (the connection, its
+  responses and event queue), `DapBridge` (the tools and the owned debuggee).
+- `main.das` - the entry: the tool schemas and the stdio loop over `utils/mcp/mcp_core.das`.
+- `test_dap_bridge.das` - the tests; `_fixture*.das` are the debuggees they run.
+
 ## Test
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 utils/dap/test_mcp_bridge.py
+bin/daslang dastest/dastest.das -- --test utils/dap/test_dap_bridge.das
 ```
 
-To exercise the native stepping mode and its locked-table regression:
-
-```sh
-DAS_TEST_STEPPING=1 PYTHONDONTWRITEBYTECODE=1 python3 utils/dap/test_mcp_bridge.py
-```
-
-The end-to-end test invokes all 21 MCP tools against real daScript debuggee
-processes, including automatic port allocation, launch, attach, stepping,
-termination, repeated cleanup, disconnect while stopped at a breakpoint, and
-debug-agent callbacks without a preconfigured context mutex. Runtime probes
-also cover shutdown and source-context destruction while a debugger worker is
-still waiting, repeated worker lifecycle in one process, and immediate
-rejection of a duplicate singleton worker. It is also run by the Linux
-`extended_checks` job.
+The end-to-end cases drive all 21 MCP tools against real daslang debuggee
+processes, once with the instrumentation debugger and once with native stepping,
+including automatic port allocation, launch, attach, stepping, termination,
+repeated cleanup, disconnect while stopped at a breakpoint, and debug-agent
+callbacks without a preconfigured context mutex. The fixture cases cover shutdown
+and source-context destruction while a debugger worker is still waiting, repeated
+worker lifecycle in one process, and immediate rejection of a duplicate singleton
+worker. The frame parser's limits and the resume-command mapping have their own
+cases. The Linux `extended_checks` job runs the file.

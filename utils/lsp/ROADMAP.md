@@ -87,7 +87,7 @@ empirically:
 
 Deliverable: probe notes in this file; wave 1 scope locked by answers, not docs.
 
-#### Probe results (2026-07-01, CC v2.1.198, probe-plugin/ + headless `claude -p --plugin-dir`)
+#### Probe results (2026-07-01, CC v2.1.198, a throwaway plugin + headless `claude -p --plugin-dir`)
 
 1. **Handshake**: `initialize` carries `rootUri`+`workspaceFolders` (project dir),
    `clientInfo{Claude Code, 2.1.198}`, `initializationOptions={}` (empty unless the

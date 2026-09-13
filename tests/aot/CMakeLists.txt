@@ -13,7 +13,9 @@ FILE(GLOB AOT_DASLIB_MODULE_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPEN
 #   profiler       — emits AOT C++ hitting an ambiguous __bit_set overload (aot.h)
 #   profiler_boost — its [_macro] forks profiler's thread-local instrumenting agent, which
 #                    perturbs later batch files' hashes → error[50101]
-#   network        — daslang class `Server` shadows C++ `das::Server` (server_init undeclared)
+#   network        — daslang class `Server` shadows C++ `das::Server` (server_init undeclared);
+#                    the module declares `options no_aot` too, so a -use-aot run that requires it
+#                    links nothing from it instead of failing on its class_info instances
 list(FILTER AOT_DASLIB_MODULE_FILES EXCLUDE REGEX "daslib/(aot_macro|profiler|profiler_boost|network)\\.das$")
 # just_in_time bootstraps the LLVM-backed JIT module via [extern](library=LLVM.dll).
 # Without DAS_LLVM_DISABLED=OFF, the [extern] macro fails at compile time.
@@ -393,7 +395,7 @@ set(DAS_AOT_SUITES
     class_boost dasbind daslib dasgltf daspeg data_walker debug debug_agent decs dynamic_cast_rtti fio
     fixed_array flatten fs functional gc glsl handle_types hash_map interfaces jit
     jobque json jsonrpc language linq lint long_array_table loops lpipe lsp
-    macro_boost macro_call match math mcp md_boost module_cache module_tests option promote quote
+    macro_boost macro_call match math mcp md_boost module_cache module_tests network option promote quote
     reader_macro regex rtti safe_addr soa spoof strings stbimage table_packed template
     tests type_lattice type_traits typemacro uri with_boost delegate)
 foreach(_s IN LISTS DAS_AOT_SUITES)
