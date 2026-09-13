@@ -2034,8 +2034,8 @@ def private attn_av_mm_gate(t : T?; dev, queue; tensor : bool; heads, hs, kv_mul
     delete env
 }
 
-//! the stage width is a stamp constant the emitter's census records: the double-buffered stamps
-//! read the 128-wide body, the single-tile stamps the 64-wide one - device-free
+// the stage width is a stamp constant the emitter's census records: the double-buffered stamps
+// read the 128-wide body, the single-tile stamps the 64-wide one - device-free
 [test]
 def test_q8_mulmm_stamp_widths(t : T?) {
     t |> run("q8 mul_mm stamps read the stage width their constants set") <| @(t : T?) {
